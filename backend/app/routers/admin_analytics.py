@@ -1779,6 +1779,189 @@ async def get_scope_baselines(
     return _compute_scope_baselines(list(tasks), lookback_days)
 
 
+def _compute_medium_scope_measurement(
+    medium_tasks: list,
+    project: Optional[Any],
+    direction_id: Optional[str],
+    lookback_days: int,
+) -> Dict[str, Any]:
+    """Compute medium-scope merge rate measurement with pre/post investment split.
+
+    Returns headline metrics, investment split, weekly time-series with direction
+    correlation, and a correlated_changes list showing direction-merged tasks
+    alongside that week's merge-rate delta.
+    """
+    # --- Headline ---
+    total_created = len(medium_tasks)
+    total_merged = sum(
+        1 for t in medium_tasks
+        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
+    )
+    medium_scope_merge_rate = round(total_merged / total_created, 3) if total_created > 0 else None
+
+    # --- Find target direction ---
+    resolved_direction_id: Optional[str] = direction_id
+    target_direction = None
+    if project and project.directions:
+        directions = project.directions or []
+        if resolved_direction_id:
+            for d in directions:
+                if d.get("id") == resolved_direction_id:
+                    target_direction = d
+                    break
+        else:
+            # Search for medium-scope direction by text
+            for d in directions:
+                text = (d.get("text") or "").lower()
+                if "medium" in text and "scope" in text:
+                    target_direction = d
+                    resolved_direction_id = d.get("id")
+                    break
+
+    # --- Investment start from earliest research_history entry ---
+    investment_start: Optional[datetime] = None
+    if target_direction:
+        research_history = target_direction.get("research_history") or []
+        timestamps: list = []
+        for entry in research_history:
+            ts = entry.get("timestamp")
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(ts)
+                    if dt.tzinfo is not None:
+                        dt = dt.replace(tzinfo=None)
+                    timestamps.append(dt)
+                except (ValueError, AttributeError):
+                    pass
+        if timestamps:
+            investment_start = min(timestamps)
+
+    # --- Pre/post split ---
+    pre_investment: Optional[Dict[str, Any]] = None
+    post_investment: Optional[Dict[str, Any]] = None
+    if investment_start is not None:
+        pre_tasks = [t for t in medium_tasks if t.created_at and t.created_at < investment_start]
+        post_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= investment_start]
+
+        def _window_stats(tasks_subset: list, window_start: Optional[datetime], window_end: Optional[datetime]) -> Dict[str, Any]:
+            created = len(tasks_subset)
+            merged = sum(
+                1 for t in tasks_subset
+                if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
+            )
+            return {
+                "merge_rate": round(merged / created, 3) if created > 0 else None,
+                "created": created,
+                "merged": merged,
+                "window_start": window_start.isoformat() if window_start else None,
+                "window_end": window_end.isoformat() if window_end else None,
+            }
+
+        pre_start = min((t.created_at for t in pre_tasks if t.created_at), default=None)
+        post_end = max((t.created_at for t in post_tasks if t.created_at), default=None)
+        pre_investment = _window_stats(pre_tasks, pre_start, investment_start)
+        post_investment = _window_stats(post_tasks, investment_start, post_end)
+
+    # --- Weekly time series ---
+    week_bucket: Dict[str, Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0, "direction_merges": 0})
+
+    for t in medium_tasks:
+        if not t.created_at:
+            continue
+        task_date = t.created_at.date()
+        week_monday = task_date - timedelta(days=task_date.weekday())
+        week_key = week_monday.isoformat()
+        week_bucket[week_key]["created"] += 1
+        is_merged = t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
+        if is_merged:
+            week_bucket[week_key]["merged"] += 1
+        if is_merged and resolved_direction_id and (t.context or {}).get("direction_id") == resolved_direction_id:
+            week_bucket[week_key]["direction_merges"] += 1
+
+    sorted_weeks = sorted(week_bucket.keys())
+    weekly_series: List[Dict[str, Any]] = []
+    for i, week_key in enumerate(sorted_weeks):
+        counts = week_bucket[week_key]
+        created = counts["created"]
+        merged = counts["merged"]
+        merge_rate = round(merged / created, 3) if created > 0 else None
+        if i == 0:
+            merge_rate_delta = None
+        else:
+            prev_rate = weekly_series[i - 1]["merge_rate"]
+            merge_rate_delta = round(merge_rate - prev_rate, 3) if (merge_rate is not None and prev_rate is not None) else None
+        weekly_series.append({
+            "week": week_key,
+            "created": created,
+            "merged": merged,
+            "merge_rate": merge_rate,
+            "direction_merges": counts["direction_merges"],
+            "merge_rate_delta": merge_rate_delta,
+        })
+
+    week_rate_delta: Dict[str, Optional[float]] = {e["week"]: e["merge_rate_delta"] for e in weekly_series}
+
+    # --- Correlated changes: direction-associated merged tasks with weekly delta ---
+    correlated_changes: List[Dict[str, Any]] = []
+    if resolved_direction_id:
+        for t in medium_tasks:
+            if (t.context or {}).get("direction_id") != resolved_direction_id:
+                continue
+            if not (t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")):
+                continue
+            if not t.created_at:
+                continue
+            task_date = t.created_at.date()
+            week_monday = task_date - timedelta(days=task_date.weekday())
+            week_key = week_monday.isoformat()
+            correlated_changes.append({
+                "title": t.title,
+                "week": week_key,
+                "merge_rate_delta": week_rate_delta.get(week_key),
+            })
+
+    return {
+        "medium_scope_merge_rate": medium_scope_merge_rate,
+        "total_created": total_created,
+        "total_merged": total_merged,
+        "investment_start": investment_start.isoformat() if investment_start else None,
+        "pre_investment": pre_investment,
+        "post_investment": post_investment,
+        "weekly_series": weekly_series,
+        "correlated_changes": correlated_changes,
+    }
+
+
+@router.get("/medium-scope-measurement")
+async def get_medium_scope_measurement(
+    project_id: uuid.UUID = Query(...),
+    direction_id: Optional[str] = Query(None),
+    lookback_days: int = Query(365, ge=1, le=730),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return medium-scope merge rate measurement with pre/post investment split.
+
+    Queries terminal tasks for the project, filters to medium scope, and computes
+    headline metrics, pre/post investment windows, weekly time-series with
+    direction correlation, and correlated_changes for shipped direction tasks.
+    """
+    cutoff = _utcnow() - timedelta(days=lookback_days)
+    result = await session.execute(
+        select(Task).where(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+            Task.created_at >= cutoff,
+            Task.project_id == project_id,
+        )
+    )
+    all_tasks = result.scalars().all()
+    medium_tasks = [t for t in all_tasks if (t.context or {}).get("scope") == "medium"]
+
+    project = await session.get(Project, project_id)
+
+    return _compute_medium_scope_measurement(medium_tasks, project, direction_id, lookback_days)
+
+
 ORCHESTRATOR_ERRORS_CACHE_TTL_SECONDS = 60
 ORCHESTRATOR_SERVICE_NAME = os.getenv("ORCHESTRATOR_SERVICE_NAME", "blueprint-orchestrator")
 _orchestrator_errors_cache: Dict[Tuple[int, int], Tuple[float, Dict[str, Any]]] = {}

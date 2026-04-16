@@ -11,7 +11,7 @@ import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.routers.admin_analytics import compute_pipeline_health_summary, _compute_scope_baselines
+from app.routers.admin_analytics import compute_pipeline_health_summary, _compute_scope_baselines, _compute_medium_scope_measurement
 from app.models import Task, TaskStatus, Project
 from testing.factories import make_task, make_project, _utcnow
 
@@ -1170,6 +1170,177 @@ def test_scope_baselines_week_key_is_monday():
 
     assert len(result["series"]) == 1
     assert result["series"][0]["week"] == monday.isoformat()
+
+
+# ── _compute_medium_scope_measurement ────────────────────────────────────────
+
+def test_medium_scope_no_tasks_returns_null_rates():
+    """No medium-scope tasks → null merge rate, zero counts, empty series."""
+    result = _compute_medium_scope_measurement([], None, None, 365)
+    assert result["medium_scope_merge_rate"] is None
+    assert result["total_created"] == 0
+    assert result["total_merged"] == 0
+    assert result["investment_start"] is None
+    assert result["pre_investment"] is None
+    assert result["post_investment"] is None
+    assert result["weekly_series"] == []
+    assert result["correlated_changes"] == []
+
+
+def test_medium_scope_headline_rate_computed_correctly():
+    """Headline rate = merged / total terminal; CANCELLED counts as created not merged."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True}, created_at=now),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True}, created_at=now),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"scope": "medium"}, created_at=now,
+                  latest_status_message="error"),
+        make_task(project_id=project_id, status=TaskStatus.CANCELLED,
+                  context={"scope": "medium"}, created_at=now),
+    ]
+    result = _compute_medium_scope_measurement(tasks, None, None, 365)
+    assert result["total_created"] == 4
+    assert result["total_merged"] == 2
+    assert result["medium_scope_merge_rate"] == round(2 / 4, 3)
+
+
+def test_medium_scope_pre_post_split_from_research_history():
+    """Pre/post windows split correctly using earliest research_history timestamp."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+    investment_ts = now - timedelta(days=30)
+
+    project = make_project(directions=[{
+        "id": direction_id,
+        "status": "active",
+        "text": "Reliable medium-scope execution",
+        "research_history": [
+            {"timestamp": (investment_ts + timedelta(days=5)).isoformat(), "prs_merged": 1},
+            {"timestamp": investment_ts.isoformat(), "prs_merged": 2},
+        ],
+    }])
+
+    # 2 tasks before investment start, 3 after
+    pre_tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True},
+                  created_at=investment_ts - timedelta(days=10)),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"scope": "medium"}, created_at=investment_ts - timedelta(days=5),
+                  latest_status_message="e"),
+    ]
+    post_tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True},
+                  created_at=investment_ts + timedelta(days=10)),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True},
+                  created_at=investment_ts + timedelta(days=15)),
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"scope": "medium"}, created_at=investment_ts + timedelta(days=20),
+                  latest_status_message="e"),
+    ]
+
+    result = _compute_medium_scope_measurement(pre_tasks + post_tasks, project, direction_id, 365)
+
+    assert result["investment_start"] is not None
+    pre = result["pre_investment"]
+    post = result["post_investment"]
+    assert pre is not None
+    assert post is not None
+    assert pre["created"] == 2
+    assert pre["merged"] == 1
+    assert pre["merge_rate"] == 0.5
+    assert post["created"] == 3
+    assert post["merged"] == 2
+    assert post["merge_rate"] == round(2 / 3, 3)
+
+
+def test_medium_scope_direction_merges_in_weekly_series():
+    """direction_merges in weekly series counts only direction-associated merged tasks."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+    other_direction_id = str(uuid.uuid4())
+
+    # All tasks in the same week
+    tasks = [
+        # Direction-associated merged
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True, "direction_id": direction_id},
+                  created_at=now),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True, "direction_id": direction_id},
+                  created_at=now),
+        # Merged but different direction — should NOT count in direction_merges
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True, "direction_id": other_direction_id},
+                  created_at=now),
+        # Direction-associated but not merged
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  context={"scope": "medium", "direction_id": direction_id},
+                  created_at=now, latest_status_message="e"),
+    ]
+
+    result = _compute_medium_scope_measurement(tasks, None, direction_id, 365)
+
+    assert len(result["weekly_series"]) == 1
+    entry = result["weekly_series"][0]
+    assert entry["created"] == 4
+    assert entry["merged"] == 3
+    assert entry["direction_merges"] == 2
+
+
+def test_medium_scope_correlated_changes_only_direction_merged():
+    """correlated_changes includes only direction-associated COMPLETED+pr_merged tasks."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    tasks = [
+        # Direction-associated merged — should appear in correlated_changes
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  title="Add retry logic",
+                  context={"scope": "medium", "pr_merged": True, "direction_id": direction_id},
+                  created_at=now),
+        # Merged but no direction — should NOT appear
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  title="Unrelated task",
+                  context={"scope": "medium", "pr_merged": True},
+                  created_at=now),
+        # Direction-associated but not merged — should NOT appear
+        make_task(project_id=project_id, status=TaskStatus.FAILED,
+                  title="Failed direction task",
+                  context={"scope": "medium", "direction_id": direction_id},
+                  created_at=now, latest_status_message="e"),
+    ]
+
+    result = _compute_medium_scope_measurement(tasks, None, direction_id, 365)
+
+    changes = result["correlated_changes"]
+    assert len(changes) == 1
+    assert changes[0]["title"] == "Add retry logic"
+    assert changes[0]["week"] is not None
+    # First week has no previous, so delta is None
+    assert changes[0]["merge_rate_delta"] is None
+
+
+def test_medium_scope_no_direction_returns_empty_correlated_changes():
+    """Without a direction_id and no project directions, correlated_changes is empty."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "pr_merged": True}, created_at=now),
+    ]
+    result = _compute_medium_scope_measurement(tasks, None, None, 365)
+    assert result["correlated_changes"] == []
+    assert result["investment_start"] is None
 
 
 # ── Pipeline-health rolling event monitor ────────────────────────────────────
