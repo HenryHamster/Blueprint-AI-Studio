@@ -359,6 +359,10 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
       const selfReviewProjectCtx = task.project_context as Record<string, unknown> | undefined;
       const reviewIssueDist = selfReviewProjectCtx?.review_issue_distribution as Record<string, number> | undefined;
+      const selfReviewPipelineHealth = selfReviewProjectCtx?.pipeline_health as Record<string, unknown> | undefined;
+      const selfReviewFasr = selfReviewPipelineHealth?.first_attempt_success_rate as Record<string, unknown> | undefined;
+      const firstAttemptByCat = selfReviewFasr?.first_attempt_by_review_category as Record<string, number> | undefined;
+      const persistentReviewIssues = selfReviewPipelineHealth?.persistent_review_issues as string[] | undefined;
 
       const selfReviewTaskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
       const selfReviewPrompt = buildSelfReviewPrompt({
@@ -370,6 +374,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         reviewIssueDistribution: reviewIssueDist,
         taskScope: selfReviewTaskScope,
         scopeOverflowWarning,
+        firstAttemptByCategory: firstAttemptByCat,
+        persistentReviewIssues,
       });
 
       const headBeforeReview = git(['rev-parse', 'HEAD']);
@@ -485,6 +491,32 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
             sendLog(ws, `\nWARNING: Lint check after self-review fixes failed — proceeding anyway:\n${msg.slice(0, 2000)}\n`);
           }
         }
+      }
+    }
+
+    // ── Guard: Post-self-review scope overflow check ─────────────────────────
+    // Re-count changed files after self-review (which may have trimmed files).
+    // If count still exceeds the threshold, block PR creation.
+    if (overflowThreshold !== undefined) {
+      const postReviewCommittedPaths = currentHead !== baseCommit
+        ? git(['diff', '--name-only', `${baseCommit}..HEAD`]).split('\n').filter(Boolean)
+        : [];
+      const postReviewDiff = git(['status', '--porcelain']);
+      const postReviewUncommitted = postReviewDiff.length > 0
+        ? postReviewDiff.split('\n').map((l: string) => l.trim().split(/\s+/).pop() || '').filter(Boolean)
+        : [];
+      const postReviewPaths = [...new Set([...postReviewCommittedPaths, ...postReviewUncommitted])];
+      if (postReviewPaths.length > overflowThreshold) {
+        const fileList = postReviewPaths.map((f: string) => `- ${f}`).join('\n');
+        const failureLog = `Scope overflow: ${postReviewPaths.length} files changed for a "${taskScope}" task (threshold: ${overflowThreshold}).\n\nChanged files:\n${fileList}\n\nTrim unrelated files and retry with a focused change set.`;
+        sendLog(ws, `\nScope overflow gate: ${postReviewPaths.length} files changed (threshold: ${overflowThreshold}) — blocking PR creation.\n`);
+        await persistAndPostStatus(taskId, {
+          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+          logs: failureLog,
+          failure_category: 'scope_overflow',
+          changed_files: postReviewPaths.slice(0, 50),
+        });
+        return;
       }
     }
 
@@ -690,6 +722,7 @@ export async function handleRefactor(
     : '';
 
   const refactorTitle = strVal(task.title, 'Refactor');
+  const isRefactorMediumOrLargeScope = refactorScope === 'medium' || refactorScope === 'large';
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
@@ -711,6 +744,8 @@ ${rp}`,
     noChangesMessage: 'No file changes.',
     runLintFix: true,
     runTestFix: true,
+    failOnTestFailure: true,
+    captureBaseline: isRefactorMediumOrLargeScope,
     runSelfReview: true,
     lintContext: 'the refactored code',
   });

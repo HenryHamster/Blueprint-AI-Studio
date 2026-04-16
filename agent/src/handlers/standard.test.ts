@@ -1105,3 +1105,152 @@ describe('lint failure handling', () => {
     );
   });
 });
+
+// ── Refactor blocking gates ───────────────────────────────────────────────────
+describe('handleRefactor blocking gates', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(git)
+      .mockReturnValueOnce('')        // rev-parse HEAD → baseCommit
+      .mockReturnValueOnce('M file')  // status --porcelain → hasChanges = true
+      .mockReturnValue('');           // all remaining calls
+  });
+
+  it('marks task as FAILED when lint fails for refactor', async () => {
+    vi.mocked(lintFixLoop).mockResolvedValue(false);
+    const task = { title: 'Refactor task', description: '', context: {}, project_context: {} };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'lint_failed' }),
+    );
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('marks task as FAILED when tests fail for refactor', async () => {
+    vi.mocked(lintFixLoop).mockResolvedValue(true);
+    vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: true, passed: false, failureSummary: 'test_foo failed' });
+    const task = { title: 'Refactor task', description: '', context: {}, project_context: {} };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'test_failed' }),
+    );
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('calls captureTestBaseline for medium scope refactor tasks', async () => {
+    const task = { title: 'Refactor task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
+  });
+
+  it('calls captureTestBaseline for large scope refactor tasks', async () => {
+    const task = { title: 'Refactor task', description: '', context: { scope: 'large' }, project_context: {} };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
+  });
+
+  it('does not call captureTestBaseline for small scope refactor tasks', async () => {
+    const task = { title: 'Refactor task', description: '', context: { scope: 'small' }, project_context: {} };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+  });
+});
+
+// ── Post-self-review scope overflow gate ─────────────────────────────────────
+describe('post-self-review scope overflow gate', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /**
+   * Builds a git mock sequence for the standard path where:
+   * - baseCommit === currentHead (no committed changes)
+   * - hasChanges = true (uncommitted diff = 'M file')
+   * - self-review runs but applies no fixes (headBefore === headAfter)
+   * - postReviewDiff = the provided string
+   */
+  function setupGitMocksWithPostReviewDiff(postReviewDiff: string): void {
+    // Restore mocks that other test suites may have permanently overridden
+    vi.mocked(lintFixLoop).mockResolvedValue(true);
+    vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: false, passed: true });
+    vi.mocked(git)
+      .mockReset()
+      .mockReturnValueOnce('')          // 1: baseCommit (rev-parse HEAD)
+      .mockReturnValueOnce('M file')    // 2: hasChanges (status --porcelain)
+      .mockReturnValueOnce('')          // 3: currentHead (same as baseCommit)
+      .mockReturnValueOnce('')          // 4: uncommittedDiff for self-review (diff HEAD)
+      .mockReturnValueOnce('abc123')    // 5: headBeforeReview
+      .mockReturnValueOnce('')          // 6: statusBeforeReview
+      .mockReturnValueOnce('abc123')    // 7: headAfterReview (same → no fixes)
+      .mockReturnValueOnce('')          // 8: statusAfterReview (same → no fixes)
+      .mockReturnValueOnce(postReviewDiff) // 9: postReviewDiff (scope overflow check)
+      .mockReturnValue('');
+  }
+
+  it('blocks PR and reports scope_overflow when medium task exceeds threshold after self-review', async () => {
+    // medium threshold = 10; provide 11 files
+    const files11 = Array.from({ length: 11 }, (_, i) => `M src/file${i}.ts`).join('\n');
+    setupGitMocksWithPostReviewDiff(files11);
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'scope_overflow' }),
+    );
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('includes threshold and file count in failure log for scope overflow', async () => {
+    const files11 = Array.from({ length: 11 }, (_, i) => `M src/file${i}.ts`).join('\n');
+    setupGitMocksWithPostReviewDiff(files11);
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const failedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'FAILED',
+    );
+    expect(failedCall).toBeDefined();
+    const logs = (failedCall![1] as Record<string, unknown>).logs as string;
+    expect(logs).toContain('11');
+    expect(logs).toContain('10');
+  });
+
+  it('does not block PR when medium task is within threshold after self-review', async () => {
+    // medium threshold = 10; provide 5 files
+    const files5 = Array.from({ length: 5 }, (_, i) => `M src/file${i}.ts`).join('\n');
+    setupGitMocksWithPostReviewDiff(files5);
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ failure_category: 'scope_overflow' }),
+    );
+  });
+
+  it('blocks PR and reports scope_overflow when small task exceeds threshold after self-review', async () => {
+    // small threshold = 6; provide 7 files
+    const files7 = Array.from({ length: 7 }, (_, i) => `M src/file${i}.ts`).join('\n');
+    setupGitMocksWithPostReviewDiff(files7);
+    const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'scope_overflow' }),
+    );
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('does not block PR when task has no scope set', async () => {
+    const files11 = Array.from({ length: 11 }, (_, i) => `M src/file${i}.ts`).join('\n');
+    setupGitMocksWithPostReviewDiff(files11);
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ failure_category: 'scope_overflow' }),
+    );
+  });
+});

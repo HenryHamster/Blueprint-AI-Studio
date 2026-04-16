@@ -1578,6 +1578,8 @@ export function buildSelfReviewPrompt(opts: {
   reviewIssueDistribution?: Record<string, number>;
   taskScope?: string;
   scopeOverflowWarning?: string;
+  firstAttemptByCategory?: Record<string, number>;
+  persistentReviewIssues?: string[];
 }): string {
   const restrictionsSection = opts.claudeMd
     ? `\n## File Restrictions (from CLAUDE.md)\n${opts.claudeMd.slice(0, 500)}\n`
@@ -1591,6 +1593,21 @@ export function buildSelfReviewPrompt(opts: {
           .map(([cat, count]) => `${cat} (${Math.round(count * 100)}%)`)
           .join(', ');
         return `\n## Project-Specific Review Patterns\nIn this project, the most common review issues are: ${sorted}. Prioritize these checks.\n`;
+      })()
+    : '';
+
+  const firstAttemptSection = opts.firstAttemptByCategory && Object.keys(opts.firstAttemptByCategory).length > 0
+    ? (() => {
+        const persistent = new Set(opts.persistentReviewIssues ?? []);
+        const lines = Object.entries(opts.firstAttemptByCategory!)
+          .sort(([, a], [, b]) => b - a)
+          .map(([cat, rate]) => {
+            const pct = Math.round(rate * 100);
+            const tag = persistent.has(cat) ? ' [PERSISTENT]' : '';
+            return `- ${cat}: ${pct}% of first-attempt rejections${tag}`;
+          })
+          .join('\n');
+        return `\n## First-Attempt Rejection Priorities\nThese categories most often block first-attempt approval — weight your checks accordingly:\n${lines}\n`;
       })()
     : '';
 
@@ -1632,7 +1649,7 @@ export function buildSelfReviewPrompt(opts: {
   const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
 
   return `You are performing a self-review of the changes you just made for this task.
-${restrictionsSection}${issueDistSection}${playbookSection}${scopeOverflowSection}${diffSection}${buildVerificationSection}
+${restrictionsSection}${issueDistSection}${firstAttemptSection}${playbookSection}${scopeOverflowSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.

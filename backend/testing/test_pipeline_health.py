@@ -419,7 +419,7 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "pipeline_conversion_rate", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "medium_scope_review_iterations"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "pipeline_conversion_rate", "self_review_effectiveness", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "medium_scope_review_iterations"}
     assert "first_attempt_by_review_category" in result["first_attempt_success_rate"]
 
 
@@ -788,6 +788,195 @@ async def test_medium_scope_review_iterations_none_when_no_medium_tasks():
     result = await compute_pipeline_health_summary(session, project_id)
 
     assert result["medium_scope_review_iterations"] is None
+
+
+# ── Self-review effectiveness ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_self_review_effectiveness_none_when_fewer_than_3():
+    """self_review_effectiveness is None when fewer than 3 tasks have self-review outcomes."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}}, "_first_attempt_succeeded": True},
+            created_at=now - timedelta(hours=1),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}}, "_first_attempt_succeeded": True},
+            created_at=now - timedelta(hours=2),
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    assert result["self_review_effectiveness"] is None
+
+
+@pytest.mark.asyncio
+async def test_self_review_effectiveness_computes_approval_rates():
+    """self_review_effectiveness computes with_self_review vs without_self_review approval rates."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        # 3 tasks with self-review, all succeeded first-attempt
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}},
+                "_first_attempt_succeeded": True,
+            },
+            created_at=now - timedelta(hours=1),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}},
+                "_first_attempt_succeeded": True,
+            },
+            created_at=now - timedelta(hours=2),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {"verdict": "PASS", "fixes_applied": True, "check_results": {}},
+                "_first_attempt_succeeded": False,
+            },
+            created_at=now - timedelta(hours=3),
+        ),
+        # 2 tasks without self-review, 1 succeeded
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},
+            created_at=now - timedelta(hours=4),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": False},
+            created_at=now - timedelta(hours=5),
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    sre = result["self_review_effectiveness"]
+    assert sre is not None
+    assert sre["sample_size"] == 3
+    assert sre["with_self_review_approval_rate"] == round(2 / 3, 2)
+    assert sre["without_self_review_approval_rate"] == round(1 / 2, 2)
+    assert sre["clean_verdict_approval_rate"] == 1.0
+    assert sre["fixed_verdict_approval_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_self_review_effectiveness_category_correlation():
+    """category_correlation shows approval rates split by whether a category had findings."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        # category "style": flagged (passed=False), first-attempt failed
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "verdict": "PASS",
+                    "fixes_applied": True,
+                    "check_results": {"style": {"passed": False, "issue": "style problems"}},
+                },
+                "_first_attempt_succeeded": False,
+            },
+            created_at=now - timedelta(hours=1),
+        ),
+        # category "style": flagged (passed=False), first-attempt failed
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "verdict": "PASS",
+                    "fixes_applied": True,
+                    "check_results": {"style": {"passed": False}},
+                },
+                "_first_attempt_succeeded": False,
+            },
+            created_at=now - timedelta(hours=2),
+        ),
+        # category "style": clean (passed=True), first-attempt succeeded
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "verdict": "PASS",
+                    "fixes_applied": False,
+                    "check_results": {"style": {"passed": True}},
+                },
+                "_first_attempt_succeeded": True,
+            },
+            created_at=now - timedelta(hours=3),
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    sre = result["self_review_effectiveness"]
+    assert sre is not None
+    assert "style" in sre["category_correlation"]
+    style = sre["category_correlation"]["style"]
+    # 2 tasks with findings, both failed first-attempt → 0.0 approval rate
+    assert style["with_findings_approval_rate"] == 0.0
+    # 1 task clean, succeeded → 1.0 approval rate
+    assert style["clean_approval_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_self_review_effectiveness_none_when_no_first_attempt_data():
+    """Rates are None when tasks have self-review outcomes but lack _first_attempt_succeeded."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}}},
+            created_at=now - timedelta(hours=1),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}}},
+            created_at=now - timedelta(hours=2),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}}},
+            created_at=now - timedelta(hours=3),
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    sre = result["self_review_effectiveness"]
+    assert sre is not None
+    assert sre["sample_size"] == 3
+    # No _first_attempt_succeeded → rate is None
+    assert sre["with_self_review_approval_rate"] is None
+    assert sre["without_self_review_approval_rate"] is None
 
 
 # ── _compute_scope_baselines ─────────────────────────────────────────────────

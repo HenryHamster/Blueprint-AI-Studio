@@ -105,6 +105,78 @@ def _compute_scope_baselines(tasks: list, lookback_days: int) -> dict:
     }
 
 
+def _compute_scope_baselines(tasks: list, lookback_days: int) -> dict:
+    """Compute per-scope merge rate baselines from a pre-fetched list of terminal tasks.
+
+    Groups tasks by ISO-week (Monday-keyed) and scope (from context['scope']),
+    computing merge_rate = COMPLETED / total terminal per bucket.  Also returns
+    an overall summary per scope with trend derived from first-to-last week delta.
+    """
+    bucket: Dict[Tuple[str, str], Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0})
+
+    for t in tasks:
+        scope = (t.context or {}).get("scope", "unknown")
+        task_date = t.created_at.date() if t.created_at else None
+        if task_date is None:
+            continue
+        week_monday = task_date - timedelta(days=task_date.weekday())
+        week_key = week_monday.isoformat()
+        bucket[(week_key, scope)]["created"] += 1
+        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+            bucket[(week_key, scope)]["merged"] += 1
+
+    # Build time-series sorted by week then scope
+    series = []
+    for (week, scope), counts in sorted(bucket.items()):
+        created = counts["created"]
+        merged = counts["merged"]
+        merge_rate = round(merged / created, 3) if created > 0 else None
+        series.append({
+            "week": week,
+            "scope": scope,
+            "created": created,
+            "merged": merged,
+            "merge_rate": merge_rate,
+        })
+
+    # Build per-scope summary: overall rate + trend from first-to-last week
+    all_scopes: set = {scope for (_, scope) in bucket}
+    summary: Dict[str, Any] = {}
+    for scope in sorted(all_scopes):
+        total_created = sum(c["created"] for (_, sc), c in bucket.items() if sc == scope)
+        total_merged = sum(c["merged"] for (_, sc), c in bucket.items() if sc == scope)
+        overall_rate = round(total_merged / total_created, 3) if total_created > 0 else None
+
+        scope_weeks = sorted((wk, c) for (wk, sc), c in bucket.items() if sc == scope)
+        scope_trend: str | None = None
+        if len(scope_weeks) >= 2:
+            first_c = scope_weeks[0][1]
+            last_c = scope_weeks[-1][1]
+            first_rate = first_c["merged"] / first_c["created"] if first_c["created"] > 0 else None
+            last_rate = last_c["merged"] / last_c["created"] if last_c["created"] > 0 else None
+            if first_rate is not None and last_rate is not None:
+                delta = last_rate - first_rate
+                if delta > 0.05:
+                    scope_trend = "improving"
+                elif delta < -0.05:
+                    scope_trend = "declining"
+                else:
+                    scope_trend = "stable"
+
+        summary[scope] = {
+            "merge_rate": overall_rate,
+            "created": total_created,
+            "merged": total_merged,
+            "trend": scope_trend,
+        }
+
+    return {
+        "series": series,
+        "summary": summary,
+        "lookback_days": lookback_days,
+    }
+
+
 def _count_research_findings(logs: str | None) -> int:
     """Parse research findings artifact logs and return finding count."""
     if not logs:
@@ -657,6 +729,61 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "first_attempt_by_review_category": first_attempt_by_review_category,
     }
 
+    # Self-review effectiveness: correlate self-review verdicts with first-attempt approval outcomes
+    tasks_with_self_review = [
+        t for t in terminal_tasks_24h
+        if "_self_review_outcome" in (t.context or {})
+    ]
+    tasks_without_self_review = [
+        t for t in terminal_tasks_24h
+        if "_self_review_outcome" not in (t.context or {})
+    ]
+    tasks_self_review_clean = [
+        t for t in tasks_with_self_review
+        if not (t.context or {}).get("_self_review_outcome", {}).get("fixes_applied", False)
+    ]
+    tasks_self_review_fixed = [
+        t for t in tasks_with_self_review
+        if (t.context or {}).get("_self_review_outcome", {}).get("fixes_applied", False)
+    ]
+
+    self_review_effectiveness: Dict[str, Any] | None = None
+    if len(tasks_with_self_review) >= 3:
+        # Category-level correlation: for each check category, compare first-attempt rate
+        # between tasks where that category flagged issues vs tasks where it passed clean.
+        all_categories: set = set()
+        for t in tasks_with_self_review:
+            check_results = (t.context or {}).get("_self_review_outcome", {}).get("check_results") or {}
+            all_categories.update(check_results.keys())
+
+        category_correlation: Dict[str, Any] = {}
+        for cat in all_categories:
+            tasks_cat_findings = [
+                t for t in tasks_with_self_review
+                if not (t.context or {}).get("_self_review_outcome", {}).get("check_results", {}).get(cat, {}).get("passed", True)
+            ]
+            tasks_cat_clean = [
+                t for t in tasks_with_self_review
+                if cat in ((t.context or {}).get("_self_review_outcome", {}).get("check_results") or {})
+                and (t.context or {}).get("_self_review_outcome", {}).get("check_results", {}).get(cat, {}).get("passed", True)
+            ]
+            cat_findings_rate = _first_attempt_rate(tasks_cat_findings) if tasks_cat_findings else None
+            cat_clean_rate = _first_attempt_rate(tasks_cat_clean) if tasks_cat_clean else None
+            if cat_findings_rate is not None or cat_clean_rate is not None:
+                category_correlation[cat] = {
+                    "with_findings_approval_rate": cat_findings_rate,
+                    "clean_approval_rate": cat_clean_rate,
+                }
+
+        self_review_effectiveness = {
+            "with_self_review_approval_rate": _first_attempt_rate(tasks_with_self_review),
+            "without_self_review_approval_rate": _first_attempt_rate(tasks_without_self_review),
+            "clean_verdict_approval_rate": _first_attempt_rate(tasks_self_review_clean),
+            "fixed_verdict_approval_rate": _first_attempt_rate(tasks_self_review_fixed),
+            "sample_size": len(tasks_with_self_review),
+            "category_correlation": category_correlation,
+        }
+
     # Review accuracy: precision and recall from user feedback signals on completed review tasks
     review_tasks = [
         t for t in terminal_tasks_24h
@@ -718,6 +845,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "direction_stats": direction_stats,
         "first_attempt_success_rate": first_attempt_success_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
+        "self_review_effectiveness": self_review_effectiveness,
         "review_accuracy": review_accuracy,
         "persistent_review_issues": persistent_review_issues,
         "review_effectiveness_trends": review_effectiveness_trends,

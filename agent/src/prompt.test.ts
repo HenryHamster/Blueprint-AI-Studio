@@ -1209,6 +1209,70 @@ describe('buildSelfReviewPrompt', () => {
     const result = buildSelfReviewPrompt({ ...baseOpts, reviewIssueDistribution: {} });
     expect(result).not.toContain('## Project-Specific Review Patterns');
   });
+
+  it('renders first-attempt rejection priorities section when firstAttemptByCategory is provided', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      firstAttemptByCategory: { 'test-coverage': 0.45, 'type-safety': 0.30, 'error-handling': 0.15 },
+    });
+    expect(result).toContain('## First-Attempt Rejection Priorities');
+    expect(result).toContain('test-coverage: 45% of first-attempt rejections');
+    expect(result).toContain('type-safety: 30% of first-attempt rejections');
+    expect(result).toContain('error-handling: 15% of first-attempt rejections');
+  });
+
+  it('sorts first-attempt rejection priorities by rate descending', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      firstAttemptByCategory: { 'error-handling': 0.10, 'test-coverage': 0.45, 'type-safety': 0.25 },
+    });
+    const section = result.slice(result.indexOf('## First-Attempt Rejection Priorities'));
+    const testCoveragePos = section.indexOf('test-coverage');
+    const typeSafetyPos = section.indexOf('type-safety');
+    const errorHandlingPos = section.indexOf('error-handling');
+    expect(testCoveragePos).toBeLessThan(typeSafetyPos);
+    expect(typeSafetyPos).toBeLessThan(errorHandlingPos);
+  });
+
+  it('marks persistent issues with [PERSISTENT] tag', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      firstAttemptByCategory: { 'test-coverage': 0.45, 'type-safety': 0.20 },
+      persistentReviewIssues: ['test-coverage'],
+    });
+    expect(result).toContain('test-coverage: 45% of first-attempt rejections [PERSISTENT]');
+    expect(result).not.toContain('type-safety: 20% of first-attempt rejections [PERSISTENT]');
+  });
+
+  it('omits [PERSISTENT] tag when persistentReviewIssues is not provided', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      firstAttemptByCategory: { 'test-coverage': 0.45 },
+    });
+    expect(result).not.toContain('[PERSISTENT]');
+  });
+
+  it('omits first-attempt rejection priorities when firstAttemptByCategory is undefined', () => {
+    const result = buildSelfReviewPrompt(baseOpts);
+    expect(result).not.toContain('## First-Attempt Rejection Priorities');
+  });
+
+  it('omits first-attempt rejection priorities when firstAttemptByCategory is empty', () => {
+    const result = buildSelfReviewPrompt({ ...baseOpts, firstAttemptByCategory: {} });
+    expect(result).not.toContain('## First-Attempt Rejection Priorities');
+  });
+
+  it('positions first-attempt rejection priorities after project-specific review patterns', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      reviewIssueDistribution: { 'test-coverage': 0.35 },
+      firstAttemptByCategory: { 'test-coverage': 0.45 },
+    });
+    const issueDistPos = result.indexOf('## Project-Specific Review Patterns');
+    const firstAttemptPos = result.indexOf('## First-Attempt Rejection Priorities');
+    expect(issueDistPos).toBeGreaterThan(-1);
+    expect(firstAttemptPos).toBeGreaterThan(issueDistPos);
+  });
 });
 
 // ── buildSelfReviewChecklist (via buildSelfReviewPrompt) ─────────────────────
