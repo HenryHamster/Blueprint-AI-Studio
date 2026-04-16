@@ -82,7 +82,7 @@ async def db_session():
 
         # Clean up: delete test data in dependency order (avoids FK violations and ORM event triggers)
         async with engine.begin() as conn:
-            for table in ("artifact", "taskhistory", "alert", "task", "projectmember", "project", "maxplanaccount", "userintegration", "alloweduser"):
+            for table in ("artifact", "taskhistory", "alert", "orchestratorerrorack", "task", "projectmember", "project", "maxplanaccount", "userintegration", "alloweduser"):
                 await conn.execute(sqlalchemy.text(f"DELETE FROM {table}"))
             # Reset deploymentstate to empty (singleton, don't delete)
             await conn.execute(sqlalchemy.text("DELETE FROM deploymentstate"))

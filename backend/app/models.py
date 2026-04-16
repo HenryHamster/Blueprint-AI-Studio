@@ -252,6 +252,17 @@ class Alert(SQLModel, table=True):
     dismissed_at: Optional[datetime] = None
 
 
+class OrchestratorErrorAck(SQLModel, table=True):
+    """Persistent acknowledgement of an orchestrator error bucket.
+
+    key is "exception_class|source" for a specific bucket, or "*" for a
+    global ack covering every bucket whose last_seen_iso <= acknowledged_at.
+    """
+    key: str = Field(primary_key=True)
+    acknowledged_at: datetime = Field(default_factory=_utcnow)
+    acknowledged_by: str = Field(default="")
+
+
 class MessageType(str, Enum):
     QUESTION = "QUESTION"
     FEEDBACK = "FEEDBACK"

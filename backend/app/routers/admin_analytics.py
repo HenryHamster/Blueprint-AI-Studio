@@ -17,7 +17,8 @@ from sqlmodel import select
 
 from app.database import get_session
 from app.models import (
-    Task, TaskStatus, Project, Artifact, ArtifactType, DeploymentState, DeploymentStatus, _utcnow
+    Task, TaskStatus, Project, Artifact, ArtifactType, DeploymentState, DeploymentStatus,
+    OrchestratorErrorAck, _utcnow,
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _user_project_ids
@@ -2284,9 +2285,9 @@ ORCHESTRATOR_ERRORS_CACHE_TTL_SECONDS = 60
 ORCHESTRATOR_SERVICE_NAME = os.getenv("ORCHESTRATOR_SERVICE_NAME", "blueprint-orchestrator")
 _orchestrator_errors_cache: Dict[Tuple[int, int], Tuple[float, Dict[str, Any]]] = {}
 
-# Acknowledged error buckets: "exception_class|source" -> ISO timestamp.
-# Buckets whose last_seen_iso <= acknowledged_at are filtered from responses.
-_acknowledged_errors: Dict[str, str] = {}
+# Acknowledged error buckets are persisted in the OrchestratorErrorAck table.
+# Key is "exception_class|source" for a specific bucket, or "*" for a global ack.
+# Buckets whose last_seen <= acknowledged_at are filtered from responses.
 
 _EXCEPTION_LINE_RE = re.compile(
     r"^(?P<cls>(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning|Timeout|NotFound|Denied|Conflict))(?::|\b)",
@@ -2459,41 +2460,73 @@ def _fetch_orchestrator_error_entries(hours: int) -> List[Any]:
     return collected
 
 
-def _filter_acknowledged_buckets(buckets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Remove buckets whose last_seen_iso is at or before the acknowledged timestamp."""
-    if not _acknowledged_errors:
+def _parse_bucket_last_seen(last_seen_iso: str) -> Optional[datetime]:
+    """Parse a bucket's last_seen_iso string into a naive UTC datetime for ack comparison."""
+    try:
+        dt = datetime.fromisoformat(last_seen_iso)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _filter_acknowledged_buckets(
+    buckets: List[Dict[str, Any]],
+    acks: Dict[str, datetime],
+) -> List[Dict[str, Any]]:
+    """Remove buckets whose last_seen is at or before the acknowledged timestamp."""
+    if not acks:
         return buckets
-    global_ack = _acknowledged_errors.get("*")
+    global_ack = acks.get("*")
     filtered = []
     for b in buckets:
-        last_seen = b["last_seen_iso"]
-        # Check per-bucket acknowledgment
+        last_seen = _parse_bucket_last_seen(b["last_seen_iso"])
+        if last_seen is None:
+            filtered.append(b)
+            continue
         key = f"{b['exception_class']}|{b['source']}"
-        ack_ts = _acknowledged_errors.get(key)
+        ack_ts = acks.get(key)
         if ack_ts and last_seen <= ack_ts:
             continue
-        # Check global acknowledgment
         if global_ack and last_seen <= global_ack:
             continue
         filtered.append(b)
     return filtered
 
 
+async def _load_acknowledgements(session: AsyncSession) -> Dict[str, datetime]:
+    """Return all persisted error-bucket acknowledgements as a key→datetime map."""
+    result = await session.execute(select(OrchestratorErrorAck))
+    return {row.key: row.acknowledged_at for row in result.scalars().all()}
+
+
+async def _upsert_ack(session: AsyncSession, key: str, when: datetime, by: str) -> None:
+    existing = await session.get(OrchestratorErrorAck, key)
+    if existing is None:
+        session.add(OrchestratorErrorAck(key=key, acknowledged_at=when, acknowledged_by=by))
+    else:
+        existing.acknowledged_at = when
+        existing.acknowledged_by = by
+
+
 @router.get("/recent-orchestrator-errors")
 async def get_recent_orchestrator_errors(
     hours: int = Query(default=1, ge=1, le=24),
     limit: int = Query(default=20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
     """Aggregate ERROR-severity logs from Cloud Logging for the orchestrator service."""
+    acks = await _load_acknowledgements(session)
     cache_key = (hours, limit)
     now = time.time()
     cached = _orchestrator_errors_cache.get(cache_key)
     if cached is not None and (now - cached[0]) < ORCHESTRATOR_ERRORS_CACHE_TTL_SECONDS:
-        # Still apply acknowledgment filter on cached data
         cached_payload = cached[1]
-        visible = _filter_acknowledged_buckets(cached_payload.get("buckets", []))
-        return {**cached_payload, "buckets": visible, "acknowledged_count": len(cached_payload.get("buckets", [])) - len(visible)}
+        cached_buckets = cached_payload.get("buckets", [])
+        visible = _filter_acknowledged_buckets(cached_buckets, acks)
+        return {**cached_payload, "buckets": visible, "acknowledged_count": len(cached_buckets) - len(visible)}
 
     try:
         entries = _fetch_orchestrator_error_entries(hours)
@@ -2509,14 +2542,13 @@ async def get_recent_orchestrator_errors(
         return payload
 
     all_buckets = _bucket_log_entries(entries, limit)
-    # Cache the full (unfiltered) set; filter on read
     _orchestrator_errors_cache[cache_key] = (now, {
         "buckets": all_buckets,
         "hours": hours,
         "total_entries_scanned": len(entries),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     })
-    visible = _filter_acknowledged_buckets(all_buckets)
+    visible = _filter_acknowledged_buckets(all_buckets, acks)
     return {
         "buckets": visible,
         "hours": hours,
@@ -2530,43 +2562,54 @@ async def get_recent_orchestrator_errors(
 async def acknowledge_orchestrator_error(
     exception_class: str = Query(...),
     source: str = Query(...),
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
     """Acknowledge a specific orchestrator error bucket so it's hidden until new occurrences arrive."""
     key = f"{exception_class}|{source}"
-    _acknowledged_errors[key] = datetime.now(timezone.utc).isoformat()
     user_email = current_user.get("email", current_user.get("sub", "unknown"))
+    await _upsert_ack(session, key, _utcnow(), user_email)
+    await session.commit()
     logger.info(f"[ADMIN] Orchestrator error acknowledged: {key} by {user_email}")
     return {"status": "acknowledged", "key": key}
 
 
 @router.post("/orchestrator-errors/acknowledge-all")
 async def acknowledge_all_orchestrator_errors(
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
     """Acknowledge all current orchestrator error buckets."""
-    now_iso = datetime.now(timezone.utc).isoformat()
-    acknowledged_keys = []
+    now_dt = _utcnow()
+    user_email = current_user.get("email", current_user.get("sub", "unknown"))
+    acknowledged_keys: List[str] = []
+    seen: set[str] = set()
     for _cached_ts, cached_payload in _orchestrator_errors_cache.values():
         for b in cached_payload.get("buckets", []):
             key = f"{b['exception_class']}|{b['source']}"
-            _acknowledged_errors[key] = now_iso
+            if key in seen:
+                continue
+            seen.add(key)
+            await _upsert_ack(session, key, now_dt, user_email)
             acknowledged_keys.append(key)
     # If cache is empty but caller wants to ack everything, set a global marker
     if not acknowledged_keys:
-        _acknowledged_errors["*"] = now_iso
-    user_email = current_user.get("email", current_user.get("sub", "unknown"))
+        await _upsert_ack(session, "*", now_dt, user_email)
+    await session.commit()
     logger.info(f"[ADMIN] All orchestrator errors acknowledged ({len(acknowledged_keys)} buckets) by {user_email}")
     return {"status": "acknowledged", "count": len(acknowledged_keys)}
 
 
 @router.delete("/orchestrator-errors/acknowledged")
 async def clear_acknowledged_orchestrator_errors(
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
     """Clear all acknowledgments so previously hidden errors reappear."""
-    count = len(_acknowledged_errors)
-    _acknowledged_errors.clear()
+    from sqlalchemy import delete as sa_delete
+    result = await session.execute(sa_delete(OrchestratorErrorAck))
+    await session.commit()
+    count = result.rowcount or 0
     return {"status": "cleared", "count": count}
 
 
