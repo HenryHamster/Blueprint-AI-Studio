@@ -1842,7 +1842,7 @@ async def get_open_prs(
             "pr_branch": (gh_pr.get("head") or {}).get("ref", ""),
             "pr_created_at": gh_pr.get("created_at"),
             "task_id": str(task.id) if task else None,
-            "task_status": task.status.value if task else None,
+            "task_status": task.status if task else None,
             "task_type": task.first_payload.get("type", "create") if task else None,
             "task_title": task.title if task else None,
             "is_orphaned": is_orphaned,
