@@ -21,6 +21,92 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
+async def _build_shipped_changes_manifest(
+    project: Project, session: AsyncSession
+) -> list[dict]:
+    """Build a manifest of merged tasks since the last architecture review.
+
+    Uses design_doc._meta.last_updated as the cutoff, falling back to the
+    most recent phase1_completed_at from vision._strategic_cycle_history.
+    Returns a list of direction-grouped dicts, capped at 50 merged tasks.
+    """
+    # Determine cutoff timestamp
+    cutoff: Optional[datetime] = None
+    last_updated = (project.design_doc or {}).get("_meta", {}).get("last_updated")
+    if last_updated:
+        try:
+            cutoff = datetime.fromisoformat(last_updated).replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            pass
+
+    if cutoff is None:
+        cycle_history = (project.vision or {}).get("_strategic_cycle_history") or []
+        for entry in reversed(cycle_history):
+            phase1_ts = entry.get("phase1_completed_at")
+            if phase1_ts:
+                try:
+                    cutoff = datetime.fromisoformat(phase1_ts).replace(tzinfo=timezone.utc)
+                    break
+                except (ValueError, TypeError):
+                    pass
+
+    # Query completed tasks updated after cutoff (filter pr_merged in Python)
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project.id,
+            Task.status == TaskStatus.COMPLETED,
+        )
+        .order_by(Task.updated_at.desc())
+        .limit(200)
+    )
+    if cutoff is not None:
+        stmt = stmt.where(Task.updated_at > cutoff)
+
+    result = await session.execute(stmt)
+    completed_tasks = result.scalars().all()
+
+    # Filter to merged tasks and collect manifest entries (cap at 50)
+    manifest_entries: list[dict] = []
+    for t in completed_tasks:
+        ctx = t.context or {}
+        if not ctx.get("pr_merged"):
+            continue
+        entry: dict = {
+            "title": t.title,
+            "direction_id": ctx.get("direction_id"),
+            "changed_files": ctx.get("_pr_changed_files") or [],
+            "scope": t.first_payload.get("scope"),
+        }
+        manifest_entries.append(entry)
+        if len(manifest_entries) >= 50:
+            break
+
+    if not manifest_entries:
+        return []
+
+    # Group by direction_id
+    by_direction: dict[str, dict] = {}
+    for entry in manifest_entries:
+        dir_id = entry["direction_id"] or "unassigned"
+        if dir_id not in by_direction:
+            by_direction[dir_id] = {
+                "direction_id": entry["direction_id"],
+                "tasks": [],
+                "all_changed_files": [],
+            }
+        by_direction[dir_id]["tasks"].append({
+            "title": entry["title"],
+            "scope": entry["scope"],
+            "changed_files": entry["changed_files"],
+        })
+        for f in entry["changed_files"]:
+            if f not in by_direction[dir_id]["all_changed_files"]:
+                by_direction[dir_id]["all_changed_files"].append(f)
+
+    return list(by_direction.values())
+
+
 async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> bool:
     """Spawn a design doc update task (Phase 1 of strategic cycle).
 
@@ -53,6 +139,9 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         for m in open_msgs_result.scalars().all()
     ]
 
+    # Build shipped_changes_manifest: tasks merged since the last arch review
+    shipped_changes_manifest = await _build_shipped_changes_manifest(project, session)
+
     payload: dict = validate_internal_payload({
         "type": "design_doc_update",
         "design_doc": project.design_doc or {},
@@ -60,6 +149,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         "project_name": project.name,
         "vision": project.vision or {},
         "open_messages": open_msgs,
+        "shipped_changes_manifest": shipped_changes_manifest,
         "base_branch": "main",
         **({"model": doc_model} if doc_model else {}),
         **({"effort": doc_effort} if doc_effort else {}),

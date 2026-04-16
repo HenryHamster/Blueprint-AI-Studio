@@ -587,6 +587,77 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
+    """Setting systems/* keys rebuilds _file_to_system reverse index; index hidden from list."""
+    project = Project(name="Design Doc Index Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-ddi-test",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-ddi-test", task_type="design_doc_update")
+    headers = {"x-agent-token": token}
+
+    # Set first system
+    resp = await client.post("/api/agent/design-doc", json={
+        "task_id": str(task.id),
+        "op": "set",
+        "key": "systems/auth",
+        "value": {"name": "Auth", "modules": ["backend/app/auth.py", "backend/app/models.py"]},
+    }, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(project)
+    idx = project.design_doc["_file_to_system"]
+    assert idx["backend/app/auth.py"] == "auth"
+    assert idx["backend/app/models.py"] == "auth"
+
+    # Set second system — index should include files from both systems
+    resp2 = await client.post("/api/agent/design-doc", json={
+        "task_id": str(task.id),
+        "op": "set",
+        "key": "systems/database",
+        "value": {"name": "Database", "modules": ["backend/app/db.py", "backend/app/models.py"]},
+    }, headers=headers)
+    assert resp2.status_code == 200
+
+    await db_session.refresh(project)
+    idx = project.design_doc["_file_to_system"]
+    assert idx["backend/app/auth.py"] == "auth"
+    assert idx["backend/app/db.py"] == "database"
+    # last-write-wins for shared file: database set second
+    assert idx["backend/app/models.py"] == "database"
+
+    # _file_to_system must NOT appear in list
+    resp3 = await client.post("/api/agent/design-doc", json={
+        "task_id": str(task.id), "op": "list",
+    }, headers=headers)
+    assert resp3.status_code == 200
+    assert "_file_to_system" not in resp3.json()["keys"]
+
+    # Delete a system — index should no longer contain its files
+    resp4 = await client.post("/api/agent/design-doc", json={
+        "task_id": str(task.id), "op": "delete", "key": "systems/auth",
+    }, headers=headers)
+    assert resp4.status_code == 200
+
+    await db_session.refresh(project)
+    idx = project.design_doc["_file_to_system"]
+    assert "backend/app/auth.py" not in idx
+    assert idx["backend/app/db.py"] == "database"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_playbook_size_limits(client: AsyncClient, db_session):
     """Tests that per-entry 2KB and total 30KB size limits are enforced."""
     project = Project(name="Playbook Size Test", user_id="test-user-123")

@@ -1362,8 +1362,28 @@ async def update_design_doc(
         if total_size > 500_000:
             del doc[key]  # rollback
             raise HTTPException(status_code=400, detail=f"Total design doc too large ({total_size} bytes, max 500KB)")
+        # Rebuild file-to-system reverse index atomically when a systems/* key is set
+        if key.startswith("systems/"):
+            file_to_system: dict = {}
+            for doc_key, doc_val in doc.items():
+                if doc_key.startswith("systems/") and isinstance(doc_val, dict):
+                    sys_id = doc_key[len("systems/"):]
+                    for fpath in doc_val.get("modules", []):
+                        if isinstance(fpath, str):
+                            file_to_system[fpath] = sys_id
+            doc["_file_to_system"] = file_to_system
     elif payload.op == "delete":
         doc.pop(key, None)
+        # Rebuild reverse index if a systems/* key is deleted to remove stale entries
+        if key.startswith("systems/"):
+            file_to_system: dict = {}
+            for doc_key, doc_val in doc.items():
+                if doc_key.startswith("systems/") and isinstance(doc_val, dict):
+                    sys_id = doc_key[len("systems/"):]
+                    for fpath in doc_val.get("modules", []):
+                        if isinstance(fpath, str):
+                            file_to_system[fpath] = sys_id
+            doc["_file_to_system"] = file_to_system
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
 

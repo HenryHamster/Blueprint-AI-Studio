@@ -6,7 +6,11 @@ Covers:
   - strategic_failures >= 3 blocks force_strategic (without auto-decay)
   - operator_rejection_rate calculation in _spawn_strategic_review direction stats
   - Active-task guard: _spawn_design_doc_update and _spawn_strategic_review return False when blocked
+  - _build_shipped_changes_manifest: cutoff, filtering, grouping, cap
 """
+import uuid
+from datetime import datetime, timezone, timedelta
+
 import pytest
 from unittest.mock import AsyncMock
 from sqlalchemy import select
@@ -14,7 +18,7 @@ from sqlalchemy import select
 import app.shared_state as _shared_state
 from app.models import Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
-from app.strategic_spawning import _spawn_design_doc_update, _spawn_strategic_review
+from app.strategic_spawning import _spawn_design_doc_update, _spawn_strategic_review, _build_shipped_changes_manifest
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -627,3 +631,183 @@ async def test_spawn_strategic_review_task_context_includes_cycle_id(db_session,
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     assert tasks[0].context.get("strategic_cycle_id") == cycle_id
+
+
+# ── _build_shipped_changes_manifest ──────────────────────────────────────────
+
+def _make_merged_task(project_id, title="Fix bug", direction_id="d-001", changed_files=None, scope="small"):
+    """Create a COMPLETED task with pr_merged=True context."""
+    return Task(
+        project_id=project_id,
+        title=title,
+        description="test",
+        payloads=[{"type": "create", "scope": scope}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "direction_id": direction_id,
+            "_pr_changed_files": changed_files or ["backend/app/foo.py"],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_shipped_manifest_empty_when_no_merged_tasks(db_session):
+    """Returns empty list when there are no completed tasks with pr_merged=True."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Add a COMPLETED task without pr_merged
+    task = Task(
+        project_id=project.id,
+        title="No merge",
+        description="test",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": False},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    manifest = await _build_shipped_changes_manifest(project, db_session)
+    assert manifest == []
+
+
+@pytest.mark.asyncio
+async def test_build_shipped_manifest_groups_by_direction(db_session):
+    """Tasks are grouped by direction_id; all_changed_files is deduplicated."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_merged_task(project.id, "Task A", direction_id="d-001", changed_files=["a.py"]))
+    db_session.add(_make_merged_task(project.id, "Task B", direction_id="d-001", changed_files=["a.py", "b.py"]))
+    db_session.add(_make_merged_task(project.id, "Task C", direction_id="d-002", changed_files=["c.py"]))
+    await db_session.commit()
+
+    manifest = await _build_shipped_changes_manifest(project, db_session)
+
+    assert len(manifest) == 2
+    by_dir = {g["direction_id"]: g for g in manifest}
+    assert "d-001" in by_dir
+    assert "d-002" in by_dir
+    assert len(by_dir["d-001"]["tasks"]) == 2
+    assert len(by_dir["d-002"]["tasks"]) == 1
+    # Deduplication: a.py appears twice in d-001 but should appear once
+    assert by_dir["d-001"]["all_changed_files"].count("a.py") == 1
+    assert "b.py" in by_dir["d-001"]["all_changed_files"]
+
+
+@pytest.mark.asyncio
+async def test_build_shipped_manifest_excludes_non_merged(db_session):
+    """Tasks without pr_merged=True are excluded even if COMPLETED."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_merged_task(project.id, "Merged task", direction_id="d-001"))
+    # Non-merged completed task
+    non_merged = Task(
+        project_id=project.id,
+        title="Unmerged task",
+        description="test",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": False, "direction_id": "d-001"},
+    )
+    db_session.add(non_merged)
+    await db_session.commit()
+
+    manifest = await _build_shipped_changes_manifest(project, db_session)
+
+    assert len(manifest) == 1
+    assert len(manifest[0]["tasks"]) == 1
+    assert manifest[0]["tasks"][0]["title"] == "Merged task"
+
+
+@pytest.mark.asyncio
+async def test_build_shipped_manifest_unassigned_direction(db_session):
+    """Tasks with no direction_id are grouped under 'unassigned' direction_id=None."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Orphan task",
+        description="test",
+        payloads=[{"type": "create", "scope": "medium"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "_pr_changed_files": ["x.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    manifest = await _build_shipped_changes_manifest(project, db_session)
+
+    assert len(manifest) == 1
+    assert manifest[0]["direction_id"] is None  # grouped with None key
+
+
+@pytest.mark.asyncio
+async def test_build_shipped_manifest_cutoff_from_design_doc(db_session):
+    """Tasks completed before design_doc._meta.last_updated are excluded."""
+    project = _make_project(
+        vision={"purpose": "test"},
+        design_doc={
+            "_meta": {
+                # Future cutoff — excludes all current tasks
+                "last_updated": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_merged_task(project.id, "Old merged task", direction_id="d-001"))
+    await db_session.commit()
+
+    manifest = await _build_shipped_changes_manifest(project, db_session)
+    # All tasks have updated_at now (before the future cutoff), so they're excluded
+    assert manifest == []
+
+
+@pytest.mark.asyncio
+async def test_build_shipped_manifest_cutoff_from_cycle_history(db_session):
+    """Falls back to _strategic_cycle_history phase1_completed_at when design_doc has no timestamp."""
+    project = _make_project(
+        vision={
+            "purpose": "test",
+            "_strategic_cycle_history": [
+                {
+                    "cycle_id": "sc-old",
+                    # Future cutoff in cycle history
+                    "phase1_completed_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+                }
+            ],
+        },
+        design_doc={"_meta": {}},  # No last_updated
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_merged_task(project.id, "Excluded task", direction_id="d-001"))
+    await db_session.commit()
+
+    manifest = await _build_shipped_changes_manifest(project, db_session)
+    assert manifest == []

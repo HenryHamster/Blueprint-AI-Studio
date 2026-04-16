@@ -179,6 +179,7 @@ class DesignDocUpdatePayload(_SystemPopulated):
     open_messages: Optional[list[dict[str, Any]]] = None
     project_name: Optional[str] = None
     proposed_changes: Optional[list[dict[str, Any]]] = None
+    shipped_changes_manifest: Optional[list[dict[str, Any]]] = None
 
 
 class SecurityAuditPayload(_SystemPopulated):

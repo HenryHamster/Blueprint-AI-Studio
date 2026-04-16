@@ -77,6 +77,29 @@ export async function handleDesignDocUpdate(
       }).join('\n')
     : '';
 
+  // Shipped changes manifest — tasks merged since last architecture review
+  const shippedManifest = Array.isArray(payload.shipped_changes_manifest)
+    ? payload.shipped_changes_manifest as Array<Record<string, unknown>>
+    : [];
+  let shippedManifestSection = '';
+  if (shippedManifest.length > 0) {
+    const lines: string[] = [];
+    for (const group of shippedManifest) {
+      const dirId = group.direction_id ? strVal(group.direction_id as string) : 'unassigned';
+      const tasks = Array.isArray(group.tasks) ? group.tasks as Array<Record<string, unknown>> : [];
+      const files = Array.isArray(group.all_changed_files) ? group.all_changed_files as string[] : [];
+      lines.push(`### Direction: ${dirId} (${tasks.length} task${tasks.length !== 1 ? 's' : ''} merged)`);
+      for (const t of tasks) {
+        const scope = t.scope ? ` [${strVal(t.scope as string)}]` : '';
+        lines.push(`  - ${strVal(t.title as string)}${scope}`);
+      }
+      if (files.length > 0) {
+        lines.push(`  Changed files: ${files.slice(0, 20).join(', ')}${files.length > 20 ? ` (+${files.length - 20} more)` : ''}`);
+      }
+    }
+    shippedManifestSection = `## Recently Shipped Changes (since last architecture review)\n${lines.join('\n')}\n`;
+  }
+
   // Write the design-doc helper script that the inner agent can call via bash.
   // The script reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (passed by runClaudeCode)
   // so the token is never written to disk.
@@ -170,13 +193,16 @@ Do NOT create files in the repo. Do NOT commit or push. Only use ./design-doc.
 ## Current pages
 ${existingPagesText}
 ${visionSection}
-${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}
-## Codebase
+${openMessagesText ? `## Open Messages\n${openMessagesText}\n` : ''}${shippedManifestSection ? `${shippedManifestSection}\n` : ''}## Codebase
 ${codebaseSummary}${fileTreeSection}
 
 # What to do
 
-1. Explore the codebase THOROUGHLY — use subagents for parallel exploration.
+${shippedManifest.length > 0 ? `This is an INCREMENTAL update — do NOT re-survey the entire codebase from scratch.
+Focus your analysis on systems touched by recently shipped changes (listed above).
+Skip full re-analysis of systems with no files in the manifest.
+
+` : ''}1. ${shippedManifest.length > 0 ? 'Focus exploration on files listed in the Recently Shipped Changes manifest. Use subagents to read those files in parallel.' : 'Explore the codebase THOROUGHLY — use subagents for parallel exploration.'}
 2. For each system you find: \`./design-doc set "systems/<id>" '{...}'\`
    Status: mature | functional | partial | stub | missing
 3. For capabilities: \`./design-doc set "capabilities/<name>" '{...}'\`
@@ -190,7 +216,7 @@ ${codebaseSummary}${fileTreeSection}
    This helps the strategic agent avoid proposing features on shaky foundations.
 9. If open messages mention architecture or systems, incorporate those observations into the relevant pages.
    Do NOT resolve messages — the strategic review agent handles message responses and resolution.
-9. Review playbook entries (run: ./playbook get) — remove outdated entries, merge duplicates,
+10. Review playbook entries (run: ./playbook get) — remove outdated entries, merge duplicates,
    and validate that entries reflect the current codebase state. Use ./playbook delete <key>
    for stale entries.`;
 
