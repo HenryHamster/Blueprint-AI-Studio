@@ -1375,9 +1375,14 @@ export function getMandatoryChecks(taskScope?: string): string[] {
 
 function buildSelfReviewChecklist(taskScope?: string): string {
   if (taskScope === 'small') {
-    return `Check for:
-1. **Correctness** — Off-by-one errors, null/undefined handling, edge cases in the changed logic?
-2. **Missing test coverage** — Is there new behavior with no corresponding test?`;
+    return `Severity guide: CRITICAL = data loss / security breach / crash; MAJOR = incorrect behavior / missing coverage; MINOR = style / naming (skip).
+
+Check for:
+1. **Correctness** (MAJOR/CRITICAL) — Off-by-one errors, null/undefined handling, edge cases in the changed logic?
+2. **Missing test coverage** (MAJOR) — Is there new behavior with no corresponding test?
+3. **Error handling** (MAJOR) — Are async operations properly awaited, exceptions caught where needed, null checks present?
+4. **Security quick-check** (CRITICAL) — Are any user inputs passed unsanitized to queries, commands, or HTML output?
+5. **Import and type verification** (MAJOR) — Are new imports available and type annotations correct?`;
   }
   if (taskScope === 'large') {
     return `Check for:

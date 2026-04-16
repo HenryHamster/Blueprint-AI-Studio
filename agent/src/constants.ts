@@ -43,7 +43,7 @@ export const TEST_RUNNER_TIMEOUT = 180_000;
 export const TEST_BASELINE_TIMEOUT = 60_000;
 
 // Self-review loop
-export const MAX_SELF_REVIEW_ATTEMPTS = 1;
+export const MAX_SELF_REVIEW_ATTEMPTS = 2;
 
 // Scope overflow detection — 2× the upper bound of each scope range
 export const SCOPE_OVERFLOW_THRESHOLDS: Record<string, number> = {

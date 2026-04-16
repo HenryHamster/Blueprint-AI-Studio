@@ -619,14 +619,15 @@ async def claim_task(
                         for entry in rev_hist:
                             if entry.get("iteration") != 0:
                                 continue
-                            desc = entry.get("description") or entry.get("issue") or ""
-                            cat = entry.get("category", "other")
-                            if not desc:
-                                continue
-                            normalized = desc.lower().strip()[:120]
-                            desc_counter[normalized] += 1
-                            if normalized not in desc_to_cat:
-                                desc_to_cat[normalized] = cat
+                            for issue in entry.get("issues", []):
+                                desc = issue.get("description") or ""
+                                cat = issue.get("category", "other")
+                                if not desc:
+                                    continue
+                                normalized = desc.lower().strip()[:120]
+                                desc_counter[normalized] += 1
+                                if normalized not in desc_to_cat:
+                                    desc_to_cat[normalized] = cat
                     recurring = [(desc, cnt) for desc, cnt in desc_counter.items() if cnt >= 2]
                     if recurring:
                         recurring.sort(key=lambda x: -x[1])

@@ -2788,3 +2788,62 @@ async def test_agent_status_failed_artifact_stores_diff_summary_and_test_failure
     ctx = task.context or {}
     assert ctx.get("_pr_diff_summary") == diff_summary
     assert ctx.get("_test_failure_summary") == test_failure_summary
+
+
+@pytest.mark.asyncio
+async def test_claim_top_first_review_issues_populated(client: AsyncClient, db_session):
+    """top_first_review_issues is populated when review_history contains issues with descriptions at iteration 0."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Top Review Issues Test", user_id="test-user-tri")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create two completed tasks with review_history entries that have issues at iteration 0
+    common_issue = "Missing test coverage for the new function"
+    for i in range(2):
+        ht = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": f"Some task {i}"}],
+            vm_instance_id=f"agent-vm-tri-{i}",
+            status=TaskStatus.COMPLETED,
+            context={
+                "review_loop": {
+                    "iteration": 2,
+                    "review_history": [
+                        {
+                            "iteration": 0,
+                            "feedback": "Needs work",
+                            "issues": [
+                                {"severity": "high", "description": common_issue, "file": "app/foo.py", "line": 10},
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+        flag_modified(ht, "context")
+        db_session.add(ht)
+    await db_session.commit()
+
+    # Create the task to claim
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "New feature"}],
+        vm_instance_id="agent-vm-tri-claim",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-tri-claim")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    project_ctx = resp.json().get("project_context", {})
+    top_issues = project_ctx.get("top_first_review_issues")
+    assert top_issues is not None, "top_first_review_issues should be populated"
+    assert len(top_issues) >= 1
+    descriptions = [issue["description"] for issue in top_issues]
+    assert common_issue.lower()[:120] in descriptions
