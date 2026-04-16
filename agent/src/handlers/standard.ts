@@ -9,12 +9,56 @@ import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
-  buildSelfReviewPrompt,
+  buildSelfReviewPrompt, extractModuleInterfaces,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { MAX_SELF_REVIEW_ATTEMPTS, SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
+
+/**
+ * Returns per-file diff statistics (additions, deletions, change type) for
+ * all files changed between baseCommit and HEAD.  Returns [] if the commits
+ * are identical or git commands fail.
+ */
+function computeFileDiffSummary(
+  baseCommit: string,
+  currentHead: string,
+): Array<{ file: string; additions: number; deletions: number; change_type: string }> {
+  if (baseCommit === currentHead) return [];
+  try {
+    const numstat = git(['diff', '--numstat', `${baseCommit}..HEAD`]);
+    const nameStatus = git(['diff', '--name-status', `${baseCommit}..HEAD`]);
+
+    const changeTypes: Record<string, string> = {};
+    for (const line of nameStatus.split('\n').filter(Boolean)) {
+      const parts = line.split('\t');
+      if (parts.length >= 2) {
+        const typeChar = parts[0][0];
+        const file = parts[parts.length - 1];
+        changeTypes[file] =
+          typeChar === 'A' ? 'added' :
+          typeChar === 'D' ? 'deleted' :
+          typeChar === 'R' ? 'renamed' : 'modified';
+      }
+    }
+
+    const result: Array<{ file: string; additions: number; deletions: number; change_type: string }> = [];
+    for (const line of numstat.split('\n').filter(Boolean)) {
+      const parts = line.split('\t');
+      if (parts.length === 3) {
+        const additions = parts[0] === '-' ? 0 : (parseInt(parts[0], 10) || 0);
+        const deletions = parts[1] === '-' ? 0 : (parseInt(parts[1], 10) || 0);
+        const file = parts[2];
+        result.push({ file, additions, deletions, change_type: changeTypes[file] || 'modified' });
+      }
+    }
+    return result.slice(0, 50);
+  } catch {
+    return [];
+  }
+}
+
 export interface StandardHandlerOpts {
   taskId: string;
   payload: Record<string, unknown>;
@@ -129,6 +173,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       ? git(['diff', '--name-only', `${baseCommit}..HEAD`]).split('\n').filter(Boolean)
       : [];
     const changedPaths = [...new Set([...uncommittedPaths, ...committedPaths])];
+    const diffSummary = computeFileDiffSummary(baseCommit, currentHead);
 
     // ── Scope overflow detection ───────────────────────────────────────────────
     const taskScope = strVal((task.context as Record<string, unknown> | undefined)?.scope);
@@ -139,7 +184,6 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     if (scopeOverflowWarning) {
       sendLog(ws, `\nWARNING: Scope overflow detected — ${changedPaths.length} files changed for a "${taskScope}" task (threshold: ${overflowThreshold}).\n`);
     }
-
     if (runLintFix) {
       const lintPassed = await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
       if (!lintPassed && failOnTestFailure) {
@@ -148,6 +192,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
           logs: `Lint/build checks failed after max fix attempts. See logs above for details.`,
           failure_category: 'lint_failed',
+          changed_files: changedPaths.slice(0, 50),
+          ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
         });
         return;
       }
@@ -172,6 +218,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
         logs: failedLogs,
         failure_category: 'test_failed',
+        changed_files: changedPaths.slice(0, 50),
+        ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+        ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
       });
       return;
     }
@@ -339,8 +388,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
       commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
       changed_files: changedPaths.slice(0, 50),
+      ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
       ...(selfReviewOutcome ? { self_review_outcome: selfReviewOutcome } : {}),
-      ...(testFailureSummary ? { test_failure_summary: testFailureSummary } : {}),
+      ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
     });
   } else if (exitCode === 0) {
     await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: noChangesMessage });
@@ -394,6 +444,9 @@ export async function handleCreate(
 
   const createScope = taskCtx?.scope as string | undefined;
   const isMediumOrLargeScope = createScope === 'medium' || createScope === 'large';
+  const moduleInterfaceContext = isMediumOrLargeScope
+    ? extractModuleInterfaces(ws, relatedFiles)
+    : '';
   const mediumScopePlanningNote = isMediumOrLargeScope
     ? '\n\n## Pre-Execution Planning\n\nBefore writing any code: (1) Identify which files need to change and why. (2) Consider dependency order — make foundational changes first (e.g., models before services, shared types before consumers). (3) Run the relevant test suite to establish a baseline. (4) Execute changes methodically, verifying each step builds/compiles before moving on.\n'
     : '';
@@ -401,7 +454,7 @@ export async function handleCreate(
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'task',
-    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${prompt}${siblingNote}`,
+    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfaceContext}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${prompt}${siblingNote}`,
     commitPrefix: 'blueprint',
     prTitlePrefix: '[Blueprint]',
     noChangesMessage: 'No file changes.',
@@ -440,12 +493,17 @@ export async function handleRefactor(
   const refactorBuildConfig = resolveBuildConfig(task);
   const refactorRelatedTestContext = discoverRelatedTests(ws, refactorRelatedFiles, refactorBuildConfig);
 
+  const refactorScope = strVal((task.context as Record<string, unknown> | undefined)?.scope);
+  const refactorModuleInterfaceContext = (refactorScope === 'medium' || refactorScope === 'large')
+    ? extractModuleInterfaces(ws, refactorRelatedFiles)
+    : '';
+
   const refactorTitle = strVal(task.title, 'Refactor');
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
-      `${contextPrefix}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
+      `${contextPrefix}${refactorModuleInterfaceContext}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.
 - Do NOT change any observable behavior, API contracts, or public interfaces.
 - Focus on ONE refactor concern per task (e.g. extract functions, reduce duplication, improve naming, simplify logic, or remove dead code — pick the most impactful single concern).

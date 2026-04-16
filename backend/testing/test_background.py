@@ -766,6 +766,69 @@ async def test_requeue_no_pr_artifacts_when_child_has_none(requeue_db, mocker):
     assert "_previous_changed_files" not in clone_ctx
 
 
+@pytest.mark.asyncio
+async def test_requeue_propagates_enriched_step_context(requeue_db, mocker):
+    """clone_ctx propagates _previous_diff_summary, _previous_test_failure_summary,
+    and _previous_self_review_outcome from the failed child's context."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    diff_summary = [
+        {"file": "backend/app/models.py", "additions": 45, "deletions": 12, "change_type": "modified"},
+        {"file": "backend/testing/test_models.py", "additions": 30, "deletions": 0, "change_type": "added"},
+    ]
+    test_failure_summary = "FAILED testing/test_models.py::test_create - AssertionError: expected 1 got 2"
+    self_review_outcome = {"issues_found": False, "fixes_applied": False, "categories": []}
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "add model"}],
+        child_context={
+            "_attempt_number": 1,
+            "_pr_diff_summary": diff_summary,
+            "_test_failure_summary": test_failure_summary,
+            "_self_review_outcome": self_review_outcome,
+        },
+        child_status_message="pytest test_create failed with AssertionError: expected 1 got 2",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+
+    assert clone_ctx.get("_previous_diff_summary") == diff_summary
+    assert clone_ctx.get("_previous_test_failure_summary") == test_failure_summary
+    assert clone_ctx.get("_previous_self_review_outcome") == self_review_outcome
+
+
+@pytest.mark.asyncio
+async def test_requeue_omits_enriched_step_context_when_absent(requeue_db, mocker):
+    """If child context has no enriched step fields, retry clone omits the _previous_ enriched fields."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    parent, _child = await _make_parent_child(
+        requeue_db,
+        child_payloads=[{"type": "create", "prompt": "fresh task"}],
+        child_context={"_attempt_number": 1},
+        child_status_message="pytest test_foo failed with AssertionError",
+    )
+
+    await _requeue_parent_task(parent, requeue_db)
+
+    clones = (await requeue_db.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert len(clones) == 1
+    clone_ctx = clones[0].context or {}
+
+    assert "_previous_diff_summary" not in clone_ctx
+    assert "_previous_test_failure_summary" not in clone_ctx
+    assert "_previous_self_review_outcome" not in clone_ctx
+
+
 async def _make_parent_with_children(session, children_specs, parent_context=None):
     """Helper: create a parent with multiple children.
 

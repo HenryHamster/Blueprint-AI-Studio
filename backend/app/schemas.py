@@ -26,6 +26,9 @@ class AgentStatusPayload(BaseModel):
     verdict_json: Optional[str] = Field(None, max_length=10000)
     failure_category: Optional[str] = Field(None, max_length=50)
     changed_files: Optional[List[str]] = Field(None, max_length=100)
+    test_failure_summary: Optional[str] = Field(None, max_length=5000)
+    self_review_outcome: Optional[Dict[str, Any]] = None
+    diff_summary: Optional[List[Dict[str, Any]]] = Field(None, max_length=50)
 
 class UploadUrlRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")

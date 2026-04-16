@@ -2077,3 +2077,115 @@ async def test_rate_limit_requeue_allows_subsequent_claim(client: AsyncClient, d
     )
 
     _terminated_task_ids.pop(task_id_str, None)
+
+
+@pytest.mark.asyncio
+async def test_agent_status_pr_artifact_stores_enriched_context(client: AsyncClient, db_session, mocker):
+    """COMPLETED+PULL_REQUEST status with diff_summary, self_review_outcome, and
+    test_failure_summary stores them in task context as _pr_diff_summary,
+    _self_review_outcome, and _test_failure_summary respectively."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Enriched Context PR Test", user_id="test-user-enriched-pr")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        vm_instance_id="agent-vm-enriched-pr",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    # Sibling stays IN_PROGRESS so project aggregation path is not triggered
+    sibling = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "sibling"}],
+        vm_instance_id="agent-vm-enriched-pr-sibling",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    db_session.add(sibling)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    diff_summary = [
+        {"file": "backend/app/models.py", "additions": 45, "deletions": 12, "change_type": "modified"},
+        {"file": "backend/testing/test_models.py", "additions": 30, "deletions": 0, "change_type": "added"},
+    ]
+    self_review_outcome = {"issues_found": False, "fixes_applied": False, "categories": []}
+    test_failure_summary = "FAILED backend/testing/test_models.py::test_create"
+
+    token = create_agent_token(str(task.id), "agent-vm-enriched-pr")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/foo/bar/pull/10",
+        "changed_files": ["backend/app/models.py", "backend/testing/test_models.py"],
+        "diff_summary": diff_summary,
+        "self_review_outcome": self_review_outcome,
+        "test_failure_summary": test_failure_summary,
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("_pr_diff_summary") == diff_summary
+    assert ctx.get("_self_review_outcome") == self_review_outcome
+    assert ctx.get("_test_failure_summary") == test_failure_summary
+    assert ctx.get("_pr_url") == "https://github.com/foo/bar/pull/10"
+
+
+@pytest.mark.asyncio
+async def test_agent_status_failed_artifact_stores_diff_summary_and_test_failure(client: AsyncClient, db_session, mocker):
+    """FAILED+ERROR_LOG status with diff_summary and test_failure_summary stores them
+    in task context as _pr_diff_summary and _test_failure_summary."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Enriched Context Failed Test", user_id="test-user-enriched-failed")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        vm_instance_id="agent-vm-enriched-failed",
+        status=TaskStatus.IN_PROGRESS,
+        # Exhaust retries so the FAILED path terminates without requeueing
+        attempt_count=3,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    diff_summary = [
+        {"file": "backend/app/models.py", "additions": 10, "deletions": 2, "change_type": "modified"},
+    ]
+    test_failure_summary = "FAILED backend/testing/test_models.py::test_create - AssertionError"
+
+    token = create_agent_token(str(task.id), "agent-vm-enriched-failed")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "ERROR_LOG",
+        "logs": "Test suite failed after max attempts",
+        "changed_files": ["backend/app/models.py"],
+        "diff_summary": diff_summary,
+        "test_failure_summary": test_failure_summary,
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("_pr_diff_summary") == diff_summary
+    assert ctx.get("_test_failure_summary") == test_failure_summary

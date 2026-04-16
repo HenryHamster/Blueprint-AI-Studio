@@ -40,6 +40,7 @@ vi.mock('../prompt.js', () => ({
   formatPlaybook: vi.fn().mockReturnValue(''),
   buildRetryContext: vi.fn().mockReturnValue(''),
   buildSelfReviewPrompt: vi.fn().mockReturnValue('self-review-prompt'),
+  extractModuleInterfaces: vi.fn().mockReturnValue(''),
 }));
 
 vi.mock('../build-config.js', async (importOriginal) => {
@@ -82,6 +83,7 @@ vi.mock('ws', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
 import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus } from '../index.js';
+import { extractModuleInterfaces } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -274,6 +276,52 @@ describe('handleRefactor configuration', () => {
     const task = { title: 'Refactor task', description: '' };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(capturedPrompt()).toContain('REFACTOR TASK \u2014 STRICT CONSTRAINTS');
+  });
+});
+
+// ── Module interface extraction (scope-conditional) ───────────────────────────
+describe('module interface extraction', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(extractModuleInterfaces).mockReturnValue('## Module Interfaces\nfoo\n\n');
+  });
+
+  it('calls extractModuleInterfaces for handleCreate with scope=medium', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'medium' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/foo.ts']);
+    expect(capturedPrompt()).toContain('## Module Interfaces');
+  });
+
+  it('calls extractModuleInterfaces for handleCreate with scope=large', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'large' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/bar.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/bar.ts']);
+  });
+
+  it('does not call extractModuleInterfaces for handleCreate with scope=small', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'small' } };
+    await handleCreate(TASK_ID, { prompt: 'Do it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
+  });
+
+  it('does not call extractModuleInterfaces for handleCreate with no scope', async () => {
+    const task = { title: 'Task', description: '' };
+    await handleCreate(TASK_ID, { prompt: 'Do it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
+  });
+
+  it('calls extractModuleInterfaces for handleRefactor with scope=medium', async () => {
+    const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/utils.ts']);
+    expect(capturedPrompt()).toContain('## Module Interfaces');
+  });
+
+  it('does not call extractModuleInterfaces for handleRefactor with scope=small', async () => {
+    const task = { title: 'Refactor', description: '', context: { scope: 'small' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
   });
 });
 
