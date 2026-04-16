@@ -881,6 +881,15 @@ async def update_agent_status(
                         + existing_msg[:300]
                     ).strip()
                     session.add(task)
+                try:
+                    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+                    await _maybe_create_failure_alert(
+                        task,
+                        session,
+                        task.latest_status_message or f"[{failure_class}] Retries exhausted ({task.attempt_count}/{max_r})",
+                    )
+                except Exception as _alert_err:
+                    logger.warning(f"[AGENT_STATUS] Failed to create failure alert for task {task.id}: {_alert_err}")
 
         # Record first-attempt success metrics for playbook effectiveness tracking
         if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
