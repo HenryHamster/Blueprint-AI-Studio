@@ -349,7 +349,7 @@ async def _process_post_commit(
         # Immediately unblock dependents when task terminally fails (retries exhausted)
         if payload.status == TaskStatus.FAILED:
             try:
-                async with AsyncSessionLocal() as dep_session:
+                async with factory() as dep_session:
                     dep_stmt = select(Task).where(
                         Task.project_id == task.project_id,
                         Task.status == TaskStatus.QUEUED,
