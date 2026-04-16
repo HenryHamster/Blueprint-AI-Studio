@@ -785,21 +785,21 @@ describe('buildSelfReviewChecklist', () => {
     expect(result).toContain('Import/dependency verification');
   });
 
-  it('taskScope=undefined produces the standard 5-item checklist', () => {
+  it('taskScope=undefined produces the standard 8-item checklist', () => {
     const result = buildSelfReviewPrompt({ ...baseOpts, taskScope: undefined });
     expect(result).toContain('Missing test coverage');
     expect(result).toContain('Type safety violations');
     expect(result).toContain('Scope violations');
     expect(result).toContain('Security issues');
     expect(result).toContain('Pattern violations');
-    expect(result).not.toContain('Cross-file consistency');
-    expect(result).not.toContain('Backwards compatibility');
+    expect(result).toContain('Cross-file consistency');
+    expect(result).toContain('Backwards compatibility');
+    expect(result).toContain('Import/dependency verification');
     expect(result).not.toContain('Data model safety');
-    expect(result).not.toContain('Import/dependency verification');
     expect(result).not.toContain('Correctness');
   });
 
-  it('taskScope=medium (explicit) produces the same 5-item checklist as undefined', () => {
+  it('taskScope=medium (explicit) produces the same 8-item checklist as undefined', () => {
     const resultUndefined = buildSelfReviewPrompt({ ...baseOpts, taskScope: undefined });
     const resultMedium = buildSelfReviewPrompt({ ...baseOpts, taskScope: 'medium' });
     expect(resultMedium).toContain('Missing test coverage');
@@ -807,7 +807,9 @@ describe('buildSelfReviewChecklist', () => {
     expect(resultMedium).toContain('Scope violations');
     expect(resultMedium).toContain('Security issues');
     expect(resultMedium).toContain('Pattern violations');
-    expect(resultMedium).not.toContain('Cross-file consistency');
+    expect(resultMedium).toContain('Cross-file consistency');
+    expect(resultMedium).toContain('Backwards compatibility');
+    expect(resultMedium).toContain('Import/dependency verification');
     expect(resultMedium).not.toContain('Correctness');
     // medium and undefined produce identical checklist output
     expect(resultMedium).toBe(resultUndefined);

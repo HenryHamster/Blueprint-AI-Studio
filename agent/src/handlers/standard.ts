@@ -238,8 +238,10 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const headBeforeReview = git(['rev-parse', 'HEAD']);
       const statusBeforeReview = git(['status', '--porcelain']);
 
+      const taskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
+      const maxSelfReviewAttempts = (taskScope === 'medium' || taskScope === 'large') ? 2 : MAX_SELF_REVIEW_ATTEMPTS;
       let selfReviewFailed = false;
-      for (let attempt = 0; attempt < MAX_SELF_REVIEW_ATTEMPTS; attempt++) {
+      for (let attempt = 0; attempt < maxSelfReviewAttempts; attempt++) {
         const { exitCode: reviewExitCode, allOutput: reviewOutput } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
         if (reviewExitCode !== 0) {
           if (matchesRateLimit(reviewOutput)) {
