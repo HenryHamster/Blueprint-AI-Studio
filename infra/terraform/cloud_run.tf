@@ -7,10 +7,26 @@ resource "google_cloud_run_v2_service" "orchestrator" {
   template {
     service_account = google_service_account.orchestrator_sa.email
 
+    # Pin the min/max instance scaling so redeploys don't drift back to defaults.
+    # Reaper + orchestrator background loops need min=1 to stay warm.
+    scaling {
+      min_instance_count = 1
+      max_instance_count = 3
+    }
+
     containers {
       # Placeholder image. CI/CD will overwrite this with the actual application image.
       image = "us-docker.pkg.dev/cloudrun/container/hello"
-      
+
+      # Memory was bumped from 1Gi → 2Gi on 2026-04-15 after an OOM cluster
+      # killed in-flight request handlers. CPU stays at 1 vCPU.
+      resources {
+        limits = {
+          memory = "2Gi"
+          cpu    = "1000m"
+        }
+      }
+
       env {
         name  = "GCP_PROJECT_ID"
         value = var.project_id
