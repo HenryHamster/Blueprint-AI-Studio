@@ -215,29 +215,24 @@ async def test_old_failures_outside_7_day_window_ignored(db_session: AsyncSessio
 
 
 @pytest.mark.asyncio
-async def test_capture_success_creates_entry_when_negative_exists(db_session: AsyncSession):
-    """capture_success_pattern creates a success-pattern entry when a failure-derived
-    entry exists for the same task type."""
+async def test_capture_success_creates_entry_after_threshold(db_session: AsyncSession):
+    """capture_success_pattern creates a success-pattern entry once the task type
+    has at least 3 total completions (success or failure) in the project."""
     from app.playbook_learning import capture_success_pattern
 
-    project = await _make_project(db_session, design_doc={
-        "playbook/review-test-coverage": {
-            "content": "test coverage issues flagged",
-            "source": "review-extracted",
-            "applicable_types": ["create"],
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        },
-    })
+    project = await _make_project(db_session, design_doc={})
+    # 2 prior completions of the same type (makes total = 3 with current task)
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
     task = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
 
-    assert key == "success-create"
+    assert key == "success-create-small"
     doc = project.design_doc or {}
-    assert "playbook/success-create" in doc
-    entry = doc["playbook/success-create"]
+    assert "playbook/success-create-small" in doc
+    entry = doc["playbook/success-create-small"]
     assert entry["source"] == "success-pattern"
     assert entry["success_count"] == 1
     assert entry["confirmed_count"] == 0
@@ -247,33 +242,27 @@ async def test_capture_success_creates_entry_when_negative_exists(db_session: As
 
 
 @pytest.mark.asyncio
-async def test_capture_success_skips_when_no_negative_entries(db_session: AsyncSession):
-    """capture_success_pattern returns None when there are no failure-derived entries
-    for the task type — success on an easy task type is not noteworthy."""
+async def test_capture_success_skips_below_threshold(db_session: AsyncSession):
+    """capture_success_pattern returns None when the task type has fewer than 3
+    total completions — the single task is not yet statistically meaningful."""
     from app.playbook_learning import capture_success_pattern
 
-    # Only a manually written entry exists — not a failure-derived one
-    project = await _make_project(db_session, design_doc={
-        "playbook/manual-tip": {
-            "content": "a manually written tip",
-            "source": "manual",
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        },
-    })
-    task = await _make_completed_task(db_session, project.id, task_type="create")
+    project = await _make_project(db_session, design_doc={})
+    # Only 1 prior completion + current = 2 total (below threshold of 3)
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    task = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
 
     assert key is None
     doc = project.design_doc or {}
-    assert "playbook/success-create" not in doc
+    assert not any(k.startswith("playbook/success-") for k in doc)
 
 
 @pytest.mark.asyncio
-async def test_capture_success_skips_when_project_has_no_playbook(db_session: AsyncSession):
-    """capture_success_pattern returns None when the project has no playbook entries at all."""
+async def test_capture_success_skips_with_no_prior_completions(db_session: AsyncSession):
+    """capture_success_pattern returns None when this is the very first task of the type."""
     from app.playbook_learning import capture_success_pattern
 
     project = await _make_project(db_session, design_doc={})
@@ -285,37 +274,41 @@ async def test_capture_success_skips_when_project_has_no_playbook(db_session: As
 
 @pytest.mark.asyncio
 async def test_capture_success_updates_existing_entry(db_session: AsyncSession):
-    """capture_success_pattern increments success_count and refreshes content on
-    a second qualifying success of the same task type."""
+    """capture_success_pattern increments success_count, updates scope_distribution,
+    and refreshes content on a second qualifying success of the same (type, scope)."""
     from app.playbook_learning import capture_success_pattern
 
     project = await _make_project(db_session, design_doc={
-        "playbook/auto-code-error-abc123": {
-            "content": "WARNING: CODE_ERROR failures have occurred 3 times",
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        },
-        "playbook/success-fix": {
-            "content": "First-attempt success pattern for fix tasks (1 observation, scope: small).",
+        "playbook/success-fix-medium": {
+            "content": "First-attempt success pattern for fix tasks (1 observation, scope: medium).",
             "source": "success-pattern",
             "success_count": 1,
             "confirmed_count": 2,
             "applicable_types": ["fix"],
+            "scope": "medium",
+            "scope_distribution": {"medium": 1},
+            "num_files_changed": 3,
+            "tests_added": False,
+            "first_attempt_success": True,
             "updated_at": _utcnow().isoformat(),
         },
     })
+    # 2 prior completions to satisfy noise filter
+    await _make_completed_task(db_session, project.id, task_type="fix", scope="medium")
+    await _make_completed_task(db_session, project.id, task_type="fix", scope="medium")
     task = await _make_completed_task(db_session, project.id, task_type="fix", scope="medium")
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
 
-    assert key == "success-fix"
-    entry = (project.design_doc or {})["playbook/success-fix"]
+    assert key == "success-fix-medium"
+    entry = (project.design_doc or {})["playbook/success-fix-medium"]
     assert entry["success_count"] == 2
     # confirmed_count is left untouched by capture_success_pattern
     assert entry["confirmed_count"] == 2
     assert "medium" in entry["content"]
     assert "2 observations" in entry["content"]
+    assert entry["scope_distribution"] == {"medium": 2}
 
 
 @pytest.mark.asyncio
@@ -323,16 +316,11 @@ async def test_capture_success_includes_related_files(db_session: AsyncSession):
     """capture_success_pattern includes the files touched in the entry content."""
     from app.playbook_learning import capture_success_pattern
 
-    project = await _make_project(db_session, design_doc={
-        "playbook/review-error-handling": {
-            "content": "error handling issues flagged",
-            "source": "review-extracted",
-            "applicable_types": ["refactor"],
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        },
-    })
+    project = await _make_project(db_session, design_doc={})
     files = ["backend/app/foo.py", "backend/app/bar.py"]
+    # 2 prior completions to satisfy noise filter
+    await _make_completed_task(db_session, project.id, task_type="refactor")
+    await _make_completed_task(db_session, project.id, task_type="refactor")
     task = await _make_completed_task(
         db_session, project.id,
         task_type="refactor", related_files=files,
@@ -341,34 +329,108 @@ async def test_capture_success_includes_related_files(db_session: AsyncSession):
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
 
-    assert key == "success-refactor"
-    entry = (project.design_doc or {})["playbook/success-refactor"]
+    assert key == "success-refactor-small"
+    entry = (project.design_doc or {})["playbook/success-refactor-small"]
     assert "foo.py" in entry["content"]
     assert "bar.py" in entry["content"]
 
 
 @pytest.mark.asyncio
-async def test_capture_success_auto_key_counts_as_negative(db_session: AsyncSession):
-    """playbook/auto-* entries created by _check_recurring_failures (no 'source' field)
-    are treated as failure-derived entries and satisfy the sampling gate."""
+async def test_capture_success_new_type_without_failures(db_session: AsyncSession):
+    """capture_success_pattern works for task types that have never failed
+    (cold-start fix: no failure-gate required)."""
     from app.playbook_learning import capture_success_pattern
 
-    project = await _make_project(db_session, design_doc={
-        # _check_recurring_failures does not set "source" — only key prefix "auto-"
-        "playbook/auto-code-error-deadbeef": {
-            "content": "WARNING: CODE_ERROR failures occurred 3 times",
-            "confirmed_count": 0,
-            "applicable_types": ["create"],
-            "updated_at": _utcnow().isoformat(),
-        },
-    })
-    task = await _make_completed_task(db_session, project.id, task_type="create")
+    project = await _make_project(db_session, design_doc={})
+    # Simulate a brand-new task type ('migrate') with 3 completions, no failures
+    await _make_completed_task(db_session, project.id, task_type="migrate", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="migrate", scope="small")
+    task = await _make_completed_task(db_session, project.id, task_type="migrate", scope="small")
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
 
-    assert key == "success-create"
-    assert "playbook/success-create" in (project.design_doc or {})
+    assert key == "success-migrate-small"
+    assert "playbook/success-migrate-small" in (project.design_doc or {})
+
+
+@pytest.mark.asyncio
+async def test_capture_success_metadata_fields(db_session: AsyncSession):
+    """New entries include num_files_changed, tests_added, first_attempt_success,
+    scope, and scope_distribution fields."""
+    from app.playbook_learning import capture_success_pattern
+
+    project = await _make_project(db_session, design_doc={})
+    files = ["backend/app/foo.py", "backend/testing/test_foo.py"]
+    await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+    task = await _make_completed_task(
+        db_session, project.id,
+        task_type="create", scope="medium", related_files=files,
+    )
+
+    key = await capture_success_pattern(task, db_session)
+    await db_session.flush()
+
+    assert key == "success-create-medium"
+    entry = (project.design_doc or {})["playbook/success-create-medium"]
+    assert entry["num_files_changed"] == 2
+    assert entry["tests_added"] is True  # test_foo.py matches /testing/ pattern
+    assert entry["first_attempt_success"] is True
+    assert entry["scope"] == "medium"
+    assert entry["scope_distribution"] == {"medium": 1}
+
+
+@pytest.mark.asyncio
+async def test_capture_success_per_scope_key(db_session: AsyncSession):
+    """Different scopes produce separate playbook entries."""
+    from app.playbook_learning import capture_success_pattern
+
+    project = await _make_project(db_session, design_doc={})
+    # 2 prior of each scope to satisfy threshold
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+
+    task_small = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    key_small = await capture_success_pattern(task_small, db_session)
+
+    task_medium = await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+    key_medium = await capture_success_pattern(task_medium, db_session)
+
+    await db_session.flush()
+
+    assert key_small == "success-create-small"
+    assert key_medium == "success-create-medium"
+    doc = project.design_doc or {}
+    assert "playbook/success-create-small" in doc
+    assert "playbook/success-create-medium" in doc
+
+
+@pytest.mark.asyncio
+async def test_capture_success_scope_distribution_accumulates(db_session: AsyncSession):
+    """scope_distribution tracks the count of successes at each scope level."""
+    from app.playbook_learning import capture_success_pattern
+
+    project = await _make_project(db_session, design_doc={})
+    # Pre-seed 2 prior completions for the threshold
+    await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
+
+    # First success: creates the entry
+    t1 = await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
+    await capture_success_pattern(t1, db_session)
+    await db_session.flush()
+
+    # Second success: updates scope_distribution
+    t2 = await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
+    await capture_success_pattern(t2, db_session)
+    await db_session.flush()
+
+    entry = (project.design_doc or {}).get("playbook/success-fix-small", {})
+    assert entry.get("success_count") == 2
+    assert entry.get("scope_distribution") == {"small": 2}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
