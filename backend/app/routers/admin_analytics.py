@@ -1463,6 +1463,10 @@ ORCHESTRATOR_ERRORS_CACHE_TTL_SECONDS = 60
 ORCHESTRATOR_SERVICE_NAME = os.getenv("ORCHESTRATOR_SERVICE_NAME", "blueprint-orchestrator")
 _orchestrator_errors_cache: Dict[Tuple[int, int], Tuple[float, Dict[str, Any]]] = {}
 
+# Acknowledged error buckets: "exception_class|source" -> ISO timestamp.
+# Buckets whose last_seen_iso <= acknowledged_at are filtered from responses.
+_acknowledged_errors: Dict[str, str] = {}
+
 _EXCEPTION_LINE_RE = re.compile(
     r"^(?P<cls>(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning|Timeout|NotFound|Denied|Conflict))(?::|\b)",
     re.MULTILINE,
@@ -1634,6 +1638,26 @@ def _fetch_orchestrator_error_entries(hours: int) -> List[Any]:
     return collected
 
 
+def _filter_acknowledged_buckets(buckets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove buckets whose last_seen_iso is at or before the acknowledged timestamp."""
+    if not _acknowledged_errors:
+        return buckets
+    global_ack = _acknowledged_errors.get("*")
+    filtered = []
+    for b in buckets:
+        last_seen = b["last_seen_iso"]
+        # Check per-bucket acknowledgment
+        key = f"{b['exception_class']}|{b['source']}"
+        ack_ts = _acknowledged_errors.get(key)
+        if ack_ts and last_seen <= ack_ts:
+            continue
+        # Check global acknowledgment
+        if global_ack and last_seen <= global_ack:
+            continue
+        filtered.append(b)
+    return filtered
+
+
 @router.get("/recent-orchestrator-errors")
 async def get_recent_orchestrator_errors(
     hours: int = Query(default=1, ge=1, le=24),
@@ -1645,7 +1669,10 @@ async def get_recent_orchestrator_errors(
     now = time.time()
     cached = _orchestrator_errors_cache.get(cache_key)
     if cached is not None and (now - cached[0]) < ORCHESTRATOR_ERRORS_CACHE_TTL_SECONDS:
-        return cached[1]
+        # Still apply acknowledgment filter on cached data
+        cached_payload = cached[1]
+        visible = _filter_acknowledged_buckets(cached_payload.get("buckets", []))
+        return {**cached_payload, "buckets": visible, "acknowledged_count": len(cached_payload.get("buckets", [])) - len(visible)}
 
     try:
         entries = _fetch_orchestrator_error_entries(hours)
@@ -1660,15 +1687,66 @@ async def get_recent_orchestrator_errors(
         _orchestrator_errors_cache[cache_key] = (now, payload)
         return payload
 
-    buckets = _bucket_log_entries(entries, limit)
-    payload = {
-        "buckets": buckets,
+    all_buckets = _bucket_log_entries(entries, limit)
+    # Cache the full (unfiltered) set; filter on read
+    _orchestrator_errors_cache[cache_key] = (now, {
+        "buckets": all_buckets,
         "hours": hours,
         "total_entries_scanned": len(entries),
         "generated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    visible = _filter_acknowledged_buckets(all_buckets)
+    return {
+        "buckets": visible,
+        "hours": hours,
+        "total_entries_scanned": len(entries),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "acknowledged_count": len(all_buckets) - len(visible),
     }
-    _orchestrator_errors_cache[cache_key] = (now, payload)
-    return payload
+
+
+@router.post("/orchestrator-errors/acknowledge")
+async def acknowledge_orchestrator_error(
+    exception_class: str = Query(...),
+    source: str = Query(...),
+    current_user: dict = Depends(require_admin),
+):
+    """Acknowledge a specific orchestrator error bucket so it's hidden until new occurrences arrive."""
+    key = f"{exception_class}|{source}"
+    _acknowledged_errors[key] = datetime.now(timezone.utc).isoformat()
+    user_email = current_user.get("email", current_user.get("sub", "unknown"))
+    logger.info(f"[ADMIN] Orchestrator error acknowledged: {key} by {user_email}")
+    return {"status": "acknowledged", "key": key}
+
+
+@router.post("/orchestrator-errors/acknowledge-all")
+async def acknowledge_all_orchestrator_errors(
+    current_user: dict = Depends(require_admin),
+):
+    """Acknowledge all current orchestrator error buckets."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    acknowledged_keys = []
+    for cached_ts, cached_payload in _orchestrator_errors_cache.values():
+        for b in cached_payload.get("buckets", []):
+            key = f"{b['exception_class']}|{b['source']}"
+            _acknowledged_errors[key] = now_iso
+            acknowledged_keys.append(key)
+    # If cache is empty but caller wants to ack everything, set a global marker
+    if not acknowledged_keys:
+        _acknowledged_errors["*"] = now_iso
+    user_email = current_user.get("email", current_user.get("sub", "unknown"))
+    logger.info(f"[ADMIN] All orchestrator errors acknowledged ({len(acknowledged_keys)} buckets) by {user_email}")
+    return {"status": "acknowledged", "count": len(acknowledged_keys)}
+
+
+@router.delete("/orchestrator-errors/acknowledged")
+async def clear_acknowledged_orchestrator_errors(
+    current_user: dict = Depends(require_admin),
+):
+    """Clear all acknowledgments so previously hidden errors reappear."""
+    count = len(_acknowledged_errors)
+    _acknowledged_errors.clear()
+    return {"status": "cleared", "count": count}
 
 
 # ---------------------------------------------------------------------------
@@ -1710,6 +1788,7 @@ async def get_open_prs(
     )
 
     # Build task lookup: pr_url -> latest task
+    # Source 1: PR artifacts (agent-created PRs)
     artifact_rows = (await session.execute(
         select(Artifact, Task)
         .join(Task, Artifact.task_id == Task.id)
@@ -1725,6 +1804,18 @@ async def get_open_prs(
         existing = pr_task_map.get(art.pr_url)
         if not existing or task.created_at > existing.created_at:
             pr_task_map[art.pr_url] = task
+
+    # Source 2: Rollup PRs (stored in parent task context, not as artifacts)
+    evaluating_parents = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status.in_([TaskStatus.EVALUATING, TaskStatus.IN_PROGRESS, TaskStatus.QUEUED]),
+        )
+    )).scalars().all()
+    for t in evaluating_parents:
+        rollup_url = (t.context or {}).get("rollup_pr_url")
+        if rollup_url and rollup_url not in pr_task_map:
+            pr_task_map[rollup_url] = t
 
     result = []
     for gh_pr in github_prs:

@@ -198,7 +198,7 @@ export function useDurationStats(projectId?: string): DurationStats {
 export function getHeartbeatStatus(lastHeartbeat?: string) {
   if (!lastHeartbeat) return { color: 'bg-neutral-600', text: 'No heartbeat' };
 
-  const diffMinutes = (new Date().getTime() - parseTimestamp(lastHeartbeat).getTime()) / 60000;
+  const diffMinutes = Math.max(0, (new Date().getTime() - parseTimestamp(lastHeartbeat).getTime()) / 60000);
   if (diffMinutes < 2) return { color: 'bg-emerald-500', text: 'Healthy (< 2m)' };
   if (diffMinutes < 5) return { color: 'bg-amber-500', text: 'Delayed (2-5m)' };
   return { color: 'bg-red-500', text: 'Stale (> 5m)' };
@@ -356,7 +356,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
   const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
 
   const hbAgeSec = (task.status === 'IN_PROGRESS' || task.status === 'EVALUATING') && task.last_heartbeat
-    ? (now30 - parseTimestamp(task.last_heartbeat).getTime()) / 1000
+    ? Math.max(0, (now30 - parseTimestamp(task.last_heartbeat).getTime()) / 1000)
     : null;
   const hbAgeText = hbAgeSec !== null ? `HB ${formatCompact(hbAgeSec)}` : null;
   const hbAgeColor = hbAgeSec === null ? '' : hbAgeSec < 60 ? 'text-emerald-400' : hbAgeSec < 300 ? 'text-amber-400' : 'text-red-400';
