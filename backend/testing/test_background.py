@@ -2888,9 +2888,10 @@ async def test_reaper_queued_age_alert_not_repeated(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_reaper_queued_age_alert_skips_requires_approval(reaper_db, mocker):
+async def test_reaper_queued_age_alert_includes_requires_approval(reaper_db, mocker):
     """
-    Reaper Step 6: tasks with requires_approval=True are skipped even if stale.
+    Reaper Step 6: tasks with requires_approval=True are NOT skipped — they get
+    an alert with an approval-specific cause so they aren't invisible forever.
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
@@ -2930,7 +2931,62 @@ async def test_reaper_queued_age_alert_skips_requires_approval(reaper_db, mocker
     alerts = (await reaper_db.execute(
         _select(Alert).where(Alert.task_id == approval_task.id)
     )).scalars().all()
-    assert len(alerts) == 0, "Approval-pending tasks should not trigger queued age alerts"
+    assert len(alerts) == 1, "Approval-pending tasks should now surface via queued age alerts"
+    assert "awaiting operator approval" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_reaper_queued_age_alert_escalates(reaper_db, mocker):
+    """
+    Reaper Step 6: a task already at tier 1 (INFO) that ages past the tier 2
+    threshold (3× base) re-alerts at WARNING with a rising tier value.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("app.reaper._runtime_config", {
+        "max_concurrent_vms": 8,
+        "max_retries": 3,
+        "max_provision_retries": 3,
+        "queued_age_alert_hours": 2,
+    })
+
+    project = Project(name="Escalation Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    # 7h old, previously alerted at tier 1 → should escalate to tier 2 (WARNING at 6h)
+    stale_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "aging"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=False,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=7),
+        context={"queued_age_alert_tier": 1, "queued_age_alert_fired": True},
+    )
+    reaper_db.add(stale_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(stale_task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await reaper_db.refresh(stale_task)
+    assert stale_task.context.get("queued_age_alert_tier") == 2
+
+    from sqlmodel import select as _select
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == stale_task.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    assert str(alerts[0].severity) in ("WARNING", "AlertSeverity.WARNING")
+    assert "tier 2" in alerts[0].message
 
 
 @pytest.mark.asyncio

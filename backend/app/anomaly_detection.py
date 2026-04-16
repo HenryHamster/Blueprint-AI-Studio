@@ -466,6 +466,41 @@ async def check_anomaly_actions() -> dict:
     return {"action": "none"}
 
 
+def _expire_stale_anomalies() -> int:
+    """Remove persistent anomalies whose last_seen is older than 48h.
+
+    Independent of detection runs — safe to call on a schedule even when no
+    research cycle has touched a project recently. Returns the count expired.
+    """
+    stale_cutoff = (_utcnow() - timedelta(hours=48)).isoformat()
+    expired = 0
+    for proj_key, proj_anomalies in list(_shared_state.persistent_anomalies.items()):
+        for key in list(proj_anomalies):
+            last_seen = proj_anomalies[key].get("last_seen", "")
+            if last_seen and last_seen < stale_cutoff:
+                del proj_anomalies[key]
+                expired += 1
+        if not proj_anomalies:
+            del _shared_state.persistent_anomalies[proj_key]
+    return expired
+
+
+async def anomaly_maintenance_sweep() -> dict:
+    """Periodic maintenance independent of autonomous research.
+
+    Expires stale persistent anomalies (>48h since last_seen) and re-evaluates
+    pipeline adjustments so that throttles get restored even when no research
+    cycle is running. Returns a small summary dict for logging.
+    """
+    expired = _expire_stale_anomalies()
+    action = await check_anomaly_actions()
+    if expired or action["action"] != "none":
+        logger.info(
+            "[ANOMALY_SWEEP] expired=%d action=%s", expired, action["action"]
+        )
+    return {"expired": expired, "action": action["action"]}
+
+
 async def _check_anomaly_proposals(project, session):
     """Generate direction proposals from persistent anomalies (occurrence_count >= 3).
 

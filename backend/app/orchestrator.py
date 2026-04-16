@@ -50,6 +50,7 @@ logger = logging.getLogger("blueprint")
 _last_pool_refresh: datetime = _utcnow()
 _last_zone_health_persist: datetime = _utcnow()
 _last_anomaly_state_persist: datetime = _utcnow()
+_last_anomaly_sweep: datetime = _utcnow()
 _last_orphan_check: datetime = _utcnow()
 _last_evaluating_timeout_check: datetime = _utcnow()
 _last_deadlock_check: float = 0.0
@@ -408,6 +409,17 @@ async def orchestrator_worker():
                 await _persist_direction_streaks()
                 await _persist_pipeline_events()
                 _last_anomaly_state_persist = _utcnow()
+
+            # Independent anomaly maintenance — expires stale entries and restores
+            # pipeline adjustments without depending on autonomous research cycles.
+            global _last_anomaly_sweep
+            if (_utcnow() - _last_anomaly_sweep).total_seconds() >= 600:
+                from app.anomaly_detection import anomaly_maintenance_sweep  # noqa: PLC0415
+                try:
+                    await anomaly_maintenance_sweep()
+                except Exception:
+                    logger.exception("anomaly_maintenance_sweep failed")
+                _last_anomaly_sweep = _utcnow()
 
             async with AsyncSessionLocal() as session:
                 # Fetch all active tasks once — used for both concurrency limit and counter reconciliation

@@ -351,8 +351,17 @@ async def _init_deployment_state():
                                 try:
                                     restored[k] = datetime.fromisoformat(v)
                                 except ValueError:
-                                    logger.warning(f"[DEPLOY] Skipping corrupted zone health key {k} for zone {zone}: {v!r}")
-                                    continue
+                                    if k == "cooldown_expires_at":
+                                        fallback = datetime.now(tz.utc) + timedelta(minutes=30)
+                                        logger.warning(f"[DEPLOY] Corrupted cooldown_expires_at for zone {zone} ({v!r}); failing safe to {fallback.isoformat()}")
+                                        restored[k] = fallback
+                                    elif k == "last_failure":
+                                        fallback = datetime.now(tz.utc)
+                                        logger.warning(f"[DEPLOY] Corrupted last_failure for zone {zone} ({v!r}); failing safe to {fallback.isoformat()}")
+                                        restored[k] = fallback
+                                    else:
+                                        logger.warning(f"[DEPLOY] Skipping corrupted zone health key {k} for zone {zone}: {v!r}")
+                                        continue
                             elif k == "recent_outcomes" and isinstance(v, list):
                                 from collections import deque as _deque
                                 from app.compute import ZONE_HISTORY_WINDOW

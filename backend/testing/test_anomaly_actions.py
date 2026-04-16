@@ -18,6 +18,8 @@ from app.anomaly_detection import (
     _apply_anomaly_adjustments,
     _check_anomaly_restoration,
     _check_fast_recovery,
+    _expire_stale_anomalies,
+    anomaly_maintenance_sweep,
     check_anomaly_actions,
     _ACTIONABLE_FAILURE_CLASSES,
     _ANOMALY_ACTION_THRESHOLD,
@@ -398,6 +400,72 @@ async def test_check_anomaly_actions_returns_none():
     """check_anomaly_actions returns 'none' when nothing to do."""
     result = await check_anomaly_actions()
     assert result["action"] == "none"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Independent maintenance sweep
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_expire_stale_anomalies_removes_old_entries():
+    """Entries with last_seen older than 48h are removed; fresh entries kept."""
+    proj = str(uuid.uuid4())
+    fresh_iso = _utcnow().isoformat()
+    stale_iso = (_utcnow() - timedelta(hours=49)).isoformat()
+    _shared_state.persistent_anomalies[proj] = {
+        "FRESH": {"severity": "high", "occurrence_count": 3,
+                  "first_seen": stale_iso, "last_seen": fresh_iso,
+                  "latest_details": ""},
+        "STALE": {"severity": "high", "occurrence_count": 3,
+                  "first_seen": stale_iso, "last_seen": stale_iso,
+                  "latest_details": ""},
+    }
+    expired = _expire_stale_anomalies()
+    assert expired == 1
+    assert "FRESH" in _shared_state.persistent_anomalies[proj]
+    assert "STALE" not in _shared_state.persistent_anomalies[proj]
+
+
+def test_expire_stale_anomalies_drops_empty_project():
+    """Project key is removed when all its anomalies expire."""
+    proj = str(uuid.uuid4())
+    stale_iso = (_utcnow() - timedelta(hours=72)).isoformat()
+    _shared_state.persistent_anomalies[proj] = {
+        "STALE": {"severity": "high", "occurrence_count": 3,
+                  "first_seen": stale_iso, "last_seen": stale_iso,
+                  "latest_details": ""},
+    }
+    _expire_stale_anomalies()
+    assert proj not in _shared_state.persistent_anomalies
+
+
+@pytest.mark.asyncio
+async def test_maintenance_sweep_restores_after_expiry():
+    """Sweep expires the triggering anomaly, then restoration runs in same call."""
+    proj = str(uuid.uuid4())
+    stale_iso = (_utcnow() - timedelta(hours=49)).isoformat()
+    _shared_state.persistent_anomalies[proj] = {
+        "PROVISION_FAILURE": {
+            "severity": "high", "occurrence_count": 5,
+            "first_seen": stale_iso, "last_seen": stale_iso,
+            "latest_details": "",
+        }
+    }
+    # Pre-existing adjustment that should be restored
+    _shared_state.anomaly_adjustments.update({
+        "active": True,
+        "adjusted_at": stale_iso,
+        "trigger_anomalies": ["PROVISION_FAILURE"],
+        "pre_adjustment_max_vms": 10,
+        "pre_adjustment_failure_gate": 0.8,
+        "failure_gate_threshold": 0.6,
+    })
+    _shared_state.runtime_config["max_concurrent_vms"] = 5  # = 10 // 2
+    result = await anomaly_maintenance_sweep()
+    assert result["expired"] == 1
+    assert result["action"] == "restored"
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 10
+    assert _shared_state.anomaly_adjustments["active"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

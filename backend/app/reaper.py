@@ -847,8 +847,11 @@ async def reaper_service():
                     logger.error(f"[REAPER] Infra recovery sweep error: {e}", exc_info=True)
 
                 # Step 6: QUEUED task age alerts — notify operators when tasks have been
-                # waiting in QUEUED state beyond the configured threshold (default 2h).
-                # Fires once per task (tracked via task.context["queued_age_alert_fired"]).
+                # waiting in QUEUED state beyond the configured threshold. Escalates through
+                # three tiers (INFO at 1×, WARNING at 3×, CRITICAL at 6× the threshold) so
+                # long-stalled tasks re-alert at rising severity instead of going silent
+                # after the first fire. Approval-blocked tasks are included with a distinct
+                # message so they aren't invisible forever.
                 try:
                     from app.models import Alert, AlertSeverity  # noqa: PLC0415
                     from app.broadcast import broadcast_to_project as _bcast  # noqa: PLC0415
@@ -858,34 +861,52 @@ async def reaper_service():
                     _stale_queued = (await session.execute(
                         select(Task).where(
                             Task.status == TaskStatus.QUEUED,
-                            Task.requires_approval.is_(False),
                             Task.created_at <= _queued_cutoff,
                         )
                     )).scalars().all()
 
+                    _tier_specs = [
+                        (1, _queued_threshold_hours, AlertSeverity.INFO, "INFO"),
+                        (2, _queued_threshold_hours * 3, AlertSeverity.WARNING, "WARNING"),
+                        (3, _queued_threshold_hours * 6, AlertSeverity.ERROR, "ERROR"),
+                    ]
+
                     _alerted = 0
                     for _qt in _stale_queued:
                         _qctx = _qt.context or {}
-                        if _qctx.get("queued_age_alert_fired"):
+                        # Backward-compat: legacy bool flag counts as tier 1 already fired.
+                        _prev_tier = _qctx.get("queued_age_alert_tier") or (1 if _qctx.get("queued_age_alert_fired") else 0)
+                        _queue_hours = (now - _qt.created_at).total_seconds() / 3600
+                        _target_tier = 0
+                        _target_severity = AlertSeverity.INFO
+                        _target_label = "INFO"
+                        for _tier, _hrs, _sev, _sev_label in _tier_specs:
+                            if _queue_hours >= _hrs:
+                                _target_tier = _tier
+                                _target_severity = _sev
+                                _target_label = _sev_label
+                        if _target_tier <= _prev_tier:
                             continue
 
                         _qt_type = (_qt.first_payload or {}).get("type", "unknown")
-                        _rate, _sample = _shared_state.get_task_type_failure_rate(_qt_type, window_minutes=15)
-                        if _sample >= 3 and _rate >= 0.7:
-                            _likely_cause = f"type failure gate active ({_qt_type}: {_rate:.0%} failure rate)"
-                        elif _shared_state.tasks_active_gauge >= _runtime_config.get("max_concurrent_vms", 8):
-                            _likely_cause = "no available VM slots (concurrency limit reached)"
+                        if _qt.requires_approval:
+                            _likely_cause = "awaiting operator approval"
                         else:
-                            _likely_cause = "no eligible accounts or slot contention"
+                            _rate, _sample = _shared_state.get_task_type_failure_rate(_qt_type, window_minutes=15)
+                            if _sample >= 3 and _rate >= 0.7:
+                                _likely_cause = f"type failure gate active ({_qt_type}: {_rate:.0%} failure rate)"
+                            elif _shared_state.tasks_active_gauge >= _runtime_config.get("max_concurrent_vms", 8):
+                                _likely_cause = "no available VM slots (concurrency limit reached)"
+                            else:
+                                _likely_cause = "no eligible accounts or slot contention"
 
-                        _queue_hours = (now - _qt.created_at).total_seconds() / 3600
                         _alert = Alert(
                             project_id=_qt.project_id,
-                            severity=AlertSeverity.INFO,
+                            severity=_target_severity,
                             title=f"Task stalled in queue: {_qt.title or str(_qt.id)[:8]}",
                             message=(
                                 f"Task type: {_qt_type}. "
-                                f"Queued for {_queue_hours:.1f}h (threshold: {_queued_threshold_hours}h). "
+                                f"Queued for {_queue_hours:.1f}h (threshold: {_queued_threshold_hours}h, tier {_target_tier}). "
                                 f"Likely cause: {_likely_cause}."
                             ),
                             task_id=_qt.id,
@@ -893,6 +914,8 @@ async def reaper_service():
                         session.add(_alert)
 
                         _new_qctx = dict(_qctx)
+                        _new_qctx["queued_age_alert_tier"] = _target_tier
+                        # Preserve legacy flag so any downstream reader still sees it set.
                         _new_qctx["queued_age_alert_fired"] = True
                         _qt.context = _new_qctx
                         session.add(_qt)
@@ -903,7 +926,7 @@ async def reaper_service():
                                 "alert_created",
                                 {
                                     "alert_id": str(_alert.id),
-                                    "severity": "INFO",
+                                    "severity": _target_label,
                                     "title": _alert.title,
                                 },
                             )
@@ -912,7 +935,7 @@ async def reaper_service():
 
                         _alerted += 1
                         logger.info(
-                            f"[REAPER] Queued age alert fired for task {_qt.id} "
+                            f"[REAPER] Queued age alert tier {_target_tier} ({_target_label}) fired for task {_qt.id} "
                             f"(type={_qt_type}, queued={_queue_hours:.1f}h, cause={_likely_cause})"
                         )
 
