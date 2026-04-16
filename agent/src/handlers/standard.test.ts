@@ -84,7 +84,7 @@ vi.mock('ws', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
 import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus } from '../index.js';
-import { extractModuleInterfaces } from '../prompt.js';
+import { extractModuleInterfaces, discoverAffectedConsumers } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -278,6 +278,36 @@ describe('handleRefactor configuration', () => {
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(capturedPrompt()).toContain('REFACTOR TASK \u2014 STRICT CONSTRAINTS');
   });
+
+  it('passes captureBaseline=true for medium scope refactor', async () => {
+    const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
+  });
+
+  it('passes captureBaseline=true for large scope refactor', async () => {
+    const task = { title: 'Refactor', description: '', context: { scope: 'large' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
+  });
+
+  it('does not capture baseline for small scope refactor', async () => {
+    const task = { title: 'Refactor', description: '', context: { scope: 'small' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+  });
+
+  it('includes planning note in prompt for medium scope refactor', async () => {
+    const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).toContain('Pre-Refactor Planning');
+  });
+
+  it('does not include planning note for small scope refactor', async () => {
+    const task = { title: 'Refactor', description: '', context: { scope: 'small' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('Pre-Refactor Planning');
+  });
 });
 
 // ── Module interface extraction (scope-conditional) ───────────────────────────
@@ -323,6 +353,20 @@ describe('module interface extraction', () => {
     const task = { title: 'Refactor', description: '', context: { scope: 'small' } };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(extractModuleInterfaces)).not.toHaveBeenCalled();
+  });
+
+  it('calls discoverAffectedConsumers for handleRefactor with scope=medium', async () => {
+    vi.mocked(discoverAffectedConsumers).mockReturnValue('## Affected Consumers\nbar\n\n');
+    const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(discoverAffectedConsumers)).toHaveBeenCalledWith(WS, ['src/utils.ts']);
+    expect(capturedPrompt()).toContain('## Affected Consumers');
+  });
+
+  it('does not call discoverAffectedConsumers for handleRefactor with scope=small', async () => {
+    const task = { title: 'Refactor', description: '', context: { scope: 'small' } };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(discoverAffectedConsumers)).not.toHaveBeenCalled();
   });
 });
 

@@ -497,8 +497,15 @@ export async function handleRefactor(
   const refactorRelatedTestContext = discoverRelatedTests(ws, refactorRelatedFiles, refactorBuildConfig);
 
   const refactorScope = strVal((task.context as Record<string, unknown> | undefined)?.scope);
-  const refactorModuleInterfaceContext = (refactorScope === 'medium' || refactorScope === 'large')
+  const refactorIsMediumOrLargeScope = refactorScope === 'medium' || refactorScope === 'large';
+  const refactorModuleInterfaceContext = refactorIsMediumOrLargeScope
     ? extractModuleInterfaces(ws, refactorRelatedFiles)
+    : '';
+  const refactorAffectedConsumersContext = refactorIsMediumOrLargeScope
+    ? discoverAffectedConsumers(ws, refactorRelatedFiles)
+    : '';
+  const refactorMediumScopePlanningNote = refactorIsMediumOrLargeScope
+    ? '\n\n## Pre-Refactor Planning\n\nBefore changing any code: (1) Identify all callers, importers, and consumers of the code being restructured. (2) Understand the full call graph so renaming or moving a symbol does not break downstream users. (3) Run the existing test suite to establish a baseline. (4) Apply changes in dependency order — update foundational types/interfaces first, then callers. (5) Verify the build compiles and all baseline tests still pass after each step.\n'
     : '';
 
   const refactorTitle = strVal(task.title, 'Refactor');
@@ -506,7 +513,7 @@ export async function handleRefactor(
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
-      `${contextPrefix}${refactorModuleInterfaceContext}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
+      `${contextPrefix}${refactorModuleInterfaceContext}${refactorAffectedConsumersContext}${refactorRelatedTestContext}${refactorOverlapWarningText}${refactorMediumScopePlanningNote}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.
 - Do NOT change any observable behavior, API contracts, or public interfaces.
 - Focus on ONE refactor concern per task (e.g. extract functions, reduce duplication, improve naming, simplify logic, or remove dead code — pick the most impactful single concern).
@@ -525,6 +532,7 @@ ${rp}`,
     runTestFix: true,
     runSelfReview: true,
     lintContext: 'the refactored code',
+    captureBaseline: refactorIsMediumOrLargeScope,
   });
 }
 
