@@ -823,6 +823,52 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   return lines.join('\n');
 }
 
+// ── Pre-implementation analysis prompt builder ───────────────────────────────
+/**
+ * Builds a read-only analysis prompt for medium-scope tasks.
+ * The agent reads related files, maps module interfaces and dependencies,
+ * then outputs a compact implementation plan before any code is written.
+ */
+export function buildAnalysisPrompt(opts: {
+  rawPrompt: string;
+  taskTitle: string;
+  relatedFiles: string[];
+  fileTree: string;
+}): string {
+  const filesList = opts.relatedFiles.length > 0
+    ? `## Files Relevant to This Task\n${opts.relatedFiles.map(f => `- ${f}`).join('\n')}\n\n`
+    : '';
+  const titleLine = opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : '';
+
+  return `${opts.fileTree}${filesList}You are performing a pre-implementation analysis for a medium-scope task. This is a READ-ONLY pass — do not modify any files.
+
+## Task
+${titleLine}${opts.rawPrompt.slice(0, 1500)}
+
+## Instructions
+
+1. Read the files listed in "Files Relevant to This Task" above. If no files are listed, identify the relevant files from the file tree and read them.
+
+2. For each relevant file, identify:
+   - What it exports (functions, classes, types, constants)
+   - What it imports from other local files
+   - Key interfaces or type contracts it defines or depends on
+
+3. Map the dependencies between files: which files import from which others.
+
+4. Output a compact structured implementation plan using exactly these headings:
+
+**Files to change** (list in recommended change order, one per line with brief reason)
+
+**Interfaces to preserve** (function signatures, exported types, or API contracts that must not be broken)
+
+**Key dependencies** (which modules call into which — determines safe change order)
+
+**Implementation approach** (2-3 sentences describing the strategy to make changes correctly without breaking type contracts)
+
+Keep the total output under 600 words. Be specific and concrete — name actual function signatures, type names, and import paths. Do NOT write any implementation code.`;
+}
+
 // ── Self-review helpers ───────────────────────────────────────────────────────
 function buildSelfReviewChecklist(taskScope?: string): string {
   if (taskScope === 'small') {

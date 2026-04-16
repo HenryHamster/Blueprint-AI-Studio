@@ -9,7 +9,7 @@ import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
-  buildSelfReviewPrompt,
+  buildSelfReviewPrompt, buildAnalysisPrompt,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { MAX_SELF_REVIEW_ATTEMPTS } from '../constants.js';
@@ -89,7 +89,43 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const disallowedTools = configureAgentPermissions(taskTypeKey);
 
   const fileTree = buildFileTree(ws);
-  const finalPromptWithTree = fileTree + finalPrompt;
+
+  // ── Phase 1: Pre-implementation analysis (medium-scope tasks only) ──────────
+  // Runs a read-only pass to map module interfaces and dependencies before coding.
+  let analysisContext = '';
+  const taskScope = strVal(ctx.scope);
+  if (taskScope === 'medium') {
+    sendLog(ws, '\n[Analysis Phase] Mapping module interfaces and dependencies...\n');
+    statusRef.value = 'Analyzing module interfaces...';
+
+    const analysisRelatedFiles = (
+      (payload.related_files as string[] | undefined) ||
+      (ctx.related_files as string[] | undefined) ||
+      []
+    ) as string[];
+
+    const analysisPrompt = buildAnalysisPrompt({
+      rawPrompt,
+      taskTitle,
+      relatedFiles: analysisRelatedFiles,
+      fileTree,
+    });
+
+    const { exitCode: analysisExitCode, lastResultText: analysisResult } = await runClaudeCode(
+      analysisPrompt,
+      ws, statusRef, model, effort,
+      ['Write', 'Edit', 'NotebookEdit'],
+    );
+
+    if (analysisExitCode === 0 && analysisResult.trim()) {
+      analysisContext = `## Pre-Implementation Analysis\n\n${analysisResult.trim()}\n\n`;
+      sendLog(ws, '[Analysis Phase] Complete.\n');
+    } else {
+      sendLog(ws, '[Analysis Phase] Skipped — proceeding to implementation.\n');
+    }
+  }
+
+  const finalPromptWithTree = fileTree + analysisContext + finalPrompt;
 
   statusRef.value = 'Running Claude Code...';
   // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
