@@ -410,6 +410,72 @@ async def test_dominant_dropout_stage_none_when_all_zeros():
     )
 
 
+# ── First-review approval rate ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_first_review_approval_rate_computes_correctly():
+    """create/refactor merged tasks without rejection categories count as approved on first review."""
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    tasks = [
+        # Approved on first review (no _first_attempt_rejection_categories)
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "create"}],
+                  context={"pr_merged": True},
+                  created_at=now - timedelta(hours=1)),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "refactor"}],
+                  context={"pr_merged": True},
+                  created_at=now - timedelta(hours=1)),
+        # Rejected on first review (has _first_attempt_rejection_categories)
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "create"}],
+                  context={"pr_merged": True, "_first_attempt_rejection_categories": ["test-coverage"]},
+                  created_at=now - timedelta(hours=1)),
+        # review-type task — excluded from eligible set
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "review"}],
+                  context={"pr_merged": True},
+                  created_at=now - timedelta(hours=1)),
+        # Not merged — excluded
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "create"}],
+                  context={"pr_merged": False},
+                  created_at=now - timedelta(hours=1)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    fra = result["first_review_approval_rate"]
+    # 2 approved out of 3 eligible (create/refactor with pr_merged=True)
+    assert fra["overall"] == round(2 / 3, 2)
+    assert fra["sample_size"] == 3
+    assert "create" in fra["by_type"]
+    assert fra["by_type"]["create"] == round(1 / 2, 2)
+    assert fra["by_type"]["refactor"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_first_review_approval_rate_none_when_no_eligible_tasks():
+    """Returns None overall when no create/refactor tasks have pr_merged=True."""
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "review"}],
+                  context={"pr_merged": True},
+                  created_at=now - timedelta(hours=1)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    fra = result["first_review_approval_rate"]
+    assert fra["overall"] is None
+    assert fra["sample_size"] == 0
+
+
 # ── Return structure ──────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -419,7 +485,7 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "medium_scope_review_iterations"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "medium_scope_review_iterations"}
     assert "first_attempt_by_review_category" in result["first_attempt_success_rate"]
 
 

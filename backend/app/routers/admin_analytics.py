@@ -521,6 +521,28 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         first_success = sum(1 for t in measured if t.context["_first_attempt_succeeded"])
         return round(first_success / len(measured), 2)
 
+    _review_eligible_types = {"create", "refactor"}
+
+    def _first_review_approval_rate(tasks):
+        """Fraction of review-eligible merged tasks that had no first-review rejection.
+
+        A task is 'review-eligible' if it is a create/refactor type with pr_merged=True.
+        A task 'approved on first review' if it does NOT have _first_attempt_rejection_categories
+        in its context (meaning the first review returned APPROVE, not REQUEST_CHANGES).
+        """
+        eligible = [
+            t for t in tasks
+            if (t.first_payload or {}).get("type", "create") in _review_eligible_types
+            and (t.context or {}).get("pr_merged") is True
+        ]
+        if not eligible:
+            return None
+        approved = sum(
+            1 for t in eligible
+            if "_first_attempt_rejection_categories" not in (t.context or {})
+        )
+        return round(approved / len(eligible), 2)
+
     tasks_with_playbook = [
         t for t in terminal_tasks_24h
         if (t.context or {}).get("_had_playbook") is True
@@ -668,6 +690,37 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "first_attempt_by_review_category": first_attempt_by_review_category,
         "with_measurements": _first_attempt_rate(tasks_with_measurements) if tasks_with_measurements else None,
         "without_measurements": _first_attempt_rate(tasks_without_measurements) if tasks_without_measurements else None,
+    }
+
+    # First-review approval rate: of create/refactor tasks that merged, what fraction
+    # were approved on the first review (i.e., no _first_attempt_rejection_categories)?
+    # This is the true measure of verification gate effectiveness.
+    _fra_by_type: Dict[str, float] = {}
+    for task_type, tasks in by_type.items():
+        rate = _first_review_approval_rate(tasks)
+        if rate is not None:
+            _fra_by_type[task_type] = rate
+
+    _fra_by_scope: Dict[str, float] = {}
+    for scope, tasks in by_scope.items():
+        rate = _first_review_approval_rate(tasks)
+        if rate is not None:
+            _fra_by_scope[scope] = rate
+
+    _review_eligible_merged = [
+        t for t in terminal_tasks_24h
+        if (t.first_payload or {}).get("type", "create") in _review_eligible_types
+        and (t.context or {}).get("pr_merged") is True
+    ]
+    first_review_approval_rate = {
+        "overall": _first_review_approval_rate(terminal_tasks_24h),
+        "sample_size": len(_review_eligible_merged),
+        "by_type": _fra_by_type,
+        "by_scope": _fra_by_scope,
+        "with_playbook": _first_review_approval_rate(tasks_with_playbook),
+        "without_playbook": _first_review_approval_rate(tasks_without_playbook),
+        "with_measurements": _first_review_approval_rate(tasks_with_measurements),
+        "without_measurements": _first_review_approval_rate(tasks_without_measurements),
     }
 
     # Self-review effectiveness: correlate self-review verdicts with first-attempt approval outcomes
@@ -818,6 +871,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "failure_distribution": failure_distribution,
         "direction_stats": direction_stats,
         "first_attempt_success_rate": first_attempt_success_rate,
+        "first_review_approval_rate": first_review_approval_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
         "self_review_effectiveness": self_review_effectiveness,
         "self_review_prediction_accuracy": self_review_prediction_accuracy,
