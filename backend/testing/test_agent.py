@@ -1228,8 +1228,8 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
     Tests that EXTERNAL_API failures requeue with exponential backoff in retry_after.
     - 1st retry: ~2 min delay (2^1 * 120 = 240s)
     - 2nd retry: ~8 min delay (2^2 * 120 = 480s)
-    - 3rd retry: ~30 min delay (2^3 * 120 = 960s, but capped at 1800s — not capped here)
-    - After 3 retries, task is not requeued
+    - 3rd retry: ~16 min delay (2^3 * 120 = 960s)
+    - After 5 retries, task is not requeued (budget exhausted)
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
@@ -1248,7 +1248,7 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
             status=TaskStatus.IN_PROGRESS,
             # Pre-seed provision_failures to verify it gets cleared on graceful requeue —
             # otherwise a single provision hiccup on a previously-successful task would
-            # immediately exhaust the 3-retry budget on the next dispatch.
+            # immediately exhaust the retry budget on the next dispatch.
             context={"_api_failure_retries": retry_num - 1, "provision_failures": 2},
         )
         db_session.add(task)
@@ -1282,20 +1282,20 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
         assert actual_delay >= expected_delay - 2, f"retry {retry_num}: delay {actual_delay} < expected {expected_delay}"
         assert actual_delay <= expected_delay + 5, f"retry {retry_num}: delay {actual_delay} too large"
 
-    # 4th attempt: api_retries=3, increments to 4 > 3 → EXTERNAL_API early-requeue path is skipped
+    # 6th attempt: api_retries=5, increments to 6 > 5 → EXTERNAL_API requeue path is skipped
     # Falls through to general retry (task.attempt_count < max_retries), so no retry_after is set
     task = Task(
         project_id=project.id,
         payloads=[{"cmd": "test"}],
-        vm_instance_id="agent-vm-backoff-4",
+        vm_instance_id="agent-vm-backoff-6",
         status=TaskStatus.IN_PROGRESS,
-        context={"_api_failure_retries": 3},
+        context={"_api_failure_retries": 5},
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(str(task.id), "agent-vm-backoff-4")
+    token = create_agent_token(str(task.id), "agent-vm-backoff-6")
     headers = {"x-agent-token": token}
     payload = {
         "task_id": str(task.id),
@@ -1310,6 +1310,69 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
     # Falls through to general retry path — no EXTERNAL_API-specific retry_after is set
     ctx = task.context or {}
     assert "retry_after" not in ctx, "after EXTERNAL_API cap exceeded, retry_after should not be set by EXTERNAL_API path"
+
+
+@pytest.mark.asyncio
+async def test_external_api_permanent_auth_failure_does_not_requeue(client: AsyncClient, db_session, mocker):
+    """
+    EXTERNAL_API failures with permanent auth indicators (token expired, 401, bad credentials)
+    must fail immediately without consuming any retry budget. Requeuing only wastes 30+ minutes
+    of exponential backoff before the task permanently fails with the same error.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Auth Failure Test", user_id="test-user-auth-fail")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    permanent_auth_cases = [
+        "GitHub API returned 401 unauthorized",
+        "token expired: please re-authenticate",
+        "token revoked by organization admin",
+        "bad credentials — check your PAT",
+        "401 Unauthorized: access denied",
+    ]
+
+    for i, logs_msg in enumerate(permanent_auth_cases):
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "do work"}],
+            vm_instance_id=f"agent-vm-auth-{i}",
+            status=TaskStatus.IN_PROGRESS,
+            context={"_api_failure_retries": 0},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        token = create_agent_token(str(task.id), f"agent-vm-auth-{i}")
+        headers = {"x-agent-token": token}
+        payload = {
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_class": "EXTERNAL_API",
+            "logs": logs_msg,
+        }
+        resp = await client.post("/api/agent/status", json=payload, headers=headers)
+        assert resp.status_code == 200, f"case {i}: unexpected status {resp.status_code}"
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED, (
+            f"case {i} ({logs_msg!r}): expected FAILED (immediate), got {task.status}"
+        )
+        # retry_after must not be set — permanent failures should not schedule a retry
+        ctx = task.context or {}
+        assert "retry_after" not in ctx, (
+            f"case {i}: retry_after should not be set for permanent auth failure"
+        )
+        # Operator-facing message must direct to re-authentication
+        assert task.latest_status_message is not None
+        assert "auth" in task.latest_status_message.lower() or "re-authenticate" in task.latest_status_message.lower(), (
+            f"case {i}: status message should mention auth/re-authenticate, got: {task.latest_status_message!r}"
+        )
 
 
 @pytest.mark.asyncio

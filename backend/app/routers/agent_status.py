@@ -707,15 +707,39 @@ async def update_agent_status(
                         ctx["blacklisted_accounts"] = blacklisted
                     should_requeue = True
                     if failure_class == "EXTERNAL_API":
-                        api_retries = ctx.get("_api_failure_retries", 0) + 1
-                        ctx["_api_failure_retries"] = api_retries
-                        if api_retries > 3:
-                            logger.warning(f"[AGENT STATUS] Task {task.id} hit {api_retries} EXTERNAL_API failures — not requeuing")
+                        # Permanent auth failures (bad/expired credentials) should never be
+                        # retried — they will keep failing until the operator re-authenticates.
+                        # Detect these by inspecting the failure message before burning retries.
+                        _logs_lower = (payload.logs or "").lower()
+                        _PERMANENT_AUTH_INDICATORS = (
+                            "token expired", "token revoked", "bad credentials",
+                            "unauthorized", "401",
+                        )
+                        if any(ind in _logs_lower for ind in _PERMANENT_AUTH_INDICATORS):
+                            logger.warning(
+                                f"[AGENT STATUS] Task {task.id} EXTERNAL_API permanent auth failure "
+                                f"— not requeuing (operator must re-authenticate)"
+                            )
+                            task.latest_status_message = (
+                                "External API auth failure — token expired or credentials invalid. "
+                                "Re-authenticate and retry."
+                            )
+                            # Exhaust the general retry budget so the fallback retry path
+                            # (attempt_count < max_retries) also skips this task.
+                            task.attempt_count = _runtime_config["max_retries"]
                             should_requeue = False
                         else:
-                            delay = min(2 ** api_retries * 120, 1800)
-                            ctx["retry_after"] = (_utcnow() + timedelta(seconds=delay)).isoformat()
-                            logger.info(f"[AGENT STATUS] Task {task.id} EXTERNAL_API retry {api_retries} — backoff {delay}s")
+                            # Transient infrastructure outage: retry with exponential backoff.
+                            # Budget is 5 retries (up from 3) to survive longer outages.
+                            api_retries = ctx.get("_api_failure_retries", 0) + 1
+                            ctx["_api_failure_retries"] = api_retries
+                            if api_retries > 5:
+                                logger.warning(f"[AGENT STATUS] Task {task.id} hit {api_retries} EXTERNAL_API failures — not requeuing")
+                                should_requeue = False
+                            else:
+                                delay = min(2 ** api_retries * 120, 1800)
+                                ctx["retry_after"] = (_utcnow() + timedelta(seconds=delay)).isoformat()
+                                logger.info(f"[AGENT STATUS] Task {task.id} EXTERNAL_API retry {api_retries} — backoff {delay}s")
 
                     if should_requeue:
                         old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
