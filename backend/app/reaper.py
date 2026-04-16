@@ -565,7 +565,7 @@ async def reaper_service():
                                         await dep_session.commit()
                                         logger.info(f"[PIPELINE] Cleared terminal dependency {task.id} from {count} waiting tasks")
                             except Exception as e:
-                                logger.error(f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}", exc_info=True)
+                                logger.warning(f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}", exc_info=True)
 
                 # Step 3: Sweep EVALUATING parents with stale unmerged children.
                 # When the initial review spawn after a child completes fails silently,
@@ -591,11 +591,11 @@ async def reaper_service():
                             try:
                                 await _check_and_trigger_rollup(child, session)
                             except Exception as e:
-                                logger.error(f"[REAPER] Evaluating sweep rollup failed for parent {parent.id}: {e}", exc_info=True)
+                                logger.warning(f"[REAPER] Evaluating sweep rollup failed for parent {parent.id}: {e}", exc_info=True)
                     if evaluating_parents:
                         logger.info(f"[REAPER] Swept {len(evaluating_parents)} stale EVALUATING parents")
                 except Exception as e:
-                    logger.error(f"[REAPER] Evaluating parent sweep error: {e}", exc_info=True)
+                    logger.warning(f"[REAPER] Evaluating parent sweep error: {e}", exc_info=True)
 
                 # Step 4: Rescue EVALUATING parents whose children ALL terminated without
                 # any completing successfully.  These parents have no COMPLETED child to

@@ -1081,10 +1081,10 @@ async def _delete_gcp(vm_instance_id: str):
             await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
         return True
     except asyncio.TimeoutError:
-        logger.exception(f"Timeout deleting VM {vm_instance_id} (>60s)")
+        logger.warning(f"Timeout deleting VM {vm_instance_id} (>60s)")
         return False
     except Exception:
-        logger.exception(f"Failed to terminate VM {vm_instance_id}")
+        logger.warning(f"Failed to terminate VM {vm_instance_id}", exc_info=True)
         return False
 
 

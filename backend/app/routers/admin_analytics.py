@@ -1484,6 +1484,32 @@ def _extract_error_message(entry: Any) -> str:
                 return value
         return json.dumps(payload, default=str)[:4000]
     if payload is None:
+        # No text payload — extract container-level metadata from the entry
+        parts: list[str] = []
+        severity = getattr(entry, "severity", None)
+        if severity:
+            parts.append(f"severity={severity}")
+        resource = getattr(entry, "resource", None)
+        if resource:
+            labels = getattr(resource, "labels", None) or {}
+            if isinstance(labels, dict):
+                for k in ("revision_name", "configuration_name"):
+                    if labels.get(k):
+                        parts.append(f"{k}={labels[k]}")
+        http_req = getattr(entry, "http_request", None)
+        if http_req and isinstance(http_req, dict):
+            method = http_req.get("requestMethod", "")
+            url = http_req.get("requestUrl", "")
+            status = http_req.get("status", "")
+            if method or url:
+                parts.append(f"{method} {url} → {status}")
+        labels = getattr(entry, "labels", None)
+        if labels and isinstance(labels, dict):
+            for k in ("instanceId", "run.googleapis.com/execution_environment"):
+                if labels.get(k):
+                    parts.append(f"{k}={labels[k]}")
+        if parts:
+            return "[Cloud Run system] " + " | ".join(parts)
         return ""
     return str(payload)[:4000]
 
@@ -1492,6 +1518,8 @@ def _parse_exception_class(message: str) -> str:
     """Scan a log payload for the last exception class name in a traceback."""
     if not message:
         return "UnknownError"
+    if message.startswith("[Cloud Run system]"):
+        return "ContainerError"
     matches = _EXCEPTION_LINE_RE.findall(message)
     if matches:
         return matches[-1].rstrip(":")
