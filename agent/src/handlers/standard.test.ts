@@ -33,6 +33,7 @@ vi.mock('../prompt.js', () => ({
   buildContextPrefix: vi.fn().mockReturnValue(''),
   buildFileTree: vi.fn().mockReturnValue(''),
   discoverRelatedTests: vi.fn().mockReturnValue(''),
+  discoverModuleInterfaces: vi.fn().mockReturnValue(''),
   configureAgentPermissions: vi.fn().mockReturnValue([]),
   writePlaybookHelper: vi.fn(),
   writeMessagesHelper: vi.fn(),

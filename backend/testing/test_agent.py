@@ -1950,6 +1950,8 @@ async def test_file_change_details_stored_in_task_context(client: AsyncClient, d
     """When an agent reports status with file_change_details, the field is stored
     in task.context['_file_change_details'] so _requeue_parent_task can propagate
     it to the retry clone as _previous_file_change_details."""
+    from app.routers.agent import _terminated_task_ids
+
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
 
@@ -1967,6 +1969,9 @@ async def test_file_change_details_stored_in_task_context(client: AsyncClient, d
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    _terminated_task_ids.pop(task_id_str, None)
 
     file_details = [
         {"file": "backend/app/models.py", "additions": 45, "deletions": 12},

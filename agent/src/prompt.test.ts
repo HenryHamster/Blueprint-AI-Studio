@@ -1,4 +1,5 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
+import fs from 'fs';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // Mock ./index.js entirely so that importing prompt.ts does NOT trigger main().
@@ -44,6 +45,7 @@ import {
   formatProjectContext,
   configureAgentPermissions,
   discoverRelatedTests,
+  discoverModuleInterfaces,
   getTaskTypeHints,
   TASK_TYPE_HINTS,
   buildSelfReviewPrompt,
@@ -963,5 +965,106 @@ describe('buildSelfReviewChecklist', () => {
     expect(resultMedium).not.toContain('Correctness');
     // medium and undefined produce identical checklist output
     expect(resultMedium).toBe(resultUndefined);
+  });
+});
+
+// ── discoverModuleInterfaces ──────────────────────────────────────────────────
+describe('discoverModuleInterfaces', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns empty string for small scope', () => {
+    const result = discoverModuleInterfaces(null, ['backend/app/foo.py'], 'small');
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when relatedFiles is empty', () => {
+    const result = discoverModuleInterfaces(null, [], 'medium');
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when scope is undefined', () => {
+    const result = discoverModuleInterfaces(null, ['backend/app/foo.py'], undefined);
+    expect(result).toBe('');
+  });
+
+  it('extracts Python module-level function and class definitions', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      'def my_func(a: str, b: int):\n    pass\n\nclass MyClass:\n    def method(self):\n        pass\n\nasync def async_func(x):\n    pass\n'
+    );
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('no matches'); });
+
+    const result = discoverModuleInterfaces(null, ['backend/app/foo.py'], 'medium');
+    expect(result).toContain('## Module Interfaces');
+    expect(result).toContain('backend/app/foo.py');
+    expect(result).toContain('def my_func(a: str, b: int)');
+    expect(result).toContain('class MyClass');
+    expect(result).toContain('async def async_func(x)');
+    // Indented method should NOT appear
+    expect(result).not.toContain('def method');
+  });
+
+  it('extracts TypeScript exported declarations', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      'export function doThing(x: string): void {\n  console.log(x);\n}\nexport class MyService {\n  constructor() {}\n}\nexport interface IConfig {\n  key: string;\n}\nexport type Handler = (req: Request) => Response;\nexport const MAX_SIZE = 100;\n'
+    );
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('no matches'); });
+
+    const result = discoverModuleInterfaces(null, ['agent/src/service.ts'], 'medium');
+    expect(result).toContain('## Module Interfaces');
+    expect(result).toContain('agent/src/service.ts');
+    expect(result).toContain('export function doThing(x: string): void');
+    expect(result).toContain('export class MyService');
+    expect(result).toContain('export interface IConfig');
+    expect(result).toContain('export type Handler = (req: Request) => Response');
+    expect(result).toContain('export const MAX_SIZE = 100');
+    // Body should not appear
+    expect(result).not.toContain('console.log');
+  });
+
+  it('includes Direct Importers section when git grep finds matches', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue('def helper():\n    pass\n');
+    // execFileSync with encoding:'utf-8' returns a string; cast to satisfy the mock's Buffer overload
+    vi.mocked(execFileSync).mockReturnValue('backend/testing/test_helpers.py\n' as unknown as Buffer<ArrayBuffer>);
+
+    const result = discoverModuleInterfaces(null, ['backend/app/helpers.py'], 'large');
+    expect(result).toContain('### Direct Importers');
+    expect(result).toContain('backend/app/helpers.py');
+    expect(result).toContain('backend/testing/test_helpers.py');
+  });
+
+  it('excludes related files themselves from importers list', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue('def helper():\n    pass\n');
+    // execFileSync with encoding:'utf-8' returns a string; cast to satisfy the mock's Buffer overload
+    vi.mocked(execFileSync).mockReturnValue('backend/app/helpers.py\nbackend/app/main.py\n' as unknown as Buffer<ArrayBuffer>);
+
+    const result = discoverModuleInterfaces(null, ['backend/app/helpers.py'], 'medium');
+    expect(result).toContain('backend/app/main.py');
+    // helpers.py should not appear in the importers list after "imported by:"
+    expect(result).not.toMatch(/imported by:.*helpers\.py/);
+  });
+
+  it('returns empty string when file does not exist', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('no matches'); });
+
+    const result = discoverModuleInterfaces(null, ['backend/app/missing.py'], 'medium');
+    expect(result).toBe('');
+  });
+
+  it('caps output at 3000 characters', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    // Generate a large number of function signatures
+    const lines = Array.from({ length: 200 }, (_, i) => `def func_${i}(arg_a: str, arg_b: int) -> bool:`).join('\n');
+    vi.mocked(fs.readFileSync).mockReturnValue(lines);
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('no matches'); });
+
+    const result = discoverModuleInterfaces(null, ['backend/app/big.py'], 'medium');
+    expect(result.length).toBeLessThanOrEqual(3000);
   });
 });

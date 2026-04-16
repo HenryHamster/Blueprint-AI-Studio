@@ -516,6 +516,106 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
   }
 }
 
+// ── Module interface discovery ───────────────────────────────────────────────
+/**
+ * Discovers lightweight interface summaries for a list of related files and
+ * their direct importers. Only runs for medium and large scope tasks.
+ *
+ * For Python files: extracts module-level function/class signatures.
+ * For TypeScript files: extracts exported declarations.
+ * Also discovers files that import from the related modules via git grep.
+ *
+ * Output is capped at 3000 characters to avoid bloating the context window.
+ */
+export function discoverModuleInterfaces(ws: WebSocket | null, relatedFiles: string[], taskScope?: string): string {
+  if (taskScope !== 'medium' && taskScope !== 'large') return '';
+  if (relatedFiles.length === 0) return '';
+
+  try {
+    const interfaceSections: string[] = [];
+
+    for (const relFile of relatedFiles) {
+      const fullPath = `${WORKSPACE}/${relFile}`;
+      if (!fs.existsSync(fullPath)) continue;
+
+      let content: string;
+      try {
+        content = fs.readFileSync(fullPath, 'utf-8');
+      } catch { continue; }
+
+      const signatures: string[] = [];
+
+      if (relFile.endsWith('.py')) {
+        // Extract module-level (non-indented) function and class definitions
+        for (const line of content.split('\n')) {
+          if (/^(?:async\s+)?def\s+\w+\(/.test(line) || /^class\s+\w+/.test(line)) {
+            // Strip trailing colon and body for clean signature line
+            signatures.push(line.replace(/:\s*$/, '').trim());
+          }
+        }
+      } else if (relFile.match(/\.(tsx?|jsx?)$/)) {
+        // Extract exported declarations — signature line without body
+        for (const line of content.split('\n')) {
+          if (/^export\s+(?:async\s+)?(?:function|class|interface|type|const)\b/.test(line)) {
+            signatures.push(line.replace(/\s*[{;].*$/, '').trim());
+          }
+        }
+      }
+
+      if (signatures.length > 0) {
+        interfaceSections.push(`### ${relFile}\n${signatures.map(s => `- ${s}`).join('\n')}`);
+      }
+    }
+
+    // Discover direct importers via git grep
+    const importerLines: string[] = [];
+    const seenModules = new Set<string>();
+    for (const relFile of relatedFiles) {
+      const moduleName = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?|py)$/, '') || '';
+      if (!moduleName || seenModules.has(moduleName)) continue;
+      seenModules.add(moduleName);
+
+      try {
+        const globArgs: string[] = relFile.endsWith('.py')
+          ? ['--', '*.py']
+          : ['--', '*.ts', '*.tsx'];
+        // Use a pattern that matches typical import statements
+        const grepPattern = relFile.endsWith('.py')
+          ? `from.*\\b${moduleName}\\b`
+          : `from.*['"].*${moduleName}['"]`;
+        const result = execFileSync(
+          'git', ['grep', '-El', grepPattern, ...globArgs],
+          { cwd: WORKSPACE, encoding: 'utf-8', timeout: 5000 },
+        );
+        const importers = result.split('\n').filter(f => f && !relatedFiles.includes(f));
+        if (importers.length > 0) {
+          importerLines.push(`- \`${relFile}\` imported by: ${importers.slice(0, 5).map(f => `\`${f}\``).join(', ')}`);
+        }
+      } catch { /* no matches or grep exited non-zero */ }
+    }
+
+    if (interfaceSections.length === 0 && importerLines.length === 0) return '';
+
+    const parts: string[] = ['## Module Interfaces'];
+    if (interfaceSections.length > 0) {
+      parts.push('');
+      parts.push(interfaceSections.join('\n\n'));
+    }
+    if (importerLines.length > 0) {
+      parts.push('');
+      parts.push('### Direct Importers');
+      parts.push(importerLines.join('\n'));
+    }
+    parts.push('');
+
+    const output = parts.join('\n') + '\n';
+    return output.slice(0, 3000);
+  } catch (e) {
+    sendLog(ws, `Warning: module interface discovery failed: ${String(e)}\n`);
+    return '';
+  }
+}
+
 function parseResearchSummary(raw: string): string {
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;

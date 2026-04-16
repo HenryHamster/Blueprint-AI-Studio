@@ -9,7 +9,7 @@ import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
-  buildSelfReviewPrompt, buildAnalysisPrompt,
+  buildSelfReviewPrompt, buildAnalysisPrompt, discoverModuleInterfaces,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { MAX_SELF_REVIEW_ATTEMPTS } from '../constants.js';
@@ -324,7 +324,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         if (conflictFiles) {
           sendLog(ws, `WARNING: Conflict markers detected in staged files:\n${conflictFiles}\nAsking Claude to resolve...\n`);
           await runClaudeCode(
-            `CRITICAL: These staged files contain git conflict markers (<<<<<<<, =======, >>>>>>>):\n${conflictFiles}\n\nResolve ALL conflict markers in every file listed before the commit. After resolving, stage the fixed files with git add.`,
+            `CRITICAL: These staged files contain git conflict markers (${'<'.repeat(7)}, ${'='.repeat(7)}, ${'>'.repeat(7)}):\n${conflictFiles}\n\nResolve ALL conflict markers in every file listed before the commit. After resolving, stage the fixed files with git add.`,
             ws, statusRef, model, effort
           );
           git(['add', '-A']);
@@ -420,11 +420,13 @@ export async function handleCreate(
   );
   const createBuildConfig = resolveBuildConfig(task);
   const relatedTestContext = discoverRelatedTests(ws, relatedFiles, createBuildConfig);
+  const createScope = strVal(taskCtx?.scope);
+  const moduleInterfacesContext = discoverModuleInterfaces(ws, relatedFiles, createScope);
 
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'task',
-    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${relatedTestContext}${overlapWarningText}${prompt}${siblingNote}`,
+    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfacesContext}${relatedTestContext}${overlapWarningText}${prompt}${siblingNote}`,
     commitPrefix: 'blueprint',
     prTitlePrefix: '[Blueprint]',
     noChangesMessage: 'No file changes.',
@@ -461,13 +463,15 @@ export async function handleRefactor(
   );
   const refactorBuildConfig = resolveBuildConfig(task);
   const refactorRelatedTestContext = discoverRelatedTests(ws, refactorRelatedFiles, refactorBuildConfig);
+  const refactorScope = strVal((task.context as Record<string, unknown> | undefined)?.scope);
+  const refactorModuleInterfacesContext = discoverModuleInterfaces(ws, refactorRelatedFiles, refactorScope);
 
   const refactorTitle = strVal(task.title, 'Refactor');
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
-      `${contextPrefix}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
+      `${contextPrefix}${refactorModuleInterfacesContext}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.
 - Do NOT change any observable behavior, API contracts, or public interfaces.
 - Focus on ONE refactor concern per task (e.g. extract functions, reduce duplication, improve naming, simplify logic, or remove dead code — pick the most impactful single concern).
