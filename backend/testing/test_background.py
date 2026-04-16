@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
-from app.models import Project, Task, TaskStatus
+from app.models import Project, Task, TaskStatus, Alert
 from app.reaper import reaper_service, _reaper_skip_counts
 from app.broadcast import broadcast_to_project, manager
 from app.services import _run_stale_branch_cleanup
@@ -2536,3 +2536,159 @@ async def test_infra_recovery_does_not_resurrect_rate_limit_when_all_accounts_bl
     await reaper_db.refresh(task)
     assert task.status == TaskStatus.FAILED
     assert "_resurrection_count" not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_reaper_queued_age_alert_fired(reaper_db, mocker):
+    """
+    Reaper Step 6: tasks sitting in QUEUED for longer than the threshold get
+    an INFO alert created and queued_age_alert_fired set in context.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("app.shared_state.runtime_config", {
+        "max_concurrent_vms": 8,
+        "max_retries": 3,
+        "max_provision_retries": 3,
+        "queued_age_alert_hours": 2,
+    })
+    # Override the reaper module's reference to runtime_config
+    mocker.patch("app.reaper._runtime_config", {
+        "max_concurrent_vms": 8,
+        "max_retries": 3,
+        "max_provision_retries": 3,
+        "queued_age_alert_hours": 2,
+    })
+
+    project = Project(name="Queued Age Alert Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    # Task queued for 3 hours — exceeds 2h threshold
+    stale_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "waiting forever"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=False,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=3),
+    )
+    reaper_db.add(stale_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(stale_task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await reaper_db.refresh(stale_task)
+    assert stale_task.context.get("queued_age_alert_fired") is True
+
+    from sqlmodel import select as _select
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == stale_task.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    assert str(alerts[0].severity) in ("INFO", "AlertSeverity.INFO")
+    assert "stalled in queue" in alerts[0].title
+    assert "create" in alerts[0].message
+    assert "3.0h" in alerts[0].message or "2." in alerts[0].message  # ~3h queued
+
+
+@pytest.mark.asyncio
+async def test_reaper_queued_age_alert_not_repeated(reaper_db, mocker):
+    """
+    Reaper Step 6: tasks that already have queued_age_alert_fired=True do NOT
+    get a second alert on the next reaper cycle.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("app.reaper._runtime_config", {
+        "max_concurrent_vms": 8,
+        "max_retries": 3,
+        "max_provision_retries": 3,
+        "queued_age_alert_hours": 2,
+    })
+
+    project = Project(name="Queued Age No Repeat Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    stale_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "stuck"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=False,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=5),
+        context={"queued_age_alert_fired": True},  # already fired
+    )
+    reaper_db.add(stale_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(stale_task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    from sqlmodel import select as _select
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == stale_task.id)
+    )).scalars().all()
+    assert len(alerts) == 0, "Alert should not be re-fired when queued_age_alert_fired is already True"
+
+
+@pytest.mark.asyncio
+async def test_reaper_queued_age_alert_skips_requires_approval(reaper_db, mocker):
+    """
+    Reaper Step 6: tasks with requires_approval=True are skipped even if stale.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("app.reaper._runtime_config", {
+        "max_concurrent_vms": 8,
+        "max_retries": 3,
+        "max_provision_retries": 3,
+        "queued_age_alert_hours": 2,
+    })
+
+    project = Project(name="Approval Skip Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    approval_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "needs approval"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=5),
+    )
+    reaper_db.add(approval_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(approval_task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    from sqlmodel import select as _select
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == approval_task.id)
+    )).scalars().all()
+    assert len(alerts) == 0, "Approval-pending tasks should not trigger queued age alerts"
