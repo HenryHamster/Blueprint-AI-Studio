@@ -239,9 +239,23 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     if parent.status != TaskStatus.EVALUATING:
         return
 
+    # Lock children with skip_locked to avoid deadlocks with concurrent
+    # agent status updates that hold FOR UPDATE on individual child rows.
     all_children = (await session.execute(
-        select(Task).where(Task.parent_task_id == parent.id).with_for_update()
+        select(Task).where(Task.parent_task_id == parent.id).with_for_update(skip_locked=True)
     )).scalars().all()
+
+    # Verify we locked all children — if some were skipped (held by agent_status
+    # or another rollup), defer to avoid acting on incomplete data.
+    total_children = await session.scalar(
+        select(_func.count()).select_from(Task).where(Task.parent_task_id == parent.id)
+    )
+    if len(all_children) < total_children:
+        logger.info(
+            f"[ROLLUP] Deferred rollup for parent {parent.id} — "
+            f"locked {len(all_children)}/{total_children} children (others held)"
+        )
+        return
 
     # Consider create, refactor, plan, research, and specialized agent tasks for rollup decisions.
     # Review/fix tasks are pipeline helpers that operate on the same PR — excluded.

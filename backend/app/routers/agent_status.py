@@ -1139,8 +1139,16 @@ async def update_agent_status(
         # stale and the reaper to kill the task.
         # At this point the status change, artifact, and retry logic are all
         # persisted.  expire_on_commit=False keeps the task object usable.
-        if session.dirty or session.new:
-            await session.commit()
+        try:
+            if session.dirty or session.new:
+                await session.commit()
+        except Exception as early_exc:
+            logger.error(f"[PIPELINE] Early commit failed for {task.id}: {early_exc}", exc_info=True)
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            raise
 
         # Pass a session factory bound to the SAME engine the request used.
         # In production this is AsyncSessionLocal; in tests it's the test engine.
@@ -1157,6 +1165,7 @@ async def update_agent_status(
             # retry re-run post-commit processing.
             logger.error(f"[PIPELINE] Post-commit processing failed for task {task.id}: {e}", exc_info=True)
             try:
+                await session.rollback()
                 await session.refresh(task)
                 task.context = {**(task.context or {}), "_post_commit_pending": {"at": _utcnow().isoformat()}}
                 session.add(task)
