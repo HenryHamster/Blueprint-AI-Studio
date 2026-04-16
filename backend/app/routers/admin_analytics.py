@@ -477,6 +477,68 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         if rate is not None:
             first_attempt_by_scope[scope] = rate
 
+    # Scope merge rates: per-scope merged/created from research_history scope_breakdown
+    _scope_cur: Dict[str, Dict[str, int]] = {}
+    _scope_prev: Dict[str, Dict[str, int]] = {}
+    for d in (project.directions or [] if project else []):
+        for entry in (d.get("research_history") or []):
+            ts_str = entry.get("timestamp")
+            sb = entry.get("scope_breakdown") or {}
+            if not sb:
+                continue
+            in_cur = _safe_ts_in_window(ts_str, window_start)
+            in_prev = (
+                not in_cur
+                and _safe_ts_in_window(ts_str, prev_window_start)
+            )
+            target = _scope_cur if in_cur else (_scope_prev if in_prev else None)
+            if target is None:
+                continue
+            for scope, counts in sb.items():
+                if scope not in target:
+                    target[scope] = {"created": 0, "merged": 0}
+                target[scope]["created"] += counts.get("created") or 0
+                target[scope]["merged"] += counts.get("merged") or 0
+
+    all_scopes = set(_scope_cur) | set(_scope_prev)
+    scope_merge_rates: Dict[str, Any] = {}
+    for scope in all_scopes:
+        cur = _scope_cur.get(scope, {})
+        prev = _scope_prev.get(scope, {})
+        cur_created = cur.get("created", 0)
+        prev_created = prev.get("created", 0)
+        cur_rate = round(cur.get("merged", 0) / cur_created, 3) if cur_created > 0 else None
+        prev_rate = round(prev.get("merged", 0) / prev_created, 3) if prev_created > 0 else None
+        delta = round(cur_rate - prev_rate, 3) if (cur_rate is not None and prev_rate is not None) else None
+        scope_trend: str | None = None
+        if delta is not None:
+            if delta > 0.05:
+                scope_trend = "improving"
+            elif delta < -0.05:
+                scope_trend = "declining"
+            else:
+                scope_trend = "stable"
+        scope_merge_rates[scope] = {
+            "current_rate": cur_rate,
+            "prev_rate": prev_rate,
+            "delta": delta,
+            "trend": scope_trend,
+        }
+
+    # Medium-scope review iterations: average iteration count for medium-scope terminal tasks
+    medium_scope_tasks_with_loop = [
+        t for t in terminal_tasks_24h
+        if (t.context or {}).get("scope") == "medium"
+        and (t.context or {}).get("review_loop") is not None
+    ]
+    medium_scope_review_iterations: float | None = None
+    if medium_scope_tasks_with_loop:
+        total_iters = sum(
+            (t.context or {}).get("review_loop", {}).get("iteration", 0)
+            for t in medium_scope_tasks_with_loop
+        )
+        medium_scope_review_iterations = round(total_iters / len(medium_scope_tasks_with_loop), 2)
+
     current_first_attempt_rate = _first_attempt_rate(terminal_tasks_24h)
 
     # Previous window for first_attempt trend comparison
@@ -570,6 +632,8 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "pipeline_conversion_rate": pipeline_conversion_rate,
         "review_accuracy": review_accuracy,
         "persistent_review_issues": persistent_review_issues,
+        "scope_merge_rates": scope_merge_rates,
+        "medium_scope_review_iterations": medium_scope_review_iterations,
     }
 
 

@@ -419,7 +419,7 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "pipeline_conversion_rate", "review_accuracy", "persistent_review_issues"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "pipeline_conversion_rate", "review_accuracy", "persistent_review_issues", "scope_merge_rates", "medium_scope_review_iterations"}
     assert "first_attempt_by_review_category" in result["first_attempt_success_rate"]
 
 
@@ -530,6 +530,187 @@ async def test_review_accuracy_skips_tasks_without_verdict():
     ra = result["review_accuracy"]
     assert ra is not None
     assert ra["total_reviews"] == 5
+
+
+# ── Scope merge rates ────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_scope_merge_rates_computed_from_research_history():
+    """scope_merge_rates aggregates scope_breakdown across directions for the 24h window."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    project = make_project(directions=[{
+        "id": direction_id,
+        "status": "active",
+        "text": "Medium scope direction",
+        "possibly_saturated": False,
+        "research_history": [
+            {
+                "timestamp": (now - timedelta(hours=5)).isoformat(),
+                "prs_merged": 2,
+                "tasks_created": 4,
+                "scope_breakdown": {
+                    "small": {"created": 2, "merged": 2, "failed": 0},
+                    "medium": {"created": 2, "merged": 1, "failed": 1},
+                },
+            }
+        ],
+    }])
+
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "research"}],
+                  context={"direction_id": direction_id},
+                  created_at=now - timedelta(hours=4)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    smr = result["scope_merge_rates"]
+    assert isinstance(smr, dict)
+    assert "medium" in smr
+    assert smr["medium"]["current_rate"] == 0.5
+    assert "small" in smr
+    assert smr["small"]["current_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_scope_merge_rates_trend_improving():
+    """scope_merge_rates trend is 'improving' when current_rate exceeds prev_rate by > 0.05."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    project = make_project(directions=[{
+        "id": direction_id,
+        "status": "active",
+        "text": "Trending direction",
+        "possibly_saturated": False,
+        "research_history": [
+            # Previous window entry (25-49h ago)
+            {
+                "timestamp": (now - timedelta(hours=30)).isoformat(),
+                "prs_merged": 1,
+                "tasks_created": 4,
+                "scope_breakdown": {
+                    "medium": {"created": 4, "merged": 1, "failed": 3},
+                },
+            },
+            # Current window entry (within 24h)
+            {
+                "timestamp": (now - timedelta(hours=5)).isoformat(),
+                "prs_merged": 3,
+                "tasks_created": 4,
+                "scope_breakdown": {
+                    "medium": {"created": 4, "merged": 3, "failed": 1},
+                },
+            },
+        ],
+    }])
+
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "research"}],
+                  context={"direction_id": direction_id},
+                  created_at=now - timedelta(hours=4)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    smr = result["scope_merge_rates"]
+    assert "medium" in smr
+    medium = smr["medium"]
+    assert medium["current_rate"] == 0.75
+    assert medium["prev_rate"] == 0.25
+    assert medium["trend"] == "improving"
+
+
+@pytest.mark.asyncio
+async def test_scope_merge_rates_no_data_returns_empty_dict():
+    """scope_merge_rates is an empty dict when no research_history entries have scope_breakdown."""
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    direction_id = str(uuid.uuid4())
+
+    project = make_project(directions=[{
+        "id": direction_id,
+        "status": "active",
+        "text": "No scope breakdown",
+        "possibly_saturated": False,
+        "research_history": [
+            {
+                "timestamp": (now - timedelta(hours=5)).isoformat(),
+                "prs_merged": 1,
+                "tasks_created": 2,
+                # no scope_breakdown key
+            }
+        ],
+    }])
+
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  payloads=[{"type": "research"}],
+                  context={"direction_id": direction_id},
+                  created_at=now - timedelta(hours=4)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    assert result["scope_merge_rates"] == {}
+
+
+@pytest.mark.asyncio
+async def test_medium_scope_review_iterations_averages_correctly():
+    """medium_scope_review_iterations averages review_loop.iteration for medium-scope terminal tasks."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+
+    tasks = [
+        # medium scope, 2 iterations
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "review_loop": {"iteration": 2}},
+                  created_at=now - timedelta(hours=1)),
+        # medium scope, 4 iterations
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium", "review_loop": {"iteration": 4}},
+                  created_at=now - timedelta(hours=2)),
+        # small scope — should be excluded
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "small", "review_loop": {"iteration": 1}},
+                  created_at=now - timedelta(hours=3)),
+        # medium scope but no review_loop — excluded
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "medium"},
+                  created_at=now - timedelta(hours=4)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    assert result["medium_scope_review_iterations"] == 3.0  # (2 + 4) / 2
+
+
+@pytest.mark.asyncio
+async def test_medium_scope_review_iterations_none_when_no_medium_tasks():
+    """medium_scope_review_iterations is None when no medium-scope tasks with review_loop exist."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
+                  context={"scope": "small", "review_loop": {"iteration": 1}},
+                  created_at=now - timedelta(hours=1)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    assert result["medium_scope_review_iterations"] is None
 
 
 # ── Pipeline-health rolling event monitor ────────────────────────────────────
