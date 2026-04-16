@@ -9,7 +9,7 @@ import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
-  buildSelfReviewPrompt, extractModuleInterfaces,
+  buildSelfReviewPrompt, extractModuleInterfaces, getMandatoryChecks,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { MAX_SELF_REVIEW_ATTEMPTS, SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
@@ -83,6 +83,26 @@ export interface StandardHandlerOpts {
   lintContext?: string;
   includeTaskTypeHints?: boolean;
   issueReference?: string;
+}
+
+/**
+ * Extracts the structured self-review JSON object from the agent's output.
+ * Looks for a ```json ... ``` code fence first, then falls back to finding
+ * the first `{` that can be parsed as JSON.
+ */
+function extractSelfReviewJson(output: string): Record<string, unknown> | null {
+  const fenceMatch = output.match(/```json\s*\n?([\s\S]*?)\n?```/);
+  if (fenceMatch) {
+    try { return JSON.parse(fenceMatch[1].trim()) as Record<string, unknown>; } catch { /* fallthrough */ }
+  }
+  const start = output.indexOf('{');
+  if (start !== -1) {
+    const end = output.lastIndexOf('}');
+    if (end > start) {
+      try { return JSON.parse(output.slice(start, end + 1)) as Record<string, unknown>; } catch { /* ignore */ }
+    }
+  }
+  return null;
 }
 
 async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
@@ -227,7 +247,16 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
     // ── Self-Review Phase ──────────────────────────────────────────────────────
     // Runs after lint/test validation, before committing, to catch critical issues.
-    let selfReviewOutcome: { issues_found: boolean; categories: string[]; fixes_applied: boolean } | undefined;
+    let selfReviewOutcome: {
+      issues_found: boolean;
+      categories: string[];
+      fixes_applied: boolean;
+      verdict?: string;
+      checks_performed?: string[];
+      files_reviewed?: number;
+      truncated_files_read?: string[];
+      parse_failed?: boolean;
+    } | undefined;
     if (runSelfReview) {
       sendLog(ws, '\nRunning self-review...\n');
       statusRef.value = 'Running self-review...';
@@ -263,6 +292,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const selfReviewProjectCtx = task.project_context as Record<string, unknown> | undefined;
       const reviewIssueDist = selfReviewProjectCtx?.review_issue_distribution as Record<string, number> | undefined;
 
+      const selfReviewTaskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
       const selfReviewPrompt = buildSelfReviewPrompt({
         rawPrompt,
         taskTitle,
@@ -272,7 +302,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         buildConfig,
         changedFiles,
         reviewIssueDistribution: reviewIssueDist,
-        taskScope: (task.context as Record<string, unknown> | undefined)?.scope as string | undefined,
+        taskScope: selfReviewTaskScope,
         scopeOverflowWarning,
       });
 
@@ -280,6 +310,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const statusBeforeReview = git(['status', '--porcelain']);
 
       let selfReviewFailed = false;
+      let lastReviewOutput = '';
       for (let attempt = 0; attempt < MAX_SELF_REVIEW_ATTEMPTS; attempt++) {
         const { exitCode: reviewExitCode, allOutput: reviewOutput } = await runClaudeCode(selfReviewPrompt, ws, statusRef, model, effort);
         if (reviewExitCode !== 0) {
@@ -291,6 +322,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           selfReviewFailed = true;
           break;
         }
+        lastReviewOutput = reviewOutput;
       }
 
       if (selfReviewFailed) {
@@ -299,7 +331,54 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         const headAfterReview = git(['rev-parse', 'HEAD']);
         const statusAfterReview = git(['status', '--porcelain']);
         const fixesApplied = headAfterReview !== headBeforeReview || statusAfterReview !== statusBeforeReview;
-        selfReviewOutcome = { issues_found: fixesApplied, categories: [], fixes_applied: fixesApplied };
+
+        // Parse structured JSON output from self-review
+        const reviewCategories: string[] = [];
+        let parsedVerdict: string | undefined;
+        let parsedChecks: string[] | undefined;
+        let parsedFilesReviewed: number | undefined;
+        let parsedTruncatedFiles: string[] | undefined;
+        let parseFailed = false;
+
+        const parsed = extractSelfReviewJson(lastReviewOutput);
+        if (!parsed) {
+          reviewCategories.push('self_review_failed', 'json_parse_failed');
+          parseFailed = true;
+        } else {
+          parsedVerdict = typeof parsed.verdict === 'string' ? parsed.verdict : undefined;
+          parsedChecks = Array.isArray(parsed.checks_performed) ? parsed.checks_performed as string[] : undefined;
+          parsedFilesReviewed = typeof parsed.files_reviewed === 'number' ? parsed.files_reviewed : undefined;
+          parsedTruncatedFiles = Array.isArray(parsed.truncated_files_read) ? parsed.truncated_files_read as string[] : [];
+
+          // Validate checks_performed contains all mandatory items
+          const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined);
+          if (!parsedChecks) {
+            reviewCategories.push('self_review_failed', 'validation_failed');
+            parseFailed = true;
+          } else {
+            const missing = mandatory.filter(m => !parsedChecks!.includes(m));
+            if (missing.length > 0) {
+              reviewCategories.push('self_review_failed', 'validation_failed');
+              parseFailed = true;
+            }
+          }
+
+          // When diff was truncated, validate that the agent actually read the files
+          if (diffTruncated && (!parsedTruncatedFiles || parsedTruncatedFiles.length === 0)) {
+            reviewCategories.push('truncation_not_verified');
+          }
+        }
+
+        selfReviewOutcome = {
+          issues_found: fixesApplied || (typeof parsed?.issues_found === 'number' && (parsed.issues_found as number) > 0),
+          categories: reviewCategories,
+          fixes_applied: fixesApplied,
+          ...(parsedVerdict !== undefined ? { verdict: parsedVerdict } : {}),
+          ...(parsedChecks !== undefined ? { checks_performed: parsedChecks } : {}),
+          ...(parsedFilesReviewed !== undefined ? { files_reviewed: parsedFilesReviewed } : {}),
+          ...(parsedTruncatedFiles !== undefined ? { truncated_files_read: parsedTruncatedFiles } : {}),
+          ...(parseFailed ? { parse_failed: true } : {}),
+        };
         sendLog(ws, fixesApplied ? '\nSelf-review: issues found and fixed.\n' : '\nSelf-review: no critical issues found.\n');
       }
     }

@@ -1121,6 +1121,22 @@ export function buildRetryContext(task: Record<string, unknown>): string {
 }
 
 // ── Self-review helpers ───────────────────────────────────────────────────────
+
+/**
+ * Returns the mandatory check IDs for the given task scope.
+ * These must appear in the `checks_performed` field of the structured self-review output.
+ */
+export function getMandatoryChecks(taskScope?: string): string[] {
+  if (taskScope === 'small') {
+    return ['correctness', 'test_coverage'];
+  }
+  if (taskScope === 'large') {
+    return ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'data_model_safety', 'import_verification'];
+  }
+  // medium or unspecified
+  return ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'import_verification'];
+}
+
 function buildSelfReviewChecklist(taskScope?: string): string {
   if (taskScope === 'small') {
     return `Check for:
@@ -1194,7 +1210,7 @@ export function buildSelfReviewPrompt(opts: {
     : '';
 
   const truncationNotice = opts.changedFiles && opts.changedFiles.length > 0
-    ? `\n\n⚠️ WARNING: The diff above was truncated. The following files were changed but may not be fully shown:\n${opts.changedFiles.map(f => `- ${f}`).join('\n')}\nRead any truncated files directly with cat/head before declaring SELF-REVIEW PASSED.`
+    ? `\n\n⚠️ WARNING: The diff above was truncated. The following files were changed but may not be fully shown:\n${opts.changedFiles.map(f => `- ${f}`).join('\n')}\nRead these files directly with cat/head. List each file you read in the "truncated_files_read" field of your JSON output.`
     : '';
   const diffSection = opts.diff
     ? `\n## Diff (changes since base branch)\n\`\`\`diff\n${opts.diff}\n\`\`\`${truncationNotice}\n`
@@ -1219,6 +1235,9 @@ export function buildSelfReviewPrompt(opts: {
     ? `\n## ⚠️ Scope Overflow Warning\n${opts.scopeOverflowWarning}\nFor each file listed, confirm it is necessary for this task. Revert any files that are not essential.\n`
     : '';
 
+  const mandatoryChecks = getMandatoryChecks(opts.taskScope);
+  const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
+
   return `You are performing a self-review of the changes you just made for this task.
 
 ## Task Requirements
@@ -1231,5 +1250,16 @@ Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.
 ${buildSelfReviewChecklist(opts.taskScope)}
 
 If you find CRITICAL or MAJOR issues, fix them and stage the changes with \`git add\`.
-If everything looks good, output exactly: SELF-REVIEW PASSED`;
+
+When done (whether or not you found issues), output a JSON block exactly like this:
+\`\`\`json
+{"verdict":"PASS","checks_performed":["test_coverage","type_safety"],"issues_found":0,"files_reviewed":3,"truncated_files_read":[]}
+\`\`\`
+
+Fields:
+- \`verdict\`: "PASS" if no blocking issues remain, "FAIL" if unresolvable issues were found
+- \`checks_performed\`: IDs of every checklist item you examined — ${checkIdsNote}
+- \`issues_found\`: number of issues found (0 if none)
+- \`files_reviewed\`: number of files you read or examined
+- \`truncated_files_read\`: paths of files you read directly to compensate for a truncated diff (empty array if diff was not truncated)`;
 }
