@@ -137,6 +137,12 @@ async def get_all_tasks(
             | (Task.latest_status_message.ilike(search_pattern, escape="\\"))
         )
     if created_after:
+        # Task.created_at is TIMESTAMP WITHOUT TIME ZONE — strip tzinfo if the
+        # query param arrived as tz-aware (e.g. `...Z` or `...+00:00`) so the
+        # asyncpg comparison doesn't raise "can't subtract offset-naive and
+        # offset-aware datetimes".
+        if created_after.tzinfo is not None:
+            created_after = created_after.astimezone(timezone.utc).replace(tzinfo=None)
         filters.append(Task.created_at >= created_after)
 
     count_query = select(func.count()).select_from(Task)

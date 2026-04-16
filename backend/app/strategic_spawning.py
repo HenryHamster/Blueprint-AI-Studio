@@ -30,25 +30,32 @@ async def _build_shipped_changes_manifest(
     most recent phase1_completed_at from vision._strategic_cycle_history.
     Returns a list of direction-grouped dicts, capped at 50 merged tasks.
     """
-    # Determine cutoff timestamp
+    # Determine cutoff timestamp.
+    # Task.updated_at is TIMESTAMP WITHOUT TIME ZONE — the cutoff must be naive
+    # UTC or asyncpg raises "can't subtract offset-naive and offset-aware
+    # datetimes" when binding the parameter.
+    def _parse_naive_utc(ts: str) -> Optional[datetime]:
+        try:
+            parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return parsed
+        except (ValueError, TypeError):
+            return None
+
     cutoff: Optional[datetime] = None
     last_updated = (project.design_doc or {}).get("_meta", {}).get("last_updated")
     if last_updated:
-        try:
-            cutoff = datetime.fromisoformat(last_updated).replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
-            pass
+        cutoff = _parse_naive_utc(last_updated)
 
     if cutoff is None:
         cycle_history = (project.vision or {}).get("_strategic_cycle_history") or []
         for entry in reversed(cycle_history):
             phase1_ts = entry.get("phase1_completed_at")
             if phase1_ts:
-                try:
-                    cutoff = datetime.fromisoformat(phase1_ts).replace(tzinfo=timezone.utc)
+                cutoff = _parse_naive_utc(phase1_ts)
+                if cutoff is not None:
                     break
-                except (ValueError, TypeError):
-                    pass
 
     # Query completed tasks updated after cutoff (filter pr_merged in Python)
     stmt = (

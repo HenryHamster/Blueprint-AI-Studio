@@ -610,22 +610,21 @@ async def orchestrator_worker():
                     continue
 
                 # Reconcile Max Plan active_tasks counters from DB each cycle.
-                # Use a raw SQL extraction to avoid loading the full context JSONB.
+                # Fetch the JSON path raw and group in Python — avoids Postgres
+                # GROUP BY quirks with JSONB path expressions (SQLAlchemy was
+                # emitting a SELECT that Postgres saw as referencing task.context
+                # without a matching GROUP BY token).
                 active_per_account: Dict[str, int] = {}
-                _acct_rows = (await session.execute(
-                    select(
-                        Task.context["max_plan_account_id"].as_string(),
-                        _func.count(),
-                    )
+                _acct_id_rows = (await session.execute(
+                    select(Task.context["max_plan_account_id"].as_string())
                     .where(
                         Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
-                        Task.context["max_plan_account_id"].as_string().is_not(None),
                     )
-                    .group_by(Task.context["max_plan_account_id"].as_string())
                 )).all()
-                for acct_id, cnt in _acct_rows:
+                for row in _acct_id_rows:
+                    acct_id = row[0]
                     if acct_id:
-                        active_per_account[acct_id] = cnt
+                        active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
                 async with _max_plan_pool_lock:
                     for acct in _account_by_id.values():
                         # Reconcile from DB — the pre-increment in select_max_plan_account() is always
