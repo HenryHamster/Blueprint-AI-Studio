@@ -217,29 +217,24 @@ async def test_old_failures_outside_7_day_window_ignored(db_session: AsyncSessio
 
 
 @pytest.mark.asyncio
-async def test_capture_success_creates_entry_when_negative_exists(db_session: AsyncSession):
-    """capture_success_pattern creates a success-pattern entry when a failure-derived
-    entry exists for the same task type."""
+async def test_capture_success_creates_entry_after_threshold(db_session: AsyncSession):
+    """capture_success_pattern creates a success-pattern entry once the task type
+    has at least 3 total completions (success or failure) in the project."""
     from app.playbook_learning import capture_success_pattern
 
-    project = await _make_project(db_session, design_doc={
-        "playbook/review-test-coverage": {
-            "content": "test coverage issues flagged",
-            "source": "review-extracted",
-            "applicable_types": ["create"],
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        },
-    })
+    project = await _make_project(db_session, design_doc={})
+    # 2 prior completions of the same type (makes total = 3 with current task)
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
     task = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
 
-    assert key == "success-create"
+    assert key == "success-create-small"
     doc = project.design_doc or {}
-    assert "playbook/success-create" in doc
-    entry = doc["playbook/success-create"]
+    assert "playbook/success-create-small" in doc
+    entry = doc["playbook/success-create-small"]
     assert entry["source"] == "success-pattern"
     assert entry["success_count"] == 1
     assert entry["confirmed_count"] == 0
@@ -249,33 +244,27 @@ async def test_capture_success_creates_entry_when_negative_exists(db_session: As
 
 
 @pytest.mark.asyncio
-async def test_capture_success_skips_when_no_negative_entries(db_session: AsyncSession):
-    """capture_success_pattern returns None when there are no failure-derived entries
-    for the task type — success on an easy task type is not noteworthy."""
+async def test_capture_success_skips_below_threshold(db_session: AsyncSession):
+    """capture_success_pattern returns None when the task type has fewer than 3
+    total completions — the single task is not yet statistically meaningful."""
     from app.playbook_learning import capture_success_pattern
 
-    # Only a manually written entry exists — not a failure-derived one
-    project = await _make_project(db_session, design_doc={
-        "playbook/manual-tip": {
-            "content": "a manually written tip",
-            "source": "manual",
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        },
-    })
-    task = await _make_completed_task(db_session, project.id, task_type="create")
+    project = await _make_project(db_session, design_doc={})
+    # Only 1 prior completion + current = 2 total (below threshold of 3)
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    task = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
 
     assert key is None
     doc = project.design_doc or {}
-    assert "playbook/success-create" not in doc
+    assert not any(k.startswith("playbook/success-") for k in doc)
 
 
 @pytest.mark.asyncio
-async def test_capture_success_skips_when_project_has_no_playbook(db_session: AsyncSession):
-    """capture_success_pattern returns None when the project has no playbook entries at all."""
+async def test_capture_success_skips_with_no_prior_completions(db_session: AsyncSession):
+    """capture_success_pattern returns None when this is the very first task of the type."""
     from app.playbook_learning import capture_success_pattern
 
     project = await _make_project(db_session, design_doc={})
@@ -287,37 +276,41 @@ async def test_capture_success_skips_when_project_has_no_playbook(db_session: As
 
 @pytest.mark.asyncio
 async def test_capture_success_updates_existing_entry(db_session: AsyncSession):
-    """capture_success_pattern increments success_count and refreshes content on
-    a second qualifying success of the same task type."""
+    """capture_success_pattern increments success_count, updates scope_distribution,
+    and refreshes content on a second qualifying success of the same (type, scope)."""
     from app.playbook_learning import capture_success_pattern
 
     project = await _make_project(db_session, design_doc={
-        "playbook/auto-code-error-abc123": {
-            "content": "WARNING: CODE_ERROR failures have occurred 3 times",
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        },
-        "playbook/success-fix": {
-            "content": "First-attempt success pattern for fix tasks (1 observation, scope: small).",
+        "playbook/success-fix-medium": {
+            "content": "First-attempt success pattern for fix tasks (1 observation, scope: medium).",
             "source": "success-pattern",
             "success_count": 1,
             "confirmed_count": 2,
             "applicable_types": ["fix"],
+            "scope": "medium",
+            "scope_distribution": {"medium": 1},
+            "num_files_changed": 3,
+            "tests_added": False,
+            "first_attempt_success": True,
             "updated_at": _utcnow().isoformat(),
         },
     })
+    # 2 prior completions to satisfy noise filter
+    await _make_completed_task(db_session, project.id, task_type="fix", scope="medium")
+    await _make_completed_task(db_session, project.id, task_type="fix", scope="medium")
     task = await _make_completed_task(db_session, project.id, task_type="fix", scope="medium")
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
 
-    assert key == "success-fix"
-    entry = (project.design_doc or {})["playbook/success-fix"]
+    assert key == "success-fix-medium"
+    entry = (project.design_doc or {})["playbook/success-fix-medium"]
     assert entry["success_count"] == 2
     # confirmed_count is left untouched by capture_success_pattern
     assert entry["confirmed_count"] == 2
     assert "medium" in entry["content"]
     assert "2 observations" in entry["content"]
+    assert entry["scope_distribution"] == {"medium": 2}
 
 
 @pytest.mark.asyncio
@@ -325,16 +318,11 @@ async def test_capture_success_includes_related_files(db_session: AsyncSession):
     """capture_success_pattern includes the files touched in the entry content."""
     from app.playbook_learning import capture_success_pattern
 
-    project = await _make_project(db_session, design_doc={
-        "playbook/review-error-handling": {
-            "content": "error handling issues flagged",
-            "source": "review-extracted",
-            "applicable_types": ["refactor"],
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        },
-    })
+    project = await _make_project(db_session, design_doc={})
     files = ["backend/app/foo.py", "backend/app/bar.py"]
+    # 2 prior completions to satisfy noise filter
+    await _make_completed_task(db_session, project.id, task_type="refactor")
+    await _make_completed_task(db_session, project.id, task_type="refactor")
     task = await _make_completed_task(
         db_session, project.id,
         task_type="refactor", related_files=files,
@@ -343,34 +331,108 @@ async def test_capture_success_includes_related_files(db_session: AsyncSession):
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
 
-    assert key == "success-refactor"
-    entry = (project.design_doc or {})["playbook/success-refactor"]
+    assert key == "success-refactor-small"
+    entry = (project.design_doc or {})["playbook/success-refactor-small"]
     assert "foo.py" in entry["content"]
     assert "bar.py" in entry["content"]
 
 
 @pytest.mark.asyncio
-async def test_capture_success_auto_key_counts_as_negative(db_session: AsyncSession):
-    """playbook/auto-* entries created by _check_recurring_failures (no 'source' field)
-    are treated as failure-derived entries and satisfy the sampling gate."""
+async def test_capture_success_new_type_without_failures(db_session: AsyncSession):
+    """capture_success_pattern works for task types that have never failed
+    (cold-start fix: no failure-gate required)."""
     from app.playbook_learning import capture_success_pattern
 
-    project = await _make_project(db_session, design_doc={
-        # _check_recurring_failures does not set "source" — only key prefix "auto-"
-        "playbook/auto-code-error-deadbeef": {
-            "content": "WARNING: CODE_ERROR failures occurred 3 times",
-            "confirmed_count": 0,
-            "applicable_types": ["create"],
-            "updated_at": _utcnow().isoformat(),
-        },
-    })
-    task = await _make_completed_task(db_session, project.id, task_type="create")
+    project = await _make_project(db_session, design_doc={})
+    # Simulate a brand-new task type ('migrate') with 3 completions, no failures
+    await _make_completed_task(db_session, project.id, task_type="migrate", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="migrate", scope="small")
+    task = await _make_completed_task(db_session, project.id, task_type="migrate", scope="small")
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
 
-    assert key == "success-create"
-    assert "playbook/success-create" in (project.design_doc or {})
+    assert key == "success-migrate-small"
+    assert "playbook/success-migrate-small" in (project.design_doc or {})
+
+
+@pytest.mark.asyncio
+async def test_capture_success_metadata_fields(db_session: AsyncSession):
+    """New entries include num_files_changed, tests_added, first_attempt_success,
+    scope, and scope_distribution fields."""
+    from app.playbook_learning import capture_success_pattern
+
+    project = await _make_project(db_session, design_doc={})
+    files = ["backend/app/foo.py", "backend/testing/test_foo.py"]
+    await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+    task = await _make_completed_task(
+        db_session, project.id,
+        task_type="create", scope="medium", related_files=files,
+    )
+
+    key = await capture_success_pattern(task, db_session)
+    await db_session.flush()
+
+    assert key == "success-create-medium"
+    entry = (project.design_doc or {})["playbook/success-create-medium"]
+    assert entry["num_files_changed"] == 2
+    assert entry["tests_added"] is True  # test_foo.py matches /testing/ pattern
+    assert entry["first_attempt_success"] is True
+    assert entry["scope"] == "medium"
+    assert entry["scope_distribution"] == {"medium": 1}
+
+
+@pytest.mark.asyncio
+async def test_capture_success_per_scope_key(db_session: AsyncSession):
+    """Different scopes produce separate playbook entries."""
+    from app.playbook_learning import capture_success_pattern
+
+    project = await _make_project(db_session, design_doc={})
+    # 2 prior of each scope to satisfy threshold
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+
+    task_small = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    key_small = await capture_success_pattern(task_small, db_session)
+
+    task_medium = await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+    key_medium = await capture_success_pattern(task_medium, db_session)
+
+    await db_session.flush()
+
+    assert key_small == "success-create-small"
+    assert key_medium == "success-create-medium"
+    doc = project.design_doc or {}
+    assert "playbook/success-create-small" in doc
+    assert "playbook/success-create-medium" in doc
+
+
+@pytest.mark.asyncio
+async def test_capture_success_scope_distribution_accumulates(db_session: AsyncSession):
+    """scope_distribution tracks the count of successes at each scope level."""
+    from app.playbook_learning import capture_success_pattern
+
+    project = await _make_project(db_session, design_doc={})
+    # Pre-seed 2 prior completions for the threshold
+    await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
+
+    # First success: creates the entry
+    t1 = await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
+    await capture_success_pattern(t1, db_session)
+    await db_session.flush()
+
+    # Second success: updates scope_distribution
+    t2 = await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
+    await capture_success_pattern(t2, db_session)
+    await db_session.flush()
+
+    entry = (project.design_doc or {}).get("playbook/success-fix-small", {})
+    assert entry.get("success_count") == 2
+    assert entry.get("scope_distribution") == {"small": 2}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1027,3 +1089,682 @@ async def test_extract_review_feedback_updates_module_profiles(db_session: Async
     entry = feedback["backend/app/routes.py"]
     assert entry["total"] > 0
     assert "last_updated" in entry
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for _extract_failure_signature module-aware signatures
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_extract_failure_signature_includes_module_from_traceback():
+    """Python exception with a File traceback frame includes the module name in the signature."""
+    from app.playbook_learning import _extract_failure_signature
+
+    error = (
+        "Traceback (most recent call last):\n"
+        '  File "backend/app/auth.py", line 42, in <module>\n'
+        "ImportError: cannot import name 'oauth_client'\n"
+    )
+    sig = _extract_failure_signature("CODE_ERROR", error)
+    # Format: "importerror: auth: cannot import name 'oauth_client'"
+    assert sig.startswith("importerror: auth:")
+    assert "oauth_client" in sig
+
+
+def test_extract_failure_signature_no_traceback_no_module():
+    """Python exception without a File frame does not inject a module prefix."""
+    from app.playbook_learning import _extract_failure_signature
+
+    error = "ImportError: cannot import name 'foo'"
+    sig = _extract_failure_signature("CODE_ERROR", error)
+    assert "importerror" in sig
+    # No module injected — "auth:" or similar should not appear
+    assert ": auth:" not in sig
+    assert sig.startswith("importerror:")
+
+
+def test_extract_failure_signature_innermost_frame_wins():
+    """When multiple File frames exist, the innermost (last) provides the module name."""
+    from app.playbook_learning import _extract_failure_signature
+
+    error = (
+        "Traceback (most recent call last):\n"
+        '  File "backend/app/main.py", line 10, in startup\n'
+        '  File "backend/app/compute.py", line 55, in init\n'
+        "AttributeError: 'NoneType' object has no attribute 'zone'\n"
+    )
+    sig = _extract_failure_signature("CODE_ERROR", error)
+    assert "compute" in sig       # innermost frame
+    assert "main" not in sig      # outer frame should not appear
+
+
+def test_extract_failure_module_returns_none_when_no_frame():
+    """_extract_failure_module returns None for text without a File "..." line."""
+    from app.playbook_learning import _extract_failure_module
+
+    assert _extract_failure_module("some error without a traceback") is None
+    assert _extract_failure_module("") is None
+
+
+def test_extract_failure_module_strips_path_and_extension():
+    """_extract_failure_module extracts just the base module name."""
+    from app.playbook_learning import _extract_failure_module
+
+    text = 'file "backend/app/github.py", line 7, in handler'
+    assert _extract_failure_module(text) == "github"
+
+
+@pytest.mark.asyncio
+async def test_auto_playbook_stores_failure_module_and_references_in_content(
+    db_session: AsyncSession,
+):
+    """_maybe_auto_playbook stores _failure_module on task context and names the module
+    explicitly in the auto-generated playbook entry content."""
+    from app.playbook_learning import _maybe_auto_playbook, _extract_failure_signature
+
+    project = await _make_project(db_session)
+    error_with_traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "backend/app/auth.py", line 10, in <module>\n'
+        "ImportError: cannot import name 'oauth_client'\n"
+    )
+
+    # Pre-seed t1 and t2 with the matching signature so the count reaches 3
+    sig = _extract_failure_signature("CODE_ERROR", error_with_traceback)
+    t1 = await _make_failed_task(db_session, project.id, status_message=error_with_traceback)
+    t1.context = {"_failure_signature": sig}
+    t2 = await _make_failed_task(db_session, project.id, status_message=error_with_traceback)
+    t2.context = {"_failure_signature": sig}
+    await db_session.flush()
+
+    t3 = await _make_failed_task(db_session, project.id, status_message=error_with_traceback)
+    await _maybe_auto_playbook(t3, "CODE_ERROR", error_with_traceback, db_session)
+    await db_session.flush()
+
+    # Module stored on task context
+    assert t3.context.get("_failure_module") == "auth"
+
+    # Playbook entry references the module explicitly
+    doc = project.design_doc or {}
+    playbook_keys = [k for k in doc if k.startswith("playbook/")]
+    assert len(playbook_keys) == 1
+    entry = doc[playbook_keys[0]]
+    assert "auth" in entry["content"]
+    assert "module" in entry["content"].lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for _accumulate_direction_first_attempt
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_accumulate_direction_first_attempt_creates_entry():
+    """Creates a direction tally entry with counts from buckets."""
+    from app.playbook_learning import _accumulate_direction_first_attempt, _DIRECTION_FIRST_ATTEMPT_KEY
+
+    doc: dict = {}
+    buckets = {
+        "test-coverage": [{"desc": "missing test", "severity": "MAJOR", "iteration": 0}],
+        "style-conventions": [
+            {"desc": "wrong naming", "severity": "MINOR", "iteration": 0},
+            {"desc": "bad indent", "severity": "MINOR", "iteration": 0},
+        ],
+    }
+    _accumulate_direction_first_attempt(doc, "dir-abc123", buckets)
+
+    assert _DIRECTION_FIRST_ATTEMPT_KEY in doc
+    tally = doc[_DIRECTION_FIRST_ATTEMPT_KEY]["dir-abc123"]
+    assert tally["test-coverage"] == 1
+    assert tally["style-conventions"] == 2
+    assert tally["total"] == 3
+    assert "last_updated" in tally
+
+
+def test_accumulate_direction_first_attempt_accumulates_across_calls():
+    """Repeated calls for the same direction accumulate counts."""
+    from app.playbook_learning import _accumulate_direction_first_attempt, _DIRECTION_FIRST_ATTEMPT_KEY
+
+    doc: dict = {}
+    buckets = {"test-coverage": [{"desc": "x", "severity": "MAJOR", "iteration": 0}]}
+    _accumulate_direction_first_attempt(doc, "dir-abc", buckets)
+    _accumulate_direction_first_attempt(doc, "dir-abc", buckets)
+    _accumulate_direction_first_attempt(doc, "dir-abc", buckets)
+
+    tally = doc[_DIRECTION_FIRST_ATTEMPT_KEY]["dir-abc"]
+    assert tally["test-coverage"] == 3
+    assert tally["total"] == 3
+
+
+def test_accumulate_direction_first_attempt_noop_on_empty_buckets():
+    """No changes when buckets are empty."""
+    from app.playbook_learning import _accumulate_direction_first_attempt, _DIRECTION_FIRST_ATTEMPT_KEY
+
+    doc: dict = {}
+    _accumulate_direction_first_attempt(doc, "dir-xyz", {})
+    assert _DIRECTION_FIRST_ATTEMPT_KEY not in doc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for _maybe_auto_playbook_from_first_attempt
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_maybe_auto_playbook_creates_entry_at_threshold():
+    """Creates a first-attempt-pattern playbook entry when a category reaches the threshold."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook_from_first_attempt,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+        _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+    )
+
+    doc: dict = {
+        _DIRECTION_FIRST_ATTEMPT_KEY: {
+            "dir-abc123": {
+                "test-coverage": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+                "style-conventions": 2,
+                "total": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD + 2,
+                "last_updated": "2026-01-01T00:00:00",
+            }
+        }
+    }
+    created = _maybe_auto_playbook_from_first_attempt(doc, "dir-abc123", "create", "task-id-1")
+
+    assert len(created) == 1
+    key = created[0]
+    assert "test-coverage" in key
+    full_key = f"playbook/{key}"
+    assert full_key in doc
+    entry = doc[full_key]
+    assert entry["source"] == "first-attempt-pattern"
+    assert entry["rejection_count"] == _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD
+    assert "create" in entry["applicable_types"]
+    assert "test" in entry["content"]
+
+
+def test_maybe_auto_playbook_skips_below_threshold():
+    """No entry created when count is below threshold."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook_from_first_attempt,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+        _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+    )
+
+    doc: dict = {
+        _DIRECTION_FIRST_ATTEMPT_KEY: {
+            "dir-abc": {
+                "test-coverage": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD - 1,
+                "total": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD - 1,
+            }
+        }
+    }
+    created = _maybe_auto_playbook_from_first_attempt(doc, "dir-abc", "create", "task-id")
+    assert created == []
+
+
+def test_maybe_auto_playbook_deduplicates():
+    """Skips entry creation if key already exists."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook_from_first_attempt,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+        _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+    )
+
+    dir_slug = "dirabc123"[:8]  # matches the slug logic: direction_key[:8].replace("-","").replace("_","")
+    # Compute the key that would be generated for direction "dir-abc123"
+    direction_key = "dir-abc123"
+    expected_slug = direction_key[:8].replace("-", "").replace("_", "")
+    existing_key = f"playbook/first-attempt-{expected_slug}-test-coverage"
+
+    doc: dict = {
+        _DIRECTION_FIRST_ATTEMPT_KEY: {
+            direction_key: {
+                "test-coverage": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD + 2,
+                "total": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD + 2,
+            }
+        },
+        existing_key: {"content": "already exists", "source": "first-attempt-pattern"},
+    }
+    created = _maybe_auto_playbook_from_first_attempt(doc, direction_key, "create", "task-id")
+    assert created == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for scope inference in _maybe_auto_playbook
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_playbook_direction_scope_when_single_direction(db_session: AsyncSession):
+    """_maybe_auto_playbook marks scope=direction when all tasks in pattern share same direction."""
+    from app.playbook_learning import _maybe_auto_playbook
+
+    direction_id = "dir-abc-123"
+    project = await _make_project(db_session)
+
+    # Compute expected signature so prior tasks match in the DB query.
+    # _extract_failure_signature("PROVISION_FAILURE", msg) falls through to generic
+    # fallback and returns the first non-empty line stripped of paths/line-numbers.
+    expected_sig = "vm failed to start after provision attempt"
+
+    # Two prior tasks with same direction and same signature
+    t1 = Task(
+        project_id=project.id,
+        title="Task 1",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="vm failed to start after provision attempt",
+        context={"direction_id": direction_id, "_failure_signature": expected_sig},
+    )
+    t2 = Task(
+        project_id=project.id,
+        title="Task 2",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="vm failed to start after provision attempt",
+        context={"direction_id": direction_id, "_failure_signature": expected_sig},
+    )
+    db_session.add(t1)
+    db_session.add(t2)
+    await db_session.flush()
+
+    # Current task — same direction
+    t3 = Task(
+        project_id=project.id,
+        title="Task 3",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="vm failed to start after provision attempt",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(t3)
+    await db_session.flush()
+
+    key = await _maybe_auto_playbook(
+        t3, "PROVISION_FAILURE",
+        "vm failed to start after provision attempt",
+        db_session,
+    )
+    await db_session.flush()
+
+    assert key is not None
+    doc = project.design_doc or {}
+    entry = doc.get(f"playbook/{key}", {})
+    assert entry.get("scope") == "direction"
+    assert entry.get("learned_from_direction") == direction_id
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_playbook_universal_scope_when_multiple_directions(db_session: AsyncSession):
+    """_maybe_auto_playbook marks scope=universal when tasks span multiple directions."""
+    from app.playbook_learning import _maybe_auto_playbook
+
+    direction_a = "dir-aaa"
+    direction_b = "dir-bbb"
+    project = await _make_project(db_session)
+
+    expected_sig = "vm failed to start after provision attempt"
+
+    t1 = Task(
+        project_id=project.id,
+        title="Task 1",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="vm failed to start after provision attempt",
+        context={"direction_id": direction_a, "_failure_signature": expected_sig},
+    )
+    t2 = Task(
+        project_id=project.id,
+        title="Task 2",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="vm failed to start after provision attempt",
+        context={"direction_id": direction_b, "_failure_signature": expected_sig},
+    )
+    db_session.add(t1)
+    db_session.add(t2)
+    await db_session.flush()
+
+    t3 = Task(
+        project_id=project.id,
+        title="Task 3",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="vm failed to start after provision attempt",
+        context={"direction_id": direction_a},
+    )
+    db_session.add(t3)
+    await db_session.flush()
+
+    key = await _maybe_auto_playbook(
+        t3, "PROVISION_FAILURE",
+        "vm failed to start after provision attempt",
+        db_session,
+    )
+    await db_session.flush()
+
+    assert key is not None
+    doc = project.design_doc or {}
+    entry = doc.get(f"playbook/{key}", {})
+    assert entry.get("scope") == "universal"
+    assert entry.get("learned_from_direction") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for extract_review_feedback_to_playbook — first-attempt (iteration < 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_accumulates_on_first_iteration(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook accumulates direction data on iteration == 1."""
+    from app.playbook_learning import extract_review_feedback_to_playbook, _DIRECTION_FIRST_ATTEMPT_KEY
+
+    project = await _make_project(db_session, design_doc={})
+    review_history = [
+        {
+            "iteration": 0,
+            "issues": [
+                {"description": "missing unit tests for the handler", "severity": "MAJOR"},
+                {"description": "no test coverage for edge cases", "severity": "MINOR"},
+            ],
+        },
+    ]
+    review_loop = {"iteration": 1, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="First-iter task",
+        payloads=[{"type": "create", "prompt": "add handler"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "direction_summary": {"id": "dir-cafebabe-1234", "title": "Test direction"},
+        },
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=99, original_task_type="create", session=db_session
+    )
+    await db_session.flush()
+
+    doc = project.design_doc or {}
+
+    # No full playbook entry created for iteration < 3
+    review_keys = [k for k in doc if k.startswith("playbook/review-")]
+    assert review_keys == [], f"Should not create review-extracted entries at iteration 1, got {review_keys}"
+
+    # Direction tally was accumulated
+    assert _DIRECTION_FIRST_ATTEMPT_KEY in doc, "direction_first_attempt_feedback should be written"
+    tally = doc[_DIRECTION_FIRST_ATTEMPT_KEY].get("dir-cafebabe-1234")
+    assert tally is not None
+    assert tally.get("test-coverage", 0) >= 1
+    assert tally.get("total", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_no_first_attempt_on_empty_history(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook returns [] with no review_history."""
+    from app.playbook_learning import extract_review_feedback_to_playbook, _DIRECTION_FIRST_ATTEMPT_KEY
+
+    project = await _make_project(db_session, design_doc={})
+    review_loop = {"iteration": 1, "review_history": []}
+    task = Task(
+        project_id=project.id,
+        title="Empty history task",
+        payloads=[{"type": "create", "prompt": "add handler"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=1, original_task_type="create", session=db_session
+    )
+    assert keys == []
+    doc = project.design_doc or {}
+    assert _DIRECTION_FIRST_ATTEMPT_KEY not in doc
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_auto_playbook_at_threshold(db_session: AsyncSession):
+    """Auto-generates a first-attempt-pattern entry when direction tally hits the threshold."""
+    from app.playbook_learning import (
+        extract_review_feedback_to_playbook,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+        _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+    )
+
+    direction_id = "dir-deadbeef-5678"
+    # Pre-populate the tally so the next call pushes test-coverage over the threshold
+    pre_count = _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD - 1
+    project = await _make_project(db_session, design_doc={
+        _DIRECTION_FIRST_ATTEMPT_KEY: {
+            direction_id: {
+                "test-coverage": pre_count,
+                "total": pre_count,
+                "last_updated": "2026-01-01T00:00:00",
+            }
+        }
+    })
+    review_history = [
+        {
+            "iteration": 0,
+            "issues": [
+                {"description": "missing unit tests", "severity": "MAJOR"},
+            ],
+        },
+    ]
+    review_loop = {"iteration": 1, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="Threshold task",
+        payloads=[{"type": "create", "prompt": "add something"}],
+        status=TaskStatus.COMPLETED,
+        context={"direction_summary": {"id": direction_id, "title": "Test direction"}},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=100, original_task_type="create", session=db_session
+    )
+    await db_session.flush()
+
+    doc = project.design_doc or {}
+    # A first-attempt-pattern entry should have been auto-created
+    fa_keys = [k for k in doc if k.startswith("playbook/first-attempt-")]
+    assert len(fa_keys) == 1, f"Expected 1 first-attempt entry, got {fa_keys}"
+    entry = doc[fa_keys[0]]
+    assert entry["source"] == "first-attempt-pattern"
+    assert entry["rejection_count"] == _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD
+    # The auto-created key is in the returned list
+    assert any("first-attempt" in k for k in keys)
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_still_creates_entries_at_3_plus(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook still creates review-extracted entries at iteration >= 3."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    project = await _make_project(db_session, design_doc={})
+    review_history = [
+        {
+            "iteration": 0,
+            "issues": [
+                {"description": "missing unit tests", "severity": "MAJOR"},
+            ],
+        },
+        {
+            "iteration": 1,
+            "issues": [
+                {"description": "still missing tests", "severity": "MAJOR"},
+            ],
+        },
+        {
+            "iteration": 2,
+            "issues": [],
+        },
+    ]
+    review_loop = {"iteration": 3, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="Multi-iter task",
+        payloads=[{"type": "create", "prompt": "add endpoint"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=42, original_task_type="create", session=db_session
+    )
+    await db_session.flush()
+
+    doc = project.design_doc or {}
+    review_keys = [k for k in doc if k.startswith("playbook/review-")]
+    assert len(review_keys) >= 1, "Should create at least 1 review-extracted entry at iteration 3"
+    assert any("review-test-coverage" in k for k in review_keys)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for scope inference in extract_review_feedback_to_playbook
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_module_scope_when_related_files_present(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook sets scope=module and stores related_files when present."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    direction_id = "dir-xyz-456"
+    project = await _make_project(db_session, design_doc={})
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {"description": "missing test coverage for new function", "severity": "MAJOR"},
+                {"description": "no unit test for edge case", "severity": "MINOR"},
+                {"description": "add test for error path", "severity": "MAJOR"},
+            ],
+        },
+        {"iteration": 2, "issues": [{"description": "still missing tests", "severity": "MAJOR"}]},
+        {"iteration": 3, "issues": []},
+    ]
+    review_loop = {"iteration": 3, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="Test task",
+        payloads=[{"type": "create", "prompt": "add endpoint"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "direction_id": direction_id,
+            "related_files": ["backend/app/routes.py", "backend/app/models.py"],
+        },
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=99, original_task_type="create", session=db_session
+    )
+    await db_session.flush()
+
+    assert keys, "Expected at least one entry to be created"
+    doc = project.design_doc or {}
+    for key in keys:
+        if not key.startswith("review-"):
+            continue  # skip first-attempt-pattern keys; scope only applies to review-extracted
+        entry = doc[f"playbook/{key}"]
+        assert entry.get("scope") == "module", f"Expected module scope, got {entry.get('scope')}"
+        assert "backend/app/routes.py" in entry.get("related_files", [])
+        assert entry.get("learned_from_direction") == direction_id
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_universal_scope_when_no_related_files(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook sets scope=universal when no related_files."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    project = await _make_project(db_session, design_doc={})
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {"description": "missing test coverage for new function", "severity": "MAJOR"},
+                {"description": "no unit test for edge case", "severity": "MINOR"},
+                {"description": "add test for error path", "severity": "MAJOR"},
+            ],
+        },
+        {"iteration": 2, "issues": [{"description": "still missing tests", "severity": "MAJOR"}]},
+        {"iteration": 3, "issues": []},
+    ]
+    review_loop = {"iteration": 3, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="Test task",
+        payloads=[{"type": "create", "prompt": "add endpoint"}],
+        status=TaskStatus.COMPLETED,
+        context={},  # No related_files
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=100, original_task_type="create", session=db_session
+    )
+    await db_session.flush()
+
+    assert keys, "Expected at least one entry to be created"
+    doc = project.design_doc or {}
+    for key in keys:
+        if not key.startswith("review-"):
+            continue  # skip first-attempt-pattern keys
+        entry = doc[f"playbook/{key}"]
+        assert entry.get("scope") == "universal", f"Expected universal scope, got {entry.get('scope')}"
+        assert "related_files" not in entry
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_stores_learned_from_direction(db_session: AsyncSession):
+    """extract_review_feedback_to_playbook stores learned_from_direction from task context."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    direction_id = "dir-provenance-test"
+    project = await _make_project(db_session, design_doc={})
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {"description": "missing test coverage for new function", "severity": "MAJOR"},
+                {"description": "no unit test for edge case", "severity": "MINOR"},
+                {"description": "add test for error path", "severity": "MAJOR"},
+            ],
+        },
+        {"iteration": 2, "issues": [{"description": "still missing tests", "severity": "MAJOR"}]},
+        {"iteration": 3, "issues": []},
+    ]
+    review_loop = {"iteration": 3, "review_history": review_history}
+    task = Task(
+        project_id=project.id,
+        title="Test task",
+        payloads=[{"type": "fix", "prompt": "fix the bug"}],
+        status=TaskStatus.COMPLETED,
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    keys = await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=101, original_task_type="fix", session=db_session
+    )
+    await db_session.flush()
+
+    assert keys
+    doc = project.design_doc or {}
+    for key in keys:
+        if not key.startswith("review-"):
+            continue  # skip first-attempt-pattern keys
+        entry = doc[f"playbook/{key}"]
+        assert entry.get("learned_from_direction") == direction_id

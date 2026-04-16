@@ -1119,7 +1119,7 @@ async def _process_post_commit(
                                             except Exception as _ar_exc:
                                                 logger.warning("[AUTO-REMEDIATION] Failed to post result message: %s", _ar_exc)
                                         # Extract review feedback as persistent playbook entries
-                                        # when a PR merges after a multi-iteration review cycle (3+)
+                                        # on every merge (captures first-attempt data at any iteration)
                                         try:
                                             from app.playbook_learning import extract_review_feedback_to_playbook
                                             _orig_task_type = orig.first_payload.get("type", "create")

@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from datetime import timedelta
 from typing import Any, Optional
 
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -235,6 +236,20 @@ def maybe_archive_for_capacity(doc: dict, new_entry_estimate: int = 0) -> dict:
 # Signature extraction
 # ---------------------------------------------------------------------------
 
+def _extract_failure_module(error_lower: str) -> Optional[str]:
+    """Return the base module name from the innermost traceback frame, if present.
+
+    For example, given a traceback containing ``File "backend/app/auth.py"``,
+    returns ``"auth"``.  Returns ``None`` when no ``File "..."`` pattern is found.
+    """
+    frame_matches = re.findall(r'file "([^"]+\.py)"', error_lower)
+    if not frame_matches:
+        return None
+    innermost = frame_matches[-1]
+    base = re.sub(r'.*/', '', innermost)       # strip directory prefix
+    return re.sub(r'\.py$', '', base) or None  # strip .py extension
+
+
 def _extract_failure_signature(
     failure_class: str,
     error_summary: str,
@@ -246,6 +261,11 @@ def _extract_failure_signature(
     The goal is reproducibility: the same root cause should produce the same
     signature across different tasks so the counter in ``_maybe_auto_playbook``
     accumulates correctly.
+
+    For Python exceptions with a traceback, the module name from the innermost
+    frame is embedded in the signature to distinguish per-module failures:
+    e.g. ``"importerror: auth: cannot import name foo"`` rather than
+    ``"importerror: cannot import name foo"``.
     """
     error_lower = (error_summary or "").lower()
 
@@ -254,6 +274,9 @@ def _extract_failure_signature(
         return f"timeout-{task_type or 'unknown'}-{scope or 'medium'}"
 
     if failure_class == "CODE_ERROR":
+        # Extract module from innermost traceback frame for module-aware signatures
+        module_name = _extract_failure_module(error_lower)
+
         # Well-known Python exception names give stable signatures
         python_exc = re.search(
             r'(modulenotfounderror|importerror|typeerror|attributeerror|'
@@ -266,7 +289,15 @@ def _extract_failure_signature(
             # Drop file-path tokens (contain /) and line-number suffixes
             raw = re.sub(r'\S*/\S+', '', raw)
             raw = re.sub(r':\d+', ':', raw)
-            return re.sub(r'\s+', ' ', raw).strip()[:80]
+            clean = re.sub(r'\s+', ' ', raw).strip()
+            if module_name:
+                # Inject module context: "importerror: auth: cannot import name foo"
+                colon_idx = clean.find(':')
+                if colon_idx >= 0:
+                    exc_type = clean[:colon_idx].strip()
+                    rest = clean[colon_idx + 1:].strip()
+                    clean = f"{exc_type}: {module_name}: {rest}"
+            return clean[:80]
 
         # Test-runner failure lines: "FAILED backend/testing/test_foo.py"
         fail_match = re.search(r'fail(?:ed)?[\s:]+[\w/_.-]+\.py', error_lower)
@@ -354,9 +385,16 @@ async def _maybe_auto_playbook(
     signature = _extract_failure_signature(
         failure_class, error_summary, task_type, task_scope
     )
+    # Store module context for cross-referencing with module_feedback_profiles
+    module_name = (
+        _extract_failure_module((error_summary or "").lower())
+        if failure_class == "CODE_ERROR" else None
+    )
 
     ctx = dict(task.context or {})
     ctx["_failure_signature"] = signature
+    if module_name:
+        ctx["_failure_module"] = module_name
     task.context = ctx
     flag_modified(task, "context")
     session.add(task)
@@ -405,11 +443,30 @@ async def _maybe_auto_playbook(
     # ── 4. Create auto-generated playbook entry ─────────────────────────────
     recent_ids = [str(t.id) for t in matching[-2:]] + [str(task.id)]
     hint = _hint_for_failure_class(failure_class)
+    module_note = f" Repeated failures in module '{module_name}'." if module_name else ""
     content = (
         f"Repeated failure pattern ({total_count}x in {window_days}d): {signature}. "
         f"Recent tasks: {', '.join(recent_ids)}. "
         f"Common fix: {hint}"
+        f"{module_note}"
     )
+
+    # Infer scope: if ALL tasks in the pattern have a direction_id and they all
+    # share the same one, mark as direction-scoped.  Tasks without a direction_id
+    # must NOT be silently dropped — their presence means the pattern is universal.
+    all_pattern_tasks = matching + [task]
+    all_have_direction = all((t.context or {}).get("direction_id") for t in all_pattern_tasks)
+    direction_ids = {
+        (t.context or {}).get("direction_id")
+        for t in all_pattern_tasks
+        if (t.context or {}).get("direction_id")
+    }
+    if all_have_direction and len(direction_ids) == 1:
+        entry_scope: str = "direction"
+        learned_from_direction: Optional[str] = next(iter(direction_ids))
+    else:
+        entry_scope = "universal"
+        learned_from_direction = None
 
     new_entry = {
         "content": content,
@@ -425,6 +482,8 @@ async def _maybe_auto_playbook(
         "updated_at": _utcnow().isoformat(),
         "confirmed_count": 0,
         "source": "auto-generated",
+        "scope": entry_scope,
+        "learned_from_direction": learned_from_direction,
     }
 
     meta = dict(doc.get("_meta", {"revision": 0}))
@@ -489,98 +548,93 @@ def _categorize_review_issues(review_history: list) -> dict[str, list[dict]]:
 # Success-pattern capture
 # ---------------------------------------------------------------------------
 
-_PLAYBOOK_DEFAULT_TYPES = frozenset({
-    "create", "fix", "refactor", "review", "qa", "smoketest",
-    "deps", "migrate", "debug", "docs",
-})
-
-
 async def capture_success_pattern(
     task: Task,
     session: AsyncSession,
 ) -> Optional[str]:
     """Capture a positive pattern from a first-attempt success as a playbook entry.
 
-    Only creates an entry when the task type already has failure-derived playbook
-    entries (``source='auto-generated'``, ``source='review-extracted'``, or a
-    ``playbook/auto-*`` key written by ``_check_recurring_failures``).  This
-    sampling gate ensures the playbook only records successes for task types that
-    are known to be challenging, avoiding noise from routine completions.
+    Uses a total-completions noise filter: only captures a success pattern after the
+    task type has accumulated at least 3 total completions (successful or failed) in the
+    project.  This avoids noise from one-off tasks without requiring failures first,
+    solving the cold-start problem for new task types like 'migrate' or 'perf'.
 
-    One entry per task type (key ``playbook/success-{task_type}``) is maintained.
-    If the entry already exists its ``success_count`` is incremented and the
-    content refreshed.  Entries are tagged ``source='success-pattern'`` to
-    distinguish them from failure-derived entries and participate in the same
-    ``confirmed_count``-based priority ordering.
+    One entry per (task_type, scope) pair — e.g. ``playbook/success-create-small``.
+    Each entry tracks success_count, scope_distribution (how many successes per scope
+    level), and lightweight metadata: num_files_changed, tests_added, first_attempt_success.
 
-    Returns the short key (e.g. ``"success-create"``) if an entry was created or
-    updated, ``None`` if the sampling gate was not met.
+    Returns the short key (e.g. ``"success-create-small"``) if an entry was created or
+    updated, ``None`` if the noise filter was not met.
     """
     task_type = task.first_payload.get("type", "")
     if not task_type:
         return None
 
+    scope: str = (task.context or {}).get("scope") or "unspecified"
+    related_files: list[str] = list((task.context or {}).get("related_files") or [])
+    num_files = len(related_files)
+    tests_added = any(
+        "/test_" in f or f.startswith("test_")
+        or ".test." in f or ".spec." in f
+        or "/tests/" in f or "/testing/" in f
+        for f in related_files
+    )
+
     project = await session.get(Project, task.project_id)
     if not project:
         return None
 
-    doc = dict(project.design_doc or {})
-
-    # Sampling gate: require at least one failure-derived entry applicable to
-    # this task type before capturing a success pattern.
-    has_negative_entry = False
-    for pk, pv in doc.items():
-        if not pk.startswith("playbook/") or not isinstance(pv, dict):
-            continue
-        entry_source = pv.get("source", "")
-        # _check_recurring_failures writes auto-* keys but omits "source"; detect by key prefix.
-        is_negative = (
-            entry_source in ("auto-generated", "review-extracted")
-            or pk.startswith("playbook/auto-")
+    # Noise filter: require at least 3 total completions (success or failure) for
+    # this task type before capturing a success pattern.  Use a COUNT query with
+    # JSONB type filter to avoid loading all project tasks into memory.
+    prior_count = (await session.execute(
+        select(func.count()).select_from(Task).where(
+            Task.project_id == task.project_id,
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.id != task.id,
+            Task.payloads[0]["type"].as_string() == task_type,
         )
-        if not is_negative:
-            continue
-        applicable = pv.get("applicable_types")
-        if applicable is not None:
-            if task_type in applicable:
-                has_negative_entry = True
-                break
-        elif task_type in _PLAYBOOK_DEFAULT_TYPES:
-            # Entries without applicable_types apply to all default task types.
-            has_negative_entry = True
-            break
+    )).scalar_one()
+    same_type_count = prior_count + 1  # +1 for the current task
 
-    if not has_negative_entry:
+    if same_type_count < 3:
+        logger.debug(
+            "[SUCCESS_PLAYBOOK] project=%s type=%s: only %d completion(s) — noise filter not met",
+            task.project_id, task_type, same_type_count,
+        )
         return None
 
-    # One entry per task type — create on first observation, update thereafter.
-    key = f"success-{task_type}"
-    playbook_full_key = f"playbook/{key}"
+    doc = dict(project.design_doc or {})
 
-    related_files: list[str] = list((task.context or {}).get("related_files") or [])
-    scope: str = (task.context or {}).get("scope") or ""
+    # One entry per (task_type, scope) pair.
+    scope_slug = scope.lower().replace(" ", "-")
+    key = f"success-{task_type}-{scope_slug}"
+    playbook_full_key = f"playbook/{key}"
     files_note = f" Files: {', '.join(related_files[:5])}." if related_files else ""
 
     existing = doc.get(playbook_full_key)
     if existing and isinstance(existing, dict):
         entry = dict(existing)
         count = entry.get("success_count", 1) + 1
+        scope_dist = dict(entry.get("scope_distribution") or {})
+        scope_dist[scope] = scope_dist.get(scope, 0) + 1
         entry["success_count"] = count
+        entry["scope_distribution"] = scope_dist
+        entry["num_files_changed"] = num_files
+        entry["tests_added"] = tests_added
         entry["updated_at"] = _utcnow().isoformat()
         entry["content"] = (
             f"First-attempt success pattern for {task_type} tasks "
-            f"({count} observations, latest scope: {scope or 'unspecified'}).{files_note} "
-            f"These tasks completed cleanly without review iterations despite "
-            f"this task type having prior failures in this project."
+            f"({count} observations, latest scope: {scope}).{files_note} "
+            f"Scope distribution: {scope_dist}."
         )
         doc[playbook_full_key] = entry
         action = "updated"
     else:
         content = (
             f"First-attempt success pattern for {task_type} tasks "
-            f"(1 observation, scope: {scope or 'unspecified'}).{files_note} "
-            f"This task completed cleanly without review iterations despite "
-            f"this task type having prior failures in this project."
+            f"(1 observation, scope: {scope}).{files_note} "
+            f"Files changed: {num_files}, tests added: {tests_added}."
         )
         new_entry = {
             "content": content,
@@ -590,6 +644,11 @@ async def capture_success_pattern(
             "success_count": 1,
             "source": "success-pattern",
             "applicable_types": [task_type],
+            "scope": scope,
+            "num_files_changed": num_files,
+            "tests_added": tests_added,
+            "first_attempt_success": True,
+            "scope_distribution": {scope: 1},
         }
         doc = maybe_archive_for_capacity(doc, len(json.dumps(new_entry).encode()))
         doc[playbook_full_key] = new_entry
@@ -606,14 +665,17 @@ async def capture_success_pattern(
     session.add(project)
 
     logger.info(
-        "[SUCCESS_PLAYBOOK] project=%s %s entry '%s' for task_type=%s",
-        task.project_id, action, key, task_type,
+        "[SUCCESS_PLAYBOOK] project=%s %s entry '%s' for task_type=%s scope=%s",
+        task.project_id, action, key, task_type, scope,
     )
     return key
 
 
 _MODULE_FEEDBACK_KEY = "module_feedback"
 _MODULE_FEEDBACK_MAX_ENTRIES = 50
+
+_DIRECTION_FIRST_ATTEMPT_KEY = "direction_first_attempt_feedback"
+_FIRST_ATTEMPT_PLAYBOOK_THRESHOLD = 5
 
 
 def _update_module_feedback_profiles(
@@ -661,6 +723,76 @@ def _update_module_feedback_profiles(
     doc[_MODULE_FEEDBACK_KEY] = profiles
 
 
+def _accumulate_direction_first_attempt(
+    doc: dict,
+    direction_key: str,
+    buckets: dict[str, list[dict]],
+) -> None:
+    """Accumulate first-attempt review rejection counts at the direction level (in-place).
+
+    Stores a running tally under ``doc["direction_first_attempt_feedback"][direction_key]``
+    with one integer count per review category.  This is a lightweight structure — not a
+    full playbook entry — designed for high-frequency updates (every 1-iteration review).
+    """
+    if not buckets:
+        return
+    now_iso = _utcnow().isoformat()
+    tally: dict = dict(doc.get(_DIRECTION_FIRST_ATTEMPT_KEY) or {})
+    entry: dict = dict(tally.get(direction_key) or {})
+    for cat, issues in buckets.items():
+        if issues:
+            entry[cat] = entry.get(cat, 0) + len(issues)
+    entry["total"] = entry.get("total", 0) + sum(len(v) for v in buckets.values() if v)
+    entry["last_updated"] = now_iso
+    tally[direction_key] = entry
+    doc[_DIRECTION_FIRST_ATTEMPT_KEY] = tally
+
+
+def _maybe_auto_playbook_from_first_attempt(
+    doc: dict,
+    direction_key: str,
+    task_type: str,
+    task_id: str,
+    threshold: int = _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+) -> list[str]:
+    """Create playbook entries for direction categories that hit the first-attempt threshold.
+
+    Returns the list of newly created playbook keys (short form, without ``playbook/`` prefix).
+    Skips categories that already have a ``playbook/first-attempt-*`` entry.
+    """
+    tally = (doc.get(_DIRECTION_FIRST_ATTEMPT_KEY) or {}).get(direction_key) or {}
+    created: list[str] = []
+    for cat, count in tally.items():
+        if cat in ("total", "last_updated") or not isinstance(count, int):
+            continue
+        if count < threshold:
+            continue
+        # Use a short direction slug to keep keys readable
+        dir_slug = direction_key[:8].replace("-", "").replace("_", "") or "proj"
+        key = f"first-attempt-{dir_slug}-{cat}"
+        full_key = f"playbook/{key}"
+        if full_key in doc:
+            continue
+        content = (
+            f"First-attempt rejection pattern (direction {direction_key[:16]}): "
+            f"{cat.replace('-', ' ')} issues have been flagged {count}x on first try. "
+            f"Agents in this direction consistently miss {cat.replace('-', ' ')} requirements "
+            f"before submitting. Pay special attention to {cat.replace('-', ' ')} before opening a PR."
+        )
+        doc[full_key] = {
+            "content": content,
+            "source_task_id": task_id,
+            "updated_at": _utcnow().isoformat(),
+            "confirmed_count": 0,
+            "source": "first-attempt-pattern",
+            "applicable_types": [task_type],
+            "direction_key": direction_key,
+            "rejection_count": count,
+        }
+        created.append(key)
+    return created
+
+
 async def extract_review_feedback_to_playbook(
     task: Task,
     review_loop: dict,
@@ -668,26 +800,25 @@ async def extract_review_feedback_to_playbook(
     original_task_type: str,
     session: AsyncSession,
 ) -> list[str]:
-    """Extract recurring review feedback themes and persist them as playbook entries.
+    """Extract review feedback and accumulate per-direction learning on every merge.
 
-    Called after a PR merges following a multi-iteration review cycle (3+ iterations).
-    Creates at most 2 entries per completed review cycle, tagged with
-    ``source='review-extracted'`` so they are distinguishable from failure-pattern
-    and manually written entries.
+    Behaviour by iteration count:
+    - Any iteration (≥1): update per-module feedback profiles; accumulate direction-level
+      first-attempt rejection tallies from the iteration-0 review entry.
+    - iteration ≥ 3: additionally create up to 2 full ``review-extracted`` playbook entries
+      (the existing high-signal path for multi-cycle reviews).
+    - iteration < 1 or no review_history: no-op.
 
-    Deduplicates by playbook key: if ``playbook/review-<category>`` already exists
-    for the project the entry is skipped.
+    When a direction accumulates ``_FIRST_ATTEMPT_PLAYBOOK_THRESHOLD`` (default 5)
+    first-attempt rejections in a single category, a targeted ``first-attempt-pattern``
+    playbook entry is auto-generated.
 
     Returns the list of created playbook keys (may be empty).
     """
     iteration = review_loop.get("iteration", 0)
     review_history = review_loop.get("review_history") or []
 
-    if iteration < 3 or not review_history:
-        return []
-
-    buckets = _categorize_review_issues(review_history)
-    if not buckets:
+    if not review_history:
         return []
 
     project = await session.get(Project, task.project_id)
@@ -696,57 +827,85 @@ async def extract_review_feedback_to_playbook(
 
     doc = dict(project.design_doc or {})
 
-    # Update per-module feedback profiles with files from this task
+    # Always update per-module feedback profiles regardless of iteration count
+    buckets = _categorize_review_issues(review_history)
     related_files: list[str] = list((task.context or {}).get("related_files") or [])
     module_profiles_updated = bool(related_files and buckets)
     _update_module_feedback_profiles(doc, related_files, buckets)
 
-    # Pick the top-2 categories by severity-weighted score (CRITICAL=3, MAJOR=2, MINOR=1)
-    _severity_weights = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
-    top_cats = sorted(
-        buckets.items(),
-        key=lambda kv: sum(_severity_weights.get(i["severity"], 1) for i in kv[1]),
-        reverse=True,
-    )[:2]
-
-    created_keys: list[str] = []
-    for cat_name, issues in top_cats:
-        playbook_full_key = f"playbook/review-{cat_name}"
-
-        if playbook_full_key in doc:
-            logger.debug(
-                "[REVIEW_PLAYBOOK] project=%s key='%s' already exists — skipping",
-                task.project_id, playbook_full_key,
+    # Accumulate direction-level first-attempt rejection data (iteration-0 entry only)
+    direction_key = str(
+        (task.context or {}).get("direction_summary", {}).get("id") or "_project"
+    )
+    first_review_entries = [e for e in review_history if e.get("iteration", 999) == 0]
+    first_attempt_keys: list[str] = []
+    direction_tally_updated = False
+    if first_review_entries:
+        first_attempt_buckets = _categorize_review_issues(first_review_entries)
+        if first_attempt_buckets:
+            _accumulate_direction_first_attempt(doc, direction_key, first_attempt_buckets)
+            direction_tally_updated = True
+            first_attempt_keys = _maybe_auto_playbook_from_first_attempt(
+                doc, direction_key, original_task_type, str(task.id)
             )
-            continue
 
-        # Surface up to 3 highest-severity examples
-        severity_order = {"CRITICAL": 0, "MAJOR": 1, "MINOR": 2}
-        top_issues = sorted(issues, key=lambda x: severity_order.get(x["severity"], 3))[:3]
-        examples = "; ".join(i["desc"] for i in top_issues if i.get("desc"))
+    # Determine provenance and scope for review-extracted entries (used in >= 3 iteration path)
+    direction_id = (task.context or {}).get("direction_id")
+    entry_scope = "module" if related_files else "universal"
 
-        content = (
-            f"Review pattern from PR #{pr_number} ({iteration} iterations): "
-            f"{cat_name.replace('-', ' ')} issues were repeatedly flagged. "
-            f"Examples: {examples[:300]}. "
-            f"Applicable to: {original_task_type} tasks."
-        )
+    created_keys: list[str] = list(first_attempt_keys)
 
-        new_entry = {
-            "content": content,
-            "source_task_id": str(task.id),
-            "updated_at": _utcnow().isoformat(),
-            "confirmed_count": 0,
-            "source": "review-extracted",
-            "applicable_types": [original_task_type],
-            "pr_number": pr_number,
-            "iteration_count": iteration,
-        }
-        doc = maybe_archive_for_capacity(doc, len(json.dumps(new_entry).encode()))
-        doc[playbook_full_key] = new_entry
-        created_keys.append(f"review-{cat_name}")
+    # Create full playbook entries only for 3+ iteration reviews
+    if iteration >= 3 and buckets:
+        # Pick the top-2 categories by severity-weighted score (CRITICAL=3, MAJOR=2, MINOR=1)
+        _severity_weights = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
+        top_cats = sorted(
+            buckets.items(),
+            key=lambda kv: sum(_severity_weights.get(i["severity"], 1) for i in kv[1]),
+            reverse=True,
+        )[:2]
 
-    if created_keys or module_profiles_updated:
+        for cat_name, issues in top_cats:
+            playbook_full_key = f"playbook/review-{cat_name}"
+
+            if playbook_full_key in doc:
+                logger.debug(
+                    "[REVIEW_PLAYBOOK] project=%s key='%s' already exists — skipping",
+                    task.project_id, playbook_full_key,
+                )
+                continue
+
+            # Surface up to 3 highest-severity examples
+            severity_order = {"CRITICAL": 0, "MAJOR": 1, "MINOR": 2}
+            top_issues = sorted(issues, key=lambda x: severity_order.get(x["severity"], 3))[:3]
+            examples = "; ".join(i["desc"] for i in top_issues if i.get("desc"))
+
+            content = (
+                f"Review pattern from PR #{pr_number} ({iteration} iterations): "
+                f"{cat_name.replace('-', ' ')} issues were repeatedly flagged. "
+                f"Examples: {examples[:300]}. "
+                f"Applicable to: {original_task_type} tasks."
+            )
+
+            entry: dict = {
+                "content": content,
+                "source_task_id": str(task.id),
+                "updated_at": _utcnow().isoformat(),
+                "confirmed_count": 0,
+                "source": "review-extracted",
+                "applicable_types": [original_task_type],
+                "pr_number": pr_number,
+                "iteration_count": iteration,
+                "scope": entry_scope,
+                "learned_from_direction": direction_id,
+            }
+            if entry_scope == "module":
+                entry["related_files"] = related_files
+            doc = maybe_archive_for_capacity(doc, len(json.dumps(entry).encode()))
+            doc[playbook_full_key] = entry
+            created_keys.append(f"review-{cat_name}")
+
+    if created_keys or module_profiles_updated or direction_tally_updated:
         meta = dict(doc.get("_meta", {"revision": 0}))
         meta["revision"] = meta.get("revision", 0) + 1
         meta["last_updated"] = _utcnow().isoformat()
