@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type React from 'react';
 import { Check, ChevronDown, ChevronRight, ChevronUp, Pencil, Trash2, X, Zap } from 'lucide-react';
 import { BarChart, Bar, Cell, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts';
@@ -72,6 +72,7 @@ export function DirectionCard({
   onViewFindings, onNavigateToTask,
 }: DirectionCardProps) {
   const forceConfirmRef = useRef<HTMLDivElement | null>(null);
+  const [expandedNotes, setExpandedNotes] = useState<Set<number>>(new Set());
 
   // Close force-confirm popover on outside click
   useEffect(() => {
@@ -501,9 +502,35 @@ export function DirectionCard({
           {d.notes && d.notes.length > 0 && (
             <div className="mt-2 p-1.5 bg-neutral-800/30 border border-neutral-700/40 rounded text-xs">
               <div className="text-neutral-500 font-medium mb-1">Agent notes ({d.notes.length}):</div>
-              {d.notes.slice(-3).map((n, ni) => (
-                <div key={ni} className="text-neutral-500 leading-relaxed">• {n.text.slice(0, 120)}</div>
-              ))}
+              {d.notes.slice(-3).map((n, ni) => {
+                const expanded = expandedNotes.has(ni);
+                const truncated = n.text.length > 200;
+                const body = expanded || !truncated ? n.text : `${n.text.slice(0, 200)}…`;
+                return (
+                  <div
+                    key={ni}
+                    className={`text-neutral-500 leading-relaxed break-words ${truncated ? 'cursor-pointer hover:text-neutral-400' : ''}`}
+                    onClick={() => {
+                      if (!truncated) return;
+                      setExpandedNotes((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(ni)) next.delete(ni);
+                        else next.add(ni);
+                        return next;
+                      });
+                    }}
+                    role={truncated ? 'button' : undefined}
+                    tabIndex={truncated ? 0 : undefined}
+                  >
+                    • {body}
+                    {truncated && (
+                      <span className="ml-1 text-neutral-600 text-[10px]">
+                        {expanded ? '(click to collapse)' : '(click to expand)'}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
           {d.pending_update && (
