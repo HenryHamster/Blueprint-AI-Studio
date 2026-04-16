@@ -955,11 +955,25 @@ export async function captureTestBaseline(
  * newly-broken tests and only counts new failures toward task FAILED status.
  * Returns whether tests passed and whether failures were detected (for commit note).
  */
+
+/** Extracts 'Interfaces to preserve' and 'Key dependencies' sections from analysis context. */
+function condensedAnalysisSections(analysisContext: string): string {
+  // Split at section boundaries (lines starting a new **[A-Z] heading)
+  const sectionBreak = /(?=\n\*\*[A-Z])/;
+  const sections = analysisContext.split(sectionBreak);
+  const wanted = sections.filter(s =>
+    s.includes('**Interfaces to preserve**') || s.includes('**Key dependencies**')
+  );
+  if (wanted.length === 0) return analysisContext.slice(0, 800).trim();
+  return wanted.map(s => s.trim()).join('\n\n');
+}
+
 export async function testFixLoop(
   ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string, buildConfig?: BuildConfig,
   baselineFailures?: Set<string>,
   relatedFiles?: string[],
+  analysisContext?: string,
 ): Promise<{ passed: boolean; testFailuresDetected: boolean; failureSummary?: string }> {
   let runners = detectTestRunners(buildConfig);
 
@@ -1052,9 +1066,11 @@ export async function testFixLoop(
     if (attempt < MAX_TEST_FIX_ATTEMPTS) {
       const preExistingHint = preExistingNote ? ' (pre-existing failures excluded)' : '';
       sendLog(ws, `Tests failed (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})${preExistingHint}:\n${combinedFailures.slice(0, 3000)}\nClaude will attempt to fix...\n`);
+      const analysisSections = analysisContext ? condensedAnalysisSections(analysisContext) : '';
+      const analysisPrefix = analysisSections ? `## Module Analysis\n\n${analysisSections}\n\n` : '';
       const fixPrompt = baselineFailures
-        ? `These tests broke because of your changes. Fix ONLY these newly-broken tests:\n\n${combinedFailures.slice(0, 4000)}${preExistingNote.slice(0, 1000)}`
-        : `Refactoring broke these tests. Fix ONLY to restore passing tests without reverting the refactor's intent:\n\n${combinedFailures.slice(0, 5000)}`;
+        ? `${analysisPrefix}These tests broke because of your changes. Fix ONLY these newly-broken tests:\n\n${combinedFailures.slice(0, 4000)}${preExistingNote.slice(0, 1000)}`
+        : `${analysisPrefix}Refactoring broke these tests. Fix ONLY to restore passing tests without reverting the refactor's intent:\n\n${combinedFailures.slice(0, 5000)}`;
       await runClaudeCode(fixPrompt, ws, statusRef, model, effort);
       git(['add', '-A']);
     } else {

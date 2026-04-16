@@ -1245,3 +1245,149 @@ async def test_trend_history_includes_first_attempt_rate(client: AsyncClient, db
     last_entry = trend_history[-1]
     assert last_entry["first_attempt_sample_size"] == 2
     assert last_entry["first_attempt_success_rate"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Scope merge rate tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_scope_merge_rates_aggregated(client: AsyncClient, db_session):
+    """scope_merge_rates aggregates scope_breakdown from research_history within the window."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-1",
+                "text": "Direction 1",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 5,
+                        "tasks_created": 6,
+                        "scope_breakdown": {
+                            "small": {"created": 4, "merged": 3, "failed": 1},
+                            "medium": {"created": 2, "merged": 1, "failed": 0},
+                        },
+                    },
+                    {
+                        "timestamp": old_ts,
+                        "prs_merged": 10,
+                        "tasks_created": 10,
+                        "scope_breakdown": {
+                            "small": {"created": 10, "merged": 10, "failed": 0},
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    # scope_merge_rates should aggregate only the recent entry (not the old one outside window)
+    rates = data["scope_merge_rates"]
+    assert rates is not None
+    assert rates["small"]["created"] == 4
+    assert rates["small"]["merged"] == 3
+    assert rates["medium"]["created"] == 2
+    assert rates["medium"]["merged"] == 1
+
+    # scope_breakdown should appear on the direction_progress entry
+    dp = data["direction_progress"]
+    assert len(dp) == 1
+    sb = dp[0]["scope_breakdown"]
+    assert sb is not None
+    assert sb["small"]["created"] == 4
+    assert sb["small"]["merged"] == 3
+    assert sb["small"]["failed"] == 1
+    assert sb["medium"]["created"] == 2
+
+
+@pytest.mark.asyncio
+async def test_digest_scope_merge_rates_absent_without_project(client: AsyncClient, db_session):
+    """scope_merge_rates is null when no project_id is provided."""
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["scope_merge_rates"] is None
+    assert data["prev_scope_merge_rates"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_prev_scope_merge_rates(client: AsyncClient, db_session):
+    """prev_scope_merge_rates aggregates scope_breakdown from the previous window."""
+    curr_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    prev_ts = (_utcnow() - timedelta(hours=36)).isoformat()  # in prev 24h window (24–48h ago)
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-1",
+                "text": "Direction 1",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": curr_ts,
+                        "prs_merged": 2,
+                        "tasks_created": 4,
+                        "scope_breakdown": {
+                            "medium": {"created": 4, "merged": 2, "failed": 0},
+                        },
+                    },
+                    {
+                        "timestamp": prev_ts,
+                        "prs_merged": 1,
+                        "tasks_created": 4,
+                        "scope_breakdown": {
+                            "medium": {"created": 4, "merged": 1, "failed": 0},
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    # Current window rates
+    assert data["scope_merge_rates"]["medium"]["created"] == 4
+    assert data["scope_merge_rates"]["medium"]["merged"] == 2
+
+    # Previous window rates (for trend comparison)
+    prev_rates = data["prev_scope_merge_rates"]
+    assert prev_rates is not None
+    assert prev_rates["medium"]["created"] == 4
+    assert prev_rates["medium"]["merged"] == 1

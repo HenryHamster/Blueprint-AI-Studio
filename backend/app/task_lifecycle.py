@@ -268,12 +268,15 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         prev_diff_summary = child_ctx.get("_pr_diff_summary", [])
         prev_test_failure_summary = child_ctx.get("_test_failure_summary", "")
         prev_self_review_outcome = child_ctx.get("_self_review_outcome")
+        prev_analysis_plan = child_ctx.get("_analysis_plan", "")
         if prev_diff_summary:
             clone_ctx["_previous_diff_summary"] = prev_diff_summary
         if prev_test_failure_summary:
             clone_ctx["_previous_test_failure_summary"] = prev_test_failure_summary
         if prev_self_review_outcome:
             clone_ctx["_previous_self_review_outcome"] = prev_self_review_outcome
+        if prev_analysis_plan:
+            clone_ctx["_previous_analysis_plan"] = prev_analysis_plan
 
         if new_payloads and isinstance(new_payloads[0], dict):
             existing_suffix = new_payloads[0].get("prompt_suffix", "") or ""

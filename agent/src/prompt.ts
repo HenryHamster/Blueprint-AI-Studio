@@ -1392,6 +1392,7 @@ export function buildRetryContext(task: Record<string, unknown>): string {
     : [];
   const previousTestFailureSummary = strVal(ctx._previous_test_failure_summary as unknown);
   const previousSelfReviewOutcome = ctx._previous_self_review_outcome as Record<string, unknown> | undefined;
+  const previousAnalysisPlan = strVal(ctx._previous_analysis_plan as unknown);
   const prevAttempt = attemptNumber - 1;
 
   const failureTypeLabel = previousFailureClass || 'UNKNOWN';
@@ -1438,6 +1439,9 @@ export function buildRetryContext(task: Record<string, unknown>): string {
     lines.push(`Self-review outcome: ${selfReviewStatus}`);
   }
 
+  if (previousAnalysisPlan) {
+    lines.push(`Pre-implementation analysis from previous attempt (skip re-analysis — use this plan directly):\n${previousAnalysisPlan}`);
+  }
 
   // For CODE_ERROR failures, show the focused error summary; otherwise show the full error.
   if (previousErrorSummary) {

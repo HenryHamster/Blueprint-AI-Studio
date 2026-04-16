@@ -32,6 +32,7 @@ interface DirectionProgress {
   product_ratio?: number | null;
   estimated_cost_usd?: number | null;
   cost_per_merged_pr?: number | null;
+  scope_breakdown?: Record<string, { created: number; merged: number; failed: number }> | null;
 }
 
 interface FailureGroupTask {
@@ -87,6 +88,8 @@ interface DigestData {
   latest_cycle?: LatestCycle | null;
   completed_count?: number;
   pipeline_conversion_rate?: number | null;
+  scope_merge_rates?: Record<string, { created: number; merged: number }> | null;
+  prev_scope_merge_rates?: Record<string, { created: number; merged: number }> | null;
 }
 
 interface OpenPR {
@@ -482,7 +485,16 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             )}
           </section>
 
-          {/* Section 2b: Medium Scope Measurement */}
+          {/* Section 2b: Scope Merge Rates */}
+          {!!selectedProjectId && (
+            <ScopeMergeRatesSection
+              scopeRates={digest?.scope_merge_rates}
+              prevScopeRates={digest?.prev_scope_merge_rates}
+              loading={loading}
+            />
+          )}
+
+          {/* Section 2c: Medium Scope Measurement */}
           {!!selectedProjectId && (
             <MediumScopeWidget data={measurementData} loading={loading} />
           )}
@@ -563,6 +575,64 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
         </div>
       </div>
     </div>
+  );
+}
+
+// ---------- scope merge rates ----------
+
+const SCOPE_ORDER = ['small', 'medium', 'large'];
+
+function ScopeMergeRatesSection({
+  scopeRates,
+  prevScopeRates,
+  loading,
+}: {
+  scopeRates: Record<string, { created: number; merged: number }> | null | undefined;
+  prevScopeRates: Record<string, { created: number; merged: number }> | null | undefined;
+  loading: boolean;
+}) {
+  if (loading) return null;
+  if (!scopeRates) return null;
+  const scopes = SCOPE_ORDER.filter(s => scopeRates[s] != null);
+  if (scopes.length === 0) return null;
+
+  return (
+    <section>
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Scope Merge Rates</h2>
+      <div className="flex gap-2 flex-wrap">
+        {scopes.map(scope => {
+          const { created, merged } = scopeRates[scope];
+          const rate = created > 0 ? merged / created : null;
+          const prev = prevScopeRates?.[scope];
+          const prevRate = prev && prev.created > 0 ? prev.merged / prev.created : null;
+
+          let trend: 'improving' | 'declining' | 'stable' | null = null;
+          if (rate != null && prevRate != null) {
+            const delta = rate - prevRate;
+            if (delta > 0.05) trend = 'improving';
+            else if (delta < -0.05) trend = 'declining';
+            else trend = 'stable';
+          }
+
+          const TrendIcon = trend === 'improving' ? TrendingUp : trend === 'declining' ? TrendingDown : Minus;
+          const trendColor = trend === 'improving' ? 'text-emerald-400' : trend === 'declining' ? 'text-red-400' : 'text-neutral-500';
+          const rateColor = rate == null ? 'text-neutral-500' : rate >= 0.6 ? 'text-emerald-400' : rate >= 0.3 ? 'text-amber-400' : 'text-red-400';
+
+          return (
+            <div key={scope} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 min-w-[110px]">
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">{scope}</p>
+              <div className="flex items-center gap-1.5">
+                <p className={`text-xl font-bold font-mono ${rateColor}`}>
+                  {rate != null ? `${Math.round(rate * 100)}%` : '--'}
+                </p>
+                {trend && <TrendIcon className={`w-3.5 h-3.5 ${trendColor}`} />}
+              </div>
+              <p className="text-[10px] text-neutral-600 mt-0.5">{merged}/{created} merged</p>
+            </div>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 

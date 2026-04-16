@@ -463,7 +463,7 @@ async def update_agent_status(
             )
             session.add(artifact)
             # Persist enriched retry info for non-PR failures (e.g. test/lint failures)
-            if payload.changed_files or payload.diff_summary or payload.test_failure_summary:
+            if payload.changed_files or payload.diff_summary or payload.test_failure_summary or payload.analysis_plan:
                 ctx = dict(task.context or {})
                 if payload.changed_files:
                     ctx['_pr_changed_files'] = payload.changed_files[:50]
@@ -471,6 +471,8 @@ async def update_agent_status(
                     ctx['_pr_diff_summary'] = payload.diff_summary[:50]
                 if payload.test_failure_summary:
                     ctx['_test_failure_summary'] = payload.test_failure_summary[:5000]
+                if payload.analysis_plan:
+                    ctx['_analysis_plan'] = payload.analysis_plan[:5000]
                 task.context = ctx
                 flag_modified(task, 'context')
 

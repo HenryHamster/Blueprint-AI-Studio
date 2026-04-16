@@ -1105,6 +1105,33 @@ describe('buildRetryContext', () => {
     const result = buildRetryContext(task);
     expect(result).toContain('Self-review ran and found no critical issues');
   });
+
+  it('renders previous analysis plan when _previous_analysis_plan is present', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failed',
+        _previous_analysis_plan: '## Pre-Implementation Analysis\n\nModule A depends on Module B.\nChange order: B first, then A.',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Pre-implementation analysis from previous attempt');
+    expect(result).toContain('Module A depends on Module B');
+    expect(result).toContain('skip re-analysis');
+  });
+
+  it('omits analysis plan section when _previous_analysis_plan is absent', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'test failed',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).not.toContain('Pre-implementation analysis from previous attempt');
+  });
 });
 
 describe('buildSelfReviewPrompt', () => {

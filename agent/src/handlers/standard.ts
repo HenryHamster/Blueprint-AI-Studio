@@ -266,6 +266,104 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     if (scopeOverflowWarning) {
       sendLog(ws, `\nWARNING: Scope overflow detected — ${changedPaths.length} files changed for a "${taskScope}" task (threshold: ${overflowThreshold}).\n`);
     }
+
+    // ── Scope Trim Enforcement (medium-scope only) ────────────────────────────
+    // For medium tasks exceeding the file threshold, prompt the agent to evaluate
+    // which files are essential and automatically revert non-essential ones before
+    // lint/test/self-review. Large tasks are not subject to this enforcement.
+    const scopeTrimReverted: string[] = [];
+    let scopeTrimJustification: string | undefined;
+    if (taskScope === 'medium' && scopeOverflowWarning) {
+      sendLog(ws, '\nEnforcing scope limits — prompting agent to identify non-essential files...\n');
+      statusRef.value = 'Trimming scope overflow...';
+
+      const fileStatsLines = changedPaths.map(f => {
+        const stats = diffSummary.find(d => d.file === f);
+        return stats
+          ? `- ${f} (+${stats.additions}/-${stats.deletions}, ${stats.change_type})`
+          : `- ${f}`;
+      }).join('\n');
+
+      const scopeTrimPrompt = `You are reviewing the scope of a completed implementation task to remove non-essential file changes before creating a PR.
+
+## Original Task
+${rawPrompt.slice(0, 3000)}
+
+## Changed Files (${changedPaths.length} files, threshold: ${overflowThreshold})
+${fileStatsLines}
+
+## Instructions
+Review each changed file and classify it as ESSENTIAL or NON-ESSENTIAL based solely on the original task above.
+
+A file is ESSENTIAL only if it is directly required to implement what was asked.
+Revert files that are: formatting-only changes, style cleanups not requested, tangential refactors, or test files for code you did not change.
+
+If ALL files are truly necessary for a legitimate cross-cutting change, you may keep them all but MUST provide a specific per-file justification explaining why each file is required.
+
+Output ONLY a JSON object in a \`\`\`json code fence:
+\`\`\`json
+{
+  "assessment": "Brief explanation of what was trimmed and why",
+  "essential_files": ["file1.ts", "file2.py"],
+  "files_to_revert": ["file3.ts"],
+  "all_essential_justification": "Only populate if files_to_revert is empty — specific reason every file is required",
+  "per_file_justification": {"file1.ts": "Required for X because...", "file2.py": "Required for Y because..."}
+}
+\`\`\``;
+
+      const { exitCode: trimExitCode, allOutput: trimOutput } = await runClaudeCode(
+        scopeTrimPrompt, ws, statusRef, model, effort,
+        ['Write', 'Edit', 'NotebookEdit'],
+      );
+
+      if (trimExitCode === 0) {
+        const trimResult = extractSelfReviewJson(trimOutput);
+        const filesToRevert = Array.isArray(trimResult?.files_to_revert)
+          ? (trimResult.files_to_revert as unknown[]).filter((f): f is string => typeof f === 'string')
+          : [];
+
+        if (filesToRevert.length > 0) {
+          sendLog(ws, `\nReverting ${filesToRevert.length} non-essential file(s):\n`);
+          for (const fileToRevert of filesToRevert) {
+            if (!changedPaths.includes(fileToRevert)) continue;
+            try {
+              // Restore file to its state at baseCommit (works for modified files)
+              execFileSync('git', ['-C', WORKSPACE, 'checkout', baseCommit, '--', fileToRevert], { encoding: 'utf-8' });
+              sendLog(ws, `  Reverted: ${fileToRevert}\n`);
+              scopeTrimReverted.push(fileToRevert);
+            } catch {
+              // File did not exist at baseCommit — it is new, remove it
+              try {
+                execFileSync('git', ['-C', WORKSPACE, 'rm', '-f', '--', fileToRevert], { encoding: 'utf-8' });
+                sendLog(ws, `  Removed (new file): ${fileToRevert}\n`);
+                scopeTrimReverted.push(fileToRevert);
+              } catch {
+                try {
+                  execFileSync('rm', ['-f', `${WORKSPACE}/${fileToRevert}`], { encoding: 'utf-8' });
+                  sendLog(ws, `  Deleted (untracked): ${fileToRevert}\n`);
+                  scopeTrimReverted.push(fileToRevert);
+                } catch (err3) {
+                  const msg = err3 instanceof Error ? err3.message : String(err3);
+                  sendLog(ws, `  WARNING: Could not revert ${fileToRevert}: ${msg}\n`);
+                }
+              }
+            }
+          }
+          // Remove reverted files from changedPaths so downstream steps (lint, test, self-review) skip them
+          const revertedSet = new Set(scopeTrimReverted);
+          changedPaths.splice(0, changedPaths.length, ...changedPaths.filter(f => !revertedSet.has(f)));
+          sendLog(ws, `Scope trim complete: ${changedPaths.length} file(s) remaining.\n`);
+        } else {
+          sendLog(ws, 'Scope trim: agent determined all files are essential.\n');
+        }
+        if (typeof trimResult?.all_essential_justification === 'string' && (trimResult.all_essential_justification as string).trim()) {
+          scopeTrimJustification = trimResult.all_essential_justification as string;
+        }
+      } else {
+        sendLog(ws, 'WARNING: Scope trim evaluation could not complete — proceeding with all files.\n');
+      }
+    }
+
     if (runLintFix) {
       const lintPassed = await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
       if (!lintPassed && failOnTestFailure) {
@@ -276,6 +374,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           failure_category: 'lint_failed',
           changed_files: changedPaths.slice(0, 50),
           ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+          ...(analysisContext ? { analysis_plan: analysisContext.slice(0, 5000) } : {}),
         });
         return;
       }
@@ -285,7 +384,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     let testsPassed = true;
     let testFailureSummary: string | undefined;
     if (runTestFix && baseBranch === 'main') {
-      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig, baselineFailures, relatedFiles);
+      const result = await testFixLoop(ws, statusRef, model, effort, buildConfig, baselineFailures, relatedFiles, analysisContext || undefined);
       testFailuresDetected = result.testFailuresDetected;
       testsPassed = result.passed;
       testFailureSummary = result.failureSummary;
@@ -303,6 +402,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         changed_files: changedPaths.slice(0, 50),
         ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
         ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
+        ...(analysisContext ? { analysis_plan: analysisContext.slice(0, 5000) } : {}),
       });
       return;
     }
@@ -672,8 +772,10 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       const testDetail = !testsPassed && testFailureSummary ? `\n\n<details><summary>Failing tests</summary>\n\n\`\`\`\n${testFailureSummary.slice(0, 1000)}\n\`\`\`\n</details>` : '';
       prBody += `## Test Results\n\n${testSummary}${testDetail}\n\n`;
     }
-    if (scopeOverflowWarning) {
-      prBody += `## ⚠️ Scope Overflow Warning\n\n${scopeOverflowWarning}\n\nPlease verify that all changed files are necessary for this task.\n\n`;
+    if (scopeTrimReverted.length > 0) {
+      prBody += `## Scope Trim Applied\n\n${scopeTrimReverted.length} non-essential file(s) were automatically reverted before PR creation:\n${scopeTrimReverted.map(f => `- ${f}`).join('\n')}\n\n`;
+    } else if (scopeOverflowWarning) {
+      prBody += `## ⚠️ Scope Overflow Warning\n\n${scopeOverflowWarning}\n\n${scopeTrimJustification ? `**Agent justification (all files kept):** ${scopeTrimJustification}\n\n` : 'Please verify that all changed files are necessary for this task.\n\n'}`;
     }
     if (selfReviewOutcome) {
       const reviewStatus = selfReviewOutcome.fixes_applied
@@ -696,6 +798,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
       ...(selfReviewOutcome ? { self_review_outcome: selfReviewOutcome } : {}),
       ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
+      ...(analysisContext ? { analysis_summary: analysisContext.slice(0, 2000) } : {}),
     });
   } else if (exitCode === 0) {
     await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: noChangesMessage });
@@ -704,6 +807,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
       failure_category: 'claude_code_failed',
       ...(fileChangeDetails.length > 0 ? { file_change_details: fileChangeDetails.slice(0, 50) } : {}),
+      ...(analysisContext ? { analysis_plan: analysisContext.slice(0, 5000) } : {}),
     });
   }
 }

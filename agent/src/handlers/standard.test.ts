@@ -1060,7 +1060,7 @@ describe('testFixLoop buildConfig propagation', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     // testFixLoop should be called with the buildConfig from task.build_config and no baseline (small scope)
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, buildConfig, undefined, [],
+      WS, expect.any(Object), undefined, undefined, buildConfig, undefined, [], undefined,
     );
   });
 
@@ -1072,7 +1072,7 @@ describe('testFixLoop buildConfig propagation', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, undefined, undefined, [],
+      WS, expect.any(Object), undefined, undefined, undefined, undefined, [], undefined,
     );
   });
 });
@@ -1135,7 +1135,7 @@ describe('test baseline capture', () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, undefined, baseline, [],
+      WS, expect.any(Object), undefined, undefined, undefined, baseline, [], undefined,
     );
   });
 
@@ -1144,7 +1144,7 @@ describe('test baseline capture', () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, undefined, undefined, [],
+      WS, expect.any(Object), undefined, undefined, undefined, undefined, [], undefined,
     );
   });
 
@@ -1170,7 +1170,7 @@ describe('test baseline capture', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something', related_files: relatedFiles }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
-      WS, expect.any(Object), undefined, undefined, undefined, undefined, relatedFiles,
+      WS, expect.any(Object), undefined, undefined, undefined, undefined, relatedFiles, undefined,
     );
   });
 });
@@ -1275,6 +1275,48 @@ describe('two-phase analysis for medium-scope tasks', () => {
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
     const analysisCallArgs = vi.mocked(runClaudeCode).mock.calls[0];
     expect(analysisCallArgs[5]).toEqual(expect.arrayContaining(['Write', 'Edit', 'NotebookEdit']));
+  });
+
+  it('passes analysis context to testFixLoop when medium-scope analysis succeeds', async () => {
+    vi.mocked(git)
+      .mockReturnValueOnce('')        // rev-parse HEAD → baseCommit
+      .mockReturnValueOnce('M file')  // status --porcelain → hasChanges = true
+      .mockReturnValue('');
+    const analysisOutput = '**Key dependencies**\nfoo.ts depends on bar.ts';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: analysisOutput })
+      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium' },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
+      WS, expect.any(Object), undefined, undefined, undefined, undefined, [],
+      expect.stringContaining('Pre-Implementation Analysis'),
+    );
+  });
+
+  it('passes undefined analysis context to testFixLoop when analysis fails', async () => {
+    vi.mocked(git)
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('M file')
+      .mockReturnValue('');
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 1, allOutput: 'error', lastResultText: '' })
+      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium' },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
+      WS, expect.any(Object), undefined, undefined, undefined, undefined, [], undefined,
+    );
   });
 });
 

@@ -30,6 +30,7 @@ class AgentStatusPayload(BaseModel):
     self_review_outcome: Dict[str, Any] | None = None
     diff_summary: List[Dict[str, Any]] | None = Field(None, max_length=50)
     file_change_details: List[Dict[str, Any]] | None = Field(None, max_length=50)
+    analysis_plan: str | None = Field(None, max_length=5000)
 
 class UploadUrlRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")

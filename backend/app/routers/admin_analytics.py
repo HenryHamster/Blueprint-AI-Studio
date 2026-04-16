@@ -987,6 +987,8 @@ async def get_digest(
     # --- Direction progress (only when project_id provided) ---
     direction_progress_list: List[Dict[str, Any]] = []
     dir_id_to_text: Dict[str, str] = {}
+    scope_merge_rates: Dict[str, Dict[str, int]] = {}
+    prev_scope_merge_rates: Dict[str, Dict[str, int]] = {}
 
     if project_id:
         project = await session.get(Project, project_id)
@@ -1028,6 +1030,8 @@ async def get_digest(
                 prs_rejected = 0
                 findings_tasks_created = 0
                 merge_time_values: List[float] = []
+                dir_scope_agg: Dict[str, Dict[str, int]] = {}
+                prev_dir_scope_agg: Dict[str, Dict[str, int]] = {}
                 for entry in d.get("research_history") or []:
                     try:
                         entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
@@ -1038,6 +1042,18 @@ async def get_digest(
                             atm = entry.get("avg_time_to_merge_hours")
                             if atm is not None:
                                 merge_time_values.append(float(atm))
+                            for scope, stats in (entry.get("scope_breakdown") or {}).items():
+                                if scope not in dir_scope_agg:
+                                    dir_scope_agg[scope] = {"created": 0, "merged": 0, "failed": 0}
+                                dir_scope_agg[scope]["created"] += stats.get("created", 0)
+                                dir_scope_agg[scope]["merged"] += stats.get("merged", 0)
+                                dir_scope_agg[scope]["failed"] += stats.get("failed", 0)
+                        elif entry_ts >= prev_window_start:
+                            for scope, stats in (entry.get("scope_breakdown") or {}).items():
+                                if scope not in prev_dir_scope_agg:
+                                    prev_dir_scope_agg[scope] = {"created": 0, "merged": 0}
+                                prev_dir_scope_agg[scope]["created"] += stats.get("created", 0)
+                                prev_dir_scope_agg[scope]["merged"] += stats.get("merged", 0)
                     except (ValueError, TypeError):
                         pass
 
@@ -1072,6 +1088,18 @@ async def get_digest(
                 acceptance_rate = round(prs_merged / total_prs, 3) if total_prs > 0 else None
                 avg_time_to_merge_hours = round(sum(merge_time_values) / len(merge_time_values), 2) if merge_time_values else None
                 conversion_rate = round(prs_merged / findings_tasks_created, 3) if findings_tasks_created > 0 else None
+                # Accumulate into project-level scope rate aggregates
+                for _s, _st in dir_scope_agg.items():
+                    if _s not in scope_merge_rates:
+                        scope_merge_rates[_s] = {"created": 0, "merged": 0}
+                    scope_merge_rates[_s]["created"] += _st["created"]
+                    scope_merge_rates[_s]["merged"] += _st["merged"]
+                for _s, _st in prev_dir_scope_agg.items():
+                    if _s not in prev_scope_merge_rates:
+                        prev_scope_merge_rates[_s] = {"created": 0, "merged": 0}
+                    prev_scope_merge_rates[_s]["created"] += _st["created"]
+                    prev_scope_merge_rates[_s]["merged"] += _st["merged"]
+
                 direction_progress_list.append({
                     "direction_id": did,
                     "direction_text": direction_text,
@@ -1091,6 +1119,7 @@ async def get_digest(
                     "type_distribution": agg_type_distribution or None,
                     "estimated_cost_usd": round(dir_cost, 2),
                     "cost_per_merged_pr": round(dir_cost / prs_merged, 4) if prs_merged > 0 else None,
+                    "scope_breakdown": dir_scope_agg or None,
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
@@ -1498,6 +1527,8 @@ async def get_digest(
         "trend": trend,
         "trend_history": trend_history,
         "latest_cycle": latest_cycle,
+        "scope_merge_rates": scope_merge_rates or None,
+        "prev_scope_merge_rates": prev_scope_merge_rates or None,
     }
 
 
