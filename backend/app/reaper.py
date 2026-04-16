@@ -752,6 +752,11 @@ async def reaper_service():
                         _new_ctx.pop("_slot_released", None)
                         _new_ctx.pop("retry_after", None)
                         _new_ctx.pop("failure_category", None)
+                        # Clear EXTERNAL_API retry counter: a resurrected task that hits another
+                        # API error would otherwise see stale _api_failure_retries > 5 and
+                        # bypass the EXTERNAL_API-specific backoff, falling through to the
+                        # general retry path with a depleted budget.
+                        _new_ctx.pop("_api_failure_retries", None)
                         _t.context = _new_ctx
                         _t.attempt_count = 0
                         _t.status = TaskStatus.QUEUED
@@ -807,8 +812,6 @@ async def reaper_service():
                 try:
                     _terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
                     rescued = 0
-                    # Batch-fetch all children for all evaluating parents in a single query
-                    # to avoid an N+1 pattern (one query per parent).
                     _children_by_parent: Dict[uuid.UUID, list] = {}
                     if evaluating_parents:
                         _parent_ids = [p.id for p in evaluating_parents]
@@ -822,15 +825,11 @@ async def reaper_service():
                         if not children:
                             continue
                         if any(c.status not in _terminal for c in children):
-                            # At least one child still running — not safe to rescue yet.
                             continue
                         if any(c.status == TaskStatus.COMPLETED for c in children):
-                            # Step 3 handles this; skip.
                             continue
-                        # All children are terminal and none completed — rescue the parent.
                         failed_children = [c for c in children if c.status == TaskStatus.FAILED]
                         cancelled_children = [c for c in children if c.status == TaskStatus.CANCELLED]
-                        # Build a diagnostic message including child failure classes.
                         parts = []
                         if failed_children:
                             classes = [
@@ -859,6 +858,82 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(f"[REAPER] All-children-failed rescue error: {e}", exc_info=True)
 
+                # Step 6: QUEUED task age alerts — notify operators when tasks have been
+                # waiting in QUEUED state beyond the configured threshold (default 2h).
+                # Fires once per task (tracked via task.context["queued_age_alert_fired"]).
+                try:
+                    from app.models import Alert, AlertSeverity  # noqa: PLC0415
+                    from app.broadcast import broadcast_to_project as _bcast  # noqa: PLC0415
+                    import app.shared_state as _shared_state  # noqa: PLC0415
+                    _queued_threshold_hours = _runtime_config.get("queued_age_alert_hours", 2)
+                    _queued_cutoff = now - timedelta(hours=_queued_threshold_hours)
+                    _stale_queued = (await session.execute(
+                        select(Task).where(
+                            Task.status == TaskStatus.QUEUED,
+                            Task.requires_approval.is_(False),
+                            Task.created_at <= _queued_cutoff,
+                        )
+                    )).scalars().all()
+
+                    _alerted = 0
+                    for _qt in _stale_queued:
+                        _qctx = _qt.context or {}
+                        if _qctx.get("queued_age_alert_fired"):
+                            continue
+
+                        _qt_type = (_qt.first_payload or {}).get("type", "unknown")
+                        _rate, _sample = _shared_state.get_task_type_failure_rate(_qt_type, window_minutes=15)
+                        if _sample >= 3 and _rate >= 0.7:
+                            _likely_cause = f"type failure gate active ({_qt_type}: {_rate:.0%} failure rate)"
+                        elif _shared_state.tasks_active_gauge >= _runtime_config.get("max_concurrent_vms", 8):
+                            _likely_cause = "no available VM slots (concurrency limit reached)"
+                        else:
+                            _likely_cause = "no eligible accounts or slot contention"
+
+                        _queue_hours = (now - _qt.created_at).total_seconds() / 3600
+                        _alert = Alert(
+                            project_id=_qt.project_id,
+                            severity=AlertSeverity.INFO,
+                            title=f"Task stalled in queue: {_qt.title or str(_qt.id)[:8]}",
+                            message=(
+                                f"Task type: {_qt_type}. "
+                                f"Queued for {_queue_hours:.1f}h (threshold: {_queued_threshold_hours}h). "
+                                f"Likely cause: {_likely_cause}."
+                            ),
+                            task_id=_qt.id,
+                        )
+                        session.add(_alert)
+
+                        _new_qctx = dict(_qctx)
+                        _new_qctx["queued_age_alert_fired"] = True
+                        _qt.context = _new_qctx
+                        session.add(_qt)
+
+                        try:
+                            await _bcast(
+                                str(_qt.project_id),
+                                "alert_created",
+                                {
+                                    "alert_id": str(_alert.id),
+                                    "severity": "INFO",
+                                    "title": _alert.title,
+                                },
+                            )
+                        except Exception as _bcast_err:
+                            logger.warning(f"[REAPER] Queued age alert broadcast failed for {_qt.id}: {_bcast_err}")
+
+                        _alerted += 1
+                        logger.info(
+                            f"[REAPER] Queued age alert fired for task {_qt.id} "
+                            f"(type={_qt_type}, queued={_queue_hours:.1f}h, cause={_likely_cause})"
+                        )
+
+                    if _alerted:
+                        await session.commit()
+                        logger.info(f"[REAPER] Fired queued age alerts for {_alerted} stale task(s)")
+
+                except Exception as e:
+                    logger.error(f"[REAPER] Queued age alert sweep error: {e}", exc_info=True)
         except asyncio.CancelledError:
             logger.info("[REAPER] Service shutting down.")
             break

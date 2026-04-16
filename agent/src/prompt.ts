@@ -559,6 +559,35 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
         }
       } catch { /* no matches */ }
 
+      // Import-based discovery: search test files for direct import statements referencing this module
+      try {
+        if (relFile.endsWith('.py')) {
+          // e.g. 'backend/app/orchestrator.py' → 'app.orchestrator'
+          const pyModulePath = relFile
+            .replace(/^backend\//, '')
+            .replace(/\.py$/, '')
+            .replace(/\//g, '.');
+          const importPattern = `(from ${pyModulePath} import|import ${pyModulePath})`;
+          const pyGrepResult = execFileSync('git', ['grep', '-lE', importPattern, '--', '*test*'],
+            { cwd: WORKSPACE, encoding: 'utf-8' });
+          for (const tf of pyGrepResult.split('\n').filter(Boolean)) {
+            processTestFile(tf);
+          }
+        } else if (relFile.match(/\.(tsx?|jsx?)$/) && !relFile.includes('.test.')) {
+          // e.g. 'agent/src/prompt.ts' → stem 'prompt'
+          const stem = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?)$/, '') || '';
+          if (stem) {
+            // Match import ... from '*/prompt', '*/prompt.js', '*/prompt.ts' etc.
+            const tsImportPattern = `from ['"][^'"]*/${stem}(\\.js|\\.ts|\\.tsx)?['"]`;
+            const tsGrepResult = execFileSync('git', ['grep', '-lE', tsImportPattern, '--', '*test*'],
+              { cwd: WORKSPACE, encoding: 'utf-8' });
+            for (const tf of tsGrepResult.split('\n').filter(Boolean)) {
+              processTestFile(tf);
+            }
+          }
+        }
+      } catch { /* no matches */ }
+
       void discoveredByConvention; // used for control flow, not needed after loop
     }
 
@@ -578,6 +607,106 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
     return output.slice(0, 3000);
   } catch (e) {
     sendLog(ws, `Warning: related test discovery failed: ${String(e)}\n`);
+    return '';
+  }
+}
+
+// ── Module interface discovery ───────────────────────────────────────────────
+/**
+ * Discovers lightweight interface summaries for a list of related files and
+ * their direct importers. Only runs for medium and large scope tasks.
+ *
+ * For Python files: extracts module-level function/class signatures.
+ * For TypeScript files: extracts exported declarations.
+ * Also discovers files that import from the related modules via git grep.
+ *
+ * Output is capped at 3000 characters to avoid bloating the context window.
+ */
+export function discoverModuleInterfaces(ws: WebSocket | null, relatedFiles: string[], taskScope?: string): string {
+  if (taskScope !== 'medium' && taskScope !== 'large') return '';
+  if (relatedFiles.length === 0) return '';
+
+  try {
+    const interfaceSections: string[] = [];
+
+    for (const relFile of relatedFiles) {
+      const fullPath = `${WORKSPACE}/${relFile}`;
+      if (!fs.existsSync(fullPath)) continue;
+
+      let content: string;
+      try {
+        content = fs.readFileSync(fullPath, 'utf-8');
+      } catch { continue; }
+
+      const signatures: string[] = [];
+
+      if (relFile.endsWith('.py')) {
+        // Extract module-level (non-indented) function and class definitions
+        for (const line of content.split('\n')) {
+          if (/^(?:async\s+)?def\s+\w+\(/.test(line) || /^class\s+\w+/.test(line)) {
+            // Strip trailing colon and body for clean signature line
+            signatures.push(line.replace(/:\s*$/, '').trim());
+          }
+        }
+      } else if (relFile.match(/\.(tsx?|jsx?)$/)) {
+        // Extract exported declarations — signature line without body
+        for (const line of content.split('\n')) {
+          if (/^export\s+(?:async\s+)?(?:function|class|interface|type|const)\b/.test(line)) {
+            signatures.push(line.replace(/\s*[{;].*$/, '').trim());
+          }
+        }
+      }
+
+      if (signatures.length > 0) {
+        interfaceSections.push(`### ${relFile}\n${signatures.map(s => `- ${s}`).join('\n')}`);
+      }
+    }
+
+    // Discover direct importers via git grep
+    const importerLines: string[] = [];
+    const seenModules = new Set<string>();
+    for (const relFile of relatedFiles) {
+      const moduleName = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?|py)$/, '') || '';
+      if (!moduleName || seenModules.has(moduleName)) continue;
+      seenModules.add(moduleName);
+
+      try {
+        const globArgs: string[] = relFile.endsWith('.py')
+          ? ['--', '*.py']
+          : ['--', '*.ts', '*.tsx'];
+        // Use a pattern that matches typical import statements
+        const grepPattern = relFile.endsWith('.py')
+          ? `from.*\\b${moduleName}\\b`
+          : `from.*['"].*${moduleName}['"]`;
+        const result = execFileSync(
+          'git', ['grep', '-El', grepPattern, ...globArgs],
+          { cwd: WORKSPACE, encoding: 'utf-8', timeout: 5000 },
+        );
+        const importers = result.split('\n').filter(f => f && !relatedFiles.includes(f));
+        if (importers.length > 0) {
+          importerLines.push(`- \`${relFile}\` imported by: ${importers.slice(0, 5).map(f => `\`${f}\``).join(', ')}`);
+        }
+      } catch { /* no matches or grep exited non-zero */ }
+    }
+
+    if (interfaceSections.length === 0 && importerLines.length === 0) return '';
+
+    const parts: string[] = ['## Module Interfaces'];
+    if (interfaceSections.length > 0) {
+      parts.push('');
+      parts.push(interfaceSections.join('\n\n'));
+    }
+    if (importerLines.length > 0) {
+      parts.push('');
+      parts.push('### Direct Importers');
+      parts.push(importerLines.join('\n'));
+    }
+    parts.push('');
+
+    const output = parts.join('\n') + '\n';
+    return output.slice(0, 3000);
+  } catch (e) {
+    sendLog(ws, `Warning: module interface discovery failed: ${String(e)}\n`);
     return '';
   }
 }
@@ -794,10 +923,16 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       }
     }
 
+    // Persistent review issues: categories above 20% for 3+ consecutive 14-day windows
+    const persistentIssues = pipelineHealth.persistent_review_issues as string[] | null | undefined;
+    if (persistentIssues && persistentIssues.length > 0) {
+      parts.push(`Persistent review issues (structural fix needed): ${persistentIssues.join(', ')}.`);
+    }
+
     if (parts.length > 0) {
       const body = parts.join(' ');
       const candidate = `### Pipeline Health (last 24h)\n${body}\n`;
-      if (candidate.length <= 400 && candidate.length <= budget) {
+      if (candidate.length <= 500 && candidate.length <= budget) {
         healthLines = ['### Pipeline Health (last 24h)', body, ''];
         budget -= candidate.length;
       }
@@ -809,6 +944,10 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   // First-attempt-specific breakdown from pipeline health (more actionable than all-iterations data)
   const fasrForReview = pipelineHealth?.first_attempt_success_rate as Record<string, unknown> | undefined;
   const firstAttemptByCat = fasrForReview?.first_attempt_by_review_category as Record<string, number> | null | undefined;
+  // Review effectiveness: per-category trend data from two consecutive 14-day windows
+  type ReviewEffectivenessCategory = { trend?: string };
+  const reviewEffectiveness = ctx.review_effectiveness as { categories?: Record<string, ReviewEffectivenessCategory> } | null | undefined;
+  const reviewEffCats = reviewEffectiveness?.categories;
   let reviewIssueLines: string[] = [];
   if (reviewIssueDist && Object.keys(reviewIssueDist).length > 0) {
     const hasFirstAttemptCats = firstAttemptByCat && Object.keys(firstAttemptByCat).length > 0;
@@ -821,7 +960,12 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       const faPct = hasFirstAttemptCats && firstAttemptByCat![cat] !== undefined
         ? ` (${Math.round(firstAttemptByCat![cat] * 100)}% of first-attempt rejections)`
         : '';
-      candidateLines.push(`- **${cat}**: ${Math.round(pct * 100)}% of review feedback${faPct}`);
+      const trend = reviewEffCats?.[cat]?.trend;
+      const trendIndicator = trend === 'decreasing' ? ', trending down'
+        : trend === 'increasing' ? ', trending up ⚠'
+        : trend === 'stable' ? ', persistent'
+        : '';
+      candidateLines.push(`- **${cat}**: ${Math.round(pct * 100)}% of review feedback${faPct}${trendIndicator}`);
     }
     // Append specific recurring patterns if available
     type FirstReviewIssue = { description: string; count: number; category: string };
@@ -970,6 +1114,8 @@ export function extractModuleInterfaces(ws: WebSocket | null, relatedFiles: stri
   try {
     const CAP = 2000;
     const entries: string[] = [];
+    const processedFiles: string[] = [];
+    const fileCallers = new Map<string, string[]>();
 
     for (const relFile of relatedFiles) {
       // Skip test files — their exports are not caller-facing APIs
@@ -1010,11 +1156,54 @@ export function extractModuleInterfaces(ws: WebSocket | null, relatedFiles: stri
         entry += `\n  Imported by: ${callers.join(', ')}`;
       }
       entries.push(entry);
+      processedFiles.push(relFile);
+      fileCallers.set(relFile, callers);
     }
 
     if (entries.length === 0) return '';
 
-    const body = `## Module Interfaces\nPublic API and callers for files you are modifying. Update callers when changing signatures.\n\n${entries.join('\n\n')}\n\n`;
+    let body = `## Module Interfaces\nPublic API and callers for files you are modifying. Update callers when changing signatures.\n\n${entries.join('\n\n')}\n\n`;
+
+    // ── Suggested Change Order ───────────────────────────────────────────────
+    // Analyze import dependencies between related files and topologically sort.
+    if (processedFiles.length > 1) {
+      try {
+        const pSet = new Set(processedFiles);
+        const dependsOn = new Map(processedFiles.map(f => [f, new Set<string>()]));
+        for (const [file, callers] of fileCallers)
+          for (const caller of callers)
+            if (pSet.has(caller)) dependsOn.get(caller)!.add(file);
+
+        if ([...dependsOn.values()].some(d => d.size > 0)) {
+          const consumers = new Map(processedFiles.map(f => [f, new Set<string>()]));
+          for (const [f, deps] of dependsOn)
+            for (const dep of deps) consumers.get(dep)!.add(f);
+
+          const inDeg = new Map(processedFiles.map(f => [f, dependsOn.get(f)!.size]));
+          const queue = processedFiles.filter(f => inDeg.get(f) === 0);
+          const order: string[] = [];
+          while (queue.length > 0) {
+            const f = queue.shift()!;
+            order.push(f);
+            for (const c of consumers.get(f)!) {
+              inDeg.set(c, inDeg.get(c)! - 1);
+              if (inDeg.get(c) === 0) queue.push(c);
+            }
+          }
+          if (order.length === processedFiles.length) {
+            const lines = order.map((f, i) => {
+              const deps = dependsOn.get(f)!;
+              const note = deps.size > 0
+                ? ` (imports from ${[...deps].map(d => d.split('/').pop() || d).join(', ')})`
+                : ' (no dependencies on other changed files)';
+              return `${i + 1}. ${f.split('/').pop() ?? f}${note}`;
+            });
+            body += `## Suggested Change Order\nBased on import dependencies between files you are modifying:\n${lines.join('\n')}\n\nModify foundational files first, then update their consumers.\n\n`;
+          }
+        }
+      } catch { /* dependency analysis failed — skip silently */ }
+    }
+
     return body.slice(0, CAP);
   } catch (e) {
     sendLog(ws, `Warning: module interface extraction failed: ${String(e)}\n`);
@@ -1119,6 +1308,52 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   }
   lines.push('');
   return lines.join('\n');
+}
+
+// ── Pre-implementation analysis prompt builder ───────────────────────────────
+/**
+ * Builds a read-only analysis prompt for medium-scope tasks.
+ * The agent reads related files, maps module interfaces and dependencies,
+ * then outputs a compact implementation plan before any code is written.
+ */
+export function buildAnalysisPrompt(opts: {
+  rawPrompt: string;
+  taskTitle: string;
+  relatedFiles: string[];
+  fileTree: string;
+}): string {
+  const filesList = opts.relatedFiles.length > 0
+    ? `## Files Relevant to This Task\n${opts.relatedFiles.map(f => `- ${f}`).join('\n')}\n\n`
+    : '';
+  const titleLine = opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : '';
+
+  return `${opts.fileTree}${filesList}You are performing a pre-implementation analysis for a medium-scope task. This is a READ-ONLY pass — do not modify any files.
+
+## Task
+${titleLine}${opts.rawPrompt.slice(0, 1500)}
+
+## Instructions
+
+1. Read the files listed in "Files Relevant to This Task" above. If no files are listed, identify the relevant files from the file tree and read them.
+
+2. For each relevant file, identify:
+   - What it exports (functions, classes, types, constants)
+   - What it imports from other local files
+   - Key interfaces or type contracts it defines or depends on
+
+3. Map the dependencies between files: which files import from which others.
+
+4. Output a compact structured implementation plan using exactly these headings:
+
+**Files to change** (list in recommended change order, one per line with brief reason)
+
+**Interfaces to preserve** (function signatures, exported types, or API contracts that must not be broken)
+
+**Key dependencies** (which modules call into which — determines safe change order)
+
+**Implementation approach** (2-3 sentences describing the strategy to make changes correctly without breaking type contracts)
+
+Keep the total output under 600 words. Be specific and concrete — name actual function signatures, type names, and import paths. Do NOT write any implementation code.`;
 }
 
 // ── Self-review helpers ───────────────────────────────────────────────────────

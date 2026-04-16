@@ -239,10 +239,13 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # Propagate PR artifacts from the failed attempt to the retry context
         prev_pr_url = child_ctx.get("_pr_url", "")
         prev_changed_files = child_ctx.get("_pr_changed_files", [])
+        prev_file_change_details = child_ctx.get("_file_change_details", [])
         if prev_pr_url:
             clone_ctx["_previous_pr_url"] = prev_pr_url
         if prev_changed_files:
             clone_ctx["_previous_changed_files"] = prev_changed_files
+        if prev_file_change_details:
+            clone_ctx["_previous_file_change_details"] = prev_file_change_details
 
         # Propagate enriched step-level progress for multi-file retry guidance
         prev_diff_summary = child_ctx.get("_pr_diff_summary", [])
@@ -1574,6 +1577,11 @@ async def _process_post_commit(
                     task.latest_status_message = (
                         f"Completed but handler failed: {type(handler_exc).__name__}: {str(handler_exc)[:200]}"
                     )
+                    from app.failure_classification import persist_failure_category  # noqa: PLC0415
+                    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+                    _fc_handler = classify_failure(task)
+                    persist_failure_category(task, _fc_handler)
+                    record_task_result(success=False, failure_class=_fc_handler, task_id=str(task.id), task_type=(task.first_payload or {}).get("type", ""))
                 session.add(task)
 
         # 6. Parent task rollup — delegated to shared function
