@@ -1510,6 +1510,11 @@ async def _process_post_commit(
                     task.latest_status_message = (
                         f"Completed but handler failed: {type(handler_exc).__name__}: {str(handler_exc)[:200]}"
                     )
+                    from app.failure_classification import persist_failure_category  # noqa: PLC0415
+                    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+                    _fc_handler = classify_failure(task)
+                    persist_failure_category(task, _fc_handler)
+                    record_task_result(success=False, failure_class=_fc_handler, task_id=str(task.id), task_type=(task.first_payload or {}).get("type", ""))
                 session.add(task)
 
         # 6. Parent task rollup — delegated to shared function

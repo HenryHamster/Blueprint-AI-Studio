@@ -1231,6 +1231,10 @@ async def orchestrator_worker():
                                     logger.exception(f"[CI] {_pr_gone_msg} for task {ci_task.id}")
                                     ci_task.status = TaskStatus.FAILED
                                     ci_task.latest_status_message = _pr_gone_msg
+                                    from app.failure_classification import persist_failure_category  # noqa: PLC0415
+                                    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+                                    persist_failure_category(ci_task, "EXTERNAL_API")
+                                    record_task_result(success=False, failure_class="EXTERNAL_API", task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
                                     session.add(ci_task)
                                     await _maybe_create_failure_alert(ci_task, session, _pr_gone_msg)
                                     await session.commit()
@@ -1344,7 +1348,10 @@ async def orchestrator_worker():
                                 ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix iterations exhausted, requires manual intervention"
                                 logger.warning(f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — marking FAILED (requires_approval)")
                                 await _maybe_create_failure_alert(ci_task, session, f"PR #{ci_pr_number} merge conflicts — fix iteration cap exhausted, manual intervention required")
-                                record_task_result(success=False, failure_class="CODE_ERROR", task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
+                                from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
+                                _fc_mc = classify_failure(ci_task)
+                                persist_failure_category(ci_task, _fc_mc)
+                                record_task_result(success=False, failure_class=_fc_mc, task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
                             session.add(ci_task)
                             await session.commit()
                             await broadcast_to_project(str(ci_task.project_id), "task_updated",
@@ -1424,6 +1431,8 @@ async def orchestrator_worker():
                                 ci_task.latest_status_message = "CI polling failed: PR not found (404) — PR may have been deleted"
                                 logger.exception(f"[CI] PR #{ci_task.context.get('review_loop', {}).get('pr_number')} returned 404 — marking task {ci_task.id} FAILED")
                                 await _maybe_create_failure_alert(ci_task, session, "CI polling failed: PR returned 404 — PR may have been deleted or archived")
+                                from app.failure_classification import persist_failure_category as _pfc404  # noqa: PLC0415
+                                _pfc404(ci_task, "EXTERNAL_API")
                                 record_task_result(success=False, failure_class="EXTERNAL_API", task_id=str(ci_task.id), task_type=(ci_task.first_payload).get("type", ""))
                             else:
                                 ci_task.latest_status_message = f"CI check error: {type(e).__name__}: {e!r}"[:500]
