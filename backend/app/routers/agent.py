@@ -682,24 +682,28 @@ async def claim_task(
                 elif task_type not in _PLAYBOOK_DEFAULT_TYPES:
                     continue
                 short_key = k[len("playbook/"):]
-                confirmed = v.get("confirmed_count", 0)
-                referenced = v.get("reference_count", 0)
-                # Demote entries with high reference count but zero confirmations
-                ineffective = 1 if (referenced >= 10 and confirmed == 0) else 0
-                if ineffective:
+                # Skip entries auto-archived due to persistently low effectiveness
+                if v.get("stale"):
                     logger.info(
-                        "Playbook entry '%s' demoted (reference_count=%d, confirmed_count=0)",
-                        short_key, referenced,
+                        "Playbook entry '%s' skipped (auto-archived, effectiveness_score=%.2f)",
+                        short_key, v.get("effectiveness_score", 0.0),
                     )
+                    continue
+                recent_outcomes = v.get("recent_outcomes", [])
+                if len(recent_outcomes) >= 3:
+                    score = sum(recent_outcomes) / len(recent_outcomes)
+                else:
+                    # Not enough recent data: fallback to lifetime ratio; 0.5 for new entries
+                    ref = v.get("reference_count", 0)
+                    conf = v.get("confirmed_count", 0)
+                    score = (conf / ref) if ref > 0 else 0.5
                 _playbook_candidates.append((
-                    ineffective,
-                    -confirmed,
-                    -referenced,
+                    -score,
                     short_key,
                     v.get("content", ""),
                 ))
         _playbook_candidates.sort()
-        for _, _, _, short_key, content in _playbook_candidates:
+        for _, short_key, content in _playbook_candidates:
             playbook_entries[short_key] = content
         total_playbook_count = sum(
             1 for k in (project_for_playbook.design_doc or {}) if k.startswith("playbook/")
@@ -707,7 +711,7 @@ async def claim_task(
         response["first_task_on_repo"] = total_playbook_count == 0
         if playbook_entries:
             response["playbook"] = playbook_entries
-            # Track reference counts — fire-and-forget, must not fail claim response
+            # Track reference counts and shown keys — fire-and-forget, must not fail claim response
             try:
                 now_iso = _utcnow().isoformat()
                 doc = dict(project_for_playbook.design_doc)
@@ -717,10 +721,32 @@ async def claim_task(
                         entry = dict(doc[full_key])
                         entry["reference_count"] = entry.get("reference_count", 0) + 1
                         entry["last_referenced_at"] = now_iso
+                        # Append False to recent_outcomes rolling window (pending confirmation)
+                        recent = list(entry.get("recent_outcomes", []))
+                        recent.append(False)
+                        if len(recent) > 10:
+                            recent = recent[-10:]
+                        entry["recent_outcomes"] = recent
+                        # Compute and store effectiveness_score; auto-archive if persistently ineffective
+                        score = sum(recent) / len(recent) if recent else 0.0
+                        entry["effectiveness_score"] = round(score, 4)
+                        if len(recent) >= 10 and score < 0.1 and not entry.get("stale"):
+                            entry["stale"] = True
+                            logger.info(
+                                "Playbook entry '%s' auto-archived (effectiveness_score=%.2f, "
+                                "%d recent outcomes with no confirmations)",
+                                short_key, score, len(recent),
+                            )
                         doc[full_key] = entry
                 project_for_playbook.design_doc = doc
                 flag_modified(project_for_playbook, "design_doc")
                 session.add(project_for_playbook)
+                # Store shown playbook keys in task context for outcome tracking at completion
+                task_ctx = dict(task.context or {})
+                task_ctx["_shown_playbook_keys"] = list(playbook_entries.keys())
+                task.context = task_ctx
+                flag_modified(task, "context")
+                session.add(task)
                 await session.commit()
             except Exception:
                 logger.exception("[AGENT] Failed to update playbook reference counts (non-critical)")

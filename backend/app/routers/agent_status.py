@@ -914,7 +914,7 @@ async def update_agent_status(
                         f"[METRICS] first_task_no_playbook project={task.project_id} task={task.id} "
                         f"type={task.first_payload.get('type', 'unknown')}"
                     )
-                # Increment confirmed_count on applicable playbook entries for successful first attempts
+                # Increment confirmed_count and update effectiveness scoring for successful first attempts
                 if _ctx["_first_attempt_succeeded"] and _proj and _playbook_count > 0:
                     try:
                         _task_type = task.first_payload.get("type", "create")
@@ -924,6 +924,11 @@ async def update_agent_status(
                         }
                         _doc = dict(_proj.design_doc or {})
                         _confirmed_changed = False
+                        _now_iso = _utcnow().isoformat()
+                        # Keys shown to this task (stored at claim time for accurate outcome tracking)
+                        _shown_keys = {
+                            f"playbook/{k}" for k in (_ctx.get("_shown_playbook_keys") or [])
+                        }
                         for _pk, _pv in list(_doc.items()):
                             if _pk.startswith("playbook/") and isinstance(_pv, dict):
                                 _applicable = _pv.get("applicable_types")
@@ -934,6 +939,26 @@ async def update_agent_status(
                                     continue
                                 _entry = dict(_pv)
                                 _entry["confirmed_count"] = _entry.get("confirmed_count", 0) + 1
+                                _entry["last_confirmed_at"] = _now_iso
+                                # Update rolling recent_outcomes only for entries shown to this task
+                                if _pk in _shown_keys:
+                                    _recent = list(_entry.get("recent_outcomes", []))
+                                    # Flip the most recent unconfirmed (False) outcome to True
+                                    _flipped = False
+                                    for _i in range(len(_recent) - 1, -1, -1):
+                                        if _recent[_i] is False:
+                                            _recent[_i] = True
+                                            _flipped = True
+                                            break
+                                    if not _flipped:
+                                        # No pending False; append True directly
+                                        _recent.append(True)
+                                        if len(_recent) > 10:
+                                            _recent = _recent[-10:]
+                                    _entry["recent_outcomes"] = _recent
+                                    # Compute and persist effectiveness_score
+                                    _score = sum(_recent) / len(_recent) if _recent else 0.5
+                                    _entry["effectiveness_score"] = round(_score, 4)
                                 _doc[_pk] = _entry
                                 _confirmed_changed = True
                         if _confirmed_changed:

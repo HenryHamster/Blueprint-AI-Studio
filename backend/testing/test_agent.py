@@ -717,7 +717,7 @@ async def test_claim_response_includes_playbook(client: AsyncClient, db_session)
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_claim_playbook_demotes_ineffective_entries(client: AsyncClient, db_session):
-    """Entries with reference_count>=10 and confirmed_count==0 are sorted after effective entries."""
+    """Entries with low effectiveness score (confirmed/referenced ratio) sort after effective entries."""
     from sqlalchemy.orm.attributes import flag_modified
 
     project = Project(name="Playbook Demotion Test", user_id="test-user-123")
@@ -770,6 +770,167 @@ async def test_claim_playbook_demotes_ineffective_entries(client: AsyncClient, d
     keys = list(playbook.keys())
     assert keys.index("aaa-effective") < keys.index("zzz-ineffective"), (
         f"Expected effective entry before ineffective, got order: {keys}"
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_skips_stale_playbook_entries(client: AsyncClient, db_session):
+    """Playbook entries with stale=True are not shown to agents (auto-archived)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Stale Playbook Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    project.design_doc = {
+        "playbook/stale-entry": {
+            "content": "outdated guidance that no longer helps",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 15,
+            "stale": True,
+            "effectiveness_score": 0.0,
+        },
+        "playbook/active-entry": {
+            "content": "current helpful guidance",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 2,
+            "reference_count": 5,
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do work"}],
+        vm_instance_id="agent-vm-stale-test",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-stale-test")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    playbook = data.get("playbook", {})
+    assert "active-entry" in playbook, "Active entry should be shown"
+    assert "stale-entry" not in playbook, "Stale entry should be excluded"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_appends_recent_outcomes_on_reference(client: AsyncClient, db_session):
+    """Claim appends False to recent_outcomes for each shown entry and stores _shown_playbook_keys."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Recent Outcomes Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    project.design_doc = {
+        "playbook/my-entry": {
+            "content": "some guidance",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 1,
+            "reference_count": 3,
+            "recent_outcomes": [True, False, True],
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do work"}],
+        vm_instance_id="agent-vm-outcomes-test",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-outcomes-test")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    # Verify recent_outcomes got a False appended
+    await db_session.refresh(project)
+    entry = project.design_doc["playbook/my-entry"]
+    outcomes = entry.get("recent_outcomes", [])
+    assert outcomes == [True, False, True, False], f"Expected [..., False] appended, got {outcomes}"
+
+    # Verify task context stores shown keys
+    await db_session.refresh(task)
+    shown_keys = (task.context or {}).get("_shown_playbook_keys", [])
+    assert "my-entry" in shown_keys, f"Expected 'my-entry' in _shown_playbook_keys, got {shown_keys}"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_recent_outcomes_sorts_by_effectiveness(client: AsyncClient, db_session):
+    """Claim sorts entries by recent_outcomes effectiveness score (sum/len) descending."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Effectiveness Sort Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    project.design_doc = {
+        # Low effectiveness: 1/5 = 0.2 score
+        "playbook/low-effectiveness": {
+            "content": "rarely helps",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 1,
+            "reference_count": 5,
+            "recent_outcomes": [False, False, False, True, False],  # score = 0.2
+        },
+        # High effectiveness: 4/5 = 0.8 score
+        "playbook/high-effectiveness": {
+            "content": "usually helps",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 4,
+            "reference_count": 5,
+            "recent_outcomes": [True, True, False, True, True],  # score = 0.8
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do work"}],
+        vm_instance_id="agent-vm-effectiveness-sort",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-effectiveness-sort")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    playbook = data.get("playbook", {})
+    keys = list(playbook.keys())
+    assert keys.index("high-effectiveness") < keys.index("low-effectiveness"), (
+        f"Expected high-effectiveness before low-effectiveness, got: {keys}"
     )
 
 
@@ -1525,31 +1686,32 @@ async def test_playbook_claim_increments_reference_count(client: AsyncClient, db
 @pytest.mark.asyncio
 async def test_playbook_claim_ordering_confirmed_count(client: AsyncClient, db_session):
     """
-    Playbook entries returned by claim are sorted by confirmed_count descending,
-    then reference_count descending as tiebreaker. Most-validated entries come first.
+    Playbook entries returned by claim are sorted by effectiveness_score descending.
+    For entries without recent_outcomes data, the score falls back to confirmed/referenced ratio.
+    Entries with higher confirmation rate per reference sort first.
     """
     project = Project(name="Playbook Order Test", user_id="test-user-order")
     project.design_doc = {
-        "playbook/low-count": {
-            "content": "low confirmed",
+        "playbook/low-ratio": {
+            "content": "low confirmation rate",
             "source_task_id": None,
             "updated_at": "2026-01-01T00:00:00",
             "confirmed_count": 1,
-            "reference_count": 10,
+            "reference_count": 10,  # ratio = 0.1
         },
-        "playbook/high-count": {
-            "content": "high confirmed",
+        "playbook/high-ratio": {
+            "content": "high confirmation rate",
             "source_task_id": None,
             "updated_at": "2026-01-01T00:00:00",
             "confirmed_count": 5,
-            "reference_count": 2,
+            "reference_count": 2,  # ratio = 2.5 (more confirmations than references — possible since all applicable tasks increment confirmed_count)
         },
-        "playbook/tiebreak": {
-            "content": "same confirmed, more references",
+        "playbook/mid-ratio": {
+            "content": "medium confirmation rate",
             "source_task_id": None,
             "updated_at": "2026-01-01T00:00:00",
             "confirmed_count": 5,
-            "reference_count": 8,
+            "reference_count": 8,  # ratio = 0.625
         },
     }
     db_session.add(project)
@@ -1572,9 +1734,9 @@ async def test_playbook_claim_ordering_confirmed_count(client: AsyncClient, db_s
 
     assert "playbook" in data
     keys = list(data["playbook"].keys())
-    # confirmed_count=5 entries first; among those, reference_count=8 before reference_count=2
-    assert keys.index("tiebreak") < keys.index("high-count")
-    assert keys.index("high-count") < keys.index("low-count")
+    # Sort by effectiveness score descending: high-ratio (2.5) → mid-ratio (0.625) → low-ratio (0.1)
+    assert keys.index("high-ratio") < keys.index("mid-ratio"), f"Order: {keys}"
+    assert keys.index("mid-ratio") < keys.index("low-ratio"), f"Order: {keys}"
 
 
 @pytest.mark.asyncio
@@ -1683,10 +1845,166 @@ async def test_playbook_confirmed_count_not_incremented_on_retry_success(
 
 
 @pytest.mark.asyncio
+async def test_playbook_recent_outcomes_flipped_on_first_attempt_success(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    When a task with _shown_playbook_keys completes on first attempt, the most recent False
+    in recent_outcomes is flipped to True and effectiveness_score is computed.
+    Entries not shown to this task do not get their recent_outcomes updated.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+
+    project = Project(name="Outcomes Flip Test", user_id="test-user-outcomes")
+    project.design_doc = {
+        "playbook/shown-entry": {
+            "content": "guidance shown to this task",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 1,
+            "reference_count": 3,
+            "recent_outcomes": [True, False, False],  # last False should be flipped
+        },
+        "playbook/not-shown-entry": {
+            "content": "guidance not shown to this task",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 2,
+            "recent_outcomes": [False, False],  # should NOT be changed
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-outcomes-flip",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        # Simulate that only 'shown-entry' was shown at claim time
+        context={"_shown_playbook_keys": ["shown-entry"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-outcomes-flip")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED", "logs": "done"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(project)
+    shown = project.design_doc["playbook/shown-entry"]
+    not_shown = project.design_doc["playbook/not-shown-entry"]
+
+    # Shown entry: last False flipped to True → [True, False, True]
+    assert shown["recent_outcomes"] == [True, False, True], (
+        f"Expected [True, False, True], got {shown['recent_outcomes']}"
+    )
+    # effectiveness_score computed: 2/3 ≈ 0.6667
+    assert shown.get("effectiveness_score") is not None
+    assert abs(shown["effectiveness_score"] - round(2/3, 4)) < 0.001
+    # last_confirmed_at set
+    assert shown.get("last_confirmed_at") is not None
+
+    # Not-shown entry: recent_outcomes unchanged
+    assert not_shown["recent_outcomes"] == [False, False], (
+        f"Not-shown entry should not be updated, got {not_shown['recent_outcomes']}"
+    )
+    assert not_shown.get("effectiveness_score") is None
+
+
+@pytest.mark.asyncio
+async def test_playbook_auto_archive_after_10_unconfirmed_references(client: AsyncClient, db_session):
+    """
+    After 10 references with no confirmations, an entry accumulates 10 Falses in recent_outcomes
+    (score=0.0 < 0.1 threshold) and is auto-archived (stale=True) during reference tracking.
+    Subsequent claims skip the stale entry.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Auto Archive Ref Test", user_id="test-user-autoarchive")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Entry pre-loaded with 9 Falses — one more reference will fill the window (10 Falses → stale)
+    project.design_doc = {
+        "playbook/zero-effectiveness": {
+            "content": "guidance that is never confirmed",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 9,
+            "recent_outcomes": [False] * 9,  # 9 unconfirmed references so far
+        },
+        "playbook/active-entry": {
+            "content": "currently active guidance",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 2,
+            "reference_count": 3,
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First claim: shows both entries, appends False to zero-effectiveness → 10 Falses → stale=True
+    task1 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "First task"}],
+        vm_instance_id="agent-vm-autoarchive-1",
+    )
+    db_session.add(task1)
+    await db_session.commit()
+    await db_session.refresh(task1)
+
+    token1 = create_agent_token(str(task1.id), "agent-vm-autoarchive-1")
+    resp1 = await client.post("/api/agent/claim", headers={"x-agent-token": token1})
+    assert resp1.status_code == 200
+
+    # After first claim: zero-effectiveness should now have stale=True in DB
+    await db_session.refresh(project)
+    entry = project.design_doc["playbook/zero-effectiveness"]
+    assert entry.get("stale") is True, f"Expected stale=True after 10 Falses, got: {entry}"
+    assert entry.get("effectiveness_score") == 0.0
+
+    # Second claim: zero-effectiveness should be excluded (stale=True)
+    task2 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Second task"}],
+        vm_instance_id="agent-vm-autoarchive-2",
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    token2 = create_agent_token(str(task2.id), "agent-vm-autoarchive-2")
+    resp2 = await client.post("/api/agent/claim", headers={"x-agent-token": token2})
+    assert resp2.status_code == 200
+
+    data2 = resp2.json()
+    playbook2 = data2.get("playbook", {})
+    assert "zero-effectiveness" not in playbook2, "Auto-archived entry should not appear in subsequent claims"
+    assert "active-entry" in playbook2, "Active entry should still appear"
+
+
+@pytest.mark.asyncio
 async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
     """
-    Admin playbook list endpoint returns reference_count, last_referenced_at, and stale flag.
-    Stale is True if no reference in 30+ days; False if recently referenced.
+    Admin playbook list endpoint returns reference_count, last_referenced_at, stale flag,
+    effectiveness_score, and last_confirmed_at.
+    Stale is True if stored stale=True (auto-archived) OR no reference in 30+ days.
     Auth is mocked by conftest to test-user-123 (admin).
     """
     from app.models import ProjectMember
@@ -1696,9 +2014,11 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
         "playbook/fresh-entry": {
             "content": "fresh content",
             "updated_at": "2026-04-10T00:00:00",
-            "confirmed_count": 1,
+            "confirmed_count": 3,
             "reference_count": 5,
             "last_referenced_at": "2026-04-13T00:00:00",  # 1 day ago — not stale
+            "last_confirmed_at": "2026-04-12T00:00:00",
+            "effectiveness_score": 0.6,
         },
         "playbook/stale-entry": {
             "content": "old content",
@@ -1712,6 +2032,15 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
             "confirmed_count": 0,
             "reference_count": 3,
             "last_referenced_at": "2025-12-15T00:00:00",  # >30 days ago
+        },
+        "playbook/auto-archived-entry": {
+            "content": "persistently ineffective",
+            "updated_at": "2026-04-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 10,
+            "last_referenced_at": "2026-04-13T00:00:00",  # recent but stale=True stored
+            "stale": True,
+            "effectiveness_score": 0.0,
         },
     }
     db_session.add(project)
@@ -1731,20 +2060,25 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
     fresh = entries["fresh-entry"]
     assert fresh["reference_count"] == 5
     assert fresh["last_referenced_at"] == "2026-04-13T00:00:00"
+    assert fresh["last_confirmed_at"] == "2026-04-12T00:00:00"
+    assert fresh["effectiveness_score"] == 0.6
     assert fresh["stale"] is False
 
     stale_entry = entries["stale-entry"]
     assert stale_entry["reference_count"] == 0
     assert stale_entry["last_referenced_at"] is None
+    assert stale_entry["last_confirmed_at"] is None
+    assert stale_entry["effectiveness_score"] is None
     assert stale_entry["stale"] is True
 
     stale_ref = entries["stale-ref-entry"]
     assert stale_ref["reference_count"] == 3
     assert stale_ref["stale"] is True
 
-    stale_ref = entries["stale-ref-entry"]
-    assert stale_ref["reference_count"] == 3
-    assert stale_ref["stale"] is True
+    # Auto-archived entry: stored stale=True takes precedence even though last_referenced_at is recent
+    auto_archived = entries["auto-archived-entry"]
+    assert auto_archived["stale"] is True
+    assert auto_archived["effectiveness_score"] == 0.0
 
 
 @pytest.mark.asyncio
