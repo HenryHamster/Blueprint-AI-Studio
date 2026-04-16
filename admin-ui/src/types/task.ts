@@ -38,7 +38,6 @@ export interface Task {
   commit_hash?: string;
   repo_url?: string;
   error_logs?: string;
-  error_logs_truncated?: boolean;
   failure_class?: string | null;
   research_findings?: ResearchFinding[] | null;
   context?: Record<string, unknown>;

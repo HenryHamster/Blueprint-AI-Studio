@@ -249,7 +249,7 @@ export function TaskDetailDrawer({
           </div>
         )}
         {activeTab === 'details' ? (
-          <DetailsTab task={task} tasks={tasks} gcpProjectId={gcpProjectId} onNavigateToTask={onNavigateToTask} onGoToLogs={() => setActiveTab('logs')} />
+          <DetailsTab task={task} tasks={tasks} gcpProjectId={gcpProjectId} onNavigateToTask={onNavigateToTask} />
         ) : (
           <>
             {wsDisconnected && (

@@ -162,7 +162,6 @@ async def get_all_tasks(
     artifacts_map: Dict[str, List[Dict[str, Any]]] = {}
     pr_map: Dict[str, str] = {}
     logs_map: Dict[str, str] = {}
-    logs_truncated_map: Dict[str, bool] = {}
     research_map: Dict[str, str] = {}
     commit_map: Dict[str, Dict[str, Any]] = {}
     if task_ids:
@@ -184,7 +183,6 @@ async def get_all_tasks(
                 pr_map[tid] = a.pr_url
             if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
                 logs_map[tid] = a.logs[:2000]
-                logs_truncated_map[tid] = len(a.logs) > 2000
             if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
                 try:
                     parsed = json.loads(a.logs[:100000])
@@ -258,7 +256,6 @@ async def get_all_tasks(
             "artifacts": artifacts_map.get(str(t.id), []),
             "pr_url": pr_map.get(str(t.id)),
             "error_logs": logs_map.get(str(t.id)),
-            "error_logs_truncated": logs_truncated_map.get(str(t.id), False),
             "research_findings": research_map.get(str(t.id)),
             "commit_hash": commit_map.get(str(t.id), {}).get("commit_hash"),
             "repo_url": commit_map.get(str(t.id), {}).get("repo_url"),
@@ -644,7 +641,6 @@ async def get_task(
     artifacts_list = []
     pr_url = None
     error_logs = None
-    error_logs_truncated = False
     research_findings = None
     commit_hash = None
     repo_url = None
@@ -660,8 +656,7 @@ async def get_task(
         if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
             pr_url = a.pr_url
         if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
-            error_logs_truncated = len(a.logs) > 2000
-            error_logs = a.logs[:2000]
+            error_logs = a.logs
         if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
             research_findings = a.logs[:100000]
         if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:
@@ -716,7 +711,6 @@ async def get_task(
         "artifacts": artifacts_list,
         "pr_url": pr_url,
         "error_logs": error_logs,
-        "error_logs_truncated": error_logs_truncated,
         "commit_hash": commit_hash,
         "repo_url": repo_url,
         "research_findings": research_findings,

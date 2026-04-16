@@ -166,7 +166,7 @@ function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task: Task; 
     </>
   );
 }
-export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoToLogs }: { task: Task; tasks?: Task[]; gcpProjectId?: string; onNavigateToTask?: (taskId: string) => void; onGoToLogs?: () => void }) {
+export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { task: Task; tasks?: Task[]; gcpProjectId?: string; onNavigateToTask?: (taskId: string) => void }) {
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isTerminal = task.status === 'COMPLETED' || task.status === 'FAILED' || task.status === 'CANCELLED';
   const duration = useElapsedTime(task.started_at ?? '', isTerminal ? task.last_heartbeat : undefined);
@@ -606,18 +606,9 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask, onGoTo
       {task.error_logs && (
         <>
           <SectionHeader>Error Logs</SectionHeader>
-          <pre className="text-sm text-red-300 whitespace-pre-wrap break-words bg-red-950/20 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-red-900/30 font-mono">
+          <pre className="text-sm text-red-300 whitespace-pre-wrap break-words bg-red-950/20 rounded-lg p-3 max-h-96 overflow-y-auto custom-scrollbar border border-red-900/30 font-mono">
             {task.error_logs}
           </pre>
-          {task.error_logs_truncated && (
-            <p className="text-xs text-neutral-500 mt-1 italic">Output truncated to 2000 characters.{' '}
-              {onGoToLogs ? (
-                <button onClick={onGoToLogs} className="text-blue-400 underline text-xs">Go to Logs tab</button>
-              ) : (
-                'View full logs in the Logs tab.'
-              )}
-            </p>
-          )}
         </>
       )}
 
