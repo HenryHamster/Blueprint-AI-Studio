@@ -63,6 +63,7 @@ runtime_config: Dict = {
     "max_parallel_research_per_project": 3,
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
+    "spawn_confidence_threshold": 0.25,  # P(success) below this injects low_confidence_spawn=True into task context
 }
 
 # --- Autonomous Loop State ---

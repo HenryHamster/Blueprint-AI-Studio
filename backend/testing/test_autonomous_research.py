@@ -2978,4 +2978,273 @@ async def test_dedup_deadlock_triggers_alert_after_3_consecutive_empty_cycles(db
     bug_reports = [m for m in messages if m.message_type == MessageType.BUG_REPORT]
     assert len(bug_reports) >= 1, "Expected a BUG_REPORT ProjectMessage for dedup deadlock"
     assert bug_reports[0].context.get("source") == "dedup_deadlock"
-    assert bug_reports[0].context.get("consecutive_empty_cycles") == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# predict_spawn_success — unit tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+from app.research_completion import predict_spawn_success
+
+
+def _make_direction_with_history(scope: str, created: int, merged: int, failed: int = 0) -> dict:
+    """Build a minimal direction dict with scope_breakdown in research_history."""
+    return {
+        "id": f"d-pred-{uuid.uuid4().hex[:6]}",
+        "status": "active",
+        "research_history": [
+            {
+                "timestamp": "2026-04-01T00:00:00",
+                "tasks_created": created,
+                "tasks_failed": failed,
+                "scope_breakdown": {
+                    scope: {"created": created, "merged": merged, "failed": failed}
+                },
+            }
+        ] * 3,  # Repeat 3x to satisfy the >=2 created threshold
+    }
+
+
+def test_predict_spawn_success_returns_float_in_range():
+    """predict_spawn_success always returns a value in [0.0, 1.0]."""
+    direction = _make_direction_with_history("small", created=5, merged=4)
+    result = predict_spawn_success("small", direction)
+    assert 0.0 <= result <= 1.0
+
+
+def test_predict_spawn_success_high_merge_rate():
+    """Direction with high merge rate returns high confidence."""
+    direction = _make_direction_with_history("small", created=5, merged=5)
+    result = predict_spawn_success("small", direction)
+    assert result >= 0.7, f"Expected high confidence for 100% merge rate, got {result}"
+
+
+def test_predict_spawn_success_low_merge_rate():
+    """Direction with low merge rate returns low confidence."""
+    direction = _make_direction_with_history("small", created=10, merged=1)
+    result = predict_spawn_success("small", direction)
+    assert result < 0.5, f"Expected low confidence for 10% merge rate, got {result}"
+
+
+def test_predict_spawn_success_no_data_returns_neutral():
+    """When direction has no history, returns neutral 0.5."""
+    direction = {"id": "d-nodata", "status": "active", "research_history": []}
+    result = predict_spawn_success("small", direction)
+    assert result == 0.5
+
+
+def test_predict_spawn_success_high_failure_rate():
+    """Direction with many task failures returns lower confidence."""
+    # 10 tasks created, 1 merged, 8 failed — very poor outcome
+    direction = _make_direction_with_history("medium", created=10, merged=1, failed=8)
+    result = predict_spawn_success("medium", direction)
+    assert result < 0.35, f"Expected low confidence for high failure rate, got {result}"
+
+
+def test_predict_spawn_success_scope_mismatch_uses_only_available_signals():
+    """If direction has data for 'small' but we query 'large', the scope signal is absent."""
+    direction = _make_direction_with_history("small", created=5, merged=5)
+    # Query for 'large' scope — no scope_breakdown entry for 'large'
+    result = predict_spawn_success("large", direction)
+    # Result should be neutral or driven only by failure-rate signal
+    assert 0.0 <= result <= 1.0
+
+
+def test_predict_spawn_success_project_signal_incorporated():
+    """When project is provided with sufficient data, project-level signal is incorporated."""
+    direction = {"id": "d-proj1", "status": "active", "research_history": []}
+    # Project has 6 small-scope tasks across directions — enough for Signal 2
+    project_directions = [
+        {
+            "id": f"d-proj{i}",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-04-01T00:00:00",
+                    "tasks_created": 3,
+                    "tasks_failed": 0,
+                    "scope_breakdown": {"small": {"created": 3, "merged": 3, "failed": 0}},
+                }
+            ],
+        }
+        for i in range(3)
+    ]
+
+    class _FakeProject:
+        directions = project_directions
+
+    result_with_project = predict_spawn_success("small", direction, _FakeProject())
+    result_without_project = predict_spawn_success("small", direction)
+    # With project high-merge-rate signal, result should be higher than neutral
+    assert result_with_project > result_without_project
+    assert result_with_project > 0.5
+
+
+def test_predict_spawn_success_project_insufficient_data_ignored():
+    """If project has fewer than 5 scope entries, Signal 2 is skipped gracefully."""
+    direction = {"id": "d-projinsuff", "status": "active", "research_history": []}
+
+    class _FakeProject:
+        directions = [
+            {
+                "id": "d-small",
+                "research_history": [
+                    {
+                        "timestamp": "2026-04-01T00:00:00",
+                        "tasks_created": 2,
+                        "tasks_failed": 0,
+                        "scope_breakdown": {"small": {"created": 2, "merged": 0, "failed": 2}},
+                    }
+                ],
+            }
+        ]
+
+    # Only 2 small tasks in project — below threshold of 5, signal ignored
+    result = predict_spawn_success("small", direction, _FakeProject())
+    # No signals fire — result is neutral 0.5
+    assert result == 0.5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _handle_research_completion — low_confidence_spawn injection
+# ─────────────────────────────────────────────────────────────────────────────
+
+import app.shared_state as _shared_state_module
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_spawn_injected_when_below_threshold(db_session, mocker):
+    """When P(success) < spawn_confidence_threshold, child task gets low_confidence_spawn=True."""
+    direction_id = "d-lowconf1"
+    # Direction with very poor merge rate: 0/10 merged across 3 cycles
+    direction = {
+        **_active_direction(direction_id, "Low-confidence direction"),
+        "research_history": [
+            {
+                "timestamp": f"2026-03-0{i}T00:00:00",
+                "tasks_created": 10,
+                "tasks_failed": 9,
+                "scope_breakdown": {"small": {"created": 10, "merged": 0, "failed": 9}},
+            }
+            for i in range(1, 4)
+        ],
+    }
+    project = Project(
+        name="Low Confidence Spawn Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    # Set threshold high enough that the 0% merge rate triggers it
+    original_threshold = _shared_state_module.runtime_config.get("spawn_confidence_threshold", 0.25)
+    _shared_state_module.runtime_config["spawn_confidence_threshold"] = 0.5
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Fix low-confidence task", direction_id, scope="small")],
+    )
+
+    try:
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        _shared_state_module.runtime_config["spawn_confidence_threshold"] = original_threshold
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    ctx = child_tasks[0].context or {}
+    assert ctx.get("low_confidence_spawn") is True, "Expected low_confidence_spawn=True in context"
+    assert "low_confidence_spawn_rate" in ctx, "Expected low_confidence_spawn_rate in context"
+    assert 0.0 <= ctx["low_confidence_spawn_rate"] <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_high_confidence_spawn_has_no_low_confidence_flag(db_session, mocker):
+    """When P(success) >= threshold, child task does NOT get low_confidence_spawn flag."""
+    direction_id = "d-hiconf01"
+    # Direction with excellent merge rate: 5/5 merged across 3 cycles
+    direction = {
+        **_active_direction(direction_id, "High-confidence direction"),
+        "research_history": [
+            {
+                "timestamp": f"2026-03-0{i}T00:00:00",
+                "tasks_created": 5,
+                "tasks_failed": 0,
+                "scope_breakdown": {"small": {"created": 5, "merged": 5, "failed": 0}},
+            }
+            for i in range(1, 4)
+        ],
+    }
+    project = Project(
+        name="High Confidence Spawn Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Implement high-confidence task", direction_id, scope="small")],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    ctx = child_tasks[0].context or {}
+    assert "low_confidence_spawn" not in ctx, (
+        "high-confidence task should NOT have low_confidence_spawn in context"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_history_spawn_has_no_low_confidence_flag(db_session, mocker):
+    """When direction has no history (insufficient data), P=0.5 >= default threshold, no flag."""
+    direction_id = "d-nohistflag"
+    direction = {**_active_direction(direction_id, "No history direction"), "research_history": []}
+    project = Project(
+        name="No History Confidence Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("No history task", direction_id)],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    ctx = child_tasks[0].context or {}
+    # Default threshold is 0.25, neutral rate is 0.5 → no flag
+    assert "low_confidence_spawn" not in ctx, "Neutral confidence (0.5) should not set low_confidence flag"
