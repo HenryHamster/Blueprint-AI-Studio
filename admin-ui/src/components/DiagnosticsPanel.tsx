@@ -1,7 +1,8 @@
-import { useState } from 'react';
-import { ChevronDown, ChevronUp, Stethoscope, AlertTriangle, Clock, Zap } from 'lucide-react';
-import type { ProjectDiagnostics, StuckTask } from '../types/diagnostics';
+import { useEffect, useState } from 'react';
+import { ChevronDown, ChevronUp, Stethoscope, AlertTriangle, Clock, Zap, Ban } from 'lucide-react';
+import type { ProjectDiagnostics, StuckTask, FailingTaskTypes } from '../types/diagnostics';
 import { formatDurationSec } from '../utils/time';
+import { API_BASE_URL, authGet } from '../api';
 
 const STUCK_REASON_LABELS: Record<StuckTask['stuck_reason'], string> = {
   provision_timeout: 'VM provision timed out',
@@ -20,6 +21,20 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
   const [collapsed, setCollapsed] = useState(() => {
     return localStorage.getItem('blueprint-admin:diagnosticsPanelCollapsed') === 'true';
   });
+  const [failingTypes, setFailingTypes] = useState<FailingTaskTypes | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await authGet(`${API_BASE_URL}/api/admin/failing-task-types`);
+        if (!cancelled && res.ok) setFailingTypes(await res.json());
+      } catch { /* leave previous value */ }
+    };
+    load();
+    const id = setInterval(load, 30000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
 
   const toggle = () => {
     const next = !collapsed;
@@ -46,6 +61,11 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
           {stuckCount > 0 && (
             <span className="ml-1 bg-red-500/20 border border-red-500/40 text-red-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none">
               {stuckCount} stuck
+            </span>
+          )}
+          {failingTypes && failingTypes.gated_types.length > 0 && (
+            <span className="ml-1 bg-amber-500/20 border border-amber-500/40 text-amber-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+              {failingTypes.gated_types.length} type{failingTypes.gated_types.length !== 1 ? 's' : ''} gated
             </span>
           )}
           {collapsed && diagnostics && (
@@ -105,6 +125,35 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
               </div>
             )}
           </div>
+
+          {/* Per-type failure gate */}
+          {failingTypes && failingTypes.gated_types.length > 0 && (
+            <div>
+              <div className="flex items-center gap-1.5 mb-1.5">
+                <Ban className="w-3 h-3 text-amber-400" />
+                <span className="font-medium text-amber-400">
+                  {failingTypes.gated_types.length} task type{failingTypes.gated_types.length !== 1 ? 's' : ''} gated
+                </span>
+                {failingTypes.anomaly_tightened && (
+                  <span className="text-[10px] text-amber-300 font-mono px-1 py-0.5 rounded bg-amber-500/10 border border-amber-500/30">
+                    anomaly-tightened gate ({Math.round(failingTypes.global_failure_threshold * 100)}%)
+                  </span>
+                )}
+              </div>
+              <div className="space-y-1 ml-4">
+                {failingTypes.gated_types.map((g) => (
+                  <div key={g.task_type} className="flex items-center gap-2">
+                    <span className="text-neutral-300 font-mono">{g.task_type}</span>
+                    <span className="text-neutral-500">—</span>
+                    <span className="text-amber-400">
+                      gated at {Math.round(g.failure_rate * 100)}% failure rate
+                    </span>
+                    <span className="text-neutral-600 font-mono">n={g.sample_size}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Zone Health */}
           <div className="flex items-center gap-1.5">

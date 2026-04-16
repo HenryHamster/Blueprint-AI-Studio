@@ -1493,3 +1493,93 @@ class TestRepairStateFailureCategory:
         await db_session.refresh(stuck_task)
         assert stuck_task.status == TaskStatus.FAILED
         assert (stuck_task.context or {}).get("failure_category") == "AGENT_TIMEOUT"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_analytics.py — direction auto-pause stats
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDirectionAutoPauseStats:
+    """Aggregation of direction auto-pause/recovery events for the dashboard widget."""
+
+    @pytest.mark.asyncio
+    async def test_aggregates_window_counts_reasons_and_trend(
+        self, client: AsyncClient, db_session
+    ):
+        from datetime import datetime, timedelta, timezone
+        project = await _make_project(db_session)
+
+        # Live directions: one currently auto-paused, one not
+        project.directions = [
+            {
+                "id": "d1", "text": "dir one", "status": "paused",
+                "auto_paused": True, "auto_pause_count": 1,
+                "paused_reason": "high failure rate",
+                "paused_at": datetime.now(timezone.utc).isoformat(),
+            },
+            {"id": "d2", "text": "dir two", "status": "active"},
+        ]
+        db_session.add(project)
+        await db_session.commit()
+
+        now = datetime.now(timezone.utc)
+        # Current window (last 24h): 3 auto-paused, 1 auto-retired
+        def _msg(hours_ago: float, milestone: str, reason: str):
+            m = ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="system",
+                content=f"Direction {milestone}: dir — {reason}",
+                context={
+                    "event_type": "direction_milestone",
+                    "milestone": milestone,
+                    "direction_text": "dir",
+                    "reason": reason,
+                },
+            )
+            m.created_at = now - timedelta(hours=hours_ago)
+            return m
+
+        db_session.add_all([
+            _msg(1, "auto-paused", "high failure rate"),
+            _msg(5, "auto-paused", "high failure rate"),
+            _msg(10, "auto-paused", "no merges"),
+            _msg(11, "auto-retired", "3 consecutive auto-pause cycles"),
+            # Previous window (24–48h ago): only 1 auto-paused — drives "up" trend
+            _msg(30, "auto-paused", "stale activity"),
+        ])
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/direction-auto-pause-stats?project_id={project.id}&window_hours=24"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["window_hours"] == 24
+        assert data["auto_paused_count"] == 3
+        assert data["auto_retired_count"] == 1
+        assert data["auto_recovered_count"] == 2  # 3 paused − 1 retired
+        assert data["currently_auto_paused"] == 1
+        assert data["prev_window_auto_paused_count"] == 1
+        assert data["trend"] == "up"
+        # Top reason is "high failure rate" (2 occurrences)
+        assert data["top_reasons"][0] == {"reason": "high failure rate", "count": 2}
+        reasons = {r["reason"] for r in data["top_reasons"]}
+        assert "no merges" in reasons
+
+    @pytest.mark.asyncio
+    async def test_empty_project_returns_zero_counts(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/direction-auto-pause-stats?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["auto_paused_count"] == 0
+        assert data["auto_retired_count"] == 0
+        assert data["auto_recovered_count"] == 0
+        assert data["currently_auto_paused"] == 0
+        assert data["top_reasons"] == []
+        assert data["trend"] == "flat"

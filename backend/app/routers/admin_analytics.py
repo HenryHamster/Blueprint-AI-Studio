@@ -18,7 +18,7 @@ from sqlmodel import select
 from app.database import get_session
 from app.models import (
     Task, TaskStatus, Project, Artifact, ArtifactType, DeploymentState, DeploymentStatus,
-    OrchestratorErrorAck, _utcnow,
+    ProjectMessage, OrchestratorErrorAck, _utcnow,
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _user_project_ids
@@ -1865,6 +1865,122 @@ async def get_health_overview(
         "queue_depth": queue_depth,
     }
 
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/direction-auto-pause-stats
+# ---------------------------------------------------------------------------
+
+
+def _compute_direction_auto_pause_stats(
+    projects: List[Project],
+    milestone_events: List[ProjectMessage],
+    now: datetime,
+    window_hours: int,
+) -> Dict[str, Any]:
+    """Aggregate direction auto-pause/recovery metrics over a window.
+
+    Uses event timestamps from ProjectMessage(event_type=direction_milestone)
+    for windowed counts and live Project.directions for currently-paused state.
+    """
+    window_start = now - timedelta(hours=window_hours)
+    prev_window_start = window_start - timedelta(hours=window_hours)
+
+    cur_paused = 0
+    cur_retired = 0
+    prev_paused = 0
+    reason_counts: Dict[str, int] = defaultdict(int)
+
+    for msg in milestone_events:
+        ctx = msg.context or {}
+        if ctx.get("event_type") != "direction_milestone":
+            continue
+        milestone = ctx.get("milestone")
+        ts = msg.created_at
+        if ts is None:
+            continue
+        if ts >= window_start:
+            if milestone == "auto-paused":
+                cur_paused += 1
+                reason = (ctx.get("reason") or "").strip()
+                if reason:
+                    reason_counts[reason[:120]] += 1
+            elif milestone == "auto-retired":
+                cur_retired += 1
+        elif ts >= prev_window_start:
+            if milestone == "auto-paused":
+                prev_paused += 1
+
+    # Recovery proxy: paused directions in window that were not auto-retired in window.
+    # Negative values are clamped — retirements can reference directions paused earlier.
+    recovered = max(cur_paused - cur_retired, 0)
+
+    # Currently auto-paused (live state — not window-bounded) so operators know active load.
+    currently_auto_paused = 0
+    for proj in projects:
+        for d in (proj.directions or []):
+            if d.get("status") == "paused" and d.get("auto_paused"):
+                currently_auto_paused += 1
+
+    top_reasons = [
+        {"reason": r, "count": c}
+        for r, c in sorted(reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+    ]
+
+    if cur_paused > prev_paused + 1:
+        trend = "up"
+    elif cur_paused + 1 < prev_paused:
+        trend = "down"
+    else:
+        trend = "flat"
+
+    return {
+        "window_hours": window_hours,
+        "auto_paused_count": cur_paused,
+        "auto_recovered_count": recovered,
+        "auto_retired_count": cur_retired,
+        "currently_auto_paused": currently_auto_paused,
+        "top_reasons": top_reasons,
+        "trend": trend,
+        "prev_window_auto_paused_count": prev_paused,
+    }
+
+
+@router.get("/direction-auto-pause-stats")
+async def get_direction_auto_pause_stats(
+    project_id: uuid.UUID | None = Query(None),
+    window_hours: int = Query(24, ge=1, le=720),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Aggregate direction auto-pause/recovery stats over a rolling window.
+
+    Powers a dashboard widget that makes self-healing efficacy visible: how many
+    directions were auto-paused, how many recovered vs. were auto-retired, the
+    most common pause reasons, and a coarse trend vs. the previous window.
+    """
+    now = _utcnow()
+    earliest = now - timedelta(hours=window_hours * 2)
+
+    # Load live directions for the "currently paused" count
+    if project_id:
+        proj = await session.get(Project, project_id)
+        projects = [proj] if proj else []
+        msg_filters = [
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.from_type == "system",
+            ProjectMessage.created_at >= earliest,
+        ]
+    else:
+        projects = (await session.execute(select(Project))).scalars().all()
+        msg_filters = [
+            ProjectMessage.from_type == "system",
+            ProjectMessage.created_at >= earliest,
+        ]
+
+    events = (await session.execute(select(ProjectMessage).where(*msg_filters))).scalars().all()
+    return _compute_direction_auto_pause_stats(projects, events, now, window_hours)
+
+
 @router.get("/task-duration-stats")
 async def get_task_duration_stats(
     project_id: uuid.UUID | None = Query(None),
@@ -1888,6 +2004,48 @@ async def get_task_duration_stats(
             sd = sorted(durs); mid = len(sd) // 2
             stats[tt] = {"p50_seconds": sd[mid] if len(sd) % 2 else (sd[mid - 1] + sd[mid]) / 2, "sample_count": len(durs)}
     return {"stats": stats}
+
+
+@router.get("/failing-task-types")
+async def get_failing_task_types(
+    current_user: dict = Depends(require_admin),
+):
+    """Return task types currently gated by the orchestrator's per-type failure rate.
+
+    Recomputes the same logic the dispatch loop uses (rate >= 0.7 with n >= 3
+    in the trailing 15-minute window) from the shared task_results buffer, so
+    operators can see which types are silently being skipped without reading
+    logs.  Also reports the global failure_gate_threshold so callers can tell
+    whether anomaly response has tightened it (0.6) vs the default (0.8).
+    """
+    from app import shared_state as _ss
+    PER_TYPE_THRESHOLD = 0.7
+    PER_TYPE_MIN_SAMPLES = 3
+    WINDOW_MINUTES = 15
+
+    cutoff = (_utcnow() - timedelta(minutes=WINDOW_MINUTES)).isoformat()
+    recent = [r for r in _ss.deploy_monitoring["task_results"] if r[0] >= cutoff]
+    seen_types = {r[3] for r in recent if len(r) > 3 and r[3]}
+
+    gated: List[Dict[str, Any]] = []
+    for ttype in sorted(seen_types):
+        rate, sample_size = _ss.get_task_type_failure_rate(ttype, window_minutes=WINDOW_MINUTES)
+        if sample_size >= PER_TYPE_MIN_SAMPLES and rate >= PER_TYPE_THRESHOLD:
+            gated.append({
+                "task_type": ttype,
+                "failure_rate": round(rate, 3),
+                "sample_size": sample_size,
+                "threshold": PER_TYPE_THRESHOLD,
+            })
+
+    global_threshold = _ss.anomaly_adjustments.get("failure_gate_threshold", 0.8)
+    return {
+        "gated_types": gated,
+        "global_failure_threshold": global_threshold,
+        "anomaly_tightened": bool(_ss.anomaly_adjustments.get("active")),
+        "window_minutes": WINDOW_MINUTES,
+        "generated_at": _utcnow().isoformat(),
+    }
 
 
 @router.get("/scope-baselines")

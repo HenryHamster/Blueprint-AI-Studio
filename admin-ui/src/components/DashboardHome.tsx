@@ -15,6 +15,7 @@ import { apiFetch } from '../api';
 import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
+import { DirectionAutoPauseWidget } from './DirectionAutoPauseWidget';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
@@ -569,6 +570,11 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               })}
             </div>
           )}
+
+          {/* Direction auto-pause/recovery observability */}
+          <div className="mt-4">
+            <DirectionAutoPauseWidget selectedProjectId={selectedProjectId} />
+          </div>
 
           {/* Section 5: PR Monitor */}
           <PRMonitorSection openPRs={openPRs} loading={loading} hasProject={!!selectedProjectId} />

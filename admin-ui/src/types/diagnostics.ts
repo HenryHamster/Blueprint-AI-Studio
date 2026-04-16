@@ -34,3 +34,29 @@ export interface HealthOverview {
   direction_portfolio: { product: number; structural: number; mixed: number; uncategorized: number; total_active: number };
   queue_depth: { queued: number; active: number; evaluating: number };
 }
+
+export interface FailingTaskTypeEntry {
+  task_type: string;
+  failure_rate: number;
+  sample_size: number;
+  threshold: number;
+}
+
+export interface FailingTaskTypes {
+  gated_types: FailingTaskTypeEntry[];
+  global_failure_threshold: number;
+  anomaly_tightened: boolean;
+  window_minutes: number;
+  generated_at: string;
+}
+
+export interface DirectionAutoPauseStats {
+  window_hours: number;
+  auto_paused_count: number;
+  auto_recovered_count: number;
+  auto_retired_count: number;
+  currently_auto_paused: number;
+  top_reasons: { reason: string; count: number }[];
+  trend: 'up' | 'down' | 'flat';
+  prev_window_auto_paused_count: number;
+}
