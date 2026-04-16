@@ -13,9 +13,10 @@ import json
 import logging
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from datetime import timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -708,3 +709,168 @@ async def extract_review_feedback_to_playbook(
         )
 
     return created_keys
+
+
+# ---------------------------------------------------------------------------
+# Review effectiveness tracking
+# ---------------------------------------------------------------------------
+
+# Minimum number of tasks with review history required in each window for the
+# trend computation to be meaningful.
+_MIN_REVIEW_SAMPLE = 10
+
+# Rate-of-change threshold below which a category is considered "stable" vs
+# "decreasing" / "increasing".  A 5pp shift is distinguishable from noise.
+_TREND_DELTA_THRESHOLD = 0.05
+
+
+async def compute_review_effectiveness(
+    project_id: uuid.UUID,
+    session: AsyncSession,
+    all_tasks: list,
+) -> Optional[dict[str, Any]]:
+    """Compare review issue category rates across two consecutive 14-day windows.
+
+    For each category in ``_REVIEW_CATEGORIES`` (plus "other"), the function
+    computes the fraction of total issues it represents in the *current* 14-day
+    window and the *previous* 14-day window, then classifies the change as one of:
+
+    - ``"decreasing"`` — rate dropped ≥ 5pp (surfacing the category is helping)
+    - ``"increasing"`` — rate rose ≥ 5pp (situation is getting worse)
+    - ``"stable"``      — change < 5pp in either direction
+
+    Returns ``None`` when either window has fewer than :data:`_MIN_REVIEW_SAMPLE`
+    tasks with non-empty review history.
+
+    **Side effect**: writes the result to
+    ``project.design_doc["review_effectiveness"]`` and maintains a per-category
+    ``rate_history`` list (capped at 5 entries) so that persistent issues can be
+    detected across multiple consecutive windows.
+
+    A *persistent issue* is a category whose ``rate_history`` tail of 3 entries
+    are each > 20 %, indicating it has been surfaced to agents for at least 3
+    windows yet remains common.
+    """
+    now = _utcnow()
+    cutoff_14d = now - timedelta(days=14)
+    cutoff_28d = now - timedelta(days=28)
+
+    def _split_history(tasks: list, start: datetime, end: datetime) -> tuple[int, list]:
+        """Return (task_count_with_reviews, combined_review_history_entries).
+
+        Compares naive datetimes; callers must pass naive *start*/*end* values.
+        """
+        tasks_with_rev = 0
+        history: list = []
+        for t in tasks:
+            if not t.created_at:
+                continue
+            # Normalise to naive for comparison regardless of DB driver timezone handling.
+            ts = t.created_at.replace(tzinfo=None) if t.created_at.tzinfo else t.created_at
+            if not (start <= ts < end):
+                continue
+            review_loop = (t.context or {}).get("review_loop") or {}
+            rev_hist = review_loop.get("review_history") or []
+            if rev_hist:
+                tasks_with_rev += 1
+                history.extend(rev_hist)
+        return tasks_with_rev, history
+
+    # Use a far-future sentinel with no tzinfo to handle both naive and aware datetimes.
+    # The cutoff datetimes from _utcnow() are tz-aware; strip tzinfo for comparison so
+    # the function works with both naive (DB default) and aware created_at values.
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    cutoff_14d_n = _naive(cutoff_14d)
+    cutoff_28d_n = _naive(cutoff_28d)
+    sentinel_n = datetime(9999, 12, 31)
+
+    current_count, current_history = _split_history(all_tasks, cutoff_14d_n, sentinel_n)
+    previous_count, previous_history = _split_history(all_tasks, cutoff_28d_n, cutoff_14d_n)
+
+    if current_count < _MIN_REVIEW_SAMPLE or previous_count < _MIN_REVIEW_SAMPLE:
+        return None
+
+    current_buckets = _categorize_review_issues(current_history)
+    previous_buckets = _categorize_review_issues(previous_history)
+
+    current_total = sum(len(v) for v in current_buckets.values())
+    previous_total = sum(len(v) for v in previous_buckets.values())
+
+    if current_total == 0 or previous_total == 0:
+        return None
+
+    all_cats = set(current_buckets.keys()) | set(previous_buckets.keys())
+    categories: dict[str, Any] = {}
+    for cat in all_cats:
+        current_rate = round(len(current_buckets.get(cat, [])) / current_total, 2)
+        previous_rate = round(len(previous_buckets.get(cat, [])) / previous_total, 2)
+
+        delta = current_rate - previous_rate
+        if delta <= -_TREND_DELTA_THRESHOLD:
+            trend = "decreasing"
+        elif delta >= _TREND_DELTA_THRESHOLD:
+            trend = "increasing"
+        else:
+            trend = "stable"
+
+        categories[cat] = {
+            "current_rate": current_rate,
+            "previous_rate": previous_rate,
+            "trend": trend,
+            "current_sample_size": current_count,
+            "previous_sample_size": previous_count,
+        }
+
+    # Update per-category window history for persistent-issue tracking.
+    project = await session.get(Project, project_id)
+    if not project:
+        return None
+
+    doc = dict(project.design_doc or {})
+    existing_eff: dict = dict(doc.get("review_effectiveness") or {})
+    existing_computed_at: Optional[str] = existing_eff.get("computed_at")
+
+    is_new_window = True
+    if existing_computed_at:
+        try:
+            last_dt = datetime.fromisoformat(existing_computed_at)
+            is_new_window = (now - last_dt).days >= 14
+        except (ValueError, TypeError):
+            pass
+
+    existing_cats: dict = dict(existing_eff.get("categories") or {})
+    for cat, data in categories.items():
+        prev_cat: dict = dict(existing_cats.get(cat) or {})
+        rate_history: list = list(prev_cat.get("rate_history") or [])
+        if is_new_window or not rate_history:
+            rate_history.append(data["current_rate"])
+            rate_history = rate_history[-5:]
+        data["rate_history"] = rate_history
+
+    # Categories above 20 % in each of their last 3 stored windows are flagged as
+    # persistent — a signal that structural changes may be needed rather than
+    # relying on agent-level awareness.
+    persistent_issues = [
+        cat for cat, data in categories.items()
+        if len(data["rate_history"]) >= 3
+        and all(r > 0.20 for r in data["rate_history"][-3:])
+    ]
+
+    result: dict[str, Any] = {
+        "computed_at": now.isoformat(),
+        "categories": categories,
+        "persistent_issues": persistent_issues,
+    }
+
+    doc["review_effectiveness"] = result
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+
+    logger.info(
+        "[REVIEW_EFFECTIVENESS] project=%s categories=%d persistent=%s",
+        project_id, len(categories), persistent_issues,
+    )
+    return result

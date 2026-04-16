@@ -551,6 +551,16 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
             "recall": recall,
         }
 
+    # Persistent review issues: categories that have remained above 20% in each of
+    # the last 3 consecutive 14-day windows, stored by compute_review_effectiveness.
+    persistent_review_issues: Optional[List[str]] = None
+    project = await session.get(Project, project_id)
+    if project and project.design_doc:
+        eff = project.design_doc.get("review_effectiveness") or {}
+        issues = eff.get("persistent_issues") or []
+        if issues:
+            persistent_review_issues = issues
+
     return {
         "success_rate": success_rate,
         "trend": trend,
@@ -559,6 +569,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "first_attempt_success_rate": first_attempt_success_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
         "review_accuracy": review_accuracy,
+        "persistent_review_issues": persistent_review_issues,
     }
 
 

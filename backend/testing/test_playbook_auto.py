@@ -675,3 +675,216 @@ async def test_capture_success_archives_when_over_capacity(db_session: AsyncSess
     doc = project.design_doc or {}
     archive = doc.get("playbook_archive", [])
     assert len(archive) >= 1, "At least one entry should have been archived for capacity"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for compute_review_effectiveness
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_review_issue(desc: str, severity: str = "MAJOR") -> dict:
+    return {"description": desc, "severity": severity}
+
+
+def _make_review_entry(iteration: int, issue_descs: list[str]) -> dict:
+    return {
+        "iteration": iteration,
+        "issues": [_make_review_issue(d) for d in issue_descs],
+    }
+
+
+async def _make_task_with_reviews(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    age_days: float,
+    issue_descs: list[str],
+    task_type: str = "create",
+) -> Task:
+    review_history = [_make_review_entry(0, issue_descs)]
+    task = Task(
+        project_id=project_id,
+        title="Task with reviews",
+        payloads=[{"type": task_type, "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={"review_loop": {"iteration": 1, "review_history": review_history}},
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    session.add(task)
+    await session.flush()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_returns_none_below_sample_size(db_session: AsyncSession):
+    """Returns None when either window has fewer than 10 tasks with review history."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    project = await _make_project(db_session)
+    # Only 5 tasks in each window (below the minimum of 10)
+    tasks = []
+    for i in range(5):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=2, issue_descs=["missing test coverage"]
+        )
+        tasks.append(t)
+    for i in range(5):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=18, issue_descs=["missing test coverage"]
+        )
+        tasks.append(t)
+
+    result = await compute_review_effectiveness(project.id, db_session, tasks)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_detects_decreasing_trend(db_session: AsyncSession):
+    """Detects a decreasing trend when a category drops by >= 5pp between windows."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    project = await _make_project(db_session)
+
+    # Previous window (15-28 days ago): all 12 tasks have test-coverage issues
+    prev_tasks = []
+    for _ in range(12):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=20,
+            issue_descs=["missing test coverage for new function", "no error handling"]
+        )
+        prev_tasks.append(t)
+
+    # Current window (last 14 days): only 2 out of 12 tasks have test-coverage issues
+    curr_tasks = []
+    for _ in range(2):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["missing test coverage for new function"]
+        )
+        curr_tasks.append(t)
+    for _ in range(10):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["no error handling"]
+        )
+        curr_tasks.append(t)
+
+    all_tasks = prev_tasks + curr_tasks
+    result = await compute_review_effectiveness(project.id, db_session, all_tasks)
+
+    assert result is not None
+    cats = result["categories"]
+    # test-coverage should be decreasing (fewer issues in current window vs previous)
+    assert "test-coverage" in cats
+    assert cats["test-coverage"]["trend"] == "decreasing"
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_stores_in_design_doc(db_session: AsyncSession):
+    """Result is persisted in project.design_doc['review_effectiveness']."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    project = await _make_project(db_session)
+
+    # Create 12 tasks in each window
+    all_tasks = []
+    for _ in range(12):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=20,
+            issue_descs=["missing test coverage for new function"]
+        )
+        all_tasks.append(t)
+    for _ in range(12):
+        t = await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["missing test coverage for new function"]
+        )
+        all_tasks.append(t)
+
+    result = await compute_review_effectiveness(project.id, db_session, all_tasks)
+    await db_session.flush()
+
+    assert result is not None
+    assert "review_effectiveness" in (project.design_doc or {})
+    stored = project.design_doc["review_effectiveness"]
+    assert "categories" in stored
+    assert "computed_at" in stored
+    assert "persistent_issues" in stored
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_rate_history_grows(db_session: AsyncSession):
+    """rate_history accumulates a new entry on each new window computation."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    project = await _make_project(db_session)
+
+    all_tasks = []
+    for _ in range(12):
+        all_tasks.append(await _make_task_with_reviews(
+            db_session, project.id, age_days=20,
+            issue_descs=["missing test coverage for new function"]
+        ))
+    for _ in range(12):
+        all_tasks.append(await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["missing test coverage for new function"]
+        ))
+
+    # First computation — creates the first history entry
+    result1 = await compute_review_effectiveness(project.id, db_session, all_tasks)
+    await db_session.flush()
+    assert result1 is not None
+    history1 = result1["categories"].get("test-coverage", {}).get("rate_history", [])
+    assert len(history1) == 1
+
+    # Simulate a new window by clearing computed_at to force is_new_window=True
+    doc = dict(project.design_doc or {})
+    doc["review_effectiveness"]["computed_at"] = (_utcnow() - timedelta(days=15)).isoformat()
+    project.design_doc = doc
+    await db_session.flush()
+
+    result2 = await compute_review_effectiveness(project.id, db_session, all_tasks)
+    await db_session.flush()
+    assert result2 is not None
+    history2 = result2["categories"].get("test-coverage", {}).get("rate_history", [])
+    assert len(history2) == 2
+
+
+@pytest.mark.asyncio
+async def test_compute_review_effectiveness_persistent_issues(db_session: AsyncSession):
+    """Identifies persistent issues when a category stays above 20% for 3+ windows."""
+    from app.playbook_learning import compute_review_effectiveness
+
+    # Pre-seed two historical high-rate windows
+    project = await _make_project(db_session, design_doc={
+        "review_effectiveness": {
+            "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
+            "categories": {
+                "test-coverage": {"rate_history": [0.35, 0.30]},
+            },
+            "persistent_issues": [],
+        },
+    })
+
+    # 12 tasks in each window, all with test-coverage issues (keeps rate high)
+    all_tasks = []
+    for _ in range(12):
+        all_tasks.append(await _make_task_with_reviews(
+            db_session, project.id, age_days=20,
+            issue_descs=["missing test coverage for new function"]
+        ))
+    for _ in range(12):
+        all_tasks.append(await _make_task_with_reviews(
+            db_session, project.id, age_days=5,
+            issue_descs=["missing test coverage for new function"]
+        ))
+
+    result = await compute_review_effectiveness(project.id, db_session, all_tasks)
+    await db_session.flush()
+
+    assert result is not None
+    # rate_history now has 3 entries, all > 20%, so it should be flagged as persistent
+    history = result["categories"].get("test-coverage", {}).get("rate_history", [])
+    assert len(history) == 3
+    assert all(r > 0.20 for r in history)
+    assert "test-coverage" in result["persistent_issues"]

@@ -378,6 +378,73 @@ describe('formatProjectContext', () => {
     const result = formatProjectContext(ctx, 'create', 'medium');
     expect(result).toContain('Your scope (medium): 75%');
   });
+
+  it('shows trend indicators in Common Review Issues when review_effectiveness is provided', () => {
+    const ctx = {
+      review_issue_distribution: {
+        'test-coverage': 0.35,
+        'error-handling': 0.25,
+        'type-safety': 0.15,
+      },
+      review_effectiveness: {
+        categories: {
+          'test-coverage': { trend: 'decreasing' },
+          'error-handling': { trend: 'stable' },
+          'type-safety': { trend: 'increasing' },
+        },
+        persistent_issues: [],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('test-coverage');
+    expect(result).toContain(', trending down');
+    expect(result).toContain(', persistent');
+    expect(result).toContain(', trending up');
+  });
+
+  it('omits trend indicators when review_effectiveness is absent', () => {
+    const ctx = {
+      review_issue_distribution: {
+        'test-coverage': 0.35,
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('test-coverage');
+    expect(result).not.toContain('trending');
+    expect(result).not.toContain('persistent');
+  });
+
+  it('surfaces persistent review issues in pipeline health', () => {
+    const ctx = {
+      pipeline_health: {
+        success_rate: 0.80,
+        trend: 'stable',
+        failure_distribution: {},
+        direction_stats: [],
+        first_attempt_success_rate: { overall: 0.60, sample_size: 15 },
+        persistent_review_issues: ['test-coverage', 'error-handling'],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('Persistent review issues');
+    expect(result).toContain('test-coverage');
+    expect(result).toContain('error-handling');
+  });
+
+  it('omits persistent review issues line when list is empty or absent', () => {
+    const ctx = {
+      pipeline_health: {
+        success_rate: 0.80,
+        trend: 'stable',
+        failure_distribution: {},
+        direction_stats: [],
+        first_attempt_success_rate: { overall: 0.60, sample_size: 15 },
+        persistent_review_issues: [],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('Persistent review issues');
+  });
 });
 
 // ── configureAgentPermissions ─────────────────────────────────────────────────

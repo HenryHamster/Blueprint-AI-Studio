@@ -593,6 +593,19 @@ async def claim_task(
             except Exception:
                 logger.exception("[AGENT] Failed to compute review_issue_distribution (non-critical)")
 
+        # Compute review effectiveness trends (stores in project.design_doc as side effect)
+        review_effectiveness = None
+        if task_type in ("create", "fix", "refactor"):
+            try:
+                from app.playbook_learning import compute_review_effectiveness
+                review_effectiveness = await compute_review_effectiveness(
+                    project_id=task.project_id,
+                    session=session,
+                    all_tasks=list(high_iter_rows),
+                )
+            except Exception:
+                logger.exception("[AGENT] Failed to compute review_effectiveness (non-critical)")
+
         response["project_context"] = {
             "active_tasks": active_tasks,
             "queued_tasks": queued_tasks,
@@ -603,6 +616,7 @@ async def claim_task(
             "pipeline_health": pipeline_health,
             "review_issue_distribution": review_issue_distribution,
             "top_first_review_issues": top_first_review_issues,
+            "review_effectiveness": review_effectiveness,
         }
     else:
         # Lightweight pipeline health for all other task types

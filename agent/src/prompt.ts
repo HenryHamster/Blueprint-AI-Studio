@@ -716,10 +716,16 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       }
     }
 
+    // Persistent review issues: categories above 20% for 3+ consecutive 14-day windows
+    const persistentIssues = pipelineHealth.persistent_review_issues as string[] | null | undefined;
+    if (persistentIssues && persistentIssues.length > 0) {
+      parts.push(`Persistent review issues (structural fix needed): ${persistentIssues.join(', ')}.`);
+    }
+
     if (parts.length > 0) {
       const body = parts.join(' ');
       const candidate = `### Pipeline Health (last 24h)\n${body}\n`;
-      if (candidate.length <= 400 && candidate.length <= budget) {
+      if (candidate.length <= 500 && candidate.length <= budget) {
         healthLines = ['### Pipeline Health (last 24h)', body, ''];
         budget -= candidate.length;
       }
@@ -731,6 +737,10 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   // First-attempt-specific breakdown from pipeline health (more actionable than all-iterations data)
   const fasrForReview = pipelineHealth?.first_attempt_success_rate as Record<string, unknown> | undefined;
   const firstAttemptByCat = fasrForReview?.first_attempt_by_review_category as Record<string, number> | null | undefined;
+  // Review effectiveness: per-category trend data from two consecutive 14-day windows
+  type ReviewEffectivenessCategory = { trend?: string };
+  const reviewEffectiveness = ctx.review_effectiveness as { categories?: Record<string, ReviewEffectivenessCategory> } | null | undefined;
+  const reviewEffCats = reviewEffectiveness?.categories;
   let reviewIssueLines: string[] = [];
   if (reviewIssueDist && Object.keys(reviewIssueDist).length > 0) {
     const hasFirstAttemptCats = firstAttemptByCat && Object.keys(firstAttemptByCat).length > 0;
@@ -743,7 +753,12 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       const faPct = hasFirstAttemptCats && firstAttemptByCat![cat] !== undefined
         ? ` (${Math.round(firstAttemptByCat![cat] * 100)}% of first-attempt rejections)`
         : '';
-      candidateLines.push(`- **${cat}**: ${Math.round(pct * 100)}% of review feedback${faPct}`);
+      const trend = reviewEffCats?.[cat]?.trend;
+      const trendIndicator = trend === 'decreasing' ? ', trending down'
+        : trend === 'increasing' ? ', trending up ⚠'
+        : trend === 'stable' ? ', persistent'
+        : '';
+      candidateLines.push(`- **${cat}**: ${Math.round(pct * 100)}% of review feedback${faPct}${trendIndicator}`);
     }
     // Append specific recurring patterns if available
     type FirstReviewIssue = { description: string; count: number; category: string };
