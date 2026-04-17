@@ -1327,9 +1327,19 @@ async def update_agent_status(
             try:
                 await session.rollback()
                 await session.refresh(task)
+                # Persist the payload along with the pending marker so the
+                # services.py sweeper can re-run _process_post_commit without
+                # waiting for the agent to retry (the VM has usually
+                # terminated by now).  mode="json" serializes uuid/enum safely.
+                try:
+                    _payload_dump = payload.model_dump(mode="json")
+                except Exception:
+                    _payload_dump = None
                 task.context = {**(task.context or {}), "_post_commit_pending": {
                     "at": _utcnow().isoformat(),
                     "reason": reason,
+                    "payload": _payload_dump,
+                    "attempts": ((task.context or {}).get("_post_commit_pending", {}) or {}).get("attempts", 0) + 1,
                 }}
                 session.add(task)
                 await session.commit()

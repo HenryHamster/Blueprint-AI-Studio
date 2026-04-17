@@ -839,6 +839,142 @@ async def _check_evaluating_timeouts():
         logger.error(f"[EVAL TIMEOUT] Evaluating timeout sweep failed: {e}", exc_info=True)
 
 
+async def _sweep_post_commit_pending():
+    """Re-run _process_post_commit for terminal tasks whose prior attempt died.
+
+    When _process_post_commit (review-pipeline spawn, rollup gate handoff,
+    completion handlers) times out — usually because GitHub quota hit 0 and
+    a defensive call took > 240s to give up — agent_status.py sets
+    context._post_commit_pending = {at, reason, payload, attempts}.  The
+    idempotency guard in agent_status re-runs post-commit when the agent
+    retries its status POST, but the agent VM has almost always terminated
+    by then, so without this sweeper the task sits with its verdict/rollup
+    state silently lost.
+
+    This runs every 60s.  For each pending task:
+      - Reconstruct AgentStatusPayload from the saved dict.
+      - Call _process_post_commit on a fresh session.
+      - On success: clear the _post_commit_pending flag.
+      - On failure/timeout: bump attempts counter (max 5 — avoid infinite
+        loop if the underlying cause is non-transient).
+    """
+    from app.routers.agent_status import _process_post_commit
+    from app.schemas import AgentStatusPayload
+
+    MAX_ATTEMPTS = 5
+    try:
+        async with AsyncSessionLocal() as session:
+            tasks = (await session.execute(
+                select(Task).where(
+                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+                    Task.archived.is_(False),
+                    Task.context["_post_commit_pending"].is_not(None),
+                ).limit(50)
+            )).scalars().all()
+
+            if not tasks:
+                return
+
+            logger.info(f"[POST_COMMIT SWEEP] Found {len(tasks)} task(s) with _post_commit_pending")
+
+            for task in tasks:
+                ctx = task.context or {}
+                pending = ctx.get("_post_commit_pending") or {}
+                attempts = int(pending.get("attempts", 0) or 0)
+                payload_dump = pending.get("payload")
+
+                if attempts >= MAX_ATTEMPTS:
+                    # Give up.  Convert the pending flag into a terminal marker
+                    # so the task doesn't keep getting picked up every sweep.
+                    logger.warning(
+                        f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} exceeded "
+                        f"{MAX_ATTEMPTS} attempts — marking post_commit_abandoned"
+                    )
+                    new_ctx = dict(ctx)
+                    new_ctx["_post_commit_abandoned"] = {
+                        "at": _utcnow().isoformat(),
+                        "after_attempts": attempts,
+                        "last_reason": pending.get("reason"),
+                    }
+                    new_ctx.pop("_post_commit_pending", None)
+                    task.context = new_ctx
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(task, "context")
+                    session.add(task)
+                    await session.commit()
+                    continue
+
+                if not payload_dump:
+                    # Older pending flag that didn't store the payload — we
+                    # can't reconstruct. Mark abandoned.
+                    logger.warning(
+                        f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} has no saved payload — cannot retry"
+                    )
+                    new_ctx = dict(ctx)
+                    new_ctx["_post_commit_abandoned"] = {
+                        "at": _utcnow().isoformat(),
+                        "reason": "no_saved_payload",
+                    }
+                    new_ctx.pop("_post_commit_pending", None)
+                    task.context = new_ctx
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(task, "context")
+                    session.add(task)
+                    await session.commit()
+                    continue
+
+                try:
+                    _payload = AgentStatusPayload(**payload_dump)
+                except Exception as e:
+                    logger.warning(
+                        f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} payload reconstruct failed: {e}"
+                    )
+                    continue
+
+                logger.info(
+                    f"[POST_COMMIT SWEEP] Retrying post-commit for task {str(task.id)[:8]} "
+                    f"(attempt {attempts + 1}/{MAX_ATTEMPTS}, reason={pending.get('reason')})"
+                )
+                try:
+                    await _process_post_commit(task.id, _payload)
+                    # Success — clear the flag on a fresh read (post_commit may
+                    # have mutated context in other ways we want to keep).
+                    async with AsyncSessionLocal() as clear_session:
+                        refreshed = await clear_session.get(Task, task.id)
+                        if refreshed:
+                            new_ctx = dict(refreshed.context or {})
+                            new_ctx.pop("_post_commit_pending", None)
+                            refreshed.context = new_ctx
+                            from sqlalchemy.orm.attributes import flag_modified
+                            flag_modified(refreshed, "context")
+                            clear_session.add(refreshed)
+                            await clear_session.commit()
+                    logger.info(f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} recovered")
+                except Exception as e:
+                    # Failure — bump attempts so we eventually give up.  The
+                    # retry path in _process_post_commit's exception handler
+                    # already bumps attempts itself if it got to set the
+                    # flag again; this covers cases where it didn't.
+                    logger.warning(
+                        f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} retry failed: {e}"
+                    )
+                    async with AsyncSessionLocal() as bump_session:
+                        refreshed = await bump_session.get(Task, task.id)
+                        if refreshed:
+                            new_ctx = dict(refreshed.context or {})
+                            new_pending = dict(new_ctx.get("_post_commit_pending") or pending)
+                            new_pending["attempts"] = int(new_pending.get("attempts", attempts)) + 1
+                            new_pending["last_retry_at"] = _utcnow().isoformat()
+                            new_ctx["_post_commit_pending"] = new_pending
+                            refreshed.context = new_ctx
+                            from sqlalchemy.orm.attributes import flag_modified
+                            flag_modified(refreshed, "context")
+                            bump_session.add(refreshed)
+                            await bump_session.commit()
+    except Exception as e:
+        logger.error(f"[POST_COMMIT SWEEP] Sweep failed: {e}", exc_info=True)
+
+
 async def _recover_orphaned_tasks():
     """Detect COMPLETED tasks with no PR artifact and no review child. Look up PR on GitHub and spawn review."""
     from app.routers.agent import get_github_token_for_task

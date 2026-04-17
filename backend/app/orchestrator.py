@@ -56,6 +56,7 @@ _last_anomaly_state_persist: datetime = _utcnow()
 _last_anomaly_sweep: datetime = _utcnow()
 _last_orphan_check: datetime = _utcnow()
 _last_evaluating_timeout_check: datetime = _utcnow()
+_last_post_commit_sweep: datetime = _utcnow()
 _last_deadlock_check: float = 0.0
 _last_zone_exhaustion_log: datetime | None = None
 _last_concurrency_broadcast: float = 0.0
@@ -456,7 +457,7 @@ async def orchestrator_worker():
     from app.rollup_management import _verify_pr_merged
     from app.review_pipeline import _spawn_pipeline_task
     from app.broadcast import broadcast_to_project, manager as ws_manager
-    from app.services import _recover_orphaned_tasks, _check_evaluating_timeouts
+    from app.services import _recover_orphaned_tasks, _check_evaluating_timeouts, _sweep_post_commit_pending
     from app.routers.agent import get_github_token_for_task
     from app.github import (
         get_check_runs,
@@ -464,7 +465,7 @@ async def orchestrator_worker():
     )
     global _last_pool_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
     global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
-    global _last_orphan_check, _last_evaluating_timeout_check
+    global _last_orphan_check, _last_evaluating_timeout_check, _last_post_commit_sweep
     while True:
         queued_tasks = []
         session = None  # defined before try so except handler can reference it
@@ -1986,6 +1987,13 @@ async def orchestrator_worker():
             if (_utcnow() - _last_evaluating_timeout_check).total_seconds() >= 300:
                 _last_evaluating_timeout_check = _utcnow()
                 await _check_evaluating_timeouts()
+            # _post_commit_pending sweeper — every 60s. Retries post-commit
+            # processing for terminal tasks whose prior attempt timed out
+            # (GitHub quota exhaustion, transient failures, etc.) without
+            # waiting for the agent to retry (the VM has usually terminated).
+            if (_utcnow() - _last_post_commit_sweep).total_seconds() >= 60:
+                _last_post_commit_sweep = _utcnow()
+                await _sweep_post_commit_pending()
             _orchestrator_consecutive_monitoring_errors = 0
         except Exception as e:
             _orchestrator_consecutive_monitoring_errors += 1
