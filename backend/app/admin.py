@@ -927,6 +927,84 @@ async def archive_task(
     await session.refresh(task)
     return task
 
+@router.post("/tasks/{task_id}/reset-iteration-cap")
+async def reset_iteration_cap(
+    task_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Reset the review-fix iteration cap for a PR.
+
+    Archives FAILED review/fix tasks for the PR (drops them from the per-PR
+    global count) and resets the per-chain iteration counter on ``task``.
+    Use when the cap tripped on infra/transient failures rather than real
+    review iterations, to let the pipeline retry without manual merge.
+
+    Does NOT re-spawn tasks automatically — after reset, re-trigger the
+    rollup (POST /tasks/{task_id}/rollup) or let the next orchestrator cycle
+    pick up the parking task.
+    """
+    task = await _get_user_task_with_role(task_id, current_user["user_id"], session, "member")
+
+    ctx = task.context or {}
+    review_loop = ctx.get("review_loop", {}) or {}
+    pr_number = review_loop.get("pr_number") or ctx.get("rollup_pr_number")
+    if not pr_number:
+        raise HTTPException(
+            status_code=400,
+            detail="Task has no PR number in context.review_loop.pr_number or context.rollup_pr_number",
+        )
+
+    # Archive FAILED review/fix tasks on this PR so they drop from the global count
+    failed_result = await session.execute(
+        select(Task).where(
+            Task.project_id == task.project_id,
+            Task.status == TaskStatus.FAILED,
+            Task.archived.is_(False),
+        )
+    )
+    archived_count = 0
+    for t in failed_result.scalars().all():
+        fp = t.first_payload
+        if fp.get("pr_number") != pr_number or fp.get("type") not in ("review", "fix"):
+            continue
+        t.archived = True
+        session.add(t)
+        archived_count += 1
+
+    # Reset per-chain iteration counter on the parking task
+    new_ctx = dict(ctx)
+    new_review_loop = dict(review_loop)
+    previous_iteration = new_review_loop.get("iteration", 0)
+    new_review_loop["iteration"] = 0
+    new_review_loop["iteration_reset_at"] = _utcnow().isoformat()
+    new_review_loop["iteration_reset_by"] = current_user.get("email", current_user["user_id"])
+    new_ctx["review_loop"] = new_review_loop
+    task.context = new_ctx
+    flag_modified(task, "context")
+
+    # Clear requires_approval if it was set by the cap path
+    was_requires_approval = task.requires_approval
+    if task.requires_approval:
+        task.requires_approval = False
+
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    logger.info(
+        f"[ADMIN] Iteration cap reset on task {task.id} (PR #{pr_number}): "
+        f"archived {archived_count} failed review/fix tasks, "
+        f"per-chain iteration {previous_iteration}→0"
+    )
+    return {
+        "task_id": str(task.id),
+        "pr_number": pr_number,
+        "archived_count": archived_count,
+        "previous_per_chain_iteration": previous_iteration,
+        "requires_approval_cleared": was_requires_approval,
+    }
+
+
 @router.post("/tasks/{task_id}/unarchive")
 async def unarchive_task(
     task_id: uuid.UUID,
@@ -1382,8 +1460,17 @@ async def trigger_rollup(
         if review_task:
             task.latest_status_message = f"Rollup PR #{rollup_pr_number} created, review spawned → {review_task.id}"
         else:
+            # _spawn_pipeline_task sets source_task.latest_status_message to a
+            # specific reason (already merged / iteration cap / deferred behind
+            # in-flight task / stuck cycle) and we want to preserve that.
+            # Only fall back to the generic message if nothing was set.
+            spawn_reason = task.latest_status_message
             task.status = TaskStatus.FAILED
-            task.latest_status_message = f"Rollup PR #{rollup_pr_number} created but review not spawned (iteration cap)"
+            task.latest_status_message = (
+                f"Rollup PR #{rollup_pr_number} created but review not spawned — {spawn_reason}"
+                if spawn_reason
+                else f"Rollup PR #{rollup_pr_number} created but review not spawned (unknown reason)"
+            )
             from app.failure_classification import persist_failure_category  # noqa: PLC0415
             persist_failure_category(task, "AGENT_TIMEOUT")
 

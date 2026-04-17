@@ -988,6 +988,26 @@ def cmd_directions(args):
             print(f"  [{prio:6}] {did[:8]}  {_safe(full_text, 120)}{sat_str}{hist_str}")
 
 
+def cmd_reset_iteration_cap(args):
+    """Reset the review-fix iteration cap for a stuck rollup/parking task.
+
+    Archives FAILED review/fix tasks on the PR (drops them from the global
+    count) and resets the per-chain iteration counter to 0. Use when the cap
+    tripped on infra failures rather than real review iterations.
+
+    Usage: tasks.py reset-iteration-cap <task_id>
+    """
+    from blueprint_api import api
+    if not args:
+        print("Usage: tasks.py reset-iteration-cap <task_id>")
+        return
+    tid = args[0]
+    result = api("POST", f"/api/admin/tasks/{tid}/reset-iteration-cap")
+    print(f"PR #{result.get('pr_number')}: archived {result.get('archived_count')} failed review/fix tasks, "
+          f"per-chain iteration {result.get('previous_per_chain_iteration')}->0"
+          + (" (cleared requires_approval)" if result.get('requires_approval_cleared') else ""))
+
+
 def cmd_unhold_direction(args):
     """Clear a direction's consecutive-failure hold.
 
@@ -1471,6 +1491,7 @@ COMMANDS = {
     "add-direction": cmd_add_direction,
     "update-direction": cmd_update_direction,
     "unhold-direction": cmd_unhold_direction,
+    "reset-iteration-cap": cmd_reset_iteration_cap,
     "autonomy-debug": cmd_autonomy_debug,
     "archive": cmd_archive,
     "research": cmd_research,

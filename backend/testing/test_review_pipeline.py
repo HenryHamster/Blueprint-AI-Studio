@@ -235,6 +235,120 @@ async def test_global_cap_blocks_spawn(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_infra_failed_tasks_dont_count_toward_global_cap(db_session, mocker):
+    """FAILED tasks with infra failure_category (PROVISION_FAILURE, RATE_LIMIT,
+    AGENT_TIMEOUT, EXTERNAL_API) never ran a real review, so they must not
+    consume iteration budget."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 103, "branch": "feat/x", "base_branch": "main"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+
+    # 20 FAILED review tasks, all infra-class — cap is 10 for small scope,
+    # but none of these should count.
+    for fc in ["PROVISION_FAILURE", "RATE_LIMIT", "AGENT_TIMEOUT", "EXTERNAL_API"] * 5:
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "review", "pr_number": 103, "branch": "feat/x", "base_branch": "main"}],
+            context={"failure_category": fc},
+        )
+        db_session.add(t)
+
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=103, branch="feat/x", base_branch="main",
+        fix_prompt="Fix",
+    )
+    assert result is not None, "Infra-class FAILED tasks must not count toward the cap"
+    assert result.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_archived_tasks_dont_count_toward_global_cap(db_session, mocker):
+    """Archived tasks must not count — this is how reset-iteration-cap works."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 104, "branch": "feat/x", "base_branch": "main"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+
+    # 15 archived COMPLETED tasks — would exceed cap if counted.
+    for _ in range(15):
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review", "pr_number": 104, "branch": "feat/x", "base_branch": "main"}],
+            archived=True,
+        )
+        db_session.add(t)
+
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=104, branch="feat/x", base_branch="main",
+        fix_prompt="Fix",
+    )
+    assert result is not None, "Archived tasks must not count toward the cap"
+
+
+@pytest.mark.asyncio
+async def test_code_error_failed_tasks_do_count_toward_global_cap(db_session, mocker):
+    """CODE_ERROR failures ARE real review iterations and must count — otherwise
+    a broken PR could loop forever."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 105, "branch": "feat/x", "base_branch": "main"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+
+    # 10 CODE_ERROR-failed tasks — reaches small-scope cap of 10.
+    for _ in range(10):
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "review", "pr_number": 105, "branch": "feat/x", "base_branch": "main"}],
+            context={"failure_category": "CODE_ERROR"},
+        )
+        db_session.add(t)
+
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=105, branch="feat/x", base_branch="main",
+    )
+    assert result is None, "CODE_ERROR FAILED tasks must count toward the cap"
+
+
+@pytest.mark.asyncio
 async def test_global_cap_under_limit_allows_spawn(db_session, mocker):
     """With fewer completed tasks than the cap, _spawn_pipeline_task creates a task."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)

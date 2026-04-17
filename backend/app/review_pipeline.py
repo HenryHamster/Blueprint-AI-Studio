@@ -234,18 +234,33 @@ async def _spawn_pipeline_task(
         return (None, False)
 
     # Per-PR iteration cap: count completed review/fix tasks for this PR across all chains
-    # Filter to tasks matching this PR number (check payloads JSONB)
+    # Filter to tasks matching this PR number (check payloads JSONB).
+    # Excludes archived tasks (manual iteration-cap reset path) and infra-class
+    # failures: a task that died in VM provisioning / rate limit / agent timeout
+    # / external API / stale-info push never actually ran a review, so counting
+    # it toward the per-PR iteration cap would trip the cap with zero real
+    # reviews on the PR.
+    from app.failure_classification import INFRA_CLASSES  # noqa: PLC0415
     pr_pipeline_tasks = (await session.execute(
         select(Task).where(
             Task.project_id == source_task.project_id,
             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.archived.is_(False),
         )
     )).scalars().all()
-    pr_iterations = sum(
-        1 for t in pr_pipeline_tasks
-        if t.first_payload.get("pr_number") == pr_number
-        and t.first_payload.get("type") in ("review", "fix")
-    )
+
+    def _counts_toward_cap(t: Task) -> bool:
+        if t.first_payload.get("pr_number") != pr_number:
+            return False
+        if t.first_payload.get("type") not in ("review", "fix"):
+            return False
+        if t.status == TaskStatus.FAILED:
+            fc = (t.context or {}).get("failure_category")
+            if fc in INFRA_CLASSES:
+                return False
+        return True
+
+    pr_iterations = sum(1 for t in pr_pipeline_tasks if _counts_toward_cap(t))
     # Load direction data for direction-aware cap adjustment.
     direction_data: dict | None = None
     direction_id = (source_task.context or {}).get("direction_id")
