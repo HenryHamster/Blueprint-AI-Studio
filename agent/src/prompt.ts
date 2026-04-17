@@ -373,6 +373,26 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       const msg = strVal(failureStagePattern.message);
       if (msg) dcLines.push(`**Failure pattern:** ${msg}`);
     }
+    const scopeRates = dirCtx.scope_success_rates as Record<string, Record<string, unknown>> | undefined;
+    if (scopeRates && typeof scopeRates === 'object') {
+      const scopeOrder = ['small', 'medium', 'large', 'ci_failure'];
+      const entries = Object.entries(scopeRates).sort(([a], [b]) => {
+        const ai = scopeOrder.indexOf(a);
+        const bi = scopeOrder.indexOf(b);
+        return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+      });
+      const parts: string[] = [];
+      for (const [scope, counts] of entries) {
+        const created = Number(counts?.created ?? 0);
+        const merged = Number(counts?.merged ?? 0);
+        if (created < 1) continue;
+        const pct = Math.round((merged / created) * 100);
+        parts.push(`${scope} ${merged}/${created} (${pct}%)`);
+      }
+      if (parts.length > 0) {
+        dcLines.push(`Scope merge rates: ${parts.join(', ')}`);
+      }
+    }
     const priorAnalysis = Array.isArray(dirCtx.direction_prior_analysis)
       ? dirCtx.direction_prior_analysis as Array<Record<string, unknown>>
       : [];

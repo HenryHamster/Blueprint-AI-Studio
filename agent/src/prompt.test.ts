@@ -263,6 +263,25 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('## Direction Context');
   });
 
+  it('renders scope_success_rates as a concise merge-rate line in Direction Context', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        scope_success_rates: {
+          medium: { created: 1, merged: 0, failed: 1 },
+          small: { created: 4, merged: 3, failed: 1 },
+          empty: { created: 0, merged: 0, failed: 0 },
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('Scope merge rates: small 3/4 (75%), medium 0/1 (0%)');
+    expect(result).not.toContain('empty');
+  });
+
   it('renders failure_stage_pattern message in Direction Context when present', () => {
     const task = {
       direction_context: {

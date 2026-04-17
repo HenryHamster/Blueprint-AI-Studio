@@ -371,20 +371,20 @@ async def _spawn_pipeline_task(
                 select(Task).where(
                     Task.project_id == source_task.project_id,
                     Task.status == TaskStatus.COMPLETED,
+                    Task.payloads[0]["type"].as_string() == "review",
+                    Task.payloads[0]["pr_number"].as_string() == str(pr_number),
                 ).order_by(Task.created_at.asc())
             )).scalars().all()
             prior_feedback_entries = []
             for t in prior_reviews:
-                t_payload = t.first_payload
-                if t_payload.get("pr_number") == pr_number and t_payload.get("type") == "review":
-                    feedback_text = t.latest_status_message or t.description or ""
-                    if feedback_text:
-                        prior_feedback_entries.append(feedback_text)
+                feedback_text = t.latest_status_message or t.description or ""
+                if feedback_text:
+                    prior_feedback_entries.append(feedback_text)
             prior_feedback_entries = prior_feedback_entries[-3:]  # last 3 iterations
             if prior_feedback_entries:
                 history_section = "\n\n---\n\n".join(prior_feedback_entries)
                 enriched_fix_prompt = (
-                    f"## Previous review feedback (already addressed):\n{history_section}"
+                    f"## Previous review feedback (from prior review iterations):\n{history_section}"
                     f"\n\n## Current review feedback:\n{fix_prompt}"
                 )
         except Exception as e:

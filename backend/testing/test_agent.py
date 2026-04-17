@@ -1399,6 +1399,54 @@ async def test_claim_injects_direction_context_for_create_task(client: AsyncClie
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_claim_injects_scope_success_rates_in_direction_context(client: AsyncClient, db_session):
+    """direction_context.scope_success_rates aggregates scope_breakdown over last 3 productive cycles."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Scope Rates Test", user_id="test-user-xyz")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "d",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [
+                # non-productive cycle should be excluded
+                {"tasks_created": 0, "prs_merged": 0, "scope_breakdown": {"small": {"created": 0, "merged": 0, "failed": 0}}},
+                {"tasks_created": 2, "prs_merged": 2, "scope_breakdown": {"small": {"created": 2, "merged": 2, "failed": 0}}},
+                {"tasks_created": 2, "prs_merged": 1, "scope_breakdown": {"small": {"created": 2, "merged": 1, "failed": 1}, "medium": {"created": 1, "merged": 0, "failed": 1}}},
+                {"tasks_created": 1, "prs_merged": 0, "scope_breakdown": {"empty": {"created": 0, "merged": 0, "failed": 0}}},
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do"}],
+        vm_instance_id="agent-vm-scope-rates",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-scope-rates")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dc = resp.json()["direction_context"]
+    rates = dc["scope_success_rates"]
+    assert rates["small"] == {"created": 4, "merged": 3, "failed": 1}
+    assert rates["medium"] == {"created": 1, "merged": 0, "failed": 1}
+    assert "empty" not in rates
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_claim_does_not_inject_direction_context_for_review_task(client: AsyncClient, db_session):
     """Claim endpoint does NOT inject direction_context for review tasks (only create/fix/refactor)."""
     from sqlalchemy.orm.attributes import flag_modified

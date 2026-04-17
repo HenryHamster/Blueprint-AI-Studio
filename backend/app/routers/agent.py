@@ -1093,6 +1093,28 @@ async def claim_task(
                 ]
                 failure_stage_pattern = _compute_failure_stage_pattern(history)
 
+                # Aggregate scope_breakdown from the last 3 productive research cycles
+                scope_success_rates: dict[str, dict[str, int]] = {}
+                productive_cycles = [
+                    h for h in history if h.get("tasks_created", 0) > 0
+                ][-3:]
+                for cycle in productive_cycles:
+                    sb = cycle.get("scope_breakdown") or {}
+                    if not isinstance(sb, dict):
+                        continue
+                    for scope_name, counts in sb.items():
+                        if not isinstance(counts, dict):
+                            continue
+                        agg_entry = scope_success_rates.setdefault(
+                            scope_name, {"created": 0, "merged": 0, "failed": 0}
+                        )
+                        agg_entry["created"] += int(counts.get("created", 0) or 0)
+                        agg_entry["merged"] += int(counts.get("merged", 0) or 0)
+                        agg_entry["failed"] += int(counts.get("failed", 0) or 0)
+                scope_success_rates = {
+                    k: v for k, v in scope_success_rates.items() if v["created"] >= 1
+                }
+
                 # Pull recent failed/cancelled sibling tasks with analysis artifacts
                 prior_analysis_cutoff = _utcnow() - timedelta(days=14)
                 prior_stmt = (
@@ -1137,6 +1159,7 @@ async def claim_task(
                     "recent_outcomes": recent_outcomes,
                     "failure_stage_pattern": failure_stage_pattern,
                     "direction_prior_analysis": direction_prior_analysis,
+                    "scope_success_rates": scope_success_rates,
                 }
 
             # Surface saturation / deadlock signals to research agents so they can
