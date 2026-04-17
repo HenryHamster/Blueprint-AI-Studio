@@ -1610,6 +1610,137 @@ async def test_rollup_merge_deferred_counter_resets_on_state_change(rollup_db, m
     assert (parent.context or {}).get("_merge_deferred_state") == "unstable"
 
 
+@pytest.mark.asyncio
+async def test_rollup_merge_total_deferrals_catches_state_flapping(rollup_db, mocker):
+    """State flapping (blocked↔unstable↔blocked) resets the per-state counter on
+    each flip, but the total-deferral counter keeps climbing. The total-count
+    thresholds (2x the per-state values) must fire alert + approval even when
+    no single state accumulates enough consecutive deferrals."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        # Per-state alert=5, approval=10 → total alert=10, total approval=20
+        {"rollup_merge_deferred_alert": 5, "rollup_merge_deferred_approval": 10},
+    )
+    state = {"state": "blocked"}
+    _patch_deferred_counter_mocks(mocker, state)
+    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_approval_dispatch = mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock,
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    # Alternate blocked↔unstable each sweep — per-state counter never exceeds 1
+    for i in range(9):
+        state["state"] = "blocked" if i % 2 == 0 else "unstable"
+        await _check_and_trigger_rollup(child, rollup_db)
+        await rollup_db.refresh(parent)
+
+    ctx = parent.context or {}
+    # Per-state counter reset on every flip → stays at 1
+    assert ctx.get("_merge_deferred_count") == 1
+    # Total counter climbs regardless of flapping
+    assert ctx.get("_merge_total_deferrals") == 9
+    # Per-state alert never fires (alert_threshold=5, counter never passes 1)
+    # Total alert threshold (10) not yet reached
+    assert mock_alert.await_count == 0
+    assert parent.requires_approval is False
+
+    # Sweep 10 — hits total alert threshold (2 * 5)
+    state["state"] = "blocked"
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert ctx.get("_merge_total_deferrals") == 10
+    assert mock_alert.await_count == 1, "total-count alert should fire at 2x per-state threshold"
+    assert ctx.get("_merge_total_alerted") is True
+    assert parent.requires_approval is False
+
+    # Sweeps 11-19 — total alert must not re-fire
+    for i in range(9):
+        state["state"] = "unstable" if i % 2 == 0 else "blocked"
+        await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert mock_alert.await_count == 1, "total alert must fire once, not on every subsequent sweep"
+
+    # Sweep 20 — hits total approval threshold (2 * 10)
+    state["state"] = "blocked"
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_total_deferrals") == 20
+    assert parent.requires_approval is True
+    assert mock_approval_dispatch.await_count == 1
+    assert mock_approval_dispatch.await_args.kwargs.get("pr_number") == 777
+
+
+@pytest.mark.asyncio
+async def test_rollup_merge_time_based_escalation(rollup_db, mocker):
+    """Time-based safety net: once total deferral time exceeds 30 min, alert
+    fires; past 60 min, approval gate engages — independent of counter values."""
+    # Keep per-state / total thresholds large so only the time gate can fire.
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {
+            "rollup_merge_deferred_alert": 9999,
+            "rollup_merge_deferred_approval": 9999,
+            "rollup_merge_deferred_time_alert_minutes": 30,
+            "rollup_merge_deferred_time_approval_minutes": 60,
+        },
+    )
+    state = {"state": "blocked"}
+    _patch_deferred_counter_mocks(mocker, state)
+    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_approval_dispatch = mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock,
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    # Sweep 1 — first deferral records timestamp; no escalation yet
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert ctx.get("_merge_first_deferred_at") is not None
+    assert mock_alert.await_count == 0
+    assert parent.requires_approval is False
+
+    # Back-date _merge_first_deferred_at to 31 minutes ago — next sweep should alert
+    from app.time_utils import _utcnow
+    ctx = {**(parent.context or {}),
+           "_merge_first_deferred_at": (_utcnow() - timedelta(minutes=31)).isoformat()}
+    parent.context = ctx
+    rollup_db.add(parent)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert mock_alert.await_count == 1, "time-based alert should fire after 30 min elapsed"
+    assert (parent.context or {}).get("_merge_time_alerted") is True
+    assert parent.requires_approval is False
+
+    # Another sweep — time-alert must not re-fire
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert mock_alert.await_count == 1, "time alert must fire once, not on every subsequent sweep"
+
+    # Back-date to 61 minutes ago — approval gate should engage
+    ctx = {**(parent.context or {}),
+           "_merge_first_deferred_at": (_utcnow() - timedelta(minutes=61)).isoformat()}
+    parent.context = ctx
+    rollup_db.add(parent)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert mock_approval_dispatch.await_count == 1
+    assert mock_approval_dispatch.await_args.kwargs.get("pr_number") == 777
+
+
 # ── Strategic Completion Handler ─────────────────────────────────────────────
 
 @pytest_asyncio.fixture()

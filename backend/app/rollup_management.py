@@ -888,6 +888,18 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             _ms_display = _ms or "missing (refetch failed)"
                             prev_state = parent_ctx.get("_merge_deferred_state")
                             deferred_count = (parent_ctx.get("_merge_deferred_count", 0) + 1) if prev_state == _ms_key else 1
+                            # Total-deferral counter: increments on every deferral regardless
+                            # of state change. Prevents a flapping PR (blocked↔unstable↔…) from
+                            # evading the per-state threshold forever.
+                            total_deferrals = parent_ctx.get("_merge_total_deferrals", 0) + 1
+                            now = _utcnow()
+                            first_deferred_at = parent_ctx.get("_merge_first_deferred_at") or now.isoformat()
+                            try:
+                                from datetime import datetime as _dt  # noqa: PLC0415
+                                _first_dt = _dt.fromisoformat(first_deferred_at)
+                                elapsed_minutes = (now - _first_dt).total_seconds() / 60.0
+                            except (TypeError, ValueError):
+                                elapsed_minutes = 0.0
                             # 'unknown' / empty = GitHub stuck computing mergeability or refetch
                             # failing → escalate faster than 'blocked'/'unstable' which
                             # legitimately wait for checks/reviews.
@@ -897,36 +909,81 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 else "rollup_merge_deferred_alert", 5 if _fast_escalate else 10
                             )
                             approval_threshold = _runtime_config.get("rollup_merge_deferred_approval", 30)
+                            total_alert_threshold = alert_threshold * 2
+                            total_approval_threshold = approval_threshold * 2
+                            time_alert_minutes = _runtime_config.get("rollup_merge_deferred_time_alert_minutes", 30)
+                            time_approval_minutes = _runtime_config.get("rollup_merge_deferred_time_approval_minutes", 60)
                             parent.context = {
                                 **parent_ctx,
                                 "rollup_pr_url": rollup_pr_url,
                                 "rollup_pr_number": rollup_pr_number,
                                 "_merge_deferred_count": deferred_count,
                                 "_merge_deferred_state": _ms_key,
+                                "_merge_total_deferrals": total_deferrals,
+                                "_merge_first_deferred_at": first_deferred_at,
                             }
                             parent.latest_status_message = (
                                 f"Rollup PR #{rollup_pr_number} merge deferred (mergeable_state={_ms_display}, "
-                                f"deferral {deferred_count}) — next rollup sweep will re-attempt"
+                                f"deferral {deferred_count}/total {total_deferrals}) — next rollup sweep will re-attempt"
                             )
+                            # Per-state alert: fires at exact threshold match per state
                             if deferred_count == alert_threshold:
                                 await _maybe_create_failure_alert(
                                     parent, session,
                                     f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
                                     f"for {deferred_count} consecutive sweeps"
                                 )
-                            if deferred_count >= approval_threshold and not parent.requires_approval:
-                                parent.requires_approval = True
-                                await _dispatch_rollup_approval_alert(
+                            # Total-count alert: fires once when total crosses threshold,
+                            # catching state-flapping PRs that evade the per-state counter.
+                            if total_deferrals >= total_alert_threshold and not parent_ctx.get("_merge_total_alerted"):
+                                await _maybe_create_failure_alert(
                                     parent, session,
-                                    f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
-                                    f"for {deferred_count} sweeps — manual investigation required",
-                                    pr_number=rollup_pr_number,
+                                    f"Rollup PR #{rollup_pr_number} merge deferred {total_deferrals} times across "
+                                    f"states (flapping) — manual investigation required"
                                 )
+                                parent.context = {**parent.context, "_merge_total_alerted": True}
+                            # Time-based alert: fires once after total deferral time crosses threshold
+                            if elapsed_minutes >= time_alert_minutes and not parent_ctx.get("_merge_time_alerted"):
+                                await _maybe_create_failure_alert(
+                                    parent, session,
+                                    f"Rollup PR #{rollup_pr_number} merge has been deferred for "
+                                    f"{elapsed_minutes:.0f} minutes — manual investigation required"
+                                )
+                                parent.context = {**parent.context, "_merge_time_alerted": True}
+                            # Approval gate: any of per-state, total, or time thresholds can fire it.
+                            # Only one approval dispatch — the first condition wins.
+                            if not parent.requires_approval:
+                                if deferred_count >= approval_threshold:
+                                    parent.requires_approval = True
+                                    await _dispatch_rollup_approval_alert(
+                                        parent, session,
+                                        f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
+                                        f"for {deferred_count} sweeps — manual investigation required",
+                                        pr_number=rollup_pr_number,
+                                    )
+                                elif total_deferrals >= total_approval_threshold:
+                                    parent.requires_approval = True
+                                    await _dispatch_rollup_approval_alert(
+                                        parent, session,
+                                        f"Rollup PR #{rollup_pr_number} deferred {total_deferrals} times across "
+                                        f"states — manual investigation required",
+                                        pr_number=rollup_pr_number,
+                                    )
+                                elif elapsed_minutes >= time_approval_minutes:
+                                    parent.requires_approval = True
+                                    await _dispatch_rollup_approval_alert(
+                                        parent, session,
+                                        f"Rollup PR #{rollup_pr_number} has been deferred for "
+                                        f"{elapsed_minutes:.0f} minutes — manual investigation required",
+                                        pr_number=rollup_pr_number,
+                                    )
                             session.add(parent)
                             await session.commit()
                             logger.info(
                                 f"[ROLLUP] PR #{rollup_pr_number} merge skipped: mergeable_state={_ms_display} "
-                                f"(deferral {deferred_count}; alert@{alert_threshold}, approval@{approval_threshold}) "
+                                f"(deferral {deferred_count}/total {total_deferrals}/{elapsed_minutes:.0f}min; "
+                                f"alert@{alert_threshold}/{total_alert_threshold}/{time_alert_minutes}min, "
+                                f"approval@{approval_threshold}/{total_approval_threshold}/{time_approval_minutes}min) "
                                 f"— deferring to next rollup sweep, no fix spawn"
                             )
                             return
