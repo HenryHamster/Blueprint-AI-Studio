@@ -1551,19 +1551,26 @@ async def agent_heartbeat(
         task.vm_started_at = _utcnow()
     if req.status_message:
         task.latest_status_message = req.status_message
-    if req.metrics:
+    if req.metrics or req.tool_trace is not None:
         ctx = dict(task.context or {})
-        metrics_dump = req.metrics.model_dump(exclude_none=True)
-        ctx['last_metrics'] = metrics_dump
-        history = list(ctx.get('metrics_history', []))
-        entry: dict = {'t': _utcnow().isoformat()}
-        for k in ('rss_mb', 'heap_used_mb', 'disk_free_mb', 'disk_total_mb', 'cgroup_mb', 'cgroup_limit_mb'):
-            if metrics_dump.get(k) is not None:
-                entry[k] = metrics_dump[k]
-        history.append(entry)
-        if len(history) > 30:
-            history = history[-30:]
-        ctx['metrics_history'] = history
+        if req.metrics:
+            metrics_dump = req.metrics.model_dump(exclude_none=True)
+            ctx['last_metrics'] = metrics_dump
+            history = list(ctx.get('metrics_history', []))
+            entry: dict = {'t': _utcnow().isoformat()}
+            for k in ('rss_mb', 'heap_used_mb', 'disk_free_mb', 'disk_total_mb', 'cgroup_mb', 'cgroup_limit_mb'):
+                if metrics_dump.get(k) is not None:
+                    entry[k] = metrics_dump[k]
+            history.append(entry)
+            if len(history) > 30:
+                history = history[-30:]
+            ctx['metrics_history'] = history
+        if req.tool_trace is not None:
+            # Overwrite rather than append — the agent already maintains a
+            # ring buffer of the latest entries, so each heartbeat carries the
+            # authoritative recent-tool-calls window. Last-successful
+            # heartbeat's value is the death trace after reap.
+            ctx['_tool_trace'] = [t.model_dump() for t in req.tool_trace]
         task.context = ctx
 
     session.add(task)

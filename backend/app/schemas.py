@@ -46,11 +46,22 @@ class HeartbeatMetrics(BaseModel):
     cgroup_mb: float | None = None
     cgroup_limit_mb: float | None = None
 
+class ToolTraceEntry(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    t: str
+    tool: str
+    input_preview: str
+
 class HeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
     status_message: str | None = None
     metrics: HeartbeatMetrics | None = None
+    # Ring buffer of recent tool invocations from the agent. Persists to
+    # task.context._tool_trace on each heartbeat, so the last-successful
+    # heartbeat's value serves as a post-mortem when the reaper later kills
+    # the task for heartbeat silence (AGENT_TIMEOUT diagnosis).
+    tool_trace: List[ToolTraceEntry] | None = None
 
 class SpawnTaskRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")

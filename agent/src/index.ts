@@ -236,6 +236,35 @@ export function log(msg: string) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
+// ── Tool-use ring buffer ────────────────────────────────────────────────────
+// Captures the most recent tool invocations so a post-mortem on AGENT_TIMEOUT
+// reap can see what the agent was doing in the seconds before the heartbeat
+// went silent. Sent with every heartbeat; the backend persists it as
+// task.context._tool_trace, so the last-successful-heartbeat value IS the
+// death-trace when the reaper later kills the task.
+type ToolTraceEntry = { t: string; tool: string; input_preview: string };
+const _toolTrace: ToolTraceEntry[] = [];
+const TOOL_TRACE_MAX = 20;
+
+export function recordToolUse(toolName: string, input: unknown): void {
+  let preview: string;
+  try {
+    preview = typeof input === 'string' ? input : JSON.stringify(input);
+  } catch {
+    preview = '<unserializable>';
+  }
+  _toolTrace.push({
+    t: new Date().toISOString(),
+    tool: toolName,
+    input_preview: preview.slice(0, 200),
+  });
+  if (_toolTrace.length > TOOL_TRACE_MAX) _toolTrace.shift();
+}
+
+function snapshotToolTrace(): ToolTraceEntry[] {
+  return _toolTrace.slice();
+}
+
 // ── Heartbeat ───────────────────────────────────────────────────────────────
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -277,6 +306,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         task_id: taskId,
         status_message: `[${metrics.heap_used_mb}MB] ${getMessage()}`,
         metrics,
+        tool_trace: snapshotToolTrace(),
       });
     } catch (e) {
       log(`Initial heartbeat failed: ${String(e)}`);
@@ -297,6 +327,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         task_id: taskId,
         status_message: `[${metrics.heap_used_mb}MB] ${getMessage()}`,
         metrics,
+        tool_trace: snapshotToolTrace(),
       });
     } catch (e: unknown) {
       log(`Heartbeat failed: ${String(e)}`);
@@ -315,6 +346,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
               task_id: taskId,
               status_message: `[${retryMetrics.heap_used_mb}MB] ${getMessage()}`,
               metrics: retryMetrics,
+              tool_trace: snapshotToolTrace(),
             });
             log('Heartbeat retry succeeded');
             return;
@@ -1284,6 +1316,7 @@ echo ""
               } else if (block.type === 'tool_use') {
                 sendLog(ws, `[tool: ${strVal(block.name)}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
                 statusRef.value = `Using tool: ${strVal(block.name)}`;
+                recordToolUse(strVal(block.name), block.input);
               }
             }
           } else if (obj.type === 'result') {
