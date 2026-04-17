@@ -407,6 +407,30 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         if (plan) dcLines.push(`  - Analysis plan: ${plan}`);
         const tfs = strVal(entry.test_failure_summary);
         if (tfs) dcLines.push(`  - Test failure: ${tfs}`);
+        const diffSummary = Array.isArray(entry.pr_diff_summary)
+          ? entry.pr_diff_summary as Array<Record<string, unknown>>
+          : [];
+        if (diffSummary.length > 0) {
+          const parts = diffSummary.map(d => {
+            const file = strVal(d.file);
+            const added = typeof d.added === 'number' ? d.added : null;
+            const removed = typeof d.removed === 'number' ? d.removed : null;
+            if (added !== null || removed !== null) {
+              return `${file} (+${added ?? 0}/-${removed ?? 0})`;
+            }
+            return file;
+          }).filter(Boolean);
+          if (parts.length > 0) dcLines.push(`  - Files changed: ${parts.join(', ')}`);
+        } else {
+          const changedFiles = Array.isArray(entry.pr_changed_files)
+            ? (entry.pr_changed_files as unknown[]).map(f => strVal(f)).filter(Boolean)
+            : [];
+          if (changedFiles.length > 0) {
+            dcLines.push(`  - Files changed: ${changedFiles.join(', ')}`);
+          }
+        }
+        const fp = strVal(entry.previous_error_fingerprint);
+        if (fp) dcLines.push(`  - Previous error fingerprint: ${fp}`);
       }
     }
     dcLines.push('');

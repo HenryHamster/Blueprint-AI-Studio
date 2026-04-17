@@ -344,6 +344,12 @@ describe('buildContextPrefix', () => {
             failure_category: 'CODE_ERROR',
             analysis_plan: 'Update orchestrator.py to call new helper',
             test_failure_summary: 'AssertionError in test_foo',
+            pr_changed_files: ['foo.py', 'bar.ts'],
+            pr_diff_summary: [
+              { file: 'foo.py', added: 10, removed: 5, change_type: 'modified' },
+              { file: 'bar.ts', added: 3, removed: 2, change_type: 'added' },
+            ],
+            previous_error_fingerprint: 'abc123def456',
           },
         ],
       },
@@ -353,6 +359,29 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('- Prior failed task [CODE_ERROR]');
     expect(result).toContain('Analysis plan: Update orchestrator.py to call new helper');
     expect(result).toContain('Test failure: AssertionError in test_foo');
+    expect(result).toContain('Files changed: foo.py (+10/-5), bar.ts (+3/-2)');
+    expect(result).toContain('Previous error fingerprint: abc123def456');
+  });
+
+  it('renders direction_prior_analysis with only changed files when diff summary is absent', () => {
+    const task = {
+      direction_context: {
+        title: 'Refactor module',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        direction_prior_analysis: [
+          {
+            title: 'Prior failed task',
+            failure_category: 'CODE_ERROR',
+            analysis_plan: 'Planned approach',
+            pr_changed_files: ['foo.py', 'bar.ts'],
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('Files changed: foo.py, bar.ts');
   });
 
   it('does not render Prior analysis section when direction_prior_analysis is empty or absent', () => {

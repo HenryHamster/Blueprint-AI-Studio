@@ -1146,6 +1146,32 @@ async def claim_task(
                         entry["analysis_plan"] = str(analysis_plan)[:500]
                     if test_failure_summary:
                         entry["test_failure_summary"] = str(test_failure_summary)[:300]
+                    changed_files = pctx.get("_pr_changed_files")
+                    if isinstance(changed_files, list) and changed_files:
+                        entry["pr_changed_files"] = [str(f) for f in changed_files[:10]]
+                    diff_summary = pctx.get("_pr_diff_summary")
+                    if isinstance(diff_summary, list) and diff_summary:
+                        compact_diff = []
+                        for d in diff_summary[:10]:
+                            if not isinstance(d, dict):
+                                continue
+                            item = {"file": str(d.get("file", ""))}
+                            added = d.get("additions", d.get("added"))
+                            removed = d.get("deletions", d.get("removed"))
+                            if isinstance(added, int):
+                                item["added"] = added
+                            if isinstance(removed, int):
+                                item["removed"] = removed
+                            change_type = d.get("change_type")
+                            if change_type:
+                                item["change_type"] = str(change_type)
+                            if item["file"]:
+                                compact_diff.append(item)
+                        if compact_diff:
+                            entry["pr_diff_summary"] = compact_diff
+                    fingerprint = pctx.get("_previous_error_fingerprint")
+                    if fingerprint:
+                        entry["previous_error_fingerprint"] = str(fingerprint)
                     entry_len = len(json.dumps(entry))
                     if total_chars + entry_len > 2000:
                         break

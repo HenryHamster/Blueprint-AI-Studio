@@ -1750,6 +1750,12 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
             "direction_id": direction_id,
             "_analysis_plan": long_plan,
             "_test_failure_summary": long_tfs,
+            "_pr_changed_files": ["foo.py", "bar.ts"],
+            "_pr_diff_summary": [
+                {"file": "foo.py", "additions": 10, "deletions": 5, "change_type": "modified"},
+                {"file": "bar.ts", "additions": 3, "deletions": 2, "change_type": "added"},
+            ],
+            "_previous_error_fingerprint": "abc123def456",
         },
         status=TaskStatus.FAILED,
         title="Prior failed task",
@@ -1790,6 +1796,12 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
     assert "failure_category" in entry
     assert len(entry["analysis_plan"]) == 500
     assert len(entry["test_failure_summary"]) == 300
+    assert entry["pr_changed_files"] == ["foo.py", "bar.ts"]
+    assert entry["pr_diff_summary"] == [
+        {"file": "foo.py", "added": 10, "removed": 5, "change_type": "modified"},
+        {"file": "bar.ts", "added": 3, "removed": 2, "change_type": "added"},
+    ]
+    assert entry["previous_error_fingerprint"] == "abc123def456"
     # Total payload stays under 2000-char cap
     import json as _json
     assert len(_json.dumps(dpa)) <= 2000
