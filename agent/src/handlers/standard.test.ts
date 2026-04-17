@@ -45,6 +45,7 @@ vi.mock('../prompt.js', () => ({
   buildSelfReviewPrompt: vi.fn().mockReturnValue('self-review-prompt'),
   buildAnalysisPrompt: vi.fn().mockReturnValue('analysis-prompt'),
   parseAnalysisPlanFiles: vi.fn().mockReturnValue([]),
+  parseAnalysisPlanTestFiles: vi.fn().mockReturnValue([]),
   extractModuleInterfaces: vi.fn().mockReturnValue(''),
   discoverAffectedConsumers: vi.fn().mockReturnValue(''),
   getMandatoryChecks: vi.fn().mockReturnValue([]),
@@ -90,7 +91,7 @@ vi.mock('ws', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
 import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks } from '../index.js';
-import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks, parseAnalysisPlanFiles } from '../prompt.js';
+import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -1701,6 +1702,8 @@ describe('analysis-phase scope feasibility gate', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(parseAnalysisPlanFiles).mockReset();
+    vi.mocked(parseAnalysisPlanTestFiles).mockReset();
+    vi.mocked(parseAnalysisPlanTestFiles).mockReturnValue([]);
   });
 
   it('proceeds to implementation when planned files are within the limit', async () => {
@@ -1763,6 +1766,54 @@ describe('analysis-phase scope feasibility gate', () => {
       expect(typeof failureCall[1].analysis_plan).toBe('string');
     }
     // implementation run must NOT have happened (only analysis + retry)
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('triggers narrowing retry when production+test total exceeds the combined budget', async () => {
+    // 6 production + 5 test = 11 > overflow threshold (10) but 6 ≤ production limit (7)
+    const productionOver = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts'];
+    const testOver = ['a.test.ts', 'b.test.ts', 'c.test.ts', 'd.test.ts', 'e.test.ts'];
+    const productionNarrowed = ['a.ts', 'b.ts'];
+    const testNarrowed = ['a.test.ts'];
+    vi.mocked(parseAnalysisPlanFiles)
+      .mockReturnValueOnce(productionOver)
+      .mockReturnValueOnce(productionNarrowed);
+    vi.mocked(parseAnalysisPlanTestFiles)
+      .mockReturnValueOnce(testOver)
+      .mockReturnValueOnce(testNarrowed);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- a.ts' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- a.ts\n- b.ts' })
+      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // analysis + narrowing retry + implementation
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ failure_category: 'scope_overflow' }),
+    );
+  });
+
+  it('fails fast when production+test total stays over budget after narrowing', async () => {
+    const productionOver = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'];
+    const testOver = ['a.test.ts', 'b.test.ts', 'c.test.ts', 'd.test.ts', 'e.test.ts', 'f.test.ts'];
+    vi.mocked(parseAnalysisPlanFiles).mockReturnValue(productionOver);
+    vi.mocked(parseAnalysisPlanTestFiles).mockReturnValue(testOver);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- a.ts' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- a.ts' })
+      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({
+        status: 'FAILED',
+        failure_category: 'scope_overflow',
+      }),
+    );
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });

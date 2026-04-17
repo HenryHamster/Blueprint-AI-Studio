@@ -1827,6 +1827,7 @@ export function buildAnalysisPrompt(opts: {
   fileTree: string;
   narrowingGuidance?: string;
   fileLimit?: number;
+  totalFileBudget?: number;
 }): string {
   const filesList = opts.relatedFiles.length > 0
     ? `## Files Relevant to This Task\n${opts.relatedFiles.map(f => `- ${f}`).join('\n')}\n\n`
@@ -1834,6 +1835,9 @@ export function buildAnalysisPrompt(opts: {
   const titleLine = opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : '';
   const limitClause = typeof opts.fileLimit === 'number'
     ? ` Aim for ${opts.fileLimit} or fewer files; if you cannot stay at or below ${opts.fileLimit}, list only the smallest viable set and note in **Implementation approach** what was deferred.`
+    : '';
+  const totalBudgetClause = typeof opts.totalFileBudget === 'number'
+    ? `\n\n**Total file budget:** the combined count of files under **Files to change** PLUS test files under **Tests to add or update** must not exceed ${opts.totalFileBudget}. Plans that exceed this budget will be rejected and you will be asked to narrow scope. Count test files when planning.`
     : '';
   const narrowingBlock = opts.narrowingGuidance
     ? `\n\n## Narrowing Directive (from prior analysis pass)\n${opts.narrowingGuidance}\n`
@@ -1869,9 +1873,48 @@ ${titleLine}${opts.rawPrompt.slice(0, 1500)}${narrowingBlock}
 
 **Tests to add or update** (list each test file you will create or modify, one per line, with the case name or behavior covered)
 
-**Tests at risk of breaking** (list existing tests whose assertions or fixtures may need adjustment because of the planned change — name the file and the specific test or describe "none expected" with a one-line justification)
+**Tests at risk of breaking** (list existing tests whose assertions or fixtures may need adjustment because of the planned change — name the file and the specific test or describe "none expected" with a one-line justification)${totalBudgetClause}
 
 Keep the total output under 700 words. Be specific and concrete — name actual function signatures, type names, and import paths. Do NOT write any implementation code.`;
+}
+
+/**
+ * Extracts file path tokens from bullet/numbered list items appearing under
+ * the first occurrence of any heading in `headingRes`. Stops at the next bold
+ * heading. Used by both production-file and test-file parsers below.
+ */
+function collectFilesUnderHeadings(analysisOutput: string, headingRes: RegExp[]): string[] {
+  if (!analysisOutput) return [];
+  const lines = analysisOutput.split('\n');
+  const nextHeadingRe = /^\s*\*\*[^*]+\*\*/;
+  const markerRe = /^\s*(?:[-*•]|\d+[.)])\s+/;
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  for (const headingRe of headingRes) {
+    let i = 0;
+    for (; i < lines.length; i++) {
+      if (headingRe.test(lines[i])) break;
+    }
+    if (i >= lines.length) continue;
+    i++;
+
+    for (; i < lines.length; i++) {
+      const raw = lines[i];
+      if (raw.trim() === '') continue;
+      if (nextHeadingRe.test(raw)) break;
+      if (!markerRe.test(raw)) continue;
+      const stripped = raw.replace(markerRe, '');
+      let token = stripped.trim().split(/\s+/)[0] || '';
+      token = token.replace(/^[`"'(]+|[`"',.;:)]+$/g, '');
+      if (!token || !/[/.]/.test(token)) continue;
+      if (seen.has(token)) continue;
+      seen.add(token);
+      out.push(token);
+    }
+  }
+  return out;
 }
 
 /**
@@ -1884,39 +1927,21 @@ Keep the total output under 700 words. Be specific and concrete — name actual 
  * Returns an empty array when the section is missing or unparsable.
  */
 export function parseAnalysisPlanFiles(analysisOutput: string): string[] {
-  if (!analysisOutput) return [];
-  const lines = analysisOutput.split('\n');
-  const headingRe = /^\s*\*\*Files to change\*\*/i;
-  let i = 0;
-  for (; i < lines.length; i++) {
-    if (headingRe.test(lines[i])) break;
-  }
-  if (i >= lines.length) return [];
-  i++; // move past the heading line itself
+  return collectFilesUnderHeadings(analysisOutput, [/^\s*\*\*Files to change\*\*/i]);
+}
 
-  const out: string[] = [];
-  const seen = new Set<string>();
-  // Stop at the next **Bold heading** line (any bold heading).
-  const nextHeadingRe = /^\s*\*\*[^*]+\*\*/;
-  // Strip leading list markers: -, *, •, "1.", "1)", optional whitespace.
-  const markerRe = /^\s*(?:[-*•]|\d+[.)])\s+/;
-
-  for (; i < lines.length; i++) {
-    const raw = lines[i];
-    if (raw.trim() === '') continue;
-    if (nextHeadingRe.test(raw)) break;
-    if (!markerRe.test(raw)) continue;
-    const stripped = raw.replace(markerRe, '');
-    // Take the first whitespace-delimited token, peeling backticks/quotes/punctuation.
-    let token = stripped.trim().split(/\s+/)[0] || '';
-    token = token.replace(/^[`"'(]+|[`"',.;:)]+$/g, '');
-    // Skip obvious non-paths (e.g., lines that start with prose like "Add").
-    if (!token || !/[/.]/.test(token)) continue;
-    if (seen.has(token)) continue;
-    seen.add(token);
-    out.push(token);
-  }
-  return out;
+/**
+ * Parses the **Tests to add or update** and **Tests at risk of breaking**
+ * sections and returns the deduped test file paths. Same parser semantics as
+ * parseAnalysisPlanFiles. Used to count test files toward the analysis-plan
+ * total-file budget so a plan with 6 production + 5 test files is caught
+ * before implementation rather than failing as scope_overflow afterward.
+ */
+export function parseAnalysisPlanTestFiles(analysisOutput: string): string[] {
+  return collectFilesUnderHeadings(analysisOutput, [
+    /^\s*\*\*Tests to add or update\*\*/i,
+    /^\s*\*\*Tests at risk of breaking\*\*/i,
+  ]);
 }
 
 // ── Self-review helpers ───────────────────────────────────────────────────────
@@ -1995,6 +2020,7 @@ export function buildSelfReviewPrompt(opts: {
   firstAttemptByCategory?: Record<string, number>;
   persistentReviewIssues?: string[];
   analysisPlan?: string;
+  topFirstReviewIssues?: Array<{ description: string; count: number; category: string }>;
 }): string {
   const restrictionsSection = opts.claudeMd
     ? `\n## File Restrictions (from CLAUDE.md)\n${opts.claudeMd.slice(0, 500)}\n`
@@ -2023,6 +2049,16 @@ export function buildSelfReviewPrompt(opts: {
           })
           .join('\n');
         return `\n## First-Attempt Rejection Priorities\nThese categories most often block first-attempt approval — weight your checks accordingly:\n${lines}\n`;
+      })()
+    : '';
+
+  const topIssuesSection = opts.topFirstReviewIssues && opts.topFirstReviewIssues.length > 0
+    ? (() => {
+        const lines = opts.topFirstReviewIssues!
+          .slice(0, 5)
+          .map(i => `- "${i.description}" (seen ${i.count}x, category: ${i.category})`)
+          .join('\n');
+        return `\n## Specific Patterns That Cause First-Review Rejections\nCheck your diff for these:\n${lines}\n`;
       })()
     : '';
 
@@ -2069,7 +2105,7 @@ export function buildSelfReviewPrompt(opts: {
   const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
 
   return `You are performing a self-review of the changes you just made for this task.
-${restrictionsSection}${issueDistSection}${firstAttemptSection}${playbookSection}${scopeOverflowSection}${planSection}${diffSection}${buildVerificationSection}
+${restrictionsSection}${issueDistSection}${firstAttemptSection}${topIssuesSection}${playbookSection}${scopeOverflowSection}${planSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.

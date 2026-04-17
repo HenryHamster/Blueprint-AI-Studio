@@ -51,6 +51,7 @@ import {
   buildSelfReviewPrompt,
   buildAnalysisPrompt,
   parseAnalysisPlanFiles,
+  parseAnalysisPlanTestFiles,
   extractModuleInterfaces,
   discoverAffectedConsumers,
   relativeTimeFromIso,
@@ -1978,6 +1979,37 @@ describe('buildSelfReviewPrompt', () => {
     expect(firstAttemptPos).toBeGreaterThan(issueDistPos);
   });
 
+  it('renders specific patterns section when topFirstReviewIssues is provided', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      topFirstReviewIssues: [
+        { description: 'missing return type on exported function', count: 3, category: 'type_safety' },
+        { description: 'untested error path', count: 2, category: 'test_coverage' },
+      ],
+    });
+    expect(result).toContain('## Specific Patterns That Cause First-Review Rejections');
+    expect(result).toContain('"missing return type on exported function" (seen 3x, category: type_safety)');
+    expect(result).toContain('"untested error path" (seen 2x, category: test_coverage)');
+  });
+
+  it('caps topFirstReviewIssues at 5 entries', () => {
+    const issues = Array.from({ length: 8 }, (_, i) => ({
+      description: `issue-${i}`,
+      count: 8 - i,
+      category: 'other',
+    }));
+    const result = buildSelfReviewPrompt({ ...baseOpts, topFirstReviewIssues: issues });
+    expect(result).toContain('issue-0');
+    expect(result).toContain('issue-4');
+    expect(result).not.toContain('issue-5');
+  });
+
+  it('omits specific patterns section when topFirstReviewIssues is undefined or empty', () => {
+    expect(buildSelfReviewPrompt(baseOpts)).not.toContain('## Specific Patterns That Cause First-Review Rejections');
+    expect(buildSelfReviewPrompt({ ...baseOpts, topFirstReviewIssues: [] }))
+      .not.toContain('## Specific Patterns That Cause First-Review Rejections');
+  });
+
   it('JSON example blocks are internally consistent (verdict matches check_results, issues_found matches failed-check count)', () => {
     const result = buildSelfReviewPrompt(baseOpts);
     const jsonBlocks = [...result.matchAll(/```json\s*\n([\s\S]*?)\n```/g)].map(m => m[1]);
@@ -2439,6 +2471,28 @@ describe('buildAnalysisPrompt', () => {
     expect(result).toContain('Narrowing Directive');
     expect(result).toContain('Cut the plan to fewer files.');
   });
+
+  it('includes the total file budget clause when totalFileBudget is provided', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Do thing',
+      taskTitle: 'Title',
+      relatedFiles: [],
+      fileTree: '',
+      totalFileBudget: 10,
+    });
+    expect(result).toContain('Total file budget');
+    expect(result).toContain('10');
+  });
+
+  it('omits the total file budget clause when totalFileBudget is absent', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Do thing',
+      taskTitle: 'Title',
+      relatedFiles: [],
+      fileTree: '',
+    });
+    expect(result).not.toContain('Total file budget');
+  });
 });
 
 // ── parseAnalysisPlanFiles ────────────────────────────────────────────────────
@@ -2491,5 +2545,40 @@ describe('parseAnalysisPlanFiles', () => {
       '**Files to change**\n* a.ts\n• b.ts\n',
     );
     expect(out).toEqual(['a.ts', 'b.ts']);
+  });
+});
+
+// ── parseAnalysisPlanTestFiles ───────────────────────────────────────────────
+describe('parseAnalysisPlanTestFiles', () => {
+  it('returns [] when neither test heading is present', () => {
+    expect(parseAnalysisPlanTestFiles('**Files to change**\n- a.ts\n')).toEqual([]);
+  });
+
+  it('extracts files from "Tests to add or update"', () => {
+    const out = parseAnalysisPlanTestFiles(
+      '**Tests to add or update**\n- agent/src/foo.test.ts — adds X case\n- agent/src/bar.test.ts (covers Y)\n',
+    );
+    expect(out).toEqual(['agent/src/foo.test.ts', 'agent/src/bar.test.ts']);
+  });
+
+  it('extracts files from "Tests at risk of breaking"', () => {
+    const out = parseAnalysisPlanTestFiles(
+      '**Tests at risk of breaking**\n- testing/test_x.py — fixture change\n',
+    );
+    expect(out).toEqual(['testing/test_x.py']);
+  });
+
+  it('combines and deduplicates across both test headings', () => {
+    const out = parseAnalysisPlanTestFiles(
+      '**Tests to add or update**\n- a.test.ts\n- b.test.ts\n\n**Tests at risk of breaking**\n- b.test.ts\n- c.test.ts\n',
+    );
+    expect(out).toEqual(['a.test.ts', 'b.test.ts', 'c.test.ts']);
+  });
+
+  it('skips bullets without a path-like token (e.g. "none expected")', () => {
+    const out = parseAnalysisPlanTestFiles(
+      '**Tests to add or update**\n- none\n- a.test.ts\n',
+    );
+    expect(out).toEqual(['a.test.ts']);
   });
 });

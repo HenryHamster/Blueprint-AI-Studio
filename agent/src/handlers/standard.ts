@@ -10,7 +10,7 @@ import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
-  buildSelfReviewPrompt, buildAnalysisPrompt, parseAnalysisPlanFiles, extractModuleInterfaces, getMandatoryChecks,
+  buildSelfReviewPrompt, buildAnalysisPrompt, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, extractModuleInterfaces, getMandatoryChecks,
   discoverAffectedConsumers, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
@@ -199,12 +199,14 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       []
     ) as string[];
 
+    const totalFileBudget = SCOPE_OVERFLOW_THRESHOLDS.medium;
     const analysisPrompt = buildAnalysisPrompt({
       rawPrompt,
       taskTitle,
       relatedFiles: analysisRelatedFiles,
       fileTree,
       fileLimit: MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
+      totalFileBudget,
     });
 
     const { exitCode: analysisExitCode, lastResultText: analysisResult } = await runClaudeCode(
@@ -216,20 +218,33 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     if (analysisExitCode === 0 && analysisResult.trim()) {
       let effectiveAnalysis = analysisResult.trim();
       let plannedFiles = parseAnalysisPlanFiles(effectiveAnalysis);
+      let plannedTestFiles = parseAnalysisPlanTestFiles(effectiveAnalysis);
+      let totalPlanned = plannedFiles.length + plannedTestFiles.length;
 
-      // Scope feasibility gate: if the analysis plans more files than the
-      // medium-scope limit, retry the analysis once with explicit narrowing
-      // guidance. If still over budget, fail fast — the implementation pass
-      // would otherwise burn ~5-10 minutes only to hit scope_overflow.
-      if (plannedFiles.length > MEDIUM_ANALYSIS_PLAN_FILE_LIMIT) {
-        sendLog(ws, `[Analysis Phase] Plan lists ${plannedFiles.length} files (limit ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT}); retrying with narrowing directive.\n`);
-        const narrowingGuidance = `The previous analysis pass planned ${plannedFiles.length} files to change, exceeding the ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT}-file limit for medium-scope tasks. Cut the plan down to the minimum viable change set (target: ≤${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT} files). Drop any files that are nice-to-have refactors, peripheral cleanups, or follow-on test/doc updates that could ship in a separate task. In **Implementation approach**, briefly note what was deferred so the next task can pick it up. Previously planned files:\n${plannedFiles.map(f => `- ${f}`).join('\n')}`;
+      // Scope feasibility gate: if the analysis plans more production files
+      // than the medium-scope limit, OR the combined production+test count
+      // exceeds the scope_overflow threshold, retry the analysis once with
+      // explicit narrowing guidance. If still over budget, fail fast — the
+      // implementation pass would otherwise burn ~5-10 minutes only to hit
+      // scope_overflow after the agent touches both production and test files.
+      const exceedsProdLimit = plannedFiles.length > MEDIUM_ANALYSIS_PLAN_FILE_LIMIT;
+      const exceedsTotalBudget = totalPlanned > totalFileBudget;
+      if (exceedsProdLimit || exceedsTotalBudget) {
+        const reason = exceedsTotalBudget
+          ? `combined plan lists ${plannedFiles.length} production + ${plannedTestFiles.length} test = ${totalPlanned} files (total budget ${totalFileBudget})`
+          : `plan lists ${plannedFiles.length} files (limit ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT})`;
+        sendLog(ws, `[Analysis Phase] ${reason}; retrying with narrowing directive.\n`);
+        const testFilesBlock = plannedTestFiles.length > 0
+          ? `\nPreviously planned test files:\n${plannedTestFiles.map(f => `- ${f}`).join('\n')}`
+          : '';
+        const narrowingGuidance = `The previous analysis pass planned ${plannedFiles.length} production files plus ${plannedTestFiles.length} test files (${totalPlanned} total). Production limit is ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT}; combined budget (production + tests) is ${totalFileBudget}. Cut the plan down to the minimum viable change set within both limits. Drop any files that are nice-to-have refactors, peripheral cleanups, or follow-on test/doc updates that could ship in a separate task. In **Implementation approach**, briefly note what was deferred so the next task can pick it up. Previously planned production files:\n${plannedFiles.map(f => `- ${f}`).join('\n')}${testFilesBlock}`;
         const retryPrompt = buildAnalysisPrompt({
           rawPrompt,
           taskTitle,
           relatedFiles: analysisRelatedFiles,
           fileTree,
           fileLimit: MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
+          totalFileBudget,
           narrowingGuidance,
         });
         const { exitCode: retryExitCode, lastResultText: retryResult } = await runClaudeCode(
@@ -240,12 +255,19 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         if (retryExitCode === 0 && retryResult.trim()) {
           effectiveAnalysis = retryResult.trim();
           plannedFiles = parseAnalysisPlanFiles(effectiveAnalysis);
+          plannedTestFiles = parseAnalysisPlanTestFiles(effectiveAnalysis);
+          totalPlanned = plannedFiles.length + plannedTestFiles.length;
         }
 
-        if (plannedFiles.length > MEDIUM_ANALYSIS_PLAN_FILE_LIMIT) {
+        const stillExceedsProd = plannedFiles.length > MEDIUM_ANALYSIS_PLAN_FILE_LIMIT;
+        const stillExceedsTotal = totalPlanned > totalFileBudget;
+        if (stillExceedsProd || stillExceedsTotal) {
           const fileList = plannedFiles.map(f => `- ${f}`).join('\n');
-          const failureLog = `Pre-implementation analysis planned ${plannedFiles.length} files to change, exceeding the medium-scope analysis limit of ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT}. The narrowing retry could not bring the plan within budget. Split this task into smaller subtasks or scope it down to a single concern before retrying.\n\nPlanned files:\n${fileList}`;
-          sendLog(ws, `[Analysis Phase] Plan still exceeds limit after retry (${plannedFiles.length} files) — failing fast.\n`);
+          const testList = plannedTestFiles.length > 0
+            ? `\n\nPlanned test files:\n${plannedTestFiles.map(f => `- ${f}`).join('\n')}`
+            : '';
+          const failureLog = `Pre-implementation analysis planned ${plannedFiles.length} production + ${plannedTestFiles.length} test = ${totalPlanned} files, exceeding the medium-scope budget (production limit ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT}, combined budget ${totalFileBudget}). The narrowing retry could not bring the plan within budget. Split this task into smaller subtasks or scope it down to a single concern before retrying.\n\nPlanned production files:\n${fileList}${testList}`;
+          sendLog(ws, `[Analysis Phase] Plan still exceeds budget after retry (${plannedFiles.length} prod + ${plannedTestFiles.length} test = ${totalPlanned}) — failing fast.\n`);
           await persistAndPostStatus(taskId, {
             task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
             logs: failureLog,
@@ -254,7 +276,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           });
           return;
         }
-        sendLog(ws, `[Analysis Phase] Plan narrowed to ${plannedFiles.length} files.\n`);
+        sendLog(ws, `[Analysis Phase] Plan narrowed to ${plannedFiles.length} production + ${plannedTestFiles.length} test = ${totalPlanned} files.\n`);
       }
 
       analysisContext = `## Pre-Implementation Analysis\n\n${effectiveAnalysis}\n\n`;
@@ -337,16 +359,21 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           : `- ${f}`;
       }).join('\n');
 
+      const plannedFilesForTrim = analysisContext ? parseAnalysisPlanFiles(analysisContext) : [];
+      const planSection = plannedFilesForTrim.length > 0
+        ? `\n## Pre-Implementation Plan — Files to change\n${plannedFilesForTrim.map(f => `- ${f}`).join('\n')}\n\nYour pre-implementation plan targeted these specific files. Files not in this list are likely non-essential additions — default to reverting them unless they are test files directly required by the planned changes.\n`
+        : '';
+
       const scopeTrimPrompt = `You are reviewing the scope of a completed implementation task to remove non-essential file changes before creating a PR.
 
 ## Original Task
 ${rawPrompt.slice(0, 3000)}
-
+${planSection}
 ## Changed Files (${changedPaths.length} files, threshold: ${overflowThreshold})
 ${fileStatsLines}
 
 ## Instructions
-Review each changed file and classify it as ESSENTIAL or NON-ESSENTIAL based solely on the original task above.
+Review each changed file and classify it as ESSENTIAL or NON-ESSENTIAL based on the original task${plannedFilesForTrim.length > 0 ? ' and pre-implementation plan' : ''} above.
 
 A file is ESSENTIAL only if it is directly required to implement what was asked.
 Revert files that are: formatting-only changes, style cleanups not requested, tangential refactors, or test files for code you did not change.
@@ -536,6 +563,9 @@ Output ONLY a JSON object in a \`\`\`json code fence:
       const selfReviewFasr = selfReviewPipelineHealth?.first_attempt_success_rate as Record<string, unknown> | undefined;
       const firstAttemptByCat = selfReviewFasr?.first_attempt_by_review_category as Record<string, number> | undefined;
       const persistentReviewIssues = selfReviewPipelineHealth?.persistent_review_issues as string[] | undefined;
+      const topFirstReviewIssues = selfReviewProjectCtx?.top_first_review_issues as
+        | Array<{ description: string; count: number; category: string }>
+        | undefined;
 
       const selfReviewTaskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
       const selfReviewAnalysisPlan = selfReviewTaskScope === 'medium' && analysisContext
@@ -553,6 +583,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         firstAttemptByCategory: firstAttemptByCat,
         persistentReviewIssues,
         analysisPlan: selfReviewAnalysisPlan,
+        topFirstReviewIssues,
       });
 
       const headBeforeReview = git(['rev-parse', 'HEAD']);
