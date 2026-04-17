@@ -670,6 +670,83 @@ async def test_stuck_cycle_detected_at_50pct_blocks_spawn(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_stuck_cycle_ignores_substring_overlap(db_session, mocker):
+    """Issues sharing a common prefix/phrase but different in meaning must NOT
+    count as repeats. Stuck-cycle matching uses normalized exact equality, not
+    substring containment — otherwise 'Missing error handling in processOrder'
+    would falsely match 'Missing error handling in processUser' and inflate
+    matched_count, prematurely escalating a cycle that was actually making
+    progress on new issues."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Prior issues: two CRITICAL issues sharing the "Missing error handling in process" prefix.
+    prior_issues = [
+        _issue("Missing error handling in processUser", "CRITICAL"),
+        _issue("Missing error handling in processPayment", "CRITICAL"),
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 305, "branch": "b5", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 305,
+                "branch": "b5",
+                "base_branch": "main",
+                "review_history": [
+                    {"iteration": 0, "feedback": "two handlers", "issues": prior_issues},
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Current issues: share substrings with prior issues but are genuinely different.
+    # Under old substring logic: all 2 would match → 100% → stuck (false positive).
+    # Under normalized equality: 0 match → spawn proceeds.
+    current_issues = [
+        _issue("Missing error handling in processOrder", "CRITICAL"),
+        _issue("Missing error handling in processRefund", "CRITICAL"),
+    ]
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=305, branch="b5", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="New handlers to fix",
+        current_feedback="New handlers to fix",
+        current_issues=current_issues,
+    )
+
+    assert result is not None, (
+        "Substring-overlapping but distinct issues must not trigger stuck-cycle detection"
+    )
+    assert result.status == TaskStatus.QUEUED
+
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is not True, (
+        "Substring overlap alone must not escalate to requires_approval"
+    )
+
+
+@pytest.mark.asyncio
 async def test_stuck_cycle_not_triggered_below_threshold(db_session, mocker):
     """When fewer than 50% of CRITICAL/MAJOR issues repeat, no stuck cycle fires."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
@@ -1424,6 +1501,59 @@ async def test_spawn_fix_cancels_in_flight_review_with_agent_timeout(db_session,
     assert in_flight_review.status == TaskStatus.CANCELLED
     assert "Superseded by fix" in (in_flight_review.latest_status_message or "")
     assert (in_flight_review.context or {}).get("failure_category") == "AGENT_TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_fix_prompt_does_not_duplicate_prior_review_feedback(db_session, mocker):
+    """Prior review feedback must NOT be prepended to the fix payload's prompt.
+
+    The fix agent already consumes structured review_history from task context
+    (with severity tags and file/line locations). Backend-side enrichment of the
+    prompt with raw latest_status_message text from prior review tasks would
+    duplicate the same feedback in a less useful form."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    # Simulate multiple prior completed review tasks for this PR — if the old
+    # enrichment path still existed, their latest_status_message text would be
+    # concatenated into the fix prompt.
+    for i in range(3):
+        prior = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review", "pr_number": 999, "branch": "b", "base_branch": "main"}],
+            latest_status_message=f"LEGACY-PRIOR-FEEDBACK-{i}",
+        )
+        db_session.add(prior)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 999, "branch": "b", "base_branch": "main"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    fix_prompt = "Address the flagged null check."
+    result, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=999, branch="b", base_branch="main",
+        fix_prompt=fix_prompt,
+    )
+
+    assert created is True and result is not None
+    spawned_prompt = result.first_payload.get("prompt", "")
+    # The fix prompt must match exactly — no prepended history section, no
+    # raw prior feedback text from completed review tasks.
+    assert spawned_prompt == fix_prompt, (
+        f"Fix payload prompt should equal fix_prompt verbatim; got: {spawned_prompt!r}"
+    )
+    assert "Previous review feedback" not in spawned_prompt
+    for i in range(3):
+        assert f"LEGACY-PRIOR-FEEDBACK-{i}" not in spawned_prompt
 
 
 def _utcnow_for_test():

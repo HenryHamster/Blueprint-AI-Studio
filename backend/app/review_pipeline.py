@@ -367,35 +367,11 @@ async def _spawn_pipeline_task(
                         **({"effort": type_effort} if type_effort else {})}
     else:
         title = f"Fix PR #{pr_number}"
-
-        # Enrich fix prompt with history of prior review feedback for this PR
-        enriched_fix_prompt = fix_prompt
-        try:
-            prior_reviews = (await session.execute(
-                select(Task).where(
-                    Task.project_id == source_task.project_id,
-                    Task.status == TaskStatus.COMPLETED,
-                    Task.payloads[0]["type"].as_string() == "review",
-                    Task.payloads[0]["pr_number"].as_string() == str(pr_number),
-                ).order_by(Task.created_at.asc())
-            )).scalars().all()
-            prior_feedback_entries = []
-            for t in prior_reviews:
-                feedback_text = t.latest_status_message or t.description or ""
-                if feedback_text:
-                    prior_feedback_entries.append(feedback_text)
-            prior_feedback_entries = prior_feedback_entries[-3:]  # last 3 iterations
-            if prior_feedback_entries:
-                history_section = "\n\n---\n\n".join(prior_feedback_entries)
-                enriched_fix_prompt = (
-                    f"## Previous review feedback (from prior review iterations):\n{history_section}"
-                    f"\n\n## Current review feedback:\n{fix_prompt}"
-                )
-        except Exception as e:
-            logger.warning(f"[PIPELINE] Failed to build review history for PR #{pr_number}: {e}", exc_info=True)
-
+        # Prior review feedback is carried via review_loop.review_history in the
+        # task context, which the fix agent formats with severity tags and file/line
+        # locations. Avoid duplicating it here as unstructured text.
         payload_data = {"type": "fix", "pr_number": pr_number, "branch": branch,
-                        "base_branch": base_branch, "prompt": enriched_fix_prompt,
+                        "base_branch": base_branch, "prompt": fix_prompt,
                         "original_prompt": original_prompt,
                         "original_task_id": resolved_original_id,
                         **({"model": type_model} if type_model else {}),
@@ -434,7 +410,7 @@ async def _spawn_pipeline_task(
         if curr_critical_major and prev_critical_major:
             matched_count = sum(
                 1 for desc in curr_critical_major
-                if any(desc in prev_desc or prev_desc in desc for prev_desc in prev_critical_major)
+                if desc in prev_critical_major
             )
             total_count = len(curr_critical_major)
             # Refactor tasks get a higher threshold — structural review feedback often repeats
