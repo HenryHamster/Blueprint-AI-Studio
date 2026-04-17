@@ -885,3 +885,41 @@ async def test_merge_success_without_orig_id(db_session, mocker):
     assert result is True
     assert task.status == TaskStatus.COMPLETED
     assert "merged" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_ci_wait_started_resets_when_checks_restart(db_session, mocker):
+    """
+    When a merge attempt returns 'in progress' (checks re-running), ci_wait_started
+    must be reset to the current time — not preserved from the original CI wait —
+    so the 30-minute backstop timeout windows the new CI run, not the old one.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "Required status check is in progress"},
+    )
+
+    project = Project(name="ci_wait_started reset", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_ts = "2020-01-01T00:00:00+00:00"
+    task = _make_task(db_session, project, ci_loop_extra={"ci_wait_started": stale_ts})
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    review_loop = (task.context or {}).get("review_loop", {})
+    new_ts = review_loop.get("ci_wait_started")
+    assert new_ts is not None
+    assert new_ts != stale_ts, "ci_wait_started must be reset, not preserved from prior CI wait"

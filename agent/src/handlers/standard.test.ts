@@ -1371,6 +1371,41 @@ describe('self-review phase', () => {
     expect(outcome.categories).toContain('truncation_not_verified');
     expect(outcome.categories).not.toContain('incomplete_review');
   });
+
+  it('retries when partial file coverage (<80%) and flags incomplete_review with unreviewed files if still below threshold', async () => {
+    // 5 changed files; pass1 reads 1 (20% coverage); retry reads 2 more (union=3 of 5 = 60% < 80%).
+    const partialPass1 = '{"verdict":"PASS","checks_performed":[],"issues_found":0,"truncated_files_read":["a.ts"]}';
+    const partialRetry = '{"verdict":"PASS","checks_performed":[],"issues_found":0,"truncated_files_read":["b.ts","c.ts"]}';
+    const longDiff = 'x'.repeat(3500);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })             // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: partialPass1, lastResultText: '' })   // pass 1 — only 1 of 5
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: partialRetry, lastResultText: '' }); // retry — 2 more, still 3/5
+    vi.mocked(git)
+      .mockReturnValueOnce('')                                  // baseCommit
+      .mockReturnValueOnce('M file')                            // hasChanges
+      .mockReturnValueOnce('')                                  // currentHead
+      .mockReturnValueOnce(longDiff)                            // uncommittedDiff → truncated
+      .mockReturnValueOnce('a.ts\nb.ts\nc.ts\nd.ts\ne.ts')      // nameOnly
+      .mockReturnValueOnce('')                                  // uncommittedNames
+      .mockReturnValueOnce('abc123')                            // headBeforeReview
+      .mockReturnValueOnce('')                                  // statusBeforeReview
+      .mockReturnValueOnce('abc123')                            // headAfterPass1 — SAME
+      .mockReturnValueOnce('')                                  // statusAfterPass1
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3); // retry did run
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome.categories).toContain('truncation_not_verified');
+    expect(outcome.categories).toContain('incomplete_review');
+    expect(outcome.verdict).toBe('PASS');
+    expect(outcome.unreviewed_files).toEqual(['d.ts', 'e.ts']);
+    expect(outcome.truncated_files_read).toEqual(expect.arrayContaining(['a.ts', 'b.ts', 'c.ts']));
+  });
 });
 
 // ── testFixLoop receives buildConfig from task.build_config ───────────────────

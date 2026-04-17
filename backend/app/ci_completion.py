@@ -99,7 +99,7 @@ async def _attempt_merge_with_retry_and_escalation(
     if "in progress" in merge_msg.lower() or "status check" in merge_msg.lower():
         ci_loop["ci_poll_interval"] = 10
         ci_loop["ci_last_polled"] = _utcnow().isoformat()
-        ci_loop.setdefault("ci_wait_started", _utcnow().isoformat())
+        ci_loop["ci_wait_started"] = _utcnow().isoformat()
         task.context = {**(task.context or {}), "review_loop": ci_loop}
         task.latest_status_message = f"Merge blocked (checks re-running on PR #{ci_pr_number}) — back to CI polling"
         logger.warning(f"[CI] PR #{ci_pr_number} merge blocked by in-progress checks — returning to CI wait ({source})")

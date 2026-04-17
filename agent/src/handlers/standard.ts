@@ -579,6 +579,9 @@ Output ONLY a JSON object in a \`\`\`json code fence:
       const topFirstReviewIssues = selfReviewProjectCtx?.top_first_review_issues as
         | Array<{ description: string; count: number; category: string }>
         | undefined;
+      const scopeSpecificReviewIssues = selfReviewProjectCtx?.scope_specific_review_issues as
+        | Array<{ description: string; count: number; category: string; scope: string }>
+        | undefined;
 
       const selfReviewTaskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
       const selfReviewAnalysisPlan = selfReviewTaskScope === 'medium' && analysisContext
@@ -597,6 +600,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         persistentReviewIssues,
         analysisPlan: selfReviewAnalysisPlan,
         topFirstReviewIssues,
+        scopeSpecificReviewIssues,
       });
 
       const headBeforeReview = git(['rev-parse', 'HEAD']);
@@ -656,6 +660,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         let parsedChecks: string[] | undefined;
         let parsedFilesReviewed: number | undefined;
         let parsedTruncatedFiles: string[] | undefined;
+        let unreviewedFiles: string[] | undefined;
         let parseFailed = false;
 
         // Prefer lastReviewResult (parsed `result` event text with real
@@ -710,19 +715,41 @@ Output ONLY a JSON object in a \`\`\`json code fence:
           }
 
           // When diff was truncated, validate that the agent actually read the files.
-          // For hard-gated tasks (failOnTestFailure), retry once with an explicit list of
-          // files that weren't shown in the diff. If the retry still reports zero files
-          // read, flag the review as incomplete and force PASS so the PR is not blocked
-          // by an untrusted verdict — but the flag surfaces the gap for downstream review.
-          if (diffTruncated && (!parsedTruncatedFiles || parsedTruncatedFiles.length === 0)) {
+          // For medium/large tasks touching N files, zero-files-read isn't the only failure:
+          // the agent may read a couple and skip the rest. We require ≥80% coverage of the
+          // changedFiles list; below that, retry with an explicit list of MISSING files.
+          // If the retry still falls short, flag as incomplete and force PASS (downstream
+          // review sees the flag + unreviewed file list).
+          const TRUNCATION_COVERAGE_THRESHOLD = 0.8;
+          const computeMissing = (readList: string[] | undefined): string[] => {
+            if (!changedFiles || changedFiles.length === 0) return [];
+            const readSet = new Set(readList ?? []);
+            return changedFiles.filter(f => !readSet.has(f));
+          };
+          const isInsufficient = (readList: string[] | undefined): boolean => {
+            if (!changedFiles || changedFiles.length === 0) {
+              return !readList || readList.length === 0;
+            }
+            const missing = computeMissing(readList);
+            const coverage = (changedFiles.length - missing.length) / changedFiles.length;
+            return coverage < TRUNCATION_COVERAGE_THRESHOLD;
+          };
+
+          if (diffTruncated && isInsufficient(parsedTruncatedFiles)) {
             reviewCategories.push('truncation_not_verified');
 
             if (failOnTestFailure && !parseFailed) {
-              const fileListForRetry = changedFiles && changedFiles.length > 0
-                ? changedFiles.map(f => `- ${f}`).join('\n')
-                : '(no file list available — use `git diff --name-only` to find changed files)';
-              sendLog(ws, '\nSelf-review: diff truncated but no files were read — retrying with explicit file-read guidance...\n');
-              const truncationRetryPrompt = `${selfReviewPrompt}\n\nCRITICAL: Your previous self-review did not read the truncated files. You MUST read each of the following files in full with the Read tool before issuing a verdict, and list them in "truncated_files_read":\n${fileListForRetry}\n\nReturn ONLY a valid JSON object with truncated_files_read populated.`;
+              const missingFiles = computeMissing(parsedTruncatedFiles);
+              const fileListForRetry = missingFiles.length > 0
+                ? missingFiles.map(f => `- ${f}`).join('\n')
+                : (changedFiles && changedFiles.length > 0
+                  ? changedFiles.map(f => `- ${f}`).join('\n')
+                  : '(no file list available — use `git diff --name-only` to find changed files)');
+              const gapDesc = (parsedTruncatedFiles && parsedTruncatedFiles.length > 0)
+                ? `${missingFiles.length} of ${changedFiles?.length ?? '?'} file(s) unread`
+                : 'no files were read';
+              sendLog(ws, `\nSelf-review: diff truncated and ${gapDesc} — retrying with explicit file-read guidance...\n`);
+              const truncationRetryPrompt = `${selfReviewPrompt}\n\nCRITICAL: Your previous self-review did not read all the truncated files. You MUST read each of the following MISSING files in full with the Read tool before issuing a verdict, and include them (along with any files already read) in "truncated_files_read":\n${fileListForRetry}\n\nReturn ONLY a valid JSON object with truncated_files_read populated.`;
               const { exitCode: truncRetryExit, allOutput: truncRetryOutput, lastResultText: truncRetryResult } = await runClaudeCode(
                 truncationRetryPrompt, ws, statusRef, model, effort,
               );
@@ -733,18 +760,27 @@ Output ONLY a JSON object in a \`\`\`json code fence:
                     ? (truncRetryParsed.truncated_files_read as unknown[]).filter((f): f is string => typeof f === 'string')
                     : [];
                   if (retryTruncatedFiles.length > 0) {
-                    parsedTruncatedFiles = retryTruncatedFiles;
+                    // Union with pass-1 reads so the agent can't shrink coverage by
+                    // omitting previously-listed files from the retry response.
+                    const merged = Array.from(new Set([...(parsedTruncatedFiles ?? []), ...retryTruncatedFiles]));
+                    parsedTruncatedFiles = merged;
                     const retryVerdict = typeof truncRetryParsed.verdict === 'string' ? truncRetryParsed.verdict : undefined;
                     if (retryVerdict !== undefined) parsedVerdict = retryVerdict;
-                    sendLog(ws, `Self-review: truncation retry succeeded — ${retryTruncatedFiles.length} file(s) read.\n`);
+                    sendLog(ws, `Self-review: truncation retry — ${merged.length} file(s) now covered.\n`);
                   }
                 }
               }
 
-              if (!parsedTruncatedFiles || parsedTruncatedFiles.length === 0) {
+              if (isInsufficient(parsedTruncatedFiles)) {
                 reviewCategories.push('incomplete_review');
                 parsedVerdict = 'PASS';
-                sendLog(ws, 'Self-review: truncation retry still reported zero files read — flagging review as incomplete and forcing PASS.\n');
+                const unreviewedAfter = computeMissing(parsedTruncatedFiles);
+                if (unreviewedAfter.length > 0) {
+                  unreviewedFiles = unreviewedAfter;
+                  sendLog(ws, `Self-review: truncation retry still missing ${unreviewedAfter.length} file(s) — flagging review as incomplete and forcing PASS. Unreviewed: ${unreviewedAfter.join(', ')}\n`);
+                } else {
+                  sendLog(ws, 'Self-review: truncation retry still reported zero files read — flagging review as incomplete and forcing PASS.\n');
+                }
               }
             }
           }
@@ -761,6 +797,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
           ...(parsedChecks !== undefined ? { checks_performed: parsedChecks } : {}),
           ...(parsedFilesReviewed !== undefined ? { files_reviewed: parsedFilesReviewed } : {}),
           ...(parsedTruncatedFiles !== undefined ? { truncated_files_read: parsedTruncatedFiles } : {}),
+          ...(unreviewedFiles !== undefined ? { unreviewed_files: unreviewedFiles } : {}),
           ...(parseFailed ? { parse_failed: true } : {}),
           ...(feedbackCategoriesInjected !== undefined ? { feedback_categories_injected: feedbackCategoriesInjected } : {}),
         };

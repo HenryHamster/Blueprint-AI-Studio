@@ -1201,6 +1201,104 @@ async def test_rollup_retries_all_failed_children(rollup_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_rollup_not_blocked_by_stale_review_task(rollup_db, mocker):
+    """A review task with no heartbeat for 15+ minutes should be treated as
+    stale and not count as active — otherwise a silently-dead review task
+    permanently blocks rollup."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+
+    project = Project(name="Stale Review Test", user_id="user1")
+    rollup_db.add(project)
+    await rollup_db.commit()
+    await rollup_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "parent task"}],
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+    )
+    rollup_db.add(parent)
+    await rollup_db.commit()
+    await rollup_db.refresh(parent)
+
+    failed = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature A"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="lint error",
+    )
+    stale_started = datetime.utcnow() - timedelta(minutes=30)
+    stale_review = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "review", "prompt": "review PR"}],
+        status=TaskStatus.IN_PROGRESS,
+        started_at=stale_started,
+        last_heartbeat=stale_started,
+    )
+    rollup_db.add(failed)
+    rollup_db.add(stale_review)
+    await rollup_db.commit()
+    await rollup_db.refresh(failed)
+    await rollup_db.refresh(stale_review)
+
+    await _check_and_trigger_rollup(failed, rollup_db)
+
+    # Stale review must not block rollup — retry path should have been taken.
+    mock_requeue.assert_called_once_with(parent, rollup_db)
+
+
+@pytest.mark.asyncio
+async def test_rollup_blocked_by_fresh_review_task(rollup_db, mocker):
+    """A review task that recently heartbeated should still block rollup —
+    the staleness guard must not cause false-positive non-blocking."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+
+    project = Project(name="Fresh Review Test", user_id="user1")
+    rollup_db.add(project)
+    await rollup_db.commit()
+    await rollup_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "parent task"}],
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+    )
+    rollup_db.add(parent)
+    await rollup_db.commit()
+    await rollup_db.refresh(parent)
+
+    failed = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature A"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="lint error",
+    )
+    fresh_review = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "review", "prompt": "review PR"}],
+        status=TaskStatus.IN_PROGRESS,
+        started_at=datetime.utcnow() - timedelta(minutes=1),
+        last_heartbeat=datetime.utcnow(),
+    )
+    rollup_db.add(failed)
+    rollup_db.add(fresh_review)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(failed, rollup_db)
+
+    # Fresh review keeps pipeline_active=True → early return, no requeue.
+    mock_requeue.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_rollup_partial_after_requeue_limit_exhausted(rollup_db, mocker):
     """When requeue limit is exhausted (_requeue_count == MAX_PARENT_REQUEUES),
     the rollup should skip retry and proceed with partial rollup of succeeded children."""
@@ -1475,6 +1573,35 @@ async def test_dispatch_rollup_approval_alert_creates_alert(rollup_db, mocker):
     approval_calls = [c for c in mock_dispatch.call_args_list if c.args[1] == "APPROVAL_NEEDED"]
     assert len(approval_calls) == 1
     assert approval_calls[0].args[2]["pr_number"] == 42
+
+
+@pytest.mark.asyncio
+async def test_rollup_retry_exhaustion_creates_failure_alert(rollup_db, mocker):
+    """When rollup PR creation fails after exhausting retries, the parent
+    transitions to FAILED *and* a failure alert is created so operators know
+    that all subtasks succeeded but the rollup PR could not be made."""
+    _patch_common_rollup_mocks(mocker)
+    # Override create_pull_request to always raise a non-transient error so the
+    # else (give-up) branch fires on the first sweep.
+    mocker.patch(
+        "app.github.create_pull_request",
+        new_callable=AsyncMock,
+        side_effect=ValueError("permanent rollup creation failure"),
+    )
+    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="main"
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert parent.status == TaskStatus.FAILED
+    mock_alert.assert_awaited_once()
+    msg = mock_alert.await_args.args[2]
+    assert "rollup" in msg.lower()
+    assert "retr" in msg.lower()
 
 
 # ── Rollup Merge Deferred Counter / Escalation ──────────────────────────────

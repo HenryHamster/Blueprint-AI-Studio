@@ -36,7 +36,7 @@ from app.models import (
     TaskStatus, ArtifactType,
 )
 from app.shared_state import runtime_config as _runtime_config
-from app.review_pipeline import _spawn_pipeline_task
+from app.review_pipeline import _spawn_pipeline_task, _is_pipeline_task_stale
 
 logger = logging.getLogger(__name__)
 
@@ -340,12 +340,23 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         return
 
     # Also check if any review/fix pipeline tasks are still active — don't rollup
-    # while a review/fix cycle is in progress
-    pipeline_active = any(
-        c.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
-        for c in all_children
-        if (c.first_payload).get("type") in ("review", "fix")
-    )
+    # while a review/fix cycle is in progress. Stale tasks (no heartbeat for
+    # 15+ min) are excluded so a silently-dead pipeline task can't permanently
+    # block rollup; the orchestrator's reaper will eventually cancel them.
+    pipeline_active = False
+    for c in all_children:
+        if (c.first_payload).get("type") not in ("review", "fix"):
+            continue
+        if c.status not in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING):
+            continue
+        if _is_pipeline_task_stale(c):
+            logger.warning(
+                f"[ROLLUP] Ignoring stale pipeline task {str(c.id)[:8]} "
+                f"(status={c.status}, last_heartbeat={c.last_heartbeat}) — not blocking rollup"
+            )
+            continue
+        pipeline_active = True
+        break
 
     # Check all non-cancelled create children are done with PRs merged
     all_done = True
@@ -1155,6 +1166,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     _fc = classify_failure(parent)
                     persist_failure_category(parent, _fc)
                     record_task_result(success=False, failure_class=_fc, task_id=str(parent.id), task_type=parent.first_payload.get("type", ""))
+                    await _maybe_create_failure_alert(
+                        parent,
+                        session,
+                        f"All {completed_count} subtasks completed but rollup PR creation failed after {rollup_retries} retries — manual recovery required",
+                    )
                     # NOTE: Do NOT delete staging_branch here — it contains all
                     # merged child work. Preserving it allows manual recovery or
                     # requeue. Branches are cleaned up by _cleanup_branches when

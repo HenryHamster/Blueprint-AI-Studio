@@ -782,6 +782,8 @@ async def claim_task(
         review_issue_distribution = None
         top_first_review_issues = None
         direction_top_first_review_issues = None
+        scope_specific_review_issues = None
+        current_task_scope = (task.context or {}).get("scope")
         if task_type in ("create", "fix", "refactor"):
             try:
                 from app.playbook_learning import _categorize_review_issues
@@ -884,6 +886,55 @@ async def claim_task(
                                 ]
                 except Exception:
                     logger.exception("[AGENT] Failed to compute direction_top_first_review_issues (non-critical)")
+
+                # Scope-specific recurring issues: filter to tasks matching the
+                # current task's scope so medium-scope patterns aren't diluted
+                # by small-scope data.
+                try:
+                    if current_task_scope:
+                        from collections import Counter
+                        scope_desc_counter: Counter = Counter()
+                        scope_desc_to_cat: dict = {}
+                        scope_task_count = 0
+                        for ht in high_iter_rows:
+                            if (ht.context or {}).get("scope") != current_task_scope:
+                                continue
+                            if ht.created_at and ht.created_at < cutoff_14d:
+                                continue
+                            review_loop = (ht.context or {}).get("review_loop", {})
+                            rev_hist = review_loop.get("review_history", []) if review_loop else []
+                            if not rev_hist:
+                                continue
+                            scope_task_count += 1
+                            for entry in rev_hist:
+                                if entry.get("iteration") != 0:
+                                    continue
+                                for issue in entry.get("issues", []):
+                                    desc = issue.get("description") or ""
+                                    cat = issue.get("category", "other")
+                                    if not desc:
+                                        continue
+                                    normalized = desc.lower().strip()[:120]
+                                    scope_desc_counter[normalized] += 1
+                                    if normalized not in scope_desc_to_cat:
+                                        scope_desc_to_cat[normalized] = cat
+                        if scope_task_count >= 3:
+                            scope_recurring = [
+                                (desc, cnt) for desc, cnt in scope_desc_counter.items() if cnt >= 2
+                            ]
+                            if scope_recurring:
+                                scope_recurring.sort(key=lambda x: -x[1])
+                                scope_specific_review_issues = [
+                                    {
+                                        "description": desc,
+                                        "count": cnt,
+                                        "category": scope_desc_to_cat.get(desc, "other"),
+                                        "scope": current_task_scope,
+                                    }
+                                    for desc, cnt in scope_recurring[:3]
+                                ]
+                except Exception:
+                    logger.exception("[AGENT] Failed to compute scope_specific_review_issues (non-critical)")
             except Exception:
                 logger.exception("[AGENT] Failed to compute review_issue_distribution (non-critical)")
 
@@ -911,6 +962,7 @@ async def claim_task(
             "pipeline_health": pipeline_health,
             "review_issue_distribution": review_issue_distribution,
             "top_first_review_issues": top_first_review_issues,
+            "scope_specific_review_issues": scope_specific_review_issues,
             "review_effectiveness": review_effectiveness,
         }
 

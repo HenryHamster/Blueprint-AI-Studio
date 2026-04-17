@@ -2045,10 +2045,10 @@ Check for:
   }
   // medium or unspecified: 8-item checklist (includes cross-file and import checks for multi-file changes)
   const planAlignmentItem = hasAnalysisPlan
-    ? `0. **Plan alignment** — Do the files you actually changed match the "Files to change" list from the analysis plan? Were any interfaces marked "preserve" altered? If yes to either, justify or revert.\n`
+    ? `0. **Plan alignment (HARD GATE — verdict MUST be FAIL if violated)** — Do the files you actually changed match the "Files to change" list from the analysis plan? Test files corresponding to planned production files count as in-plan; any other unplanned non-test file is a scope violation. Were any interfaces marked "preserve" altered? If either condition is violated, the verdict MUST be FAIL — revert the unplanned changes and re-attempt within scope. Justification is NOT acceptable.\n`
     : '';
   const scopeViolationsItem = hasAnalysisPlan
-    ? `3. **Scope violations** — Are there changed files not listed in the analysis plan's "Files to change" section (excluding test files)? If a file is in the plan, it is in-scope.`
+    ? `3. **Scope violations (HARD GATE — verdict MUST be FAIL if violated)** — Any changed non-test file not listed in the analysis plan's "Files to change" section is a scope violation and MUST result in a FAIL verdict. Test files for planned production files are in-scope. Revert unplanned non-test files; do not justify them.`
     : `3. **Scope violations** — Are there changes unrelated to the task requirements?`;
   return `This is a multi-file change — verify that types, imports, and function signatures are consistent across all changed files.
 
@@ -2081,6 +2081,7 @@ export function buildSelfReviewPrompt(opts: {
   persistentReviewIssues?: string[];
   analysisPlan?: string;
   topFirstReviewIssues?: Array<{ description: string; count: number; category: string }>;
+  scopeSpecificReviewIssues?: Array<{ description: string; count: number; category: string; scope: string }>;
 }): string {
   const restrictionsSection = opts.claudeMd
     ? `\n## File Restrictions (from CLAUDE.md)\n${opts.claudeMd.slice(0, 500)}\n`
@@ -2109,6 +2110,17 @@ export function buildSelfReviewPrompt(opts: {
           })
           .join('\n');
         return `\n## First-Attempt Rejection Priorities\nThese categories most often block first-attempt approval — weight your checks accordingly:\n${lines}\n`;
+      })()
+    : '';
+
+  const scopeSpecificSection = opts.scopeSpecificReviewIssues && opts.scopeSpecificReviewIssues.length > 0
+    ? (() => {
+        const scope = opts.scopeSpecificReviewIssues![0].scope;
+        const lines = opts.scopeSpecificReviewIssues!
+          .slice(0, 5)
+          .map(i => `- "${i.description}" (seen ${i.count}x, category: ${i.category})`)
+          .join('\n');
+        return `\n## Scope-Specific Review Patterns\nFor ${scope}-scope tasks in this project, these issues are most common:\n${lines}\n`;
       })()
     : '';
 
@@ -2165,7 +2177,7 @@ export function buildSelfReviewPrompt(opts: {
   const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
 
   return `You are performing a self-review of the changes you just made for this task.
-${restrictionsSection}${issueDistSection}${firstAttemptSection}${topIssuesSection}${playbookSection}${scopeOverflowSection}${planSection}${diffSection}${buildVerificationSection}
+${restrictionsSection}${scopeSpecificSection}${issueDistSection}${firstAttemptSection}${topIssuesSection}${playbookSection}${scopeOverflowSection}${planSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.
