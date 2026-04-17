@@ -1043,6 +1043,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 prior_retry_ctx["_previous_diff_summary"] = _prior_ctx["_pr_diff_summary"]
             if _prior_ctx.get("_pr_url"):
                 prior_retry_ctx["_previous_pr_url"] = _prior_ctx["_pr_url"]
+            if _prior_ctx.get("_test_failure_summary"):
+                prior_retry_ctx["_previous_test_failure_summary"] = _prior_ctx["_test_failure_summary"]
+            if _prior_ctx.get("_self_review_outcome"):
+                prior_retry_ctx["_previous_self_review_outcome"] = _prior_ctx["_self_review_outcome"]
+            if _prior_ctx.get("_file_change_details"):
+                prior_retry_ctx["_previous_file_change_details"] = _prior_ctx["_file_change_details"]
         finding_payload = validate_internal_payload({
             "type": task_type,
             "prompt": full_prompt,

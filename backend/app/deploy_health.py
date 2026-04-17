@@ -55,6 +55,7 @@ _HEALTH_HISTORY_SIZE = 5
 _HEALTH_HISTORY_HEALTHY_REQUIRED = 3
 _health_recovery_history: "deque[bool]" = deque(maxlen=_HEALTH_HISTORY_SIZE)
 _last_exhausted_zones: set = set()  # tracks zone health for transition logging
+_last_auto_resume_at: "datetime | None" = None  # timestamp of most recent auto-resume (normal or forced)
 
 
 def _reset_health_recovery_history() -> None:
@@ -427,7 +428,7 @@ async def _check_pause_mode():
     auto-pause duration forces resume (with reduced VMs) if healthy probes never
     reach the threshold — preventing indefinite pause under intermittent failures.
     """
-    global _pause_failure_streak
+    global _pause_failure_streak, _last_auto_resume_at
     ext = _shared_state.external_health
     failed = ext.get("failed_deps", [])
     # Auto-pause on critical deps including Claude API (rate limits, not just missing credentials)
@@ -466,7 +467,31 @@ async def _check_pause_mode():
         # --- Pause-trigger path -------------------------------------------------
         if not is_auto_paused:
             _reset_health_recovery_history()
-            if critical_failures and _pause_failure_streak >= 3 and _runtime_config["max_concurrent_vms"] > 0:
+            in_grace_period = False
+            grace_remaining = 0.0
+            if _last_auto_resume_at is not None:
+                grace = _runtime_config.get("auto_resume_grace_period_seconds", 300)
+                elapsed = (_utcnow() - _last_auto_resume_at).total_seconds()
+                if 0 <= elapsed < grace:
+                    in_grace_period = True
+                    grace_remaining = grace - elapsed
+
+            if critical_failures and _pause_failure_streak >= 3 and _runtime_config["max_concurrent_vms"] > 0 and in_grace_period:
+                logger.warning(
+                    f"[PAUSE] Suppressing auto-pause during post-resume grace period "
+                    f"({int(grace_remaining)}s remaining); failed={critical_failures}"
+                )
+                try:
+                    await manager.broadcast_to_all("health_degrading", {
+                        "streak": _pause_failure_streak,
+                        "threshold": 3,
+                        "failed_deps": critical_failures,
+                        "in_grace_period": True,
+                        "grace_remaining_seconds": int(grace_remaining),
+                    })
+                except Exception as _be:
+                    logger.warning(f"[WS] health_degrading broadcast failed: {_be}")
+            elif critical_failures and _pause_failure_streak >= 3 and _runtime_config["max_concurrent_vms"] > 0:
                 if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
                     state.status = DeploymentStatus.PAUSED
                     state.pause_reason = f"External dependency down: {', '.join(critical_failures)}"
@@ -544,6 +569,7 @@ async def _check_pause_mode():
         await session.commit()
         _runtime_config["max_concurrent_vms"] = initial_vms
         _reset_health_recovery_history()
+        _last_auto_resume_at = _utcnow()
 
         if should_force_resume:
             logger.error(

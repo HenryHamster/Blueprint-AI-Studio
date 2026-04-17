@@ -3486,6 +3486,9 @@ async def test_respawn_after_cooldown_injects_prior_failure_context(db_session, 
             "_pr_changed_files": ["app/webhooks.py", "testing/test_webhooks.py"],
             "_pr_diff_summary": [{"file": "app/webhooks.py", "added": 12, "removed": 2}],
             "_pr_url": "https://github.com/example/repo/pull/999",
+            "_test_failure_summary": "1 failed: test_webhooks.py::test_retry_on_5xx",
+            "_self_review_outcome": {"status": "failed", "notes": "missing retry count assertion"},
+            "_file_change_details": [{"file": "app/webhooks.py", "summary": "added retry decorator"}],
         },
         status=TaskStatus.FAILED,
         latest_status_message="Tests failed: AssertionError in test_webhooks.py line 42",
@@ -3530,3 +3533,6 @@ async def test_respawn_after_cooldown_injects_prior_failure_context(db_session, 
     assert ctx.get("_previous_changed_files") == ["app/webhooks.py", "testing/test_webhooks.py"]
     assert ctx.get("_previous_diff_summary") == [{"file": "app/webhooks.py", "added": 12, "removed": 2}]
     assert ctx.get("_previous_pr_url") == "https://github.com/example/repo/pull/999"
+    assert ctx.get("_previous_test_failure_summary") == "1 failed: test_webhooks.py::test_retry_on_5xx"
+    assert ctx.get("_previous_self_review_outcome") == {"status": "failed", "notes": "missing retry count assertion"}
+    assert ctx.get("_previous_file_change_details") == [{"file": "app/webhooks.py", "summary": "added retry decorator"}]

@@ -70,9 +70,11 @@ def reset_module_state():
     """Reset module-level streak counters before and after every test."""
     _dh._pause_failure_streak = 0
     _dh._reset_health_recovery_history()
+    _dh._last_auto_resume_at = None
     yield
     _dh._pause_failure_streak = 0
     _dh._reset_health_recovery_history()
+    _dh._last_auto_resume_at = None
 
 
 def _seed_recovery_history(*values):
@@ -683,6 +685,100 @@ async def test_forced_resume_after_max_duration(dh_db):
     _dh._create_forced_resume_alerts.assert_awaited_once()
     # Normal resume alert helper should NOT be called on the forced path.
     _dh._create_auto_resume_alerts.assert_not_awaited()
+
+
+# ── Tests: anti-flap grace period after auto-resume ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_grace_period_suppresses_repause(dh_db, mocker):
+    """Health failures during the post-resume grace period must NOT re-trigger auto-pause."""
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    _shared_state.runtime_config["max_concurrent_vms"] = 4
+    _shared_state.runtime_config["auto_resume_grace_period_seconds"] = 300
+    _set_critical_failures("db")
+
+    # Simulate a very recent auto-resume.
+    _dh._last_auto_resume_at = _dh._utcnow()
+    _dh._pause_failure_streak = 2  # next failure would normally trigger pause
+
+    bcast = mocker.patch("app.deploy_health.manager.broadcast_to_all", new_callable=AsyncMock)
+    await _dh._check_pause_mode()
+
+    # Streak still increments and health_degrading still broadcasts so operators see flap.
+    assert _dh._pause_failure_streak == 3
+    bcast.assert_awaited_once()
+    event, payload = bcast.await_args.args
+    assert event == "health_degrading"
+    assert payload["in_grace_period"] is True
+    assert payload["grace_remaining_seconds"] > 0
+
+    # But the pipeline is NOT paused.
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    assert state.status == DeploymentStatus.STABLE.value
+    _dh._create_auto_pause_alerts.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pause_triggers_after_grace_period_expires(dh_db):
+    """Health failures AFTER the grace period must re-trigger auto-pause normally."""
+    from datetime import timedelta
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    _shared_state.runtime_config["max_concurrent_vms"] = 4
+    _shared_state.runtime_config["auto_resume_grace_period_seconds"] = 300
+    _set_critical_failures("gcp")
+
+    # Last resume was well before the grace window.
+    _dh._last_auto_resume_at = _dh._utcnow() - timedelta(seconds=600)
+    _dh._pause_failure_streak = 2
+
+    await _dh._check_pause_mode()
+
+    assert _dh._pause_failure_streak == 3
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 0
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    assert state.status == DeploymentStatus.PAUSED.value
+
+
+@pytest.mark.asyncio
+async def test_normal_auto_resume_sets_grace_timestamp(dh_db):
+    """A normal (3-of-5) auto-resume must set _last_auto_resume_at for future grace checks."""
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: db",
+        pre_pause_max_vms=4,
+    )
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.deploy_monitoring["window_start"] = None
+    _set_healthy()
+    _seed_recovery_history(True, True)
+
+    assert _dh._last_auto_resume_at is None
+    await _dh._check_pause_mode()
+    assert _dh._last_auto_resume_at is not None
+
+
+@pytest.mark.asyncio
+async def test_forced_resume_sets_grace_timestamp(dh_db):
+    """A forced resume (max-duration exceeded) must also set _last_auto_resume_at."""
+    from datetime import timedelta
+    long_ago = _dh._utcnow() - timedelta(seconds=10_000)
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: claude_api",
+        pre_pause_max_vms=8,
+        paused_at=long_ago,
+    )
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.runtime_config["max_auto_pause_duration_seconds"] = 7200
+    _shared_state.deploy_monitoring["window_start"] = None
+    _set_critical_failures("claude_api")
+
+    assert _dh._last_auto_resume_at is None
+    await _dh._check_pause_mode()
+    assert _dh._last_auto_resume_at is not None
 
 
 # ── Tests: task_results staleness guard (auto-resume deadlock) ───────────────
