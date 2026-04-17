@@ -28,6 +28,35 @@ from app.review_pipeline import _spawn_pipeline_task
 logger = logging.getLogger(__name__)
 
 
+async def _dispatch_rollup_approval_alert(
+    parent: Task, session: AsyncSession, reason: str, pr_number: int | None = None
+) -> None:
+    """Create a failure alert and fire an external APPROVAL_NEEDED notification
+    when a rollup parent enters the approval-gated state so operators are
+    notified instead of discovering the stall later.
+    """
+    import asyncio as _asyncio
+    from app.main import _maybe_create_failure_alert
+    from app.notification_dispatch import dispatch_external_notification
+    try:
+        await _maybe_create_failure_alert(parent, session, reason)
+    except Exception as e:
+        logger.warning(f"[NOTIFY] rollup approval alert creation failed: {e}")
+    try:
+        _asyncio.ensure_future(dispatch_external_notification(  # noqa: RUF006
+            parent.project_id,
+            "APPROVAL_NEEDED",
+            {
+                "task_id": str(parent.id),
+                "task_title": parent.title or str(parent.id)[:8],
+                "pr_number": pr_number,
+                "reason": reason,
+            },
+        ))
+    except Exception as e:
+        logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {e}")
+
+
 async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
     """Check if a create task's PR is merged. Uses context cache, falls back to GitHub API.
 
@@ -663,6 +692,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     )
                     parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
                     session.add(parent)
+                    await _dispatch_rollup_approval_alert(
+                        parent, session,
+                        f"Rollup PR #{rollup_pr_number} awaiting approval — contains high-risk changes",
+                        pr_number=rollup_pr_number,
+                    )
                     await session.commit()
                     await broadcast_to_project(str(parent.project_id), "task_updated",
                                                {"task_id": str(parent.id), "status": parent.status})
@@ -691,6 +725,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             if rollup_scan["findings"]:
                                 await create_pr_comment(gh_token, owner, repo, rollup_pr_number, rollup_scan["report"])
                             session.add(parent)
+                            await _dispatch_rollup_approval_alert(
+                                parent, session,
+                                f"Rollup PR #{rollup_pr_number} blocked by security scan: {rollup_scan['summary']}",
+                                pr_number=rollup_pr_number,
+                            )
                             await session.commit()
                             return
                         if rollup_scan["findings"]:
@@ -701,6 +740,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         parent.latest_status_message = f"Rollup security scan failed — requires manual approval: {type(e).__name__}: {e!r}"[:500]
                         parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
                         session.add(parent)
+                        await _dispatch_rollup_approval_alert(
+                            parent, session,
+                            f"Rollup PR #{rollup_pr_number} security scan failed — requires manual approval: {type(e).__name__}",
+                            pr_number=rollup_pr_number,
+                        )
                         await session.commit()
                         return
 

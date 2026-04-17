@@ -1296,6 +1296,184 @@ async def test_rollup_fails_parent_when_all_fail_and_limit_exhausted(rollup_db, 
     )
 
 
+# ── Rollup Approval Gate Alerts ──────────────────────────────────────────────
+
+
+async def _make_rollup_parent_with_completed_child(rollup_db, *, target_branch, child_risk=None):
+    project = Project(name="Approval Gate Test", user_id="user1")
+    rollup_db.add(project)
+    await rollup_db.commit()
+    await rollup_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="rollup parent",
+        payloads=[{"type": "research", "prompt": "parent"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "plan_branch": "research/abc12345",
+            "parent_base": target_branch,
+        },
+    )
+    rollup_db.add(parent)
+    await rollup_db.commit()
+    await rollup_db.refresh(parent)
+
+    child_ctx = {"pr_merged": True}
+    if child_risk:
+        child_ctx["risk"] = child_risk
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        status=TaskStatus.COMPLETED,
+        context=child_ctx,
+    )
+    rollup_db.add(child)
+    await rollup_db.commit()
+    await rollup_db.refresh(child)
+    return project, parent, child
+
+
+def _patch_common_rollup_mocks(mocker):
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management.broadcast_to_project", new_callable=AsyncMock, create=True)
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="deadbeef")
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock, return_value=None)
+    mocker.patch(
+        "app.github.create_pull_request",
+        new_callable=AsyncMock,
+        return_value={"number": 777, "html_url": "https://example.com/pr/777", "empty_diff": False},
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_high_risk_gate_dispatches_approval_alert(rollup_db, mocker):
+    """High-risk child gate: parent.requires_approval=True → alert + notification."""
+    _patch_common_rollup_mocks(mocker)
+    mock_dispatch = mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="main", child_risk="high"
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    await rollup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert "high-risk" in (parent.latest_status_message or "").lower()
+    mock_dispatch.assert_awaited_once()
+    assert mock_dispatch.await_args.kwargs.get("pr_number") == 777
+
+
+@pytest.mark.asyncio
+async def test_rollup_security_scan_blocked_dispatches_approval_alert(rollup_db, mocker):
+    """Security scan blocked gate: parent.requires_approval=True → alert + notification."""
+    _patch_common_rollup_mocks(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"additions": 5, "deletions": 5},
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": True, "summary": "injection found", "findings": [], "report": ""},
+    )
+    mock_dispatch = mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent12", child_risk=None
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    await rollup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert "security scan blocked" in (parent.latest_status_message or "").lower()
+    mock_dispatch.assert_awaited_once()
+    assert mock_dispatch.await_args.kwargs.get("pr_number") == 777
+
+
+@pytest.mark.asyncio
+async def test_rollup_security_scan_failure_dispatches_approval_alert(rollup_db, mocker):
+    """Security scan exception gate: parent.requires_approval=True → alert + notification."""
+    _patch_common_rollup_mocks(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"additions": 5, "deletions": 5},
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("scanner crashed"),
+    )
+    mock_dispatch = mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent12", child_risk=None
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    await rollup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert "security scan failed" in (parent.latest_status_message or "").lower()
+    mock_dispatch.assert_awaited_once()
+    assert mock_dispatch.await_args.kwargs.get("pr_number") == 777
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rollup_approval_alert_creates_alert(rollup_db, mocker):
+    """The helper creates an Alert row and fires an APPROVAL_NEEDED notification."""
+    from app.rollup_management import _dispatch_rollup_approval_alert
+    from app.models import Alert
+    from sqlmodel import select as _select
+
+    mock_dispatch = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock
+    )
+    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Helper Test", user_id="user1")
+    rollup_db.add(project)
+    await rollup_db.commit()
+    await rollup_db.refresh(project)
+    parent = Task(
+        project_id=project.id,
+        title="rollup",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+    )
+    rollup_db.add(parent)
+    await rollup_db.commit()
+    await rollup_db.refresh(parent)
+
+    await _dispatch_rollup_approval_alert(parent, rollup_db, "needs approval", pr_number=42)
+    await rollup_db.commit()
+
+    alerts = (await rollup_db.execute(_select(Alert).where(Alert.task_id == parent.id))).scalars().all()
+    assert len(alerts) == 1
+    assert "needs approval" in (alerts[0].message or "")
+    approval_calls = [c for c in mock_dispatch.call_args_list if c.args[1] == "APPROVAL_NEEDED"]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 42
+
+
 # ── Strategic Completion Handler ─────────────────────────────────────────────
 
 @pytest_asyncio.fixture()
