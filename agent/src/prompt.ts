@@ -527,6 +527,23 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
             : `Review iterations: ${iter} (${iter === 1 ? '1 cycle' : `${iter} cycles`} before failure)`;
           dcLines.push(`  - ${label}`);
         }
+        const reviewFeedback = entry.review_feedback;
+        if (Array.isArray(reviewFeedback) && reviewFeedback.length > 0) {
+          const parts = reviewFeedback.map(item => {
+            if (!item || typeof item !== 'object') return '';
+            const obj = item as Record<string, unknown>;
+            const sev = strVal(obj.severity);
+            const desc = strVal(obj.description);
+            if (!desc) return '';
+            const file = strVal(obj.file);
+            const line = typeof obj.line === 'number' ? obj.line : null;
+            const loc = file ? ` (${file}${line !== null ? `:${line}` : ''})` : '';
+            return sev ? `[${sev}] ${desc}${loc}` : `${desc}${loc}`;
+          }).filter(Boolean);
+          if (parts.length > 0) dcLines.push(`  - Review feedback: ${parts.join(', ')}`);
+        } else if (typeof reviewFeedback === 'string' && reviewFeedback) {
+          dcLines.push(`  - Review feedback: ${reviewFeedback}`);
+        }
       }
     }
     const successfulAnalysis = Array.isArray(dirCtx.direction_successful_analysis)
@@ -536,7 +553,9 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       dcLines.push('**Approaches that worked:**');
       for (const entry of successfulAnalysis) {
         const t = strVal(entry.title);
-        dcLines.push(`- ${t}`);
+        const scope = strVal(entry.scope);
+        const header = scope ? `- ${t} [${scope}]` : `- ${t}`;
+        dcLines.push(header);
         const plan = strVal(entry.analysis_plan);
         if (plan) dcLines.push(`  - Analysis plan: ${plan}`);
         const changedFiles = Array.isArray(entry.pr_changed_files)
@@ -545,12 +564,29 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         if (changedFiles.length > 0) {
           dcLines.push(`  - Files changed: ${changedFiles.join(', ')}`);
         }
+        if (typeof entry.review_iterations === 'number') {
+          const iter = entry.review_iterations;
+          const label = iter <= 1
+            ? '1st-pass success'
+            : `${iter} review cycles`;
+          dcLines.push(`  - ${label}`);
+        }
       }
     }
     const patterns = synthesizeSuccessPatterns(dirCtx, taskScope);
     if (patterns.length > 0) {
       dcLines.push('**What tends to work:**');
       for (const s of patterns) dcLines.push(`- ${s}`);
+    }
+    type DirectionFirstReviewIssue = { description: string; count: number; category: string };
+    const dirTopIssues = Array.isArray(dirCtx.top_first_review_issues)
+      ? dirCtx.top_first_review_issues as DirectionFirstReviewIssue[]
+      : [];
+    if (dirTopIssues.length > 0) {
+      dcLines.push('**Recurring review issues in this direction (address before submitting):**');
+      for (const issue of dirTopIssues) {
+        dcLines.push(`- "${issue.description}" (seen ${issue.count}x, category: ${issue.category})`);
+      }
     }
     dcLines.push('');
     prefix += dcLines.join('\n') + '\n';

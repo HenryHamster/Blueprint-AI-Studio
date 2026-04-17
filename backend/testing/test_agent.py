@@ -1843,6 +1843,161 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
     assert len(_json.dumps(dpa)) <= 2000
 
 
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_includes_structured_review_feedback(client: AsyncClient, db_session):
+    """Failed tasks with structured review issues surface top critical/major items."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Review Feedback Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Refactor module Z",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "prior"}],
+        vm_instance_id="vm-rf-1",
+        context={
+            "direction_id": direction_id,
+            "_analysis_plan": "approach plan",
+            "review_loop": {
+                "iteration": 2,
+                "review_history": [
+                    {
+                        "iteration": 0,
+                        "feedback": "first round",
+                        "issues": [
+                            {"severity": "minor", "description": "old style"},
+                        ],
+                    },
+                    {
+                        "iteration": 1,
+                        "feedback": "second round",
+                        "issues": [
+                            {"severity": "minor", "description": "nit: rename var"},
+                            {"severity": "critical", "description": "missing null check in handler", "file": "foo.py", "line": 42},
+                            {"severity": "major", "description": "no test for edge case", "file": "test_foo.py"},
+                            {"severity": "critical", "description": "race condition in cache update"},
+                            {"severity": "major", "description": "should be a single bullet but text long " * 10},
+                        ],
+                    },
+                ],
+            },
+        },
+        status=TaskStatus.FAILED,
+        title="Prior with review feedback",
+        latest_status_message="failed self-review",
+    )
+    db_session.add(prior)
+    await db_session.commit()
+
+    current = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "current"}],
+        vm_instance_id="vm-rf-current",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(current)
+    await db_session.commit()
+    await db_session.refresh(current)
+
+    token = create_agent_token(str(current.id), "vm-rf-current")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dpa = resp.json()["direction_context"]["direction_prior_analysis"]
+    assert len(dpa) == 1
+    rf = dpa[0]["review_feedback"]
+    # Top 3 critical/major from the LAST review entry, critical first
+    assert isinstance(rf, list)
+    assert len(rf) == 3
+    assert rf[0]["severity"] == "CRITICAL"
+    assert rf[0]["description"] == "missing null check in handler"
+    assert rf[0]["file"] == "foo.py"
+    assert rf[0]["line"] == 42
+    assert rf[1]["severity"] == "CRITICAL"
+    assert rf[1]["description"] == "race condition in cache update"
+    assert "file" not in rf[1]
+    assert rf[2]["severity"] == "MAJOR"
+    # Long description truncated to 150 chars
+    assert len(rf[2]["description"]) <= 150
+
+
+@pytest.mark.asyncio
+async def test_claim_review_feedback_falls_back_to_text(client: AsyncClient, db_session):
+    """When review history lacks structured issues, fall back to truncated feedback string."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Review Feedback Fallback", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Refactor module W",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    long_feedback = "F" * 500  # truncated to 200
+    prior = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "prior"}],
+        vm_instance_id="vm-rf-fb-1",
+        context={
+            "direction_id": direction_id,
+            "_analysis_plan": "approach",
+            "review_loop": {
+                "iteration": 1,
+                "review_history": [
+                    {"iteration": 0, "feedback": long_feedback},
+                ],
+            },
+        },
+        status=TaskStatus.FAILED,
+        title="Prior text feedback",
+        latest_status_message="failed",
+    )
+    db_session.add(prior)
+    await db_session.commit()
+
+    current = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "current"}],
+        vm_instance_id="vm-rf-fb-current",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(current)
+    await db_session.commit()
+    await db_session.refresh(current)
+
+    token = create_agent_token(str(current.id), "vm-rf-fb-current")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dpa = resp.json()["direction_context"]["direction_prior_analysis"]
+    assert len(dpa) == 1
+    rf = dpa[0]["review_feedback"]
+    assert isinstance(rf, str)
+    assert len(rf) == 200
+    assert rf == "F" * 200
+
+
 @pytest.mark.asyncio
 async def test_claim_injects_direction_successful_analysis(client: AsyncClient, db_session):
     """Claim endpoint surfaces analysis_plan from recent successful sibling tasks."""
@@ -1874,6 +2029,7 @@ async def test_claim_injects_direction_successful_analysis(client: AsyncClient, 
             "_analysis_plan": long_plan,
             "_pr_changed_files": ["svc.py", "route.py"],
             "scope": "medium",
+            "review_loop": {"iteration": 2},
         },
         status=TaskStatus.COMPLETED,
         title="Successful task",
@@ -1927,10 +2083,12 @@ async def test_claim_injects_direction_successful_analysis(client: AsyncClient, 
     assert len(full["analysis_plan"]) == 500
     assert full["pr_changed_files"] == ["svc.py", "route.py"]
     assert full["scope"] == "medium"
+    assert full["review_iterations"] == 2
     small = by_title["Successful small-scope task"]
     assert "analysis_plan" not in small
     assert small["pr_changed_files"] == ["small.py"]
     assert small["scope"] == "small"
+    assert "review_iterations" not in small
     import json as _json
     assert len(_json.dumps(dsa)) <= 1500
 
@@ -3855,3 +4013,139 @@ async def test_claim_top_first_review_issues_populated(client: AsyncClient, db_s
     assert len(top_issues) >= 1
     descriptions = [issue["description"] for issue in top_issues]
     assert common_issue.lower()[:120] in descriptions
+
+
+@pytest.mark.asyncio
+async def test_claim_direction_top_first_review_issues_populated(client: AsyncClient, db_session):
+    """direction_context.top_first_review_issues is populated when a direction has 3+ tasks with review history and a recurring issue."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Direction Top Review Issues Test", user_id="test-user-dtri")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Refactor auth",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    direction_issue = "Direction-scoped missing validation on inputs"
+    other_issue = "Unique issue seen only once"
+    # 3 tasks in this direction with review history; 2 share the recurring issue.
+    for i in range(3):
+        issues = [{"severity": "high", "description": direction_issue, "file": "a.py", "line": 1}]
+        if i == 2:
+            issues = [{"severity": "low", "description": other_issue, "file": "b.py", "line": 2}]
+        ht = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": f"dir task {i}"}],
+            vm_instance_id=f"agent-vm-dtri-{i}",
+            status=TaskStatus.COMPLETED,
+            context={
+                "direction_id": direction_id,
+                "review_loop": {
+                    "iteration": 2,
+                    "review_history": [
+                        {"iteration": 0, "feedback": "fix", "issues": issues},
+                    ],
+                },
+            },
+        )
+        flag_modified(ht, "context")
+        db_session.add(ht)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "new in direction"}],
+        vm_instance_id="agent-vm-dtri-claim",
+        context={"direction_id": direction_id},
+    )
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dtri-claim")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    dc = resp.json().get("direction_context", {})
+    dir_top = dc.get("top_first_review_issues")
+    assert dir_top, "direction_context.top_first_review_issues should be populated"
+    descriptions = [issue["description"] for issue in dir_top]
+    assert direction_issue.lower()[:120] in descriptions
+    assert other_issue.lower()[:120] not in descriptions
+
+
+@pytest.mark.asyncio
+async def test_claim_direction_top_first_review_issues_gated_by_min_tasks(client: AsyncClient, db_session):
+    """direction_context.top_first_review_issues stays None when fewer than 3 direction-scoped tasks have review history."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Direction Top Review Issues Gated", user_id="test-user-dtri-gate")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Refactor auth",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    shared_issue = "Recurring direction issue"
+    # Only 2 direction-scoped tasks with review history — below the 3-task threshold.
+    for i in range(2):
+        ht = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": f"dir task {i}"}],
+            vm_instance_id=f"agent-vm-dtri-gate-{i}",
+            status=TaskStatus.COMPLETED,
+            context={
+                "direction_id": direction_id,
+                "review_loop": {
+                    "iteration": 2,
+                    "review_history": [
+                        {
+                            "iteration": 0,
+                            "feedback": "fix",
+                            "issues": [{"severity": "high", "description": shared_issue, "file": "a.py", "line": 1}],
+                        },
+                    ],
+                },
+            },
+        )
+        flag_modified(ht, "context")
+        db_session.add(ht)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "new in direction"}],
+        vm_instance_id="agent-vm-dtri-gate-claim",
+        context={"direction_id": direction_id},
+    )
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dtri-gate-claim")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    dc = resp.json().get("direction_context", {})
+    assert dc.get("top_first_review_issues") is None

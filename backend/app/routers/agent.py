@@ -781,6 +781,7 @@ async def claim_task(
         # Aggregate review issue distribution for create/fix/refactor tasks (last 14 days)
         review_issue_distribution = None
         top_first_review_issues = None
+        direction_top_first_review_issues = None
         if task_type in ("create", "fix", "refactor"):
             try:
                 from app.playbook_learning import _categorize_review_issues
@@ -835,6 +836,54 @@ async def claim_task(
                         ]
                 except Exception:
                     logger.exception("[AGENT] Failed to compute top_first_review_issues (non-critical)")
+
+                # Direction-scoped recurring issues: per-task presence within the current direction.
+                # Requires at least 3 direction-scoped tasks with review history to avoid noisy signals.
+                try:
+                    if current_direction_id:
+                        dir_desc_task_ids: dict = {}
+                        dir_desc_to_cat: dict = {}
+                        dir_task_count = 0
+                        for ht in high_iter_rows:
+                            if (ht.context or {}).get("direction_id") != current_direction_id:
+                                continue
+                            if ht.created_at and ht.created_at < cutoff_14d:
+                                continue
+                            review_loop = (ht.context or {}).get("review_loop", {})
+                            rev_hist = review_loop.get("review_history", []) if review_loop else []
+                            if not rev_hist:
+                                continue
+                            dir_task_count += 1
+                            for entry in rev_hist:
+                                if entry.get("iteration") != 0:
+                                    continue
+                                for issue in entry.get("issues", []):
+                                    desc = issue.get("description") or ""
+                                    cat = issue.get("category", "other")
+                                    if not desc:
+                                        continue
+                                    normalized = desc.lower().strip()[:120]
+                                    dir_desc_task_ids.setdefault(normalized, set()).add(ht.id)
+                                    if normalized not in dir_desc_to_cat:
+                                        dir_desc_to_cat[normalized] = cat
+                        if dir_task_count >= 3:
+                            dir_recurring = [
+                                (desc, len(tids))
+                                for desc, tids in dir_desc_task_ids.items()
+                                if len(tids) >= 2
+                            ]
+                            if dir_recurring:
+                                dir_recurring.sort(key=lambda x: -x[1])
+                                direction_top_first_review_issues = [
+                                    {
+                                        "description": desc,
+                                        "count": cnt,
+                                        "category": dir_desc_to_cat.get(desc, "other"),
+                                    }
+                                    for desc, cnt in dir_recurring[:3]
+                                ]
+                except Exception:
+                    logger.exception("[AGENT] Failed to compute direction_top_first_review_issues (non-critical)")
             except Exception:
                 logger.exception("[AGENT] Failed to compute review_issue_distribution (non-critical)")
 
@@ -1216,6 +1265,41 @@ async def claim_task(
                         iteration = review_loop.get("iteration", 0)
                         if isinstance(iteration, int):
                             entry["review_iterations"] = iteration
+                        review_history = review_loop.get("review_history")
+                        if isinstance(review_history, list) and review_history:
+                            last_entry = review_history[-1]
+                            if isinstance(last_entry, dict):
+                                issues = last_entry.get("issues")
+                                compact_issues: list = []
+                                if isinstance(issues, list):
+                                    for sev_filter in ("critical", "major"):
+                                        for issue in issues:
+                                            if not isinstance(issue, dict):
+                                                continue
+                                            sev = str(issue.get("severity", "")).lower()
+                                            if sev != sev_filter:
+                                                continue
+                                            desc = str(issue.get("description", "")).strip()
+                                            if not desc:
+                                                continue
+                                            item = {"severity": sev.upper(), "description": desc[:150]}
+                                            file_path = issue.get("file")
+                                            if file_path:
+                                                item["file"] = str(file_path)
+                                                line = issue.get("line")
+                                                if isinstance(line, int):
+                                                    item["line"] = line
+                                            compact_issues.append(item)
+                                            if len(compact_issues) >= 3:
+                                                break
+                                        if len(compact_issues) >= 3:
+                                            break
+                                if compact_issues:
+                                    entry["review_feedback"] = compact_issues
+                                else:
+                                    feedback_text = str(last_entry.get("feedback") or "").strip()
+                                    if feedback_text:
+                                        entry["review_feedback"] = feedback_text[:200]
                     entry_len = len(json.dumps(entry))
                     if total_chars + entry_len > 2000:
                         break
@@ -1255,6 +1339,11 @@ async def claim_task(
                         s_entry["scope"] = str(scope)
                     if has_changed_files:
                         s_entry["pr_changed_files"] = [str(f) for f in changed_files[:10]]
+                    review_loop = sctx.get("review_loop")
+                    if isinstance(review_loop, dict):
+                        iteration = review_loop.get("iteration", 0)
+                        if isinstance(iteration, int):
+                            s_entry["review_iterations"] = iteration
                     s_entry_len = len(json.dumps(s_entry))
                     if success_chars + s_entry_len > 1500:
                         break
@@ -1270,6 +1359,7 @@ async def claim_task(
                     "direction_prior_analysis": direction_prior_analysis,
                     "direction_successful_analysis": direction_successful_analysis,
                     "scope_success_rates": scope_success_rates,
+                    "top_first_review_issues": direction_top_first_review_issues,
                 }
 
             # Surface saturation / deadlock signals to research agents so they can

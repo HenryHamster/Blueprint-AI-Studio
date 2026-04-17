@@ -441,6 +441,53 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('Review iterations: 0 (failed before review)');
   });
 
+  it('renders structured review_feedback in prior analysis entries', () => {
+    const task = {
+      direction_context: {
+        title: 'Refactor module',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        direction_prior_analysis: [
+          {
+            title: 'Reviewed task',
+            failure_category: 'CODE_ERROR',
+            analysis_plan: 'Try X',
+            review_iterations: 2,
+            review_feedback: [
+              { severity: 'CRITICAL', description: 'missing null check in handler', file: 'foo.py', line: 42 },
+              { severity: 'MAJOR', description: 'no test for edge case', file: 'test_foo.py' },
+            ],
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('Review feedback: [CRITICAL] missing null check in handler (foo.py:42), [MAJOR] no test for edge case (test_foo.py)');
+  });
+
+  it('renders string review_feedback fallback in prior analysis entries', () => {
+    const task = {
+      direction_context: {
+        title: 'Refactor module',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        direction_prior_analysis: [
+          {
+            title: 'Reviewed task',
+            failure_category: 'CODE_ERROR',
+            analysis_plan: 'Try X',
+            review_iterations: 1,
+            review_feedback: 'Reviewer asked for more comprehensive tests covering the new branch logic',
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('Review feedback: Reviewer asked for more comprehensive tests covering the new branch logic');
+  });
+
   it('renders scope alongside failure_category in prior analysis header', () => {
     const task = {
       direction_context: {
@@ -497,6 +544,37 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('- Successful task');
     expect(result).toContain('Analysis plan: Add helper in services.py and wire into router');
     expect(result).toContain('Files changed: services.py, router.py');
+  });
+
+  it('renders scope tag and review iteration indicator for successful analysis entries', () => {
+    const task = {
+      direction_context: {
+        title: 'Refactor module',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        direction_successful_analysis: [
+          {
+            title: 'Small fix',
+            scope: 'small',
+            analysis_plan: 'Touch one helper',
+            pr_changed_files: ['svc.py'],
+            review_iterations: 0,
+          },
+          {
+            title: 'Medium fix',
+            scope: 'medium',
+            pr_changed_files: ['a.py', 'b.py'],
+            review_iterations: 3,
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('- Small fix [small]');
+    expect(result).toContain('1st-pass success');
+    expect(result).toContain('- Medium fix [medium]');
+    expect(result).toContain('3 review cycles');
   });
 
   it('does not render Approaches that worked when direction_successful_analysis is empty or absent', () => {
@@ -600,6 +678,34 @@ describe('buildContextPrefix', () => {
     };
     const result = buildContextPrefix(task);
     expect(result).not.toContain('**What tends to work:**');
+  });
+
+  it('renders direction-scoped recurring review issues from direction_context.top_first_review_issues', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        top_first_review_issues: [
+          { description: 'missing validation on user input', count: 3, category: 'correctness' },
+          { description: 'test coverage gap for edge cases', count: 2, category: 'tests' },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('**Recurring review issues in this direction (address before submitting):**');
+    expect(result).toContain('- "missing validation on user input" (seen 3x, category: correctness)');
+    expect(result).toContain('- "test coverage gap for edge cases" (seen 2x, category: tests)');
+  });
+
+  it('omits direction-scoped recurring review issues section when the field is empty or missing', () => {
+    const withEmpty = buildContextPrefix({
+      direction_context: { title: 'x', priority: 'medium', top_first_review_issues: [] },
+    });
+    const withMissing = buildContextPrefix({
+      direction_context: { title: 'x', priority: 'medium' },
+    });
+    expect(withEmpty).not.toContain('Recurring review issues in this direction');
+    expect(withMissing).not.toContain('Recurring review issues in this direction');
   });
 
   it('returns empty string for relativeTimeFromIso when iso is empty or unparseable', () => {
