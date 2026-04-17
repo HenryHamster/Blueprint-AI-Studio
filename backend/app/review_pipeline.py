@@ -540,6 +540,13 @@ async def _spawn_pipeline_task(
         if not k.startswith('_') and k != 'review_loop'
     }
     propagated_ctx['scope'] = propagated_scope
+    # Carry forward the create task's self-review outcome so the review agent
+    # can see which files were verified (truncated_files_read) and whether the
+    # self-review was marked incomplete, and focus attention on blind spots
+    # rather than re-reviewing files the self-review already checked.
+    prev_self_review_outcome = source_ctx.get('_self_review_outcome')
+    if prev_self_review_outcome:
+        propagated_ctx['_self_review_outcome'] = prev_self_review_outcome
     propagated_ctx['review_loop'] = {
         "pr_number": pr_number, "branch": branch,
         "base_branch": base_branch,

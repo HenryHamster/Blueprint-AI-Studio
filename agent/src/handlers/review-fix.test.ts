@@ -39,6 +39,7 @@ vi.mock('../prompt.js', () => ({
   formatPlaybook: vi.fn().mockReturnValue(''),
   buildRetryContext: vi.fn().mockReturnValue(''),
   discoverRelatedTests: vi.fn().mockReturnValue(''),
+  formatSelfReviewBlindSpots: vi.fn().mockReturnValue(''),
 }));
 
 vi.mock('../build-config.js', () => ({
@@ -461,6 +462,58 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
     expect(prompt).not.toContain('confined to agent/');
     // small-scope still gets its own hint
     expect(prompt).toContain('small-scope change');
+  });
+});
+
+// ── handleReview: self-review blind-spots surfacing ─────────────────────────
+describe('handleReview — self-review blind-spots surfacing', () => {
+  it('passes task.context._self_review_outcome and the changed-file path list to formatSelfReviewBlindSpots, and injects the returned section into the prompt', async () => {
+    const promptMod = await import('../prompt.js');
+    vi.mocked(promptMod.formatSelfReviewBlindSpots).mockReturnValue('SELF_REVIEW_BLIND_SPOTS_MARKER\n\n');
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tagent/src/prompt.ts\nA\tagent/src/handlers/review-fix.ts';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    const outcome = {
+      verdict: 'PASS',
+      categories: ['incomplete_review'],
+      truncated_files_read: ['agent/src/prompt.ts'],
+    };
+    await handleReview(
+      'task-blind-spots',
+      { pr_number: 77, branch: 'feat/blind', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small', _self_review_outcome: outcome } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(promptMod.formatSelfReviewBlindSpots).toHaveBeenCalledWith(
+      outcome,
+      ['agent/src/prompt.ts', 'agent/src/handlers/review-fix.ts'],
+    );
+    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    expect(prompt).toContain('SELF_REVIEW_BLIND_SPOTS_MARKER');
+  });
+
+  it('passes undefined self-review outcome when task.context is absent', async () => {
+    const promptMod = await import('../prompt.js');
+    vi.mocked(promptMod.formatSelfReviewBlindSpots).mockReturnValue('');
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\ta.ts';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-no-context',
+      { pr_number: 78, branch: 'feat/nctx', base_branch: 'main', original_prompt: '' },
+      {},
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(promptMod.formatSelfReviewBlindSpots).toHaveBeenCalledWith(undefined, ['a.ts']);
   });
 });
 

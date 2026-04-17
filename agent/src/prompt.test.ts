@@ -57,6 +57,7 @@ import {
   relativeTimeFromIso,
   synthesizeSuccessPatterns,
   synthesizeFailureHotspots,
+  formatSelfReviewBlindSpots,
 } from './prompt.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
@@ -2688,5 +2689,47 @@ describe('parseAnalysisPlanTestFiles', () => {
       '**Tests to add or update**\n- none\n- a.test.ts\n',
     );
     expect(out).toEqual(['a.test.ts']);
+  });
+});
+
+describe('formatSelfReviewBlindSpots', () => {
+  it('returns empty string when self-review outcome is undefined', () => {
+    expect(formatSelfReviewBlindSpots(undefined, ['a.ts'])).toBe('');
+  });
+
+  it('returns empty string when no blind-spot signal is present', () => {
+    const outcome = { verdict: 'PASS', categories: [], truncated_files_read: [] };
+    expect(formatSelfReviewBlindSpots(outcome, ['a.ts', 'b.ts'])).toBe('');
+  });
+
+  it('lists verified files when truncated_files_read is populated', () => {
+    const outcome = { verdict: 'PASS', truncated_files_read: ['a.ts', 'b.ts'] };
+    const out = formatSelfReviewBlindSpots(outcome, ['a.ts', 'b.ts', 'c.ts']);
+    expect(out).toContain('Self-review verdict: PASS');
+    expect(out).toContain('Files the self-review verified');
+    expect(out).toContain('- a.ts');
+    expect(out).toContain('- b.ts');
+    expect(out).toContain('Files NOT verified by self-review');
+    expect(out).toContain('- c.ts');
+  });
+
+  it('warns when incomplete_review category is present', () => {
+    const outcome = {
+      verdict: 'PASS',
+      categories: ['truncation_not_verified', 'incomplete_review'],
+      truncated_files_read: [],
+    };
+    const out = formatSelfReviewBlindSpots(outcome, ['a.ts', 'b.ts']);
+    expect(out).toContain('INCOMPLETE');
+    expect(out).toContain('- a.ts');
+    expect(out).toContain('- b.ts');
+    expect(out).not.toContain('Files the self-review verified');
+  });
+
+  it('omits unverified section when all changed files were verified', () => {
+    const outcome = { truncated_files_read: ['a.ts', 'b.ts'] };
+    const out = formatSelfReviewBlindSpots(outcome, ['a.ts', 'b.ts']);
+    expect(out).toContain('Files the self-review verified');
+    expect(out).not.toContain('Files NOT verified by self-review');
   });
 });

@@ -1787,6 +1787,82 @@ async def test_strategic_context_propagates_to_spawned_fix(db_session, mocker):
     assert ctx.get("review_loop", {}).get("pr_number") == 501
 
 
+@pytest.mark.asyncio
+async def test_self_review_outcome_propagates_to_spawned_review(db_session, mocker):
+    """When the source task carries `_self_review_outcome` (set by the create
+    handler's self-review), it must be carried forward to the spawned review
+    task's context so the review agent can surface blind spots. This is a
+    deliberate exception to the generic underscore-prefix filter."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    outcome = {
+        "verdict": "PASS",
+        "categories": ["incomplete_review"],
+        "truncated_files_read": ["agent/src/prompt.ts"],
+    }
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 777, "branch": "feat/sr",
+                   "base_branch": "main", "prompt": "Build X"}],
+        context={
+            "scope": "small",
+            "_self_review_outcome": outcome,
+            "_other_internal": "filtered",
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=777, branch="feat/sr", base_branch="main",
+    )
+
+    assert created is True
+    assert result is not None
+    ctx = result.context or {}
+    assert ctx.get("_self_review_outcome") == outcome, (
+        "_self_review_outcome must be carried forward to enable blind-spot surfacing"
+    )
+    # Other underscore-prefixed flags must still be filtered.
+    assert "_other_internal" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_self_review_outcome_absent_when_not_on_source(db_session, mocker):
+    """When the source task has no `_self_review_outcome`, the spawned task's
+    context must not synthesize one."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 778, "branch": "feat/sr2",
+                   "base_branch": "main", "prompt": "Build Y"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=778, branch="feat/sr2", base_branch="main",
+    )
+
+    assert created is True
+    assert result is not None
+    ctx = result.context or {}
+    assert "_self_review_outcome" not in ctx
+
+
 # ── filter_pipeline_duplicates: pre-dispatch dedup safety net ─────────────────
 
 

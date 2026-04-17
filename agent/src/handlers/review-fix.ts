@@ -11,7 +11,7 @@ import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, type PlaybookEntry,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 
@@ -281,11 +281,13 @@ export async function handleReview(
   // augmenting it with a warning leaves contradictory text in place ("review
   // everything" alongside "deprioritize security"), and reviewers tend to
   // follow the more specific (wrong) instruction.
-  const changedFileCount = changedFiles
+  const changedFilePathList = changedFiles
     .split('\n')
     .map(l => l.trim())
     .filter(l => l && !l.startsWith('('))
-    .length;
+    .map(l => l.split(/\s+/).pop() || '')
+    .filter(Boolean);
+  const changedFileCount = changedFilePathList.length;
   const scopeThreshold = SCOPE_OVERFLOW_THRESHOLDS[taskScope];
   const isScopeOverflow = !!(scopeThreshold && changedFileCount > scopeThreshold);
   const scopePreamble = isScopeOverflow
@@ -354,6 +356,12 @@ actual changes.
 `
     : '';
 
+  // Surface which files the create task's self-review verified vs. left unread
+  // (truncation blind spots). Only present when _self_review_outcome was
+  // propagated by the backend from the create task's context.
+  const selfReviewOutcome = taskContext?._self_review_outcome as Record<string, unknown> | undefined;
+  const selfReviewBlindSpotsSection = formatSelfReviewBlindSpots(selfReviewOutcome, changedFilePathList);
+
   // Build review prompt — Claude has full repo access, not just a diff blob
   const reviewPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const reviewPrompt = `${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
@@ -362,6 +370,8 @@ ${iterationPreamble}
 ${rollupGuidance}
 ${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}Files changed in this PR:
 ${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}
+
+${selfReviewBlindSpotsSection}
 
 You have full access to the codebase. Read any files you need to understand the changes in context. Use \`git diff origin/${baseBranch}...HEAD\` to see the full diff, or \`git diff origin/${baseBranch}...HEAD -- <file>\` for specific files.
 

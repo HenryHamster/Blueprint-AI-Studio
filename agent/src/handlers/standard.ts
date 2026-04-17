@@ -538,8 +538,11 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         ? git(['diff', `${baseCommit}..HEAD`])
         : '';
       const uncommittedDiffFull = git(['diff', 'HEAD']);
-      const COMMITTED_LIMIT = 8000;
-      const UNCOMMITTED_LIMIT = 3000;
+      // Diff budget scales with scope so medium/large tasks (12-24k+ diffs)
+      // aren't truncated on virtually every run, which wasted review cycles by
+      // sending unverified changes (via the forced-PASS path) to PR review.
+      const COMMITTED_LIMIT = taskScope === 'large' ? 40000 : taskScope === 'medium' ? 24000 : 8000;
+      const UNCOMMITTED_LIMIT = taskScope === 'large' ? 15000 : taskScope === 'medium' ? 9000 : 3000;
       const committedDiff = committedDiffFull.slice(0, COMMITTED_LIMIT);
       const uncommittedDiff = uncommittedDiffFull.slice(0, UNCOMMITTED_LIMIT);
       const reviewDiff = (committedDiff + (uncommittedDiff ? '\n' + uncommittedDiff : '')).trim();
