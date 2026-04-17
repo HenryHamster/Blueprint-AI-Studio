@@ -2263,10 +2263,18 @@ def _compute_medium_scope_measurement(
         if timestamps:
             investment_start = min(timestamps)
 
+    _TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+
     def _window_stats(tasks_subset: list, window_start: Optional[datetime], window_end: Optional[datetime]) -> Dict[str, Any]:
-        created = len(tasks_subset)
+        """Count ``tasks_subset`` once, using terminal-updated-in-window
+        semantics. Callers that pre-filter by created_at produce in-flight
+        bias on short windows — use ``_rolling_window_stats`` for those.
+        Kept for pre/post-investment comparisons where the window spans
+        months and everything is long-terminal."""
+        finished = [t for t in tasks_subset if t.status in _TERMINAL_STATUSES]
+        created = len(finished)
         merged = sum(
-            1 for t in tasks_subset
+            1 for t in finished
             if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
         )
         return {
@@ -2275,6 +2283,44 @@ def _compute_medium_scope_measurement(
             "merged": merged,
             "window_start": window_start.isoformat() if window_start else None,
             "window_end": window_end.isoformat() if window_end else None,
+        }
+
+    def _rolling_window_stats(all_tasks: list, since: datetime) -> Dict[str, Any]:
+        """Count tasks that reached a *terminal* state inside the window.
+
+        Filtering by created_at for short windows produces severe in-flight
+        bias: a medium-scope task takes ~60-90min end-to-end, so a 24h
+        window of "tasks created in window" includes many still running,
+        deflating the merge_rate (1/16 reads as 6% when the real rate is
+        40%+). Bias is worst for slower scopes (medium, large), which
+        would make the strategic agent panic on healthy data.
+
+        This helper answers the operator question directly: "in this
+        window, what fraction of the work that finished actually merged?"
+        """
+        now = _utcnow()
+        finished = 0
+        merged = 0
+        spawned = 0
+        for t in all_tasks:
+            if t.created_at and t.created_at >= since:
+                spawned += 1
+            if t.status not in _TERMINAL_STATUSES:
+                continue
+            resolved_at = t.updated_at or t.created_at
+            if not resolved_at or resolved_at < since:
+                continue
+            finished += 1
+            if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+                merged += 1
+        return {
+            "merge_rate": round(merged / finished, 3) if finished > 0 else None,
+            "created": finished,  # legacy alias — denominator of merge_rate
+            "merged": merged,
+            "finished": finished,
+            "spawned": spawned,
+            "window_start": since.isoformat(),
+            "window_end": now.isoformat(),
         }
 
     # --- Pre/post split ---
@@ -2293,20 +2339,28 @@ def _compute_medium_scope_measurement(
     # 24h and 3d added 2026-04-17: at 20-40 tasks/day, 7d+ windows drown recent
     # movement in old data. Overlapping windows let operators see "is this
     # a 24h blip or a 7d trend" at a glance, mirroring the strategic agent's
-    # rolling_rates view.
+    # rolling_rates view. Using _rolling_window_stats (terminal-updated-in-window,
+    # not created-in-window) avoids the in-flight bias that made a healthy
+    # 40%+ medium merge rate read as 6% in a 24h window.
     _now = _utcnow()
     recent_24h_start = _now - timedelta(hours=24)
     recent_3d_start = _now - timedelta(days=3)
     recent_7d_start = _now - timedelta(days=7)
     recent_30d_start = _now - timedelta(days=30)
-    recent_24h_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= recent_24h_start]
-    recent_3d_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= recent_3d_start]
-    recent_7d_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= recent_7d_start]
-    recent_30d_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= recent_30d_start]
-    recent_24h = _window_stats(recent_24h_tasks, recent_24h_start, _now) if recent_24h_tasks else None
-    recent_3d = _window_stats(recent_3d_tasks, recent_3d_start, _now) if recent_3d_tasks else None
-    recent_7d = _window_stats(recent_7d_tasks, recent_7d_start, _now) if recent_7d_tasks else None
-    recent_30d = _window_stats(recent_30d_tasks, recent_30d_start, _now) if recent_30d_tasks else None
+    recent_24h = _rolling_window_stats(medium_tasks, recent_24h_start)
+    recent_3d = _rolling_window_stats(medium_tasks, recent_3d_start)
+    recent_7d = _rolling_window_stats(medium_tasks, recent_7d_start)
+    recent_30d = _rolling_window_stats(medium_tasks, recent_30d_start)
+    # Suppress empty tiles (no finished tasks in window) to preserve the
+    # existing "no data" rendering behaviour in the dashboard.
+    if recent_24h["finished"] == 0:
+        recent_24h = None
+    if recent_3d["finished"] == 0:
+        recent_3d = None
+    if recent_7d["finished"] == 0:
+        recent_7d = None
+    if recent_30d["finished"] == 0:
+        recent_30d = None
 
     # --- Weekly time series ---
     week_bucket: Dict[str, Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0, "direction_merges": 0})
@@ -2352,13 +2406,20 @@ def _compute_medium_scope_measurement(
     # Daily buckets are the right granularity at this pipeline's velocity
     # (20-40 medium tasks/day) — weekly reads as "one dot per week" and
     # hides within-week movement.
+    # Bucket by shipped-on-day, not created-on-day: today's bucket should
+    # reflect "what merged/failed today" rather than "of what started
+    # today so far, how much merged?" (the latter is always low because
+    # many tasks are still running).
     daily_cutoff = _now - timedelta(days=lookback_days)
     day_bucket: Dict[str, Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0, "direction_merges": 0})
     for t in medium_tasks:
-        if not t.created_at or t.created_at < daily_cutoff:
+        if t.status not in _TERMINAL_STATUSES:
             continue
-        day_key = t.created_at.date().isoformat()
-        day_bucket[day_key]["created"] += 1
+        resolved_at = t.updated_at or t.created_at
+        if not resolved_at or resolved_at < daily_cutoff:
+            continue
+        day_key = resolved_at.date().isoformat()
+        day_bucket[day_key]["created"] += 1  # legacy key = denominator (finished-in-day)
         is_merged = t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
         if is_merged:
             day_bucket[day_key]["merged"] += 1

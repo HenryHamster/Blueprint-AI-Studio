@@ -802,32 +802,56 @@ ${hotspotsSection}
       if (hoursSinceLast !== null && rollingRates) {
         const sinceLast = rollingRates.since_last_strategic || {};
         const mergedSince = typeof sinceLast.merged === 'number' ? sinceLast.merged : 0;
-        const createdSince = typeof sinceLast.created === 'number' ? sinceLast.created : 0;
+        const finishedSince = typeof sinceLast.finished === 'number' ? sinceLast.finished
+          : typeof sinceLast.created === 'number' ? sinceLast.created : 0;
+        const spawnedSince = typeof sinceLast.spawned === 'number' ? sinceLast.spawned : null;
         const rateSince = typeof sinceLast.merge_rate === 'number' ? `${Math.round((sinceLast.merge_rate as number) * 100)}%` : 'n/a';
+        const spawnNote = spawnedSince != null && spawnedSince !== finishedSince
+          ? ` (${spawnedSince} spawned, some still in flight)`
+          : '';
         clockHeader = `\n# Clock\n`
           + `${hoursSinceLast}h since your last strategic cycle. In that window: `
-          + `${mergedSince}/${createdSince} merged (${rateSince}).\n`
+          + `${mergedSince} of ${finishedSince} finished tasks merged (${rateSince})${spawnNote}.\n`
           + `If that's a low-value ${hoursSinceLast}h relative to the ambition you set last time, that's information — ask why before doubling down on the same plays.\n`;
+      }
+
+      // Active in-flight counts per scope: preserves visibility of
+      // still-running work now that merge rates are finished-only.
+      const activeByScope = recentInterventions.active_by_scope as Record<string, number> | undefined;
+      if (activeByScope) {
+        const parts: string[] = [];
+        for (const s of ['small', 'medium', 'large', 'unknown']) {
+          const n = activeByScope[s];
+          if (typeof n === 'number' && n > 0) parts.push(`${s}=${n}`);
+        }
+        if (parts.length > 0) {
+          clockHeader += `Currently in flight: ${parts.join(', ')} (not in the merge-rate numbers above — those only count finished tasks).\n`;
+        }
       }
 
       if (merges.length > 0 || rollingRates || perDirectionDelta.length > 0) {
         const lines: string[] = ['\n# Recent Work & Rolling Outcomes'];
         lines.push('IMPORTANT — read this carefully before acting:');
+        lines.push('- Rate numerator/denominator semantics: merge_rate = merged/finished, where "finished" means the task reached a terminal state inside the window. Tasks spawned mid-window that have not finished yet do NOT count in the denominator — so short-window rates are not biased downward by in-flight slower-scope tasks.');
+        lines.push('- "spawned" = tasks created in the window (throughput signal). "finished" = reached terminal state in the window (quality denominator). Divergence between the two is normal for slow scopes.');
         lines.push('- Correlation is NOT causation. Rate swings can reflect task difficulty shifts, account health, rate limits, CI outages, or small-sample noise.');
         lines.push('- Weekly buckets were replaced with rolling windows (last_24h / last_3d / last_7d / since_last_strategic) because weekly is too coarse for this pipeline\'s velocity.');
         lines.push('- Only act on patterns visible across 2+ of the overlapping windows. A spike in last_24h that does not show in last_3d is probably noise.');
         lines.push('- Prefer "investigate whether X helps" over "revert X".');
 
         if (rollingRates) {
-          lines.push('\nRolling merge-rate windows:');
+          lines.push('\nRolling merge-rate windows (merged / finished):');
           const order = ['since_last_strategic', 'last_24h', 'last_3d', 'last_7d'];
           for (const w of order) {
             const r = rollingRates[w];
             if (!r) continue;
-            const created = typeof r.created === 'number' ? r.created : 0;
+            const finished = typeof r.finished === 'number' ? r.finished
+              : typeof r.created === 'number' ? r.created : 0;
             const merged = typeof r.merged === 'number' ? r.merged : 0;
+            const spawned = typeof r.spawned === 'number' ? r.spawned : null;
             const rate = typeof r.merge_rate === 'number' ? `${Math.round((r.merge_rate as number) * 100)}%` : 'n/a';
-            lines.push(`  ${w}: ${merged}/${created} merged (${rate})`);
+            const spawnTail = spawned != null && spawned !== finished ? `, ${spawned} spawned` : '';
+            lines.push(`  ${w}: ${merged}/${finished} merged (${rate}${spawnTail})`);
           }
         }
 

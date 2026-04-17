@@ -175,18 +175,47 @@ async def _build_recent_interventions(
     _7d_ago = now - timedelta(days=7)
     _strategic_cutoff = last_strategic_at  # may be None for first-ever cycle
 
+    _TERMINAL = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+
     def _window_counts(tasks: list[Task], since: datetime) -> dict[str, Any]:
-        created = 0
+        """Count *terminal* tasks that reached their final state within the window.
+
+        Filtering by terminal-updated-in-window instead of created-in-window
+        avoids the in-flight bias that would otherwise make short windows
+        look artificially bad: e.g. 16 medium tasks spawned in the last 24h
+        of which 12 are still QUEUED/IN_PROGRESS/EVALUATING would read as
+        "1/16 merged, 6% rate" even though the measured rate is 40%+ once
+        those tasks finish. Slower-scope tasks (medium, large) were the
+        biggest victims. "merged/finished" answers the operator question
+        "of the work that landed or failed in this window, what fraction
+        succeeded?" — the number they actually want to read.
+        """
         merged = 0
+        finished = 0
+        spawned = 0  # retained for throughput visibility
         for t in tasks:
-            ts = t.created_at
-            if not ts or ts < since:
+            created_at = t.created_at
+            if created_at and created_at >= since:
+                spawned += 1
+            if t.status not in _TERMINAL:
                 continue
-            created += 1
+            updated_at = t.updated_at or created_at
+            if not updated_at or updated_at < since:
+                continue
+            finished += 1
             if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
                 merged += 1
-        rate = round(merged / created, 3) if created > 0 else None
-        return {"created": created, "merged": merged, "merge_rate": rate}
+        rate = round(merged / finished, 3) if finished > 0 else None
+        return {
+            "finished": finished,
+            "merged": merged,
+            "spawned": spawned,
+            "merge_rate": rate,
+            # Legacy alias so existing consumers that read .created keep
+            # working. Points at finished (not spawned) because "denominator"
+            # for the merge_rate is finished-in-window.
+            "created": finished,
+        }
 
     rolling_rates = {
         "last_24h": _window_counts(tasks_in_window, _24h_ago),
@@ -291,10 +320,35 @@ async def _build_recent_interventions(
             entry["recent_merged_titles"] = recent_merges[:10]
         per_direction_delta.append(entry)
 
+    # Active-by-scope: tasks currently in flight per scope. Surfaced so the
+    # strategic agent doesn't lose sight of in-flight work now that the
+    # merge_rate denominators are "finished-in-window" only. Without this,
+    # pulling in-flight out of the rate would hide slow-moving large-scope
+    # tasks entirely — the agent would see "no large merges in 24h" with
+    # no signal that 3 large tasks are actively running.
+    active_statuses = (
+        TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+    )
+    active_by_scope: dict[str, int] = {"small": 0, "medium": 0, "large": 0, "unknown": 0}
+    for t in tasks_in_window:
+        if t.status not in active_statuses:
+            continue
+        # Only count ROLLUP_TYPES work — pipeline tasks (review/fix) aren't
+        # scope-classified and would inflate the counts.
+        t_type = (t.first_payload or {}).get("type", "")
+        if t_type in ("review", "fix"):
+            continue
+        scope = (t.context or {}).get("scope") or "unknown"
+        if scope not in active_by_scope:
+            active_by_scope[scope] = 0
+        active_by_scope[scope] += 1
+
     result: dict[str, Any] = {
         "merges": merges_out,
         "rolling_rates": rolling_rates,
         "per_direction_delta": per_direction_delta,
+        "active_by_scope": active_by_scope,
         "lookback_days": lookback_days,
     }
     if _strategic_cutoff:
