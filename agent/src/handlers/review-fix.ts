@@ -15,6 +15,36 @@ import {
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 
+/**
+ * Push with --force-with-lease, retrying once if another agent raced us.
+ *
+ * "stale info" is the lease-check rejection emitted when the remote branch
+ * advanced between our last fetch and this push — typically because another
+ * agent on a sibling task of the same research parent pushed first. Retrying
+ * unconditionally with plain --force would clobber their work; instead we
+ * refetch, rebase our local commits onto the new remote tip, and then push
+ * with a fresh lease. Any other push failure surfaces immediately.
+ */
+async function pushForceWithLeaseRetrying(branch: string, ws: WebSocket | null): Promise<void> {
+  try {
+    await gitAsync(['push', '--force-with-lease', 'origin', branch]);
+    return;
+  } catch (e) {
+    const errMsg = e instanceof Error ? e.message : String(e);
+    if (!errMsg.includes('stale info')) throw e;
+    sendLog(ws, `Push rejected (stale info) — concurrent push detected, refetching ${branch} and retrying...\n`);
+  }
+  git(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+  try {
+    git(['rebase', `origin/${branch}`]);
+  } catch {
+    try { git(['rebase', '--abort']); } catch { /* ignore */ }
+    throw new Error(`Rebase onto updated origin/${branch} conflicted after concurrent push`);
+  }
+  await gitAsync(['push', '--force-with-lease', 'origin', branch]);
+  sendLog(ws, `Retry push to ${branch} succeeded after rebasing onto concurrent work.\n`);
+}
+
 // ── Build instruction generator for review prompts ───────────────────────────
 function buildTypeCheckInstructions(buildConfig?: BuildConfig): string {
   if (!buildConfig || !buildConfig.directories || buildConfig.directories.length === 0) {
@@ -563,7 +593,7 @@ export async function handleFix(
       const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
       const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
       execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
-      await gitAsync(['push', '--force-with-lease', 'origin', branch]);
+      await pushForceWithLeaseRetrying(branch, ws);
       sendLog(ws, `Pushed fixes to ${branch}\n`);
 
       await persistAndPostStatus(taskId, {
