@@ -564,6 +564,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
         if staging_branch and target_branch and staging_branch != target_branch:
             gh_token = owner = repo = None
+            # Track the rollup PR number/url across the try block so the
+            # exception handler can rescue a newly-created PR whose marker
+            # commit failed (see orphan-PR rescue below).
+            rollup_pr_number: int | None = None
+            rollup_pr_url: str = ""
             try:
                 gh_token, owner, repo = await get_github_token_for_task(parent.id, session)
 
@@ -899,12 +904,14 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         # behind its base (common when concurrent rollups land on
                         # the same target). If so, update-branch via GitHub API
                         # and let the next rollup sweep re-attempt the merge.
+                        _pr_refetch_failed = False
                         try:
                             _pr_detail = await get_pull_request(
                                 gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id),
                             )
                         except Exception as _pr_exc:
                             _pr_detail = {}
+                            _pr_refetch_failed = True
                             logger.debug(f"[ROLLUP] Could not refetch PR #{rollup_pr_number} for behind-check: {_pr_exc}")
                         # Classify mergeable_state before assuming this is a real
                         # conflict. Only 'dirty' (and 'behind' as fall-through if
@@ -973,16 +980,19 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
                                 f"{_behind_retries} times ({_upd_msg}); falling through to fix spawn"
                             )
-                        elif _ms != "dirty":
-                            # Non-conflict states: known stalls (blocked/unstable/unknown),
-                            # empty _ms (PR refetch failed — transient infrastructure issue,
-                            # not a merge conflict), or any unrecognized value GitHub may
-                            # introduce. All defer to the next rollup sweep instead of
-                            # spawning a fix. Track consecutive deferrals so silent stalls
-                            # surface with an alert (and escalate to approval) instead of
-                            # waiting out the 6h hard timeout.
+                        elif _ms != "dirty" and not _pr_refetch_failed:
+                            # Non-conflict states: known stalls (blocked/unstable/unknown)
+                            # or any unrecognized value GitHub may introduce. All defer
+                            # to the next rollup sweep instead of spawning a fix. Track
+                            # consecutive deferrals so silent stalls surface with an
+                            # alert (and escalate to approval) instead of waiting out
+                            # the 6h hard timeout. Note: when the PR refetch itself
+                            # failed (_pr_refetch_failed=True), we fall through to the
+                            # fix-spawn path below — the merge has already been observed
+                            # to fail, and we can't classify the failure, so deferring
+                            # cannot help.
                             _ms_key = _ms or "empty"
-                            _ms_display = _ms or "missing (refetch failed)"
+                            _ms_display = _ms or "missing (field absent)"
                             _is_unrecognized = _ms_key not in ("blocked", "unstable", "unknown", "empty")
                             # For blocked/unstable, ask GitHub to auto-merge once gates
                             # clear — mirrors the task_lifecycle auto-merge fallback so a
@@ -1215,6 +1225,37 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         # NOTE: Do NOT delete staging_branch here — it contains
                         # all merged child work and requeueing should be possible.
             except Exception as e:
+                # Orphan PR rescue: if we created a rollup PR during this try
+                # but the marker commit failed (connection loss, session invalid),
+                # the local variable still holds the PR number while the DB has
+                # no record.  Persist it via a separate session so the retry
+                # cycle's crash-recovery check resumes the existing PR instead
+                # of creating a duplicate.
+                if rollup_pr_number is not None:
+                    try:
+                        async with AsyncSessionLocal() as rescue_session:
+                            db_parent = await rescue_session.get(Task, parent.id)
+                            if db_parent is not None:
+                                db_ctx = db_parent.context or {}
+                                if not db_ctx.get("rollup_pr_number"):
+                                    db_parent.context = {
+                                        **db_ctx,
+                                        "rollup_pr_number": rollup_pr_number,
+                                        "rollup_pr_url": rollup_pr_url,
+                                    }
+                                    rescue_session.add(db_parent)
+                                    await rescue_session.commit()
+                                    logger.warning(
+                                        f"[ROLLUP] Rescued rollup PR #{rollup_pr_number} marker "
+                                        f"for parent {parent.id} via separate session — "
+                                        f"preventing orphan on retry"
+                                    )
+                    except Exception as rescue_err:
+                        logger.error(
+                            f"[ROLLUP] Failed to rescue rollup PR #{rollup_pr_number} marker "
+                            f"for parent {parent.id}: {rescue_err}",
+                            exc_info=True,
+                        )
                 err_str = str(e).lower()
                 # Auth failures: invalidate the cached token so the next retry uses a fresh one
                 if isinstance(e, HTTPException) and e.status_code == 401:

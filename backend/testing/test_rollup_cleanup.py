@@ -903,3 +903,166 @@ async def test_zero_diff_rollup_pr_closed_without_spawning_review(cleanup_db, mo
     mock_spawn.assert_not_called()
     # Rollup PR marker cleared so reaper/retry logic doesn't resume with a closed PR
     assert "rollup_pr_number" not in (parent.context or {})
+
+
+@pytest.mark.asyncio
+async def test_marker_commit_failure_rescues_pr_number(cleanup_db, mocker):
+    """When PR creation succeeds but the marker commit fails, the exception
+    handler must persist rollup_pr_number via a separate session so the
+    retry cycle's crash-recovery check resumes the existing PR rather than
+    creating a duplicate orphan."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    # PR creation itself succeeds — the bug is in the marker persistence that follows.
+    mock_create = mocker.patch(
+        "app.github.create_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "number": 9999,
+            "html_url": "https://github.com/owner/repo/pull/9999",
+            "empty_diff": False,
+        },
+    )
+
+    # Rescue session: captures the marker write the exception handler makes
+    # via AsyncSessionLocal() after the primary session's commit fails.
+    db_parent_mock = MagicMock()
+    db_parent_mock.context = {}
+    rescue_session = AsyncMock()
+    rescue_session.get = AsyncMock(return_value=db_parent_mock)
+    rescue_session.add = MagicMock()
+    rescue_session.commit = AsyncMock()
+    rescue_ctx = MagicMock()
+    rescue_ctx.__aenter__ = AsyncMock(return_value=rescue_session)
+    rescue_ctx.__aexit__ = AsyncMock(return_value=False)
+    mocker.patch("app.rollup_management.AsyncSessionLocal", return_value=rescue_ctx)
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"research_branch": "research/marker-fail", "parent_base": "main"},
+        plan_output="some plan",
+    )
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    # Fail the first commit inside _check_and_trigger_rollup (the marker
+    # commit right after PR creation).  Subsequent commits use the real
+    # impl so the retry-counter update can land.
+    real_commit = cleanup_db.commit
+    commit_calls = {"n": 0}
+
+    async def flaky_commit(*args, **kwargs):
+        commit_calls["n"] += 1
+        if commit_calls["n"] == 1:
+            raise RuntimeError("connection reset during marker commit")
+        return await real_commit(*args, **kwargs)
+
+    cleanup_db.commit = flaky_commit
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    # PR was created exactly once — the rescue prevents a second orphan PR
+    mock_create.assert_awaited_once()
+
+    # The rescue path must have used AsyncSessionLocal to persist the marker
+    rescue_session.get.assert_awaited_once()
+    get_args = rescue_session.get.await_args.args
+    assert get_args[0] is Task
+    assert get_args[1] == parent.id
+    rescue_session.add.assert_called_once_with(db_parent_mock)
+    rescue_session.commit.assert_awaited_once()
+    # Context written to rescue session contains the PR number/url so that
+    # the next retry cycle's crash-recovery branch can resume this PR.
+    assert db_parent_mock.context.get("rollup_pr_number") == 9999
+    assert db_parent_mock.context.get("rollup_pr_url") == "https://github.com/owner/repo/pull/9999"
+
+
+@pytest.mark.asyncio
+async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(cleanup_db, mocker):
+    """If the marker is already persisted in the DB (e.g. the commit partially
+    succeeded or a prior cycle wrote it), the rescue path must NOT overwrite
+    it — the existing value is authoritative."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.create_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "number": 9999,
+            "html_url": "https://github.com/owner/repo/pull/9999",
+            "empty_diff": False,
+        },
+    )
+
+    db_parent_mock = MagicMock()
+    # Simulate a stored marker from a prior cycle
+    db_parent_mock.context = {"rollup_pr_number": 8888, "rollup_pr_url": "https://x/8888"}
+    rescue_session = AsyncMock()
+    rescue_session.get = AsyncMock(return_value=db_parent_mock)
+    rescue_session.add = MagicMock()
+    rescue_session.commit = AsyncMock()
+    rescue_ctx = MagicMock()
+    rescue_ctx.__aenter__ = AsyncMock(return_value=rescue_session)
+    rescue_ctx.__aexit__ = AsyncMock(return_value=False)
+    mocker.patch("app.rollup_management.AsyncSessionLocal", return_value=rescue_ctx)
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"research_branch": "research/marker-exists", "parent_base": "main"},
+        plan_output="some plan",
+    )
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    real_commit = cleanup_db.commit
+    commit_calls = {"n": 0}
+
+    async def flaky_commit(*args, **kwargs):
+        commit_calls["n"] += 1
+        if commit_calls["n"] == 1:
+            raise RuntimeError("connection reset during marker commit")
+        return await real_commit(*args, **kwargs)
+
+    cleanup_db.commit = flaky_commit
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    # Rescue must not overwrite an existing marker
+    rescue_session.add.assert_not_called()
+    rescue_session.commit.assert_not_awaited()
+    assert db_parent_mock.context == {
+        "rollup_pr_number": 8888,
+        "rollup_pr_url": "https://x/8888",
+    }
