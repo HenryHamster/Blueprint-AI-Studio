@@ -210,6 +210,44 @@ async def test_merge_no_retry_for_webhook_source(db_session, mocker):
     sleep_mock.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_merge_conflict_skips_retries(db_session, mocker):
+    """
+    When merge returns conflict=True (409), the retry loop must break immediately.
+    Conflicts cannot be resolved by retrying — only by code changes.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    sleep_mock = mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open"},
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "conflict": True, "message": "merge conflict"},
+    )
+
+    project = Project(name="Conflict no retry", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False
+    assert merge_mock.call_count == 1, "Conflict must not retry — exactly 1 merge call"
+    sleep_mock.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # 3. Rule-block keyword detection → immediate escalation
 # ---------------------------------------------------------------------------

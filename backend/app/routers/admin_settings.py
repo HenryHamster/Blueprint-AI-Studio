@@ -67,12 +67,18 @@ class ProjectSummary(TypedDict):
 
 
 def _classify_stuck_failure(task: Task) -> Optional[str]:
-    """Classify stuck tasks using the canonical classifier, returning None for CODE_ERROR.
+    """Classify stuck tasks using the canonical classifier.
 
-    Stuck tasks have not actually failed yet, so CODE_ERROR (the default fallback) is
-    misleading. We suppress it and return None so the UI shows 'unclassified' instead.
+    Stuck tasks have not actually failed yet, so misleading classifications are
+    suppressed. CODE_ERROR (the default fallback) and AGENT_TIMEOUT (which
+    classify_failure returns for empty/whitespace messages — meaningful for an
+    actually-failed task with a crashed agent, but not for one still in flight
+    that just hasn't emitted a status yet) both return None so the UI shows
+    'unclassified' instead.
     """
     from app.failure_classification import classify_failure  # noqa: PLC0415
+    if not (task.latest_status_message or "").strip():
+        return None
     result = classify_failure(task)
     return result if result != "CODE_ERROR" else None
 

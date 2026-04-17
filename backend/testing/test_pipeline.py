@@ -1477,6 +1477,139 @@ async def test_dispatch_rollup_approval_alert_creates_alert(rollup_db, mocker):
     assert approval_calls[0].args[2]["pr_number"] == 42
 
 
+# ── Rollup Merge Deferred Counter / Escalation ──────────────────────────────
+
+def _patch_deferred_counter_mocks(mocker, mergeable_state_holder):
+    """Mock the GitHub + security plumbing so _check_and_trigger_rollup reaches
+    the mergeable_state=blocked/unstable/unknown deferred-counter branch.
+
+    `mergeable_state_holder` is a single-key dict {'state': <str>} — mutate it
+    between sweeps to change the observed mergeable_state without re-patching.
+    """
+    _patch_common_rollup_mocks(mocker)
+
+    def _pr_detail(*_args, **_kwargs):
+        # Fields satisfy every get_pull_request call in the flow:
+        #   - additions+deletions keep the PR small (auto-merge path)
+        #   - state=open + merged=False keep the existing-PR resume path open
+        #   - mergeable_state drives the deferred-counter branch
+        return {
+            "additions": 5, "deletions": 5,
+            "state": "open", "merged": False,
+            "mergeable_state": mergeable_state_holder["state"],
+            "head": {"sha": "abc123"},
+        }
+
+    mocker.patch("app.github.get_pull_request", new_callable=AsyncMock, side_effect=_pr_detail)
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "merge blocked"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_merge_deferred_counter_increments_and_escalates(rollup_db, mocker):
+    """Deferred-merge counter: consecutive same-state sweeps increment the
+    counter, fire the stall alert exactly once at the alert threshold, and
+    flip requires_approval at the approval threshold."""
+    # Small thresholds keep the test to a handful of sweeps.
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"rollup_merge_deferred_alert": 3, "rollup_merge_deferred_approval": 5},
+    )
+    state = {"state": "blocked"}
+    _patch_deferred_counter_mocks(mocker, state)
+    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_approval_dispatch = mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock,
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    # Sweep 1 — first defer: counter=1, no escalations yet
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 1
+    assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.requires_approval is False
+    assert mock_alert.await_count == 0
+    assert mock_approval_dispatch.await_count == 0
+
+    # Sweep 2 — counter=2, still below alert threshold
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 2
+    assert mock_alert.await_count == 0
+
+    # Sweep 3 — counter hits alert threshold (3): stall alert fires
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 3
+    assert mock_alert.await_count == 1
+    assert parent.requires_approval is False
+
+    # Sweep 4 — counter=4 (past alert threshold): alert must NOT re-fire
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 4
+    assert mock_alert.await_count == 1, (
+        "alert must fire only once (at threshold), not on every subsequent sweep"
+    )
+    assert parent.requires_approval is False
+
+    # Sweep 5 — counter hits approval threshold (5): requires_approval flips,
+    # approval dispatch fires once with the rollup PR number.
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 5
+    assert parent.requires_approval is True
+    assert mock_approval_dispatch.await_count == 1
+    assert mock_approval_dispatch.await_args.kwargs.get("pr_number") == 777
+
+
+@pytest.mark.asyncio
+async def test_rollup_merge_deferred_counter_resets_on_state_change(rollup_db, mocker):
+    """When mergeable_state changes between sweeps, the counter resets to 1
+    so transient flapping does not accidentally escalate."""
+    state = {"state": "blocked"}
+    _patch_deferred_counter_mocks(mocker, state)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock)
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    # Two consecutive "blocked" sweeps — counter climbs to 2
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 1
+    assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 2
+    assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
+
+    # Flip state to "unstable" — counter must reset to 1, state recorded as "unstable"
+    state["state"] = "unstable"
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 1, (
+        "counter must reset when mergeable_state changes between sweeps"
+    )
+    assert (parent.context or {}).get("_merge_deferred_state") == "unstable"
+
+
 # ── Strategic Completion Handler ─────────────────────────────────────────────
 
 @pytest_asyncio.fixture()

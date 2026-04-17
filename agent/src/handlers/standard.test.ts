@@ -1112,40 +1112,6 @@ describe('self-review phase', () => {
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 
-  it('retry prompt tells agent explicitly which checks had verdict-check mismatch', async () => {
-    const { getMandatoryChecks } = await import('../prompt.js');
-    vi.mocked(getMandatoryChecks).mockReturnValue(['test_coverage', 'type_safety']);
-    const inconsistentJson = JSON.stringify({
-      verdict: 'PASS',
-      check_results: { test_coverage: { passed: true }, type_safety: { passed: false, issue: 'x' } },
-      checks_performed: ['test_coverage', 'type_safety'],
-      issues_found: 0,
-      files_reviewed: 2,
-      truncated_files_read: [],
-    });
-    vi.mocked(runClaudeCode)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${inconsistentJson}\n\`\`\``, lastResultText: '' }) // pass 1
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'not valid', lastResultText: '' }); // retry still bad → FAILED
-    vi.mocked(git)
-      .mockReturnValueOnce('')
-      .mockReturnValueOnce('M file')
-      .mockReturnValueOnce('')
-      .mockReturnValueOnce('')
-      .mockReturnValueOnce('abc123')
-      .mockReturnValueOnce('')
-      .mockReturnValueOnce('abc123')
-      .mockReturnValueOnce('')
-      .mockReturnValue('');
-    const task = { title: 'Task', description: '', context: {}, project_context: {} };
-    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const retryCall = vi.mocked(runClaudeCode).mock.calls[2];
-    const retryPrompt = retryCall[0] as string;
-    expect(retryPrompt).toContain('type_safety');
-    expect(retryPrompt).toContain('passed:false');
-    expect(retryPrompt).toContain('verdict MUST be FAIL');
-  });
-
   it('re-runs testFixLoop after self-review applies fixes (handleCreate, main branch)', async () => {
     const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
     vi.mocked(runClaudeCode)

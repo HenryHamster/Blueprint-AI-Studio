@@ -67,12 +67,13 @@ async def _attempt_merge_with_retry_and_escalation(
     ci_orig_id = ci_loop.get("original_task_id", "") or ci_payload.get("original_task_id", "")
 
     merge_result = await merge_pull_request(gh_token, owner, repo, ci_pr_number)
-    if not merge_result.get("merged") and source != "webhook":
-        # Retry with backoff (skip in webhook context — would timeout delivery)
+    if not merge_result.get("merged") and not merge_result.get("conflict") and source != "webhook":
+        # Retry with backoff (skip in webhook context — would timeout delivery).
+        # Skip retries on conflict: 409 means the diff can't merge until code changes.
         for attempt in range(3):
             await asyncio.sleep(5 * (3 ** attempt))
             merge_result = await merge_pull_request(gh_token, owner, repo, ci_pr_number)
-            if merge_result.get("merged"):
+            if merge_result.get("merged") or merge_result.get("conflict"):
                 break
 
     if merge_result.get("merged"):

@@ -282,7 +282,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     from app.github import (
         create_pr_comment, delete_branch, create_pull_request,
         merge_pull_request, get_pull_request, get_pr_files, get_branch_sha,
-        close_pull_request, update_branch,
+        close_pull_request, update_branch_with_sha_retry,
     )
 
     if not child_task.parent_task_id:
@@ -857,16 +857,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         # the next rollup sweep instead of burning a fix cycle.
                         _ms = (_pr_detail.get("mergeable_state") or "").lower()
                         if _ms == "behind":
-                            try:
-                                _upd = await update_branch(
-                                    gh_token, owner, repo, rollup_pr_number,
-                                    expected_head_sha=_pr_detail.get("head", {}).get("sha") or None,
-                                    project_id=str(parent.project_id),
-                                )
-                            except HTTPException as _upd_exc:
-                                _upd = {"updated": False, "message": f"HTTP error: {_upd_exc.detail}"}
-                            except Exception as _upd_exc:
-                                _upd = {"updated": False, "message": f"{type(_upd_exc).__name__}: {_upd_exc}"}
+                            _upd = await update_branch_with_sha_retry(
+                                gh_token, owner, repo, rollup_pr_number,
+                                expected_head_sha=_pr_detail.get("head", {}).get("sha") or None,
+                                project_id=str(parent.project_id),
+                            )
                             if _upd.get("updated"):
                                 parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
                                 parent.latest_status_message = (
@@ -883,17 +878,56 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} but update_branch failed: "
                                 f"{_upd.get('message')} — falling through to fix spawn"
                             )
-                        elif _ms in ("blocked", "unstable", "unknown"):
-                            parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
-                            parent.latest_status_message = (
-                                f"Rollup PR #{rollup_pr_number} merge deferred (mergeable_state={_ms}) — "
-                                f"next rollup sweep will re-attempt"
+                        elif _ms in ("blocked", "unstable", "unknown") or not _ms:
+                            # Empty _ms means the PR refetch failed (empty dict) — transient
+                            # infrastructure failure, not a merge conflict. Treat the same as
+                            # 'unknown': defer to the next rollup sweep instead of spawning a fix.
+                            # Track consecutive deferrals so silent stalls surface with an alert
+                            # (and escalate to approval) instead of waiting out the 6h hard timeout.
+                            _ms_key = _ms or "empty"
+                            _ms_display = _ms or "missing (refetch failed)"
+                            prev_state = parent_ctx.get("_merge_deferred_state")
+                            deferred_count = (parent_ctx.get("_merge_deferred_count", 0) + 1) if prev_state == _ms_key else 1
+                            # 'unknown' / empty = GitHub stuck computing mergeability or refetch
+                            # failing → escalate faster than 'blocked'/'unstable' which
+                            # legitimately wait for checks/reviews.
+                            _fast_escalate = _ms_key in ("unknown", "empty")
+                            alert_threshold = _runtime_config.get(
+                                "rollup_merge_deferred_alert_unknown" if _fast_escalate
+                                else "rollup_merge_deferred_alert", 5 if _fast_escalate else 10
                             )
+                            approval_threshold = _runtime_config.get("rollup_merge_deferred_approval", 30)
+                            parent.context = {
+                                **parent_ctx,
+                                "rollup_pr_url": rollup_pr_url,
+                                "rollup_pr_number": rollup_pr_number,
+                                "_merge_deferred_count": deferred_count,
+                                "_merge_deferred_state": _ms_key,
+                            }
+                            parent.latest_status_message = (
+                                f"Rollup PR #{rollup_pr_number} merge deferred (mergeable_state={_ms_display}, "
+                                f"deferral {deferred_count}) — next rollup sweep will re-attempt"
+                            )
+                            if deferred_count == alert_threshold:
+                                await _maybe_create_failure_alert(
+                                    parent, session,
+                                    f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
+                                    f"for {deferred_count} consecutive sweeps"
+                                )
+                            if deferred_count >= approval_threshold and not parent.requires_approval:
+                                parent.requires_approval = True
+                                await _dispatch_rollup_approval_alert(
+                                    parent, session,
+                                    f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
+                                    f"for {deferred_count} sweeps — manual investigation required",
+                                    pr_number=rollup_pr_number,
+                                )
                             session.add(parent)
                             await session.commit()
                             logger.info(
-                                f"[ROLLUP] PR #{rollup_pr_number} merge skipped: mergeable_state={_ms} "
-                                f"(not a conflict) — deferring to next rollup sweep, no fix spawn"
+                                f"[ROLLUP] PR #{rollup_pr_number} merge skipped: mergeable_state={_ms_display} "
+                                f"(deferral {deferred_count}; alert@{alert_threshold}, approval@{approval_threshold}) "
+                                f"— deferring to next rollup sweep, no fix spawn"
                             )
                             return
                         elif _ms and _ms != "dirty":

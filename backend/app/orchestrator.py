@@ -499,7 +499,7 @@ async def orchestrator_worker():
         get_check_runs_cached,
         get_pull_request,
         reopen_pull_request,
-        update_branch,
+        update_branch_with_sha_retry,
     )
     global _last_pool_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
     global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
@@ -1945,16 +1945,11 @@ async def orchestrator_worker():
                                 # Trivially resolvable via GitHub's update-branch API.
                                 # Update the branch in-place; the merge-commit
                                 # triggers fresh CI and the next poll re-evaluates.
-                                try:
-                                    _upd = await update_branch(
-                                        ci_gh_token, ci_owner, ci_repo, ci_pr_number,
-                                        expected_head_sha=pr_data.get("head", {}).get("sha") or None,
-                                        project_id=str(ci_task.project_id),
-                                    )
-                                except HTTPException as _upd_exc:
-                                    _upd = {"updated": False, "message": f"HTTP error: {_upd_exc.detail}"}
-                                except Exception as _upd_exc:
-                                    _upd = {"updated": False, "message": f"{type(_upd_exc).__name__}: {_upd_exc}"}
+                                _upd = await update_branch_with_sha_retry(
+                                    ci_gh_token, ci_owner, ci_repo, ci_pr_number,
+                                    expected_head_sha=pr_data.get("head", {}).get("sha") or None,
+                                    project_id=str(ci_task.project_id),
+                                )
                                 if _upd.get("updated"):
                                     ci_task.latest_status_message = (
                                         f"PR #{ci_pr_number} was behind base — updated branch via GitHub API, awaiting fresh CI"

@@ -1538,6 +1538,60 @@ async def update_branch(
     )
 
 
+async def update_branch_with_sha_retry(
+    token: str, owner: str, repo: str, pr_number: int,
+    expected_head_sha: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Call update_branch, and on a SHA-mismatch 422 refetch the PR and retry once.
+
+    GitHub returns 422 for update-branch when expected_head_sha no longer matches
+    the current PR head — a common race with concurrent pushes or CI reruns.
+    Refetching and retrying with the fresh SHA usually succeeds and saves a
+    3-5 min fix-VM spawn. Returns the same {"updated": bool, "message": str}
+    shape as update_branch.
+    """
+    try:
+        result = await update_branch(
+            token, owner, repo, pr_number,
+            expected_head_sha=expected_head_sha, project_id=project_id,
+        )
+    except HTTPException as exc:
+        return {"updated": False, "message": f"HTTP error: {exc.detail}"}
+    except Exception as exc:
+        return {"updated": False, "message": f"{type(exc).__name__}: {exc}"}
+    if result.get("updated"):
+        return result
+    msg = (result.get("message") or "").lower()
+    sha_mismatch = (
+        "expected_head_sha" in msg
+        or "head branch was modified" in msg
+        or "head sha" in msg
+    )
+    if not sha_mismatch:
+        return result
+    try:
+        fresh = await get_pull_request(token, owner, repo, pr_number, project_id=project_id)
+    except Exception as exc:
+        logger.debug(f"[UPDATE-BRANCH] PR #{pr_number} SHA-mismatch refetch failed: {exc}")
+        return result
+    fresh_sha = (fresh.get("head") or {}).get("sha")
+    if not fresh_sha or fresh_sha == expected_head_sha:
+        return result
+    logger.info(
+        f"[UPDATE-BRANCH] PR #{pr_number} SHA mismatch — retrying with fresh head {fresh_sha[:7]}"
+    )
+    try:
+        return await update_branch(
+            token, owner, repo, pr_number,
+            expected_head_sha=fresh_sha, project_id=project_id,
+        )
+    except HTTPException as exc:
+        return {"updated": False, "message": f"HTTP error on retry: {exc.detail}"}
+    except Exception as exc:
+        return {"updated": False, "message": f"{type(exc).__name__} on retry: {exc}"}
+
+
 async def close_pull_request(
     token: str, owner: str, repo: str, pr_number: int,
     project_id: str | None = None,
