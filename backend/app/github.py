@@ -241,29 +241,50 @@ def generate_github_app_jwt() -> str:
     encoded_jwt = jwt.encode(payload, private_key, algorithm="RS256")
     return encoded_jwt
 
+# Cache of (owner, repo) → installation_id.  Installations don't change
+# often (only when a repo is added/removed from the App), so a long TTL
+# is safe.  Cuts the "discover + generate" path from 2 API calls to 1
+# for every token refresh after the first one on a given Cloud Run
+# instance.  Invalidated by a 404 from installation lookup OR a 401 on
+# the generated token (handled by the general invalidate-cache flow).
+_INSTALLATION_ID_TTL_SECONDS = 24 * 60 * 60  # 24 hours
+_installation_id_cache: dict[str, tuple[str, float]] = {}
+
+
 async def get_repo_installation_token(owner: str, repo: str) -> str | None:
     """
     Discovers the GitHub App installation for a specific repo and returns an access token.
     Used as a fallback when no UserIntegration exists (e.g., admin-created tasks).
     Returns None if the App is not installed on the repo.
+
+    Two API calls on cold cache (GET installation, POST access_tokens).
+    One API call on warm cache (installation_id cached, POST access_tokens only).
     """
     if not GITHUB_APP_ID or not GITHUB_PRIVATE_KEY:
         return None
 
-    app_jwt = generate_github_app_jwt()
-    headers = {
-        "Authorization": f"Bearer {app_jwt}",
-        "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
-    }
+    cache_key = f"{owner}/{repo}"
+    cached = _installation_id_cache.get(cache_key)
+    installation_id: str | None = None
+    if cached and time.time() - cached[1] < _INSTALLATION_ID_TTL_SECONDS:
+        installation_id = cached[0]
 
-    resp = await _github_request(
-        "GET", f"https://api.github.com/repos/{owner}/{repo}/installation", headers
-    )
-    if resp.status_code != 200:
-        logger.warning(f"No GitHub App installation found for {owner}/{repo}: {resp.status_code}")
-        return None
-    installation_id = str(resp.json()["id"])
+    if installation_id is None:
+        app_jwt = generate_github_app_jwt()
+        headers = {
+            "Authorization": f"Bearer {app_jwt}",
+            "Accept": "application/vnd.github.v3+json",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+        resp = await _github_request(
+            "GET", f"https://api.github.com/repos/{owner}/{repo}/installation", headers
+        )
+        if resp.status_code != 200:
+            logger.warning(f"No GitHub App installation found for {owner}/{repo}: {resp.status_code}")
+            _installation_id_cache.pop(cache_key, None)
+            return None
+        installation_id = str(resp.json()["id"])
+        _installation_id_cache[cache_key] = (installation_id, time.time())
 
     return await generate_installation_access_token(installation_id, repositories=[repo])
 

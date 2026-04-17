@@ -2820,6 +2820,14 @@ _ACTIVE_STATUSES = {
 }
 
 
+# Server-side cache for the open-PRs dashboard widget.  Dashboard polls at
+# 30s; without caching, every open tab = 120 GitHub calls/hr to /pulls.
+# With a 60s cache, total is capped at 60/hr regardless of how many
+# browser tabs are open.
+_OPEN_PRS_CACHE_TTL_SECONDS = 60
+_open_prs_cache: Dict[uuid.UUID, Tuple[float, dict]] = {}
+
+
 @router.get("/open-prs")
 async def get_open_prs(
     project_id: uuid.UUID = Query(...),
@@ -2835,6 +2843,12 @@ async def get_open_prs(
     )).scalars().first()
     if not project or not project.github_owner or not project.github_repo:
         return {"open_prs": []}
+
+    # Cache check (skipping early paths above because github_owner/repo can
+    # change and we want to honor that immediately).
+    cached = _open_prs_cache.get(project_id)
+    if cached and time.time() - cached[0] < _OPEN_PRS_CACHE_TTL_SECONDS:
+        return cached[1]
 
     try:
         token = await _get_project_github_token(project, session)
@@ -2913,4 +2927,6 @@ async def get_open_prs(
             "is_orphaned": len(tasks_payload) == 0,
         })
 
-    return {"open_prs": result}
+    payload = {"open_prs": result}
+    _open_prs_cache[project_id] = (time.time(), payload)
+    return payload
