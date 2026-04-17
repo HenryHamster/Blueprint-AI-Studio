@@ -306,7 +306,8 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
     });
     if (hasData) {
-      prefix = formatProjectContext(projectCtx, taskType, taskScope) + '\n\n';
+      const currentDirectionId = taskContext ? strVal(taskContext.direction_id) : '';
+      prefix = formatProjectContext(projectCtx, taskType, taskScope, currentDirectionId) + '\n\n';
     }
   }
 
@@ -790,7 +791,7 @@ function parseResearchSummary(raw: string): string {
 }
 
 // ── Shared: Format project_context into a markdown section ────────────────
-export function formatProjectContext(ctx: Record<string, unknown>, taskType = '', taskScope = ''): string {
+export function formatProjectContext(ctx: Record<string, unknown>, taskType = '', taskScope = '', currentDirectionId = ''): string {
   const CONTEXT_BUDGET = 8000;
 
   const header = [
@@ -855,10 +856,18 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   const lessonsData = ctx.lessons as Array<Record<string, unknown>> | undefined;
   let lessonsLines: string[] = [];
   if (lessonsData && lessonsData.length > 0) {
+    const sortedLessons = currentDirectionId
+      ? [...lessonsData].sort((a, b) => {
+          const aMatch = strVal(a.direction_id) === currentDirectionId ? 0 : 1;
+          const bMatch = strVal(b.direction_id) === currentDirectionId ? 0 : 1;
+          return aMatch - bMatch;
+        })
+      : lessonsData;
     const candidateLines: string[] = ['### Lessons from Past Reviews'];
-    for (const l of lessonsData) {
+    for (const l of sortedLessons) {
       const fcSuffix = l.failure_class ? ` [${strVal(l.failure_class)}]` : '';
-      candidateLines.push(`- **${strVal(l.task_title)}** (${String(l.iterations)} cycles)${fcSuffix}: ${strVal(l.last_feedback)}`);
+      const dirSuffix = currentDirectionId && strVal(l.direction_id) === currentDirectionId ? ' [same direction]' : '';
+      candidateLines.push(`- **${strVal(l.task_title)}** (${String(l.iterations)} cycles)${fcSuffix}${dirSuffix}: ${strVal(l.last_feedback)}`);
     }
     candidateLines.push('');
     const candidateContent = candidateLines.join('\n');
@@ -884,42 +893,56 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     }
   }
 
+  const renderCompletedTaskLine = (t: Record<string, unknown>): string => {
+    const pr = t.pr_url ? ` (${strVal(t.pr_url)})` : '';
+    const summary = t.research_findings_summary ? ` — ${parseResearchSummary(strVal(t.research_findings_summary))}` : '';
+    const failureClass = t.failure_class ? ` [${strVal(t.failure_class)}]` : '';
+    const failureSuffix = t.failure_reason ? ` (FAILED${failureClass}: ${strVal(t.failure_reason)})` : '';
+    const reviewSuffix = (typeof t.review_iterations === 'number' && t.review_iterations > 1) ? ` (${t.review_iterations} review cycles)` : '';
+    const extras: string[] = [];
+    if (t.direction_id) extras.push(`dir=${strVal(t.direction_id)}`);
+    const relatedFiles = t.related_files as unknown;
+    if (Array.isArray(relatedFiles) && relatedFiles.length > 0) {
+      const files = relatedFiles.slice(0, 3).map((f) => strVal(f)).join(', ');
+      extras.push(`files: ${files}${relatedFiles.length > 3 ? ` +${relatedFiles.length - 3}` : ''}`);
+    }
+    const changedFiles = t.changed_files as unknown;
+    if (t.failure_reason && Array.isArray(changedFiles) && changedFiles.length > 0) {
+      const files = changedFiles.slice(0, 3).map((f) => strVal(f)).join(', ');
+      extras.push(`changed: ${files}${changedFiles.length > 3 ? ` +${changedFiles.length - 3}` : ''}`);
+    }
+    let metaSuffix = extras.length > 0 ? ` [${extras.join('; ')}]` : '';
+    if (metaSuffix.length > 100) metaSuffix = metaSuffix.slice(0, 97) + '...]';
+    let promptSuffix = '';
+    if (t.prompt) {
+      const p = strVal(t.prompt).replace(/\s+/g, ' ').trim();
+      if (p.length > 0) {
+        const excerpt = p.length > 80 ? p.slice(0, 77) + '...' : p;
+        promptSuffix = `\n  prompt: ${excerpt}`;
+      }
+    }
+    return `- [${strVal(t.task_type)}] **${strVal(t.title)}**${pr}${summary}${failureSuffix}${reviewSuffix}${metaSuffix}${promptSuffix}`;
+  };
+
+  // Build direction-filtered recent tasks section — prioritized, shown before general recent
+  const directionRecentTasks = ctx.direction_recent_tasks as Array<Record<string, unknown>> | undefined;
+  let directionRecentLines: string[] = [];
+  if (directionRecentTasks && directionRecentTasks.length > 0) {
+    const headerLine = '### Recent Tasks in This Direction';
+    const entries = directionRecentTasks.map(renderCompletedTaskLine);
+    const candidate = [headerLine, ...entries, ''].join('\n');
+    if (candidate.length <= budget) {
+      directionRecentLines = [headerLine, ...entries, ''];
+      budget -= candidate.length;
+    }
+  }
+
   // Build recently completed section — drop oldest entries to fit budget
   const recentTasks = ctx.recently_completed_tasks as Array<Record<string, unknown>> | undefined;
   let recentLines: string[] = [];
   let recentDropped = 0;
   if (recentTasks && recentTasks.length > 0) {
-    const allEntries: string[] = [];
-    for (const t of recentTasks) {
-      const pr = t.pr_url ? ` (${strVal(t.pr_url)})` : '';
-      const summary = t.research_findings_summary ? ` — ${parseResearchSummary(strVal(t.research_findings_summary))}` : '';
-      const failureClass = t.failure_class ? ` [${strVal(t.failure_class)}]` : '';
-      const failureSuffix = t.failure_reason ? ` (FAILED${failureClass}: ${strVal(t.failure_reason)})` : '';
-      const reviewSuffix = (typeof t.review_iterations === 'number' && t.review_iterations > 1) ? ` (${t.review_iterations} review cycles)` : '';
-      const extras: string[] = [];
-      if (t.direction_id) extras.push(`dir=${strVal(t.direction_id)}`);
-      const relatedFiles = t.related_files as unknown;
-      if (Array.isArray(relatedFiles) && relatedFiles.length > 0) {
-        const files = relatedFiles.slice(0, 3).map((f) => strVal(f)).join(', ');
-        extras.push(`files: ${files}${relatedFiles.length > 3 ? ` +${relatedFiles.length - 3}` : ''}`);
-      }
-      const changedFiles = t.changed_files as unknown;
-      if (t.failure_reason && Array.isArray(changedFiles) && changedFiles.length > 0) {
-        const files = changedFiles.slice(0, 3).map((f) => strVal(f)).join(', ');
-        extras.push(`changed: ${files}${changedFiles.length > 3 ? ` +${changedFiles.length - 3}` : ''}`);
-      }
-      let metaSuffix = extras.length > 0 ? ` [${extras.join('; ')}]` : '';
-      if (metaSuffix.length > 100) metaSuffix = metaSuffix.slice(0, 97) + '...]';
-      let promptSuffix = '';
-      if (t.prompt) {
-        const p = strVal(t.prompt).replace(/\s+/g, ' ').trim();
-        if (p.length > 0) {
-          const excerpt = p.length > 80 ? p.slice(0, 77) + '...' : p;
-          promptSuffix = `\n  prompt: ${excerpt}`;
-        }
-      }
-      allEntries.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}**${pr}${summary}${failureSuffix}${reviewSuffix}${metaSuffix}${promptSuffix}`);
-    }
+    const allEntries: string[] = recentTasks.map(renderCompletedTaskLine);
 
     // Keep most recent entries that fit within budget
     const headerLine = '### Recently Completed Tasks';
@@ -1132,7 +1155,7 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
   return allLines.join('\n');
 }
 

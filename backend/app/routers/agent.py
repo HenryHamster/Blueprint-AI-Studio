@@ -568,6 +568,7 @@ async def claim_task(
                     "task_title": ht.title,
                     "iterations": len(review_hist) + 1,
                     "last_feedback": last_feedback,
+                    "direction_id": (ht.context or {}).get("direction_id"),
                 }
                 if first_feedback and first_feedback != last_feedback:
                     lesson["first_feedback"] = first_feedback
@@ -588,9 +589,66 @@ async def claim_task(
                             "iterations": 0,
                             "last_feedback": (ht.latest_status_message or "")[:500],
                             "failure_class": "CODE_ERROR",
+                            "direction_id": (ht.context or {}).get("direction_id"),
                         })
                 if len(lessons) >= 8:
                     break
+
+        # Direction-filtered recent tasks: up to 5 completed/failed from the same direction
+        current_direction_id = (task.context or {}).get("direction_id")
+        direction_recent_tasks = []
+        if current_direction_id:
+            dir_stmt = select(Task).where(
+                Task.project_id == task.project_id,
+                Task.id != task.id,
+                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+            ).order_by(Task.created_at.desc()).limit(50)
+            dir_rows = (await session.execute(dir_stmt)).scalars().all()
+            dir_matches = [
+                t for t in dir_rows
+                if (t.context or {}).get("direction_id") == current_direction_id
+            ][:5]
+            dir_match_ids = [t.id for t in dir_matches]
+            dir_artifacts_by_task: dict = {}
+            if dir_match_ids:
+                dir_art_stmt = select(Artifact).where(
+                    Artifact.task_id.in_(dir_match_ids),
+                    Artifact.artifact_type.in_([ArtifactType.PULL_REQUEST, ArtifactType.RESEARCH_FINDINGS]),
+                )
+                for a in (await session.execute(dir_art_stmt)).scalars().all():
+                    dir_artifacts_by_task.setdefault(a.task_id, []).append(a)
+            for t in dir_matches:
+                p = t.first_payload
+                t_ctx = t.context or {}
+                t_arts = dir_artifacts_by_task.get(t.id, [])
+                pr_url = t_ctx.get("rollup_pr_url")
+                if not pr_url:
+                    for a in t_arts:
+                        if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
+                            pr_url = a.pr_url
+                            break
+                research_findings_summary = None
+                for a in t_arts:
+                    if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
+                        research_findings_summary = a.logs[:8000]
+                        break
+                is_failed = t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+                t_prompt = (p.get("prompt") or p.get("description") or t.description or "")[:300]
+                direction_recent_tasks.append({
+                    "id": str(t.id),
+                    "title": t.title,
+                    "task_type": p.get("type", ""),
+                    "status": t.status.value if hasattr(t.status, "value") else str(t.status),
+                    "pr_url": pr_url,
+                    "research_findings_summary": research_findings_summary,
+                    "failure_reason": (t.latest_status_message or "")[:500] if is_failed and t.latest_status_message else None,
+                    "failure_class": classify_failure(t) if is_failed and t.latest_status_message else None,
+                    "review_iterations": (t_ctx.get("review_loop", {}) or {}).get("iteration", 0) if t_ctx.get("review_loop") else None,
+                    "prompt": t_prompt or None,
+                    "related_files": (t_ctx.get("related_files") or [])[:10],
+                    "direction_id": t_ctx.get("direction_id"),
+                    "changed_files": (t_ctx.get("_pr_changed_files") or [])[:10] if is_failed else None,
+                })
 
         # Open PRs: distinct pr_url from PULL_REQUEST artifacts for non-terminal tasks in project
         open_prs_stmt = (
@@ -744,6 +802,7 @@ async def claim_task(
             "active_tasks": active_tasks,
             "queued_tasks": queued_tasks,
             "recently_completed_tasks": recently_completed_tasks,
+            "direction_recent_tasks": direction_recent_tasks if current_direction_id else [],
             "open_prs": list(open_prs_rows),
             "sibling_tasks": sibling_tasks,
             "lessons": lessons,
