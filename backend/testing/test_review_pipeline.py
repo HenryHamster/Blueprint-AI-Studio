@@ -673,13 +673,11 @@ async def test_stuck_cycle_detected_at_50pct_blocks_spawn(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_stuck_cycle_ignores_substring_overlap(db_session, mocker):
-    """Issues sharing a common prefix/phrase but different in meaning must NOT
-    count as repeats. Stuck-cycle matching uses normalized exact equality, not
-    substring containment — otherwise 'Missing error handling in processOrder'
-    would falsely match 'Missing error handling in processUser' and inflate
-    matched_count, prematurely escalating a cycle that was actually making
-    progress on new issues."""
+async def test_stuck_cycle_distinct_issues_do_not_match(db_session, mocker):
+    """Genuinely-different issues must NOT trigger stuck-cycle detection even
+    when prior and current iterations both contain CRITICAL/MAJOR feedback.
+    Jaccard token similarity below the threshold keeps the pipeline moving on
+    real progress between iterations."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
@@ -693,7 +691,6 @@ async def test_stuck_cycle_ignores_substring_overlap(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    # Prior issues: two CRITICAL issues sharing the "Missing error handling in process" prefix.
     prior_issues = [
         _issue("Missing error handling in processUser", "CRITICAL"),
         _issue("Missing error handling in processPayment", "CRITICAL"),
@@ -721,12 +718,10 @@ async def test_stuck_cycle_ignores_substring_overlap(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    # Current issues: share substrings with prior issues but are genuinely different.
-    # Under old substring logic: all 2 would match → 100% → stuck (false positive).
-    # Under normalized equality: 0 match → spawn proceeds.
+    # Current issues: distinct topics with no meaningful token overlap with prior.
     current_issues = [
-        _issue("Missing error handling in processOrder", "CRITICAL"),
-        _issue("Missing error handling in processRefund", "CRITICAL"),
+        _issue("Cache invalidation race condition", "CRITICAL"),
+        _issue("Database connection pool exhaustion", "CRITICAL"),
     ]
 
     result, _ = await _spawn_pipeline_task(
@@ -739,14 +734,85 @@ async def test_stuck_cycle_ignores_substring_overlap(db_session, mocker):
     )
 
     assert result is not None, (
-        "Substring-overlapping but distinct issues must not trigger stuck-cycle detection"
+        "Distinct issues with no token overlap must not trigger stuck-cycle detection"
     )
     assert result.status == TaskStatus.QUEUED
 
     await db_session.refresh(original_task)
     assert original_task.requires_approval is not True, (
-        "Substring overlap alone must not escalate to requires_approval"
+        "Distinct issues alone must not escalate to requires_approval"
     )
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_detects_rephrased_issue(db_session, mocker):
+    """Issues rephrased between iterations (same meaning, different wording)
+    must trigger stuck-cycle detection. Token Jaccard similarity catches what
+    exact equality would miss — e.g. 'Error handling missing in payment
+    processor' vs 'Payment processor lacks error handling'."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    prior_issues = [_issue("Error handling missing in payment processor", "CRITICAL")]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 306, "branch": "b6", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 306,
+                "branch": "b6",
+                "base_branch": "main",
+                "review_history": [
+                    {"iteration": 0, "feedback": "needs error handling", "issues": prior_issues},
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Same underlying issue, different phrasing. Exact-match would miss this;
+    # token Jaccard (4 shared / 6 union ≈ 0.67) correctly identifies the repeat.
+    current_issues = [_issue("Payment processor lacks error handling", "CRITICAL")]
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=306, branch="b6", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Try again",
+        current_feedback="Try again",
+        current_issues=current_issues,
+    )
+
+    assert result is None, (
+        "Rephrased repeat issue should be detected and block fix spawn"
+    )
+
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True, (
+        "Stuck-cycle on rephrased issue must escalate via requires_approval"
+    )
+    assert "stuck" in (original_task.latest_status_message or "").lower()
 
 
 @pytest.mark.asyncio
@@ -767,8 +833,8 @@ async def test_stuck_cycle_not_triggered_below_threshold(db_session, mocker):
 
     # 2 CRITICAL issues in the prior entry, only 1 of 3 current issues repeats (<50%).
     prior_issues = [
-        _issue("issue A", "CRITICAL"),
-        _issue("issue B", "CRITICAL"),
+        _issue("Memory leak in cache cleanup", "CRITICAL"),
+        _issue("Deadlock on retry path", "CRITICAL"),
     ]
     source_task = make_task(
         project_id=project.id,
@@ -793,11 +859,12 @@ async def test_stuck_cycle_not_triggered_below_threshold(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    # 3 current issues, only 1 repeats (33% < 50% threshold).
+    # 3 current issues, only 1 repeats (33% < 50% threshold). The two new issues
+    # have no token overlap with prior, keeping Jaccard similarity well below 0.5.
     current_issues = [
-        _issue("issue A", "CRITICAL"),   # repeats
-        _issue("new issue C", "CRITICAL"),
-        _issue("new issue D", "MAJOR"),
+        _issue("Memory leak in cache cleanup", "CRITICAL"),   # repeats
+        _issue("TLS handshake fails on reconnect", "CRITICAL"),
+        _issue("Race condition in queue dispatch", "MAJOR"),
     ]
 
     result, _ = await _spawn_pipeline_task(

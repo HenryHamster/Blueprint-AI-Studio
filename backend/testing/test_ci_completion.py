@@ -528,6 +528,131 @@ async def test_closed_pr_state_also_completes_task(db_session, mocker):
 
 
 # ---------------------------------------------------------------------------
+# 5b. mergeable_state is the primary signal for rule-block detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mergeable_state_blocked_escalates_without_keywords(db_session, mocker):
+    """
+    When get_pull_request reports mergeable_state='blocked', escalate as rule
+    block even if the merge error message lacks the legacy keywords.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "blocked"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "some future GitHub error wording"},
+    )
+
+    project = Project(name="mergeable_state blocked", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    assert task.requires_approval is True
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_rule_blocked") is True
+    assert review_loop.get("merge_failures", 0) == 0, "rule blocks must not increment merge_failures"
+
+
+@pytest.mark.asyncio
+async def test_mergeable_state_clean_does_not_escalate_on_keyword(db_session, mocker):
+    """
+    When mergeable_state is a known non-blocked value (e.g. 'clean'), do not
+    escalate even if the error message happens to contain a legacy rule-block
+    keyword — mergeable_state is authoritative.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "clean"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "at least 1 approving review required"},
+    )
+
+    project = Project(name="mergeable_state clean", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    assert task.requires_approval is not True, "clean mergeable_state must not escalate"
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_rule_blocked") is None
+    assert review_loop.get("merge_failures") == 1, "treat as transient — counter should tick"
+
+
+@pytest.mark.asyncio
+async def test_mergeable_state_unknown_falls_back_to_keywords(db_session, mocker):
+    """
+    When mergeable_state is 'unknown' (GitHub still computing), fall back to
+    keyword matching on the error message.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "unknown"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "Repository rule violations: rule violation"},
+    )
+
+    project = Project(name="mergeable_state unknown", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    assert task.requires_approval is True, "unknown mergeable_state must fall back to keyword match"
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_rule_blocked") is True
+
+
+# ---------------------------------------------------------------------------
 # 6. ci_orig_id status propagation on successful merge
 # ---------------------------------------------------------------------------
 

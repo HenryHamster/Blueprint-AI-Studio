@@ -95,6 +95,23 @@ def _compute_all_accounts_blocked_action(
     return "noop"
 
 
+def _compute_retry_after_escalation_action(
+    resets: int, alert_threshold: int, fail_threshold: int
+) -> str | None:
+    """Decide how to escalate a task that keeps cycling through retry_after holds.
+
+    Returns 'fail' once `resets` reaches the secondary `fail_threshold` (auto-fail
+    so the requeue/retry machinery can take over with fresh context), 'alert'
+    when only the WARNING `alert_threshold` is crossed, or None below both bars.
+    The fail check wins ties when both thresholds are crossed.
+    """
+    if fail_threshold > 0 and resets >= fail_threshold:
+        return "fail"
+    if alert_threshold > 0 and resets >= alert_threshold:
+        return "alert"
+    return None
+
+
 async def _emit_all_accounts_blocked_stall(
     session: AsyncSession, earliest_recovery: datetime | None
 ) -> None:
@@ -1324,12 +1341,61 @@ async def orchestrator_worker():
                             task.context = stall_ctx
                             # Escalate when a task is stuck cycling through retry_after holds.
                             # Each reset is up to RETRY_AFTER_MAX_MINUTES (30m), so 8 resets ≈ 4h.
+                            # At the secondary fail_threshold (default 2x alert), auto-fail so the
+                            # requeue/retry machinery can take over with fresh context instead of
+                            # blocking dispatch indefinitely.
+                            _auto_failed = False
                             try:
                                 _resets = int(stall_ctx.get("_retry_after_resets") or 0)
                                 _reset_threshold = _runtime_config.get("retry_after_reset_alert_threshold", 8)
-                                if _resets >= _reset_threshold:
+                                _fail_threshold = _runtime_config.get(
+                                    "retry_after_reset_fail_threshold", _reset_threshold * 2
+                                )
+                                _action = _compute_retry_after_escalation_action(
+                                    _resets, _reset_threshold, _fail_threshold
+                                )
+                                if _action in ("alert", "fail"):
                                     from app.models import Alert, AlertSeverity  # noqa: PLC0415
                                     from app.max_plan_pool import describe_pool_blockage  # noqa: PLC0415
+                                    _blockage = describe_pool_blockage(task_model, user_id=dispatch_user_id)
+                                    _hold_min = (_utcnow() - task.created_at).total_seconds() / 60 if task.created_at else 0.0
+                                if _action == "fail":
+                                    from app.failure_classification import persist_failure_category  # noqa: PLC0415
+                                    _exhaust_msg = (
+                                        f"Auto-failed after {_resets} retry_after cycles "
+                                        f"(threshold {_fail_threshold}); held {_hold_min:.0f}m. "
+                                        f"Pool state: {_blockage}."
+                                    )
+                                    task.status = TaskStatus.FAILED
+                                    task.latest_status_message = _exhaust_msg[:500]
+                                    persist_failure_category(task, "retry_after_exhausted")
+                                    _acct_id = (task.context or {}).get("max_plan_account_id")
+                                    if _acct_id:
+                                        await release_max_plan_account(_acct_id)
+                                    session.add(task)
+                                    await _maybe_create_failure_alert(task, session, _exhaust_msg[:200])
+                                    try:
+                                        record_task_result(
+                                            success=False,
+                                            failure_class="retry_after_exhausted",
+                                            task_id=str(task.id),
+                                            task_type=(task.first_payload or {}).get("type", ""),
+                                        )
+                                    except Exception:
+                                        logger.exception(
+                                            f"[ORCHESTRATOR] Failed to record retry_after_exhausted result for task {task.id}"
+                                        )
+                                    await broadcast_to_project(
+                                        str(task.project_id),
+                                        "task_updated",
+                                        {"task_id": str(task.id), "status": task.status, "message": task.latest_status_message},
+                                    )
+                                    logger.warning(
+                                        f"[ORCHESTRATOR] Task {task.id} auto-failed after {_resets} retry_after cycles "
+                                        f"(threshold={_fail_threshold}, blockage={_blockage})"
+                                    )
+                                    _auto_failed = True
+                                elif _action == "alert":
                                     _stuck_title = f"Task stuck in retry_after cycle: {task.title or str(task.id)[:8]}"
                                     _existing_stuck = (await session.execute(
                                         select(Alert).where(
@@ -1339,8 +1405,6 @@ async def orchestrator_worker():
                                         )
                                     )).scalars().first()
                                     if _existing_stuck is None:
-                                        _hold_min = (_utcnow() - task.created_at).total_seconds() / 60 if task.created_at else 0.0
-                                        _blockage = describe_pool_blockage(task_model, user_id=dispatch_user_id)
                                         _stuck_msg = (
                                             f"Task {task.id} has been cycling through retry_after holds "
                                             f"{_resets} times (threshold {_reset_threshold}); held for "
@@ -1365,6 +1429,8 @@ async def orchestrator_worker():
                                         )
                             except Exception:
                                 logger.exception(f"[ORCHESTRATOR] Failed to evaluate retry_after escalation for task {task.id}")
+                            if _auto_failed:
+                                continue
                             if not (task.latest_status_message or "").startswith("All accounts"):
                                 # Update directly on the locked task object (separate session would deadlock)
                                 task.latest_status_message = stall_msg

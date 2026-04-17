@@ -111,13 +111,21 @@ async def _attempt_merge_with_retry_and_escalation(
             task.latest_status_message = f"PR #{ci_pr_number} already merged by another task"
             logger.info(f"[CI] PR #{ci_pr_number} was already merged — marking complete ({source})")
             return True
-        # Detect non-transient merge blocks — escalate immediately instead of retrying
-        _merge_msg_lower = merge_msg.lower()
-        _is_rule_block = any(kw in _merge_msg_lower for kw in [
-            "rule violation", "branch protection", "required review",
-            "required status", "merge restrictions", "not allowed to merge",
-            "at least", "approving review",
-        ])
+        # Detect non-transient merge blocks — escalate immediately instead of retrying.
+        # Prefer mergeable_state from the refetched PR as the primary signal: it is
+        # authoritative and resilient to GitHub API error-message wording changes.
+        # Fall back to keyword matching only when mergeable_state is absent or still
+        # 'unknown' (GitHub hasn't finished computing it).
+        _ms = ((_recheck_pr or {}).get("mergeable_state") or "").lower()
+        if _ms and _ms != "unknown":
+            _is_rule_block = _ms == "blocked"
+        else:
+            _merge_msg_lower = merge_msg.lower()
+            _is_rule_block = any(kw in _merge_msg_lower for kw in [
+                "rule violation", "branch protection", "required review",
+                "required status", "merge restrictions", "not allowed to merge",
+                "at least", "approving review",
+            ])
         if _is_rule_block:
             task.latest_status_message = (
                 f"CI passed but merge blocked on PR #{ci_pr_number}: "

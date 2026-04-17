@@ -2204,6 +2204,42 @@ def test_all_accounts_blocked_action_noop_when_no_signal():
     assert act(blocked_count=0, dispatched_count=0, already_alerted=True) == "noop"
 
 
+# ── retry_after escalation thresholds ────────────────────────────────────────
+
+def test_retry_after_escalation_below_alert_returns_none():
+    """Resets below the alert threshold leave the task alone."""
+    from app.orchestrator import _compute_retry_after_escalation_action as act
+
+    assert act(resets=0, alert_threshold=8, fail_threshold=16) is None
+    assert act(resets=7, alert_threshold=8, fail_threshold=16) is None
+
+
+def test_retry_after_escalation_alert_at_threshold():
+    """Reaching the alert threshold (but not the fail threshold) fires a WARNING."""
+    from app.orchestrator import _compute_retry_after_escalation_action as act
+
+    assert act(resets=8, alert_threshold=8, fail_threshold=16) == "alert"
+    assert act(resets=15, alert_threshold=8, fail_threshold=16) == "alert"
+
+
+def test_retry_after_escalation_fail_at_secondary_threshold():
+    """At the secondary threshold, the orchestrator must auto-fail the task."""
+    from app.orchestrator import _compute_retry_after_escalation_action as act
+
+    assert act(resets=16, alert_threshold=8, fail_threshold=16) == "fail"
+    assert act(resets=99, alert_threshold=8, fail_threshold=16) == "fail"
+
+
+def test_retry_after_escalation_disabled_thresholds():
+    """A non-positive threshold disables that escalation tier."""
+    from app.orchestrator import _compute_retry_after_escalation_action as act
+
+    # fail disabled — alert still fires above its threshold.
+    assert act(resets=100, alert_threshold=8, fail_threshold=0) == "alert"
+    # both disabled — nothing happens.
+    assert act(resets=100, alert_threshold=0, fail_threshold=0) is None
+
+
 @pytest.mark.asyncio
 async def test_all_accounts_blocked_emits_broadcast_and_alert(monkeypatch):
     """Simulate a full cycle where every dispatchable task hit the account-blocked
