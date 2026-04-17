@@ -1596,6 +1596,23 @@ async def test_compute_failure_stage_pattern_no_pattern():
     assert _compute_failure_stage_pattern([]) is None
 
 
+@pytest.mark.asyncio
+async def test_compute_failure_stage_pattern_staging_only_dominant():
+    """Returns staging_only pattern when 60%+ of non-infra failures are staging-only dropouts."""
+    from app.routers.agent import _compute_failure_stage_pattern
+
+    history = [
+        {"stage_dropout": {"tasks_failed_code_error": 0, "tasks_failed_infra": 1, "tasks_required_approval": 1, "tasks_merged_staging_only": 3}},
+        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 0, "tasks_required_approval": 0, "tasks_merged_staging_only": 2}},
+    ]
+    # Non-infra totals: code_error=1, approval=1, staging_only=5, total=7 → rate=5/7≈0.714
+    result = _compute_failure_stage_pattern(history)
+    assert result is not None
+    assert result["stage"] == "staging_only"
+    assert result["rate"] >= 0.6
+    assert "integration" in result["message"].lower() or "rollup" in result["message"].lower() or "ci" in result["message"].lower()
+
+
 def test_parse_failed_approach_extracts_known_category():
     """Known failure categories in parens are extracted into failure_type."""
     from app.routers.agent import _parse_failed_approach
@@ -1760,12 +1777,21 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
                 {"file": "bar.ts", "additions": 3, "deletions": 2, "change_type": "added"},
             ],
             "_previous_error_fingerprint": "abc123def456",
+            "_self_review_outcome": {
+                "verdict": "FAIL",
+                "notes": "lint errors remain",
+                "check_results": {
+                    "lint": {"passed": False, "issue": "E501"},
+                    "tests": {"passed": True},
+                    "types": {"passed": False},
+                },
+            },
         },
         status=TaskStatus.FAILED,
         title="Prior failed task",
-        latest_status_message="tests failed",
+        latest_status_message="TypeError: cannot read property x of undefined",
     )
-    # Prior with no analysis artifacts — should be skipped
+    # Prior with no analysis artifacts and no status message — should be skipped
     prior_no_artifacts = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "no artifacts"}],
@@ -1773,7 +1799,7 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
         context={"direction_id": direction_id},
         status=TaskStatus.FAILED,
         title="No artifacts task",
-        latest_status_message="failed",
+        latest_status_message=None,
     )
     db_session.add_all([prior, prior_no_artifacts])
     await db_session.commit()
@@ -1806,6 +1832,10 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
         {"file": "bar.ts", "added": 3, "removed": 2, "change_type": "added"},
     ]
     assert entry["previous_error_fingerprint"] == "abc123def456"
+    assert entry["latest_status_message"] == "TypeError: cannot read property x of undefined"
+    assert entry["self_review_outcome"]["verdict"] == "FAIL"
+    assert entry["self_review_outcome"]["notes"] == "lint errors remain"
+    assert set(entry["self_review_outcome"]["failed_checks"]) == {"lint", "types"}
     # Total payload stays under 2000-char cap
     import json as _json
     assert len(_json.dumps(dpa)) <= 2000

@@ -407,6 +407,22 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         if (plan) dcLines.push(`  - Analysis plan: ${plan}`);
         const tfs = strVal(entry.test_failure_summary);
         if (tfs) dcLines.push(`  - Test failure: ${tfs}`);
+        const statusMsg = strVal(entry.latest_status_message);
+        if (statusMsg) dcLines.push(`  - Error: ${statusMsg}`);
+        const sro = entry.self_review_outcome;
+        if (sro && typeof sro === 'object') {
+          const sroObj = sro as Record<string, unknown>;
+          const sroParts: string[] = [];
+          const verdict = strVal(sroObj.verdict);
+          if (verdict) sroParts.push(`verdict=${verdict}`);
+          const failedChecks = Array.isArray(sroObj.failed_checks)
+            ? (sroObj.failed_checks as unknown[]).map(f => strVal(f)).filter(Boolean)
+            : [];
+          if (failedChecks.length > 0) sroParts.push(`failed=${failedChecks.join(',')}`);
+          const notes = strVal(sroObj.notes);
+          if (notes) sroParts.push(`notes=${notes}`);
+          if (sroParts.length > 0) dcLines.push(`  - Self-review: ${sroParts.join('; ')}`);
+        }
         const diffSummary = Array.isArray(entry.pr_diff_summary)
           ? entry.pr_diff_summary as Array<Record<string, unknown>>
           : [];

@@ -340,21 +340,24 @@ def _compute_failure_stage_pattern(history: list) -> "dict | None":
     Analyze recent research_history stage_dropout data to identify dominant failure stages.
 
     Returns a pattern dict if 60%+ of non-infra failures cluster at one stage, else None.
-    Only considers code_error and approval stages — agents can't address infra failures.
+    Considers code_error, approval, and staging_only stages — agents can't address infra failures.
     Uses the last 3 research cycles for recency.
     """
     recent = history[-3:]
     code_error_total = 0
     approval_total = 0
+    staging_only_total = 0
     for entry in recent:
         sd = entry.get("stage_dropout") or {}
         code_error_total += sd.get("tasks_failed_code_error", 0)
         approval_total += sd.get("tasks_required_approval", 0)
-    total_non_infra = code_error_total + approval_total
+        staging_only_total += sd.get("tasks_merged_staging_only", 0)
+    total_non_infra = code_error_total + approval_total + staging_only_total
     if total_non_infra < 3:
         return None
     code_error_rate = code_error_total / total_non_infra
     approval_rate = approval_total / total_non_infra
+    staging_only_rate = staging_only_total / total_non_infra
     threshold = 0.6
     if code_error_rate >= threshold:
         return {
@@ -372,6 +375,15 @@ def _compute_failure_stage_pattern(history: list) -> "dict | None":
             "message": (
                 "Recent tasks for this direction frequently stall waiting for approval — "
                 "consider smaller, more targeted changes that require less manual review."
+            ),
+        }
+    if staging_only_rate >= threshold:
+        return {
+            "stage": "staging_only",
+            "rate": round(staging_only_rate, 2),
+            "message": (
+                "Recent tasks for this direction frequently merge to staging but fail the rollup to main — "
+                "watch for integration-level issues like merge conflicts and CI failures against the target branch."
             ),
         }
     return None
@@ -1136,7 +1148,9 @@ async def claim_task(
                     pctx = pt.context or {}
                     analysis_plan = pctx.get("_analysis_plan")
                     test_failure_summary = pctx.get("_test_failure_summary")
-                    if not analysis_plan and not test_failure_summary:
+                    status_message = (pt.latest_status_message or "").strip()
+                    self_review_outcome = pctx.get("_self_review_outcome")
+                    if not analysis_plan and not test_failure_summary and not status_message:
                         continue
                     entry = {
                         "title": pt.title,
@@ -1146,6 +1160,27 @@ async def claim_task(
                         entry["analysis_plan"] = str(analysis_plan)[:500]
                     if test_failure_summary:
                         entry["test_failure_summary"] = str(test_failure_summary)[:300]
+                    if status_message:
+                        entry["latest_status_message"] = status_message[:300]
+                    if isinstance(self_review_outcome, dict) and self_review_outcome:
+                        sro_compact: dict = {}
+                        verdict = self_review_outcome.get("verdict")
+                        if verdict:
+                            sro_compact["verdict"] = str(verdict)[:50]
+                        notes = self_review_outcome.get("notes")
+                        if notes:
+                            sro_compact["notes"] = str(notes)[:200]
+                        check_results = self_review_outcome.get("check_results")
+                        if isinstance(check_results, dict):
+                            failed_checks = [
+                                str(name)
+                                for name, result in check_results.items()
+                                if isinstance(result, dict) and result.get("passed") is False
+                            ]
+                            if failed_checks:
+                                sro_compact["failed_checks"] = failed_checks[:10]
+                        if sro_compact:
+                            entry["self_review_outcome"] = sro_compact
                     changed_files = pctx.get("_pr_changed_files")
                     if isinstance(changed_files, list) and changed_files:
                         entry["pr_changed_files"] = [str(f) for f in changed_files[:10]]

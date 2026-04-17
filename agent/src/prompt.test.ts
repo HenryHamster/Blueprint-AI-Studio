@@ -363,6 +363,32 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('Previous error fingerprint: abc123def456');
   });
 
+  it('renders latest_status_message and self_review_outcome in prior analysis', () => {
+    const task = {
+      direction_context: {
+        title: 'Refactor module',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        direction_prior_analysis: [
+          {
+            title: 'Prior failed task',
+            failure_category: 'CODE_ERROR',
+            latest_status_message: 'TypeError: cannot read property x of undefined',
+            self_review_outcome: {
+              verdict: 'FAIL',
+              failed_checks: ['lint', 'types'],
+              notes: 'lint errors remain',
+            },
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('Error: TypeError: cannot read property x of undefined');
+    expect(result).toContain('Self-review: verdict=FAIL; failed=lint,types; notes=lint errors remain');
+  });
+
   it('renders direction_prior_analysis with only changed files when diff summary is absent', () => {
     const task = {
       direction_context: {
