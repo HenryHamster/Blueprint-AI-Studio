@@ -3269,7 +3269,7 @@ async def test_reaper_clears_far_future_retry_after(reaper_db, mocker):
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "do work"}],
         status=TaskStatus.QUEUED,
-        context={"retry_after": far_future},
+        context={"retry_after": far_future, "_retry_after_resets": 2},
     )
     malformed_task = Task(
         project_id=project.id,
@@ -3299,6 +3299,10 @@ async def test_reaper_clears_far_future_retry_after(reaper_db, mocker):
 
     assert "retry_after" not in (stale_task.context or {}), (
         "far-future retry_after should have been cleared"
+    )
+    assert "_retry_after_resets" not in (stale_task.context or {}), (
+        "_retry_after_resets must be cleared alongside retry_after to avoid "
+        "false escalations on the next rate-limit episode"
     )
     assert "retry_after" not in (malformed_task.context or {}), (
         "unparseable retry_after should have been cleared"

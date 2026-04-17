@@ -335,8 +335,12 @@ async def _check_external_health():
     ext = _shared_state.external_health
     now = _utcnow()
 
-    # Check every 60 seconds (authenticated via App JWT = 5,000 req/hr)
-    if ext["last_check"] and (now - ext["last_check"]).total_seconds() < 60:
+    # Adaptive interval: 15s while the pipeline is auto-paused (max_concurrent_vms == 0),
+    # 60s otherwise. During pause no tasks dispatch and the GitHub App JWT budget
+    # (5,000 req/hr) is idle, so faster probing cuts the 3-of-5 ring-buffer recovery
+    # from ~3 min to ~45 s. Worst-case 240 calls/hr is well within budget.
+    interval = 15 if _runtime_config.get("max_concurrent_vms", 0) == 0 else 60
+    if ext["last_check"] and (now - ext["last_check"]).total_seconds() < interval:
         return
     ext["last_check"] = now
     failed = []

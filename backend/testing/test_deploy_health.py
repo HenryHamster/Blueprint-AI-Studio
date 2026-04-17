@@ -1223,11 +1223,106 @@ async def test_flap_doubles_grace_period(dh_db, mocker):
     assert _shared_state.runtime_config["max_concurrent_vms"] == 4
 
 
+@pytest.mark.asyncio
+async def test_external_health_uses_short_interval_when_paused(mocker):
+    """While paused (max_concurrent_vms == 0), the probe interval drops to 15s."""
+    from datetime import datetime as _dt, timedelta as _td
+    mocker.patch("app.deploy_health.check_db_health", new_callable=AsyncMock, return_value=None)
+    mocker.patch("app.deploy_health.check_github_health", new_callable=AsyncMock, return_value=None)
+    mocker.patch("app.deploy_health.check_claude_api_health", return_value=None)
+    mocker.patch("app.deploy_health.check_gcp_health", return_value=None)
+    mocker.patch("app.deploy_health.recheck_disabled_accounts", new_callable=AsyncMock)
+    mocker.patch("app.deploy_health.log_zone_health_transitions")
+    mocker.patch("app.deploy_health._get_zone_health_summary", return_value={"total_zones": 0, "available": 0, "exhausted": []})
+    now_mock = _dt(2026, 4, 17, 12, 0, 0)
+    mocker.patch("app.deploy_health._utcnow", return_value=now_mock)
+
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+
+    # Paused: 20s since last check → 15s interval elapsed, probe runs.
+    _shared_state.external_health["last_check"] = now_mock - _td(seconds=20)
+    await _dh._check_external_health()
+    assert _shared_state.external_health["last_check"] == now_mock
+
+    # Paused: 10s since last check → under 15s, probe skipped.
+    _shared_state.external_health["last_check"] = now_mock - _td(seconds=10)
+    await _dh._check_external_health()
+    assert _shared_state.external_health["last_check"] == now_mock - _td(seconds=10)
+
+
+@pytest.mark.asyncio
+async def test_external_health_uses_normal_interval_when_active(mocker):
+    """Active pipeline (max_concurrent_vms > 0) keeps the 60s probe cadence."""
+    from datetime import datetime as _dt, timedelta as _td
+    mocker.patch("app.deploy_health.check_db_health", new_callable=AsyncMock, return_value=None)
+    mocker.patch("app.deploy_health.check_github_health", new_callable=AsyncMock, return_value=None)
+    mocker.patch("app.deploy_health.check_claude_api_health", return_value=None)
+    mocker.patch("app.deploy_health.check_gcp_health", return_value=None)
+    mocker.patch("app.deploy_health.recheck_disabled_accounts", new_callable=AsyncMock)
+    mocker.patch("app.deploy_health.log_zone_health_transitions")
+    mocker.patch("app.deploy_health._get_zone_health_summary", return_value={"total_zones": 0, "available": 0, "exhausted": []})
+    now_mock = _dt(2026, 4, 17, 12, 0, 0)
+    mocker.patch("app.deploy_health._utcnow", return_value=now_mock)
+
+    _shared_state.runtime_config["max_concurrent_vms"] = 4
+
+    # Active: 20s since last check → under 60s, probe skipped.
+    _shared_state.external_health["last_check"] = now_mock - _td(seconds=20)
+    await _dh._check_external_health()
+    assert _shared_state.external_health["last_check"] == now_mock - _td(seconds=20)
+
+    # Active: 65s since last check → probe runs.
+    _shared_state.external_health["last_check"] = now_mock - _td(seconds=65)
+    await _dh._check_external_health()
+    assert _shared_state.external_health["last_check"] == now_mock
+
+
 def test_restore_health_streaks_restores_recent_auto_resumes():
     """_restore_health_streaks rehydrates the flap-detection deque."""
     from datetime import datetime as _dt
     t1 = _dt(2026, 4, 17, 10, 30, 0)
     t2 = _dt(2026, 4, 17, 10, 40, 0)
     snapshot = {"_recent_auto_resumes": [t1.isoformat(), t2.isoformat(), "not-a-date"]}
+    _dh._restore_health_streaks(snapshot)
+    assert list(_dh._recent_auto_resumes) == [t1, t2]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_persist_zone_health_round_trips_recent_auto_resumes(mocker):
+    """orchestrator._persist_zone_health must save _recent_auto_resumes so restore can rehydrate it."""
+    from datetime import datetime as _dt
+    from unittest.mock import MagicMock
+    import threading
+    from collections import deque as _deque
+    from app.orchestrator import _persist_zone_health as _orch_persist
+
+    mocker.patch("app.compute._zone_health", {})
+    mocker.patch("app.compute._zone_lock", threading.Lock())
+    mocker.patch("app.deploy_health._pause_failure_streak", 0)
+    mocker.patch("app.deploy_health._health_recovery_history", _deque(maxlen=5))
+    mocker.patch("app.deploy_health._last_auto_resume_at", None)
+
+    t1 = _dt(2026, 4, 17, 11, 0, 0)
+    t2 = _dt(2026, 4, 17, 11, 30, 0)
+    mocker.patch("app.deploy_health._recent_auto_resumes", _deque([t1, t2]))
+
+    mock_state = MagicMock()
+    mock_state.zone_health_state = None
+    mock_session = MagicMock()
+    mock_session.add = MagicMock()
+    mock_session.commit = AsyncMock()
+    mock_session_ctx = MagicMock()
+    mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
+    mocker.patch("app.orchestrator.AsyncSessionLocal", return_value=mock_session_ctx)
+    mocker.patch("app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=mock_state))
+
+    await _orch_persist()
+
+    snapshot = mock_state.zone_health_state
+    assert snapshot["_recent_auto_resumes"] == [t1.isoformat(), t2.isoformat()]
+
+    # Round-trip: clear and restore.
+    _dh._recent_auto_resumes.clear()
     _dh._restore_health_streaks(snapshot)
     assert list(_dh._recent_auto_resumes) == [t1, t2]

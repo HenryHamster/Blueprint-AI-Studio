@@ -885,6 +885,7 @@ async def reaper_service():
                             continue
                         _new_ctx = dict(_qctx)
                         _new_ctx.pop("retry_after", None)
+                        _new_ctx.pop("_retry_after_resets", None)
                         _qt.context = _new_ctx
                         session.add(_qt)
                         _cleared += 1
