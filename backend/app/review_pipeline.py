@@ -35,13 +35,16 @@ STUCK_CYCLE_THRESHOLD_REFACTOR = 0.75
 STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT = 0.7
 STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR = 0.85
 
-_FEEDBACK_TOKEN_RE = re.compile(r"[a-z0-9_]+")
+# Secondary Jaccard thresholds for the rephrased-issue fallback: both sides
+# have structured CRITICAL/MAJOR issues but the exact-match proportion falls
+# below the primary structured threshold. Stays above 0.6 so that two issues
+# sharing boilerplate tokens but targeting different symbols (e.g. "Missing
+# error handling in processUser" vs "…processOrder" → Jaccard 0.6) do NOT
+# trigger a false positive.
+STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT = 0.65
+STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR = 0.8
 
-# Per-issue token Jaccard threshold for stuck-cycle matching. Catches
-# rephrasings (e.g. "Missing null check on user input" vs "User input lacks
-# null validation") that exact equality would miss, while still requiring
-# substantial token overlap.
-STUCK_CYCLE_ISSUE_JACCARD_THRESHOLD = 0.5
+_FEEDBACK_TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
 
 def _feedback_token_set(text: str) -> set[str]:
@@ -55,19 +58,6 @@ def _feedback_jaccard(a: str, b: str) -> float:
         return 0.0
     return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
 
-
-def _issue_matches_any(curr_desc: str, prev_token_sets: list[set[str]]) -> bool:
-    """True if curr_desc has Jaccard similarity ≥ threshold with any prev token set."""
-    curr_tokens = _feedback_token_set(curr_desc)
-    if not curr_tokens:
-        return False
-    for prev_tokens in prev_token_sets:
-        if not prev_tokens:
-            continue
-        similarity = len(curr_tokens & prev_tokens) / len(curr_tokens | prev_tokens)
-        if similarity >= STUCK_CYCLE_ISSUE_JACCARD_THRESHOLD:
-            return True
-    return False
 
 # A pipeline task is considered 'stale' (effectively dead, safe to supersede)
 # when it has not heartbeated for this long. Matches the orchestrator's own
@@ -456,16 +446,39 @@ async def _spawn_pipeline_task(
         stuck_detail = ""
 
         if curr_critical_major and prev_critical_major:
-            prev_token_sets = [_feedback_token_set(desc) for desc in prev_critical_major]
             matched_count = sum(
                 1 for desc in curr_critical_major
-                if _issue_matches_any(desc, prev_token_sets)
+                if desc in prev_critical_major
             )
             total_count = len(curr_critical_major)
             stuck_threshold = STUCK_CYCLE_THRESHOLD_REFACTOR if is_refactor else STUCK_CYCLE_THRESHOLD_DEFAULT
             if matched_count / total_count >= stuck_threshold:
                 is_stuck = True
                 stuck_detail = f"{matched_count}/{total_count} issues repeated"
+            else:
+                # Primary uses normalized exact equality, so it misses pure
+                # rephrasings ("Missing null check in handler" ↔ "Handler lacks
+                # null check"). Fall back to a Jaccard on the *concatenated*
+                # CRITICAL/MAJOR descriptions: token overlap aggregated across
+                # all issues distinguishes genuine rephrasings (high overall
+                # overlap) from issues that only share boilerplate but target
+                # different symbols (processUser vs processOrder — distinct
+                # target tokens dilute aggregate overlap below the 0.65 floor).
+                similarity = _feedback_jaccard(
+                    " ".join(prev_critical_major), " ".join(curr_critical_major)
+                )
+                issue_threshold = (
+                    STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR
+                    if is_refactor
+                    else STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT
+                )
+                if similarity >= issue_threshold:
+                    is_stuck = True
+                    stuck_detail = (
+                        f"rephrased-issue similarity {similarity:.0%} "
+                        f"≥ {issue_threshold:.0%} "
+                        f"(exact match {matched_count}/{total_count})"
+                    )
         elif not prev_issues_list or not curr_issues_list:
             # Fallback when at least one side lacks structured issues (verdict parsing
             # fell back to log/keyword scraping). Compare normalized feedback text.

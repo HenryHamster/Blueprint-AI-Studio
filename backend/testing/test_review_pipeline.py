@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, patch
 from app.models import Project, Task, TaskStatus
 from app.review_pipeline import (
     MAX_REVIEW_FIX_ITERATIONS,
+    STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
+    STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR,
     STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT,
     STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR,
     STUCK_CYCLE_THRESHOLD_DEFAULT,
@@ -1491,6 +1493,234 @@ def test_stuck_cycle_text_threshold_constants():
     assert STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR == 0.85
     assert STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT > STUCK_CYCLE_THRESHOLD_DEFAULT
     assert STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR > STUCK_CYCLE_THRESHOLD_REFACTOR
+
+
+def test_stuck_cycle_issue_similarity_threshold_constants():
+    """Tripwire: rephrased-issue thresholds must stay above 0.6 so that two
+    issues sharing only boilerplate tokens (e.g. processUser vs processOrder,
+    Jaccard = 0.6) cannot trigger the secondary fallback."""
+    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT == 0.65
+    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR == 0.8
+    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT > 0.6
+    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR > 0.6
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_detects_rephrased_issues(db_session, mocker):
+    """When both iterations have structured CRITICAL/MAJOR issues whose
+    descriptions are rewordings of the same concepts (0% exact match but
+    high token overlap), the rephrased-issue fallback flags the cycle."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    prior_issues = [
+        _issue("Missing null check in handler", "CRITICAL"),
+        _issue("Race condition in scheduler", "CRITICAL"),
+        _issue("Query builder uses direct concat", "CRITICAL"),
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 401, "branch": "b1", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 401,
+                "branch": "b1",
+                "base_branch": "main",
+                "review_history": [
+                    {"iteration": 0, "feedback": "prev feedback", "issues": prior_issues},
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Same concepts, different wording — zero exact matches.
+    current_issues = [
+        _issue("Handler lacks null check", "CRITICAL"),
+        _issue("Scheduler has race condition", "CRITICAL"),
+        _issue("Direct string concat in query builder", "CRITICAL"),
+    ]
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=401, branch="b1", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Same issues, reworded",
+        current_feedback="Same issues, reworded",
+        current_issues=current_issues,
+    )
+
+    assert result is None, (
+        "Rephrased but conceptually identical issues should trigger the "
+        "rephrased-issue fallback and block the fix spawn"
+    )
+
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True, (
+        "Rephrased-issue stuck detection must set requires_approval=True"
+    )
+    assert "stuck" in (original_task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_rephrased_fallback_ignores_distinct_targets(db_session, mocker):
+    """Issues sharing boilerplate tokens but targeting genuinely different
+    symbols must NOT trip the rephrased-issue fallback. 'Missing error
+    handling in processUser' vs 'Missing error handling in processOrder'
+    yields Jaccard = 0.6, just below the 0.65 default threshold."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    prior_issues = [
+        _issue("Missing error handling in processUser", "CRITICAL"),
+        _issue("Missing error handling in processPayment", "CRITICAL"),
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 402, "branch": "b2", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 402,
+                "branch": "b2",
+                "base_branch": "main",
+                "review_history": [
+                    {"iteration": 0, "feedback": "prev", "issues": prior_issues},
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Shared pattern, different target symbols — must not be treated as rephrased.
+    current_issues = [
+        _issue("Missing error handling in processOrder", "CRITICAL"),
+        _issue("Missing error handling in processRefund", "CRITICAL"),
+    ]
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=402, branch="b2", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="New handlers to fix",
+        current_feedback="New handlers to fix",
+        current_issues=current_issues,
+    )
+
+    assert result is not None, (
+        "Distinct-target issues sharing boilerplate tokens must not trigger "
+        "the rephrased-issue fallback"
+    )
+    assert result.status == TaskStatus.QUEUED
+
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is not True
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_refactor_uses_higher_rephrased_threshold(db_session, mocker):
+    """For refactor source tasks the rephrased-issue threshold is 0.8, not 0.65.
+    A Jaccard similarity of ~0.67 (enough to trip default) must NOT escalate a
+    refactor cycle."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "refactor", "prompt": "Restructure", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Same wording set as the default-threshold rephrased test. Jaccard ≈ 0.67,
+    # which clears default (0.65) but not refactor (0.8).
+    prior_issues = [
+        _issue("Missing null check in handler", "CRITICAL"),
+        _issue("Race condition in scheduler", "CRITICAL"),
+        _issue("Query builder uses direct concat", "CRITICAL"),
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "refactor", "pr_number": 403, "branch": "b3", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 403,
+                "branch": "b3",
+                "base_branch": "main",
+                "review_history": [
+                    {"iteration": 0, "feedback": "prev", "issues": prior_issues},
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    current_issues = [
+        _issue("Handler lacks null check", "CRITICAL"),
+        _issue("Scheduler has race condition", "CRITICAL"),
+        _issue("Direct string concat in query builder", "CRITICAL"),
+    ]
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=403, branch="b3", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Same issues, reworded",
+        current_feedback="Same issues, reworded",
+        current_issues=current_issues,
+    )
+
+    assert result is not None, (
+        "Refactor rephrased-issue threshold (0.8) must not fire at ~0.67 similarity"
+    )
+    assert result.status == TaskStatus.QUEUED
 
 
 # ── Strategic context propagation ─────────────────────────────────────────────

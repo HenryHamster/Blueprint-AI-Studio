@@ -668,7 +668,8 @@ Output ONLY a JSON object in a \`\`\`json code fence:
           parsedFilesReviewed = typeof parsed.files_reviewed === 'number' ? parsed.files_reviewed : undefined;
           parsedTruncatedFiles = Array.isArray(parsed.truncated_files_read) ? parsed.truncated_files_read as string[] : [];
 
-          // Extract check_results if present
+          // Extract check_results if present and derive checks_performed from
+          // its keys when the agent omitted that field.
           if (parsed.check_results && typeof parsed.check_results === 'object' && !Array.isArray(parsed.check_results)) {
             parsedCheckResults = parsed.check_results as Record<string, { passed: boolean; issue?: string }>;
             // When the agent provided an explicit checks_performed array alongside

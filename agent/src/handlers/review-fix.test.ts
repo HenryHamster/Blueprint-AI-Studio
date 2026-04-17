@@ -196,6 +196,46 @@ describe('annotateResolvedIssues — marks issues not re-flagged by next iterati
     ]);
     expect(result[0].issues).toBeUndefined();
   });
+
+  it('treats rephrased issues with high token overlap as still-present (not resolved)', () => {
+    // The example from the task description: same conceptual issue, reworded.
+    const result = annotateResolvedIssues([
+      { iteration: 1, feedback: '', issues: [
+        { severity: 'major', description: 'missing null check' },
+      ] },
+      { iteration: 2, feedback: '', issues: [
+        { severity: 'major', description: 'null check not present' },
+      ] },
+    ]);
+    const it1 = result.find(e => e.iteration === 1)!;
+    expect(it1.issues![0].resolvedInIteration).toBeUndefined();
+  });
+
+  it('treats reordered/rephrased multi-word issues as still-present', () => {
+    const result = annotateResolvedIssues([
+      { iteration: 1, feedback: '', issues: [
+        { severity: 'major', description: 'Missing null check in handler' },
+      ] },
+      { iteration: 2, feedback: '', issues: [
+        { severity: 'major', description: 'Handler lacks null check' },
+      ] },
+    ]);
+    const it1 = result.find(e => e.iteration === 1)!;
+    expect(it1.issues![0].resolvedInIteration).toBeUndefined();
+  });
+
+  it('still marks unrelated issues as resolved when next iteration has different problems', () => {
+    const result = annotateResolvedIssues([
+      { iteration: 1, feedback: '', issues: [
+        { severity: 'major', description: 'missing null check' },
+      ] },
+      { iteration: 2, feedback: '', issues: [
+        { severity: 'minor', description: 'add unit tests for parser' },
+      ] },
+    ]);
+    const it1 = result.find(e => e.iteration === 1)!;
+    expect(it1.issues![0].resolvedInIteration).toBe(2);
+  });
 });
 
 // ── Review history text truncation: reviewer and fixer must align ───────────
@@ -255,6 +295,80 @@ describe('review history feedback truncation — reviewer sees at least as much 
     const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
     expect(prompt).not.toMatch(/- Iteration 1: x+/);
+  });
+});
+
+// ── handleReview: scope-overflow replaces (not augments) scope preamble ─────
+describe('handleReview — scope overflow replaces scope-narrowed preamble', () => {
+  const basePayload = {
+    pr_number: 50,
+    branch: 'feature/big',
+    base_branch: 'main',
+    original_prompt: '',
+  };
+
+  // Build a `git diff --name-status` style listing with N files.
+  const fakeDiffNameStatus = (n: number) =>
+    Array.from({ length: n }, (_, i) => `M\tsrc/file${i}.ts`).join('\n');
+
+  it('small-scope PR exceeding threshold gets overflow preamble WITHOUT "lower priority" text', async () => {
+    // 8 files > small threshold of 6.
+    vi.mocked(indexMod.git).mockImplementation(((args: string[]) => {
+      if (Array.isArray(args) && args[0] === 'diff' && args[1] === '--name-status') {
+        return fakeDiffNameStatus(8);
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-overflow-small', basePayload, { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    // Overflow note present
+    expect(prompt).toContain('exceeds the typical range for a small-scope change');
+    expect(prompt).toContain('review ALL checklist sections thoroughly');
+    // Contradictory small-scope deprioritization MUST be gone
+    expect(prompt).not.toContain('Security and performance sections are lower priority');
+    expect(prompt).not.toContain('This is a small-scope change. Focus your review');
+  });
+
+  it('small-scope PR within threshold keeps the small-scope preamble (no overflow note)', async () => {
+    // 3 files within small threshold of 6.
+    vi.mocked(indexMod.git).mockImplementation(((args: string[]) => {
+      if (Array.isArray(args) && args[0] === 'diff' && args[1] === '--name-status') {
+        return fakeDiffNameStatus(3);
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-no-overflow', basePayload, { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    expect(prompt).toContain('Security and performance sections are lower priority');
+    expect(prompt).not.toContain('exceeds the typical range');
+  });
+
+  it('medium-scope PR exceeding threshold replaces empty preamble with overflow note', async () => {
+    // 12 files > medium threshold of 10.
+    vi.mocked(indexMod.git).mockImplementation(((args: string[]) => {
+      if (Array.isArray(args) && args[0] === 'diff' && args[1] === '--name-status') {
+        return fakeDiffNameStatus(12);
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-overflow-medium', basePayload, { context: { scope: 'medium' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    expect(prompt).toContain('exceeds the typical range for a medium-scope change');
   });
 });
 

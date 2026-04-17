@@ -56,21 +56,65 @@ type ReviewHistoryEntry = { iteration: number; feedback: string; issues?: Review
 type AnnotatedIssue = ReviewHistoryIssue & { resolvedInIteration?: number };
 type AnnotatedEntry = { iteration: number; feedback: string; issues?: AnnotatedIssue[] };
 
+// Jaccard token-overlap threshold for treating a rephrased issue as the SAME
+// concept. Reviewers often paraphrase between iterations ("missing null check"
+// → "null check not present"); exact-match alone marks those as resolved and
+// the next reviewer skips a real bug. False positives here are cheap (reviewer
+// re-verifies an unrelated issue once); false negatives are expensive
+// (persistent bug ships), so the threshold leans permissive.
+export const ISSUE_SIMILARITY_THRESHOLD = 0.4;
+
+const ISSUE_TOKEN_STOPWORDS = new Set([
+  'the', 'a', 'an', 'is', 'in', 'on', 'at', 'of', 'to', 'for', 'and', 'or',
+  'this', 'that', 'it', 'as', 'be', 'are', 'was', 'were', 'has', 'have', 'had',
+  'with', 'by', 'from', 'into', 'when', 'if',
+]);
+
+function tokenizeIssue(s: string): Set<string> {
+  return new Set(
+    s.toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(t => t.length >= 2 && !ISSUE_TOKEN_STOPWORDS.has(t))
+  );
+}
+
+function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersection = 0;
+  for (const t of a) if (b.has(t)) intersection++;
+  const union = a.size + b.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
 // Annotate each iteration's issues with whether they reappeared in the next
 // iteration. Issues that don't reappear are likely resolved — surfacing that
 // signal prevents the next reviewer from re-flagging already-fixed problems or
-// wasting effort re-verifying them. The most recent iteration is never
-// annotated (no "next" to compare against).
+// wasting effort re-verifying them. Matches both exact descriptions (after
+// whitespace/case normalization) and rephrasings (token overlap above
+// ISSUE_SIMILARITY_THRESHOLD), so a paraphrased-but-persisting issue is not
+// silently marked resolved. The most recent iteration is never annotated (no
+// "next" to compare against).
 export function annotateResolvedIssues(history: ReviewHistoryEntry[]): AnnotatedEntry[] {
   const sorted = [...history].sort((a, b) => a.iteration - b.iteration);
   const norm = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
   return sorted.map((entry, idx) => {
     const next = sorted[idx + 1];
     if (!next || !entry.issues || entry.issues.length === 0) return entry;
-    const nextDescs = new Set((next.issues || []).map(i => norm(i.description)));
-    const annotated: AnnotatedIssue[] = entry.issues.map(i =>
-      nextDescs.has(norm(i.description)) ? i : { ...i, resolvedInIteration: next.iteration }
-    );
+    const nextIssues = next.issues || [];
+    const nextDescs = new Set(nextIssues.map(i => norm(i.description)));
+    const nextTokenSets = nextIssues.map(i => tokenizeIssue(i.description));
+    const annotated: AnnotatedIssue[] = entry.issues.map(i => {
+      if (nextDescs.has(norm(i.description))) return i;
+      const currentTokens = tokenizeIssue(i.description);
+      if (currentTokens.size > 0) {
+        for (const nextTokens of nextTokenSets) {
+          if (jaccardSimilarity(currentTokens, nextTokens) >= ISSUE_SIMILARITY_THRESHOLD) {
+            return i;
+          }
+        }
+      }
+      return { ...i, resolvedInIteration: next.iteration };
+    });
     return { ...entry, issues: annotated };
   });
 }
@@ -222,19 +266,37 @@ export async function handleReview(
     changedFiles = git(['diff', '--name-status', `origin/${baseBranch}...HEAD`]);
   } catch { changedFiles = '(could not generate file list)'; }
 
-  // Scope-drift warning: the `taskScope` label is set at task creation and never
+  // Shortstat gives the reviewer objective line-change volume alongside the
+  // file list. A "3 files changed" PR that touches 300 lines reads very
+  // differently from one that touches 10 — surfacing both prevents scope-label
+  // mismatches and gives rollup reviewers proof the PR has real changes.
+  let diffShortstat = '';
+  try {
+    diffShortstat = git(['diff', '--shortstat', `origin/${baseBranch}...HEAD`]).trim();
+  } catch { /* shortstat is best-effort context */ }
+
+  // Scope-drift handling: the `taskScope` label is set at task creation and never
   // re-validated against the actual diff. If fix iterations ballooned this PR
-  // beyond its original scope, tell the reviewer to ignore the scope-narrowed
-  // checklist and scrutinize everything.
+  // beyond its original scope, REPLACE the scope-narrowed preamble entirely —
+  // augmenting it with a warning leaves contradictory text in place ("review
+  // everything" alongside "deprioritize security"), and reviewers tend to
+  // follow the more specific (wrong) instruction.
   const changedFileCount = changedFiles
     .split('\n')
     .map(l => l.trim())
     .filter(l => l && !l.startsWith('('))
     .length;
   const scopeThreshold = SCOPE_OVERFLOW_THRESHOLDS[taskScope];
-  const scopeOverflowWarning = (scopeThreshold && changedFileCount > scopeThreshold)
-    ? `NOTE: This PR has ${changedFileCount} changed files, which exceeds the typical range for a ${taskScope}-scope change (threshold: ${scopeThreshold}). Consider reviewing ALL checklist sections regardless of scope label.\n\n`
-    : '';
+  const isScopeOverflow = !!(scopeThreshold && changedFileCount > scopeThreshold);
+  const scopePreamble = isScopeOverflow
+    ? `NOTE: This PR has ${changedFileCount} changed files, which exceeds the typical range for a ${taskScope}-scope change (threshold: ${scopeThreshold}). Treat this as a higher-risk change and review ALL checklist sections thoroughly — Security, Code Quality, and Test Coverage are NOT deprioritized here regardless of the original ${taskScope}-scope label.\n\n`
+    : taskScope === 'small'
+      ? 'This is a small-scope change. Focus your review on Correctness & Logic and Build & Type Safety. Security and performance sections are lower priority unless the change touches auth, user input handling, or database queries.\n\n'
+      : taskScope === 'large'
+        ? 'This is a large-scope change with higher risk. Review ALL checklist sections thoroughly. Pay special attention to backwards compatibility, data model safety, and security implications.\n\n'
+        : taskScope === 'medium'
+          ? detectMediumScopeSubsystemHint(changedFiles)
+          : '';
 
   // Read CLAUDE.md for codebase instructions
   const reviewClaudeMd = readClaudeMd();
@@ -299,13 +361,13 @@ actual changes.
 ${iterationPreamble}
 ${rollupGuidance}
 ${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}Files changed in this PR:
-${changedFiles}
+${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}
 
 You have full access to the codebase. Read any files you need to understand the changes in context. Use \`git diff origin/${baseBranch}...HEAD\` to see the full diff, or \`git diff origin/${baseBranch}...HEAD -- <file>\` for specific files.
 
 Review the changes thoroughly using this checklist:
 
-${scopeOverflowWarning}${taskScope === 'small' ? 'This is a small-scope change. Focus your review on Correctness & Logic and Build & Type Safety. Security and performance sections are lower priority unless the change touches auth, user input handling, or database queries.\n\n' : taskScope === 'large' ? 'This is a large-scope change with higher risk. Review ALL checklist sections thoroughly. Pay special attention to backwards compatibility, data model safety, and security implications.\n\n' : taskScope === 'medium' ? detectMediumScopeSubsystemHint(changedFiles) : ''}${origTaskType === 'qa' ? 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n' : origTaskType === 'migrate' ? 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n' : ''}**Correctness & Logic:**
+${scopePreamble}${origTaskType === 'qa' ? 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n' : origTaskType === 'migrate' ? 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n' : ''}**Correctness & Logic:**
 - Does the code correctly implement what the original task asked for?
 - Are there edge cases, null/undefined handling, or off-by-one errors?
 - Are async operations properly awaited? Are errors properly handled?
