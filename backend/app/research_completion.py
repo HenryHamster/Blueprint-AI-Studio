@@ -410,6 +410,29 @@ def _parse_eviction_counts(summary_text: Optional[str]) -> dict:
     return result
 
 
+def _format_evicted_failed(entry: str, max_len: int = 60) -> str:
+    """Format an evicted failed-approach entry preserving the category.
+
+    Failed entries follow '{title} ({category}) [at=... stage=...] — {reason}'.
+    Long titles push the category past a naive prefix truncation, so extract
+    the category and ensure it is preserved within max_len.
+    """
+    m = re.match(r"^(.*?)\s*\(([^)]+)\)(?:\s*\[|\s*—|\s*$)", entry)
+    if not m:
+        return entry[:max_len]
+    title = m.group(1).strip()
+    category = m.group(2).strip()
+    suffix = f" ({category})"
+    budget = max_len - len(suffix)
+    if budget <= 0:
+        return entry[:max_len]
+    if len(title) <= budget:
+        return f"{title}{suffix}"
+    ellipsis = "..."
+    truncated = title[: max(0, budget - len(ellipsis))] + ellipsis
+    return f"{truncated}{suffix}"
+
+
 def _format_eviction_body(established: int, failed: int, open_questions: int, failed_titles: list) -> str:
     """Format the eviction summary body content (without the ## header line)."""
     count_parts = []
@@ -518,7 +541,9 @@ def _build_research_context(
     new_failed = len(before["failed"]) - len(parsed["failed"])
     new_oq = len(before["open_questions"]) - len(parsed["open_questions"])
 
-    evicted_failed_titles = [e[:60] for e in before["failed"][:new_failed]] if new_failed > 0 else []
+    evicted_failed_titles = (
+        [_format_evicted_failed(e) for e in before["failed"][:new_failed]] if new_failed > 0 else []
+    )
 
     # Merge with prior eviction summary
     total_established = prior_eviction["established"] + new_established

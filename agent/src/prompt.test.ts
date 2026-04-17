@@ -56,6 +56,7 @@ import {
   discoverAffectedConsumers,
   relativeTimeFromIso,
   synthesizeSuccessPatterns,
+  synthesizeFailureHotspots,
 } from './prompt.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
@@ -282,8 +283,26 @@ describe('buildContextPrefix', () => {
       },
     };
     const result = buildContextPrefix(task);
-    expect(result).toContain('Scope merge rates: small 3/4 (75%), medium 0/1 (0%)');
+    expect(result).toContain('Scope merge rates: small 3/4 (75%, 1 failed), medium 0/1 (0%, 1 failed)');
     expect(result).not.toContain('empty');
+  });
+
+  it('omits failed annotation in scope merge rates when failed count is zero', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        scope_success_rates: {
+          small: { created: 4, merged: 3, failed: 0 },
+          medium: { created: 2, merged: 2 },
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('Scope merge rates: small 3/4 (75%), medium 2/2 (100%)');
+    expect(result).not.toContain('failed');
   });
 
   it('renders failure_stage_pattern message in Direction Context when present', () => {
@@ -302,7 +321,7 @@ describe('buildContextPrefix', () => {
     };
     const result = buildContextPrefix(task);
     expect(result).toContain('## Direction Context');
-    expect(result).toContain('**Failure pattern:**');
+    expect(result).toContain('**Failure pattern (86% of recent failures):**');
     expect(result).toContain('pay extra attention to test coverage');
   });
 
@@ -925,6 +944,71 @@ describe('synthesizeSuccessPatterns', () => {
       '',
     );
     expect(out).toEqual([]);
+  });
+});
+
+// ── synthesizeFailureHotspots ────────────────────────────────────────────────
+describe('synthesizeFailureHotspots', () => {
+  it('lists files appearing in 2+ failed entries and excludes single-occurrence files', () => {
+    const out = synthesizeFailureHotspots({
+      direction_prior_analysis: [
+        { pr_changed_files: ['backend/app/orchestrator.py', 'backend/app/services.py'] },
+        { pr_changed_files: ['backend/app/orchestrator.py', 'backend/app/unique.py'] },
+        { pr_changed_files: ['backend/app/orchestrator.py', 'backend/app/services.py'] },
+      ],
+    });
+    expect(out).toEqual([
+      { file: 'backend/app/orchestrator.py', count: 3 },
+      { file: 'backend/app/services.py', count: 2 },
+    ]);
+  });
+
+  it('returns empty when no file appears in multiple failures', () => {
+    const out = synthesizeFailureHotspots({
+      direction_prior_analysis: [
+        { pr_changed_files: ['a.py'] },
+        { pr_changed_files: ['b.py'] },
+      ],
+    });
+    expect(out).toEqual([]);
+  });
+
+  it('skips test files even if they appear in multiple failures', () => {
+    const out = synthesizeFailureHotspots({
+      direction_prior_analysis: [
+        { pr_changed_files: ['backend/testing/test_foo.py', 'backend/app/foo.py'] },
+        { pr_changed_files: ['backend/testing/test_foo.py', 'backend/app/foo.py'] },
+      ],
+    });
+    expect(out).toEqual([{ file: 'backend/app/foo.py', count: 2 }]);
+  });
+
+  it('renders the hotspots line in buildContextPrefix output', () => {
+    const result = buildContextPrefix({
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        direction_prior_analysis: [
+          { title: 'f1', pr_changed_files: ['backend/app/orchestrator.py', 'a.py'] },
+          { title: 'f2', pr_changed_files: ['backend/app/orchestrator.py', 'b.py'] },
+        ],
+      },
+    });
+    expect(result).toContain('Files appearing in multiple recent failures: backend/app/orchestrator.py (2x)');
+  });
+
+  it('omits the hotspots line when no file appears in 2+ failures', () => {
+    const result = buildContextPrefix({
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        direction_prior_analysis: [
+          { title: 'f1', pr_changed_files: ['a.py'] },
+          { title: 'f2', pr_changed_files: ['b.py'] },
+        ],
+      },
+    });
+    expect(result).not.toContain('Files appearing in multiple recent failures');
   });
 });
 

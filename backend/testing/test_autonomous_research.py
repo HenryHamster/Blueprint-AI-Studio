@@ -3667,3 +3667,25 @@ async def test_respawn_after_cooldown_injects_failure_class_prompt_suffix(db_ses
     suffix = children[0].payloads[0].get("prompt_suffix", "") or ""
     assert "RETRY GUIDANCE" in suffix
     assert "failing tests" in suffix.lower()
+
+
+def test_evicted_failed_preserves_category_with_long_title():
+    """Eviction summary retains failure category even when title is long."""
+    from app.research_completion import _format_evicted_failed
+
+    entry = (
+        "fix: implement comprehensive retry logic with backoff and circuit breaker "
+        "(CODE_ERROR) [at=2026-04-17 stage=code] — tests failed repeatedly"
+    )
+    result = _format_evicted_failed(entry)
+    assert len(result) <= 60
+    assert "(CODE_ERROR)" in result
+    assert result.startswith("fix: implement")
+
+    short_entry = "fix: short title (SCOPE_MISMATCH) [at=2026-04-17 stage=plan] — oops"
+    short_result = _format_evicted_failed(short_entry)
+    assert short_result == "fix: short title (SCOPE_MISMATCH)"
+
+    unparseable = "no category here at all, just a long free-form note x" * 3
+    fallback = _format_evicted_failed(unparseable)
+    assert fallback == unparseable[:60]

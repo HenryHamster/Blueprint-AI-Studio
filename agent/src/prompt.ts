@@ -382,6 +382,33 @@ export function synthesizeSuccessPatterns(
   return sentences;
 }
 
+// Aggregate pr_changed_files across failed prior-analysis entries to find
+// files appearing in 2+ failures. Skips test files. Returns up to top 5.
+export function synthesizeFailureHotspots(
+  dirCtx: Record<string, unknown>,
+): Array<{ file: string; count: number }> {
+  const failed = Array.isArray(dirCtx.direction_prior_analysis)
+    ? dirCtx.direction_prior_analysis as Array<Record<string, unknown>>
+    : [];
+  if (failed.length < 2) return [];
+  const counts = new Map<string, number>();
+  for (const entry of failed) {
+    const files = Array.isArray(entry.pr_changed_files) ? entry.pr_changed_files as unknown[] : [];
+    const seen = new Set<string>();
+    for (const f of files) {
+      const path = typeof f === 'string' ? f : '';
+      if (!path || isTestFilePath(path) || seen.has(path)) continue;
+      seen.add(path);
+      counts.set(path, (counts.get(path) ?? 0) + 1);
+    }
+  }
+  return Array.from(counts.entries())
+    .filter(([, c]) => c >= 2)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 5)
+    .map(([file, count]) => ({ file, count }));
+}
+
 export function buildContextPrefix(task: Record<string, unknown>): string {
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
@@ -442,7 +469,13 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     const failureStagePattern = dirCtx.failure_stage_pattern as Record<string, unknown> | undefined;
     if (failureStagePattern) {
       const msg = strVal(failureStagePattern.message);
-      if (msg) dcLines.push(`**Failure pattern:** ${msg}`);
+      if (msg) {
+        const rate = Number(failureStagePattern.rate);
+        const header = Number.isFinite(rate) && rate > 0
+          ? `**Failure pattern (${Math.round(rate * 100)}% of recent failures):**`
+          : `**Failure pattern:**`;
+        dcLines.push(`${header} ${msg}`);
+      }
     }
     const scopeRates = dirCtx.scope_success_rates as Record<string, Record<string, unknown>> | undefined;
     if (scopeRates && typeof scopeRates === 'object') {
@@ -458,7 +491,9 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         const merged = Number(counts?.merged ?? 0);
         if (created < 1) continue;
         const pct = Math.round((merged / created) * 100);
-        parts.push(`${scope} ${merged}/${created} (${pct}%)`);
+        const failed = Number(counts?.failed ?? 0);
+        const suffix = failed > 0 ? `, ${failed} failed` : '';
+        parts.push(`${scope} ${merged}/${created} (${pct}%${suffix})`);
       }
       if (parts.length > 0) {
         dcLines.push(`Scope merge rates: ${parts.join(', ')}`);
@@ -545,6 +580,11 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
           dcLines.push(`  - Review feedback: ${reviewFeedback}`);
         }
       }
+    }
+    const failureHotspots = synthesizeFailureHotspots(dirCtx);
+    if (failureHotspots.length > 0) {
+      const parts = failureHotspots.map(h => `${h.file} (${h.count}x)`).join(', ');
+      dcLines.push(`Files appearing in multiple recent failures: ${parts} — changes to these files need extra care.`);
     }
     const successfulAnalysis = Array.isArray(dirCtx.direction_successful_analysis)
       ? dirCtx.direction_successful_analysis as Array<Record<string, unknown>>
