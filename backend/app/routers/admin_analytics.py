@@ -926,6 +926,8 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 "total_merged": full.get("total_merged"),
                 "pre_investment": full.get("pre_investment"),
                 "post_investment": full.get("post_investment"),
+                "recent_30d": full.get("recent_30d"),
+                "recent_7d": full.get("recent_7d"),
                 "investment_start": full.get("investment_start"),
             }
     except Exception:
@@ -2194,6 +2196,20 @@ def _compute_medium_scope_measurement(
         if timestamps:
             investment_start = min(timestamps)
 
+    def _window_stats(tasks_subset: list, window_start: Optional[datetime], window_end: Optional[datetime]) -> Dict[str, Any]:
+        created = len(tasks_subset)
+        merged = sum(
+            1 for t in tasks_subset
+            if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
+        )
+        return {
+            "merge_rate": round(merged / created, 3) if created > 0 else None,
+            "created": created,
+            "merged": merged,
+            "window_start": window_start.isoformat() if window_start else None,
+            "window_end": window_end.isoformat() if window_end else None,
+        }
+
     # --- Pre/post split ---
     pre_investment: Optional[Dict[str, Any]] = None
     post_investment: Optional[Dict[str, Any]] = None
@@ -2201,24 +2217,19 @@ def _compute_medium_scope_measurement(
         pre_tasks = [t for t in medium_tasks if t.created_at and t.created_at < investment_start]
         post_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= investment_start]
 
-        def _window_stats(tasks_subset: list, window_start: Optional[datetime], window_end: Optional[datetime]) -> Dict[str, Any]:
-            created = len(tasks_subset)
-            merged = sum(
-                1 for t in tasks_subset
-                if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
-            )
-            return {
-                "merge_rate": round(merged / created, 3) if created > 0 else None,
-                "created": created,
-                "merged": merged,
-                "window_start": window_start.isoformat() if window_start else None,
-                "window_end": window_end.isoformat() if window_end else None,
-            }
-
         pre_start = min((t.created_at for t in pre_tasks if t.created_at), default=None)
         post_end = max((t.created_at for t in post_tasks if t.created_at), default=None)
         pre_investment = _window_stats(pre_tasks, pre_start, investment_start)
         post_investment = _window_stats(post_tasks, investment_start, post_end)
+
+    # --- Recent rolling windows (independent of investment_start) ---
+    _now = _utcnow()
+    recent_30d_start = _now - timedelta(days=30)
+    recent_7d_start = _now - timedelta(days=7)
+    recent_30d_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= recent_30d_start]
+    recent_7d_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= recent_7d_start]
+    recent_30d = _window_stats(recent_30d_tasks, recent_30d_start, _now) if recent_30d_tasks else None
+    recent_7d = _window_stats(recent_7d_tasks, recent_7d_start, _now) if recent_7d_tasks else None
 
     # --- Weekly time series ---
     week_bucket: Dict[str, Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0, "direction_merges": 0})
@@ -2285,6 +2296,8 @@ def _compute_medium_scope_measurement(
         "investment_start": investment_start.isoformat() if investment_start else None,
         "pre_investment": pre_investment,
         "post_investment": post_investment,
+        "recent_30d": recent_30d,
+        "recent_7d": recent_7d,
         "weekly_series": weekly_series,
         "correlated_changes": correlated_changes,
     }

@@ -583,6 +583,8 @@ ${hotspotsSection}
         total_merged: number | null;
         pre_investment: { merge_rate: number | null; created: number | null; merged: number | null } | null;
         post_investment: { merge_rate: number | null; created: number | null; merged: number | null } | null;
+        recent_30d?: { merge_rate: number | null; created: number | null; merged: number | null } | null;
+        recent_7d?: { merge_rate: number | null; created: number | null; merged: number | null } | null;
       }
     | null
     | undefined;
@@ -590,11 +592,17 @@ ${hotspotsSection}
     const fmtPct = (r: number | null | undefined) => (typeof r === 'number' ? `${Math.round(r * 100)}%` : '—');
     const pre = mediumScopeMeasurement.pre_investment;
     const post = mediumScopeMeasurement.post_investment;
+    const recent30 = mediumScopeMeasurement.recent_30d;
+    const recent7 = mediumScopeMeasurement.recent_7d;
     if (pre || post) {
       const preStr = pre ? `pre-investment ${fmtPct(pre.merge_rate)} (${pre.created ?? 0} tasks)` : 'pre-investment —';
       const postStr = post ? `post-investment ${fmtPct(post.merge_rate)} (${post.created ?? 0} tasks)` : 'post-investment —';
       const headline = `${fmtPct(mediumScopeMeasurement.medium_scope_merge_rate)} overall (${mediumScopeMeasurement.total_merged ?? 0}/${mediumScopeMeasurement.total_created ?? 0})`;
-      pipelineScopeRatesSection += `Medium-scope before/after: ${preStr}, ${postStr}; ${headline}\n`;
+      const recentParts: string[] = [];
+      if (recent30) recentParts.push(`recent-30d ${fmtPct(recent30.merge_rate)} (${recent30.created ?? 0} tasks)`);
+      if (recent7) recentParts.push(`recent-7d ${fmtPct(recent7.merge_rate)} (${recent7.created ?? 0} tasks)`);
+      const recentStr = recentParts.length ? `; ${recentParts.join(', ')}` : '';
+      pipelineScopeRatesSection += `Medium-scope before/after: ${preStr}, ${postStr}${recentStr}; ${headline}\n`;
     }
   }
 

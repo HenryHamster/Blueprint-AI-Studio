@@ -129,6 +129,8 @@ interface MediumScopeMeasurement {
   investment_start: string | null;
   pre_investment: WindowStats | null;
   post_investment: WindowStats | null;
+  recent_30d: WindowStats | null;
+  recent_7d: WindowStats | null;
   weekly_series: WeeklySeries[];
   correlated_changes: CorrelatedChange[];
 }
@@ -926,6 +928,15 @@ function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | n
                         {postRate != null ? `${Math.round(postRate * 100)}%` : '--'}
                       </p>
                       <p className="text-[9px] text-neutral-600">{data.post_investment.merged}/{data.post_investment.created}</p>
+                    </div>
+                  )}
+                  {data.recent_30d && (
+                    <div className="text-center">
+                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 30d</p>
+                      <p className="text-lg font-bold font-mono text-neutral-300">
+                        {data.recent_30d.merge_rate != null ? `${Math.round(data.recent_30d.merge_rate * 100)}%` : '--'}
+                      </p>
+                      <p className="text-[9px] text-neutral-600">{data.recent_30d.merged}/{data.recent_30d.created}</p>
                     </div>
                   )}
                   {deltaPp != null && (
