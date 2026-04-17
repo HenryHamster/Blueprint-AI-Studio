@@ -116,6 +116,17 @@ runtime_config: Dict = {
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
     "spawn_confidence_threshold": 0.25,  # P(success) below this injects low_confidence_spawn=True into task context
+    # Pipeline-wide scope merge-rate baselines used for cold-start scope calibration
+    # when a direction/project has insufficient research_history. Defaults reflect
+    # observed behavior: medium scope routinely fails, small succeeds. Allows
+    # _calibrate_scope to upgrade medium→large(decompose) on the first cycle of a
+    # new direction instead of burning through 3+ medium-scope failures first.
+    "pipeline_scope_baseline_rates": {"small": 0.75, "medium": 0.04, "large": 0.50},
+    # Pipeline-wide merge rate per scope (e.g. {"medium": 0.04}). Acts as a
+    # weakest-signal fallback in predict_spawn_success when direction- and
+    # project-level scope_breakdown data are too sparse to fire. Operator-
+    # adjustable from admin_analytics observations.
+    "pipeline_scope_merge_rates": {},
     # Per-failure-class retry budgets: max attempt_count before permanent failure.
     # Overrides max_retries for specific failure classes. Operator-adjustable.
     #   CODE_ERROR:    2 — code won't self-correct; 3rd attempt wastes compute

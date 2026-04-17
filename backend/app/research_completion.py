@@ -89,6 +89,38 @@ def _assess_spawn_health() -> tuple[bool, str | None]:
     return False, None
 
 
+def _maybe_cold_start_upgrade_medium(
+    proposed_scope: str, direction: dict
+) -> tuple[str, str | None]:
+    """Upgrade medium→large(decompose) when no direction/project history exists yet.
+
+    Mirrors the in-history upgrade path (medium failing, small healthy) but uses
+    the pipeline-wide baseline rates from runtime_config so a new direction
+    doesn't burn through 3+ medium-scope failures before the standard calibration
+    upgrade triggers. Returns (proposed_scope, None) when not eligible.
+    """
+    if proposed_scope != "medium":
+        return proposed_scope, None
+    baselines = _runtime_config.get("pipeline_scope_baseline_rates") or {}
+    medium_rate = baselines.get("medium")
+    small_rate = baselines.get("small")
+    threshold = 0.4
+    if (
+        medium_rate is None
+        or small_rate is None
+        or medium_rate >= threshold
+        or small_rate < threshold
+    ):
+        return proposed_scope, None
+    logger.info(
+        "[RESEARCH] Cold-start upgrade scope medium→large(decompose) for direction '%s' "
+        "(pipeline baseline medium %.0f%% < %.0f%%, small %.0f%% healthy)",
+        direction.get("title", direction.get("id", "?")),
+        medium_rate * 100, threshold * 100, small_rate * 100,
+    )
+    return "large", "medium"
+
+
 def _calibrate_scope(
     proposed_scope: str,
     direction: dict,
@@ -102,6 +134,8 @@ def _calibrate_scope(
     Uses direction's last-3 research_history (40% threshold) when it has >= 3
     data points. Otherwise falls back to project-wide aggregation across all
     directions with a softer 30% threshold to avoid over-aggressive downgrades.
+    When neither source has enough data, applies a cold-start upgrade for
+    medium-scope tasks based on pipeline-wide baseline rates.
     """
     try:
         idx = _SCOPE_ORDER.index(proposed_scope)
@@ -134,12 +168,12 @@ def _calibrate_scope(
                     proj_agg[s]["created"] += stats.get("created", 0)
                     proj_agg[s]["merged"] += stats.get("merged", 0)
         if sum(v["created"] for v in proj_agg.values()) < 3:
-            return proposed_scope, None
+            return _maybe_cold_start_upgrade_medium(proposed_scope, direction)
         agg = proj_agg
         threshold = 0.3
         source = "project"
     else:
-        return proposed_scope, None
+        return _maybe_cold_start_upgrade_medium(proposed_scope, direction)
 
     def _merge_rate(scope: str) -> float | None:
         stats = agg.get(scope)
@@ -194,13 +228,16 @@ def predict_spawn_success(
 ) -> float:
     """Predict P(success) for a spawned task using in-memory data only.
 
-    Combines three signals with weighted averaging:
+    Combines four signals with weighted averaging:
     1. Direction's scope-specific merge rate from last 3 history entries
        (weight 2.0 — most relevant signal)
     2. Project-wide scope merge rate across all directions
        (weight 1.0 — proxy for project-level first_attempt_success_rate by task type)
     3. Direction's recent overall failure rate from last 3 history entries
        (weight 1.5 — captures transient regressions)
+    4. Pipeline-wide scope merge rate from runtime_config["pipeline_scope_merge_rates"]
+       (weight 0.5 — weakest fallback so new directions with sparse data don't
+       collapse to a neutral 0.5 that bypasses the low_confidence_spawn gate)
 
     Returns a float in [0.0, 1.0]. Falls back to 0.5 when data is insufficient.
     No DB queries — uses only data already loaded during research_completion processing.
@@ -249,6 +286,16 @@ def predict_spawn_success(
             failure_rate = total_failed / total_created
             signals.append(max(0.0, 1.0 - failure_rate))
             weights.append(1.5)
+
+    # Signal 4: pipeline-wide scope merge rate fallback. Weighted lowest so it
+    # only dominates when other signals are absent — prevents brand-new
+    # directions from passing the spawn_confidence_threshold via a neutral 0.5
+    # default when the global rate for this scope is in fact poor.
+    pipeline_rates = _runtime_config.get("pipeline_scope_merge_rates") or {}
+    pipeline_rate = pipeline_rates.get(scope)
+    if isinstance(pipeline_rate, (int, float)):
+        signals.append(max(0.0, min(1.0, float(pipeline_rate))))
+        weights.append(0.5)
 
     if not signals:
         return 0.5  # insufficient data — neutral
@@ -1022,6 +1069,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _direction = _directions_by_id.get(str(_dir_id)) if _dir_id else None
             if _direction:
                 scope, scope_calibrated_from = _calibrate_scope(scope, _direction, _scope_cal_project)
+
+        # Pre-spawn file-count heuristic: medium-scope findings with 5+ related_files
+        # will almost certainly overflow the 10-file threshold in standard.ts once
+        # tests and discovered imports are added. Upgrade to large to route through
+        # the plan agent for decomposition into smaller subtasks.
+        if scope == "medium":
+            _heuristic_files = finding.get("related_files") or []
+            if len(_heuristic_files) >= 5:
+                logger.info(
+                    "[RESEARCH] Upgrading scope medium→large for '%s' "
+                    "(file-count heuristic: %d related_files >= 5)",
+                    title, len(_heuristic_files),
+                )
+                scope = "large"
+                scope_calibrated_from = "medium"
 
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation

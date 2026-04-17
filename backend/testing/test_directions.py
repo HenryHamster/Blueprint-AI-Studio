@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
-from app.research_completion import _handle_research_completion, _compute_momentum_factor, _compute_merge_rate, _calibrate_scope
+from app.research_completion import _handle_research_completion, _compute_momentum_factor, _compute_merge_rate, _calibrate_scope, predict_spawn_success
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -1876,13 +1876,17 @@ class TestCalibrateScope:
             ],
         }
 
-    def test_no_history_returns_unchanged(self):
-        """Direction with no research_history → scope unchanged, calibrated_from None."""
+    def test_no_history_returns_unchanged(self, monkeypatch):
+        """Direction with no research_history + no baselines → scope unchanged."""
+        from app.shared_state import runtime_config as _rc
+        monkeypatch.setitem(_rc, "pipeline_scope_baseline_rates", {})
         d = {"id": "d1"}
         assert _calibrate_scope("medium", d) == ("medium", None)
 
-    def test_empty_history_returns_unchanged(self):
-        """Explicit empty research_history → scope unchanged."""
+    def test_empty_history_returns_unchanged(self, monkeypatch):
+        """Explicit empty research_history + no baselines → scope unchanged."""
+        from app.shared_state import runtime_config as _rc
+        monkeypatch.setitem(_rc, "pipeline_scope_baseline_rates", {})
         d = {"id": "d1", "research_history": []}
         assert _calibrate_scope("medium", d) == ("medium", None)
 
@@ -2048,8 +2052,10 @@ class TestCalibrateScope:
         assert result_scope == "medium"
         assert calibrated_from is None
 
-    def test_project_fallback_returns_unchanged_when_project_data_also_thin(self):
-        """Both direction and project-wide data insufficient → no calibration."""
+    def test_project_fallback_returns_unchanged_when_project_data_also_thin(self, monkeypatch):
+        """Both direction and project-wide data insufficient + no baselines → no calibration."""
+        from app.shared_state import runtime_config as _rc
+        monkeypatch.setitem(_rc, "pipeline_scope_baseline_rates", {})
         d = self._direction([])
         project = self._project([
             [{"medium": {"created": 1, "merged": 0}}],
@@ -2058,10 +2064,78 @@ class TestCalibrateScope:
         assert result_scope == "medium"
         assert calibrated_from is None
 
-    def test_project_fallback_omitted_returns_unchanged(self):
-        """No project passed AND direction insufficient → unchanged (back-compat)."""
+    def test_project_fallback_omitted_returns_unchanged(self, monkeypatch):
+        """No project passed AND direction insufficient + no baselines → unchanged (back-compat)."""
+        from app.shared_state import runtime_config as _rc
+        monkeypatch.setitem(_rc, "pipeline_scope_baseline_rates", {})
         d = self._direction([])
         assert _calibrate_scope("medium", d) == ("medium", None)
+
+    def test_cold_start_upgrades_medium_when_pipeline_baseline_below_threshold(self, monkeypatch):
+        """No direction/project history + baseline medium < 40% + small healthy → upgrade medium→large."""
+        from app.shared_state import runtime_config as _rc
+        monkeypatch.setitem(
+            _rc, "pipeline_scope_baseline_rates", {"small": 0.75, "medium": 0.04, "large": 0.50},
+        )
+        d = self._direction([])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "large"
+        assert calibrated_from == "medium"
+
+    def test_cold_start_upgrades_medium_when_project_data_thin(self, monkeypatch):
+        """Direction empty + project < 3 data points + baseline says medium failing → upgrade."""
+        from app.shared_state import runtime_config as _rc
+        monkeypatch.setitem(
+            _rc, "pipeline_scope_baseline_rates", {"small": 0.75, "medium": 0.04, "large": 0.50},
+        )
+        d = self._direction([])
+        project = self._project([
+            [{"medium": {"created": 1, "merged": 0}}],
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d, project)
+        assert result_scope == "large"
+        assert calibrated_from == "medium"
+
+    def test_cold_start_no_upgrade_when_baseline_medium_healthy(self, monkeypatch):
+        """Cold-start + baseline medium >= 40% → no upgrade (pipeline-wide medium is fine)."""
+        from app.shared_state import runtime_config as _rc
+        monkeypatch.setitem(
+            _rc, "pipeline_scope_baseline_rates", {"small": 0.75, "medium": 0.50, "large": 0.50},
+        )
+        d = self._direction([])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "medium"
+        assert calibrated_from is None
+
+    def test_cold_start_no_upgrade_when_baseline_small_unhealthy(self, monkeypatch):
+        """Cold-start + baseline small < 40% → no upgrade (decompose target is unproven)."""
+        from app.shared_state import runtime_config as _rc
+        monkeypatch.setitem(
+            _rc, "pipeline_scope_baseline_rates", {"small": 0.20, "medium": 0.04, "large": 0.50},
+        )
+        d = self._direction([])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "medium"
+        assert calibrated_from is None
+
+    def test_cold_start_no_upgrade_for_non_medium_scope(self, monkeypatch):
+        """Cold-start upgrade only fires for medium — small/large pass through unchanged."""
+        from app.shared_state import runtime_config as _rc
+        monkeypatch.setitem(
+            _rc, "pipeline_scope_baseline_rates", {"small": 0.75, "medium": 0.04, "large": 0.50},
+        )
+        d = self._direction([])
+        assert _calibrate_scope("small", d) == ("small", None)
+        assert _calibrate_scope("large", d) == ("large", None)
+
+    def test_cold_start_no_upgrade_when_baselines_missing(self, monkeypatch):
+        """Cold-start + no baseline configured → returns unchanged (no implicit defaults applied)."""
+        from app.shared_state import runtime_config as _rc
+        monkeypatch.setitem(_rc, "pipeline_scope_baseline_rates", {"small": 0.75})
+        d = self._direction([])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "medium"
+        assert calibrated_from is None
 
     def test_medium_upgrades_to_large_when_small_is_healthy(self):
         """Medium below threshold + small healthy → upgrade to large for plan-agent decomposition.
@@ -2280,3 +2354,81 @@ async def test_record_research_task_failure_no_direction_is_noop(db_session):
 
     # Should be a silent no-op, no exception
     await _record_research_task_failure(task, db_session)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Standalone tests for predict_spawn_success (no DB required)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPredictSpawnSuccessPipelineSignal:
+    """Unit tests for the pipeline-wide scope merge rate fallback signal."""
+
+    def test_no_data_no_pipeline_rate_returns_neutral(self):
+        """With no signals at all, returns 0.5 — preserves prior fallback behavior."""
+        from app.shared_state import runtime_config
+        runtime_config["pipeline_scope_merge_rates"] = {}
+        try:
+            assert predict_spawn_success("medium", {}) == 0.5
+        finally:
+            runtime_config["pipeline_scope_merge_rates"] = {}
+
+    def test_only_pipeline_rate_dominates_when_others_absent(self):
+        """When only signal #4 is available (sparse direction), it sets P(success)
+        to the global rate so a 4% medium rate triggers the low_confidence gate
+        instead of collapsing to a neutral 0.5 that always passes."""
+        from app.shared_state import runtime_config
+        runtime_config["pipeline_scope_merge_rates"] = {"medium": 0.04}
+        try:
+            p = predict_spawn_success("medium", {})
+            assert p == pytest.approx(0.04)
+        finally:
+            runtime_config["pipeline_scope_merge_rates"] = {}
+
+    def test_pipeline_rate_does_not_apply_to_other_scopes(self):
+        """A medium pipeline rate must not influence small-scope predictions."""
+        from app.shared_state import runtime_config
+        runtime_config["pipeline_scope_merge_rates"] = {"medium": 0.04}
+        try:
+            assert predict_spawn_success("small", {}) == 0.5
+        finally:
+            runtime_config["pipeline_scope_merge_rates"] = {}
+
+    def test_pipeline_rate_weighted_below_direction_signal(self):
+        """Direction-level signal (weight 2.0) must dominate the pipeline-wide
+        fallback (weight 0.5) when both are present."""
+        from app.shared_state import runtime_config
+        runtime_config["pipeline_scope_merge_rates"] = {"medium": 0.0}
+        try:
+            d = {
+                "research_history": [
+                    {"scope_breakdown": {"medium": {"created": 5, "merged": 5}}},
+                ],
+            }
+            # Signal 1: 1.0 (weight 2.0); Signal 4: 0.0 (weight 0.5).
+            # Weighted: (1.0*2.0 + 0.0*0.5) / 2.5 = 0.8
+            p = predict_spawn_success("medium", d)
+            assert p == pytest.approx(0.8)
+        finally:
+            runtime_config["pipeline_scope_merge_rates"] = {}
+
+    def test_pipeline_rate_clamped_to_unit_interval(self):
+        """Out-of-range pipeline rates are clamped to [0.0, 1.0]."""
+        from app.shared_state import runtime_config
+        runtime_config["pipeline_scope_merge_rates"] = {"medium": 1.5}
+        try:
+            assert predict_spawn_success("medium", {}) == pytest.approx(1.0)
+            runtime_config["pipeline_scope_merge_rates"] = {"medium": -0.2}
+            assert predict_spawn_success("medium", {}) == pytest.approx(0.0)
+        finally:
+            runtime_config["pipeline_scope_merge_rates"] = {}
+
+    def test_pipeline_rate_ignores_non_numeric(self):
+        """Non-numeric values (e.g. None, strings) are ignored — falls back to neutral."""
+        from app.shared_state import runtime_config
+        runtime_config["pipeline_scope_merge_rates"] = {"medium": None}
+        try:
+            assert predict_spawn_success("medium", {}) == 0.5
+            runtime_config["pipeline_scope_merge_rates"] = {"medium": "0.04"}
+            assert predict_spawn_success("medium", {}) == 0.5
+        finally:
+            runtime_config["pipeline_scope_merge_rates"] = {}

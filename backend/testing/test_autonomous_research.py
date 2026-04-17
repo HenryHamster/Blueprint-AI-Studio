@@ -1374,6 +1374,88 @@ async def test_finding_type_security_audit_spawns_security_audit_task(db_session
     assert child_tasks[0].payloads[0]["type"] == "security_audit"
 
 
+@pytest.mark.asyncio
+async def test_medium_scope_with_many_related_files_upgrades_to_large(db_session, mocker):
+    """Medium-scope finding with >=5 related_files is upgraded to large via pre-spawn heuristic."""
+    direction = _active_direction("d-fchint01", "File-count heuristic direction")
+    project = Project(
+        name="File Count Heuristic Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    finding = _make_finding(
+        "Refactor auth module across many files",
+        direction["id"],
+        scope="medium",
+    )
+    finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(5)]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    assert child_tasks[0].payloads[0]["type"] == "plan"
+    assert child_tasks[0].context["scope"] == "large"
+    assert child_tasks[0].context["scope_calibrated_from"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_medium_scope_with_few_related_files_stays_medium(db_session, mocker, monkeypatch):
+    """Medium-scope finding with <5 related_files is not upgraded by the file-count heuristic."""
+    # Disable cold-start baseline upgrade so this test isolates the file-count heuristic.
+    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    direction = _active_direction("d-fchint02", "File-count heuristic under threshold")
+    project = Project(
+        name="File Count Under Threshold Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    finding = _make_finding(
+        "Tweak a handful of files",
+        direction["id"],
+        scope="medium",
+    )
+    finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(4)]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    assert child_tasks[0].payloads[0]["type"] == "create"
+    assert child_tasks[0].context["scope"] == "medium"
+    assert "scope_calibrated_from" not in child_tasks[0].context
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. _handle_research_completion — JSONB research_history Updates
 # ─────────────────────────────────────────────────────────────────────────────
