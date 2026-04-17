@@ -1626,6 +1626,83 @@ describe('buildRetryContext', () => {
     const result = buildRetryContext(task);
     expect(result).not.toContain('Pre-implementation analysis from previous attempt');
   });
+
+  it('omits retry budget when _max_attempts is absent', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'err',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('## Previous Attempt (attempt #1 failed)');
+    expect(result).not.toContain('Retry budget:');
+    expect(result).not.toContain('Final attempt');
+  });
+
+  it('shows retry budget with attempts remaining when multiple retries remain', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _max_attempts: 4,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'err',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('## Previous Attempt (attempt #1 of 4 failed)');
+    expect(result).toContain('Retry budget: attempt 2 of 4 (2 retries remaining after this one)');
+    expect(result).not.toContain('Final attempt');
+    expect(result).not.toContain('Be conservative');
+  });
+
+  it('warns to be conservative when exactly one retry remains after this one', () => {
+    const task = {
+      context: {
+        _attempt_number: 3,
+        _max_attempts: 4,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'err',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('attempt 3 of 4');
+    expect(result).toContain('1 retry remaining after this one');
+    expect(result).toContain('Be conservative');
+  });
+
+  it('flags the final attempt and urges a conservative strategy when no retries remain', () => {
+    const task = {
+      context: {
+        _attempt_number: 4,
+        _max_attempts: 4,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'err',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('## Previous Attempt (attempt #3 of 4 failed)');
+    expect(result).toContain('Final attempt (4 of 4)');
+    expect(result).toContain('no retries remain after this one');
+    expect(result).toContain('conservative strategy');
+    expect(result).toContain('smallest viable change');
+  });
+
+  it('ignores inconsistent _max_attempts less than _attempt_number', () => {
+    const task = {
+      context: {
+        _attempt_number: 5,
+        _max_attempts: 4,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'err',
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('## Previous Attempt (attempt #4 failed)');
+    expect(result).not.toContain('Retry budget:');
+    expect(result).not.toContain('Final attempt');
+  });
 });
 
 describe('buildSelfReviewPrompt', () => {

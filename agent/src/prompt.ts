@@ -1665,6 +1665,9 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   const attemptNumber = typeof ctx._attempt_number === 'number' ? ctx._attempt_number : 1;
   if (attemptNumber <= 1) return '';
 
+  const maxAttempts = typeof ctx._max_attempts === 'number' && ctx._max_attempts >= attemptNumber
+    ? ctx._max_attempts
+    : 0;
   const previousError = strVal(ctx._previous_error as unknown);
   const previousFailureClass = strVal(ctx._previous_failure_class as unknown);
   const previousPrUrl = strVal(ctx._previous_pr_url as unknown);
@@ -1685,12 +1688,30 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   const prevAttempt = attemptNumber - 1;
 
   const failureTypeLabel = previousFailureClass || 'UNKNOWN';
+  const headerSuffix = maxAttempts > 0 ? ` of ${maxAttempts}` : '';
   const lines: string[] = [
-    `## Previous Attempt (attempt #${prevAttempt} failed)`,
+    `## Previous Attempt (attempt #${prevAttempt}${headerSuffix} failed)`,
     previousFailureStage
       ? `Failure type: ${failureTypeLabel} (at ${previousFailureStage} stage)`
       : `Failure type: ${failureTypeLabel}`,
   ];
+
+  if (maxAttempts > 0) {
+    const remainingAfter = Math.max(0, maxAttempts - attemptNumber);
+    if (remainingAfter === 0) {
+      lines.push(
+        `**Final attempt (${attemptNumber} of ${maxAttempts}) — no retries remain after this one.** Adopt a conservative strategy: prefer the smallest viable change that addresses the root cause. Fewer files, simpler approach, avoid speculative refactors or scope expansion.`,
+      );
+    } else if (remainingAfter === 1) {
+      lines.push(
+        `Retry budget: attempt ${attemptNumber} of ${maxAttempts} (1 retry remaining after this one). **Be conservative** — narrow scope where possible and avoid speculative changes.`,
+      );
+    } else {
+      lines.push(
+        `Retry budget: attempt ${attemptNumber} of ${maxAttempts} (${remainingAfter} retries remaining after this one).`,
+      );
+    }
+  }
 
   if (previousIsRecurring) {
     lines.push(

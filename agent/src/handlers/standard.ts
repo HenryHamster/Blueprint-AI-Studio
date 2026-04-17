@@ -180,7 +180,16 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // Runs a read-only pass to map module interfaces and dependencies before coding.
   let analysisContext = '';
   const taskScope = strVal(ctx.scope);
-  if (taskScope === 'medium') {
+  const previousAnalysisPlan = strVal(ctx._previous_analysis_plan as unknown);
+  if (taskScope === 'medium' && previousAnalysisPlan) {
+    // Retry with an existing plan: reuse it instead of burning another ~3-5 min
+    // Claude Code session re-deriving the same analysis.
+    sendLog(ws, '\n[Analysis Phase] Reusing plan from previous attempt — skipping re-analysis.\n');
+    const trimmed = previousAnalysisPlan.trim();
+    analysisContext = trimmed.startsWith('## Pre-Implementation Analysis')
+      ? `${trimmed}\n\n`
+      : `## Pre-Implementation Analysis\n\n${trimmed}\n\n`;
+  } else if (taskScope === 'medium') {
     sendLog(ws, '\n[Analysis Phase] Mapping module interfaces and dependencies...\n');
     statusRef.value = 'Analyzing module interfaces...';
 
@@ -965,7 +974,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
       ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
       ...(selfReviewOutcome ? { self_review_outcome: selfReviewOutcome } : {}),
       ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
-      ...(analysisContext ? { analysis_summary: analysisContext.slice(0, 2000) } : {}),
+      ...(analysisContext ? { analysis_plan: analysisContext.slice(0, 5000) } : {}),
     });
   } else if (exitCode === 0) {
     await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: noChangesMessage });

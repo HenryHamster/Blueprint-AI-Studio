@@ -460,6 +460,37 @@ describe('pre-implementation analysis note', () => {
     await handleQA(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(capturedPrompt()).not.toContain('## Pre-Implementation Analysis');
   });
+
+  it('reuses _previous_analysis_plan on medium-scope retry and skips the analysis Claude Code call', async () => {
+    const priorPlan = 'Module X imports Y. Plan: change files A, B.';
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium', _previous_analysis_plan: priorPlan },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // Only the main implementation runClaudeCode call should fire — analysis phase is skipped.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('## Pre-Implementation Analysis');
+    expect(prompt).toContain(priorPlan);
+  });
+
+  it('preserves existing Pre-Implementation Analysis header when reusing a previous plan', async () => {
+    const priorPlan = '## Pre-Implementation Analysis\n\nModule X imports Y.';
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium', _previous_analysis_plan: priorPlan },
+      project_context: {},
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    // Header appears exactly once (no duplicate prefix when the stored plan already includes it).
+    expect(prompt.match(/## Pre-Implementation Analysis/g) ?? []).toHaveLength(1);
+    expect(prompt).toContain('Module X imports Y.');
+  });
 });
 
 describe('handleDocs configuration', () => {
@@ -1734,6 +1765,49 @@ describe('analysis-phase scope feasibility gate', () => {
     // implementation run must NOT have happened (only analysis + retry)
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('includes analysis_plan in COMPLETED payload so siblings can learn from successful plans', async () => {
+    vi.mocked(parseAnalysisPlanFiles).mockReturnValue(['a.ts', 'b.ts']);
+    vi.mocked(lintFixLoop).mockResolvedValue(true);
+    vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: false, passed: true });
+    const analysisOutput = '**Files to change**\n- a.ts\n- b.ts';
+    const validSelfReviewOutput = '```json\n' + JSON.stringify({
+      verdict: 'PASS',
+      checks_performed: ['correctness', 'test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'data_model_safety', 'import_verification'],
+      issues_found: 0,
+      files_reviewed: 1,
+      truncated_files_read: [],
+    }) + '\n```';
+    vi.mocked(runClaudeCode)
+      .mockReset()
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: analysisOutput })  // analysis
+      .mockResolvedValue({ exitCode: 0, allOutput: validSelfReviewOutput, lastResultText: '' });
+    vi.mocked(git)
+      .mockReset()
+      .mockReturnValueOnce('')          // 1: baseCommit
+      .mockReturnValueOnce('M file')    // 2: hasChanges
+      .mockReturnValueOnce('')          // 3: currentHead
+      .mockReturnValueOnce('')          // 4: uncommittedDiff for self-review
+      .mockReturnValueOnce('abc123')    // 5: headBeforeReview
+      .mockReturnValueOnce('')          // 6: statusBeforeReview
+      .mockReturnValueOnce('abc123')    // 7: headAfterReview (same → no fixes)
+      .mockReturnValueOnce('')          // 8: statusAfterReview
+      .mockReturnValueOnce('')          // 9: postReviewDiff (scope overflow check)
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+    const completedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED'
+        && (c[1] as Record<string, unknown>).artifact_type === 'PULL_REQUEST',
+    );
+    expect(completedCall).toBeDefined();
+    const body = completedCall![1] as Record<string, unknown>;
+    expect(typeof body.analysis_plan).toBe('string');
+    expect(body.analysis_plan as string).toContain('Pre-Implementation Analysis');
+    // Field must be analysis_plan (schema-defined), not analysis_summary (silently dropped)
+    expect(body).not.toHaveProperty('analysis_summary');
   });
 });
 

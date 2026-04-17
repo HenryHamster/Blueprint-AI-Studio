@@ -316,6 +316,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         }
         clone_ctx = {k: v for k, v in child_ctx.items() if k not in _ctx_keys_to_strip}
         clone_ctx["_attempt_number"] = attempt + 1
+        clone_ctx["_max_attempts"] = MAX_PARENT_REQUEUES + 1
         clone_ctx["_previous_error"] = (original_status_message or "")[:5000]
         clone_ctx["_previous_failure_class"] = failure_class
 

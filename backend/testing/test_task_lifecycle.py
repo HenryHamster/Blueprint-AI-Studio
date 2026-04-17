@@ -293,6 +293,7 @@ async def test_requeue_cancels_failed_children_and_creates_clones(tl_db, mocker)
     assert len(clones) == 1
     clone = clones[0]
     assert clone.context["_attempt_number"] == 2
+    assert clone.context["_max_attempts"] == 4
     assert clone.context["_previous_error"] == "Build failed: tests failing"
     assert clone.context.get("_previous_failure_class") is not None
 
