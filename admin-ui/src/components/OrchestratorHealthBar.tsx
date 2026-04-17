@@ -28,17 +28,19 @@ interface CircuitBreakerState {
   opened_at: string | null;
 }
 
+interface GithubQuota {
+  remaining: number | null;
+  limit: number | null;
+  reset_at: number | null;
+  last_updated: string | null;
+  status: 'ok' | 'degraded' | 'critical' | 'unknown';
+}
+
 interface DetailedHealth {
   circuit_breaker: { projects: Record<string, CircuitBreakerState> };
   max_plan_pool: { total: number; available: number };
   autonomous: { enabled: boolean; consecutive_failures: number };
-  github_quota: {
-    remaining: number | null;
-    limit: number | null;
-    reset_at: number | null;
-    last_updated: string | null;
-    status: 'ok' | 'degraded' | 'critical' | 'unknown';
-  };
+  github_quota: GithubQuota;
 }
 
 interface PipelineThrottle {
@@ -85,17 +87,32 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
   const [now, setNow] = useState(() => Date.now());
   const [circuitExpanded, setCircuitExpanded] = useState(false);
   const [refreshingQuota, setRefreshingQuota] = useState(false);
+  const [localQuota, setLocalQuota] = useState<GithubQuota | null>(null);
 
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
 
+  // Clear the local override once the parent's polled data catches up —
+  // detected by the server-reported last_updated reaching (or exceeding)
+  // the timestamp we stored from our manual refresh response.
+  useEffect(() => {
+    if (!localQuota || !detailedHealth?.github_quota) return;
+    const serverTs = detailedHealth.github_quota.last_updated;
+    const localTs = localQuota.last_updated;
+    if (serverTs && localTs && serverTs >= localTs) setLocalQuota(null);
+  }, [detailedHealth?.github_quota, localQuota]);
+
   const refreshQuota = async () => {
     if (refreshingQuota) return;
     setRefreshingQuota(true);
     try {
-      await apiFetch('/api/admin/github-quota/refresh', { method: 'POST' });
+      const res = await apiFetch('/api/admin/github-quota/refresh', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.github_quota) setLocalQuota(data.github_quota as GithubQuota);
+      }
     } catch {
       // Ignored — the pill will keep showing last-known values.
     } finally {
@@ -312,7 +329,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
           <>
             <div className="w-px h-3 bg-neutral-800 shrink-0" />
             {(() => {
-              const q = detailedHealth.github_quota;
+              const q = localQuota ?? detailedHealth.github_quota;
               const dotColor =
                 q.status === 'critical' ? 'bg-red-500 animate-pulse' :
                 q.status === 'degraded' ? 'bg-amber-400' :

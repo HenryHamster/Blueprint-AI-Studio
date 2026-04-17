@@ -1053,10 +1053,18 @@ async def refresh_github_quota(
     import app.shared_state as _ss  # noqa: PLC0415
     from app.github import probe_rate_limit  # noqa: PLC0415
     ok = await probe_rate_limit()
-    return {
-        "probed": bool(ok),
-        "github_quota": dict(_ss.github_quota),
-    }
+    gq = dict(_ss.github_quota)
+    remaining = gq.get("remaining")
+    if remaining is None:
+        status = "unknown"
+    elif remaining < 100:
+        status = "critical"
+    elif remaining < 500:
+        status = "degraded"
+    else:
+        status = "ok"
+    gq["status"] = status
+    return {"probed": bool(ok), "github_quota": gq}
 
 
 @router.post("/github-quota/reset-tracking")
