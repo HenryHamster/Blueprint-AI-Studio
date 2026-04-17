@@ -625,6 +625,14 @@ Output ONLY a JSON object in a \`\`\`json code fence:
             if (!parsedChecks) {
               parsedChecks = Object.keys(parsedCheckResults);
             }
+            // Enforce verdict consistency: any failed check forces FAIL regardless
+            // of what the agent reported in the verdict field.
+            const anyFailed = Object.values(parsedCheckResults).some(
+              (c) => c && typeof c === 'object' && c.passed === false,
+            );
+            if (anyFailed && parsedVerdict !== 'FAIL') {
+              parsedVerdict = 'FAIL';
+            }
           }
 
           // Validate checks_performed contains all mandatory items

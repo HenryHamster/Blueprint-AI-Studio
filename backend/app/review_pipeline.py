@@ -513,6 +513,7 @@ async def _spawn_pipeline_task(
         "base_branch": base_branch,
         "original_task_id": resolved_original_id,
         "iteration": iteration,
+        "max_iterations": per_chain_cap,
         **({"review_history": new_review_history} if new_review_history else {}),
         **({"fix_reason": fix_reason} if fix_reason else {}),
     }

@@ -67,6 +67,12 @@ export function computeMaxFixIterations(task: Record<string, unknown>): number {
   const ctx = (task.context as Record<string, unknown> | undefined) || {};
   const scope = (ctx.scope as string | undefined) || 'medium';
   const reviewLoop = ctx.review_loop as Record<string, unknown> | undefined;
+  // Backend may pass an effective cap (reduced for low-quality directions). Prefer
+  // it so the agent's "iteration N of M" and FINAL-attempt warning match reality.
+  const backendMax = reviewLoop?.max_iterations;
+  if (typeof backendMax === 'number' && Number.isFinite(backendMax) && backendMax > 0) {
+    return Math.floor(backendMax);
+  }
   const fixReason = reviewLoop?.fix_reason as string | undefined;
   if (fixReason === 'ci_failure') return 8;
   if (scope === 'small') return 10;

@@ -769,7 +769,7 @@ describe('self-review phase', () => {
     expect(outcome.parse_failed).toBeUndefined();
   });
 
-  it('derives checks_performed from check_results keys when checks_performed is absent', async () => {
+  it('derives checks_performed from check_results keys and overrides verdict to FAIL when any check failed', async () => {
     const { getMandatoryChecks } = await import('../prompt.js');
     vi.mocked(getMandatoryChecks).mockReturnValue(['test_coverage', 'type_safety']);
     const reviewJson = JSON.stringify({
@@ -790,14 +790,18 @@ describe('self-review phase', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1] as Record<string, unknown>).status === 'FAILED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    const payload = statusCall![1] as Record<string, unknown>;
+    expect(payload.failure_category).toBe('self_review_rejected');
+    const outcome = payload.self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.check_results).toEqual({ test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing type annotation' } });
     expect(outcome.checks_performed).toEqual(['test_coverage', 'type_safety']);
+    expect(outcome.verdict).toBe('FAIL');
     expect(outcome.parse_failed).toBeUndefined();
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 
   it('marks self_review_failed when self-review output contains no JSON', async () => {

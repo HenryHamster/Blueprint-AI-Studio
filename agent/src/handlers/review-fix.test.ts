@@ -127,6 +127,25 @@ describe('computeMaxFixIterations — mirrors backend _max_review_iterations', (
     })).toBe(12);
   });
 
+  it('prefers backend-provided max_iterations over scope-based default', () => {
+    // Backend may reduce cap (~30%) for low-quality directions; agent must use it
+    // so "iteration N of M" and FINAL-attempt warning match what backend enforces.
+    expect(computeMaxFixIterations({
+      context: { scope: 'medium', review_loop: { max_iterations: 8 } },
+    })).toBe(8);
+    // Backend value also wins over ci_failure default.
+    expect(computeMaxFixIterations({
+      context: { scope: 'small', review_loop: { fix_reason: 'ci_failure', max_iterations: 6 } },
+    })).toBe(6);
+    // Invalid backend values fall through to scope-based default.
+    expect(computeMaxFixIterations({
+      context: { scope: 'small', review_loop: { max_iterations: 0 } },
+    })).toBe(10);
+    expect(computeMaxFixIterations({
+      context: { scope: 'small', review_loop: { max_iterations: 'bad' } },
+    })).toBe(10);
+  });
+
   it('does not throw on unusual (but typed) context shapes', () => {
     // Empty object is the realistic edge; the guard coerces to ctx={}.
     expect(() => computeMaxFixIterations({ context: {} })).not.toThrow();
