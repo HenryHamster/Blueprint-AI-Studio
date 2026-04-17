@@ -556,6 +556,30 @@ ${hotspotsSection}
     pipelineScopeRatesSection = `\nPipeline-wide scope merge rates (current / prev 24h window): ${parts.join(', ')}\n`;
   }
 
+  // Medium-scope pre/post investment measurement — rendered so measurement directions
+  // can read the headline before/after numbers straight from the prompt.
+  const mediumScopeMeasurement = pipelineHealthForScope?.medium_scope_measurement as
+    | {
+        medium_scope_merge_rate: number | null;
+        total_created: number | null;
+        total_merged: number | null;
+        pre_investment: { merge_rate: number | null; created: number | null; merged: number | null } | null;
+        post_investment: { merge_rate: number | null; created: number | null; merged: number | null } | null;
+      }
+    | null
+    | undefined;
+  if (mediumScopeMeasurement) {
+    const fmtPct = (r: number | null | undefined) => (typeof r === 'number' ? `${Math.round(r * 100)}%` : '—');
+    const pre = mediumScopeMeasurement.pre_investment;
+    const post = mediumScopeMeasurement.post_investment;
+    if (pre || post) {
+      const preStr = pre ? `pre-investment ${fmtPct(pre.merge_rate)} (${pre.created ?? 0} tasks)` : 'pre-investment —';
+      const postStr = post ? `post-investment ${fmtPct(post.merge_rate)} (${post.created ?? 0} tasks)` : 'post-investment —';
+      const headline = `${fmtPct(mediumScopeMeasurement.medium_scope_merge_rate)} overall (${mediumScopeMeasurement.total_merged ?? 0}/${mediumScopeMeasurement.total_created ?? 0})`;
+      pipelineScopeRatesSection += `Medium-scope before/after: ${preStr}, ${postStr}; ${headline}\n`;
+    }
+  }
+
   // Build anomaly signals section for undirected research cycles
   let anomalySection = '';
   if (!currentDirectionId) {

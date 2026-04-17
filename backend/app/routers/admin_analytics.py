@@ -903,6 +903,34 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
             "sample_size": len(tasks_with_both),
         }
 
+    # Medium-scope pre/post investment measurement — computed over a longer lookback
+    # so research agents see the actual before/after merge rates straight from the prompt
+    # instead of hitting /medium-scope-measurement (admin-auth only; agent tokens 401).
+    medium_scope_measurement: Dict[str, Any] | None = None
+    try:
+        ms_cutoff = _now - timedelta(days=365)
+        ms_result = await session.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+                Task.created_at >= ms_cutoff,
+            )
+        )
+        ms_all = ms_result.scalars().all()
+        ms_medium = [t for t in ms_all if (t.context or {}).get("scope") == "medium"]
+        if ms_medium:
+            full = _compute_medium_scope_measurement(ms_medium, project, None, 365)
+            medium_scope_measurement = {
+                "medium_scope_merge_rate": full.get("medium_scope_merge_rate"),
+                "total_created": full.get("total_created"),
+                "total_merged": full.get("total_merged"),
+                "pre_investment": full.get("pre_investment"),
+                "post_investment": full.get("post_investment"),
+                "investment_start": full.get("investment_start"),
+            }
+    except Exception:
+        logger.exception("[ANALYTICS] medium_scope_measurement computation failed (non-critical)")
+
     return {
         "success_rate": success_rate,
         "trend": trend,
@@ -920,6 +948,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "scope_merge_rates": scope_merge_rates,
         "medium_scope_review_iterations": medium_scope_review_iterations,
         "direction_first_attempt_feedback": direction_first_attempt_feedback,
+        "medium_scope_measurement": medium_scope_measurement,
     }
 
 
