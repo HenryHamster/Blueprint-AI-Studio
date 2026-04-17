@@ -557,3 +557,61 @@ class TestFrontendSizeGuardrails:
 
     def test_messages_panel(self):
         self._check_frontend("components/MessagesPanel.tsx")
+
+
+# ── Failure Classification Taxonomy ────────────────────────────────────────
+
+
+class TestFailureClassificationInvariants:
+    """Structural invariants over failure_classification canonical classes.
+
+    INFRA_CLASSES governs which failures are treated as infrastructure (not
+    penalizing direction health). direction_outcomes and research_completion
+    both import it, so accidental additions/removals silently change rollup
+    and dedup behavior across the pipeline.
+    """
+
+    def test_infra_classes_membership_exact(self):
+        from app.failure_classification import (
+            AGENT_TIMEOUT,
+            EXTERNAL_API,
+            INFRA_CLASSES,
+            PROVISION_FAILURE,
+            RATE_LIMIT,
+            SCOPE_OVERFLOW,
+        )
+        assert INFRA_CLASSES == frozenset({
+            PROVISION_FAILURE,
+            RATE_LIMIT,
+            AGENT_TIMEOUT,
+            EXTERNAL_API,
+            SCOPE_OVERFLOW,
+        }), (
+            "INFRA_CLASSES membership changed — direction_outcomes and "
+            "research_completion rely on this exact set to distinguish infra "
+            "failures from code failures."
+        )
+
+    def test_canonical_classes_partitioned_by_infra(self):
+        from app.failure_classification import (
+            AGENT_TIMEOUT,
+            CODE_ERROR,
+            EXTERNAL_API,
+            INFRA_CLASSES,
+            PROVISION_FAILURE,
+            RATE_LIMIT,
+            SCOPE_OVERFLOW,
+        )
+        canonical = [
+            CODE_ERROR,
+            PROVISION_FAILURE,
+            AGENT_TIMEOUT,
+            EXTERNAL_API,
+            RATE_LIMIT,
+            SCOPE_OVERFLOW,
+        ]
+        for cls in canonical:
+            assert isinstance(cls, str) and cls, f"{cls!r} must be a non-empty string"
+            assert cls in INFRA_CLASSES or cls == CODE_ERROR, (
+                f"{cls!r} must be either CODE_ERROR or a member of INFRA_CLASSES"
+            )

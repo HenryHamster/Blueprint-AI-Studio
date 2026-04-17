@@ -91,7 +91,26 @@ interface DigestData {
   pipeline_conversion_rate?: number | null;
   scope_merge_rates?: Record<string, { created: number; merged: number }> | null;
   prev_scope_merge_rates?: Record<string, { created: number; merged: number }> | null;
+  failure_taxonomy_distribution?: {
+    categories: Record<string, { count: number; percentage: number }>;
+    total_failures: number;
+    dominant_category: string | null;
+  } | null;
 }
+
+const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
+const TAXONOMY_LABELS: Record<string, string> = {
+  scope_related: 'scope',
+  review_quality: 'review',
+  infra_related: 'infra',
+  code_defect: 'code',
+};
+const TAXONOMY_COLORS: Record<string, string> = {
+  scope_related: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
+  review_quality: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
+  infra_related: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  code_defect: 'bg-red-500/20 text-red-400 border-red-500/30',
+};
 
 interface SparkPoint {
   active: number;
@@ -433,6 +452,36 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               </div>
             </section>
           )}
+
+          {/* Section 1c: Failure Taxonomy Breakdown */}
+          {!loading && digest?.failure_taxonomy_distribution && digest.failure_taxonomy_distribution.total_failures > 0 && (() => {
+            const tax = digest.failure_taxonomy_distribution;
+            return (
+            <section>
+              <div className="flex flex-wrap gap-1.5 items-center">
+                <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Taxonomy</span>
+                {TAXONOMY_ORDER.map(k => {
+                  const cat = tax.categories[k];
+                  if (!cat) return null;
+                  const isDominant = tax.dominant_category === k;
+                  const base = TAXONOMY_COLORS[k] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+                  const cls = isDominant ? `${base} ring-1 ring-current` : base;
+                  return (
+                    <span
+                      key={k}
+                      className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${cls}`}
+                      title={`${TAXONOMY_LABELS[k]}: ${cat.count} (${cat.percentage}%)${isDominant ? ' — dominant' : ''}`}
+                    >
+                      {TAXONOMY_LABELS[k]}
+                      <span className="font-bold">{cat.count}</span>
+                      <span className="opacity-70">{cat.percentage}%</span>
+                    </span>
+                  );
+                })}
+              </div>
+            </section>
+            );
+          })()}
 
           {/* Section 2: Direction Portfolio Health */}
           <section>
