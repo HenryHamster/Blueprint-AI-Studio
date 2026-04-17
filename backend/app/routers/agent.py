@@ -1241,14 +1241,19 @@ async def claim_task(
                 for st in success_rows:
                     sctx = st.context or {}
                     analysis_plan = sctx.get("_analysis_plan")
-                    if not analysis_plan:
+                    changed_files = sctx.get("_pr_changed_files")
+                    has_changed_files = isinstance(changed_files, list) and changed_files
+                    if not analysis_plan and not has_changed_files:
                         continue
                     s_entry = {
                         "title": st.title,
-                        "analysis_plan": str(analysis_plan)[:500],
                     }
-                    changed_files = sctx.get("_pr_changed_files")
-                    if isinstance(changed_files, list) and changed_files:
+                    if analysis_plan:
+                        s_entry["analysis_plan"] = str(analysis_plan)[:500]
+                    scope = sctx.get("scope")
+                    if scope:
+                        s_entry["scope"] = str(scope)
+                    if has_changed_files:
                         s_entry["pr_changed_files"] = [str(f) for f in changed_files[:10]]
                     s_entry_len = len(json.dumps(s_entry))
                     if success_chars + s_entry_len > 1500:

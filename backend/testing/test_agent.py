@@ -1873,20 +1873,34 @@ async def test_claim_injects_direction_successful_analysis(client: AsyncClient, 
             "direction_id": direction_id,
             "_analysis_plan": long_plan,
             "_pr_changed_files": ["svc.py", "route.py"],
+            "scope": "medium",
         },
         status=TaskStatus.COMPLETED,
         title="Successful task",
     )
-    # Successful task with no analysis plan — should be skipped
-    success_no_plan = Task(
+    # Small-scope task without analysis plan but with pr_changed_files — should be included
+    success_small = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "no plan"}],
+        payloads=[{"type": "create", "prompt": "small"}],
         vm_instance_id="vm-success-2",
+        context={
+            "direction_id": direction_id,
+            "_pr_changed_files": ["small.py"],
+            "scope": "small",
+        },
+        status=TaskStatus.COMPLETED,
+        title="Successful small-scope task",
+    )
+    # Successful task with no analysis plan AND no pr_changed_files — should be skipped
+    success_empty = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "empty"}],
+        vm_instance_id="vm-success-3",
         context={"direction_id": direction_id},
         status=TaskStatus.COMPLETED,
-        title="Successful no-plan task",
+        title="Successful empty task",
     )
-    db_session.add_all([success, success_no_plan])
+    db_session.add_all([success, success_small, success_empty])
     await db_session.commit()
 
     current = Task(
@@ -1905,11 +1919,18 @@ async def test_claim_injects_direction_successful_analysis(client: AsyncClient, 
     dc = resp.json()["direction_context"]
     assert "direction_successful_analysis" in dc
     dsa = dc["direction_successful_analysis"]
-    assert len(dsa) == 1
-    entry = dsa[0]
-    assert entry["title"] == "Successful task"
-    assert len(entry["analysis_plan"]) == 500
-    assert entry["pr_changed_files"] == ["svc.py", "route.py"]
+    assert len(dsa) == 2
+    titles = {e["title"] for e in dsa}
+    assert titles == {"Successful task", "Successful small-scope task"}
+    by_title = {e["title"]: e for e in dsa}
+    full = by_title["Successful task"]
+    assert len(full["analysis_plan"]) == 500
+    assert full["pr_changed_files"] == ["svc.py", "route.py"]
+    assert full["scope"] == "medium"
+    small = by_title["Successful small-scope task"]
+    assert "analysis_plan" not in small
+    assert small["pr_changed_files"] == ["small.py"]
+    assert small["scope"] == "small"
     import json as _json
     assert len(_json.dumps(dsa)) <= 1500
 
