@@ -147,9 +147,10 @@ def _calibrate_scope(
     for entry in direction.get("research_history", [])[-3:]:
         for scope, stats in (entry.get("scope_breakdown") or {}).items():
             if scope not in aggregated:
-                aggregated[scope] = {"created": 0, "merged": 0}
+                aggregated[scope] = {"created": 0, "merged": 0, "failed_infra": 0}
             aggregated[scope]["created"] += stats.get("created", 0)
             aggregated[scope]["merged"] += stats.get("merged", 0)
+            aggregated[scope]["failed_infra"] += stats.get("failed_infra", 0)
 
     direction_data_points = sum(v["created"] for v in aggregated.values())
 
@@ -164,9 +165,10 @@ def _calibrate_scope(
             for entry in (d.get("research_history") or []):
                 for s, stats in (entry.get("scope_breakdown") or {}).items():
                     if s not in proj_agg:
-                        proj_agg[s] = {"created": 0, "merged": 0}
+                        proj_agg[s] = {"created": 0, "merged": 0, "failed_infra": 0}
                     proj_agg[s]["created"] += stats.get("created", 0)
                     proj_agg[s]["merged"] += stats.get("merged", 0)
+                    proj_agg[s]["failed_infra"] += stats.get("failed_infra", 0)
         if sum(v["created"] for v in proj_agg.values()) < 3:
             return _maybe_cold_start_upgrade_medium(proposed_scope, direction)
         agg = proj_agg
@@ -176,10 +178,17 @@ def _calibrate_scope(
         return _maybe_cold_start_upgrade_medium(proposed_scope, direction)
 
     def _merge_rate(scope: str) -> float | None:
+        # Exclude infra failures from the denominator so transient provisioning /
+        # rate-limit / timeout incidents don't masquerade as scope-quality signal.
+        # When all attempts at a scope were infra-failed, effective denominator is 0:
+        # treat as insufficient data rather than 0% merge rate.
         stats = agg.get(scope)
-        if not stats or stats["created"] < 3:
+        if not stats:
             return None
-        return stats["merged"] / stats["created"]
+        effective = stats["created"] - stats.get("failed_infra", 0)
+        if effective < 3:
+            return None
+        return stats["merged"] / effective
 
     rate = _merge_rate(proposed_scope)
     if rate is None or rate >= threshold:
@@ -238,6 +247,10 @@ def predict_spawn_success(
     4. Pipeline-wide scope merge rate from runtime_config["pipeline_scope_merge_rates"]
        (weight 0.5 — weakest fallback so new directions with sparse data don't
        collapse to a neutral 0.5 that bypasses the low_confidence_spawn gate)
+    5. Average subtask_merge_rate from decomposition_quality in recent history
+       (weight 1.5, large scope only — reflects whether plan decomposition
+       actually produces mergeable subtasks for this direction; omitted when
+       no decomposition data exists)
 
     Returns a float in [0.0, 1.0]. Falls back to 0.5 when data is insufficient.
     No DB queries — uses only data already loaded during research_completion processing.
@@ -251,14 +264,17 @@ def predict_spawn_success(
     for entry in history3:
         for s, stats in (entry.get("scope_breakdown") or {}).items():
             if s not in scope_agg:
-                scope_agg[s] = {"created": 0, "merged": 0}
+                scope_agg[s] = {"created": 0, "merged": 0, "failed_infra": 0}
             scope_agg[s]["created"] += stats.get("created", 0)
             scope_agg[s]["merged"] += stats.get("merged", 0)
+            scope_agg[s]["failed_infra"] += stats.get("failed_infra", 0)
     scope_stats = scope_agg.get(scope)
-    if scope_stats and scope_stats["created"] >= 2:
-        rate = scope_stats["merged"] / scope_stats["created"]
-        signals.append(rate)
-        weights.append(2.0)
+    if scope_stats:
+        effective = scope_stats["created"] - scope_stats.get("failed_infra", 0)
+        if effective >= 2:
+            rate = scope_stats["merged"] / effective
+            signals.append(rate)
+            weights.append(2.0)
 
     # Signal 2: project-level scope merge rate across all directions
     # (proxy for project-level first_attempt_success_rate for this task type, since
@@ -269,14 +285,17 @@ def predict_spawn_success(
             for entry in (d.get("research_history") or []):
                 for s, stats in (entry.get("scope_breakdown") or {}).items():
                     if s not in proj_agg:
-                        proj_agg[s] = {"created": 0, "merged": 0}
+                        proj_agg[s] = {"created": 0, "merged": 0, "failed_infra": 0}
                     proj_agg[s]["created"] += stats.get("created", 0)
                     proj_agg[s]["merged"] += stats.get("merged", 0)
+                    proj_agg[s]["failed_infra"] += stats.get("failed_infra", 0)
         proj_scope_stats = proj_agg.get(scope)
-        if proj_scope_stats and proj_scope_stats["created"] >= 5:
-            proj_rate = proj_scope_stats["merged"] / proj_scope_stats["created"]
-            signals.append(proj_rate)
-            weights.append(1.0)
+        if proj_scope_stats:
+            proj_effective = proj_scope_stats["created"] - proj_scope_stats.get("failed_infra", 0)
+            if proj_effective >= 5:
+                proj_rate = proj_scope_stats["merged"] / proj_effective
+                signals.append(proj_rate)
+                weights.append(1.0)
 
     # Signal 3: direction's recent overall failure rate (last 3 history entries)
     if history3:
@@ -285,6 +304,22 @@ def predict_spawn_success(
         if total_created >= 3:
             failure_rate = total_failed / total_created
             signals.append(max(0.0, 1.0 - failure_rate))
+            weights.append(1.5)
+
+    # Signal 5: decomposition quality for large-scope spawns. Large-scope findings
+    # are routed to the plan agent, which decomposes them into subtasks; the
+    # historical merge rate of those subtasks is a direct indicator of whether
+    # plan decomposition works for this direction. Omitted entirely when no
+    # decomposition data exists so brand-new directions aren't penalized.
+    if scope == "large":
+        decomp_rates: list[float] = []
+        for entry in history3:
+            for dq in (entry.get("decomposition_quality") or []):
+                rate = dq.get("subtask_merge_rate")
+                if isinstance(rate, (int, float)):
+                    decomp_rates.append(float(rate))
+        if decomp_rates:
+            signals.append(sum(decomp_rates) / len(decomp_rates))
             weights.append(1.5)
 
     # Signal 4: pipeline-wide scope merge rate fallback. Weighted lowest so it

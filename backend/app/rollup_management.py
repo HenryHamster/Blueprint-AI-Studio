@@ -1062,57 +1062,78 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 f"Rollup PR #{rollup_pr_number} merge deferred (mergeable_state={_ms_display}, "
                                 f"deferral {deferred_count}/total {total_deferrals}) — next rollup sweep will re-attempt"
                             )
-                            # Per-state alert: fires at exact threshold match per state
+                            # Per-state alert: fires at exact threshold match per state.
+                            # Alert/approval dispatch is wrapped in try/except so dispatch
+                            # failures don't prevent the counter-persisting commit below —
+                            # otherwise counters reset each sweep and thresholds never fire.
                             if deferred_count == alert_threshold:
-                                await _maybe_create_failure_alert(
-                                    parent, session,
-                                    f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
-                                    f"for {deferred_count} consecutive sweeps"
-                                )
+                                try:
+                                    await _maybe_create_failure_alert(
+                                        parent, session,
+                                        f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
+                                        f"for {deferred_count} consecutive sweeps"
+                                    )
+                                except Exception as _alert_err:
+                                    logger.warning(f"[ROLLUP] Failed to create per-state deferral alert for PR #{rollup_pr_number}: {_alert_err}")
                             # Total-count alert: fires once when total crosses threshold,
                             # catching state-flapping PRs that evade the per-state counter.
                             if total_deferrals >= total_alert_threshold and not parent_ctx.get("_merge_total_alerted"):
-                                await _maybe_create_failure_alert(
-                                    parent, session,
-                                    f"Rollup PR #{rollup_pr_number} merge deferred {total_deferrals} times across "
-                                    f"states (flapping) — manual investigation required"
-                                )
+                                try:
+                                    await _maybe_create_failure_alert(
+                                        parent, session,
+                                        f"Rollup PR #{rollup_pr_number} merge deferred {total_deferrals} times across "
+                                        f"states (flapping) — manual investigation required"
+                                    )
+                                except Exception as _alert_err:
+                                    logger.warning(f"[ROLLUP] Failed to create total-deferral alert for PR #{rollup_pr_number}: {_alert_err}")
                                 parent.context = {**parent.context, "_merge_total_alerted": True}
                             # Time-based alert: fires once after total deferral time crosses threshold
                             if elapsed_minutes >= time_alert_minutes and not parent_ctx.get("_merge_time_alerted"):
-                                await _maybe_create_failure_alert(
-                                    parent, session,
-                                    f"Rollup PR #{rollup_pr_number} merge has been deferred for "
-                                    f"{elapsed_minutes:.0f} minutes — manual investigation required"
-                                )
+                                try:
+                                    await _maybe_create_failure_alert(
+                                        parent, session,
+                                        f"Rollup PR #{rollup_pr_number} merge has been deferred for "
+                                        f"{elapsed_minutes:.0f} minutes — manual investigation required"
+                                    )
+                                except Exception as _alert_err:
+                                    logger.warning(f"[ROLLUP] Failed to create time-based deferral alert for PR #{rollup_pr_number}: {_alert_err}")
                                 parent.context = {**parent.context, "_merge_time_alerted": True}
                             # Approval gate: any of per-state, total, or time thresholds can fire it.
                             # Only one approval dispatch — the first condition wins.
                             if not parent.requires_approval:
                                 if deferred_count >= approval_threshold:
                                     parent.requires_approval = True
-                                    await _dispatch_rollup_approval_alert(
-                                        parent, session,
-                                        f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
-                                        f"for {deferred_count} sweeps — manual investigation required",
-                                        pr_number=rollup_pr_number,
-                                    )
+                                    try:
+                                        await _dispatch_rollup_approval_alert(
+                                            parent, session,
+                                            f"Rollup PR #{rollup_pr_number} stuck in mergeable_state={_ms_display} "
+                                            f"for {deferred_count} sweeps — manual investigation required",
+                                            pr_number=rollup_pr_number,
+                                        )
+                                    except Exception as _alert_err:
+                                        logger.warning(f"[ROLLUP] Failed to dispatch per-state approval alert for PR #{rollup_pr_number}: {_alert_err}")
                                 elif total_deferrals >= total_approval_threshold:
                                     parent.requires_approval = True
-                                    await _dispatch_rollup_approval_alert(
-                                        parent, session,
-                                        f"Rollup PR #{rollup_pr_number} deferred {total_deferrals} times across "
-                                        f"states — manual investigation required",
-                                        pr_number=rollup_pr_number,
-                                    )
+                                    try:
+                                        await _dispatch_rollup_approval_alert(
+                                            parent, session,
+                                            f"Rollup PR #{rollup_pr_number} deferred {total_deferrals} times across "
+                                            f"states — manual investigation required",
+                                            pr_number=rollup_pr_number,
+                                        )
+                                    except Exception as _alert_err:
+                                        logger.warning(f"[ROLLUP] Failed to dispatch total-deferral approval alert for PR #{rollup_pr_number}: {_alert_err}")
                                 elif elapsed_minutes >= time_approval_minutes:
                                     parent.requires_approval = True
-                                    await _dispatch_rollup_approval_alert(
-                                        parent, session,
-                                        f"Rollup PR #{rollup_pr_number} has been deferred for "
-                                        f"{elapsed_minutes:.0f} minutes — manual investigation required",
-                                        pr_number=rollup_pr_number,
-                                    )
+                                    try:
+                                        await _dispatch_rollup_approval_alert(
+                                            parent, session,
+                                            f"Rollup PR #{rollup_pr_number} has been deferred for "
+                                            f"{elapsed_minutes:.0f} minutes — manual investigation required",
+                                            pr_number=rollup_pr_number,
+                                        )
+                                    except Exception as _alert_err:
+                                        logger.warning(f"[ROLLUP] Failed to dispatch time-based approval alert for PR #{rollup_pr_number}: {_alert_err}")
                             session.add(parent)
                             await session.commit()
                             _log = logger.warning if _is_unrecognized else logger.info

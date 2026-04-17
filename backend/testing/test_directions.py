@@ -2432,3 +2432,57 @@ class TestPredictSpawnSuccessPipelineSignal:
             assert predict_spawn_success("medium", {}) == 0.5
         finally:
             runtime_config["pipeline_scope_merge_rates"] = {}
+
+
+class TestPredictSpawnSuccessDecompositionSignal:
+    """Unit tests for the large-scope decomposition_quality signal."""
+
+    def test_decomposition_signal_only_applies_to_large_scope(self):
+        d = {
+            "research_history": [
+                {"decomposition_quality": [{"subtask_merge_rate": 0.8}]},
+            ],
+        }
+        # medium scope: decomposition signal omitted → no signals → neutral 0.5
+        assert predict_spawn_success("medium", d) == 0.5
+
+    def test_decomposition_signal_averages_recent_plans(self):
+        d = {
+            "research_history": [
+                {"decomposition_quality": [
+                    {"subtask_merge_rate": 0.4},
+                    {"subtask_merge_rate": 0.8},
+                ]},
+            ],
+        }
+        # Only signal 5: average = 0.6
+        assert predict_spawn_success("large", d) == pytest.approx(0.6)
+
+    def test_decomposition_signal_omitted_when_no_data(self):
+        """No decomposition data → signal omitted, not defaulted to 0.5."""
+        d = {"research_history": [{"decomposition_quality": []}]}
+        assert predict_spawn_success("large", d) == 0.5
+
+    def test_decomposition_signal_skips_none_rates(self):
+        d = {
+            "research_history": [
+                {"decomposition_quality": [
+                    {"subtask_merge_rate": None},
+                    {"subtask_merge_rate": 0.5},
+                ]},
+            ],
+        }
+        assert predict_spawn_success("large", d) == pytest.approx(0.5)
+
+    def test_decomposition_signal_combines_with_direction_signal(self):
+        d = {
+            "research_history": [
+                {
+                    "scope_breakdown": {"large": {"created": 2, "merged": 2}},
+                    "decomposition_quality": [{"subtask_merge_rate": 0.0}],
+                },
+            ],
+        }
+        # Signal 1 (weight 2.0): 1.0; Signal 5 (weight 1.5): 0.0
+        # (2.0*1.0 + 1.5*0.0) / 3.5 = 0.5714...
+        assert predict_spawn_success("large", d) == pytest.approx(2.0 / 3.5)
