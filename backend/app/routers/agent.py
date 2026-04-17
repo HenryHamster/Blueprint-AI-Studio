@@ -807,35 +807,11 @@ async def claim_task(
                             for cat, issues in top3
                         }
 
-                # Extract top recurring specific issue descriptions from first reviews (iteration 0)
+                from app.playbook_learning import compute_recurring_first_review_descriptions
                 try:
-                    from collections import Counter
-                    desc_counter: Counter = Counter()
-                    desc_to_cat: dict = {}
-                    for ht in high_iter_rows:
-                        if ht.created_at and ht.created_at < cutoff_14d:
-                            continue
-                        review_loop = (ht.context or {}).get("review_loop", {})
-                        rev_hist = review_loop.get("review_history", []) if review_loop else []
-                        for entry in rev_hist:
-                            if entry.get("iteration") != 0:
-                                continue
-                            for issue in entry.get("issues", []):
-                                desc = issue.get("description") or ""
-                                cat = issue.get("category", "other")
-                                if not desc:
-                                    continue
-                                normalized = desc.lower().strip()[:120]
-                                desc_counter[normalized] += 1
-                                if normalized not in desc_to_cat:
-                                    desc_to_cat[normalized] = cat
-                    recurring = [(desc, cnt) for desc, cnt in desc_counter.items() if cnt >= 2]
-                    if recurring:
-                        recurring.sort(key=lambda x: -x[1])
-                        top_first_review_issues = [
-                            {"description": desc, "count": cnt, "category": desc_to_cat.get(desc, "other")}
-                            for desc, cnt in recurring[:3]
-                        ]
+                    top_first_review_issues = compute_recurring_first_review_descriptions(
+                        high_iter_rows, cutoff_14d,
+                    )
                 except Exception:
                     logger.exception("[AGENT] Failed to compute top_first_review_issues (non-critical)")
 
@@ -843,47 +819,12 @@ async def claim_task(
                 # Requires at least 3 direction-scoped tasks with review history to avoid noisy signals.
                 try:
                     if current_direction_id:
-                        dir_desc_task_ids: dict = {}
-                        dir_desc_to_cat: dict = {}
-                        dir_task_count = 0
-                        for ht in high_iter_rows:
-                            if (ht.context or {}).get("direction_id") != current_direction_id:
-                                continue
-                            if ht.created_at and ht.created_at < cutoff_14d:
-                                continue
-                            review_loop = (ht.context or {}).get("review_loop", {})
-                            rev_hist = review_loop.get("review_history", []) if review_loop else []
-                            if not rev_hist:
-                                continue
-                            dir_task_count += 1
-                            for entry in rev_hist:
-                                if entry.get("iteration") != 0:
-                                    continue
-                                for issue in entry.get("issues", []):
-                                    desc = issue.get("description") or ""
-                                    cat = issue.get("category", "other")
-                                    if not desc:
-                                        continue
-                                    normalized = desc.lower().strip()[:120]
-                                    dir_desc_task_ids.setdefault(normalized, set()).add(ht.id)
-                                    if normalized not in dir_desc_to_cat:
-                                        dir_desc_to_cat[normalized] = cat
-                        if dir_task_count >= 3:
-                            dir_recurring = [
-                                (desc, len(tids))
-                                for desc, tids in dir_desc_task_ids.items()
-                                if len(tids) >= 2
-                            ]
-                            if dir_recurring:
-                                dir_recurring.sort(key=lambda x: -x[1])
-                                direction_top_first_review_issues = [
-                                    {
-                                        "description": desc,
-                                        "count": cnt,
-                                        "category": dir_desc_to_cat.get(desc, "other"),
-                                    }
-                                    for desc, cnt in dir_recurring[:3]
-                                ]
+                        direction_top_first_review_issues = compute_recurring_first_review_descriptions(
+                            high_iter_rows, cutoff_14d,
+                            task_filter=lambda ht: (ht.context or {}).get("direction_id") == current_direction_id,
+                            min_tasks=3,
+                            count_unique_tasks=True,
+                        )
                 except Exception:
                     logger.exception("[AGENT] Failed to compute direction_top_first_review_issues (non-critical)")
 
@@ -892,47 +833,12 @@ async def claim_task(
                 # by small-scope data.
                 try:
                     if current_task_scope:
-                        from collections import Counter
-                        scope_desc_counter: Counter = Counter()
-                        scope_desc_to_cat: dict = {}
-                        scope_task_count = 0
-                        for ht in high_iter_rows:
-                            if (ht.context or {}).get("scope") != current_task_scope:
-                                continue
-                            if ht.created_at and ht.created_at < cutoff_14d:
-                                continue
-                            review_loop = (ht.context or {}).get("review_loop", {})
-                            rev_hist = review_loop.get("review_history", []) if review_loop else []
-                            if not rev_hist:
-                                continue
-                            scope_task_count += 1
-                            for entry in rev_hist:
-                                if entry.get("iteration") != 0:
-                                    continue
-                                for issue in entry.get("issues", []):
-                                    desc = issue.get("description") or ""
-                                    cat = issue.get("category", "other")
-                                    if not desc:
-                                        continue
-                                    normalized = desc.lower().strip()[:120]
-                                    scope_desc_counter[normalized] += 1
-                                    if normalized not in scope_desc_to_cat:
-                                        scope_desc_to_cat[normalized] = cat
-                        if scope_task_count >= 3:
-                            scope_recurring = [
-                                (desc, cnt) for desc, cnt in scope_desc_counter.items() if cnt >= 2
-                            ]
-                            if scope_recurring:
-                                scope_recurring.sort(key=lambda x: -x[1])
-                                scope_specific_review_issues = [
-                                    {
-                                        "description": desc,
-                                        "count": cnt,
-                                        "category": scope_desc_to_cat.get(desc, "other"),
-                                        "scope": current_task_scope,
-                                    }
-                                    for desc, cnt in scope_recurring[:3]
-                                ]
+                        scope_specific_review_issues = compute_recurring_first_review_descriptions(
+                            high_iter_rows, cutoff_14d,
+                            task_filter=lambda ht: (ht.context or {}).get("scope") == current_task_scope,
+                            min_tasks=3,
+                            extra_fields={"scope": current_task_scope},
+                        )
                 except Exception:
                     logger.exception("[AGENT] Failed to compute scope_specific_review_issues (non-critical)")
             except Exception:

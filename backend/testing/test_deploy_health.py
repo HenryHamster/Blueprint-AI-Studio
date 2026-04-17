@@ -21,6 +21,10 @@ import app.deploy_health as _dh
 import app.shared_state as _shared_state
 from app.models import DeploymentState, DeploymentStatus, Project
 
+# Capture real function references at import time so tests can invoke them
+# after the dh_db fixture replaces them with AsyncMocks.
+_REAL_CREATE_FORCED_RESUME_ALERTS = _dh._create_forced_resume_alerts
+
 # ── SQLite JSONB compatibility ────────────────────────────────────────────────
 
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
@@ -73,6 +77,7 @@ def reset_module_state():
     _dh._last_auto_resume_at = None
     _dh._recent_auto_resumes.clear()
     _dh._last_resume_was_forced = False
+    _dh._consecutive_force_resumes = 0
     _shared_state.deploy_monitoring["task_results"].clear()
     yield
     _dh._pause_failure_streak = 0
@@ -80,6 +85,7 @@ def reset_module_state():
     _dh._last_auto_resume_at = None
     _dh._recent_auto_resumes.clear()
     _dh._last_resume_was_forced = False
+    _dh._consecutive_force_resumes = 0
     _shared_state.deploy_monitoring["task_results"].clear()
 
 
@@ -1368,3 +1374,136 @@ async def test_orchestrator_persist_zone_health_round_trips_last_resume_was_forc
     _dh._last_resume_was_forced = True
     _dh._restore_health_streaks({})
     assert _dh._last_resume_was_forced is False
+
+
+# ── Tests: consecutive force-resume counter and escalation ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_force_resume_increments_consecutive_counter(dh_db):
+    """Each force-resume increments _consecutive_force_resumes."""
+    from datetime import timedelta
+    long_ago = _dh._utcnow() - timedelta(seconds=10_000)
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: claude_api",
+        pre_pause_max_vms=8,
+        paused_at=long_ago,
+    )
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.runtime_config["max_auto_pause_duration_seconds"] = 7200
+    _shared_state.deploy_monitoring["window_start"] = None
+    _set_critical_failures("claude_api")
+
+    _dh._consecutive_force_resumes = 1  # simulating a prior force-resume
+
+    await _dh._check_pause_mode()
+
+    assert _dh._consecutive_force_resumes == 2
+    _dh._create_forced_resume_alerts.assert_awaited_once()
+    call = _dh._create_forced_resume_alerts.await_args
+    # 4th positional arg is the counter.
+    assert call.args[3] == 2
+
+
+@pytest.mark.asyncio
+async def test_normal_resume_resets_consecutive_force_counter(dh_db):
+    """A normal (healthy) auto-resume resets the force-resume counter to 0."""
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: db",
+        pre_pause_max_vms=4,
+    )
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.deploy_monitoring["window_start"] = None
+    _set_healthy()
+
+    _dh._consecutive_force_resumes = 2
+    _seed_recovery_history(True, True)
+
+    await _dh._check_pause_mode()
+
+    # Third healthy probe triggers a normal (not forced) resume; counter resets.
+    assert _shared_state.runtime_config["max_concurrent_vms"] > 0
+    assert _dh._consecutive_force_resumes == 0
+
+
+@pytest.mark.asyncio
+async def test_force_resume_escalation_threshold_changes_title(dh_db, mocker):
+    """After 3 consecutive force-resumes, the alert title escalates to 'Prolonged pipeline stall'."""
+    mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
+
+    # Seed a project so the alert helper has somewhere to write.
+    from app.models import Alert
+    import uuid as _uuid
+    project = Project(id=_uuid.uuid4(), name="p", user_id="u")
+    dh_db.add(project)
+    await dh_db.commit()
+
+    # Non-escalated case (counter = 1).
+    await _REAL_CREATE_FORCED_RESUME_ALERTS(dh_db, 7200, ["claude_api"], 1)
+    await dh_db.commit()
+    alerts = (await dh_db.execute(select(Alert))).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].title == "Pipeline force-resumed: max auto-pause duration exceeded"
+
+    # Escalated case (counter = 3).
+    await _REAL_CREATE_FORCED_RESUME_ALERTS(dh_db, 7200, ["claude_api"], 3)
+    await dh_db.commit()
+    alerts = (await dh_db.execute(select(Alert).order_by(Alert.created_at))).scalars().all()
+    escalated = [a for a in alerts if a.title.startswith("Prolonged pipeline stall")]
+    assert len(escalated) == 1
+    assert "3 consecutive force-resumes" in escalated[0].title
+    assert "persistent infrastructure failure" in escalated[0].message.lower()
+
+
+def test_restore_health_streaks_restores_consecutive_force_resumes():
+    """_restore_health_streaks rehydrates _consecutive_force_resumes across restarts."""
+    _dh._consecutive_force_resumes = 0
+    _dh._restore_health_streaks({"_consecutive_force_resumes": 5})
+    assert _dh._consecutive_force_resumes == 5
+
+    # Missing key -> safe default 0.
+    _dh._consecutive_force_resumes = 7
+    _dh._restore_health_streaks({})
+    assert _dh._consecutive_force_resumes == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_persist_zone_health_round_trips_consecutive_force_resumes(mocker):
+    """_consecutive_force_resumes must survive persist/restore so escalation counter holds across restarts."""
+    import threading
+    from collections import deque as _deque
+    from unittest.mock import MagicMock
+    from app.orchestrator import _persist_zone_health as _orch_persist
+
+    mocker.patch("app.compute._zone_health", {})
+    mocker.patch("app.compute._zone_lock", threading.Lock())
+    mocker.patch("app.deploy_health._pause_failure_streak", 0)
+    mocker.patch("app.deploy_health._health_recovery_history", _deque(maxlen=5))
+    mocker.patch("app.deploy_health._last_auto_resume_at", None)
+    mocker.patch("app.deploy_health._recent_auto_resumes", _deque())
+    mocker.patch("app.deploy_health._last_resume_was_forced", False)
+    mocker.patch("app.deploy_health._consecutive_force_resumes", 4)
+
+    mock_state = MagicMock()
+    mock_state.zone_health_state = None
+    mock_session = MagicMock()
+    mock_session.add = MagicMock()
+    mock_session.commit = AsyncMock()
+    mock_session_ctx = MagicMock()
+    mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
+    mocker.patch("app.orchestrator.AsyncSessionLocal", return_value=mock_session_ctx)
+    mocker.patch("app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=mock_state))
+
+    await _orch_persist()
+
+    snapshot = mock_state.zone_health_state
+    assert snapshot["_consecutive_force_resumes"] == 4
+
+    _dh._consecutive_force_resumes = 0
+    _dh._restore_health_streaks(snapshot)
+    assert _dh._consecutive_force_resumes == 4

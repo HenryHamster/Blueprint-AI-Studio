@@ -582,6 +582,72 @@ def _categorize_review_issues(review_history: list) -> dict[str, list[dict]]:
     return buckets
 
 
+def compute_recurring_first_review_descriptions(
+    rows,
+    cutoff,
+    *,
+    task_filter=None,
+    min_tasks: int = 0,
+    count_unique_tasks: bool = False,
+    extra_fields: Optional[dict] = None,
+) -> Optional[list[dict]]:
+    """Top recurring issue descriptions from first-review (iteration 0) history.
+
+    Scans review_history across ``rows`` and returns up to 3 descriptions that
+    appear at least twice, sorted by count descending. Tasks with
+    ``created_at < cutoff`` or rejected by ``task_filter`` are skipped. When
+    ``count_unique_tasks`` is True, counts distinct tasks mentioning each
+    description; otherwise counts total occurrences. Returns None if the
+    filtered task count is below ``min_tasks`` or no description repeats.
+    """
+    from collections import Counter
+    desc_counter: Counter = Counter()
+    desc_to_cat: dict = {}
+    desc_task_ids: dict = {}
+    filtered_task_count = 0
+    for ht in rows:
+        if ht.created_at and ht.created_at < cutoff:
+            continue
+        if task_filter and not task_filter(ht):
+            continue
+        review_loop = (ht.context or {}).get("review_loop", {})
+        rev_hist = review_loop.get("review_history", []) if review_loop else []
+        if not rev_hist:
+            continue
+        filtered_task_count += 1
+        for entry in rev_hist:
+            if entry.get("iteration") != 0:
+                continue
+            for issue in entry.get("issues", []):
+                desc = issue.get("description") or ""
+                cat = issue.get("category", "other")
+                if not desc:
+                    continue
+                normalized = desc.lower().strip()[:120]
+                if count_unique_tasks:
+                    desc_task_ids.setdefault(normalized, set()).add(ht.id)
+                else:
+                    desc_counter[normalized] += 1
+                if normalized not in desc_to_cat:
+                    desc_to_cat[normalized] = cat
+    if filtered_task_count < min_tasks:
+        return None
+    if count_unique_tasks:
+        pairs = [(desc, len(tids)) for desc, tids in desc_task_ids.items() if len(tids) >= 2]
+    else:
+        pairs = [(desc, cnt) for desc, cnt in desc_counter.items() if cnt >= 2]
+    if not pairs:
+        return None
+    pairs.sort(key=lambda x: -x[1])
+    out = []
+    for desc, cnt in pairs[:3]:
+        entry = {"description": desc, "count": cnt, "category": desc_to_cat.get(desc, "other")}
+        if extra_fields:
+            entry.update(extra_fields)
+        out.append(entry)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Success-pattern capture
 # ---------------------------------------------------------------------------

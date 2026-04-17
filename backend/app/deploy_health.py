@@ -66,6 +66,12 @@ _last_resume_was_forced: bool = False
 # >= `flap_threshold`.
 _recent_auto_resumes: "deque[datetime]" = deque()
 _FLAP_ESCALATED_HEALTHY_REQUIRED = _HEALTH_HISTORY_SIZE  # 5-of-5 when flapping
+# Counts consecutive forced resumes. Force-resumes happen at max_auto_pause_duration
+# intervals (default 2 hours), far outside the 30-min flap window, so flap detection
+# misses them. A sustained force-resume loop indicates persistent infrastructure
+# failure; escalate the alert once this threshold is crossed.
+_consecutive_force_resumes: int = 0
+_FORCE_RESUME_ESCALATION_THRESHOLD = 3
 
 
 def _reset_health_recovery_history() -> None:
@@ -103,9 +109,10 @@ def _restore_health_streaks(snapshot: dict) -> None:
     Called once at startup. Tolerates missing keys, legacy int history format, and
     invalid ISO timestamps — corrupt values fall back to safe defaults (0 / empty / None).
     """
-    global _pause_failure_streak, _last_auto_resume_at, _last_resume_was_forced
+    global _pause_failure_streak, _last_auto_resume_at, _last_resume_was_forced, _consecutive_force_resumes
     _pause_failure_streak = int(snapshot.get("_pause_failure_streak") or 0)
     _last_resume_was_forced = bool(snapshot.get("_last_resume_was_forced") or False)
+    _consecutive_force_resumes = int(snapshot.get("_consecutive_force_resumes") or 0)
     history = snapshot.get("_health_recovery_history")
     _health_recovery_history.clear()
     if isinstance(history, list):
@@ -497,16 +504,40 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
         logger.warning(f"[NOTIFY] DEPLOY_HEALTH_ALERT dispatch setup failed: {_ne}")
 
 
-async def _create_forced_resume_alerts(session: AsyncSession, pause_duration_seconds: float, failed_deps: list) -> None:
-    """CRITICAL alerts when we force a resume after max_auto_pause_duration_seconds elapsed."""
+async def _create_forced_resume_alerts(
+    session: AsyncSession,
+    pause_duration_seconds: float,
+    failed_deps: list,
+    consecutive_force_resumes: int = 1,
+) -> None:
+    """ERROR alerts when we force a resume after max_auto_pause_duration_seconds elapsed.
+
+    Once ``consecutive_force_resumes`` crosses ``_FORCE_RESUME_ESCALATION_THRESHOLD``,
+    the alert title shifts to a distinct "Prolonged pipeline stall" form signalling
+    persistent infrastructure failure that needs manual investigation. AlertSeverity
+    only goes up to ERROR (no CRITICAL enum value), so escalation is carried by the
+    title, not a severity bump.
+    """
+    from app.main import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
     pause_title = "Pipeline auto-paused: external dependencies down"
-    title = "Pipeline force-resumed: max auto-pause duration exceeded"
-    msg = (
-        f"Pipeline force-resumed after {int(pause_duration_seconds)}s paused "
-        f"(max {_runtime_config['max_auto_pause_duration_seconds']}s). "
-        f"Health probes still report failures: {', '.join(failed_deps) if failed_deps else 'none'}. "
-        "Resuming with reduced VM count (1) — operators should investigate."
-    )
+    escalated = consecutive_force_resumes >= _FORCE_RESUME_ESCALATION_THRESHOLD
+    if escalated:
+        title = f"Prolonged pipeline stall: {consecutive_force_resumes} consecutive force-resumes"
+        msg = (
+            f"Pipeline has force-resumed {consecutive_force_resumes} times in a row without "
+            f"health probes ever stabilizing (latest pause {int(pause_duration_seconds)}s, "
+            f"max {_runtime_config['max_auto_pause_duration_seconds']}s). "
+            f"Still-failing deps: {', '.join(failed_deps) if failed_deps else 'none'}. "
+            "This signals persistent infrastructure failure — manual investigation required."
+        )
+    else:
+        title = "Pipeline force-resumed: max auto-pause duration exceeded"
+        msg = (
+            f"Pipeline force-resumed after {int(pause_duration_seconds)}s paused "
+            f"(max {_runtime_config['max_auto_pause_duration_seconds']}s). "
+            f"Health probes still report failures: {', '.join(failed_deps) if failed_deps else 'none'}. "
+            "Resuming with reduced VM count (1) — operators should investigate."
+        )
     now = _utcnow()
     projects = (await session.execute(select(Project))).scalars().all()
     for project in projects:
@@ -533,6 +564,22 @@ async def _create_forced_resume_alerts(session: AsyncSession, pause_duration_sec
             "alert_created",
             {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
         )
+    await _send_webhook_notification("FORCED_RESUME", title, msg)
+    try:
+        import asyncio as _asyncio  # noqa: PLC0415
+        from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+        for project in projects:
+            _asyncio.ensure_future(dispatch_external_notification(
+                project.id,
+                "FORCED_RESUME",
+                {
+                    "pause_duration_seconds": int(pause_duration_seconds),
+                    "failed_deps": failed_deps,
+                    "title": title,
+                },
+            ))
+    except Exception as _ne:
+        logger.warning(f"[NOTIFY] FORCED_RESUME dispatch setup failed: {_ne}")
 
 
 async def _create_auto_resume_alerts(session: AsyncSession, flapping: bool = False) -> None:
@@ -575,6 +622,20 @@ async def _create_auto_resume_alerts(session: AsyncSession, flapping: bool = Fal
             "alert_created",
             {"alert_id": str(alert.id), "severity": severity.name, "title": alert.title},
         )
+    if flapping:
+        from app.main import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
+        await _send_webhook_notification("FLAPPING_RESUME", resume_title, resume_title)
+        try:
+            import asyncio as _asyncio  # noqa: PLC0415
+            from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+            for project in projects:
+                _asyncio.ensure_future(dispatch_external_notification(
+                    project.id,
+                    "FLAPPING_RESUME",
+                    {"title": resume_title},
+                ))
+        except Exception as _ne:
+            logger.warning(f"[NOTIFY] FLAPPING_RESUME dispatch setup failed: {_ne}")
 
 
 async def _check_pause_mode():
@@ -584,7 +645,7 @@ async def _check_pause_mode():
     auto-pause duration forces resume (with reduced VMs) if healthy probes never
     reach the threshold — preventing indefinite pause under intermittent failures.
     """
-    global _pause_failure_streak, _last_auto_resume_at, _last_resume_was_forced
+    global _pause_failure_streak, _last_auto_resume_at, _last_resume_was_forced, _consecutive_force_resumes
     ext = _shared_state.external_health
     failed = ext.get("failed_deps", [])
     # Auto-pause on critical deps including Claude API (rate limits, not just missing credentials)
@@ -782,8 +843,12 @@ async def _check_pause_mode():
         _last_resume_was_forced = bool(should_force_resume)
 
         if should_force_resume:
-            await _create_forced_resume_alerts(session, pause_duration, critical_failures)
+            _consecutive_force_resumes += 1
+            await _create_forced_resume_alerts(
+                session, pause_duration, critical_failures, _consecutive_force_resumes
+            )
         else:
+            _consecutive_force_resumes = 0
             await _create_auto_resume_alerts(session, flapping=flap_escalated)
         await session.commit()
         _runtime_config["max_concurrent_vms"] = initial_vms
@@ -794,7 +859,8 @@ async def _check_pause_mode():
             logger.error(
                 f"[PAUSE] FORCE-RESUMED after {int(pause_duration)}s paused (max {max_duration}s) "
                 f"with {initial_vms} VM(s). Health history: {history_snapshot}. "
-                f"Still-failing deps: {critical_failures or 'none'}",
+                f"Still-failing deps: {critical_failures or 'none'}. "
+                f"Consecutive force-resumes: {_consecutive_force_resumes}",
                 extra={
                     "alert": True,
                     "type": "forced_resume",
@@ -802,6 +868,7 @@ async def _check_pause_mode():
                     "max_auto_pause_duration_seconds": max_duration,
                     "health_history": history_snapshot,
                     "failed_deps": critical_failures,
+                    "consecutive_force_resumes": _consecutive_force_resumes,
                 },
             )
         elif flap_escalated:

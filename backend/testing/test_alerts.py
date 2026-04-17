@@ -17,6 +17,7 @@ from app.main import (
     _create_auto_pause_alerts,
     _create_auto_resume_alerts,
 )
+from app.deploy_health import _create_forced_resume_alerts
 from testing.factories import make_project, make_task, make_alert
 
 
@@ -613,3 +614,107 @@ class TestAlertDeduplication:
         assert len(warnings) == 2
         undismissed = [w for w in warnings if w.dismissed_at is None]
         assert len(undismissed) == 1
+
+
+# ---------------------------------------------------------------------------
+# External notification dispatch for high-severity resume events
+# ---------------------------------------------------------------------------
+
+class TestForcedResumeExternalNotifications:
+    """Forced resume must dispatch external notifications (webhook + per-project)."""
+
+    @pytest.mark.asyncio
+    async def test_forced_resume_dispatches_webhook_and_external_notifications(self, db_session, mocker):
+        mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
+        webhook_mock = mocker.patch("app.main._send_webhook_notification", new_callable=AsyncMock)
+        dispatch_mock = mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock,
+        )
+        p1 = make_project(name="P1")
+        p2 = make_project(name="P2")
+        db_session.add(p1)
+        db_session.add(p2)
+        await db_session.commit()
+        await db_session.refresh(p1)
+        await db_session.refresh(p2)
+
+        await _create_forced_resume_alerts(db_session, 7200.0, ["gcp", "github_api"])
+        await db_session.commit()
+
+        webhook_mock.assert_awaited_once()
+        args, _ = webhook_mock.call_args
+        assert args[0] == "FORCED_RESUME"
+        assert "force-resumed" in args[1].lower()
+
+        assert dispatch_mock.call_count == 2
+        called_event_types = {call.args[1] for call in dispatch_mock.call_args_list}
+        assert called_event_types == {"FORCED_RESUME"}
+        called_project_ids = {call.args[0] for call in dispatch_mock.call_args_list}
+        assert called_project_ids == {p1.id, p2.id}
+        for call in dispatch_mock.call_args_list:
+            payload = call.args[2]
+            assert payload["pause_duration_seconds"] == 7200
+            assert payload["failed_deps"] == ["gcp", "github_api"]
+            assert "force-resumed" in payload["title"].lower()
+
+    @pytest.mark.asyncio
+    async def test_forced_resume_no_projects_still_calls_webhook(self, db_session, mocker):
+        mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
+        webhook_mock = mocker.patch("app.main._send_webhook_notification", new_callable=AsyncMock)
+        dispatch_mock = mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock,
+        )
+
+        await _create_forced_resume_alerts(db_session, 3600.0, [])
+        await db_session.commit()
+
+        webhook_mock.assert_awaited_once()
+        dispatch_mock.assert_not_called()
+
+
+class TestFlappingResumeExternalNotifications:
+    """Flapping auto-resume must dispatch external notifications; non-flapping must not."""
+
+    @pytest.mark.asyncio
+    async def test_flapping_resume_dispatches_webhook_and_external_notifications(self, db_session, mocker):
+        mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
+        webhook_mock = mocker.patch("app.main._send_webhook_notification", new_callable=AsyncMock)
+        dispatch_mock = mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock,
+        )
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _create_auto_resume_alerts(db_session, flapping=True)
+        await db_session.commit()
+
+        webhook_mock.assert_awaited_once()
+        args, _ = webhook_mock.call_args
+        assert args[0] == "FLAPPING_RESUME"
+        assert "flapping" in args[1].lower()
+
+        dispatch_mock.assert_called_once()
+        call = dispatch_mock.call_args
+        assert call.args[0] == project.id
+        assert call.args[1] == "FLAPPING_RESUME"
+        assert "flapping" in call.args[2]["title"].lower()
+
+    @pytest.mark.asyncio
+    async def test_non_flapping_resume_skips_external_notifications(self, db_session, mocker):
+        mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
+        webhook_mock = mocker.patch("app.main._send_webhook_notification", new_callable=AsyncMock)
+        dispatch_mock = mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock,
+        )
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _create_auto_resume_alerts(db_session, flapping=False)
+        await db_session.commit()
+
+        webhook_mock.assert_not_awaited()
+        dispatch_mock.assert_not_called()
