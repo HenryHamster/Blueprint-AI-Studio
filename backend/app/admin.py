@@ -1519,6 +1519,16 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
         failures = sum(1 for r in results if r[1] == "failure")
         failure_rate = failures / len(results)
 
+    current_vms = runtime_config["max_concurrent_vms"]
+    target_vms = state.runtime_max_concurrent_vms
+    ramp_in_progress = (
+        state.status in (DeploymentStatus.MONITORING, DeploymentStatus.STABLE)
+        and state.pre_pause_max_vms is None
+        and target_vms is not None
+        and 0 < current_vms < target_vms
+    )
+    ramp_step_size = min(2, target_vms - current_vms) if ramp_in_progress else 0
+
     return {
         "current_revision": state.current_revision,
         "current_sha": state.current_sha,
@@ -1538,6 +1548,10 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
         "task_results_count": len(results),
         "external_health": external_health,
         "max_concurrent_vms": runtime_config["max_concurrent_vms"],
+        "current_vms": current_vms,
+        "target_vms": target_vms,
+        "ramp_in_progress": ramp_in_progress,
+        "ramp_step_size": ramp_step_size,
         "zone_health": _get_zone_health_summary(),
         "gcp_project_id": os.getenv("GCP_PROJECT_ID", ""),
         "health_recovery_streak": sum(1 for x in getattr(_deploy_health_module, "_health_recovery_history", []) if x),

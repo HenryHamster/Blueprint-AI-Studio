@@ -769,12 +769,24 @@ async def orchestrator_worker():
                 ).order_by(Task.priority.desc().nullslast(), Task.created_at.asc()).limit(max(slots_available * 2, 50))  # Fetch extra; NULL priority = lowest
                 candidate_tasks = (await session.execute(candidate_stmt)).scalars().all()
 
-                # Once-per-cycle snapshot of pool availability. Rate-limit-origin
-                # retry_after holds (set without _infra_wait) can be released
-                # early when any account recovers faster than predicted.
-                _cycle_any_account_available = any(
-                    _account_available_for_model(a, None) for a in _account_by_id.values()
-                )
+                # Per-user pool availability cache. Rate-limit-origin retry_after
+                # holds (set without _infra_wait) can be released early when the
+                # dispatching user's own pool recovers. Checking the global pool
+                # would release tasks whose user pool is still exhausted, only to
+                # re-block them at dispatch.
+                _user_pool_available: Dict[str, bool] = {}
+
+                async def _user_has_available_account(task: Task) -> bool:
+                    user_id = task.launched_by_user_id
+                    if not user_id:
+                        proj = await session.get(Project, task.project_id)
+                        user_id = proj.user_id if proj else ""
+                    if user_id in _user_pool_available:
+                        return _user_pool_available[user_id]
+                    pool = _max_plan_pools.get(user_id, [])
+                    available = any(_account_available_for_model(a, None) for a in pool)
+                    _user_pool_available[user_id] = available
+                    return available
 
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
                 eligible_ids = []
@@ -785,9 +797,9 @@ async def orchestrator_worker():
                         try:
                             retry_after_dt = datetime.fromisoformat(retry_after_str)
                             if retry_after_dt > _utcnow():
-                                # Release rate-limit holds early when the pool has recovered.
-                                # _infra_wait holds wait for zone recovery, not accounts.
-                                if not (task.context or {}).get("_infra_wait") and _cycle_any_account_available:
+                                # Release rate-limit holds early when the dispatching user's
+                                # pool has recovered. _infra_wait holds wait for zone recovery.
+                                if not (task.context or {}).get("_infra_wait") and await _user_has_available_account(task):
                                     ctx = dict(task.context or {})
                                     ctx.pop("retry_after", None)
                                     task.context = ctx
@@ -1540,7 +1552,20 @@ async def orchestrator_worker():
                     _cycle_accounts_blocked, _cycle_dispatched, _all_accounts_blocked_alerted
                 )
                 if _stall_action == "reset":
-                    _all_accounts_blocked_alerted = False
+                    if _all_accounts_blocked_alerted:
+                        _all_accounts_blocked_alerted = False
+                        logger.info(
+                            "[ORCHESTRATOR] Rate-limit stall resolved — "
+                            f"{_cycle_dispatched} task(s) dispatched after prior all-accounts-blocked episode"
+                        )
+                        try:
+                            from app.broadcast import manager as _ws_manager  # noqa: PLC0415
+                            await _ws_manager.broadcast_to_all("rate_limit_stall_resolved", {
+                                "dispatched_count": _cycle_dispatched,
+                                "detail": "Pipeline recovered: tasks dispatching after all-accounts-blocked stall",
+                            })
+                        except Exception:
+                            logger.exception("[ORCHESTRATOR] Failed to broadcast rate_limit_stall_resolved")
                 elif _stall_action == "fire":
                     _all_accounts_blocked_alerted = True
                     await _emit_all_accounts_blocked_stall(session, _cycle_earliest_recovery)
