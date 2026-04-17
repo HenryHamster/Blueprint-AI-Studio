@@ -34,6 +34,8 @@ interface DirectionProgress {
   estimated_cost_usd?: number | null;
   cost_per_merged_pr?: number | null;
   scope_breakdown?: Record<string, { created: number; merged: number; failed: number }> | null;
+  taxonomy_summary?: Record<string, number> | null;
+  recent_failed_titles?: string[] | null;
 }
 
 interface FailureGroupTask {
@@ -545,6 +547,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                             <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
                           )}
                         </div>
+                        {d.taxonomy_summary && <div className="flex gap-1 mt-1 flex-wrap">{TAXONOMY_ORDER.map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return v ? <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span> : null; })}</div>}
                       </div>
                     );
                   })}

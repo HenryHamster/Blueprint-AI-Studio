@@ -1107,41 +1107,49 @@ async def get_digest(
                     if t.created_at >= window_start
                 )
 
-                # prs_merged / prs_rejected: sum from research_history entries within window
+                # Single pass over research_history: aggregate PR/scope/product/type/taxonomy
                 prs_merged = 0
                 prs_rejected = 0
                 findings_tasks_created = 0
                 merge_time_values: List[float] = []
                 dir_scope_agg: Dict[str, Dict[str, int]] = {}
                 prev_dir_scope_agg: Dict[str, Dict[str, int]] = {}
+                window_product_ratios: List[float] = []
+                agg_type_distribution: Dict[str, int] = {}
+                dir_taxonomy_summary: Dict[str, int] = {}
+                recent_failed_titles: List[str] = []
                 for entry in d.get("research_history") or []:
                     try:
                         entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
-                        if entry_ts >= window_start:
-                            prs_merged += entry.get("prs_merged") or 0
-                            prs_rejected += entry.get("prs_rejected") or 0
-                            findings_tasks_created += entry.get("tasks_created") or 0
-                            atm = entry.get("avg_time_to_merge_hours")
-                            if atm is not None:
-                                merge_time_values.append(float(atm))
-                            for scope, stats in (entry.get("scope_breakdown") or {}).items():
-                                if scope not in dir_scope_agg:
-                                    dir_scope_agg[scope] = {"created": 0, "merged": 0, "failed": 0, "calibrated_in": 0, "calibrated_out": 0}
-                                dir_scope_agg[scope]["created"] += stats.get("created", 0)
-                                dir_scope_agg[scope]["merged"] += stats.get("merged", 0)
-                                dir_scope_agg[scope]["failed"] += stats.get("failed", 0)
-                                dir_scope_agg[scope]["calibrated_in"] += stats.get("calibrated_in", 0)
-                                dir_scope_agg[scope]["calibrated_out"] += stats.get("calibrated_out", 0)
-                        elif entry_ts >= prev_window_start:
-                            for scope, stats in (entry.get("scope_breakdown") or {}).items():
-                                if scope not in prev_dir_scope_agg:
-                                    prev_dir_scope_agg[scope] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
-                                prev_dir_scope_agg[scope]["created"] += stats.get("created", 0)
-                                prev_dir_scope_agg[scope]["merged"] += stats.get("merged", 0)
-                                prev_dir_scope_agg[scope]["calibrated_in"] += stats.get("calibrated_in", 0)
-                                prev_dir_scope_agg[scope]["calibrated_out"] += stats.get("calibrated_out", 0)
                     except (ValueError, TypeError):
-                        pass
+                        continue
+                    if entry_ts >= window_start:
+                        prs_merged += entry.get("prs_merged") or 0
+                        prs_rejected += entry.get("prs_rejected") or 0
+                        findings_tasks_created += entry.get("tasks_created") or 0
+                        atm = entry.get("avg_time_to_merge_hours")
+                        if atm is not None:
+                            merge_time_values.append(float(atm))
+                        for scope, stats in (entry.get("scope_breakdown") or {}).items():
+                            agg = dir_scope_agg.setdefault(scope, {"created": 0, "merged": 0, "failed": 0, "calibrated_in": 0, "calibrated_out": 0})
+                            for k in ("created", "merged", "failed", "calibrated_in", "calibrated_out"):
+                                agg[k] += stats.get(k, 0)
+                        pr = entry.get("product_ratio")
+                        if pr is not None:
+                            window_product_ratios.append(float(pr))
+                        for ttype, cnt in (entry.get("type_distribution") or {}).items():
+                            agg_type_distribution[ttype] = agg_type_distribution.get(ttype, 0) + cnt
+                        for tax, cnt in (entry.get("taxonomy_summary") or {}).items():
+                            dir_taxonomy_summary[tax] = dir_taxonomy_summary.get(tax, 0) + cnt
+                        for fd in (entry.get("failed_task_details") or []):
+                            title = (fd or {}).get("title")
+                            if title:
+                                recent_failed_titles.append(title)
+                    elif entry_ts >= prev_window_start:
+                        for scope, stats in (entry.get("scope_breakdown") or {}).items():
+                            agg = prev_dir_scope_agg.setdefault(scope, {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0})
+                            for k in ("created", "merged", "calibrated_in", "calibrated_out"):
+                                agg[k] += stats.get(k, 0)
 
                 if cycles_in_window == 0 and tasks_created_in_window == 0:
                     continue
@@ -1150,21 +1158,6 @@ async def get_digest(
                 latest_insights = last_entry.get("cycle_insights", []) if last_entry else []
                 recent_finding_titles = last_entry.get("finding_titles", []) if last_entry else []
                 latest_research_at = last_entry.get("timestamp") if last_entry else None
-
-                # Compute product_ratio and type_distribution from window entries
-                window_product_ratios = []
-                agg_type_distribution: Dict[str, int] = {}
-                for entry in d.get("research_history") or []:
-                    try:
-                        entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
-                        if entry_ts >= window_start:
-                            pr = entry.get("product_ratio")
-                            if pr is not None:
-                                window_product_ratios.append(float(pr))
-                            for ttype, cnt in (entry.get("type_distribution") or {}).items():
-                                agg_type_distribution[ttype] = agg_type_distribution.get(ttype, 0) + cnt
-                    except (ValueError, TypeError):
-                        pass
                 dir_product_ratio = round(sum(window_product_ratios) / len(window_product_ratios), 3) if window_product_ratios else None
 
                 dir_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in tasks_for_dir if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start)
@@ -1210,6 +1203,8 @@ async def get_digest(
                     "estimated_cost_usd": round(dir_cost, 2),
                     "cost_per_merged_pr": round(dir_cost / prs_merged, 4) if prs_merged > 0 else None,
                     "scope_breakdown": dir_scope_agg or None,
+                    "taxonomy_summary": dir_taxonomy_summary or None,
+                    "recent_failure_titles": recent_failed_titles[-3:] or None,
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)

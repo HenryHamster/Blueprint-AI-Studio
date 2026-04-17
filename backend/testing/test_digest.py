@@ -624,6 +624,125 @@ async def test_digest_direction_progress_absent_without_project_id(client: Async
     assert data["direction_progress"] == []
 
 
+@pytest.mark.asyncio
+async def test_digest_direction_progress_taxonomy_and_failure_titles(client: AsyncClient, db_session):
+    """direction_progress aggregates taxonomy_summary and recent_failure_titles across research_history entries in-window."""
+    recent_ts_1 = (_utcnow() - timedelta(hours=10)).isoformat()
+    recent_ts_2 = (_utcnow() - timedelta(hours=5)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=50)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-tax",
+                "text": "Taxonomy direction",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts_1,
+                        "prs_merged": 1,
+                        "tasks_created": 3,
+                        "taxonomy_summary": {"scope_related": 2, "infra_related": 1},
+                        "failed_task_details": [
+                            {"title": "failed task A"},
+                            {"title": "failed task B"},
+                        ],
+                    },
+                    {
+                        "timestamp": recent_ts_2,
+                        "prs_merged": 1,
+                        "tasks_created": 2,
+                        "taxonomy_summary": {"scope_related": 1, "code_defect": 3},
+                        "failed_task_details": [
+                            {"title": "failed task C"},
+                            {"title": "failed task D"},
+                        ],
+                    },
+                    # Outside window — must be excluded
+                    {
+                        "timestamp": old_ts,
+                        "prs_merged": 0,
+                        "tasks_created": 1,
+                        "taxonomy_summary": {"scope_related": 99},
+                        "failed_task_details": [{"title": "old failed task"}],
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-tax"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    dp_list = data["direction_progress"]
+    assert len(dp_list) == 1
+    dp = dp_list[0]
+    assert dp["direction_id"] == "dir-tax"
+
+    # taxonomy counts summed across both in-window entries, old entry excluded
+    assert dp["taxonomy_summary"] == {"scope_related": 3, "infra_related": 1, "code_defect": 3}
+
+    # recent_failure_titles: last 3 titles from in-window failed_task_details
+    titles = dp["recent_failure_titles"]
+    assert titles is not None
+    assert len(titles) == 3
+    assert "old failed task" not in titles
+    assert titles[-1] == "failed task D"
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_taxonomy_absent_when_no_entries(client: AsyncClient, db_session):
+    """taxonomy_summary and recent_failure_titles are null when research_history entries omit those fields."""
+    recent_ts = (_utcnow() - timedelta(hours=5)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-plain",
+                "text": "No taxonomy direction",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "prs_merged": 1, "tasks_created": 2},
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-plain"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    dp_list = data["direction_progress"]
+    assert len(dp_list) == 1
+    assert dp_list[0]["taxonomy_summary"] is None
+    assert dp_list[0]["recent_failure_titles"] is None
+
+
 # ---------------------------------------------------------------------------
 # Narrative content assertion tests
 # ---------------------------------------------------------------------------

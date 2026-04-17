@@ -434,6 +434,11 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (agg.get("total_prs_rejected") or 0)
         total_failed = sum(h.get("tasks_failed", 0) for h in history) + (agg.get("total_tasks_failed") or 0)
         total_failed_infra = sum(h.get("tasks_failed_infra", 0) for h in history) + (agg.get("total_tasks_failed_infra") or 0)
+        taxonomy_totals: dict[str, int] = {}
+        for h in history:
+            for tkey, tval in (h.get("taxonomy_summary") or {}).items():
+                if tval:
+                    taxonomy_totals[tkey] = taxonomy_totals.get(tkey, 0) + tval
         recent_history = history[-5:]
         recent_findings = []
         recent_failures = []
@@ -454,6 +459,8 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         }
         if total_failed_infra > 0:
             stat_entry["tasks_failed_infra"] = total_failed_infra
+        if taxonomy_totals:
+            stat_entry["taxonomy_summary"] = taxonomy_totals
         if total_rejected > 0:
             stat_entry["prs_rejected"] = total_rejected
         if operator_rejection_rate is not None and total_rejected > 0:
