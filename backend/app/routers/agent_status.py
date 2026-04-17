@@ -388,11 +388,13 @@ async def update_agent_status(
             return {"status": "already_terminal", "task_id": str(check_task.id)}
         if check_task.status == TaskStatus.EVALUATING:
             return {"status": "already_evaluating", "task_id": str(check_task.id)}
-        # Non-terminal + locked: tell the agent to retry. 503 engages the
-        # agent's 5xx retry path (apiPost in agent/src/index.ts); a 4xx
-        # would be treated as a permanent failure.
+        # Non-terminal + locked: tell the agent to retry. We use 429 instead
+        # of 503 so Cloud Run does not classify these temporary-contention
+        # responses as ContainerError (Cloud Run flags any 5xx as a container
+        # fault, quarantining the instance). The agent's apiPost treats 429
+        # as retry-able the same way it handles 5xx.
         raise HTTPException(
-            status_code=503,
+            status_code=429,
             detail="Task row locked, retry",
             headers={"Retry-After": "5"},
         )

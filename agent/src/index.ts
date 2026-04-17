@@ -151,6 +151,20 @@ export async function apiPost(path: string, body: Record<string, unknown> = {}, 
         tokenRefreshed = true;
         continue;
       }
+      // 429: retry after Retry-After header. Backend uses this for
+      // temporary-contention signals (e.g. row-locked in /api/agent/status);
+      // treating it as transient keeps the agent's retry loop aligned with
+      // 5xx handling without tripping Cloud Run ContainerError classification.
+      if (res.status === 429) {
+        if (attempt === retries - 1) {
+          throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+        }
+        const retryAfterSec = parseInt(res.headers.get('Retry-After') || '5', 10);
+        const delayMs = Math.max(1000, Math.min(retryAfterSec * 1000, 30000));
+        log(`POST ${path} got 429 (rate-limited/locked), retrying in ${delayMs}ms`);
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
       // Other 4xx errors are not transient — fail immediately
       if (res.status < 500) {
         throw new Error(`POST ${path} failed (${res.status}): ${text}`);
@@ -160,7 +174,9 @@ export async function apiPost(path: string, body: Record<string, unknown> = {}, 
         throw new Error(`POST ${path} failed (${res.status}): ${text}`);
       }
     } catch (e) {
-      // Re-throw 4xx errors and final-attempt errors immediately
+      // Re-throw 4xx errors and final-attempt errors immediately. 429 is
+      // intentionally excluded from the 4xx bail-out via the explicit check
+      // above, which uses `continue` before this catch runs.
       if (attempt === retries - 1 || (e instanceof Error && /failed \(4\d{2}\)/.test(e.message))) throw e;
     }
     await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt) + Math.random() * 1000, 30000)));
@@ -629,10 +645,16 @@ export async function pushAndCreatePR(
   statusRef.value = 'Creating pull request...';
   let prUrl = '';
   try {
+    // Timeout must cover the backend's worst case: get_github_token_for_task,
+    // existing-artifact idempotency check (which calls get_pull_request on
+    // GitHub), plus create_pull_request itself — each a GitHub call with up
+    // to 3 retries and a 120s rate-limit sleep in _github_request. 90s was
+    // not enough on rate-limited or slow cycles and every retry hit the same
+    // slow path, so tasks failed with AbortError.
     const prRes = await apiPost('/api/agent/github/pull-requests', {
       task_id: taskId, owner, repo, title,
       head: workBranch, base: baseBranch, body,
-    }, API_MAX_RETRIES, 90_000) as { data?: { html_url?: string } };
+    }, API_MAX_RETRIES, 240_000) as { data?: { html_url?: string } };
     prUrl = prRes.data?.html_url ?? '';
     sendLog(ws, `PR created: ${prUrl}\n`);
   } catch (e) {
