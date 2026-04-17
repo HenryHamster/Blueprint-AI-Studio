@@ -71,7 +71,16 @@ def _derive_failure_stage(failure_class: str, status_message: str) -> "str | Non
 
 
 async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
-    """Return True if any QUEUED/PROVISIONING/IN_PROGRESS task is a design_doc_update or strategic_review."""
+    """Return True if any QUEUED/PROVISIONING/IN_PROGRESS task is a design_doc_update or strategic_review.
+
+    Takes a FOR UPDATE lock on the project row so the check+spawn is transactionally
+    atomic. Without it, two concurrent callers (e.g. design_doc completion chaining
+    to phase 2 and an autonomous-research tick) can both read "none active" in the
+    same window and each insert a duplicate strategic task.
+    """
+    await session.execute(
+        select(Project.id).where(Project.id == project_id).with_for_update()
+    )
     active = (await session.execute(
         select(Task).where(
             Task.project_id == project_id,
@@ -459,6 +468,36 @@ async def _merge_with_retry(
                 )
                 await asyncio.sleep(backoff)
     raise last_exc  # type: ignore[misc]
+
+
+async def _comment_with_retry(
+    create_pr_comment_fn, gh_token: str, owner: str, repo: str,
+    pr_number: int, body: str, max_attempts: int = 3,
+) -> None:
+    """Call create_pr_comment with exponential backoff for transient GitHub failures.
+
+    create_pr_comment raises HTTPException on any non-201 response, so a single
+    upstream 5xx would otherwise abort the post-commit flow. Swallows failure
+    after exhausting retries — a missing PR comment is not worth aborting the
+    merge pipeline.
+    """
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            await create_pr_comment_fn(gh_token, owner, repo, pr_number, body)
+            return
+        except Exception as exc:  # noqa: PERF203 — per-attempt try is required for the retry loop
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                backoff = (2 ** attempt) * (1 + _random.random())  # ~1-2s, ~2-4s
+                logger.warning(
+                    f"[PIPELINE] PR #{pr_number} comment attempt {attempt + 1} raised "
+                    f"{type(exc).__name__}, retrying in {backoff:.1f}s: {exc!r}"
+                )
+                await asyncio.sleep(backoff)
+    logger.error(
+        f"[PIPELINE] PR #{pr_number} comment failed after {max_attempts} attempts: {last_exc!r}"
+    )
 
 async def _process_post_commit(
     task_id: uuid.UUID,
@@ -1217,7 +1256,7 @@ async def _process_post_commit(
                                     await session.commit()
                                     await broadcast_to_project(str(_approval_orig.project_id), "task_updated",
                                                                {"task_id": str(_approval_orig.id), "status": TaskStatus.EVALUATING})
-                                    await create_pr_comment(gh_token, owner, repo, pr_number,
+                                    await _comment_with_retry(create_pr_comment, gh_token, owner, repo, pr_number,
                                         f"**Blueprint Review Pipeline**: Review approved, but merge requires human approval — {reason}")
                                     logger.info(f"[PIPELINE] PR #{pr_number} review approved but merge blocked — requires_approval set on {original_task_id[:8]}")
                                     action_taken = True
@@ -1228,7 +1267,7 @@ async def _process_post_commit(
                         merge_result = await _merge_with_retry(merge_pull_request, gh_token, owner, repo, pr_number, project_id=str(task.project_id))
 
                         if merge_result.get("merged"):
-                            await create_pr_comment(gh_token, owner, repo, pr_number,
+                            await _comment_with_retry(create_pr_comment, gh_token, owner, repo, pr_number,
                                 "**Blueprint Review Pipeline**: PR auto-merged.")
                             # Mark original create task so dependents can proceed
                             if original_task_id:
@@ -1535,6 +1574,29 @@ async def _process_post_commit(
                     )
                     if fix_task:
                         logger.info(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")
+                        # Reset the parking parent's CI-wait clock: each spawned fix
+                        # is a fresh cycle of work, so the 30-min backstop in
+                        # services.py should count from here instead of the initial
+                        # rollup-creation timestamp.  Without this, a rollup that
+                        # legitimately cycles through 3-4 fix iterations gets killed
+                        # mid-pipeline.
+                        if original_task_id:
+                            try:
+                                _orig_q = select(Task).where(
+                                    Task.id == uuid.UUID(original_task_id)
+                                ).with_for_update()
+                                _orig = (await session.execute(_orig_q)).scalars().first()
+                                if _orig:
+                                    _orig_loop = dict((_orig.context or {}).get("review_loop", {}) or {})
+                                    if _orig_loop.get("ci_waiting"):
+                                        _orig_loop["ci_wait_started"] = _utcnow().isoformat()
+                                        _orig.context = {**(_orig.context or {}), "review_loop": _orig_loop}
+                                        flag_modified(_orig, "context")
+                                        session.add(_orig)
+                            except Exception as _reset_err:
+                                logger.warning(
+                                    f"[REVIEW PIPELINE] Failed to reset ci_wait_started on parent {original_task_id[:8]}: {_reset_err}"
+                                )
                     else:
                         task.latest_status_message = f"Fix not spawned for PR #{pr_number} — iteration cap reached"
                         task.requires_approval = True

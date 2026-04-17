@@ -42,6 +42,7 @@ export interface DirectionCardProps {
   reorderDirections: (newOrder: Direction[]) => Promise<void>;
   // State
   taskCounts: Record<string, number>;
+  activeTasks?: Record<string, Array<{ id: string; status: string; title: string; latest_status_message?: string }>>;
   cooldownMinutes: number;
   researchingIds: Record<string, boolean>;
   researchSuccessIds: Record<string, boolean>;
@@ -66,7 +67,7 @@ export function DirectionCard({
   updateDirection, approveProposal, rejectProposal, reviveProposal,
   reactivateDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
   applyDirectionUpdate, dismissDirectionUpdate, triggerResearch, reorderDirections,
-  taskCounts, cooldownMinutes, researchingIds, researchSuccessIds,
+  taskCounts, activeTasks, cooldownMinutes, researchingIds, researchSuccessIds,
   forceConfirmId, setForceConfirmId,
   historyOpenIds, setHistoryOpenIds,
   onViewFindings, onNavigateToTask,
@@ -430,8 +431,14 @@ export function DirectionCard({
               if (!history || history.length === 0) return null;
               const totalPrsMerged = history.reduce((sum, e) => sum + (e.prs_merged ?? 0), 0);
               const totalTasksCreated = history.reduce((sum, e) => sum + (e.tasks_created ?? 0), 0);
-              const successRate = totalTasksCreated > 0 ? totalPrsMerged / totalTasksCreated : 0;
+              const rawRate = totalTasksCreated > 0 ? totalPrsMerged / totalTasksCreated : 0;
+              // tasks_created is frozen at cycle-complete time, but prs_merged keeps
+              // updating as children (including later auto-remediation spawns under
+              // the same parent) finish merging — so the raw ratio can exceed 1.0.
+              // Clamp for display; surface the raw numbers in the tooltip.
+              const displayRate = Math.min(rawRate, 1);
               const totalCycles = history.length;
+              const colorBucket = displayRate >= 0.5 ? 'emerald' : displayRate >= 0.2 ? 'amber' : 'red';
               return (
                 <>
                   {totalPrsMerged > 0 && (
@@ -440,8 +447,11 @@ export function DirectionCard({
                     </span>
                   )}
                   {totalCycles >= 2 && (
-                    <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${successRate >= 0.5 ? 'emerald' : successRate >= 0.2 ? 'amber' : 'red'}-950/40 border-${successRate >= 0.5 ? 'emerald' : successRate >= 0.2 ? 'amber' : 'red'}-900/50 text-${successRate >= 0.5 ? 'emerald' : successRate >= 0.2 ? 'amber' : 'red'}-400`}>
-                      {Math.round(successRate * 100)}% success
+                    <span
+                      title={`${totalPrsMerged} merged across ${totalTasksCreated} spawned tasks${rawRate > 1 ? ' (capped at 100%; later auto-remediation children inflated the ratio)' : ''}`}
+                      className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${colorBucket}-950/40 border-${colorBucket}-900/50 text-${colorBucket}-400`}
+                    >
+                      {Math.round(displayRate * 100)}% success
                     </span>
                   )}
                 </>
@@ -484,7 +494,34 @@ export function DirectionCard({
             <span className="text-[10px] text-neutral-600 ml-auto">
               {d.added_at ? parseTimestamp(d.added_at).toLocaleDateString() : ''}
             </span>
-            {(taskCounts[d.id] ?? 0) > 0 && (
+            {/* Active research tasks for this direction — clickable badges when we
+                have the per-task list, otherwise fall back to a plain count. */}
+            {(() => {
+              const tasks = activeTasks?.[d.id] ?? [];
+              if (tasks.length === 0) return null;
+              const statusColor = (s: string) => {
+                if (s === 'IN_PROGRESS') return 'bg-yellow-950/40 border-yellow-900/50 text-yellow-400';
+                if (s === 'PROVISIONING') return 'bg-sky-950/40 border-sky-900/60 text-sky-400';
+                if (s === 'EVALUATING') return 'bg-indigo-950/40 border-indigo-900/60 text-indigo-400';
+                return 'bg-neutral-800/60 border-neutral-700/60 text-neutral-400';
+              };
+              return (
+                <div className="flex flex-wrap gap-1">
+                  {tasks.map(t => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => onNavigateToTask?.(t.id)}
+                      title={t.title || t.latest_status_message || t.status}
+                      className={`text-[10px] px-1.5 py-0.5 rounded border font-medium transition-opacity hover:opacity-80 ${statusColor(t.status)}`}
+                    >
+                      {t.status.toLowerCase()} · {t.id.slice(0, 8)}
+                    </button>
+                  ))}
+                </div>
+              );
+            })()}
+            {(!activeTasks?.[d.id]) && (taskCounts[d.id] ?? 0) > 0 && (
               <span className="text-[10px] text-neutral-500">
                 {taskCounts[d.id]} {taskCounts[d.id] === 1 ? 'task' : 'tasks'}
               </span>

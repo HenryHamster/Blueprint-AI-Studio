@@ -87,6 +87,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   const [autonomousEnabled, setAutonomousEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
   const [taskCounts, setTaskCounts] = useState<Record<string, number>>({});
+  const [activeTasks, setActiveTasks] = useState<Record<string, Array<{ id: string; status: string; title: string; latest_status_message?: string }>>>({});
   const [vision, setVision] = useState<Record<string, unknown>>({});
   const [designDoc, setDesignDoc] = useState<Record<string, unknown>>({});
   const [activeTab, setActiveTab] = useState<'directions' | 'vision' | 'design-doc'>('directions');
@@ -160,6 +161,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
       if (countsRes.ok) {
         const countsData = await countsRes.json();
         setTaskCounts(countsData.counts ?? {});
+        setActiveTasks(countsData.active_tasks ?? {});
       }
     } catch (err) {
       console.error('Failed to fetch directions:', err);
@@ -779,6 +781,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                             triggerResearch={triggerResearch}
                             reorderDirections={reorderDirections}
                             taskCounts={taskCounts}
+                            activeTasks={activeTasks}
                             cooldownMinutes={config.cooldownMinutes}
                             researchingIds={researchingIds}
                             researchSuccessIds={researchSuccessIds}

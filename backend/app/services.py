@@ -369,6 +369,51 @@ async def _persist_zone_health():
         logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
 
 
+async def _chain_has_active_pipeline_work(parent: Task, session, stale_seconds: int = 600) -> bool:
+    """True if any review/fix task on this chain has heartbeated within ``stale_seconds``.
+
+    The backstop uses wall-clock time as the sole kill signal, but a rollup PR
+    that's legitimately cycling through REQUEST_CHANGES → fix → re-review can
+    easily exceed the 30-min CI backstop while the pipeline is actively making
+    progress.  Before killing such a task, check whether there is a review or
+    fix task on the same chain (matching pr_number + original_task_id) whose
+    last_heartbeat is recent — if so, the pipeline is alive and we defer to
+    the next sweep.
+    """
+    rl = (parent.context or {}).get("review_loop", {})
+    pr_number = rl.get("pr_number")
+    original_id = rl.get("original_task_id") or str(parent.id)
+    if not pr_number:
+        return False
+    try:
+        candidates = (await session.execute(
+            select(Task).where(
+                Task.project_id == parent.project_id,
+                Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+            )
+        )).scalars().all()
+        cutoff = _utcnow() - timedelta(seconds=stale_seconds)
+        for t in candidates:
+            fp = t.first_payload
+            if fp.get("type") not in ("review", "fix"):
+                continue
+            if fp.get("pr_number") != pr_number:
+                continue
+            if (fp.get("original_task_id") or "") != original_id:
+                continue
+            if t.last_heartbeat and t.last_heartbeat > cutoff:
+                return True
+            # QUEUED/PROVISIONING tasks have no heartbeat yet but are live work
+            if t.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING):
+                return True
+    except Exception:
+        logger.debug(
+            f"[EVAL TIMEOUT] Failed to check chain activity for task {str(parent.id)[:8]}",
+            exc_info=True,
+        )
+    return False
+
+
 async def _summarize_latest_review_for_chain(parent: Task, session) -> dict | None:
     """Return a small summary of the most recent review task on the same chain.
 
@@ -512,6 +557,15 @@ async def _check_evaluating_timeouts():
                     elapsed = (now - evaluating_since).total_seconds()
                     if elapsed <= CI_BACKSTOP_SECONDS:
                         # Under backstop threshold — let normal CI timeout handle it
+                        continue
+                    # Pipeline still actively working on the chain (review/fix
+                    # task heartbeated within 10min) — defer to next sweep so
+                    # we don't kill legitimate in-flight iteration cycles.
+                    if await _chain_has_active_pipeline_work(task, session):
+                        logger.info(
+                            f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past CI backstop but chain "
+                            f"has fresh review/fix heartbeat — skipping kill"
+                        )
                         continue
                     hours = round(elapsed / 3600, 1)
                     ci_passed = bool(rl.get("ci_passed"))
@@ -661,6 +715,15 @@ async def _check_evaluating_timeouts():
 
                 # 6-hour hard timeout
                 if elapsed > EVALUATING_FAIL_SECONDS:
+                    # Same protection as the CI backstop: if the chain has an
+                    # actively heartbeating review/fix task, the pipeline is
+                    # still doing real work — defer to next sweep.
+                    if await _chain_has_active_pipeline_work(task, session):
+                        logger.info(
+                            f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past 6h hard timeout but "
+                            f"chain has fresh review/fix heartbeat — skipping kill"
+                        )
+                        continue
                     hours = round(elapsed / 3600, 1)
                     logger.error(
                         f"[EVAL TIMEOUT] Task {str(task.id)[:8]} has been EVALUATING "
