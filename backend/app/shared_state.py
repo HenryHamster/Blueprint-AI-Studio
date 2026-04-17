@@ -528,6 +528,18 @@ external_health: Dict = {
     "consecutive_failures": {},     # dep_name -> int count of consecutive failed health checks
 }
 
+# --- GitHub API Quota Tracking ---
+# Populated on every _github_request by reading X-RateLimit-Remaining /
+# X-RateLimit-Reset headers off the response. Surfaced in /api/health/detailed
+# and drives the dashboard quota widget + WARNING alert when remaining < 100.
+# Treat None values as "not yet observed — no recent GitHub call".
+github_quota: Dict = {
+    "remaining": None,              # int, lowest remaining seen since last reset
+    "limit": None,                  # int, 5000 for GitHub App installs
+    "reset_at": None,               # int unix ts, when quota resets
+    "last_updated": None,           # isoformat str, last observation
+}
+
 # Track last successful GitHub API operation (tokens, PR comments, etc.)
 # Used by health check to passively verify GitHub is reachable without
 # making an active API call that competes for the shared connection pool.

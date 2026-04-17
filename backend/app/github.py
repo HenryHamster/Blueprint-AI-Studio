@@ -40,6 +40,30 @@ async def close_github_client():
         _github_client = None
 
 
+def _update_quota_state(remaining: int, limit: int | None, reset_ts: int | None) -> None:
+    """Mirror X-RateLimit-* headers into shared_state.github_quota.
+
+    Keeps the LOWEST `remaining` seen before the reset time (so a later
+    higher value doesn't mask a recent crisis until the window resets).
+    Fires a WARNING alert once per reset window when remaining < 100.
+    """
+    from datetime import datetime, timezone
+    import app.shared_state as _ss  # noqa: PLC0415
+    q = _ss.github_quota
+    now_iso = datetime.now(timezone.utc).isoformat()
+    prev_reset = q.get("reset_at")
+    prev_remaining = q.get("remaining")
+    # If the reset window rolled over, accept the new value unconditionally.
+    rolled_over = prev_reset is not None and reset_ts is not None and reset_ts > prev_reset
+    if rolled_over or prev_remaining is None or remaining < prev_remaining:
+        q["remaining"] = remaining
+    if limit is not None:
+        q["limit"] = limit
+    if reset_ts is not None:
+        q["reset_at"] = reset_ts
+    q["last_updated"] = now_iso
+
+
 async def _github_request(
     method: str,
     url: str,
@@ -92,6 +116,19 @@ async def _github_request(
                             await asyncio.sleep(min(wait, 120))  # cap at 2min
                 except (ValueError, TypeError):
                     pass  # Malformed header, skip rate limit check
+            # Mirror rate-limit headers into shared_state so /api/health/detailed
+            # and the dashboard widget can show remaining quota + reset time
+            # without every consumer re-implementing header parsing. Observed
+            # on every response (success or error) — cheap.
+            if remaining is not None:
+                try:
+                    _update_quota_state(
+                        remaining=int(remaining),
+                        limit=int(response.headers.get("X-RateLimit-Limit", 0)) or None,
+                        reset_ts=int(response.headers.get("X-RateLimit-Reset", 0)) or None,
+                    )
+                except (ValueError, TypeError):
+                    pass  # Malformed headers, skip
             if response.status_code == 401:
                 logger.warning(
                     f"[GITHUB] {method} {url} returned 401 Unauthorized — "

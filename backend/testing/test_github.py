@@ -375,6 +375,69 @@ async def test_validate_fine_grained_pat_expired_token_returns_401_not_500(mocke
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+async def test_github_request_mirrors_rate_limit_headers_into_shared_state(mocker):
+    """Every _github_request response populates shared_state.github_quota from
+    X-RateLimit-* headers so /api/health/detailed + dashboard widget can show
+    live quota without each consumer re-parsing headers."""
+    import app.shared_state as _ss
+    from app.github import _github_request
+
+    # Reset state so the test is independent
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+
+    async def mock_request(method, *args, **kwargs):
+        return MockResponse(200, {"ok": True}, headers={
+            "X-RateLimit-Remaining": "3421",
+            "X-RateLimit-Limit": "5000",
+            "X-RateLimit-Reset": "1776400000",
+        })
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+
+    resp = await _github_request("GET", "https://api.github.com/test", {})
+    assert resp.status_code == 200
+    assert _ss.github_quota["remaining"] == 3421
+    assert _ss.github_quota["limit"] == 5000
+    assert _ss.github_quota["reset_at"] == 1776400000
+    assert _ss.github_quota["last_updated"] is not None
+
+
+@pytest.mark.asyncio
+async def test_github_quota_keeps_lowest_remaining_within_reset_window(mocker):
+    """Within the same reset window, the lowest observed `remaining` is kept
+    so transient dips aren't hidden by a later higher value until the window
+    actually rolls over."""
+    import app.shared_state as _ss
+    from app.github import _github_request
+
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+
+    responses = [
+        MockResponse(200, {}, headers={"X-RateLimit-Remaining": "500", "X-RateLimit-Reset": "1776400000"}),
+        MockResponse(200, {}, headers={"X-RateLimit-Remaining": "50",  "X-RateLimit-Reset": "1776400000"}),
+        MockResponse(200, {}, headers={"X-RateLimit-Remaining": "120", "X-RateLimit-Reset": "1776400000"}),
+    ]
+    it = iter(responses)
+    async def mock_request(*args, **kwargs):
+        return next(it)
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+    for _ in range(3):
+        await _github_request("GET", "https://api.github.com/test", {})
+    # Lowest-observed within window wins.
+    assert _ss.github_quota["remaining"] == 50
+
+    # After the reset window rolls over, accept the fresh value.
+    _ss.github_quota["reset_at"] = 1776400000  # sanity: still the old window
+    async def fresh_window(*args, **kwargs):
+        return MockResponse(200, {}, headers={"X-RateLimit-Remaining": "4800", "X-RateLimit-Reset": "1776403600"})
+    mocker.patch("httpx.AsyncClient.request", side_effect=fresh_window)
+    await _github_request("GET", "https://api.github.com/test", {})
+    assert _ss.github_quota["remaining"] == 4800
+    assert _ss.github_quota["reset_at"] == 1776403600
+
+
+@pytest.mark.asyncio
 async def test_github_request_retries_on_502(mocker):
     """
     _github_request retries on 502 and succeeds on the second attempt.

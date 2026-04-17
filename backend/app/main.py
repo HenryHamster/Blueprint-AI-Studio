@@ -1074,6 +1074,22 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
         "consecutive_failures": consecutive_failures,
     }
 
+    # --- GitHub API Quota (populated by _github_request on every response) ---
+    # Surfaces X-RateLimit-Remaining so the dashboard can show a live quota
+    # widget.  critical < 100, degraded < 500, ok otherwise (unknown = no
+    # recent call observed).
+    gq = dict(_shared_state.github_quota)
+    _q_remaining = gq.get("remaining")
+    if _q_remaining is None:
+        _q_status = "unknown"
+    elif _q_remaining < 100:
+        _q_status = "critical"
+    elif _q_remaining < 500:
+        _q_status = "degraded"
+    else:
+        _q_status = "ok"
+    components["github_quota"] = {**gq, "status": _q_status}
+
     # --- Pipeline Health (rolling reaper signals) ---
     ph_snapshot = _shared_state.get_pipeline_health_snapshot()
     ph_status = "degraded" if ph_snapshot["alerts_active"] else "ok"

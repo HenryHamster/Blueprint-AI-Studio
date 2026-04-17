@@ -1296,19 +1296,41 @@ async def update_agent_status(
         # This ensures the helper's fresh session doesn't bypass test DB overrides.
         _bind = session.bind
         _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
+        # Cloud Run's default request timeout is 300s. Post-commit makes
+        # multiple GitHub calls (review posting, check-run update, PR state
+        # check, merge attempts) that each retry with up to 3x120s backoff on
+        # 403 rate-limit. A single stalled retry chain can exceed 300s and
+        # Cloud Run kills the request mid-execution, bypassing the except
+        # handler below — _post_commit_pending never gets set, the agent's
+        # idempotency guard then blocks retries, and the task's state is
+        # silently lost (reviews approved but never propagated, creates
+        # completed but never spawned follow-up).
+        # Explicit 240s budget inside our own timeout so we catch the
+        # timeout in Python and set the pending marker before giving up.
         try:
-            return await _process_post_commit(task.id, payload, _session_factory=_factory)
-        except Exception as e:
+            return await asyncio.wait_for(
+                _process_post_commit(task.id, payload, _session_factory=_factory),
+                timeout=240,
+            )
+        except (Exception, asyncio.TimeoutError) as e:
             # Early-commit already persisted the task status. If post-commit
-            # (review pipeline, rollup, etc.) fails, the idempotency guard
-            # would block agent retries — permanently orphaning any PR that
-            # needed a review/fix spawn. Set a flag so the guard lets the
-            # retry re-run post-commit processing.
-            logger.error(f"[PIPELINE] Post-commit processing failed for task {task.id}: {e}", exc_info=True)
+            # (review pipeline, rollup, etc.) fails or times out, the
+            # idempotency guard would block agent retries — permanently
+            # orphaning any PR that needed a review/fix spawn. Set a flag so
+            # the guard lets the retry re-run post-commit processing.
+            is_timeout = isinstance(e, asyncio.TimeoutError)
+            reason = "post_commit_timeout" if is_timeout else "post_commit_error"
+            logger.error(
+                f"[PIPELINE] Post-commit {'timed out' if is_timeout else 'failed'} for task {task.id}: {e}",
+                exc_info=not is_timeout,
+            )
             try:
                 await session.rollback()
                 await session.refresh(task)
-                task.context = {**(task.context or {}), "_post_commit_pending": {"at": _utcnow().isoformat()}}
+                task.context = {**(task.context or {}), "_post_commit_pending": {
+                    "at": _utcnow().isoformat(),
+                    "reason": reason,
+                }}
                 session.add(task)
                 await session.commit()
             except Exception as ctx_err:
