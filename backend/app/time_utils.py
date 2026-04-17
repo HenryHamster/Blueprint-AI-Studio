@@ -1,5 +1,9 @@
 """Shared time utilities with no intra-app dependencies."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+
+RETRY_AFTER_MAX_MINUTES = 30
 
 
 def _utcnow() -> datetime:
@@ -9,3 +13,31 @@ def _utcnow() -> datetime:
     PostgreSQL columns used throughout the app.
     """
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def set_retry_after(context: dict, minutes: float) -> str:
+    """Clamp `minutes` to [0, 30] and write `retry_after` on the context dict.
+
+    Returns the ISO-formatted timestamp that was written. A single helper
+    prevents far-future or malformed values from permanently blocking
+    dispatch, since the orchestrator skips tasks where retry_after > now.
+    """
+    clamped = max(0.0, min(float(minutes), RETRY_AFTER_MAX_MINUTES))
+    iso = (_utcnow() + timedelta(minutes=clamped)).isoformat()
+    # Round-trip to validate ISO format before persisting.
+    datetime.fromisoformat(iso)
+    context["retry_after"] = iso
+    return iso
+
+
+def parse_retry_after(value) -> Optional[datetime]:
+    """Parse a stored retry_after value. Returns a naive UTC datetime or None."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt

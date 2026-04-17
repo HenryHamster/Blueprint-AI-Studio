@@ -38,7 +38,7 @@ from app.orchestrator_filters import filter_file_conflicts, filter_rollup_confli
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
-from app.time_utils import _utcnow
+from app.time_utils import _utcnow, set_retry_after
 
 logger = logging.getLogger("blueprint")
 
@@ -59,6 +59,85 @@ _last_concurrency_broadcast: float = 0.0
 _last_type_throttle_broadcast: dict[str, float] = {}
 _last_type_unthrottle_broadcast: dict[str, float] = {}
 _previously_failing_types: set[str] = set()
+
+# Debounce: fire the all-accounts-blocked alert once per stall episode.
+# Reset when any task dispatches successfully (stall resolved), then re-arm
+# if every eligible task is again blocked by account rate limits.
+_all_accounts_blocked_alerted: bool = False
+
+
+def _compute_all_accounts_blocked_action(
+    blocked_count: int, dispatched_count: int, already_alerted: bool
+) -> str:
+    """Decide how to handle the all-accounts-blocked stall signal after a cycle.
+
+    Returns 'fire' (emit a new stall alert), 'reset' (re-arm the debounce),
+    or 'noop' (leave state untouched).
+    """
+    if blocked_count > 0 and dispatched_count == 0:
+        return "noop" if already_alerted else "fire"
+    if dispatched_count > 0:
+        return "reset"
+    return "noop"
+
+
+async def _emit_all_accounts_blocked_stall(
+    session: AsyncSession, earliest_recovery: datetime | None
+) -> None:
+    """Broadcast, alert, and notify operators that the pipeline is stalled on
+    Max-plan account exhaustion. Intended to be called once per stall episode."""
+    from app.broadcast import broadcast_to_project, manager as ws_manager  # noqa: PLC0415
+    from app.models import Alert, AlertSeverity  # noqa: PLC0415
+    from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+
+    recovery_iso = earliest_recovery.isoformat() if earliest_recovery else None
+    title = "Pipeline stalled — all Max plan accounts rate-limited"
+    msg = (
+        "Every dispatchable task was skipped because all Max plan accounts are "
+        "in rate-limit cooldown. "
+        + (f"Earliest recovery: {recovery_iso}." if recovery_iso else "Waiting for cooldown.")
+    )
+    try:
+        await ws_manager.broadcast_to_all("pipeline_throttle", {
+            "reason": "all_accounts_blocked",
+            "detail": msg,
+            "earliest_recovery": recovery_iso,
+        })
+    except Exception:
+        logger.exception("[ORCHESTRATOR] Failed to broadcast all_accounts_blocked throttle")
+    try:
+        projects = (await session.execute(select(Project))).scalars().all()
+        for proj in projects:
+            existing = (await session.execute(
+                select(Alert).where(
+                    Alert.project_id == proj.id,
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.ERROR,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == title,
+                )
+            )).scalars().first()
+            if existing is None:
+                alert = Alert(
+                    project_id=proj.id,
+                    severity=AlertSeverity.ERROR,
+                    title=title,
+                    message=msg,
+                )
+                session.add(alert)
+                await broadcast_to_project(
+                    str(proj.id), "alert_created",
+                    {"alert_id": str(alert.id), "severity": "ERROR", "title": title},
+                )
+            asyncio.ensure_future(dispatch_external_notification(  # noqa: RUF006
+                proj.id, "PIPELINE_STALLED",
+                {"reason": "all_accounts_blocked",
+                 "earliest_recovery": recovery_iso or "",
+                 "detail": msg},
+            ))
+    except Exception:
+        logger.exception("[ORCHESTRATOR] Failed to create all-accounts-blocked stall alert")
+    logger.warning(f"[ORCHESTRATOR] {title}: {msg}")
 
 # Timestamp updated each orchestrator cycle — used by /debug endpoint
 _orchestrator_last_cycle: datetime | None = None
@@ -174,7 +253,7 @@ async def _persist_circuit_breakers():
 
 async def _persist_zone_health():
     """Snapshot zone health to DB so cooldowns survive restarts."""
-    from app.deploy_health import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_streak
+    from app.deploy_health import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_history
     try:
         from app.compute import _zone_health, _zone_lock
         with _zone_lock:
@@ -187,7 +266,7 @@ async def _persist_zone_health():
                     for k, v in data.items()
                 }
         snapshot["_pause_failure_streak"] = _pause_failure_streak
-        snapshot["_health_recovery_streak"] = _health_recovery_streak
+        snapshot["_health_recovery_history"] = list(_health_recovery_history)
         async with AsyncSessionLocal() as session:
             state = await _get_deploy_state_for_update(session)
             if state:
@@ -1075,6 +1154,12 @@ async def orchestrator_worker():
                         except Exception:
                             logger.exception("[ORCHESTRATOR] Failed to create all-types-blocked project alerts")
 
+                # Track per-cycle counts so a full stall on Max-plan account exhaustion
+                # fires an alert+broadcast once, rather than only per-task retry_after.
+                _cycle_accounts_blocked = 0
+                _cycle_dispatched = 0
+                _cycle_earliest_recovery: datetime | None = None
+
                 for task in queued_tasks:
                     # Per-type failure gate: skip tasks whose type is currently failing
                     # (global 80% backstop already handled above; this skips only the bad type)
@@ -1168,7 +1253,7 @@ async def orchestrator_worker():
                             # Short retry delay so we don't hot-loop while all accounts are blocked.
                             # Cap at 2 min to stay responsive when accounts recover sooner.
                             stall_ctx = dict(task.context or {})
-                            stall_ctx["retry_after"] = (_utcnow() + timedelta(minutes=2)).isoformat()
+                            set_retry_after(stall_ctx, 2)
                             task.context = stall_ctx
                             if not (task.latest_status_message or "").startswith("All accounts"):
                                 # Update directly on the locked task object (separate session would deadlock)
@@ -1176,6 +1261,11 @@ async def orchestrator_worker():
                                 await broadcast_to_project(str(task.project_id), "task_updated",
                                     {"task_id": str(task.id), "status": task.status, "message": stall_msg})
                             session.add(task)
+                            _cycle_accounts_blocked += 1
+                            if earliest_recovery and (
+                                _cycle_earliest_recovery is None or earliest_recovery < _cycle_earliest_recovery
+                            ):
+                                _cycle_earliest_recovery = earliest_recovery
                             continue
                         # No accounts at all — check for API key fallback
                         if os.getenv("ANTHROPIC_API_KEY"):
@@ -1339,7 +1429,7 @@ async def orchestrator_worker():
                                                     delay_min = min(wait_sec / 60, 30)
                                                 else:
                                                     delay_min = 10
-                                                ctx["retry_after"] = (_utcnow() + timedelta(minutes=delay_min)).isoformat()
+                                                set_retry_after(ctx, delay_min)
                                                 failed_task.latest_status_message = f"Infra-wide provision failure (#{infra_count}), requeued — waiting for zone recovery: {provision_err or 'unknown'}"[:500]
                                                 logger.warning(f"[ORCHESTRATOR] Task {t_id} infra provision failure — requeuing without burning retry budget (delay {delay_min:.0f}min)")
                                             else:
@@ -1365,7 +1455,7 @@ async def orchestrator_worker():
                                                     failed_task.last_heartbeat = None
                                                     failed_task.started_at = None
                                                     # Back off 2 min per failure to let zones recover
-                                                    ctx["retry_after"] = (_utcnow() + timedelta(minutes=2 * prov_failures)).isoformat()
+                                                    set_retry_after(ctx, 2 * prov_failures)
                                                     failed_task.latest_status_message = f"Provision failed (attempt {prov_failures}/{max_prov_retries}), requeued: {provision_err or 'unknown'}"
                                                     logger.warning(f"[ORCHESTRATOR] Task {t_id} provision failed (attempt {prov_failures}) — requeuing")
 
@@ -1398,6 +1488,21 @@ async def orchestrator_worker():
                         "task_updated",
                         {"task_id": str(task.id), "status": TaskStatus.PROVISIONING}
                     )
+                    _cycle_dispatched += 1
+
+                # All-accounts-blocked stall detection: if at least one task was
+                # skipped for rate-limited accounts and nothing dispatched, the
+                # pipeline is silently stalled. Emit one alert/broadcast/notification
+                # per episode (debounced until any task dispatches again).
+                global _all_accounts_blocked_alerted
+                _stall_action = _compute_all_accounts_blocked_action(
+                    _cycle_accounts_blocked, _cycle_dispatched, _all_accounts_blocked_alerted
+                )
+                if _stall_action == "reset":
+                    _all_accounts_blocked_alerted = False
+                elif _stall_action == "fire":
+                    _all_accounts_blocked_alerted = True
+                    await _emit_all_accounts_blocked_stall(session, _cycle_earliest_recovery)
 
                 # Flush any status message updates from skipped tasks (e.g., "All accounts rate-limited")
                 if session.dirty:

@@ -1497,7 +1497,7 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
     """Assemble the deploy state payload. Used by both HTTP endpoint and WS broadcasts."""
     import os
     from app.shared_state import deploy_monitoring, external_health, runtime_config
-    import app.main as _main_module
+    import app.deploy_health as _deploy_health_module
 
     state = await session.get(DeploymentState, 1)
     if not state:
@@ -1538,9 +1538,12 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
         "max_concurrent_vms": runtime_config["max_concurrent_vms"],
         "zone_health": _get_zone_health_summary(),
         "gcp_project_id": os.getenv("GCP_PROJECT_ID", ""),
-        "health_recovery_streak": getattr(_main_module, "_health_recovery_streak", 0),
+        "health_recovery_streak": sum(1 for x in getattr(_deploy_health_module, "_health_recovery_history", []) if x),
         "health_recovery_streak_required": 3,
-        "health_failure_streak": getattr(_main_module, "_pause_failure_streak", 0),
+        "health_recovery_history": list(getattr(_deploy_health_module, "_health_recovery_history", [])),
+        "health_recovery_history_size": 5,
+        "health_failure_streak": getattr(_deploy_health_module, "_pause_failure_streak", 0),
         "health_failure_streak_threshold": 3,
+        "max_auto_pause_duration_seconds": runtime_config.get("max_auto_pause_duration_seconds", 7200),
     }
 

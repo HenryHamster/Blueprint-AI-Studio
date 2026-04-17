@@ -3097,3 +3097,81 @@ async def test_reaper_backoff_on_consecutive_errors(reaper_db, mocker):
     assert sleep_calls[1] == 240   # error 2: counter=2
     assert sleep_calls[2] == 300   # error 3: counter=3 → capped
     assert sleep_calls[3] == 60    # success: counter reset to 0
+
+
+@pytest.mark.asyncio
+async def test_reaper_clears_far_future_retry_after(reaper_db, mocker):
+    """A QUEUED task with a far-future retry_after (>30 min) has it cleared by the reaper.
+
+    Without this sweep, a malformed or runaway value silently blocks dispatch
+    forever since the orchestrator skips tasks where retry_after > now.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
+
+    project = Project(name="Retry-After Sweep Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    far_future = (datetime.utcnow() + timedelta(hours=5)).isoformat()
+    stale_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.QUEUED,
+        context={"retry_after": far_future},
+    )
+    malformed_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "more work"}],
+        status=TaskStatus.QUEUED,
+        context={"retry_after": "not-a-timestamp"},
+    )
+    valid_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "ok work"}],
+        status=TaskStatus.QUEUED,
+        context={"retry_after": (datetime.utcnow() + timedelta(minutes=5)).isoformat()},
+    )
+    reaper_db.add_all([stale_task, malformed_task, valid_task])
+    await reaper_db.commit()
+    for t in (stale_task, malformed_task, valid_task):
+        await reaper_db.refresh(t)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    await reaper_db.refresh(stale_task)
+    await reaper_db.refresh(malformed_task)
+    await reaper_db.refresh(valid_task)
+
+    assert "retry_after" not in (stale_task.context or {}), (
+        "far-future retry_after should have been cleared"
+    )
+    assert "retry_after" not in (malformed_task.context or {}), (
+        "unparseable retry_after should have been cleared"
+    )
+    assert (valid_task.context or {}).get("retry_after"), (
+        "valid (<=30min) retry_after should be preserved"
+    )
+
+
+def test_set_retry_after_clamps_to_30_minutes():
+    """set_retry_after must cap delays at RETRY_AFTER_MAX_MINUTES."""
+    from app.time_utils import set_retry_after, RETRY_AFTER_MAX_MINUTES, parse_retry_after
+
+    ctx = {}
+    set_retry_after(ctx, 9999)
+    dt = parse_retry_after(ctx["retry_after"])
+    assert dt is not None
+    assert dt <= datetime.utcnow() + timedelta(minutes=RETRY_AFTER_MAX_MINUTES) + timedelta(seconds=5)
+
+    ctx2 = {}
+    set_retry_after(ctx2, -100)
+    dt2 = parse_retry_after(ctx2["retry_after"])
+    assert dt2 is not None
+    assert dt2 >= datetime.utcnow() - timedelta(seconds=5)

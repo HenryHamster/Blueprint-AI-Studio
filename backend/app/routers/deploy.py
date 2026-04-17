@@ -121,7 +121,7 @@ async def reset_deploy_health(
     try:
         import app.deploy_health as _dh
         _dh._pause_failure_streak = 0
-        _dh._health_recovery_streak = 0
+        _dh._reset_health_recovery_history()
     except Exception:
         logger.exception("[DEPLOY] Failed to reset deploy_health streak counters")
 

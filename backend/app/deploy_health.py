@@ -11,6 +11,7 @@ Extracted from app.main to reduce module size. Contains:
 """
 
 import logging
+from collections import deque
 from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,8 +49,17 @@ def _get_zone_health_summary() -> dict:
 # ---------------------------------------------------------------------------
 
 _pause_failure_streak: int = 0   # consecutive health check cycles with critical failures
-_health_recovery_streak: int = 0  # consecutive healthy cycles while PAUSED (gate for auto-resume)
+# Ring buffer of the last 5 health check results while PAUSED (True == healthy).
+# Auto-resume fires once >= 3 of the last 5 are healthy, tolerating a single flaky probe.
+_HEALTH_HISTORY_SIZE = 5
+_HEALTH_HISTORY_HEALTHY_REQUIRED = 3
+_health_recovery_history: "deque[bool]" = deque(maxlen=_HEALTH_HISTORY_SIZE)
 _last_exhausted_zones: set = set()  # tracks zone health for transition logging
+
+
+def _reset_health_recovery_history() -> None:
+    """Clear the recovery ring buffer (called on pause, on resume, and on manual reset)."""
+    _health_recovery_history.clear()
 
 
 def should_rollback() -> tuple:
@@ -338,6 +348,44 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
         logger.warning(f"[NOTIFY] DEPLOY_HEALTH_ALERT dispatch setup failed: {_ne}")
 
 
+async def _create_forced_resume_alerts(session: AsyncSession, pause_duration_seconds: float, failed_deps: list) -> None:
+    """CRITICAL alerts when we force a resume after max_auto_pause_duration_seconds elapsed."""
+    pause_title = "Pipeline auto-paused: external dependencies down"
+    title = "Pipeline force-resumed: max auto-pause duration exceeded"
+    msg = (
+        f"Pipeline force-resumed after {int(pause_duration_seconds)}s paused "
+        f"(max {_runtime_config['max_auto_pause_duration_seconds']}s). "
+        f"Health probes still report failures: {', '.join(failed_deps) if failed_deps else 'none'}. "
+        "Resuming with reduced VM count (1) — operators should investigate."
+    )
+    now = _utcnow()
+    projects = (await session.execute(select(Project))).scalars().all()
+    for project in projects:
+        existing_warnings = (await session.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.severity == AlertSeverity.WARNING,
+                Alert.dismissed_at.is_(None),
+                Alert.title == pause_title,
+            )
+        )).scalars().all()
+        for w in existing_warnings:
+            w.dismissed_at = now
+            session.add(w)
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.ERROR,
+            title=title,
+            message=msg,
+        )
+        session.add(alert)
+        await broadcast_to_project(
+            str(project.id),
+            "alert_created",
+            {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
+        )
+
+
 async def _create_auto_resume_alerts(session: AsyncSession) -> None:
     """Create INFO alerts and dismiss existing auto-pause warnings when the pipeline auto-resumes."""
     pause_title = "Pipeline auto-paused: external dependencies down"
@@ -373,15 +421,20 @@ async def _create_auto_resume_alerts(session: AsyncSession) -> None:
 
 
 async def _check_pause_mode():
-    """Auto-pause when critical external deps fail, auto-resume when they recover."""
-    global _pause_failure_streak, _health_recovery_streak
+    """Auto-pause when critical external deps fail, auto-resume when they recover.
+
+    Recovery uses a 3-of-5 ring buffer to tolerate a single flaky probe. A max
+    auto-pause duration forces resume (with reduced VMs) if healthy probes never
+    reach the threshold — preventing indefinite pause under intermittent failures.
+    """
+    global _pause_failure_streak
     ext = _shared_state.external_health
     failed = ext.get("failed_deps", [])
     # Auto-pause on critical deps including Claude API (rate limits, not just missing credentials)
     critical_failures = [d for d in failed if d in ("db", "github_api", "gcp", "claude_api")]
+    is_healthy = not critical_failures
 
     if critical_failures:
-        _health_recovery_streak = 0
         _pause_failure_streak += 1
         # Require 3 consecutive failures before pausing (avoid flaky single checks)
         if _pause_failure_streak < 3:
@@ -394,12 +447,27 @@ async def _check_pause_mode():
                 })
             except Exception as _be:
                 logger.warning(f"[WS] health_degrading broadcast failed: {_be}")
+            # Still record into recovery history while PAUSED so a single flake doesn't reset progress
+    else:
+        _pause_failure_streak = 0
+
+    # If we're not paused from our own auto-pause, handle the pause-trigger path.
+    async with AsyncSessionLocal() as session:
+        state = await _get_deploy_state_for_update(session)
+        if state is None:
             return
-        # Should we pause?
-        if _runtime_config["max_concurrent_vms"] > 0:
-            async with AsyncSessionLocal() as session:
-                state = await _get_deploy_state_for_update(session)
-                if state and state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+
+        is_auto_paused = (
+            state.status == DeploymentStatus.PAUSED
+            and state.pre_pause_max_vms is not None
+            and (state.pause_reason or "").startswith("External dependency down")
+        )
+
+        # --- Pause-trigger path -------------------------------------------------
+        if not is_auto_paused:
+            _reset_health_recovery_history()
+            if critical_failures and _pause_failure_streak >= 3 and _runtime_config["max_concurrent_vms"] > 0:
+                if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
                     state.status = DeploymentStatus.PAUSED
                     state.pause_reason = f"External dependency down: {', '.join(critical_failures)}"
                     state.paused_at = _utcnow()
@@ -408,39 +476,81 @@ async def _check_pause_mode():
                     session.add(state)
                     await _create_auto_pause_alerts(session, critical_failures)
                     await session.commit()
-                    # Only set to 0 after saving pre_pause value
                     _runtime_config["max_concurrent_vms"] = 0
-            logger.warning(f"[PAUSE] Auto-paused pipeline — {', '.join(critical_failures)} down")
-            await broadcast_deploy_state()
-    else:
-        _pause_failure_streak = 0
-        # All deps healthy — should we auto-resume?
-        async with AsyncSessionLocal() as session:
-            state = await _get_deploy_state_for_update(session)
-            if state and state.status == DeploymentStatus.PAUSED and state.pre_pause_max_vms is not None:
-                # Only auto-resume pauses we initiated (external dep down).
-                # Don't override a manual admin pause — the operator paused on purpose.
-                if not (state.pause_reason or "").startswith("External dependency down"):
-                    _health_recovery_streak = 0
-                    return
-                _health_recovery_streak += 1
-                if _health_recovery_streak < 3:
-                    logger.info(f"[PAUSE] Recovery streak {_health_recovery_streak}/3 — all deps healthy, waiting for confirmation")
-                    return
-                restore = state.pre_pause_max_vms
-                state.status = DeploymentStatus.MONITORING if _shared_state.deploy_monitoring["window_start"] else DeploymentStatus.STABLE
-                state.pause_reason = None
-                state.paused_at = None
-                state.pre_pause_max_vms = None
-                state.runtime_max_concurrent_vms = restore
-                session.add(state)
-                await _create_auto_resume_alerts(session)
-                await session.commit()
-                initial_vms = min(2, restore)
-                _runtime_config["max_concurrent_vms"] = initial_vms
-                _health_recovery_streak = 0
-                logger.info(f"[PAUSE] Auto-resumed pipeline with {initial_vms} VMs (target: {restore})")
-                await broadcast_deploy_state()
+                    logger.warning(f"[PAUSE] Auto-paused pipeline — {', '.join(critical_failures)} down")
+                    await broadcast_deploy_state()
+            return
+
+        # --- Recovery path (we are in our own auto-pause) ----------------------
+        _health_recovery_history.append(is_healthy)
+        history_snapshot = list(_health_recovery_history)
+        healthy_count = sum(1 for x in history_snapshot if x)
+
+        # Forced-resume after max auto-pause duration
+        max_duration = _runtime_config.get("max_auto_pause_duration_seconds", 7200)
+        pause_duration = 0.0
+        if state.paused_at is not None:
+            paused_at = state.paused_at
+            now = _utcnow()
+            # _utcnow() is naive UTC; normalize both sides to match.
+            if paused_at.tzinfo is not None:
+                paused_at = paused_at.replace(tzinfo=None)
+            pause_duration = (now - paused_at).total_seconds()
+
+        should_force_resume = pause_duration >= max_duration > 0
+        should_normal_resume = (
+            len(history_snapshot) >= _HEALTH_HISTORY_HEALTHY_REQUIRED
+            and healthy_count >= _HEALTH_HISTORY_HEALTHY_REQUIRED
+        )
+
+        if not (should_force_resume or should_normal_resume):
+            logger.info(
+                f"[PAUSE] Recovery progress: {healthy_count}/{len(history_snapshot)} healthy "
+                f"(need {_HEALTH_HISTORY_HEALTHY_REQUIRED}-of-{_HEALTH_HISTORY_SIZE}); "
+                f"paused {int(pause_duration)}s/{max_duration}s"
+            )
+            return
+
+        restore = state.pre_pause_max_vms or 1
+        if should_force_resume:
+            initial_vms = 1
+        else:
+            initial_vms = min(2, restore)
+
+        state.status = DeploymentStatus.MONITORING if _shared_state.deploy_monitoring["window_start"] else DeploymentStatus.STABLE
+        state.pause_reason = None
+        state.paused_at = None
+        state.pre_pause_max_vms = None
+        state.runtime_max_concurrent_vms = initial_vms if should_force_resume else restore
+        session.add(state)
+        if should_force_resume:
+            await _create_forced_resume_alerts(session, pause_duration, critical_failures)
+        else:
+            await _create_auto_resume_alerts(session)
+        await session.commit()
+        _runtime_config["max_concurrent_vms"] = initial_vms
+        _reset_health_recovery_history()
+
+        if should_force_resume:
+            logger.error(
+                f"[PAUSE] FORCE-RESUMED after {int(pause_duration)}s paused (max {max_duration}s) "
+                f"with {initial_vms} VM(s). Health history: {history_snapshot}. "
+                f"Still-failing deps: {critical_failures or 'none'}",
+                extra={
+                    "alert": True,
+                    "type": "forced_resume",
+                    "pause_duration_seconds": int(pause_duration),
+                    "max_auto_pause_duration_seconds": max_duration,
+                    "health_history": history_snapshot,
+                    "failed_deps": critical_failures,
+                },
+            )
+        else:
+            logger.info(
+                f"[PAUSE] Auto-resumed pipeline with {initial_vms} VMs (target: {restore}) "
+                f"after {int(pause_duration)}s paused. Health history: {history_snapshot}"
+            )
+        await broadcast_deploy_state()
 
 
 async def broadcast_deploy_state():

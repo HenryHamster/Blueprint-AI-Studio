@@ -2093,3 +2093,90 @@ async def test_lookback_hours_excludes_tasks_outside_window():
     # With 3h lookback: both tasks in window → 1 completed, 1 failed → success_rate = 0.5
     result_3h = await compute_pipeline_health_summary(session, project_id, lookback_hours=3)
     assert result_3h["success_rate"] == 0.5
+
+
+# ── All-accounts-blocked stall detection ─────────────────────────────────────
+
+def test_all_accounts_blocked_action_fires_once_per_episode():
+    """Every eligible task blocked, nothing dispatched → fire, then debounce."""
+    from app.orchestrator import _compute_all_accounts_blocked_action as act
+
+    # Stall starts: fire a single alert.
+    assert act(blocked_count=3, dispatched_count=0, already_alerted=False) == "fire"
+    # Stall persists across cycles: do not re-alert.
+    assert act(blocked_count=3, dispatched_count=0, already_alerted=True) == "noop"
+
+
+def test_all_accounts_blocked_action_resets_on_dispatch():
+    """Any successful dispatch re-arms the debounce for the next stall."""
+    from app.orchestrator import _compute_all_accounts_blocked_action as act
+
+    assert act(blocked_count=0, dispatched_count=2, already_alerted=True) == "reset"
+    # Mixed cycle (some dispatched, some blocked) is not a full stall.
+    assert act(blocked_count=1, dispatched_count=1, already_alerted=True) == "reset"
+
+
+def test_all_accounts_blocked_action_noop_when_no_signal():
+    """Empty cycle or no account-blocked skips should not trip the alert."""
+    from app.orchestrator import _compute_all_accounts_blocked_action as act
+
+    assert act(blocked_count=0, dispatched_count=0, already_alerted=False) == "noop"
+    assert act(blocked_count=0, dispatched_count=0, already_alerted=True) == "noop"
+
+
+@pytest.mark.asyncio
+async def test_all_accounts_blocked_emits_broadcast_and_alert(monkeypatch):
+    """Simulate a full cycle where every dispatchable task hit the account-blocked
+    stall: the orchestrator must broadcast pipeline_throttle with reason
+    'all_accounts_blocked' and create a project-level ERROR alert (once)."""
+    from app import orchestrator as orch
+    from app.models import Alert, AlertSeverity
+
+    orch._all_accounts_blocked_alerted = False
+
+    project_id = uuid.uuid4()
+    project = MagicMock()
+    project.id = project_id
+
+    added = []
+    session = AsyncMock()
+    session.add = MagicMock(side_effect=lambda obj: added.append(obj))
+
+    # First call: Project list; second call: existing-alert dedup check (none).
+    proj_result = MagicMock()
+    proj_result.scalars.return_value.all.return_value = [project]
+    existing_result = MagicMock()
+    existing_result.scalars.return_value.first.return_value = None
+    session.execute = AsyncMock(side_effect=[proj_result, existing_result])
+
+    broadcasts = []
+    ws_mock = MagicMock()
+    ws_mock.broadcast_to_all = AsyncMock(
+        side_effect=lambda event, payload: broadcasts.append((event, payload))
+    )
+
+    proj_events = []
+
+    async def _bp(pid, event, payload):
+        proj_events.append((pid, event, payload))
+
+    import app.broadcast as _broadcast_mod
+    monkeypatch.setattr(_broadcast_mod, "manager", ws_mock, raising=False)
+    monkeypatch.setattr(_broadcast_mod, "broadcast_to_project", _bp, raising=False)
+
+    notifications = []
+
+    async def _dispatch(pid, kind, payload):
+        notifications.append((pid, kind, payload))
+
+    import app.notification_dispatch as _nd_mod
+    monkeypatch.setattr(_nd_mod, "dispatch_external_notification", _dispatch)
+
+    earliest = datetime.now(timezone.utc) + timedelta(minutes=10)
+    await orch._emit_all_accounts_blocked_stall(session, earliest)
+
+    assert any(event == "pipeline_throttle" and payload.get("reason") == "all_accounts_blocked"
+               for event, payload in broadcasts), broadcasts
+    stall_alerts = [a for a in added if isinstance(a, Alert) and a.severity == AlertSeverity.ERROR]
+    assert len(stall_alerts) == 1
+    assert "all Max plan accounts" in stall_alerts[0].message.lower() or "rate-limited" in stall_alerts[0].title.lower()

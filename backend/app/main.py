@@ -396,9 +396,18 @@ async def _init_deployment_state():
             if state.zone_health_state:
                 import app.deploy_health as _dh
                 _dh._pause_failure_streak = state.zone_health_state.get("_pause_failure_streak", 0)
-                _dh._health_recovery_streak = state.zone_health_state.get("_health_recovery_streak", 0)
-                if _dh._pause_failure_streak or _dh._health_recovery_streak:
-                    logger.info(f"[DEPLOY] Restored health streaks: pause_failures={_dh._pause_failure_streak}, recovery={_dh._health_recovery_streak}")
+                # Recovery state migrated from int streak → bool ring buffer.
+                # Accept either legacy int (discarded — empty history) or new list form.
+                history = state.zone_health_state.get("_health_recovery_history")
+                _dh._health_recovery_history.clear()
+                if isinstance(history, list):
+                    for v in history[-_dh._HEALTH_HISTORY_SIZE:]:
+                        _dh._health_recovery_history.append(bool(v))
+                if _dh._pause_failure_streak or _dh._health_recovery_history:
+                    logger.info(
+                        f"[DEPLOY] Restored health streaks: pause_failures={_dh._pause_failure_streak}, "
+                        f"recovery_history={list(_dh._health_recovery_history)}"
+                    )
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore health streaks: {e}", exc_info=True)
 

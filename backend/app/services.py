@@ -346,7 +346,7 @@ async def _persist_circuit_breakers():
 
 async def _persist_zone_health():
     """Snapshot zone health to DB so cooldowns survive restarts."""
-    from app.deploy_health import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_streak
+    from app.deploy_health import _get_deploy_state_for_update, _pause_failure_streak, _health_recovery_history
 
     try:
         from app.compute import _zone_health, _zone_lock
@@ -358,7 +358,7 @@ async def _persist_zone_health():
                     for k, v in data.items()
                 }
         snapshot["_pause_failure_streak"] = _pause_failure_streak
-        snapshot["_health_recovery_streak"] = _health_recovery_streak
+        snapshot["_health_recovery_history"] = list(_health_recovery_history)
         async with AsyncSessionLocal() as session:
             state = await _get_deploy_state_for_update(session)
             if state:

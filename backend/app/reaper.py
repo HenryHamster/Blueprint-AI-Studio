@@ -15,7 +15,7 @@ from app.compute import get_provision_error, record_zone_failure, _capture_seria
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import record_pipeline_event, external_health as _external_health
 from app.failure_classification import classify_failure, persist_failure_category, INFRA_CLASSES
-from app.time_utils import _utcnow
+from app.time_utils import _utcnow, set_retry_after, parse_retry_after, RETRY_AFTER_MAX_MINUTES
 from app.failure_classification import classify_failure, persist_failure_category
 
 logger = logging.getLogger(__name__)
@@ -25,23 +25,20 @@ logger = logging.getLogger(__name__)
 _reaper_skip_counts: Dict[uuid.UUID, int] = {}
 
 
+_ANALYSIS_ARTIFACT_KEYS = (
+    ("_pr_diff_summary", "_previous_diff_summary"),
+    ("_test_failure_summary", "_previous_test_failure_summary"),
+    ("_self_review_outcome", "_previous_self_review_outcome"),
+    ("_analysis_plan", "_previous_analysis_plan"),
+)
+
+
 def _copy_analysis_artifacts_to_previous(ctx: dict) -> None:
-    """Mirror the _pr_diff_summary/_test_failure_summary/_self_review_outcome/
-    _analysis_plan artifacts from the failed attempt into their _previous_*
-    equivalents so the agent's buildRetryContext can surface them. Matches the
-    conversion in task_lifecycle._requeue_parent_task."""
-    prev_diff_summary = ctx.get("_pr_diff_summary", [])
-    prev_test_failure_summary = ctx.get("_test_failure_summary", "")
-    prev_self_review_outcome = ctx.get("_self_review_outcome")
-    prev_analysis_plan = ctx.get("_analysis_plan", "")
-    if prev_diff_summary:
-        ctx["_previous_diff_summary"] = prev_diff_summary
-    if prev_test_failure_summary:
-        ctx["_previous_test_failure_summary"] = prev_test_failure_summary
-    if prev_self_review_outcome:
-        ctx["_previous_self_review_outcome"] = prev_self_review_outcome
-    if prev_analysis_plan:
-        ctx["_previous_analysis_plan"] = prev_analysis_plan
+    # Mirror failed-attempt artifacts into _previous_* so the agent's buildRetryContext
+    # surfaces them — matches task_lifecycle._requeue_parent_task.
+    for src, dst in _ANALYSIS_ARTIFACT_KEYS:
+        if ctx.get(src):
+            ctx[dst] = ctx[src]
 
 
 async def reaper_service():
@@ -528,7 +525,7 @@ async def reaper_service():
                             else:
                                 # Exponential backoff for agent failures: 1, 2, 4, 8 min capped at 15
                                 delay_minutes = min(2 ** (task.attempt_count - 1), 15) * random.uniform(0.75, 1.25)
-                            reaper_ctx["retry_after"] = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
+                            set_retry_after(reaper_ctx, delay_minutes)
                             task.context = reaper_ctx
                             session.add(task)
 
@@ -721,10 +718,8 @@ async def reaper_service():
                 try:
                     from app.max_plan_pool import _all_accounts, _account_available_for_model  # noqa: PLC0415
                     _infra_lookback = now - timedelta(hours=2)
-                    # Exclude tasks that were just reaped in this iteration — otherwise a
-                    # task failed in Step 2 with an infra class (e.g. AGENT_TIMEOUT) would
-                    # be immediately resurrected in the same cycle, defeating the retry
-                    # budget. The next cycle's sweep will pick them up if infra recovers.
+                    # Exclude just-reaped tasks so Step 2 failures aren't immediately
+                    # resurrected in the same cycle, defeating the retry budget.
                     _just_reaped_ids = {t.id for t in orphaned_tasks}
                     _infra_query = select(Task).where(
                         Task.status == TaskStatus.FAILED,
@@ -867,12 +862,40 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(f"[REAPER] Infra recovery sweep error: {e}", exc_info=True)
 
-                # Step 6: QUEUED task age alerts — notify operators when tasks have been
-                # waiting in QUEUED state beyond the configured threshold. Escalates through
-                # three tiers (INFO at 1×, WARNING at 3×, CRITICAL at 6× the threshold) so
-                # long-stalled tasks re-alert at rising severity instead of going silent
-                # after the first fire. Approval-blocked tasks are included with a distinct
-                # message so they aren't invisible forever.
+                # Step 5b: Clear stale or malformed retry_after on QUEUED tasks.
+                # A far-future or unparseable value permanently blocks dispatch
+                # (orchestrator skips tasks where retry_after > now).
+                try:
+                    _retry_cutoff = now + timedelta(minutes=RETRY_AFTER_MAX_MINUTES)
+                    _queued_with_retry = (await session.execute(
+                        select(Task).where(Task.status == TaskStatus.QUEUED)
+                    )).scalars().all()
+                    _cleared = 0
+                    for _qt in _queued_with_retry:
+                        _qctx = _qt.context or {}
+                        _ra = _qctx.get("retry_after")
+                        if _ra is None:
+                            continue
+                        _parsed = parse_retry_after(_ra)
+                        if _parsed is None:
+                            logger.warning(f"[REAPER] Task {_qt.id}: clearing unparseable retry_after={_ra!r}")
+                        elif _parsed > _retry_cutoff:
+                            logger.warning(f"[REAPER] Task {_qt.id}: clearing far-future retry_after={_ra} (>{RETRY_AFTER_MAX_MINUTES}min)")
+                        else:
+                            continue
+                        _new_ctx = dict(_qctx)
+                        _new_ctx.pop("retry_after", None)
+                        _qt.context = _new_ctx
+                        session.add(_qt)
+                        _cleared += 1
+                    if _cleared:
+                        await session.commit()
+                        logger.info(f"[REAPER] Cleared stale retry_after on {_cleared} task(s)")
+                except Exception as e:
+                    logger.error(f"[REAPER] Stale retry_after sweep error: {e}", exc_info=True)
+
+                # Step 6: QUEUED task age alerts — escalate through 3 tiers (INFO/WARNING/ERROR
+                # at 1×/3×/6× the threshold) so long-stalled tasks re-alert instead of going silent.
                 try:
                     from app.models import Alert, AlertSeverity  # noqa: PLC0415
                     from app.broadcast import broadcast_to_project as _bcast  # noqa: PLC0415
@@ -895,17 +918,12 @@ async def reaper_service():
                     _alerted = 0
                     for _qt in _stale_queued:
                         _qctx = _qt.context or {}
-                        # Backward-compat: legacy bool flag counts as tier 1 already fired.
                         _prev_tier = _qctx.get("queued_age_alert_tier") or (1 if _qctx.get("queued_age_alert_fired") else 0)
                         _queue_hours = (now - _qt.created_at).total_seconds() / 3600
-                        _target_tier = 0
-                        _target_severity = AlertSeverity.INFO
-                        _target_label = "INFO"
+                        _target_tier, _target_severity, _target_label = 0, AlertSeverity.INFO, "INFO"
                         for _tier, _hrs, _sev, _sev_label in _tier_specs:
                             if _queue_hours >= _hrs:
-                                _target_tier = _tier
-                                _target_severity = _sev
-                                _target_label = _sev_label
+                                _target_tier, _target_severity, _target_label = _tier, _sev, _sev_label
                         if _target_tier <= _prev_tier:
                             continue
 
@@ -936,21 +954,16 @@ async def reaper_service():
 
                         _new_qctx = dict(_qctx)
                         _new_qctx["queued_age_alert_tier"] = _target_tier
-                        # Preserve legacy flag so any downstream reader still sees it set.
                         _new_qctx["queued_age_alert_fired"] = True
                         _qt.context = _new_qctx
                         session.add(_qt)
 
                         try:
-                            await _bcast(
-                                str(_qt.project_id),
-                                "alert_created",
-                                {
-                                    "alert_id": str(_alert.id),
-                                    "severity": _target_label,
-                                    "title": _alert.title,
-                                },
-                            )
+                            await _bcast(str(_qt.project_id), "alert_created", {
+                                "alert_id": str(_alert.id),
+                                "severity": _target_label,
+                                "title": _alert.title,
+                            })
                         except Exception as _bcast_err:
                             logger.warning(f"[REAPER] Queued age alert broadcast failed for {_qt.id}: {_bcast_err}")
 

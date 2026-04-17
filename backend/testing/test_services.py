@@ -435,7 +435,8 @@ async def test_persist_zone_health_serializes_datetimes(deploy_db, mocker):
     mocker.patch("app.compute._zone_lock", threading.Lock())
 
     mocker.patch("app.deploy_health._pause_failure_streak", 2)
-    mocker.patch("app.deploy_health._health_recovery_streak", 1)
+    from collections import deque as _deque
+    mocker.patch("app.deploy_health._health_recovery_history", _deque([True], maxlen=5))
 
     mock_state = MagicMock()
     mock_state.zone_health_state = None
@@ -454,12 +455,13 @@ async def test_persist_zone_health_serializes_datetimes(deploy_db, mocker):
 
 @pytest.mark.asyncio
 async def test_persist_zone_health_includes_streak_counters(deploy_db, mocker):
-    """Snapshot must include _pause_failure_streak and _health_recovery_streak."""
+    """Snapshot must include _pause_failure_streak and _health_recovery_history."""
     mocker.patch("app.compute._zone_health", {})
     import threading
     mocker.patch("app.compute._zone_lock", threading.Lock())
     mocker.patch("app.deploy_health._pause_failure_streak", 4)
-    mocker.patch("app.deploy_health._health_recovery_streak", 7)
+    from collections import deque as _deque
+    mocker.patch("app.deploy_health._health_recovery_history", _deque([True, False, True], maxlen=5))
 
     mock_state = MagicMock()
     mock_state.zone_health_state = None
@@ -469,7 +471,7 @@ async def test_persist_zone_health_includes_streak_counters(deploy_db, mocker):
 
     snapshot = mock_state.zone_health_state
     assert snapshot["_pause_failure_streak"] == 4
-    assert snapshot["_health_recovery_streak"] == 7
+    assert snapshot["_health_recovery_history"] == [True, False, True]
 
 
 @pytest.mark.asyncio
@@ -479,7 +481,8 @@ async def test_persist_zone_health_handles_missing_deploy_state(mocker):
     import threading
     mocker.patch("app.compute._zone_lock", threading.Lock())
     mocker.patch("app.deploy_health._pause_failure_streak", 0)
-    mocker.patch("app.deploy_health._health_recovery_streak", 0)
+    from collections import deque as _deque
+    mocker.patch("app.deploy_health._health_recovery_history", _deque(maxlen=5))
     mocker.patch("app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=None))
     mocker.patch("app.services.AsyncSessionLocal", MagicMock())
 

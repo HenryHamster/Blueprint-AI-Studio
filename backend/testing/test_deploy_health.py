@@ -54,6 +54,7 @@ async def dh_db(mocker):
     # Suppress all side-effects that require running infra
     mocker.patch("app.deploy_health._create_auto_pause_alerts", new_callable=AsyncMock)
     mocker.patch("app.deploy_health._create_auto_resume_alerts", new_callable=AsyncMock)
+    mocker.patch("app.deploy_health._create_forced_resume_alerts", new_callable=AsyncMock)
     mocker.patch("app.deploy_health.broadcast_deploy_state", new_callable=AsyncMock)
 
     async with _Session() as session:
@@ -68,10 +69,17 @@ async def dh_db(mocker):
 def reset_module_state():
     """Reset module-level streak counters before and after every test."""
     _dh._pause_failure_streak = 0
-    _dh._health_recovery_streak = 0
+    _dh._reset_health_recovery_history()
     yield
     _dh._pause_failure_streak = 0
-    _dh._health_recovery_streak = 0
+    _dh._reset_health_recovery_history()
+
+
+def _seed_recovery_history(*values):
+    """Seed the health recovery ring buffer with the given boolean values."""
+    _dh._reset_health_recovery_history()
+    for v in values:
+        _dh._health_recovery_history.append(bool(v))
 
 
 @pytest.fixture(autouse=True)
@@ -252,7 +260,7 @@ async def test_recovery_first_healthy_cycle_does_not_resume(dh_db):
 
     await _dh._check_pause_mode()
 
-    assert _dh._health_recovery_streak == 1
+    assert list(_dh._health_recovery_history) == [True]
     assert _shared_state.runtime_config["max_concurrent_vms"] == 0  # still paused
 
     state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
@@ -271,11 +279,11 @@ async def test_recovery_second_healthy_cycle_does_not_resume(dh_db):
     _shared_state.runtime_config["max_concurrent_vms"] = 0
     _set_healthy()
 
-    _dh._health_recovery_streak = 1  # one prior healthy cycle
+    _seed_recovery_history(True)  # one prior healthy cycle
 
     await _dh._check_pause_mode()
 
-    assert _dh._health_recovery_streak == 2
+    assert list(_dh._health_recovery_history) == [True, True]
     assert _shared_state.runtime_config["max_concurrent_vms"] == 0
 
     state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
@@ -295,11 +303,11 @@ async def test_recovery_third_healthy_cycle_resumes(dh_db):
     _shared_state.deploy_monitoring["window_start"] = None
     _set_healthy()
 
-    _dh._health_recovery_streak = 2  # two prior healthy cycles
+    _seed_recovery_history(True, True)  # two prior healthy cycles
 
     await _dh._check_pause_mode()
 
-    assert _dh._health_recovery_streak == 0  # reset after resume
+    assert list(_dh._health_recovery_history) == []  # reset after resume
     assert _shared_state.runtime_config["max_concurrent_vms"] == 2  # min(2, 4)
 
     state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
@@ -321,7 +329,7 @@ async def test_resume_creates_alerts(dh_db):
     _shared_state.deploy_monitoring["window_start"] = None
     _set_healthy()
 
-    _dh._health_recovery_streak = 2
+    _seed_recovery_history(True, True)
 
     await _dh._check_pause_mode()
 
@@ -343,7 +351,7 @@ async def test_resume_vm_count_capped_at_2(dh_db):
     _shared_state.deploy_monitoring["window_start"] = None
     _set_healthy()
 
-    _dh._health_recovery_streak = 2
+    _seed_recovery_history(True, True)
 
     await _dh._check_pause_mode()
 
@@ -364,7 +372,7 @@ async def test_resume_vm_count_uses_pre_pause_when_less_than_2(dh_db):
     _shared_state.deploy_monitoring["window_start"] = None
     _set_healthy()
 
-    _dh._health_recovery_streak = 2
+    _seed_recovery_history(True, True)
 
     await _dh._check_pause_mode()
 
@@ -386,12 +394,12 @@ async def test_manual_pause_is_not_auto_resumed(dh_db):
     _shared_state.runtime_config["max_concurrent_vms"] = 0
     _set_healthy()
 
-    _dh._health_recovery_streak = 2  # would normally trigger resume
+    _seed_recovery_history(True, True)  # would normally trigger resume
 
     await _dh._check_pause_mode()
 
-    # recovery streak reset because it's not an automated pause
-    assert _dh._health_recovery_streak == 0
+    # recovery history reset because it's not an automated pause
+    assert list(_dh._health_recovery_history) == []
     assert _shared_state.runtime_config["max_concurrent_vms"] == 0  # still paused
 
     state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
@@ -410,7 +418,7 @@ async def test_no_pause_reason_is_not_auto_resumed(dh_db):
     _shared_state.runtime_config["max_concurrent_vms"] = 0
     _set_healthy()
 
-    _dh._health_recovery_streak = 2
+    _seed_recovery_history(True, True)
 
     await _dh._check_pause_mode()
 
@@ -471,11 +479,11 @@ async def test_already_paused_state_skips_re_pause(dh_db):
     _dh._create_auto_pause_alerts.assert_not_awaited()
 
 
-# ── Tests: recovery streak resets on new failure ─────────────────────────────
+# ── Tests: recovery ring buffer tolerates a single flaky probe ───────────────
 
 @pytest.mark.asyncio
 async def test_recovery_streak_resets_on_new_failure(dh_db):
-    """If a failure occurs while building the recovery streak, the streak resets to 0."""
+    """A single flaky probe is recorded but prior healthy samples are retained (3-of-5 semantics)."""
     await _make_deploy_state(
         dh_db,
         status=DeploymentStatus.PAUSED,
@@ -485,9 +493,101 @@ async def test_recovery_streak_resets_on_new_failure(dh_db):
     _shared_state.runtime_config["max_concurrent_vms"] = 0
     _set_critical_failures("gcp")  # dep fails again during recovery
 
-    _dh._health_recovery_streak = 2  # was building up
+    _seed_recovery_history(True, True)  # was building up
 
     await _dh._check_pause_mode()
 
-    assert _dh._health_recovery_streak == 0  # reset
+    # Single flake is appended to history but does NOT reset the existing healthy samples.
+    # This is the 3-of-5 semantics: one bad probe shouldn't erase progress toward recovery.
+    assert list(_dh._health_recovery_history) == [True, True, False]
     assert _shared_state.runtime_config["max_concurrent_vms"] == 0  # still paused
+
+
+# ── Tests: 3-of-5 recovery tolerates a flake ─────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_recovery_three_of_five_healthy_resumes(dh_db):
+    """Auto-resume fires when 3 of the last 5 probes are healthy, even with a flake in the middle."""
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: github_api",
+        pre_pause_max_vms=4,
+        paused_at=_dh._utcnow(),
+    )
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.deploy_monitoring["window_start"] = None
+    _set_healthy()
+
+    # Prior pattern: healthy, flaky, healthy — now a third healthy probe arrives.
+    _seed_recovery_history(True, False, True)
+
+    await _dh._check_pause_mode()
+
+    assert list(_dh._health_recovery_history) == []  # cleared after resume
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 2  # min(2, 4)
+
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    assert state.status == DeploymentStatus.STABLE.value
+    assert state.pause_reason is None
+
+
+@pytest.mark.asyncio
+async def test_single_flake_does_not_reset_recovery(dh_db):
+    """A single intermittent failure during recovery does not clear the ring buffer;
+    the very next healthy probe after the flake pushes the count back to 3-of-5 and resumes."""
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: gcp",
+        pre_pause_max_vms=5,
+        paused_at=_dh._utcnow(),
+    )
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.deploy_monitoring["window_start"] = None
+
+    # Two healthy, then a flake: history is [T, T, F]. Still 2/3 healthy — no resume.
+    _seed_recovery_history(True, True)
+    _set_critical_failures("gcp")
+    await _dh._check_pause_mode()
+    assert list(_dh._health_recovery_history) == [True, True, False]
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 0
+
+    # Flake recovers — next cycle is healthy. History → [T, T, F, T]; 3-of-4 healthy → resume.
+    _set_healthy()
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 2
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    assert state.status == DeploymentStatus.STABLE.value
+
+
+# ── Tests: forced resume after max auto-pause duration ───────────────────────
+
+@pytest.mark.asyncio
+async def test_forced_resume_after_max_duration(dh_db):
+    """After max_auto_pause_duration_seconds, force-resume with 1 VM regardless of health state."""
+    from datetime import timedelta
+    long_ago = _dh._utcnow() - timedelta(seconds=10_000)  # well past default 7200s
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: claude_api",
+        pre_pause_max_vms=8,
+        paused_at=long_ago,
+    )
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.runtime_config["max_auto_pause_duration_seconds"] = 7200
+    _shared_state.deploy_monitoring["window_start"] = None
+    _set_critical_failures("claude_api")  # health probes still failing
+
+    await _dh._check_pause_mode()
+
+    # Force-resume path: 1 VM, history cleared, CRITICAL alert path invoked.
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 1
+    assert list(_dh._health_recovery_history) == []
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    assert state.status == DeploymentStatus.STABLE.value
+    assert state.pause_reason is None
+    _dh._create_forced_resume_alerts.assert_awaited_once()
+    # Normal resume alert helper should NOT be called on the forced path.
+    _dh._create_auto_resume_alerts.assert_not_awaited()
