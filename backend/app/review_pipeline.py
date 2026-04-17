@@ -289,6 +289,17 @@ async def _spawn_pipeline_task(
         logger.warning(f"[PIPELINE] PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations across all chains)")
         source_task.latest_status_message = f"Review-fix cap reached for PR #{pr_number} ({pr_iterations} total iterations)"
         session.add(source_task)
+        # Mirror per-chain cap: mark the chain's root task requires_approval so the
+        # pipeline has a consistent terminal signal for cap exhaustion.
+        try:
+            orig = await session.get(Task, uuid.UUID(resolved_original_id))
+            if orig:
+                orig.requires_approval = True
+                orig.latest_status_message = f"Review-fix cycle reached limit ({pr_iterations} iterations across all chains) — manual review required"
+                session.add(orig)
+                await session.commit()
+        except Exception as e:
+            logger.warning(f"[PIPELINE] Failed to mark global cap on {resolved_original_id}: {e}", exc_info=True)
         try:
             from app.main import _maybe_create_failure_alert
             await _maybe_create_failure_alert(source_task, session, f"PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations) — manual intervention required")
