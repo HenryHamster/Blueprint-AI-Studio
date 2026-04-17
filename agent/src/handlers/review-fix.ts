@@ -45,6 +45,22 @@ async function pushForceWithLeaseRetrying(branch: string, ws: WebSocket | null):
   sendLog(ws, `Retry push to ${branch} succeeded after rebasing onto concurrent work.\n`);
 }
 
+// Mirrors backend _max_review_iterations (review_pipeline.py): ci_failure=8,
+// small=10, medium=12, else=16. Keep in sync — if this drifts, the agent will
+// claim "FINAL attempt" at the wrong iteration and collapse targeted fixes
+// into one risky rewrite. Backend defaults missing scope to 'medium', so we
+// do the same here (a bare task with no context still maps to 12, not 16).
+export function computeMaxFixIterations(task: Record<string, unknown>): number {
+  const ctx = (task.context as Record<string, unknown> | undefined) || {};
+  const scope = (ctx.scope as string | undefined) || 'medium';
+  const reviewLoop = ctx.review_loop as Record<string, unknown> | undefined;
+  const fixReason = reviewLoop?.fix_reason as string | undefined;
+  if (fixReason === 'ci_failure') return 8;
+  if (scope === 'small') return 10;
+  if (scope === 'medium') return 12;
+  return 16;
+}
+
 // ── Build instruction generator for review prompts ───────────────────────────
 function buildTypeCheckInstructions(buildConfig?: BuildConfig): string {
   if (!buildConfig || !buildConfig.directories || buildConfig.directories.length === 0) {
@@ -345,7 +361,7 @@ export async function handleFix(
   const reviewLoop = (task.context as Record<string, unknown> | undefined)?.review_loop as Record<string, unknown> | undefined;
   const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string; issues?: Array<{severity: string; description: string}> }> | undefined) || [];
   const iteration = (reviewLoop?.iteration as number | undefined) || 1;
-  const maxIterations = 5;
+  const maxIterations = computeMaxFixIterations(task);
   let iterationHeader = `You are on fix iteration ${iteration} of ${maxIterations}.\n`;
   if (iteration >= maxIterations) {
     iterationHeader += 'This is your FINAL attempt. If this fix is not accepted, the task will require manual intervention. Address every feedback point thoroughly.\n';

@@ -1238,7 +1238,13 @@ async def get_pr_files(
     token: str, owner: str, repo: str, pr_number: int,
     project_id: str | None = None,
 ) -> list[dict]:
-    """Fetches the list of files changed in a PR with their status (added/modified/removed)."""
+    """Fetches the list of files changed in a PR with their status.
+
+    Raises HTTPException on any non-200 response so callers can distinguish a
+    genuinely empty PR (returns []) from a transient GitHub failure. The
+    empty-rollup short-circuit in task_lifecycle relies on this distinction to
+    avoid closing real PRs when the API is briefly unavailable.
+    """
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -1251,8 +1257,11 @@ async def get_pr_files(
     if response.status_code == 401:
         raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized)")
     if response.status_code != 200:
-        logger.error(f"Failed to get PR files #{pr_number}: {response.text}")
-        return []
+        logger.error(f"Failed to get PR files #{pr_number}: {response.status_code} {response.text[:300]}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"GitHub API error fetching PR #{pr_number} files (HTTP {response.status_code})",
+        )
     return [{"filename": f["filename"], "status": f["status"]} for f in response.json()]
 
 

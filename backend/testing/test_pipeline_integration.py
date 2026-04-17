@@ -424,6 +424,106 @@ async def test_review_request_changes_empty_pr_closes_rollup_instead_of_spawning
 
 
 @pytest.mark.asyncio
+async def test_review_request_changes_api_error_does_not_close_pr(
+    client: AsyncClient, db_session, mocker
+):
+    """When the empty-PR check hits a GitHub API error, the system must NOT
+    treat the PR as empty (which would close it as an obsolete rollup) — it
+    should fall through to spawning a fix task. Regression guard for the
+    false-positive empty-rollup closure caused by get_pr_files swallowing
+    non-200 errors as []."""
+    from fastapi import HTTPException
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch("app.routers.agent.get_github_token_for_task", return_value=("fake-token", "owner", "repo"))
+    # Simulate a transient GitHub API failure during the empty-PR check.
+    mocker.patch(
+        "app.github.get_pr_files",
+        side_effect=HTTPException(status_code=502, detail="GitHub API error"),
+    )
+    close_mock = mocker.patch("app.github.close_pull_request", return_value=True)
+
+    project = Project(name="API Error Empty-PR Guard Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent_task = Task(
+        project_id=project.id,
+        title="Rollup: api-error branch",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        context={"review_loop": {
+            "pr_number": 888,
+            "branch": "research/abc888",
+            "base_branch": "main",
+            "ci_waiting": True,
+            "ci_passed": True,
+            "iteration": 2,
+        }},
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    vm_id = "agent-vm-api-err-review-001"
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #888",
+        payloads=[{
+            "type": "review",
+            "pr_number": 888,
+            "branch": "research/abc888",
+            "base_branch": "main",
+            "original_task_id": str(parent_task.id),
+        }],
+        context={"review_loop": {
+            "pr_number": 888,
+            "branch": "research/abc888",
+            "base_branch": "main",
+            "iteration": 2,
+            "original_task_id": str(parent_task.id),
+        }},
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    verdict_json = json.dumps({
+        "verdict": "REQUEST_CHANGES",
+        "feedback": "Real changes are needed; do not treat as empty",
+    })
+    await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Review: needs changes",
+    )
+
+    # The PR must NOT have been closed — API error masked file presence.
+    assert not close_mock.called, "API error during empty-PR check must not close the PR"
+
+    # A fix task should have been spawned (normal REQUEST_CHANGES flow).
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id.not_in([review_task.id, parent_task.id]),
+        )
+    )
+    spawned = result.scalars().all()
+    fix_tasks = [t for t in spawned if _task_type(t) == "fix"]
+    assert len(fix_tasks) == 1, f"Expected fix task to be spawned, got: {spawned}"
+
+    # Parent rollup must still be in EVALUATING (not COMPLETED-as-empty).
+    await db_session.refresh(parent_task)
+    assert parent_task.status == TaskStatus.EVALUATING
+    assert (parent_task.context or {}).get("pr_closed_empty") is not True
+
+
+@pytest.mark.asyncio
 async def test_review_request_changes_spawns_fix(
     client: AsyncClient, db_session, mocker
 ):
