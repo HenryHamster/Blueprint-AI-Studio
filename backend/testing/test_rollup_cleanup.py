@@ -831,3 +831,75 @@ async def test_all_children_failed_with_only_infra_failures(cleanup_db, mocker):
     await cleanup_db.refresh(parent)
     assert parent.status == TaskStatus.FAILED
     assert parent.context.get("failure_category") == "PROVISION_FAILURE"
+
+
+@pytest.mark.asyncio
+async def test_zero_diff_rollup_pr_closed_without_spawning_review(cleanup_db, mocker):
+    """A rollup PR with 0 additions + 0 deletions is closed immediately:
+    parent goes COMPLETED, staging branch deleted, no review task spawned."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    # Target branch exists, staging branch exists, no open PRs targeting staging
+    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    # Rollup PR is created (not empty_diff) but its diff fetch returns 0 lines changed
+    mocker.patch(
+        "app.github.create_pull_request",
+        new_callable=AsyncMock,
+        return_value={"number": 4242, "html_url": "https://github.com/owner/repo/pull/4242", "empty_diff": False},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"additions": 0, "deletions": 0, "merged": False, "state": "open"},
+    )
+    mock_close = mocker.patch("app.github.close_pull_request", new_callable=AsyncMock, return_value=True)
+    mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    # Critical: verify review task is NOT spawned on zero-diff PR
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "research_branch": "research/zero-diff",
+            "parent_base": "main",
+        },
+        plan_output="some plan",
+    )
+    # One child that is COMPLETED with pr_merged=True so rollup proceeds
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+    mock_close.assert_awaited_once()
+    # close_pull_request called with rollup PR number
+    close_args = mock_close.call_args
+    assert close_args.args[3] == 4242 or close_args.kwargs.get("pr_number") == 4242
+    # Staging branch deleted
+    assert any(call.args[-1] == "research/zero-diff" for call in mock_delete.call_args_list)
+    # No review/fix task spawned
+    mock_spawn.assert_not_called()
+    # Rollup PR marker cleared so reaper/retry logic doesn't resume with a closed PR
+    assert "rollup_pr_number" not in (parent.context or {})

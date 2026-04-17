@@ -248,6 +248,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     from app.github import (
         create_pr_comment, delete_branch, create_pull_request,
         merge_pull_request, get_pull_request, get_pr_files, get_branch_sha,
+        close_pull_request,
     )
 
     if not child_task.parent_task_id:
@@ -711,6 +712,31 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 except Exception as e:
                     logger.warning(f"[ROLLUP] Failed to fetch PR #{rollup_pr_number} diff size for task {parent.id}: {e}")
                     lines_changed = 999  # assume large if we can't check
+                    pr_detail = None
+
+                # Zero-diff guard: squash-merged commits can produce a PR with commits
+                # but no file changes. Close before spawning review/fix VMs.
+                if pr_detail is not None and lines_changed == 0:
+                    logger.info(f"[ROLLUP] PR #{rollup_pr_number} has zero lines changed — closing and marking COMPLETED")
+                    try:
+                        await close_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id))
+                    except Exception as e:
+                        logger.warning(f"[ROLLUP] Failed to close zero-diff PR #{rollup_pr_number}: {e}")
+                    try:
+                        await delete_branch(gh_token, owner, repo, staging_branch)
+                    except Exception as e:
+                        logger.warning(f"[ROLLUP] Failed to delete staging branch '{staging_branch}' for task {parent.id}: {e}")
+                    parent.status = TaskStatus.COMPLETED
+                    parent.latest_status_message = f"✓ All {completed_count} subtasks completed — rollup PR #{rollup_pr_number} had no file changes (already on {target_branch})"
+                    parent.context = {k: v for k, v in (parent.context or {}).items()
+                                      if k not in ("rollup_pr_number", "rollup_pr_url")}
+                    session.add(parent)
+                    await session.commit()
+                    await _cleanup_branches(parent, session)
+                    await broadcast_to_project(str(parent.project_id), "task_updated",
+                                               {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
+                    return
+
                 is_small_rollup = lines_changed <= 100
                 logger.info(f"[ROLLUP] PR #{rollup_pr_number}: {lines_changed} lines changed, {'auto-merge' if is_small_rollup and is_target_intermediate else 'review'}")
                 if is_target_intermediate and is_small_rollup:
