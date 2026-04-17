@@ -355,9 +355,25 @@ def test_taxonomy_review_quality_from_lint_failure():
     assert classify_failure_taxonomy(t) == TAXONOMY_REVIEW_QUALITY
 
 
-def test_taxonomy_scope_related_from_medium_scope():
+def test_taxonomy_medium_scope_without_evidence_is_code_defect():
+    """Medium-scope CODE_ERROR without scope evidence must classify as code_defect.
+    Bare scope='medium'/'large' is not positive evidence of a scope-related failure."""
     t = _task_with_ctx("TypeError: unsupported operand", {"scope": "medium"})
+    assert classify_failure_taxonomy(t) == TAXONOMY_CODE_DEFECT
+
+
+def test_taxonomy_scope_related_from_expansion_ratio():
+    """expansion_ratio > 1.5 is positive evidence that the scope was exceeded."""
+    t = _task_with_ctx("NameError: foo not defined",
+                       {"scope": "small", "expansion_ratio": 2.0})
     assert classify_failure_taxonomy(t) == TAXONOMY_SCOPE_RELATED
+
+
+def test_taxonomy_expansion_ratio_at_or_below_threshold_is_code_defect():
+    """expansion_ratio <= 1.5 is not enough evidence — falls through to code_defect."""
+    t = _task_with_ctx("NameError: foo not defined",
+                       {"scope": "small", "expansion_ratio": 1.5})
+    assert classify_failure_taxonomy(t) == TAXONOMY_CODE_DEFECT
 
 
 def test_taxonomy_scope_related_from_calibrated_from():
@@ -387,6 +403,45 @@ def test_taxonomy_infra_for_provision_failure():
 
 
 def test_taxonomy_review_quality_beats_scope():
-    """Test/lint signal takes precedence over scope — review quality is the root cause."""
-    t = _task_with_ctx("pytest failure in test_x", {"scope": "large"})
+    """Test/lint signal takes precedence over scope signals — review quality is the root cause.
+    Uses real scope evidence (scope_calibrated_from + expansion_ratio) to prove precedence,
+    since a bare medium/large scope is no longer treated as evidence."""
+    t = _task_with_ctx(
+        "pytest failure in test_x",
+        {"scope": "large", "scope_calibrated_from": "small", "expansion_ratio": 2.5},
+    )
     assert classify_failure_taxonomy(t) == TAXONOMY_REVIEW_QUALITY
+
+
+# ── Cross-function: normalize_agent_failure_category + classify_failure_taxonomy ──
+
+def test_taxonomy_scope_related_from_calibrated_from_ignores_message_text():
+    """scope_calibrated_from in ctx routes to scope_related even when the status
+    message carries no scope or review-quality keywords. Base must still be
+    CODE_ERROR (not empty/infra), so use a generic non-keyword code error."""
+    for msg in ("generic failure", "AttributeError: 'NoneType' has no attribute 'x'"):
+        t = _task_with_ctx(msg, {"scope": "small", "scope_calibrated_from": "medium"})
+        assert classify_failure_taxonomy(t) == TAXONOMY_SCOPE_RELATED, (
+            f"Expected SCOPE_RELATED for calibrated-from task with msg={msg!r}"
+        )
+
+
+def test_taxonomy_infra_related_for_agent_reported_scope_overflow():
+    """End-to-end: normalize_agent_failure_category('scope_overflow', task) persists
+    SCOPE_OVERFLOW in context; classify_failure_taxonomy must then return INFRA_RELATED
+    (SCOPE_OVERFLOW is in INFRA_CLASSES)."""
+    t = _task_with_ctx("agent aborted", {})
+    normalized = normalize_agent_failure_category("scope_overflow", t)
+    assert normalized == "SCOPE_OVERFLOW"
+    t.context = {"failure_category": normalized}
+    assert classify_failure_taxonomy(t) == TAXONOMY_INFRA_RELATED
+
+
+def test_taxonomy_infra_related_for_agent_reported_rate_limited():
+    """End-to-end: normalize_agent_failure_category('rate_limited', task) yields
+    RATE_LIMIT; classify_failure_taxonomy must then return INFRA_RELATED."""
+    t = _task_with_ctx("claude cli exited 1", {})
+    normalized = normalize_agent_failure_category("rate_limited", t)
+    assert normalized == "RATE_LIMIT"
+    t.context = {"failure_category": normalized}
+    assert classify_failure_taxonomy(t) == TAXONOMY_INFRA_RELATED

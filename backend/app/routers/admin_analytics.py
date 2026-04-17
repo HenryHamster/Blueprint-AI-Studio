@@ -1117,6 +1117,7 @@ async def get_digest(
                 window_product_ratios: List[float] = []
                 agg_type_distribution: Dict[str, int] = {}
                 dir_taxonomy_summary: Dict[str, int] = {}
+                dir_stage_dropout: Dict[str, int] = {}
                 recent_failed_titles: List[str] = []
                 for entry in d.get("research_history") or []:
                     try:
@@ -1141,6 +1142,8 @@ async def get_digest(
                             agg_type_distribution[ttype] = agg_type_distribution.get(ttype, 0) + cnt
                         for tax, cnt in (entry.get("taxonomy_summary") or {}).items():
                             dir_taxonomy_summary[tax] = dir_taxonomy_summary.get(tax, 0) + cnt
+                        for stage, cnt in (entry.get("stage_dropout") or {}).items():
+                            dir_stage_dropout[stage] = dir_stage_dropout.get(stage, 0) + (cnt or 0)
                         for fd in (entry.get("failed_task_details") or []):
                             title = (fd or {}).get("title")
                             if title:
@@ -1204,6 +1207,7 @@ async def get_digest(
                     "cost_per_merged_pr": round(dir_cost / prs_merged, 4) if prs_merged > 0 else None,
                     "scope_breakdown": dir_scope_agg or None,
                     "taxonomy_summary": dir_taxonomy_summary or None,
+                    "stage_dropout": dir_stage_dropout or None,
                     "recent_failure_titles": recent_failed_titles[-3:] or None,
                 })
 
@@ -1448,9 +1452,12 @@ async def get_digest(
         ]
         _p_failed = len(_p_failed_tasks)
         _p_by_class: dict[str, int] = {}
+        _p_by_taxonomy: dict[str, int] = {}
         for _ft in _p_failed_tasks:
             _cls = _classify_failure(_ft)
             _p_by_class[_cls] = _p_by_class.get(_cls, 0) + 1
+            _tax = _classify_taxonomy(_ft)
+            _p_by_taxonomy[_tax] = _p_by_taxonomy.get(_tax, 0) + 1
         _p_total = _p_completed + _p_failed
         _p_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and _p_start <= t.vm_stopped_at < _p_end)
         _p_terminal = [
@@ -1466,6 +1473,7 @@ async def get_digest(
             "completed": _p_completed,
             "failed": _p_failed,
             "failed_by_class": _p_by_class,
+            "failed_by_taxonomy": _p_by_taxonomy,
             "period_cost_usd": round(_p_cost, 4),
             "first_attempt_success_rate": _p_fa_rate,
             "first_attempt_sample_size": len(_p_measured),

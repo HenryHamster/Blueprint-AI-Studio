@@ -610,10 +610,11 @@ async def test_taxonomy_fields_in_outcome_entries(db_session: AsyncSession):
                               status=TaskStatus.FAILED,
                               context={"failure_category": "CODE_ERROR", "scope": "small"},
                               title="rq1", latest_status_message="pytest failed in tests")
-    # scope_related: CODE_ERROR on medium scope
+    # scope_related: CODE_ERROR with positive scope evidence (scope_calibrated_from)
     await _create_child_task(db_session, research_task.id, project.id,
                               status=TaskStatus.FAILED,
-                              context={"failure_category": "CODE_ERROR", "scope": "medium"},
+                              context={"failure_category": "CODE_ERROR", "scope": "medium",
+                                       "scope_calibrated_from": "small"},
                               title="sc1", latest_status_message="something broke")
     # code_defect: CODE_ERROR small with no classifying signal
     await _create_child_task(db_session, research_task.id, project.id,

@@ -146,9 +146,10 @@ async def test_failure_taxonomy_distribution_mixed():
                   latest_status_message="pytest tests failed"),
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=2),
                   latest_status_message="ruff lint error"),
-        # scope_related (scope in context)
+        # scope_related (positive scope evidence: scope_calibrated_from)
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=3),
-                  latest_status_message="build error", context={"scope": "large"}),
+                  latest_status_message="build error",
+                  context={"scope": "large", "scope_calibrated_from": "medium"}),
         # infra_related
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=4),
                   latest_status_message="API Error: Rate limit reached"),

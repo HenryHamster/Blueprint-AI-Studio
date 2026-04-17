@@ -741,6 +741,69 @@ async def test_digest_direction_progress_taxonomy_absent_when_no_entries(client:
     assert len(dp_list) == 1
     assert dp_list[0]["taxonomy_summary"] is None
     assert dp_list[0]["recent_failure_titles"] is None
+    assert dp_list[0]["stage_dropout"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_stage_dropout(client: AsyncClient, db_session):
+    """direction_progress aggregates stage_dropout across in-window research_history entries."""
+    recent_ts_1 = (_utcnow() - timedelta(hours=10)).isoformat()
+    recent_ts_2 = (_utcnow() - timedelta(hours=5)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=50)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-drop",
+                "text": "Dropout direction",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts_1,
+                        "prs_merged": 1,
+                        "tasks_created": 3,
+                        "stage_dropout": {"review": 2, "ci": 1},
+                    },
+                    {
+                        "timestamp": recent_ts_2,
+                        "prs_merged": 0,
+                        "tasks_created": 1,
+                        "stage_dropout": {"review": 1, "agent": 4},
+                    },
+                    # Outside window — must be excluded
+                    {
+                        "timestamp": old_ts,
+                        "prs_merged": 0,
+                        "tasks_created": 1,
+                        "stage_dropout": {"review": 99},
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-drop"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    dp_list = data["direction_progress"]
+    assert len(dp_list) == 1
+    dp = dp_list[0]
+    assert dp["direction_id"] == "dir-drop"
+    # Stage counts summed across in-window entries only; old entry's {"review": 99} excluded.
+    assert dp["stage_dropout"] == {"review": 3, "ci": 1, "agent": 4}
 
 
 # ---------------------------------------------------------------------------
@@ -1364,6 +1427,55 @@ async def test_trend_history_includes_first_attempt_rate(client: AsyncClient, db
     last_entry = trend_history[-1]
     assert last_entry["first_attempt_sample_size"] == 2
     assert last_entry["first_attempt_success_rate"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_trend_history_includes_failed_by_taxonomy(client: AsyncClient, db_session):
+    """trend_history entries include failed_by_taxonomy counts parallel to failed_by_class."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    # A review_quality failure (status message contains a keyword)
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        latest_status_message="pytest tests failed",
+    ))
+    # A scope_related failure (positive evidence: scope_calibrated_from)
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        latest_status_message="error",
+        context={"scope": "medium", "scope_calibrated_from": "small"},
+    ))
+    # A residual code_defect failure (no scope, no review keywords)
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        latest_status_message="unexpected exception",
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    trend_history = data["trend_history"]
+    assert len(trend_history) == 7
+    for entry in trend_history:
+        assert "failed_by_taxonomy" in entry
+        assert isinstance(entry["failed_by_taxonomy"], dict)
+
+    last_entry = trend_history[-1]
+    assert last_entry["failed"] == 3
+    tax = last_entry["failed_by_taxonomy"]
+    assert tax.get("review_quality") == 1
+    assert tax.get("scope_related") == 1
+    assert tax.get("code_defect") == 1
+    assert sum(tax.values()) == 3
 
 
 # ---------------------------------------------------------------------------

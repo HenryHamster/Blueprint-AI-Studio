@@ -78,11 +78,11 @@ def classify_failure_taxonomy(task: "Task") -> str:
     if any(kw in status_msg for kw in _REVIEW_QUALITY_KEYWORDS):
         return TAXONOMY_REVIEW_QUALITY
 
-    scope = ctx.get("scope")
+    expansion_ratio = ctx.get("expansion_ratio")
     if (
-        scope in ("medium", "large")
-        or ctx.get("scope_calibrated_from")
+        ctx.get("scope_calibrated_from")
         or any(kw in status_msg for kw in _SCOPE_KEYWORDS)
+        or (isinstance(expansion_ratio, (int, float)) and expansion_ratio > 1.5)
     ):
         return TAXONOMY_SCOPE_RELATED
 
