@@ -1080,7 +1080,8 @@ def _list_vms_in_zone(zone: str) -> list[tuple[str, str, str]]:
         request = compute_v1.ListInstancesRequest(
             project=GCP_PROJECT_ID, zone=zone, filter='name:agent-vm-'
         )
-        results = [(instance.name, zone, instance.status) for instance in client.list(request=request)]
+        # Per-RPC timeout so a single unresponsive zone can't freeze the whole cleanup cycle.
+        results = [(instance.name, zone, instance.status) for instance in client.list(request=request, timeout=30)]
     except Exception:
         logger.exception(f"[GCP CLEANUP] Failed to list VMs in zone {zone}")
     return results
@@ -1104,12 +1105,17 @@ async def _delete_gcp(vm_instance_id: str):
 
         for zone in zones_to_try:
             try:
-                instance_client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
-                # Capture serial BEFORE deletion (VM still exists)
-                serial_tail = _capture_serial_for_vm(vm_instance_id, zone)
-                # Now delete
+                instance = instance_client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+                # Serial capture only makes sense while the agent was running — for already
+                # TERMINATED/STOPPING VMs the buffer is just shutdown output, and the 10s call
+                # eats into the delete budget for no forensic gain.
+                status = getattr(instance, "status", "") or ""
+                if status in ("TERMINATED", "STOPPING"):
+                    serial_tail = None
+                else:
+                    serial_tail = _capture_serial_for_vm(vm_instance_id, zone)
                 operation = instance_client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
-                operation.result(timeout=300)
+                operation.result(timeout=180)
                 logger.info(f"Successfully terminated VM {vm_instance_id} in {zone}")
                 return zone, serial_tail
             except Exception as e:
@@ -1121,9 +1127,11 @@ async def _delete_gcp(vm_instance_id: str):
 
     try:
         async with _gcp_ops_semaphore:
-            deleted_zone, serial_tail = await asyncio.wait_for(
+            # Budget: up to ~10s zone probes + up to 10s serial + up to 180s delete op.
+            # The prior 60s cap left ops that actually reached GCP stranded mid-delete.
+            _deleted_zone, serial_tail = await asyncio.wait_for(
                 asyncio.to_thread(_find_capture_and_delete),
-                timeout=60
+                timeout=240
             )
 
         if serial_tail:
@@ -1134,7 +1142,7 @@ async def _delete_gcp(vm_instance_id: str):
             await asyncio.to_thread(_delete_agent_secret, vm_instance_id)
         return True
     except asyncio.TimeoutError:
-        logger.warning(f"Timeout deleting VM {vm_instance_id} (>60s)")
+        logger.warning(f"Timeout deleting VM {vm_instance_id} (>240s)")
         return False
     except Exception:
         logger.warning(f"Failed to terminate VM {vm_instance_id}", exc_info=True)
@@ -1167,6 +1175,7 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
 
     # Phase 1: Parallel zone listing (semaphore-bounded)
     unique_zones = list({z for z, _ in FALLBACK_ZONES})
+    logger.info(f"[GCP CLEANUP] Cycle starting — scanning {len(unique_zones)} zones, DB active: {len(active_vm_ids)}")
 
     async def _list_zone_bounded(zone: str):
         async with _gcp_ops_semaphore:

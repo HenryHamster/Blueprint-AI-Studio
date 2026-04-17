@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections import deque
 from datetime import datetime, timedelta
 
 from sqlalchemy import or_
@@ -350,13 +351,18 @@ async def _persist_zone_health():
 
     try:
         from app.compute import _zone_health, _zone_lock
+
+        def _serialize_value(v):
+            if isinstance(v, datetime):
+                return v.isoformat()
+            if isinstance(v, deque):
+                return list(v)
+            return v
+
         with _zone_lock:
             snapshot = {}
             for zone, data in _zone_health.items():
-                snapshot[zone] = {
-                    k: v.isoformat() if isinstance(v, datetime) else v
-                    for k, v in data.items()
-                }
+                snapshot[zone] = {k: _serialize_value(v) for k, v in data.items()}
         snapshot["_pause_failure_streak"] = _pause_failure_streak
         snapshot["_health_recovery_history"] = list(_health_recovery_history)
         async with AsyncSessionLocal() as session:
