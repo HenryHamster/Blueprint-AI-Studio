@@ -1937,3 +1937,97 @@ async def test_pr_opened_unregistered_repo_no_auto_review(client, db_session, mo
 
     assert resp.status_code == 200
     auto_review_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_branch_with_sha_retry_success_first_attempt(mocker):
+    """First-attempt success returns without refetching the PR."""
+    from app import github as gh
+
+    update_branch_mock = mocker.patch.object(
+        gh, "update_branch", new_callable=AsyncMock,
+        return_value={"updated": True, "message": "Update queued"},
+    )
+    get_pr_mock = mocker.patch.object(gh, "get_pull_request", new_callable=AsyncMock)
+
+    result = await gh.update_branch_with_sha_retry(
+        "t", "o", "r", 1, expected_head_sha="abc",
+    )
+
+    assert result == {"updated": True, "message": "Update queued"}
+    assert update_branch_mock.await_count == 1
+    get_pr_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_branch_with_sha_retry_sha_mismatch_retry_succeeds(mocker):
+    """Non-success + fresh SHA differs → retry with fresh SHA succeeds."""
+    from app import github as gh
+
+    update_branch_mock = mocker.patch.object(
+        gh, "update_branch", new_callable=AsyncMock,
+        side_effect=[
+            {"updated": False, "message": "Some error wording GitHub might change"},
+            {"updated": True, "message": "Update queued"},
+        ],
+    )
+    mocker.patch.object(
+        gh, "get_pull_request", new_callable=AsyncMock,
+        return_value={"head": {"sha": "fresh123"}},
+    )
+
+    result = await gh.update_branch_with_sha_retry(
+        "t", "o", "r", 1, expected_head_sha="stale456",
+    )
+
+    assert result == {"updated": True, "message": "Update queued"}
+    assert update_branch_mock.await_count == 2
+    second_call_kwargs = update_branch_mock.await_args_list[1].kwargs
+    assert second_call_kwargs["expected_head_sha"] == "fresh123"
+
+
+@pytest.mark.asyncio
+async def test_update_branch_with_sha_retry_non_sha_failure_no_retry(mocker):
+    """Non-success but fresh SHA matches original → no retry, return original failure."""
+    from app import github as gh
+
+    update_branch_mock = mocker.patch.object(
+        gh, "update_branch", new_callable=AsyncMock,
+        return_value={"updated": False, "message": "merge conflict"},
+    )
+    mocker.patch.object(
+        gh, "get_pull_request", new_callable=AsyncMock,
+        return_value={"head": {"sha": "sameSha"}},
+    )
+
+    result = await gh.update_branch_with_sha_retry(
+        "t", "o", "r", 1, expected_head_sha="sameSha",
+    )
+
+    assert result == {"updated": False, "message": "merge conflict"}
+    assert update_branch_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_update_branch_with_sha_retry_retry_also_fails(mocker):
+    """Retry with fresh SHA also fails → return the retry failure."""
+    from app import github as gh
+
+    update_branch_mock = mocker.patch.object(
+        gh, "update_branch", new_callable=AsyncMock,
+        side_effect=[
+            {"updated": False, "message": "first failure"},
+            {"updated": False, "message": "retry failure"},
+        ],
+    )
+    mocker.patch.object(
+        gh, "get_pull_request", new_callable=AsyncMock,
+        return_value={"head": {"sha": "fresh999"}},
+    )
+
+    result = await gh.update_branch_with_sha_retry(
+        "t", "o", "r", 1, expected_head_sha="stale",
+    )
+
+    assert result == {"updated": False, "message": "retry failure"}
+    assert update_branch_mock.await_count == 2
