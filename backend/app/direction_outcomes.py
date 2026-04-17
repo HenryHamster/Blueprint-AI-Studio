@@ -12,7 +12,9 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.failure_classification import (
+    CODE_ERROR,
     INFRA_CLASSES,
+    SCOPE_OVERFLOW,
     TAXONOMY_CODE_DEFECT,
     TAXONOMY_INFRA_RELATED,
     TAXONOMY_REVIEW_QUALITY,
@@ -283,6 +285,7 @@ async def _update_direction_research_outcomes(
                 if s not in scope_breakdown:
                     scope_breakdown[s] = {
                         "created": 0, "merged": 0, "failed": 0, "failed_infra": 0,
+                        "failed_code_error": 0, "failed_scope_overflow": 0,
                         "calibrated_in": 0, "calibrated_out": 0,
                     }
 
@@ -295,8 +298,13 @@ async def _update_direction_research_outcomes(
                     scope_breakdown[scope]["merged"] += 1
                 if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
                     scope_breakdown[scope]["failed"] += 1
-                    if (ctx_.get("failure_category") or _classify_failure(ct)) in INFRA_CLASSES:
+                    fcat = ctx_.get("failure_category") or _classify_failure(ct)
+                    if fcat in INFRA_CLASSES:
                         scope_breakdown[scope]["failed_infra"] += 1
+                    if fcat == CODE_ERROR:
+                        scope_breakdown[scope]["failed_code_error"] += 1
+                    elif fcat == SCOPE_OVERFLOW:
+                        scope_breakdown[scope]["failed_scope_overflow"] += 1
                 calibrated_from = ctx_.get("scope_calibrated_from")
                 if calibrated_from:
                     scope_breakdown[scope]["calibrated_in"] += 1

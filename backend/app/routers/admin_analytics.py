@@ -1299,6 +1299,7 @@ async def get_digest(
         "AGENT_TIMEOUT": "Agent Timeout",
         "EXTERNAL_API": "External API",
         "RATE_LIMIT": "Rate Limit",
+        "SCOPE_OVERFLOW": "Scope Overflow",
     }
     _failure_class_groups: Dict[str, List[Dict[str, Any]]] = {}
     for t in failed_tasks:
@@ -1510,6 +1511,7 @@ async def get_digest(
                     "EXTERNAL_API": f"Most failures ({cnt}/{failed_count}) are external API errors — GitHub/Claude API may be experiencing issues.",
                     "AGENT_TIMEOUT": f"Most failures ({cnt}/{failed_count}) are agent timeouts — tasks may need complexity reduction.",
                     "CODE_ERROR": f"Most failures ({cnt}/{failed_count}) are code errors in agent-written code.",
+                    "SCOPE_OVERFLOW": f"Most failures ({cnt}/{failed_count}) exceeded scope budget (touched more files than scope allows) — consider task decomposition or scope escalation.",
                 }
                 dominant_msg = _root_cause_msgs.get(cls)
             if dominant_msg:
