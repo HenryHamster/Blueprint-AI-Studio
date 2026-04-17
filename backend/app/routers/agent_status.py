@@ -45,7 +45,7 @@ from app.rollup_management import _check_and_trigger_rollup
 from app.payload_schemas import validate_internal_payload as _validate_internal_payload
 from app.task_completion import _compute_first_attempt_succeeded
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
-from app.time_utils import _utcnow
+from app.time_utils import _utcnow, set_retry_after
 
 logger = logging.getLogger(__name__)
 
@@ -795,7 +795,7 @@ async def update_agent_status(
                                 should_requeue = False
                             else:
                                 delay = min(2 ** api_retries * 120, 1800)
-                                ctx["retry_after"] = (_utcnow() + timedelta(seconds=delay)).isoformat()
+                                set_retry_after(ctx, delay / 60)
                                 logger.info(f"[AGENT STATUS] Task {task.id} EXTERNAL_API retry {api_retries} — backoff {delay}s")
 
                     if should_requeue:
@@ -849,10 +849,11 @@ async def update_agent_status(
                             if any_available:
                                 ctx.pop("retry_after", None)
                             elif earliest_recovery:
-                                ctx["retry_after"] = earliest_recovery.isoformat()
+                                minutes_until = (earliest_recovery - _utcnow()).total_seconds() / 60
+                                set_retry_after(ctx, minutes_until)
                                 task.latest_status_message = f"Rate Limited — all accounts exhausted, waiting for recovery"
                             else:
-                                ctx["retry_after"] = (_utcnow() + timedelta(minutes=5)).isoformat()
+                                set_retry_after(ctx, 5)
                                 task.latest_status_message = f"Rate Limited — all accounts exhausted, retrying in 5min"
                         elif failure_class != "EXTERNAL_API":
                             ctx.pop("retry_after", None)
@@ -920,8 +921,7 @@ async def update_agent_status(
                 # Exponential backoff: 30min * 2^(n-1), capped at 4 hours, ±20% jitter
                 base_delay_minutes = min(30 * (2 ** (rl_hit_count - 1)), 240)
                 delay_minutes = base_delay_minutes * random.uniform(0.8, 1.2)
-                retry_after = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
-                ctx["retry_after"] = retry_after
+                retry_after = set_retry_after(ctx, delay_minutes)
                 logger.info(f"[ORCHESTRATOR] Task {task.id} rate-limited (hit #{rl_hit_count}) — holding back {delay_minutes:.0f}min (retry_after={retry_after})")
                 # Blacklist rate-limited account so the retry picks a different one
                 if acct_id:
@@ -931,8 +931,7 @@ async def update_agent_status(
                     ctx["blacklisted_accounts"] = blacklisted
             elif failure_class == "PROVISION_FAILURE":
                 delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75-6.25 minutes
-                retry_after = (_utcnow() + timedelta(minutes=delay_minutes)).isoformat()
-                ctx["retry_after"] = retry_after
+                retry_after = set_retry_after(ctx, delay_minutes)
                 logger.info(f"[ORCHESTRATOR] Task {task.id} provision failure — holding back {delay_minutes:.1f}min (retry_after={retry_after})")
             else:
                 ctx.pop("retry_after", None)  # Clear any stale retry_after on non-delayed retries
