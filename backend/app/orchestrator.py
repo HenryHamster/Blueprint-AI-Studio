@@ -840,7 +840,9 @@ async def orchestrator_worker():
                                     logger.info(f"[ORCHESTRATOR] Task {task.id} held back — retry_after={retry_after_str}")
                                     continue
                         except (ValueError, TypeError):
-                            pass  # Malformed retry_after — let it through
+                            logger.warning(
+                                f"[ORCHESTRATOR] Task {task.id} has malformed retry_after={retry_after_str!r} — letting through"
+                            )
                     # Clear infra-wait flag when task becomes eligible again
                     if (task.context or {}).get("_infra_wait"):
                         ctx = dict(task.context or {})

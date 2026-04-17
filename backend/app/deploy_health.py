@@ -384,12 +384,59 @@ async def _check_external_health():
         logger.error(f"[HEALTH] External dependency check failed: {', '.join(failed)}")
 
 
+def _build_rate_limit_details() -> "dict | None":
+    """Collect account-pool rate-limit state for inclusion in auto-pause alerts.
+
+    Returns None when the account pool cannot be inspected (e.g. raw-API-key mode
+    with no pool configured) — callers fall back to the generic message.
+    """
+    try:
+        from app.max_plan_pool import (  # noqa: PLC0415
+            summarize_pool_state,
+            _account_by_id,
+            _OPUS_MODEL,
+        )
+    except Exception:
+        return None
+    try:
+        summary = summarize_pool_state(_OPUS_MODEL)
+    except Exception:
+        return None
+    if not summary.get("total"):
+        return None
+    blocked_models: set = set()
+    for a in _account_by_id.values():
+        for m in (a.get("disabled_models") or {}).keys():
+            blocked_models.add(m)
+    recovery = summary.get("earliest_recovery")
+    return {
+        "total_accounts": summary.get("total", 0),
+        "rate_limited_accounts": summary.get("rate_limited", 0),
+        "healthy_accounts": summary.get("healthy", 0),
+        "probing_accounts": summary.get("probing", 0),
+        "blocked_models": sorted(blocked_models),
+        "earliest_recovery": recovery.isoformat() if recovery else None,
+    }
+
+
 async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) -> None:
     """Create WARNING alerts on all projects when the pipeline auto-pauses due to external dep failures."""
     from app.main import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
     title = "Pipeline auto-paused: external dependencies down"
+    rl_details = _build_rate_limit_details() if "claude_api" in failed_deps else None
+    if rl_details:
+        suffix_parts = [
+            f"{rl_details['rate_limited_accounts']}/{rl_details['total_accounts']} accounts rate-limited"
+        ]
+        if rl_details["blocked_models"]:
+            suffix_parts.append(f"models blocked: {', '.join(rl_details['blocked_models'])}")
+        if rl_details["earliest_recovery"]:
+            suffix_parts.append(f"earliest recovery: {rl_details['earliest_recovery']}")
+        rl_suffix = " (" + "; ".join(suffix_parts) + ")"
+    else:
+        rl_suffix = ""
     msg = (
-        f"Pipeline auto-paused: external dependencies down — {', '.join(failed_deps)}. "
+        f"Pipeline auto-paused: external dependencies down — {', '.join(failed_deps)}{rl_suffix}. "
         "Will auto-resume when healthy."
     )
     projects = (await session.execute(select(Project))).scalars().all()
@@ -428,6 +475,7 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
                 {
                     "failed_deps": failed_deps,
                     "title": title,
+                    **({"rate_limit": rl_details} if rl_details else {}),
                 },
             ))
     except Exception as _ne:
@@ -662,12 +710,33 @@ async def _check_pause_mode():
         )
 
         if not (should_force_resume or should_normal_resume):
+            tracked_deps = ("db", "github_api", "gcp", "claude_api")
+            consec_map = ext.get("consecutive_failures", {}) or {}
+            failed_set = set(failed)
+            still_failing = {d: consec_map.get(d, 0) for d in tracked_deps if d in failed_set}
+            recovered = [d for d in tracked_deps if d not in failed_set]
             logger.info(
                 f"[PAUSE] Recovery progress: {healthy_count}/{len(history_snapshot)} healthy "
                 f"(need {healthy_required}-of-{_HEALTH_HISTORY_SIZE}"
                 f"{' FLAPPING' if flapping_now else ''}); "
-                f"paused {int(pause_duration)}s/{max_duration}s"
+                f"paused {int(pause_duration)}s/{max_duration}s; "
+                f"healthy_deps={recovered or 'none'}; "
+                f"still_failing={still_failing or 'none'}"
             )
+            try:
+                await manager.broadcast_to_all("health_recovering", {
+                    "healthy_count": healthy_count,
+                    "history_len": len(history_snapshot),
+                    "healthy_required": healthy_required,
+                    "history_size": _HEALTH_HISTORY_SIZE,
+                    "flapping": flapping_now,
+                    "pause_duration_seconds": int(pause_duration),
+                    "max_auto_pause_duration_seconds": max_duration,
+                    "healthy_deps": recovered,
+                    "still_failing_deps": still_failing,
+                })
+            except Exception as _be:
+                logger.warning(f"[WS] health_recovering broadcast failed: {_be}")
             return
 
         restore = state.pre_pause_max_vms or 1
