@@ -114,24 +114,44 @@ async def _build_shipped_changes_manifest(
     return list(by_direction.values())
 
 
+_TRIVIAL_ROLLUP_RE = None  # lazy: re module imported inline
+
+
+def _rollup_body_is_trivial(body: str | None) -> bool:
+    """Rollup PR bodies usually start with 'Rollup of N subtasks...' — that
+    string carries no information about what actually shipped. Flag so callers
+    can substitute per-subtask detail instead."""
+    if not body:
+        return True
+    import re  # noqa: PLC0415
+    return bool(re.match(r"^\s*Rollup of \d+ subtasks?\b", body))
+
+
 async def _build_recent_interventions(
-    project: Project, session: AsyncSession, limit: int = 15, lookback_days: int = 21
+    project: Project, session: AsyncSession,
+    limit: int = 15, lookback_days: int = 21,
+    last_strategic_at: datetime | None = None,
 ) -> dict[str, Any]:
-    """Build a time-series view of recent merged work + per-week merge-rate deltas.
+    """Build a rolling-window view of recent merged work.
 
-    Returns {merges: [...], weekly_rates: [...]} where:
-      - merges: last `limit` merged PRs, each with {pr_title, pr_number,
-        direction_id, direction_text, week, merged_at}
-      - weekly_rates: per-week create/merge counts + rate + delta vs prior week
-        (same shape as admin_analytics._weekly_merge_rate_deltas)
+    Replaces the prior weekly_rates view because weekly buckets are too coarse
+    for this pipeline's velocity (20-40 tasks/day → 150-300/week). Weekly
+    signal arrives 7 days late and noise dominates small samples. The rolling
+    windows let the strategic agent reason about what's happening NOW vs the
+    recent trend without waiting for week-end.
 
-    The strategic agent uses this to notice when recent features correlate
-    with metric movement — correlation, NOT causation. The prompt frames
-    the uncertainty explicitly.
+    Returns:
+      - merges: last `limit` merged tasks with pr_title, pr_number, body
+        (rollup body if non-trivial; else a synthesized summary from
+        subtask titles), direction_id, direction_text, merged_at, hours_ago
+      - rolling_rates: create/merge/rate for multiple windows:
+        last_24h, last_3d, last_7d, since_last_strategic
+      - per_direction_delta: for each direction, what shipped in each window
+      - lookback_days: the outer data window
     """
-    cutoff = _utcnow() - timedelta(days=lookback_days)
+    now = _utcnow()
+    cutoff = now - timedelta(days=lookback_days)
 
-    # All tasks in the lookback window — needed for the weekly rate calc
     tasks_result = await session.execute(
         select(Task).where(
             Task.project_id == project.id,
@@ -140,10 +160,6 @@ async def _build_recent_interventions(
     )
     tasks_in_window = list(tasks_result.scalars().all())
 
-    # Compute weekly rates using the shared helper
-    from app.routers.admin_analytics import _weekly_merge_rate_deltas  # noqa: PLC0415
-    weekly_rates = _weekly_merge_rate_deltas(tasks_in_window)
-
     # Build direction lookup for text enrichment
     directions_by_id: dict[str, str] = {
         d.get("id", ""): d.get("text", "")[:200]
@@ -151,39 +167,159 @@ async def _build_recent_interventions(
         if d.get("id")
     }
 
+    # Rolling windows: tighter than weekly, self-scaling to throughput.
+    # "since_last_strategic" anchors to the actual review cadence so the
+    # agent sees what's shipped since it last looked, not since Monday.
+    _24h_ago = now - timedelta(hours=24)
+    _3d_ago = now - timedelta(days=3)
+    _7d_ago = now - timedelta(days=7)
+    _strategic_cutoff = last_strategic_at  # may be None for first-ever cycle
+
+    def _window_counts(tasks: list[Task], since: datetime) -> dict[str, Any]:
+        created = 0
+        merged = 0
+        for t in tasks:
+            ts = t.created_at
+            if not ts or ts < since:
+                continue
+            created += 1
+            if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+                merged += 1
+        rate = round(merged / created, 3) if created > 0 else None
+        return {"created": created, "merged": merged, "merge_rate": rate}
+
+    rolling_rates = {
+        "last_24h": _window_counts(tasks_in_window, _24h_ago),
+        "last_3d": _window_counts(tasks_in_window, _3d_ago),
+        "last_7d": _window_counts(tasks_in_window, _7d_ago),
+    }
+    if _strategic_cutoff:
+        rolling_rates["since_last_strategic"] = _window_counts(
+            tasks_in_window, _strategic_cutoff
+        )
+
     # Extract the latest N merged tasks, newest first
-    merged = [
+    merged_tasks = [
         t for t in tasks_in_window
         if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
     ]
-    merged.sort(
+    merged_tasks.sort(
         key=lambda t: t.updated_at or t.created_at or datetime.min,
         reverse=True,
     )
 
+    # For rollups: look up child titles so the agent sees what actually
+    # shipped instead of "Rollup of 4 subtasks" + a title.
+    merged_parent_ids = {str(t.id) for t in merged_tasks[:limit]}
+    child_titles_by_parent: dict[str, list[str]] = {}
+    if merged_parent_ids:
+        children_result = await session.execute(
+            select(Task).where(
+                Task.parent_task_id.in_([uuid.UUID(p) for p in merged_parent_ids]),
+                Task.status == TaskStatus.COMPLETED,
+            )
+        )
+        for c in children_result.scalars().all():
+            # Only include real product-work children — skip review/fix pipeline tasks
+            c_type = c.first_payload.get("type") if c.first_payload else ""
+            if c_type in ("review", "fix"):
+                continue
+            child_titles_by_parent.setdefault(str(c.parent_task_id), []).append(
+                (c.title or "")[:150]
+            )
+
     merges_out: list[dict[str, Any]] = []
-    for t in merged[:limit]:
+    for t in merged_tasks[:limit]:
         ctx = t.context or {}
         merged_at = t.updated_at or t.created_at
-        week_key = None
-        if merged_at:
-            d = merged_at.date()
-            week_key = (d - timedelta(days=d.weekday())).isoformat()
         direction_id = ctx.get("direction_id")
+        hours_ago: float | None = None
+        if merged_at:
+            hours_ago = round((now - merged_at).total_seconds() / 3600.0, 1)
+
+        # Body resolution: use t.description when available and informative.
+        # If it's the trivial "Rollup of N subtasks..." boilerplate, replace
+        # with a synthesized summary from child titles — the agent needs to
+        # know WHAT shipped, not just how many things.
+        body = (t.description or "")[:1200]
+        if _rollup_body_is_trivial(body):
+            children = child_titles_by_parent.get(str(t.id), [])
+            if children:
+                body = "Rollup contents:\n- " + "\n- ".join(children[:8])
+            else:
+                body = ""
+
         merges_out.append({
             "pr_title": (t.title or "")[:200],
             "pr_number": ctx.get("rollup_pr_number") or ctx.get("pr_number"),
             "direction_id": direction_id,
             "direction_text": directions_by_id.get(direction_id, "") if direction_id else "",
-            "week": week_key,
             "merged_at": merged_at.isoformat() if merged_at else None,
+            "hours_ago": hours_ago,
+            "body": body,
         })
 
-    return {
+    # Per-direction delta: for each active direction, counts + titles per
+    # window. Lets the agent see "direction X shipped N things since my
+    # last cycle" without having to cross-correlate merges[] by direction_id.
+    per_direction_delta: list[dict[str, Any]] = []
+    for d in (project.directions or []):
+        d_id = d.get("id")
+        if not d_id or d.get("status") != "active":
+            continue
+        d_tasks = [t for t in tasks_in_window
+                   if (t.context or {}).get("direction_id") == d_id]
+        entry: dict[str, Any] = {
+            "direction_id": d_id,
+            "direction_text": (d.get("text") or "")[:200],
+            "last_24h": _window_counts(d_tasks, _24h_ago),
+            "last_3d": _window_counts(d_tasks, _3d_ago),
+        }
+        if _strategic_cutoff:
+            entry["since_last_strategic"] = _window_counts(
+                d_tasks, _strategic_cutoff
+            )
+        # Titles of things that shipped since last strategic (or last 24h as fallback)
+        recent_cutoff = _strategic_cutoff or _24h_ago
+        recent_merges = [
+            (t.title or "")[:160] for t in d_tasks
+            if t.status == TaskStatus.COMPLETED
+            and (t.context or {}).get("pr_merged")
+            and (t.updated_at or t.created_at or datetime.min) >= recent_cutoff
+        ]
+        if recent_merges:
+            entry["recent_merged_titles"] = recent_merges[:10]
+        per_direction_delta.append(entry)
+
+    result: dict[str, Any] = {
         "merges": merges_out,
-        "weekly_rates": weekly_rates,
+        "rolling_rates": rolling_rates,
+        "per_direction_delta": per_direction_delta,
         "lookback_days": lookback_days,
     }
+    if _strategic_cutoff:
+        result["hours_since_last_strategic"] = round(
+            (now - _strategic_cutoff).total_seconds() / 3600.0, 1
+        )
+    return result
+
+
+async def _find_last_strategic_cycle_time(
+    project: Project, session: AsyncSession
+) -> datetime | None:
+    """Return the updated_at of the most recent completed strategic_review
+    for this project, or None if there isn't one yet."""
+    result = await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.payloads[0]["type"].as_string() == "strategic_review",
+        ).order_by(Task.updated_at.desc()).limit(1)
+    )
+    task = result.scalars().first()
+    if not task:
+        return None
+    return task.updated_at or task.created_at
 
 
 async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> bool:
@@ -359,7 +495,10 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
                     _runtime_config.get("task_type_efforts", {}).get("research") or None
 
     from app.strategic_analysis import _build_outcome_evaluation  # noqa: PLC0415
-    recent_interventions = await _build_recent_interventions(project, session)
+    last_strategic_at = await _find_last_strategic_cycle_time(project, session)
+    recent_interventions = await _build_recent_interventions(
+        project, session, last_strategic_at=last_strategic_at
+    )
     payload: dict = validate_internal_payload({
         "type": "strategic_review",
         "research_mode": "strategic",

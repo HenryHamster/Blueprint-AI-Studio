@@ -782,41 +782,94 @@ ${hotspotsSection}
     // Recent interventions — time-series view of what shipped + per-week rate deltas.
     // Given with explicit non-causal framing so the agent doesn't over-attribute.
     const recentInterventions = payload.recent_interventions as Record<string, unknown> | undefined;
+    let clockHeader = '';
     let recentWorkSection = '';
     if (recentInterventions && typeof recentInterventions === 'object') {
       const merges = Array.isArray(recentInterventions.merges)
         ? recentInterventions.merges as Array<Record<string, unknown>>
         : [];
-      const weeklyRates = Array.isArray(recentInterventions.weekly_rates)
-        ? recentInterventions.weekly_rates as Array<Record<string, unknown>>
+      const rollingRates = recentInterventions.rolling_rates as Record<string, Record<string, unknown>> | undefined;
+      const perDirectionDelta = Array.isArray(recentInterventions.per_direction_delta)
+        ? recentInterventions.per_direction_delta as Array<Record<string, unknown>>
         : [];
-      if (merges.length > 0 || weeklyRates.length > 0) {
-        const lines: string[] = ['\n# Recent Work & Weekly Outcomes'];
+      const hoursSinceLast = typeof recentInterventions.hours_since_last_strategic === 'number'
+        ? recentInterventions.hours_since_last_strategic as number
+        : null;
+
+      // Clock header: answer "since I last ran, what's happened?" before anything else.
+      // Forces the agent to notice when a cycle elapsed without meaningful throughput
+      // instead of silently re-running its last playbook.
+      if (hoursSinceLast !== null && rollingRates) {
+        const sinceLast = rollingRates.since_last_strategic || {};
+        const mergedSince = typeof sinceLast.merged === 'number' ? sinceLast.merged : 0;
+        const createdSince = typeof sinceLast.created === 'number' ? sinceLast.created : 0;
+        const rateSince = typeof sinceLast.merge_rate === 'number' ? `${Math.round((sinceLast.merge_rate as number) * 100)}%` : 'n/a';
+        clockHeader = `\n# Clock\n`
+          + `${hoursSinceLast}h since your last strategic cycle. In that window: `
+          + `${mergedSince}/${createdSince} merged (${rateSince}).\n`
+          + `If that's a low-value ${hoursSinceLast}h relative to the ambition you set last time, that's information — ask why before doubling down on the same plays.\n`;
+      }
+
+      if (merges.length > 0 || rollingRates || perDirectionDelta.length > 0) {
+        const lines: string[] = ['\n# Recent Work & Rolling Outcomes'];
         lines.push('IMPORTANT — read this carefully before acting:');
-        lines.push('- Correlation is NOT causation. Weekly rate swings can reflect shifts in task difficulty, external factors (account health, rate limits, CI outages), or random variance on small samples.');
-        lines.push('- Only act on patterns spanning 2+ consecutive weeks with a consistent direction.');
-        lines.push('- If one week looks anomalous, check the directions_summary before concluding anything.');
-        lines.push('- Prefer "investigate whether X helps" (via ./strategic spawn-task) over "revert X".');
-        if (weeklyRates.length > 0) {
-          lines.push('\nWeekly merge-rate trend:');
-          for (const w of weeklyRates) {
-            const week = strVal(w.week, '?');
-            const created = typeof w.created === 'number' ? w.created : 0;
-            const merged = typeof w.merged === 'number' ? w.merged : 0;
-            const rate = typeof w.merge_rate === 'number' ? `${Math.round((w.merge_rate as number) * 100)}%` : 'n/a';
-            const delta = typeof w.merge_rate_delta === 'number' ? ` (Δ ${(w.merge_rate_delta as number) >= 0 ? '+' : ''}${Math.round((w.merge_rate_delta as number) * 100)}pp)` : '';
-            lines.push(`  ${week}: ${merged}/${created} merged (${rate})${delta}`);
+        lines.push('- Correlation is NOT causation. Rate swings can reflect task difficulty shifts, account health, rate limits, CI outages, or small-sample noise.');
+        lines.push('- Weekly buckets were replaced with rolling windows (last_24h / last_3d / last_7d / since_last_strategic) because weekly is too coarse for this pipeline\'s velocity.');
+        lines.push('- Only act on patterns visible across 2+ of the overlapping windows. A spike in last_24h that does not show in last_3d is probably noise.');
+        lines.push('- Prefer "investigate whether X helps" over "revert X".');
+
+        if (rollingRates) {
+          lines.push('\nRolling merge-rate windows:');
+          const order = ['since_last_strategic', 'last_24h', 'last_3d', 'last_7d'];
+          for (const w of order) {
+            const r = rollingRates[w];
+            if (!r) continue;
+            const created = typeof r.created === 'number' ? r.created : 0;
+            const merged = typeof r.merged === 'number' ? r.merged : 0;
+            const rate = typeof r.merge_rate === 'number' ? `${Math.round((r.merge_rate as number) * 100)}%` : 'n/a';
+            lines.push(`  ${w}: ${merged}/${created} merged (${rate})`);
           }
         }
+
+        if (perDirectionDelta.length > 0) {
+          lines.push('\nPer-direction outcomes in the rolling windows:');
+          for (const d of perDirectionDelta) {
+            const dirText = strVal(d.direction_text, '').slice(0, 100);
+            lines.push(`\n- ${dirText} (${strVal(d.direction_id)})`);
+            const sinceLast = d.since_last_strategic as Record<string, unknown> | undefined;
+            const last24h = d.last_24h as Record<string, unknown> | undefined;
+            const last3d = d.last_3d as Record<string, unknown> | undefined;
+            const fmt = (r: Record<string, unknown> | undefined): string => {
+              if (!r) return '0/0';
+              const c = typeof r.created === 'number' ? r.created : 0;
+              const m = typeof r.merged === 'number' ? r.merged : 0;
+              return `${m}/${c}`;
+            };
+            const parts: string[] = [];
+            if (sinceLast) parts.push(`since_last_strategic: ${fmt(sinceLast)}`);
+            parts.push(`last_24h: ${fmt(last24h)}`, `last_3d: ${fmt(last3d)}`);
+            lines.push(`  ${parts.join(', ')}`);
+            const recentTitles = Array.isArray(d.recent_merged_titles) ? d.recent_merged_titles as string[] : [];
+            if (recentTitles.length > 0) {
+              lines.push(`  Recently shipped: ${recentTitles.map(t => `"${t}"`).join('; ')}`);
+            }
+          }
+        }
+
         if (merges.length > 0) {
-          lines.push('\nRecent merges (newest first):');
+          lines.push('\nRecent merges (newest first, with body when informative):');
           for (const m of merges) {
             const title = strVal(m.pr_title, '?').slice(0, 120);
             const pr = m.pr_number ? `#${m.pr_number}` : '';
-            const week = strVal(m.week, '?');
+            const hoursAgo = typeof m.hours_ago === 'number' ? `${m.hours_ago}h ago` : '?';
             const dirText = strVal(m.direction_text, '').slice(0, 80);
             const dirTag = dirText ? ` [direction: ${dirText}]` : ' [no direction]';
-            lines.push(`  - ${title} ${pr} (week ${week})${dirTag}`);
+            lines.push(`  - ${title} ${pr} (${hoursAgo})${dirTag}`);
+            const body = strVal(m.body, '').trim();
+            if (body) {
+              const indented = body.split('\n').map(l => `    ${l}`).join('\n');
+              lines.push(indented);
+            }
           }
         }
         recentWorkSection = lines.join('\n') + '\n';
@@ -1035,7 +1088,7 @@ echo ""
     const thinkerPrompt = `${contextPrefix}You own this project's strategic direction.
 
 # Project: ${projectName}
-${strategicContext ? `\n## Running Context (from prior cycles)\n${strategicContext}\n` : ''}
+${clockHeader}${strategicContext ? `\n## Running Context (from prior cycles)\n${strategicContext}\n` : ''}
 ## Architecture (design document — current state)
 ${designDocJson || 'No design document yet.'}
 
@@ -1067,6 +1120,18 @@ Think about what bold moves close that gap:
 - What are we avoiding that we shouldn't be?
 
 Think big. If a direction would fundamentally change the product's trajectory, it's worth more than five safe incremental ones. Don't optimize the current plan — question whether it's the right plan.
+
+## Read the metrics through the vision's lens
+
+You're being shown merge-rate, success-rate, cycle counts, per-direction throughput, weekly deltas. These are proxies — useful but partial. The vision is the authoritative measure of what "better" means here. For every metric in front of you:
+
+- **Translate the metric into vision-progress.** "Merge-rate up 5pp" isn't a win on its own — it's a win only if the merged work is the kind of work the vision calls for. Before acting on a metric trend, name how it maps to the vision's purpose. If you can't, the metric probably isn't what you should be optimizing for.
+
+- **When evaluating a direction, ask "what would push us furthest toward the vision?" — not "what would move this number most?"** Those often align, but when they diverge the vision wins. A direction that hits its numeric target while leaving the vision no closer is finished, not successful. Retire or reframe it.
+
+- **Watch for the metric-proxy drift.** If recent directions moved a number (merge-rate, review-pass rate, cycle count) without visibly moving the user's experience or the vision's stated outcomes, that's a signal the metric has detached from what it's meant to proxy. Spot it early — propose a direction that either re-anchors the metric or replaces it with something closer to the vision.
+
+This isn't about distrusting numbers or being adversarial about every measurement. It's about remembering that metrics exist to serve the vision, not the other way around. When they agree, act on them. When they drift apart, trust the vision.
 
 Some task failures are caused by the pipeline itself — marked [PROVISION_FAILURE], [RATE_LIMIT], [AGENT_TIMEOUT], or [EXTERNAL_API] in the failure details. These say nothing about the direction's quality. If you see a pattern of infra failures, flag it to the user as a pipeline issue (\`./messages send 'observation' NOTE\`) rather than penalizing the direction.
 
