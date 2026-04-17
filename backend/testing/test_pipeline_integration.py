@@ -1503,34 +1503,34 @@ async def test_stuck_cycle_detected_without_explicit_original_task_id(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_rollup_bypasses_global_cap_via_status_message(
+async def test_rollup_bypasses_global_cap_via_is_rollup_review_flag(
     db_session, mocker
 ):
     """
-    When source_task.latest_status_message contains 'rollup', _spawn_pipeline_task
+    When source_task.context['_is_rollup_review'] is True, _spawn_pipeline_task
     must use MAX_REVIEW_FIX_ITERATIONS (16) as the global cap instead of the
     scope-based cap, allowing rollup reviews to proceed even after many retries.
 
     Setup: medium scope task → normal global cap = 12.
     Pre-populate 12 completed review/fix tasks for PR #200 (would hit normal cap).
-    Set latest_status_message to contain 'rollup'.
+    Set _is_rollup_review flag in context.
     Expect: _spawn_pipeline_task returns a task (not None).
     """
     mocker.patch("app.broadcast.broadcast_to_project")
 
-    project = Project(name="Rollup Cap Bypass via Status Test", user_id="test-user-123")
+    project = Project(name="Rollup Cap Bypass via Flag Test", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Parent research/rollup task — medium scope, 'rollup' in latest_status_message
+    # Parent research/rollup task — medium scope, _is_rollup_review flag set
     parent_task = Task(
         project_id=project.id,
         title="Research task (rollup parent)",
         payloads=[{"type": "research", "prompt": "Research improvements", "base_branch": "main"}],
         vm_instance_id="agent-vm-rollup-parent-001",
         status=TaskStatus.EVALUATING,
-        context={"scope": "medium"},
+        context={"scope": "medium", "_is_rollup_review": True},
         latest_status_message="All 3 subtasks merged, rollup PR #200 awaiting review",
     )
     db_session.add(parent_task)
@@ -1566,7 +1566,7 @@ async def test_rollup_bypasses_global_cap_via_status_message(
     )
 
     assert result is not None and was_created, (
-        "Rollup task (latest_status_message contains 'rollup') should bypass the "
+        "Rollup task (_is_rollup_review=True) should bypass the "
         f"medium-scope global cap (12) and use MAX_REVIEW_FIX_ITERATIONS ({MAX_REVIEW_FIX_ITERATIONS})"
     )
     assert result.status == TaskStatus.QUEUED

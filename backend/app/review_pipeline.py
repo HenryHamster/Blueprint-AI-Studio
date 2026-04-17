@@ -301,13 +301,11 @@ async def _spawn_pipeline_task(
 
     global_cap = _max_review_iterations(source_task, direction_data)
     # Rollup reviews accumulate iterations across retry attempts — always use the max cap
-    # so transient review failures don't permanently block rollup merges.
-    # Two detection paths: (1) _rollup_retries set when PR creation fails transiently,
-    # (2) 'rollup' in status_message set by rollup_management before calling _spawn_pipeline_task.
+    # so transient review failures don't permanently block rollup merges. Detection uses
+    # context flags set authoritatively by rollup_management when spawning review/fix tasks.
     is_rollup = (
         (source_task.context or {}).get("_is_rollup_review") is True
         or (source_task.context or {}).get("_rollup_retries") is not None
-        or 'rollup' in (source_task.latest_status_message or '').lower()
     )
     if is_rollup:
         global_cap = MAX_REVIEW_FIX_ITERATIONS

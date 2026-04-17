@@ -8,7 +8,7 @@ import {
   captureTestBaseline, sendHeartbeatSync,
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
-import { DEFAULT_CLONE_DEPTH } from '../constants.js';
+import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, type PlaybookEntry,
@@ -49,6 +49,37 @@ function fmtIssueLoc(i: { file?: string; line?: number }): string {
   if (i.file && typeof i.line === 'number') return ` [${i.file}:${i.line}]`;
   if (i.file) return ` [${i.file}]`;
   return '';
+}
+
+type ReviewHistoryIssue = { severity: string; description: string; file?: string; line?: number };
+type ReviewHistoryEntry = { iteration: number; feedback: string; issues?: ReviewHistoryIssue[] };
+type AnnotatedIssue = ReviewHistoryIssue & { resolvedInIteration?: number };
+type AnnotatedEntry = { iteration: number; feedback: string; issues?: AnnotatedIssue[] };
+
+// Annotate each iteration's issues with whether they reappeared in the next
+// iteration. Issues that don't reappear are likely resolved — surfacing that
+// signal prevents the next reviewer from re-flagging already-fixed problems or
+// wasting effort re-verifying them. The most recent iteration is never
+// annotated (no "next" to compare against).
+export function annotateResolvedIssues(history: ReviewHistoryEntry[]): AnnotatedEntry[] {
+  const sorted = [...history].sort((a, b) => a.iteration - b.iteration);
+  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+  return sorted.map((entry, idx) => {
+    const next = sorted[idx + 1];
+    if (!next || !entry.issues || entry.issues.length === 0) return entry;
+    const nextDescs = new Set((next.issues || []).map(i => norm(i.description)));
+    const annotated: AnnotatedIssue[] = entry.issues.map(i =>
+      nextDescs.has(norm(i.description)) ? i : { ...i, resolvedInIteration: next.iteration }
+    );
+    return { ...entry, issues: annotated };
+  });
+}
+
+function fmtAnnotatedIssue(label: string, i: AnnotatedIssue): string {
+  const base = `  [${label}]${fmtIssueLoc(i)} ${i.description}`;
+  return i.resolvedInIteration
+    ? `${base} (likely resolved — not flagged in iteration ${i.resolvedInIteration})`
+    : base;
 }
 
 // Truncation budget for raw review-feedback text in the per-iteration history
@@ -166,6 +197,20 @@ export async function handleReview(
     changedFiles = git(['diff', '--name-status', `origin/${baseBranch}...HEAD`]);
   } catch { changedFiles = '(could not generate file list)'; }
 
+  // Scope-drift warning: the `taskScope` label is set at task creation and never
+  // re-validated against the actual diff. If fix iterations ballooned this PR
+  // beyond its original scope, tell the reviewer to ignore the scope-narrowed
+  // checklist and scrutinize everything.
+  const changedFileCount = changedFiles
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('('))
+    .length;
+  const scopeThreshold = SCOPE_OVERFLOW_THRESHOLDS[taskScope];
+  const scopeOverflowWarning = (scopeThreshold && changedFileCount > scopeThreshold)
+    ? `NOTE: This PR has ${changedFileCount} changed files, which exceeds the typical range for a ${taskScope}-scope change (threshold: ${scopeThreshold}). Consider reviewing ALL checklist sections regardless of scope label.\n\n`
+    : '';
+
   // Read CLAUDE.md for codebase instructions
   const reviewClaudeMd = readClaudeMd();
   const reviewClaudeMdPrefix = reviewClaudeMd
@@ -174,15 +219,17 @@ export async function handleReview(
 
   // Read project_context for active/sibling task awareness
   const reviewProjectCtx = task.project_context as Record<string, unknown> | undefined;
-  const reviewProjectCtxSection = reviewProjectCtx ? formatProjectContext(reviewProjectCtx) + '\n\n' : '';
+  const reviewDirectionId = (taskContext?.direction_id as string | undefined) || '';
+  const reviewProjectCtxSection = reviewProjectCtx ? formatProjectContext(reviewProjectCtx, 'review', taskScope, reviewDirectionId) + '\n\n' : '';
 
   // Build prior review history section (for iterations > 1)
-  const reviewHistorySection = reviewHistory.length > 0 && iteration > 1
-    ? `Issues from previous iterations (verify each was addressed):\n${reviewHistory.map(e => {
+  const annotatedReviewHistory = annotateResolvedIssues(reviewHistory);
+  const reviewHistorySection = annotatedReviewHistory.length > 0 && iteration > 1
+    ? `Issues from previous iterations (verify each was addressed — issues marked "(likely resolved ...)" were not re-flagged in the following iteration and are historical context, not active blockers):\n${annotatedReviewHistory.map(e => {
         if (e.issues && e.issues.length > 0) {
-          const critical = e.issues.filter(i => i.severity === 'critical').map(i => `  [CRITICAL]${fmtIssueLoc(i)} ${i.description}`);
-          const major = e.issues.filter(i => i.severity === 'major').map(i => `  [MAJOR]${fmtIssueLoc(i)} ${i.description}`);
-          const minor = e.issues.filter(i => i.severity === 'minor').map(i => `  [MINOR]${fmtIssueLoc(i)} ${i.description}`);
+          const critical = e.issues.filter(i => i.severity === 'critical').map(i => fmtAnnotatedIssue('CRITICAL', i));
+          const major = e.issues.filter(i => i.severity === 'major').map(i => fmtAnnotatedIssue('MAJOR', i));
+          const minor = e.issues.filter(i => i.severity === 'minor').map(i => fmtAnnotatedIssue('MINOR', i));
           return `- Iteration ${e.iteration}:\n` + [...critical, ...major, ...minor].join('\n');
         }
         return `- Iteration ${e.iteration}: ` + e.feedback.slice(0, REVIEW_FEEDBACK_HISTORY_CHARS);
@@ -233,7 +280,7 @@ You have full access to the codebase. Read any files you need to understand the 
 
 Review the changes thoroughly using this checklist:
 
-${taskScope === 'small' ? 'This is a small-scope change. Focus your review on Correctness & Logic and Build & Type Safety. Security and performance sections are lower priority unless the change touches auth, user input handling, or database queries.\n\n' : taskScope === 'large' ? 'This is a large-scope change with higher risk. Review ALL checklist sections thoroughly. Pay special attention to backwards compatibility, data model safety, and security implications.\n\n' : ''}${origTaskType === 'qa' ? 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n' : origTaskType === 'migrate' ? 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n' : ''}**Correctness & Logic:**
+${scopeOverflowWarning}${taskScope === 'small' ? 'This is a small-scope change. Focus your review on Correctness & Logic and Build & Type Safety. Security and performance sections are lower priority unless the change touches auth, user input handling, or database queries.\n\n' : taskScope === 'large' ? 'This is a large-scope change with higher risk. Review ALL checklist sections thoroughly. Pay special attention to backwards compatibility, data model safety, and security implications.\n\n' : ''}${origTaskType === 'qa' ? 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n' : origTaskType === 'migrate' ? 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n' : ''}**Correctness & Logic:**
 - Does the code correctly implement what the original task asked for?
 - Are there edge cases, null/undefined handling, or off-by-one errors?
 - Are async operations properly awaited? Are errors properly handled?
@@ -399,20 +446,21 @@ export async function handleFix(
   const originalPromptSection = originalPrompt ? `## Original Task Goal\n${originalPrompt}\n\n` : '';
   let basePrompt = originalPromptSection + iterationHeader + prompt;
   if (reviewHistory.length > 0) {
-    const historyLines = reviewHistory
+    const annotatedHistory = annotateResolvedIssues(reviewHistory);
+    const historyLines = annotatedHistory
       .map(e => {
         const issues = e.issues;
         if (issues && issues.length > 0) {
-          const critical = issues.filter(i => i.severity === 'critical').map(i => `  [CRITICAL]${fmtIssueLoc(i)} ${i.description}`);
-          const major = issues.filter(i => i.severity === 'major').map(i => `  [MAJOR]${fmtIssueLoc(i)} ${i.description}`);
-          const minor = issues.filter(i => i.severity === 'minor').map(i => `  [MINOR]${fmtIssueLoc(i)} ${i.description}`);
+          const critical = issues.filter(i => i.severity === 'critical').map(i => fmtAnnotatedIssue('CRITICAL', i));
+          const major = issues.filter(i => i.severity === 'major').map(i => fmtAnnotatedIssue('MAJOR', i));
+          const minor = issues.filter(i => i.severity === 'minor').map(i => fmtAnnotatedIssue('MINOR', i));
           return `- Iteration ${e.iteration}:\n${[...critical, ...major, ...minor].join('\n')}`;
         } else {
           return `- Iteration ${e.iteration}: ${e.feedback.slice(0, REVIEW_FEEDBACK_HISTORY_CHARS)}`;
         }
       })
       .join('\n');
-    basePrompt = `${originalPromptSection}Previous review iterations:\n${historyLines}\n\nCurrent review feedback to address:\n${prompt}`;
+    basePrompt = `${originalPromptSection}Previous review iterations (issues marked "(likely resolved ...)" were not re-flagged in the following iteration — treat as historical context, focus on the current feedback):\n${historyLines}\n\nCurrent review feedback to address:\n${prompt}`;
   }
 
   // Always check for conflict markers — even if rebase/merge appeared to succeed

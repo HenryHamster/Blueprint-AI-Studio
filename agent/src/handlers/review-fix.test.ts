@@ -60,7 +60,7 @@ vi.mock('child_process', () => ({
 import fs from 'fs';
 import { execFileSync } from 'child_process';
 import * as indexMod from '../index.js';
-import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS } from './review-fix.js';
+import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS, annotateResolvedIssues } from './review-fix.js';
 
 const statusRef = () => ({ value: '' });
 
@@ -150,6 +150,51 @@ describe('computeMaxFixIterations — mirrors backend _max_review_iterations', (
     // Empty object is the realistic edge; the guard coerces to ctx={}.
     expect(() => computeMaxFixIterations({ context: {} })).not.toThrow();
     expect(() => computeMaxFixIterations({})).not.toThrow();
+  });
+});
+
+describe('annotateResolvedIssues — marks issues not re-flagged by next iteration', () => {
+  it('annotates an issue with resolvedInIteration when it does not reappear next', () => {
+    const result = annotateResolvedIssues([
+      { iteration: 1, feedback: '', issues: [
+        { severity: 'major', description: 'missing null check', file: 'a.ts' },
+        { severity: 'minor', description: 'unused import' },
+      ] },
+      { iteration: 2, feedback: '', issues: [
+        { severity: 'major', description: 'missing null check', file: 'a.ts' },
+      ] },
+    ]);
+    const it1 = result.find(e => e.iteration === 1)!;
+    const nullCheck = it1.issues!.find(i => i.description === 'missing null check')!;
+    const unused = it1.issues!.find(i => i.description === 'unused import')!;
+    expect(nullCheck.resolvedInIteration).toBeUndefined();
+    expect(unused.resolvedInIteration).toBe(2);
+  });
+
+  it('never annotates the most recent iteration', () => {
+    const result = annotateResolvedIssues([
+      { iteration: 1, feedback: '', issues: [{ severity: 'major', description: 'x' }] },
+      { iteration: 2, feedback: '', issues: [{ severity: 'major', description: 'y' }] },
+    ]);
+    const it2 = result.find(e => e.iteration === 2)!;
+    expect(it2.issues![0].resolvedInIteration).toBeUndefined();
+  });
+
+  it('normalizes whitespace/case when matching descriptions', () => {
+    const result = annotateResolvedIssues([
+      { iteration: 1, feedback: '', issues: [{ severity: 'major', description: 'Missing  NULL check' }] },
+      { iteration: 2, feedback: '', issues: [{ severity: 'major', description: 'missing null check' }] },
+    ]);
+    const it1 = result.find(e => e.iteration === 1)!;
+    expect(it1.issues![0].resolvedInIteration).toBeUndefined();
+  });
+
+  it('leaves feedback-only (no issues) entries untouched', () => {
+    const result = annotateResolvedIssues([
+      { iteration: 1, feedback: 'plain text' },
+      { iteration: 2, feedback: 'also plain' },
+    ]);
+    expect(result[0].issues).toBeUndefined();
   });
 });
 
@@ -277,6 +322,20 @@ describe('handleReview — verdict file parsing', () => {
     const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
     expect(status.verdict_json).toBeUndefined();
     expect(String(status.logs)).toBe('last');
+  });
+
+  it('passes review taskType, scope, and direction_id to formatProjectContext', async () => {
+    const promptMod = await import('../prompt.js');
+    vi.mocked(promptMod.formatProjectContext).mockClear();
+    await handleReview(
+      'task-pc',
+      basePayload,
+      { context: { scope: 'small', direction_id: 'd-abc123' }, project_context: { foo: 'bar' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(promptMod.formatProjectContext).toHaveBeenCalledWith(
+      { foo: 'bar' }, 'review', 'small', 'd-abc123',
+    );
   });
 
   it('surfaces FAILED status with failure_category when Claude exits non-zero', async () => {
