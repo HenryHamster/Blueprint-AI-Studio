@@ -1259,10 +1259,19 @@ async def get_autonomy_debug(
         "cooldown_ends_at": cooldown_ends_at,
     }
 
-    # Guard 4 prerequisite: identify research tasks that are actively holding a
-    # direction. Mirror `_spawn_research_task_inner` — EVALUATING parents still
-    # own the direction until their children merge.
-    active_tasks_result = await session.execute(
+    # Mirror `_spawn_research_task_inner`'s two separate concerns:
+    #   - busy_direction_ids (direction eligibility): include EVALUATING because
+    #     the direction is still "owned" by a research cycle whose children are
+    #     merging — re-spawning on it would be wasteful.
+    #   - active_research_count (parallel-research cap): exclude EVALUATING
+    #     because those tasks aren't consuming VM slots and shouldn't count
+    #     against max_parallel (see autonomous_research.py:366, "EVALUATING
+    #     parents are just waiting on children — they don't block new research").
+    #
+    # Conflating them (the previous single-query approach) made this endpoint
+    # report `research_task_active` blocks that the spawn path would not
+    # actually hit, which was misleading the autonomy-debug UI.
+    busy_tasks_result = await session.execute(
         select(Task).where(
             Task.project_id == project_id,
             Task.status.in_([
@@ -1271,16 +1280,18 @@ async def get_autonomy_debug(
             ]),
         )
     )
-    active_tasks = active_tasks_result.scalars().all()
-    active_research_count = 0
     busy_direction_ids: list[str] = []
-    for t in active_tasks:
+    active_research_count = 0
+    for t in busy_tasks_result.scalars().all():
         payload = t.first_payload
-        if payload.get("type") == "research":
+        if payload.get("type") != "research":
+            continue
+        did = payload.get("current_direction_id")
+        if did:
+            busy_direction_ids.append(did)
+        # Only the VM-consuming statuses count against the parallel cap
+        if t.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS):
             active_research_count += 1
-            did = payload.get("current_direction_id")
-            if did:
-                busy_direction_ids.append(did)
 
     # Guard 3: no_eligible_directions — a direction is eligible only if it's
     # active, out of cooldown, AND not already held by another research task.

@@ -227,6 +227,37 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             if any(rid in (d.get("conflicts_with") or []) for rid in busy_direction_ids):
                 blocked_ids.add(d.get("id"))
 
+        # Cross-instance serialization: Cloud Run runs up to N orchestrator
+        # instances (maxScale=3 currently), each firing its own idle-research
+        # cycle.  Without this lock, instances race — each reads "0 active
+        # research" before any of them commits, then each spawns a task.  The
+        # user sets max_parallel=1 expecting 1 task; without serialization
+        # they get up to N (one per instance, each picking a different
+        # direction because the first instance's just-QUEUED task shows up
+        # as "busy" to the next instance's read).
+        #
+        # pg_try_advisory_xact_lock is non-blocking; losers return for this
+        # cycle and pick up on the next interval tick.  The lock is scoped
+        # to the transaction — releases on commit/rollback automatically.
+        # Tests use SQLite which has no advisory locks; the try/except keeps
+        # the fallback equivalent to "assume we hold the lock" (safe because
+        # there's only one process in tests).
+        from sqlalchemy import text as _sql_text  # noqa: PLC0415
+        _lock_key = abs(hash(f"research_spawn:{project.id}")) % (2**31)
+        try:
+            _got_lock = (await session.execute(
+                _sql_text("SELECT pg_try_advisory_xact_lock(:k)"),
+                {"k": _lock_key},
+            )).scalar()
+        except Exception:
+            _got_lock = True  # non-Postgres dialect (tests) — skip serialization
+        if not _got_lock:
+            logger.info(
+                f"[AUTONOMOUS] Research spawn for project {project.id} skipped — "
+                f"another instance holds the advisory lock"
+            )
+            return
+
         max_parallel = _runtime_config.get("max_parallel_research_per_project", 2)
         for d in sorted_eligible:
             did = d.get("id")
