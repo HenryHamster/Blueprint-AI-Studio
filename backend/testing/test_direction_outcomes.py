@@ -838,6 +838,67 @@ async def test_scope_breakdown_avg_expansion_ratio(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_scope_breakdown_failed_scope_overflow_counter(db_session: AsyncSession):
+    """SCOPE_OVERFLOW failures increment both failed_infra and failed_scope_overflow.
+
+    _effective_scope_denominator subtracts (failed_infra - failed_scope_overflow)
+    from created to exclude true-infra failures while keeping scope-overflow
+    signal in the denominator.
+    """
+    direction_id = "d-scope-overflow"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    await db_session.flush()
+
+    # medium task that hit scope overflow
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "medium", "failure_category": "SCOPE_OVERFLOW"},
+        payloads=[{"type": "create"}],
+        title="m-overflow", latest_status_message="scope overflow",
+    )
+    # medium task with a pure infra failure (no scope overflow)
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "medium", "failure_category": "RATE_LIMIT"},
+        payloads=[{"type": "create"}],
+        title="m-rate", latest_status_message="rate limited",
+    )
+    # small task with CODE_ERROR — should not touch either infra counter
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "small", "failure_category": "CODE_ERROR"},
+        payloads=[{"type": "create"}],
+        title="s-code", latest_status_message="test failed",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    sb = project.directions[0]["research_history"][0]["scope_breakdown"]
+    # SCOPE_OVERFLOW is in INFRA_CLASSES, so it bumps both counters
+    assert sb["medium"]["failed"] == 2
+    assert sb["medium"]["failed_infra"] == 2
+    assert sb["medium"]["failed_scope_overflow"] == 1
+    # CODE_ERROR does not touch either infra counter
+    assert sb["small"]["failed"] == 1
+    assert sb["small"]["failed_infra"] == 0
+    assert sb["small"]["failed_scope_overflow"] == 0
+
+
+@pytest.mark.asyncio
 async def test_scope_breakdown_no_expansion_ratio_when_no_data(db_session: AsyncSession):
     """avg_expansion_ratio is omitted when no qualifying tasks exist for a scope."""
     direction_id = "d-no-expand"

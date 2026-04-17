@@ -4184,8 +4184,8 @@ def test_fold_evicted_preserves_scope_and_decomposition():
     assert agg["first_cycle_at"] == "2025-01-01T00:00:00"
 
     sb = agg["scope_breakdown"]
-    assert sb["small"] == {"created": 5, "merged": 3, "failed": 1, "failed_infra": 0}
-    assert sb["medium"] == {"created": 1, "merged": 0, "failed": 0, "failed_infra": 1}
+    assert sb["small"] == {"created": 5, "merged": 3, "failed": 1, "failed_infra": 0, "failed_scope_overflow": 0}
+    assert sb["medium"] == {"created": 1, "merged": 0, "failed": 0, "failed_infra": 1, "failed_scope_overflow": 0}
 
     dq = agg["decomposition_quality"]
     assert dq["total_decompositions"] == 3
@@ -4239,7 +4239,7 @@ def test_fold_evicted_accumulates_into_existing_aggregate():
     sb = agg["scope_breakdown"]
     assert sb["small"]["created"] == 6
     assert sb["small"]["merged"] == 3
-    assert sb["large"] == {"created": 1, "merged": 0, "failed": 1, "failed_infra": 0}
+    assert sb["large"] == {"created": 1, "merged": 0, "failed": 1, "failed_infra": 0, "failed_scope_overflow": 0}
 
     dq = agg["decomposition_quality"]
     assert dq["total_decompositions"] == 2

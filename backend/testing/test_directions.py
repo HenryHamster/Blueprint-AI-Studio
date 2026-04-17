@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
-from app.research_completion import _handle_research_completion, _compute_momentum_factor, _compute_merge_rate, _calibrate_scope, predict_spawn_success
+from app.research_completion import _handle_research_completion, _compute_momentum_factor, _compute_merge_rate, _calibrate_scope, predict_spawn_success, _poor_decomp_history
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -2486,3 +2486,154 @@ class TestPredictSpawnSuccessDecompositionSignal:
         # Signal 1 (weight 2.0): 1.0; Signal 5 (weight 1.5): 0.0
         # (2.0*1.0 + 1.5*0.0) / 3.5 = 0.5714...
         assert predict_spawn_success("large", d) == pytest.approx(2.0 / 3.5)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _poor_decomp_history helper unit tests (suppression signal)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPoorDecompHistory:
+    """Unit tests for _poor_decomp_history: suppression signal shared by
+    _calibrate_scope and the low-confidence auto-escalation gate.
+    """
+
+    def test_no_history_returns_false(self):
+        assert _poor_decomp_history({}) is False
+
+    def test_insufficient_subtask_count_returns_false(self):
+        d = {"research_history": [{"decomposition_quality": [
+            {"subtask_merge_rate": 0.0, "subtask_count": 2},
+        ]}]}
+        assert _poor_decomp_history(d) is False
+
+    def test_poor_weighted_avg_returns_true(self):
+        d = {"research_history": [{"decomposition_quality": [
+            {"subtask_merge_rate": 0.1, "subtask_count": 4},
+        ]}]}
+        assert _poor_decomp_history(d) is True
+
+    def test_healthy_weighted_avg_returns_false(self):
+        d = {"research_history": [{"decomposition_quality": [
+            {"subtask_merge_rate": 0.5, "subtask_count": 4},
+        ]}]}
+        assert _poor_decomp_history(d) is False
+
+    def test_weighted_averaging_across_entries(self):
+        # 2*0.8 + 3*0.1 = 1.9 over 5 subtasks = 0.38 >= 0.3 → healthy
+        d = {"research_history": [{"decomposition_quality": [
+            {"subtask_merge_rate": 0.8, "subtask_count": 2},
+            {"subtask_merge_rate": 0.1, "subtask_count": 3},
+        ]}]}
+        assert _poor_decomp_history(d) is False
+
+    def test_skips_non_numeric_rates(self):
+        d = {"research_history": [{"decomposition_quality": [
+            {"subtask_merge_rate": None, "subtask_count": 10},
+            {"subtask_merge_rate": 0.1, "subtask_count": 3},
+        ]}]}
+        assert _poor_decomp_history(d) is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Low-confidence medium auto-escalation gate (integration via _handle_research_completion)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _setup_escalation_project(db_session, direction_id, decomp_quality):
+    # Empty research_history keeps _calibrate_scope a no-op (cold-start falls through);
+    # low-confidence is simulated via mocker.patch on predict_spawn_success in the test.
+    direction = {
+        "id": direction_id,
+        "text": "Low-confidence medium",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": (
+            [{"decomposition_quality": decomp_quality}] if decomp_quality else []
+        ),
+    }
+    project = Project(name="Escalation test", user_id="test-user-123",
+                      autonomous_enabled=True, directions=[direction])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        title="Research: low-conf",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task, direction
+
+
+def _mock_escalation_externals(mocker, direction_id):
+    mocker.patch("app.task_completion.get_github_token_for_task",
+                 new=AsyncMock(return_value=("fake-token", "owner", "repo")))
+    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": "Medium improvement",
+            "description": "Some work",
+            "prompt": "Do the work",
+            "priority": "medium",
+            "scope": "medium",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction_id,
+        }],
+    )
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_medium_auto_escalates_to_large(db_session, mocker):
+    """Medium-scope low-confidence finding is escalated to large+plan; the
+    low_confidence_spawn flag is preserved in context for tracking."""
+    direction_id = "d-lowconf1"
+    _, task, _ = await _setup_escalation_project(db_session, direction_id, None)
+    _mock_escalation_externals(mocker, direction_id)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.0)
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    children = result.scalars().all()
+    assert len(children) == 1
+    child = children[0]
+    assert child.context["scope"] == "large"
+    assert child.context["scope_calibrated_from"] == "medium"
+    assert child.context["low_confidence_spawn"] is True
+    assert child.first_payload["type"] == "plan"
+
+
+@pytest.mark.asyncio
+async def test_auto_escalate_suppressed_by_poor_decomp_history(db_session, mocker):
+    """Medium-scope low-confidence finding stays at medium when prior plan
+    decompositions merged poorly (shares suppression with _calibrate_scope)."""
+    direction_id = "d-suppressed"
+    _, task, _ = await _setup_escalation_project(
+        db_session, direction_id,
+        [{"subtask_merge_rate": 0.1, "subtask_count": 5}],
+    )
+    _mock_escalation_externals(mocker, direction_id)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.0)
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    children = result.scalars().all()
+    assert len(children) == 1
+    child = children[0]
+    assert child.context["scope"] == "medium"
+    assert child.context["low_confidence_spawn"] is True
+    assert child.first_payload["type"] == "create"
