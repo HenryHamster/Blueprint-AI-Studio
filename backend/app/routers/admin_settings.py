@@ -1485,6 +1485,27 @@ async def get_strategic_debug(
     else:
         phase = 0
 
+    # Architecture (design doc) summary: last update, revision, system count,
+    # and how many strategic cycles until the next architecture review fires.
+    design_doc = project.design_doc or {}
+    dd_meta = design_doc.get("_meta") or {}
+    system_keys = [k for k in design_doc.keys() if isinstance(k, str) and k.startswith("systems/")]
+    capability_keys = [k for k in design_doc.keys() if isinstance(k, str) and k.startswith("capabilities/")]
+    if arch_frequency > 0:
+        arch_remainder = strategic_cycle_count % arch_frequency
+        next_arch_in_cycles = arch_frequency if arch_remainder == 0 and strategic_cycle_count > 0 \
+            else arch_frequency - arch_remainder
+    else:
+        next_arch_in_cycles = None
+    architecture_info = {
+        "revision": dd_meta.get("revision", 0),
+        "last_updated": dd_meta.get("last_updated"),
+        "updated_by_task": dd_meta.get("updated_by_task"),
+        "system_count": len(system_keys),
+        "capability_count": len(capability_keys),
+        "next_arch_in_cycles": next_arch_in_cycles,
+    }
+
     return {
         "phase": phase,
         "blocking_guards": blocking_guards,
@@ -1498,6 +1519,7 @@ async def get_strategic_debug(
         "strategic_failures": strategic_failures,
         "strategic_failures_at": failures_at_iso,
         "strategic_failures_decay_at": failures_decay_at_iso,
+        "architecture": architecture_info,
         "active_task": {
             "id": str(active_strategic_task.id),
             "phase": active_phase,

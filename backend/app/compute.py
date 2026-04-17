@@ -1003,8 +1003,17 @@ STATICENV
         return True
     except (asyncio.TimeoutError, asyncio.CancelledError) as e:
         _cancel_event.set()  # Signal thread to stop trying more zones
-        logger.exception(f"Failed to provision VM {vm_instance_id}")
-        _last_provision_error[vm_instance_id] = str(e)[:300]
+        # Our own 420s budget fired — GCP insert/zone-iteration didn't return in
+        # time. Orchestrator requeues on attempt 1, so this is handled recovery,
+        # not a novel error. Log at WARN (same pattern as OPERATION_CANCELED_BY_USER
+        # below) so it stops fouling "UnknownError" dashboards.
+        kind = type(e).__name__
+        detail = str(e) or f"{kind} (no message)"
+        logger.warning(
+            f"[PROVISION] {vm_instance_id} aborted after 420s budget ({kind}) — "
+            f"orchestrator will requeue: {detail[:200]}"
+        )
+        _last_provision_error[vm_instance_id] = f"{kind}: {detail}"[:300]
         if len(_last_provision_error) > _PROVISION_ERROR_MAX:
             _last_provision_error.popitem(last=False)
         await asyncio.to_thread(_delete_agent_secret, vm_instance_id)

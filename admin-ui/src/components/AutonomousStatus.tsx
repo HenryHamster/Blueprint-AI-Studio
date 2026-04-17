@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, type RefObject } from 'react';
-import { Zap, ZapOff, AlertTriangle, RefreshCw, Lock, Clock, PlayCircle, Gauge, Pause, Server } from 'lucide-react';
+import { Zap, ZapOff, AlertTriangle, RefreshCw, Lock, Clock, PlayCircle, Gauge, Pause, Server, Compass, CheckCircle2, XCircle, Activity, FileText } from 'lucide-react';
 import { API_BASE_URL, authHeaders, apiFetch } from '../api';
 import { secondsUntil, parseTimestamp } from '../utils/time';
 
@@ -69,6 +69,56 @@ interface AutonomyDebug {
     seconds_until_eligible: number | null;
   }>;
   next_check_at: string;
+}
+
+interface StrategicBlockingGuard {
+  guard: string;
+  reason: string;
+  failures?: number;
+  decay_at?: string;
+}
+
+interface StrategicCycleEntry {
+  cycle_id?: string;
+  started_at?: string;
+  phase1_completed_at?: string | null;
+  phase2_completed_at?: string | null;
+  outcome?: string;
+  failed_phase?: string;
+  error?: string;
+  directions_created?: number;
+  directions_retired?: number;
+}
+
+interface StrategicDebug {
+  phase: number;
+  blocking_guards: StrategicBlockingGuard[];
+  has_purpose: boolean;
+  research_spawn_count: number;
+  strategic_cycle_count: number;
+  strategic_frequency: number;
+  architecture_review_frequency: number;
+  next_strategic_in: number | null;
+  next_is_architecture: boolean;
+  strategic_failures: number;
+  strategic_failures_at: string | null;
+  strategic_failures_decay_at: string | null;
+  architecture: {
+    revision: number;
+    last_updated: string | null;
+    updated_by_task: string | null;
+    system_count: number;
+    capability_count: number;
+    next_arch_in_cycles: number | null;
+  };
+  active_task: {
+    id: string;
+    phase: string;
+    status: string;
+    started_at: string | null;
+  } | null;
+  last_cycle: StrategicCycleEntry | null;
+  recent_cycles: StrategicCycleEntry[];
 }
 
 interface AutonomousStatusProps {
@@ -251,8 +301,8 @@ function LifecycleIndicator({ debug }: { debug: AutonomyDebug }) {
 
   return (
     <div className="mt-2">
-      <p className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider mb-1.5">
-        Loop lifecycle
+      <p className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider mb-1.5 flex items-center gap-1">
+        <Zap className="w-3 h-3" />Tactical (research)
       </p>
       <div className="flex items-center w-full">
         {LIFECYCLE_STEPS.map((step, i) => {
@@ -292,9 +342,193 @@ function LifecycleIndicator({ debug }: { debug: AutonomyDebug }) {
   );
 }
 
+function phaseLabelForStrategicTask(phase: string): string {
+  if (phase === 'design_doc_update') return 'Architecture review';
+  if (phase === 'strategic_review') return 'Strategic review';
+  return phase;
+}
+
+function strategicOutcomeBadge(outcome: string | undefined) {
+  if (outcome === 'success' || outcome === 'completed') {
+    return <span className="inline-flex items-center gap-1 text-emerald-400 text-[10px]"><CheckCircle2 className="w-3 h-3" />success</span>;
+  }
+  if (outcome === 'in_progress') {
+    return <span className="inline-flex items-center gap-1 text-cyan-400 text-[10px]"><Activity className="w-3 h-3" />in progress</span>;
+  }
+  if (outcome) {
+    return <span className="inline-flex items-center gap-1 text-red-400 text-[10px]"><XCircle className="w-3 h-3" />{outcome}</span>;
+  }
+  return null;
+}
+
+function StrategicGuardLabel(g: StrategicBlockingGuard): string {
+  if (g.guard === 'strategic_failures_high') {
+    const decaySecs = g.decay_at ? secondsUntil(g.decay_at) : null;
+    const decayStr = decaySecs && decaySecs > 0 ? ` — auto-recovers in ${formatSeconds(decaySecs)}` : '';
+    return `${g.failures ?? '?'} consecutive strategic failures${decayStr}`;
+  }
+  return g.reason;
+}
+
+function StrategicLifecycleIndicator({ debug }: { debug: StrategicDebug }) {
+  const activeStep = debug.phase;
+  const subLabel = (() => {
+    if (activeStep === 2 && debug.active_task) return phaseLabelForStrategicTask(debug.active_task.phase);
+    if ((activeStep === 0 || activeStep === 1) && debug.next_strategic_in != null) {
+      const spawns = debug.next_strategic_in;
+      const kind = debug.next_is_architecture ? 'arch' : 'strategic';
+      return spawns === 0 ? `${kind} now` : `${kind} in ${spawns}`;
+    }
+    return null;
+  })();
+  return (
+    <div className="mt-2">
+      <p className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider mb-1.5 flex items-center gap-1">
+        <Compass className="w-3 h-3" />Strategic (directions)
+      </p>
+      <div className="flex items-center w-full">
+        {LIFECYCLE_STEPS.map((step, i) => {
+          const isActive = i === activeStep;
+          const isPast = i < activeStep;
+          return (
+            <div key={step} className="flex items-center flex-1 min-w-0">
+              <div className="flex flex-col items-center shrink-0">
+                <div className={`w-2 h-2 rounded-full border transition-colors ${
+                  isActive ? 'bg-cyan-400 border-cyan-400 ring-2 ring-cyan-400/30'
+                  : isPast ? 'bg-neutral-600 border-neutral-600' : 'bg-transparent border-neutral-600'
+                }`} />
+                <span className={`text-[9px] mt-0.5 leading-tight text-center whitespace-nowrap ${
+                  isActive ? 'text-cyan-400 font-semibold' : 'text-neutral-600'
+                }`}>
+                  {step}
+                  {isActive && subLabel && <span className="block text-neutral-600 font-normal">{subLabel}</span>}
+                </span>
+              </div>
+              {i < LIFECYCLE_STEPS.length - 1 && (
+                <div className={`flex-1 h-px mx-0.5 ${i < activeStep ? 'bg-neutral-600' : 'bg-neutral-800'}`} />
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function formatTimeAgoShort(iso: string | null): string {
+  if (!iso) return 'never';
+  const diff = Date.now() - parseTimestamp(iso).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
+}
+
+function StrategicSection({ strategic }: { strategic: StrategicDebug }) {
+  return (
+    <div className="mt-3 pt-3 border-t border-neutral-800 space-y-1.5">
+      {/* Active task or next countdown */}
+      {strategic.active_task ? (
+        <div className="flex items-center justify-between text-[11px]">
+          <span className="text-neutral-500 flex items-center gap-1">
+            <Activity className="w-3 h-3 shrink-0" />{phaseLabelForStrategicTask(strategic.active_task.phase)}
+          </span>
+          <span className="text-cyan-400 font-mono text-[10px]">{strategic.active_task.status}</span>
+        </div>
+      ) : strategic.next_strategic_in != null && (
+        <div className="flex items-center justify-between text-[11px] text-neutral-500">
+          <span>Next strategic cycle</span>
+          <span className="font-mono">
+            {strategic.next_strategic_in === 0 ? 'ready now' : `${strategic.next_strategic_in} spawn${strategic.next_strategic_in === 1 ? '' : 's'}`}
+            {strategic.next_is_architecture && <span className="text-amber-400 ml-1">(arch)</span>}
+          </span>
+        </div>
+      )}
+
+      {/* Cycle counts */}
+      <div className="flex items-center justify-between text-[11px] text-neutral-500">
+        <span>Spawns · cycles</span>
+        <span className="font-mono">{strategic.research_spawn_count} · {strategic.strategic_cycle_count}</span>
+      </div>
+
+      {/* Last cycle */}
+      {strategic.last_cycle && (
+        <div className="flex items-center justify-between text-[11px] text-neutral-500">
+          <span>Last cycle</span>
+          <span className="flex items-center gap-1.5 font-mono text-[10px]">
+            {strategicOutcomeBadge(strategic.last_cycle.outcome)}
+            {strategic.last_cycle.phase2_completed_at && (
+              <span className="text-neutral-600">{formatTimeAgoShort(strategic.last_cycle.phase2_completed_at)}</span>
+            )}
+          </span>
+        </div>
+      )}
+
+      {!strategic.has_purpose && (
+        <div className="rounded-md bg-amber-500/5 border border-amber-500/20 px-2 py-1 flex items-start gap-1.5">
+          <AlertTriangle className="w-3 h-3 shrink-0 text-amber-400 mt-0.5" />
+          <span className="text-[11px] leading-tight text-amber-300">
+            Vision has no purpose — strategic cycles will bootstrap once, then stall on failure.
+          </span>
+        </div>
+      )}
+
+      {strategic.blocking_guards.length > 0 && (
+        <div className="rounded-md bg-red-500/5 border border-red-500/20 px-2.5 py-2">
+          <p className="text-[10px] font-semibold text-red-400 uppercase tracking-wider mb-1.5">Why strategic is blocked</p>
+          <ul className="space-y-1">
+            {strategic.blocking_guards.map((g, i) => (
+              <li key={i} className="flex items-start gap-1.5">
+                <AlertTriangle className="w-3 h-3 shrink-0 text-red-400 mt-px" />
+                <span className="text-[11px] leading-tight text-red-300">{StrategicGuardLabel(g)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <StrategicLifecycleIndicator debug={strategic} />
+    </div>
+  );
+}
+
+function ArchitectureSection({ strategic }: { strategic: StrategicDebug }) {
+  const arch = strategic.architecture;
+  const cyclesUntilArch = arch.next_arch_in_cycles;
+  return (
+    <div className="mt-3 pt-3 border-t border-neutral-800 space-y-1.5">
+      <p className="text-[10px] font-semibold text-neutral-500 uppercase tracking-wider flex items-center gap-1">
+        <FileText className="w-3 h-3" />Architecture (design doc)
+      </p>
+      <div className="flex items-center justify-between text-[11px] text-neutral-500">
+        <span>Last update</span>
+        <span className="font-mono text-[10px]">
+          {formatTimeAgoShort(arch.last_updated)}
+          {arch.revision > 0 && <span className="text-neutral-600 ml-1">rev {arch.revision}</span>}
+        </span>
+      </div>
+      <div className="flex items-center justify-between text-[11px] text-neutral-500">
+        <span>Systems · capabilities</span>
+        <span className="font-mono text-[10px]">{arch.system_count} · {arch.capability_count}</span>
+      </div>
+      <div className="flex items-center justify-between text-[11px] text-neutral-500">
+        <span>Next review</span>
+        <span className="font-mono text-[10px]">
+          {cyclesUntilArch == null ? 'disabled'
+            : cyclesUntilArch === 0 ? 'next strategic cycle'
+            : `${cyclesUntilArch} cycle${cyclesUntilArch === 1 ? '' : 's'} away`}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: AutonomousStatusProps) {
   const [projects, setProjects] = useState<ProjectAutonomousStatus[]>([]);
   const [debugData, setDebugData] = useState<Record<string, AutonomyDebug>>({});
+  const [strategicData, setStrategicData] = useState<Record<string, StrategicDebug>>({});
   const [expanded, setExpanded] = useState(false);
   const [toggling, setToggling] = useState<string | null>(null);
   const [resettingBreaker, setResettingBreaker] = useState<string | null>(null);
@@ -312,23 +546,30 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
       const fetched: ProjectAutonomousStatus[] = data.projects || [];
       setProjects(fetched);
 
-      // Fetch debug data for each project in parallel
+      // Fetch both autonomy-debug and strategic-debug for each project in parallel.
+      // Results are interleaved then split back into two maps by project_id.
       const settled = await Promise.allSettled(
-        fetched.map(p =>
+        fetched.flatMap(p => [
           apiFetch(`/api/admin/projects/${p.project_id}/autonomy-debug`)
             .then(r => (r.ok ? r.json() : null))
-            .then((d): [string, AutonomyDebug] | null => (d ? [p.project_id, d as AutonomyDebug] : null))
-            .catch(() => null)
-        )
+            .then((d): ['autonomy', string, AutonomyDebug] | null => (d ? ['autonomy', p.project_id, d as AutonomyDebug] : null))
+            .catch(() => null),
+          apiFetch(`/api/admin/projects/${p.project_id}/strategic-debug`)
+            .then(r => (r.ok ? r.json() : null))
+            .then((d): ['strategic', string, StrategicDebug] | null => (d ? ['strategic', p.project_id, d as StrategicDebug] : null))
+            .catch(() => null),
+        ])
       );
-      const newDebug: Record<string, AutonomyDebug> = {};
+      const newAutonomy: Record<string, AutonomyDebug> = {};
+      const newStrategic: Record<string, StrategicDebug> = {};
       for (const result of settled) {
-        if (result.status === 'fulfilled' && result.value) {
-          const [id, d] = result.value;
-          newDebug[id] = d;
-        }
+        if (result.status !== 'fulfilled' || !result.value) continue;
+        const [kind, id, d] = result.value;
+        if (kind === 'autonomy') newAutonomy[id] = d as AutonomyDebug;
+        else newStrategic[id] = d as StrategicDebug;
       }
-      setDebugData(newDebug);
+      setDebugData(newAutonomy);
+      setStrategicData(newStrategic);
       setLastUpdated(new Date());
     } catch {
       // silent
@@ -458,7 +699,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
       {expanded && (
         <div className="absolute top-full mt-2 right-0 w-96 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-4 z-50 max-h-[70vh] overflow-y-auto custom-scrollbar">
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Autonomous Pipeline</h3>
+            <h3 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Autonomous Pipeline — Tactical · Strategic · Architecture</h3>
             <span className="flex items-center gap-1.5">
               {lastUpdated && (
                 <span className="text-[10px] text-neutral-600 font-mono">
@@ -484,6 +725,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
 
           {projects.map(p => {
             const debug = debugData[p.project_id];
+            const strategic = strategicData[p.project_id];
             return (
               <div key={p.project_id} className="mb-3 last:mb-0 bg-neutral-950 border border-neutral-800 rounded-lg p-3">
                 {/* Header */}
@@ -547,18 +789,21 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
                   </div>
                 </div>
 
-                {/* Debug sections — only when debug data available */}
+                {/* Tactical debug: spawn guards + research lifecycle */}
                 {debug && (
                   <>
-                    {/* Spawn guard diagnostics */}
                     {debug.spawn_blocked && (
                       <SpawnGuardDiagnostics guards={debug.blocking_guards} />
                     )}
-
-                    {/* Lifecycle step indicator */}
                     <LifecycleIndicator debug={debug} />
                   </>
                 )}
+
+                {/* Strategic cycle section */}
+                {strategic && <StrategicSection strategic={strategic} />}
+
+                {/* Architecture / design doc section */}
+                {strategic && <ArchitectureSection strategic={strategic} />}
               </div>
             );
           })}
