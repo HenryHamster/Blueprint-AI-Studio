@@ -655,6 +655,39 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('Effort: high');
   });
 
+  it('renders scope calibration note when scope_calibrated_from is present and differs', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: { scope: 'small', scope_calibrated_from: 'medium' },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Task Scope');
+    expect(result).toContain('Scope: small');
+    expect(result).toContain('originally scoped as medium but calibrated down to small');
+    expect(result).toContain('medium-scope tasks have struggled');
+  });
+
+  it('omits scope calibration note when scope_calibrated_from matches current scope', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: { scope: 'small', scope_calibrated_from: 'small' },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Task Scope');
+    expect(result).not.toContain('originally scoped as');
+    expect(result).not.toContain('calibrated down');
+  });
+
+  it('omits scope calibration note when scope_calibrated_from is absent', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: { scope: 'small' },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Task Scope');
+    expect(result).not.toContain('originally scoped as');
+  });
+
   it('does not render ## Task Scope for review task type', () => {
     const task = {
       payloads: [{ type: 'review' }],

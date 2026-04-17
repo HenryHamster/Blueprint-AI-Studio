@@ -3609,3 +3609,61 @@ async def test_respawn_after_cooldown_marks_recurring_failure(db_session, mocker
     assert len(children) == 1
     ctx = children[0].context or {}
     assert ctx.get("_previous_is_recurring") is True
+
+
+@pytest.mark.asyncio
+async def test_respawn_after_cooldown_injects_failure_class_prompt_suffix(db_session, mocker):
+    """Re-spawned findings receive failure-class-specific retry guidance in prompt_suffix,
+    matching task_lifecycle._requeue_parent_task's behavior for directly requeued tasks."""
+    direction = _active_direction("d-promptsfx", "Prompt-suffix retry guidance direction")
+    project = Project(
+        name="Respawn Prompt Suffix Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    title = "Tighten JSON parsing in ingest worker"
+    desc = "Ingest worker crashes on malformed event envelopes"
+    fhash = hashlib.sha256((title + desc).encode()).hexdigest()[:16]
+
+    prior_failed = Task(
+        project_id=project.id,
+        title=title,
+        payloads=[{"type": "create", "prompt": "tighten parsing", "base_branch": "main"}],
+        context={"finding_hash": fhash},
+        status=TaskStatus.FAILED,
+        latest_status_message="pytest failures: AssertionError in test_ingest.py::test_parse",
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        created_at=datetime.utcnow() - timedelta(hours=72),
+    )
+    db_session.add(prior_failed)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": title, "description": desc, "prompt": "Tighten parsing",
+            "priority": "medium", "scope": "small", "risk": "low",
+            "type": "improvement", "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    children = result.scalars().all()
+    assert len(children) == 1
+    suffix = children[0].payloads[0].get("prompt_suffix", "") or ""
+    assert "RETRY GUIDANCE" in suffix
+    assert "failing tests" in suffix.lower()

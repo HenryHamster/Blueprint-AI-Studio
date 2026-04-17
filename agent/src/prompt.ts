@@ -584,10 +584,16 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     };
     const scopeDesc = scopeDescriptions[taskScope] ?? '';
     const effort = payload ? strVal(payload.effort) : '';
+    const calibratedFrom = taskContext ? strVal(taskContext.scope_calibrated_from) : '';
     const scopeLines: string[] = ['## Task Scope'];
     const scopeLine = scopeDesc ? `Scope: ${taskScope} — ${scopeDesc}` : `Scope: ${taskScope}`;
     scopeLines.push(scopeLine);
     if (effort) scopeLines.push(`Effort: ${effort}`);
+    if (calibratedFrom && calibratedFrom !== taskScope) {
+      scopeLines.push(
+        `Note: This task was originally scoped as ${calibratedFrom} but calibrated down to ${taskScope} because ${calibratedFrom}-scope tasks have struggled for this direction. Stay tightly focused — the scope reduction is intentional to avoid the scope creep that caused prior ${calibratedFrom}-scope failures.`,
+      );
+    }
     scopeLines.push('');
     prefix += scopeLines.join('\n') + '\n';
   }

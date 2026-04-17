@@ -1025,6 +1025,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # inject its failure context using the _previous_* naming convention so the agent's
         # buildRetryContext renders prior-attempt guidance.
         prior_retry_ctx: dict = {}
+        _retry_prompt_suffix = ""
         _prior = prior_failure_by_hash.get(fhash)
         if _prior is not None:
             _prior_ctx = _prior.context or {}
@@ -1071,13 +1072,33 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 prior_retry_ctx["_previous_self_review_outcome"] = _prior_ctx["_self_review_outcome"]
             if _prior_ctx.get("_file_change_details"):
                 prior_retry_ctx["_previous_file_change_details"] = _prior_ctx["_file_change_details"]
+            # Generate failure-class-specific retry guidance, mirroring
+            # task_lifecycle._requeue_parent_task so re-spawned findings get the
+            # same tailored prompt_suffix as directly requeued retries.
+            try:
+                from app.task_lifecycle import _build_retry_prompt_suffix  # noqa: PLC0415
+                _retry_prompt_suffix, _scope_override = _build_retry_prompt_suffix(
+                    failure_class_val,
+                    _prior.latest_status_message,
+                    prior_retry_ctx["_attempt_number"],
+                    scope,
+                    prior_retry_ctx,
+                )
+                if _scope_override:
+                    scope = _scope_override
+                    prior_retry_ctx["_scope_reduced"] = True
+            except Exception:
+                logger.exception("[RESEARCH_COMPLETION] Failed to build retry prompt_suffix for finding %s", fhash)
+        _combined_suffix = _retry_prompt_suffix
+        if type_suffix:
+            _combined_suffix = (_combined_suffix + ("\n" if _combined_suffix else "") + type_suffix)
         finding_payload = validate_internal_payload({
             "type": task_type,
             "prompt": full_prompt,
             "base_branch": research_branch,
             **(({'model': finding_model} if finding_model else {})),
             **(({'effort': finding_effort} if finding_effort else {})),
-            **({"prompt_suffix": type_suffix} if type_suffix else {}),
+            **({"prompt_suffix": _combined_suffix} if _combined_suffix else {}),
         }, f"research_completion:finding:{task_type}")
         new_task = Task(
             project_id=task.project_id,

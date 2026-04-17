@@ -69,6 +69,79 @@ def _derive_failure_stage(failure_class: str, status_message: str) -> "str | Non
     return None
 
 
+def _build_retry_prompt_suffix(
+    failure_class: "str | None",
+    original_status_message: "str | None",
+    attempt: int,
+    task_scope: str,
+    ctx: dict,
+) -> "tuple[str, str | None]":
+    """Build failure-class-specific retry guidance for the agent prompt_suffix.
+
+    Returns (extra_guidance, scope_override). scope_override is set to a reduced
+    scope string when repeated AGENT_TIMEOUT on a large-scope task should trigger
+    a downgrade; otherwise None. Reads ``_previous_failing_tests`` and
+    ``_previous_error_files`` from ctx for CODE_ERROR hints.
+    """
+    extra_guidance = ""
+    scope_override: "str | None" = None
+
+    if failure_class == "AGENT_TIMEOUT":
+        extra_guidance = (
+            "IMPORTANT: The previous attempt TIMED OUT. You MUST reduce scope:\n"
+            "- Focus on the single most critical change only\n"
+            "- Skip non-essential improvements, refactors, or cleanup\n"
+            "- Commit working changes early and often\n"
+            "- If the task requires changes across many files, pick the 2-3 most important\n"
+        )
+        if attempt >= 2 and task_scope == "large":
+            scope_override = "medium"
+
+    elif failure_class == "CODE_ERROR":
+        error_text = (original_status_message or "").lower()
+        hints = []
+        if any(kw in error_text for kw in ["test", "assert", "pytest", "jest", "vitest"]):
+            hints.append("Fix the specific failing tests shown in the error log before making other changes.")
+        if any(kw in error_text for kw in ["lint", "ruff", "eslint", "tsc"]):
+            hints.append("Fix lint/type errors first — run the linter before committing.")
+        if hints:
+            extra_guidance = "RETRY GUIDANCE: " + " ".join(hints) + "\n"
+        failing_tests = ctx.get("_previous_failing_tests", [])
+        error_files = ctx.get("_previous_error_files", [])
+        if failing_tests:
+            extra_guidance += "Failing tests:\n" + "".join(f"  {t}\n" for t in failing_tests)
+        if error_files:
+            extra_guidance += "Error file locations:\n" + "".join(f"  {f}\n" for f in error_files)
+
+    elif failure_class == "EXTERNAL_API":
+        error_text = (original_status_message or "")
+        lower = error_text.lower()
+        if "github" in lower:
+            service = "GitHub API"
+        elif "anthropic" in lower or "claude" in lower:
+            service = "Claude API"
+        else:
+            service = "external API"
+        code_match = re.search(r"\b([45]\d{2})\b", error_text)
+        code_hint = f" (status {code_match.group(1)})" if code_match else ""
+        extra_guidance = (
+            f"RETRY GUIDANCE: The previous attempt failed due to an {service} error{code_hint}.\n"
+            "- Check the service's status page before making calls\n"
+            "- Implement exponential backoff with jitter on retries\n"
+            "- Handle transient 5xx and network errors gracefully\n"
+        )
+
+    elif failure_class == "RATE_LIMIT":
+        extra_guidance = (
+            "RETRY GUIDANCE: The previous attempt hit a rate limit.\n"
+            "- Respect Retry-After headers when present\n"
+            "- Use exponential backoff with jitter between retries\n"
+            "- Batch or reduce request volume where possible\n"
+        )
+
+    return extra_guidance, scope_override
+
+
 
 async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     """Return True if any QUEUED/PROVISIONING/IN_PROGRESS task is a design_doc_update or strategic_review.
@@ -289,64 +362,12 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
 
         if new_payloads and isinstance(new_payloads[0], dict):
             existing_suffix = new_payloads[0].get("prompt_suffix", "") or ""
-            extra_guidance = ""
-
-            if failure_class == "AGENT_TIMEOUT":
-                scope_guidance = (
-                    "IMPORTANT: The previous attempt TIMED OUT. You MUST reduce scope:\n"
-                    "- Focus on the single most critical change only\n"
-                    "- Skip non-essential improvements, refactors, or cleanup\n"
-                    "- Commit working changes early and often\n"
-                    "- If the task requires changes across many files, pick the 2-3 most important\n"
-                )
-                extra_guidance = scope_guidance
-                # Downgrade scope on second+ AGENT_TIMEOUT for large-scope tasks
-                if attempt >= 2 and task_scope == "large":
-                    clone_ctx["scope"] = "medium"
-                    clone_ctx["_scope_reduced"] = True
-
-            elif failure_class == "CODE_ERROR":
-                error_text = (original_status_message or "").lower()
-                hints = []
-                if any(kw in error_text for kw in ["test", "assert", "pytest", "jest", "vitest"]):
-                    hints.append("Fix the specific failing tests shown in the error log before making other changes.")
-                if any(kw in error_text for kw in ["lint", "ruff", "eslint", "tsc"]):
-                    hints.append("Fix lint/type errors first — run the linter before committing.")
-                if hints:
-                    extra_guidance = "RETRY GUIDANCE: " + " ".join(hints) + "\n"
-                failing_tests = clone_ctx.get("_previous_failing_tests", [])
-                error_files = clone_ctx.get("_previous_error_files", [])
-                if failing_tests:
-                    extra_guidance += "Failing tests:\n" + "".join(f"  {t}\n" for t in failing_tests)
-                if error_files:
-                    extra_guidance += "Error file locations:\n" + "".join(f"  {f}\n" for f in error_files)
-
-            elif failure_class == "EXTERNAL_API":
-                error_text = (original_status_message or "")
-                lower = error_text.lower()
-                if "github" in lower:
-                    service = "GitHub API"
-                elif "anthropic" in lower or "claude" in lower:
-                    service = "Claude API"
-                else:
-                    service = "external API"
-                code_match = re.search(r"\b([45]\d{2})\b", error_text)
-                code_hint = f" (status {code_match.group(1)})" if code_match else ""
-                extra_guidance = (
-                    f"RETRY GUIDANCE: The previous attempt failed due to an {service} error{code_hint}.\n"
-                    "- Check the service's status page before making calls\n"
-                    "- Implement exponential backoff with jitter on retries\n"
-                    "- Handle transient 5xx and network errors gracefully\n"
-                )
-
-            elif failure_class == "RATE_LIMIT":
-                extra_guidance = (
-                    "RETRY GUIDANCE: The previous attempt hit a rate limit.\n"
-                    "- Respect Retry-After headers when present\n"
-                    "- Use exponential backoff with jitter between retries\n"
-                    "- Batch or reduce request volume where possible\n"
-                )
-
+            extra_guidance, scope_override = _build_retry_prompt_suffix(
+                failure_class, original_status_message, attempt, task_scope, clone_ctx,
+            )
+            if scope_override:
+                clone_ctx["scope"] = scope_override
+                clone_ctx["_scope_reduced"] = True
             if extra_guidance:
                 new_payloads[0]["prompt_suffix"] = extra_guidance + ("\n" + existing_suffix if existing_suffix else "")
 
