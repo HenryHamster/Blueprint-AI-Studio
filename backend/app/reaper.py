@@ -952,9 +952,10 @@ async def reaper_service():
                             if _sample >= 3 and _rate >= 0.7:
                                 _likely_cause = f"type failure gate active ({_qt_type}: {_rate:.0%} failure rate)"
                             elif _shared_state.tasks_active_gauge >= _runtime_config.get("max_concurrent_vms", 8):
-                                _likely_cause = "no available VM slots (concurrency limit reached)"
+                                _likely_cause = "all accounts healthy but VM slot limit reached"
                             else:
-                                _likely_cause = "no eligible accounts or slot contention"
+                                from app.max_plan_pool import describe_pool_blockage, _extract_task_model  # noqa: PLC0415
+                                _likely_cause = describe_pool_blockage(_extract_task_model(_qt))
 
                         _alert = Alert(
                             project_id=_qt.project_id,

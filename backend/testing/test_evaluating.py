@@ -882,3 +882,137 @@ async def test_backstop_spawns_recovery_review_once(eval_db, mocker):
     assert rl.get("review_recovery_at")
     # ci_wait_started must be newer than the original stale timestamp
     assert rl.get("ci_wait_started") != ci_wait_started.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_backstop_early_recovery_when_review_child_terminal(eval_db, mocker):
+    """Early trigger: CI has passed, review_approved is missing, and the review
+    child task is already FAILED — recovery must fire immediately without
+    waiting for the 30-minute backstop window to elapse."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    mock_spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
+    fake_review = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "review", "pr_number": 55555}],
+        status=TaskStatus.QUEUED,
+    )
+    mock_spawn.return_value = (fake_review, True)
+
+    project = Project(name="Backstop Early Recovery", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "early recovery"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # CI wait began only 8 minutes ago — well under the 30-min backstop.
+    ci_wait_started = _naive_utc_ago(minutes=8)
+    parent.context = {
+        "review_loop": {
+            "ci_waiting": True,
+            "ci_wait_started": ci_wait_started.isoformat(),
+            "ci_passed": True,
+            "review_approved": False,
+            "pr_number": 55555,
+            "branch": "blueprint/task-early",
+            "base_branch": "main",
+            "original_task_id": str(parent.id),
+        }
+    }
+    eval_db.add(parent)
+    await eval_db.commit()
+
+    # Review child task: FAILED without posting a verdict.
+    dead_review = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "review",
+            "pr_number": 55555,
+            "original_task_id": str(parent.id),
+        }],
+        status=TaskStatus.FAILED,
+    )
+    eval_db.add(dead_review)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"Early recovery must not kill the parent, got "
+        f"{parent.status}: {parent.latest_status_message!r}"
+    )
+    mock_spawn.assert_called_once()
+    rl = (parent.context or {}).get("review_loop", {})
+    assert rl.get("review_recovery_attempted") is True
+    assert rl.get("review_recovery_at")
+
+
+@pytest.mark.asyncio
+async def test_backstop_no_early_recovery_when_review_child_in_progress(eval_db, mocker):
+    """Guard: if the review child is still running (not terminal), the early
+    trigger must NOT fire — the elapsed guard should still cause a skip."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
+
+    project = Project(name="Backstop Early Recovery Negative", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "no early recovery"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    ci_wait_started = _naive_utc_ago(minutes=8)
+    parent.context = {
+        "review_loop": {
+            "ci_waiting": True,
+            "ci_wait_started": ci_wait_started.isoformat(),
+            "ci_passed": True,
+            "review_approved": False,
+            "pr_number": 66666,
+            "branch": "blueprint/task-live",
+            "base_branch": "main",
+            "original_task_id": str(parent.id),
+        }
+    }
+    eval_db.add(parent)
+    await eval_db.commit()
+
+    live_review = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "review",
+            "pr_number": 66666,
+            "original_task_id": str(parent.id),
+        }],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    eval_db.add(live_review)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    mock_spawn.assert_not_called()
+    rl = (parent.context or {}).get("review_loop", {})
+    assert rl.get("review_recovery_attempted") is not True

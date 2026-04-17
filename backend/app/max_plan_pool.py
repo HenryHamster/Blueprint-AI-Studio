@@ -271,6 +271,68 @@ def _account_available_for_model(acct: dict, model: str | None) -> bool:
     return _account_state_for_model(acct, model) != "unavailable"
 
 
+def summarize_pool_state(model: str | None, user_id: str | None = None) -> Dict[str, Any]:
+    """Summarize account pool state for diagnostics. Returns counts per state
+    plus the earliest cooldown recovery time across rate-limited accounts.
+
+    If user_id is provided, only that user's accounts are considered; otherwise
+    the entire pool is summarized.
+    """
+    accts = _max_plan_pools.get(user_id, []) if user_id else _all_accounts()
+    now = _utcnow()
+    healthy = probing = rate_limited = 0
+    other_unavailable = 0
+    earliest_recovery: datetime | None = None
+    norm_model = _normalize_rl_model(model) if model else None
+    for a in accts:
+        state = _account_state_for_model(a, model, now=now)
+        if state == "healthy":
+            healthy += 1
+            continue
+        if state == "probing":
+            probing += 1
+            continue
+        # unavailable — distinguish active rate-limit cooldown from other causes
+        dm = a.get("disabled_models") or {}
+        info = dm.get(norm_model) if norm_model else None
+        # If model is None and account has any disabled model, treat as rate-limited
+        if info is None and norm_model is None and dm:
+            info = next(iter(dm.values()))
+        if info and info.get("at") is not None:
+            hits = info.get("hits", 1)
+            cooldown_seconds = min(30 * (2 ** (hits - 1)), 240) * 60
+            recovery = info["at"] + timedelta(seconds=cooldown_seconds)
+            if recovery > now:
+                rate_limited += 1
+                if earliest_recovery is None or recovery < earliest_recovery:
+                    earliest_recovery = recovery
+                continue
+        other_unavailable += 1
+    return {
+        "total": len(accts),
+        "healthy": healthy,
+        "probing": probing,
+        "rate_limited": rate_limited,
+        "other_unavailable": other_unavailable,
+        "earliest_recovery": earliest_recovery,
+    }
+
+
+def describe_pool_blockage(model: str | None, user_id: str | None = None) -> str:
+    """Human-readable description of why no account can pick up a task.
+    Used by reaper queued-age alerts to distinguish rate-limit cooldown from
+    slot contention or missing configuration."""
+    s = summarize_pool_state(model, user_id=user_id)
+    if s["total"] == 0:
+        return "no accounts configured"
+    if s["healthy"] == 0 and s["probing"] == 0 and s["rate_limited"] > 0:
+        rec = s["earliest_recovery"]
+        return f"all accounts in rate-limit cooldown (earliest recovery: {rec.isoformat() if rec else 'unknown'})"
+    if s["rate_limited"] > 0:
+        return f"{s['rate_limited']} of {s['total']} accounts rate-limited, remaining accounts at capacity"
+    return "no eligible accounts or slot contention"
+
+
 def _extract_task_model(task: Any) -> str | None:
     """Extract which model a task uses from its payload."""
     payloads = task.payloads or []

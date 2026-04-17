@@ -767,6 +767,13 @@ async def orchestrator_worker():
                 ).order_by(Task.priority.desc().nullslast(), Task.created_at.asc()).limit(max(slots_available * 2, 50))  # Fetch extra; NULL priority = lowest
                 candidate_tasks = (await session.execute(candidate_stmt)).scalars().all()
 
+                # Once-per-cycle snapshot of pool availability. Rate-limit-origin
+                # retry_after holds (set without _infra_wait) can be released
+                # early when any account recovers faster than predicted.
+                _cycle_any_account_available = any(
+                    _account_available_for_model(a, None) for a in _account_by_id.values()
+                )
+
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
                 eligible_ids = []
                 for task in candidate_tasks:
@@ -776,8 +783,17 @@ async def orchestrator_worker():
                         try:
                             retry_after_dt = datetime.fromisoformat(retry_after_str)
                             if retry_after_dt > _utcnow():
-                                logger.info(f"[ORCHESTRATOR] Task {task.id} held back — retry_after={retry_after_str}")
-                                continue
+                                # Release rate-limit holds early when the pool has recovered.
+                                # _infra_wait holds wait for zone recovery, not accounts.
+                                if not (task.context or {}).get("_infra_wait") and _cycle_any_account_available:
+                                    ctx = dict(task.context or {})
+                                    ctx.pop("retry_after", None)
+                                    task.context = ctx
+                                    session.add(task)
+                                    logger.info(f"[ORCHESTRATOR] Task {task.id} retry_after cleared early — account pool recovered")
+                                else:
+                                    logger.info(f"[ORCHESTRATOR] Task {task.id} held back — retry_after={retry_after_str}")
+                                    continue
                         except (ValueError, TypeError):
                             pass  # Malformed retry_after — let it through
                     # Clear infra-wait flag when task becomes eligible again

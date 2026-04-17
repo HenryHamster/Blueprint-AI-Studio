@@ -702,7 +702,29 @@ async def _check_evaluating_timeouts():
                         evaluating_since = task.started_at or task.created_at
 
                     elapsed = (now - evaluating_since).total_seconds()
-                    if elapsed <= CI_BACKSTOP_SECONDS:
+                    # Early trigger: if CI has passed but review_approved is
+                    # missing AND the review child task is already terminal
+                    # (FAILED/CANCELLED), the review VM died silently — we
+                    # have enough signal to recover now without waiting for
+                    # the 30-min backstop. The elapsed guard remains as the
+                    # fallback for cases where review status hasn't become
+                    # terminal yet.
+                    rl_ci_passed = bool(rl.get("ci_passed"))
+                    rl_review_approved = (
+                        bool(rl.get("review_approved"))
+                        or rl.get("verdict") == "APPROVE"
+                    )
+                    rl_recovery_attempted = bool(rl.get("review_recovery_attempted"))
+                    early_recovery_eligible = False
+                    if (
+                        rl_ci_passed
+                        and not rl_review_approved
+                        and not rl_recovery_attempted
+                    ):
+                        _early_summary = await _summarize_latest_review_for_chain(task, session)
+                        if _early_summary and _early_summary["status"] in ("FAILED", "CANCELLED"):
+                            early_recovery_eligible = True
+                    if elapsed <= CI_BACKSTOP_SECONDS and not early_recovery_eligible:
                         # Under backstop threshold — let normal CI timeout handle it
                         continue
                     # Pipeline still actively working on the chain (review/fix

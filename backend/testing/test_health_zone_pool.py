@@ -1401,6 +1401,37 @@ class TestDisabledStatePersistenceAndRestoration:
         # Should be probing (cooldown elapsed) rather than unavailable
         assert _account_state_for_model(expired_entry, OPUS) == "probing"
 
+    def test_summarize_pool_state_distinguishes_rate_limited_from_other(self):
+        """summarize_pool_state should count healthy/probing/rate_limited buckets
+        and surface the earliest cooldown recovery time."""
+        from app.max_plan_pool import summarize_pool_state, _account_by_id, _max_plan_pools
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+        now = datetime.utcnow()
+        a_healthy = {"id": "h", "name": "h", "user_id": "u",
+                     "enabled": True, "active_tasks": 0, "oauth_token": "sk-ant-1"}
+        a_rl_short = {"id": "r1", "name": "r1", "user_id": "u",
+                      "enabled": True, "active_tasks": 0, "oauth_token": "sk-ant-2",
+                      "disabled_models": {OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}}}
+        a_rl_long = {"id": "r2", "name": "r2", "user_id": "u",
+                     "enabled": True, "active_tasks": 0, "oauth_token": "sk-ant-3",
+                     "disabled_models": {OPUS: {"hits": 2, "at": now - timedelta(minutes=1)}}}
+        a_no_token = {"id": "n", "name": "n", "user_id": "u",
+                      "enabled": True, "active_tasks": 0, "oauth_token": None}
+        for a in (a_healthy, a_rl_short, a_rl_long, a_no_token):
+            _account_by_id[a["id"]] = a
+            _max_plan_pools.setdefault("u", []).append(a)
+        summary = summarize_pool_state(OPUS)
+        assert summary["total"] == 4
+        assert summary["healthy"] == 1
+        assert summary["rate_limited"] == 2
+        assert summary["other_unavailable"] == 1
+        # Earliest recovery comes from a_rl_short (hits=1, 30min cooldown, started 5min ago → ~25min from now)
+        assert summary["earliest_recovery"] is not None
+        assert summary["earliest_recovery"] < now + timedelta(minutes=30)
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+
 
 # ─── disable_account_model (shared rate-limit mark path) ────────────────────
 
