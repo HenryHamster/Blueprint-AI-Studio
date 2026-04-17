@@ -1908,6 +1908,88 @@ describe('scope overflow gate', () => {
   });
 });
 
+// ── Scope trim prompt framing ─────────────────────────────────────────────────
+describe('scope trim prompt', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(parseAnalysisPlanFiles).mockReset();
+    vi.mocked(parseAnalysisPlanTestFiles).mockReset();
+    vi.mocked(parseAnalysisPlanTestFiles).mockReturnValue([]);
+    vi.mocked(lintFixLoop).mockResolvedValue(true);
+    vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: false, passed: true });
+  });
+
+  it('uses neutral language for unplanned files and omits bias phrasing', async () => {
+    // Plan targets 2 files; implementation touches 11 → trips medium overflow (threshold = 10).
+    vi.mocked(parseAnalysisPlanFiles).mockReturnValue(['planned1.ts', 'planned2.ts']);
+    const files11 = Array.from({ length: 11 }, (_, i) => `M src/file${i}.ts`).join('\n');
+    const trimJson = '```json\n' + JSON.stringify({
+      assessment: 'all essential',
+      essential_files: Array.from({ length: 11 }, (_, i) => `src/file${i}.ts`),
+      files_to_revert: [],
+      all_essential_justification: 'every file is necessary',
+    }) + '\n```';
+    vi.mocked(runClaudeCode)
+      .mockReset()
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- planned1.ts\n- planned2.ts' }) // analysis
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // implementation
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: trimJson, lastResultText: '' })  // scope trim
+      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(git)
+      .mockReset()
+      .mockReturnValueOnce('')           // baseCommit
+      .mockReturnValueOnce(files11)       // status --porcelain
+      .mockReturnValueOnce('')           // currentHead (same as baseCommit)
+      .mockReturnValue('');
+
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const trimPrompt = vi.mocked(runClaudeCode).mock.calls[2][0];
+    // Bias phrasing against unplanned files must be gone.
+    expect(trimPrompt).not.toContain('likely non-essential');
+    expect(trimPrompt).not.toContain('default to reverting');
+    // Plan section should still exist and now frame unplanned files neutrally.
+    expect(trimPrompt).toContain('Pre-Implementation Plan');
+    expect(trimPrompt).toContain('evaluate each file on its own merit');
+    expect(trimPrompt).toContain('Implementation often reveals necessary changes');
+  });
+
+  it('includes Implementation notes from commit messages when commits exist', async () => {
+    vi.mocked(parseAnalysisPlanFiles).mockReturnValue(['planned1.ts', 'planned2.ts']);
+    const files11 = Array.from({ length: 11 }, (_, i) => `M src/file${i}.ts`).join('\n');
+    const trimJson = '```json\n' + JSON.stringify({
+      assessment: 'all essential', essential_files: [], files_to_revert: [],
+      all_essential_justification: 'every file is necessary',
+    }) + '\n```';
+    vi.mocked(runClaudeCode)
+      .mockReset()
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- planned1.ts' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: trimJson, lastResultText: '' })
+      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    // Simulate commits by making currentHead differ from baseCommit, so the log call fires.
+    vi.mocked(git)
+      .mockReset()
+      .mockReturnValueOnce('base-sha')           // baseCommit
+      .mockReturnValueOnce(files11)               // status --porcelain
+      .mockReturnValueOnce('head-sha')           // currentHead (differs → commits exist)
+      .mockReturnValueOnce('1\t0\tsrc/file0.ts') // numstat for fileChangeDetails
+      .mockReturnValueOnce('src/file0.ts')       // diff --name-only for committedPaths
+      .mockReturnValueOnce('1\t0\tsrc/file0.ts') // numstat for diffSummary
+      .mockReturnValueOnce('A\tsrc/file0.ts')   // name-status for diffSummary
+      .mockReturnValueOnce('feat: discovered dependency on helper.ts\nfixes wiring\n---') // git log for implementation notes
+      .mockReturnValue('');
+
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const trimPrompt = vi.mocked(runClaudeCode).mock.calls[2][0];
+    expect(trimPrompt).toContain('Implementation notes');
+    expect(trimPrompt).toContain('discovered dependency on helper.ts');
+  });
+});
+
 // ── Refactor blocking gates ───────────────────────────────────────────────────
 describe('handleRefactor blocking gates', () => {
   beforeEach(() => {

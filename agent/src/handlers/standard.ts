@@ -361,14 +361,24 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
       const plannedFilesForTrim = analysisContext ? parseAnalysisPlanFiles(analysisContext) : [];
       const planSection = plannedFilesForTrim.length > 0
-        ? `\n## Pre-Implementation Plan — Files to change\n${plannedFilesForTrim.map(f => `- ${f}`).join('\n')}\n\nYour pre-implementation plan targeted these specific files. Files not in this list are likely non-essential additions — default to reverting them unless they are test files directly required by the planned changes.\n`
+        ? `\n## Pre-Implementation Plan — Files to change\n${plannedFilesForTrim.map(f => `- ${f}`).join('\n')}\n\nYour pre-implementation plan targeted these files. Implementation often reveals necessary changes that were not anticipated during planning, so treat files outside the plan neutrally — evaluate each file on its own merit based on whether it is required for the task to work correctly.\n`
         : '';
+
+      let implementationNotes = '';
+      if (currentHead !== baseCommit) {
+        try {
+          const commitLog = git(['log', '--format=%s%n%b%n---', `${baseCommit}..HEAD`]).trim();
+          if (commitLog) {
+            implementationNotes = `\n## Implementation notes — recent commit messages\n${commitLog.slice(0, 2000)}\n`;
+          }
+        } catch { /* ignore log errors */ }
+      }
 
       const scopeTrimPrompt = `You are reviewing the scope of a completed implementation task to remove non-essential file changes before creating a PR.
 
 ## Original Task
 ${rawPrompt.slice(0, 3000)}
-${planSection}
+${planSection}${implementationNotes}
 ## Changed Files (${changedPaths.length} files, threshold: ${overflowThreshold})
 ${fileStatsLines}
 

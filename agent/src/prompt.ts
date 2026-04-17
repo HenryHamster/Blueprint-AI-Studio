@@ -1665,16 +1665,18 @@ export function discoverAffectedConsumers(ws: WebSocket | null, relatedFiles: st
       if (consumerFiles.length === 0) continue;
 
       // For each consumer, extract which symbols it imports from this module
-      const consumerDetails: Array<{ file: string; imports: string[] }> = [];
+      const consumerDetails: Array<{ file: string; imports: string[]; usageCounts: Map<string, number> }> = [];
       for (const consumerFile of consumerFiles) {
         const fullPath = `${WORKSPACE}/${consumerFile}`;
         if (!fs.existsSync(fullPath)) continue;
 
         try {
-          const lines = fs.readFileSync(fullPath, 'utf-8').split('\n').slice(0, 80);
+          const allLines = fs.readFileSync(fullPath, 'utf-8').split('\n');
+          const importLines = allLines.slice(0, 80);
+          const bodyLines = allLines.slice(80, 280);
           const imports: string[] = [];
 
-          for (const line of lines) {
+          for (const line of importLines) {
             if (isPython) {
               // from .module_name import X, Y  /  from app.module_name import X
               const m = line.match(new RegExp(`from\\s+\\S*${moduleName}\\s+import\\s+(.+)`));
@@ -1705,16 +1707,31 @@ export function discoverAffectedConsumers(ws: WebSocket | null, relatedFiles: st
             }
           }
 
-          consumerDetails.push({ file: consumerFile, imports: [...new Set(imports)].slice(0, 8) });
+          const uniqueImports = [...new Set(imports)].slice(0, 8);
+          const usageCounts = new Map<string, number>();
+          for (const sym of uniqueImports) {
+            // Symbols are validated as /^\w+$/, so they are safe to embed in a regex
+            const wordRe = new RegExp(`\\b${sym}\\b`, 'g');
+            let count = 0;
+            for (const line of bodyLines) {
+              const matches = line.match(wordRe);
+              if (matches) count += matches.length;
+            }
+            usageCounts.set(sym, count);
+          }
+
+          consumerDetails.push({ file: consumerFile, imports: uniqueImports, usageCounts });
         } catch {
-          consumerDetails.push({ file: consumerFile, imports: [] });
+          consumerDetails.push({ file: consumerFile, imports: [], usageCounts: new Map() });
         }
       }
 
       if (consumerDetails.length === 0) continue;
 
       const consumerLines = consumerDetails.map(c => {
-        const importStr = c.imports.length > 0 ? ` (imports: ${c.imports.join(', ')})` : '';
+        const importStr = c.imports.length > 0
+          ? ` (imports: ${c.imports.map(s => `${s} used ${c.usageCounts.get(s) ?? 0}x`).join(', ')})`
+          : '';
         return `  - ${c.file}${importStr}`;
       });
       entries.push(`**${relFile}** is imported by:\n${consumerLines.join('\n')}`);

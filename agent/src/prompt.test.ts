@@ -2433,6 +2433,30 @@ describe('discoverAffectedConsumers', () => {
     expect(result).toContain('extractModuleInterfaces');
   });
 
+  it('appends call-site usage counts to imported symbols', () => {
+    vi.mocked(execFileSync).mockReturnValue(
+      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    // Build a file: import line at line 0, then 79 padding lines so body starts at line 80
+    const importLine = 'import { foo, bar } from \'../prompt.js\';';
+    const padding = Array(79).fill('').join('\n');
+    const body = [
+      'function example() {',
+      '  foo();',
+      '  foo(arg);',
+      '  return foo();',
+      '  const x = bar;',
+      '}',
+    ].join('\n');
+    vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
+      `${importLine}\n${padding}\n${body}\n`
+    );
+    const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
+    expect(result).toContain('foo used 3x');
+    expect(result).toContain('bar used 1x');
+  });
+
   it('extracts Python imports from consumer files', () => {
     vi.mocked(execFileSync).mockReturnValue(
       'backend/app/orchestrator.py\n' as unknown as ReturnType<typeof execFileSync>

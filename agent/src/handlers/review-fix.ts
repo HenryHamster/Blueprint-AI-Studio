@@ -725,6 +725,16 @@ export async function handleFix(
         const shortId = taskId.replace(/-/g, '').slice(0, 8);
         execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: fix post-rebase lint errors\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
       }
+      // Re-validate that the fix actually resolved lint. Without this, a partial
+      // fix gets pushed and only surfaces as a CI failure — burning a full review
+      // cycle. Recompute paths in case Claude touched new files during the fix.
+      const revalidatePaths = git(['diff', '--name-only', `origin/${baseBranch}..HEAD`]).split('\n').filter(Boolean);
+      try {
+        runProjectLintChecks(revalidatePaths, ws, fixBuildConfig);
+      } catch (revalidateErr: unknown) {
+        const revalidateMsg = revalidateErr instanceof Error ? revalidateErr.message : String(revalidateErr);
+        sendLog(ws, `WARNING: post-rebase lint still failing after fix attempt — pushing anyway, CI will catch it:\n${revalidateMsg.slice(0, 2000)}\n`);
+      }
     }
   }
 

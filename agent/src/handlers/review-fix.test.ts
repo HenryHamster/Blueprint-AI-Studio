@@ -608,3 +608,61 @@ describe('handleFix — stale-premise detection', () => {
     expect(prompt).not.toContain('Stale-premise notice');
   });
 });
+
+// ── handleFix: post-rebase lint re-validation ───────────────────────────────
+describe('handleFix — post-rebase lint re-validation', () => {
+  // Mock `git` so `hasFixChanges` is true (non-empty status output) and the
+  // post-rebase changedPaths derivation produces a non-empty list. Both the
+  // status-porcelain-derived paths and the diff-derived re-validation paths
+  // resolve to a single TS file under agent/.
+  const setupGitForLintPath = () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (!args) return '';
+      if (args[0] === 'status' && args.includes('--porcelain')) return ' M agent/src/foo.ts';
+      if (args[0] === 'diff' && args.includes('--name-only')) return 'agent/src/foo.ts';
+      return '';
+    }) as unknown as typeof indexMod.git);
+  };
+
+  it('re-runs runProjectLintChecks after the fix attempt and warns when lint still fails', async () => {
+    setupGitForLintPath();
+    let lintCalls = 0;
+    vi.mocked(indexMod.runProjectLintChecks).mockImplementation((() => {
+      lintCalls += 1;
+      throw new Error('eslint: agent/src/foo.ts:1 no-unused-vars');
+    }) as unknown as typeof indexMod.runProjectLintChecks);
+
+    await handleFix(
+      'task-revalidate-fail',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 50, prompt: 'fix lint regression' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    // Initial post-rebase lint check + re-validation after Claude's fix attempt.
+    expect(lintCalls).toBe(2);
+    const sendLogMessages = vi.mocked(indexMod.sendLog).mock.calls.map(c => String(c[1]));
+    expect(sendLogMessages.some(m => /still failing/i.test(m))).toBe(true);
+  });
+
+  it('does not warn when re-validation passes after the fix attempt', async () => {
+    setupGitForLintPath();
+    let lintCalls = 0;
+    vi.mocked(indexMod.runProjectLintChecks).mockImplementation((() => {
+      lintCalls += 1;
+      if (lintCalls === 1) throw new Error('eslint: agent/src/foo.ts:1 no-unused-vars');
+      // Second call (re-validation) returns cleanly — fix worked.
+    }) as unknown as typeof indexMod.runProjectLintChecks);
+
+    await handleFix(
+      'task-revalidate-ok',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 51, prompt: 'fix lint regression' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(lintCalls).toBe(2);
+    const sendLogMessages = vi.mocked(indexMod.sendLog).mock.calls.map(c => String(c[1]));
+    expect(sendLogMessages.some(m => /still failing/i.test(m))).toBe(false);
+  });
+});
