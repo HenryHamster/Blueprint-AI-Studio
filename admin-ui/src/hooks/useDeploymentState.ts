@@ -32,6 +32,13 @@ interface DetailedHealth {
   circuit_breaker: { projects: Record<string, CircuitBreakerState> };
   max_plan_pool: { total: number; available: number };
   autonomous: { enabled: boolean; consecutive_failures: number };
+  github_quota: {
+    remaining: number | null;
+    limit: number | null;
+    reset_at: number | null;
+    last_updated: string | null;
+    status: 'ok' | 'degraded' | 'critical' | 'unknown';
+  };
 }
 
 export function useDeploymentState(
@@ -204,6 +211,9 @@ export function useDeploymentState(
           circuit_breaker: data.components?.circuit_breaker ?? { projects: {} },
           max_plan_pool: data.components?.max_plan_pool ?? { total: 0, available: 0 },
           autonomous: data.components?.autonomous ?? { enabled: false, consecutive_failures: 0 },
+          github_quota: data.components?.github_quota ?? {
+            remaining: null, limit: null, reset_at: null, last_updated: null, status: 'unknown',
+          },
         });
       } else {
         setDetailedHealth(null);

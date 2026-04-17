@@ -30,6 +30,13 @@ interface DetailedHealth {
   circuit_breaker: { projects: Record<string, CircuitBreakerState> };
   max_plan_pool: { total: number; available: number };
   autonomous: { enabled: boolean; consecutive_failures: number };
+  github_quota: {
+    remaining: number | null;
+    limit: number | null;
+    reset_at: number | null;
+    last_updated: string | null;
+    status: 'ok' | 'degraded' | 'critical' | 'unknown';
+  };
 }
 
 interface PipelineThrottle {
@@ -281,6 +288,42 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
               <span className="text-amber-400">{autonomousFailures} auto-fail</span>
             </div>
+          </>
+        )}
+
+        {/* GitHub quota — only show when degraded/critical or unknown-with-recent-fetch.
+            Hidden when healthy to avoid noise; visible the moment it matters. */}
+        {detailedHealth?.github_quota && detailedHealth.github_quota.status !== 'ok' && (
+          <>
+            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            {(() => {
+              const q = detailedHealth.github_quota;
+              const dotColor =
+                q.status === 'critical' ? 'bg-red-500 animate-pulse' :
+                q.status === 'degraded' ? 'bg-amber-400' :
+                'bg-neutral-600';
+              const textColor =
+                q.status === 'critical' ? 'text-red-400' :
+                q.status === 'degraded' ? 'text-amber-400' :
+                'text-neutral-500';
+              const resetIn = q.reset_at
+                ? Math.max(0, Math.round((q.reset_at * 1000 - now) / 60000))
+                : null;
+              const remainingDisplay = q.remaining == null ? '?' : q.remaining;
+              const limitDisplay = q.limit ?? 5000;
+              const title = q.remaining == null
+                ? 'GitHub quota: no recent observation'
+                : `GitHub API quota: ${remainingDisplay}/${limitDisplay} remaining${resetIn != null ? `, resets in ~${resetIn}min` : ''}`;
+              return (
+                <div className="flex items-center gap-1.5" title={title}>
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
+                  <span className={textColor}>
+                    GH: {remainingDisplay}{q.status === 'critical' ? ' ⚠' : ''}
+                    {resetIn != null && resetIn > 0 && ` (${resetIn}m)`}
+                  </span>
+                </div>
+              );
+            })()}
           </>
         )}
 
