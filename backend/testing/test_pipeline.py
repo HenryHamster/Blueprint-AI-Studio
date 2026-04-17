@@ -183,9 +183,12 @@ class TestFailureClassification:
         task = self._make_task("TypeError: cannot read property 'x' of undefined")
         assert classify_failure(task) == "CODE_ERROR"
 
-    def test_code_error_empty(self):
+    def test_empty_message_is_agent_timeout(self):
+        # Empty combined log means the agent crashed or never communicated —
+        # classified as AGENT_TIMEOUT (infra), not CODE_ERROR. See
+        # failure_classification.classify_failure.
         task = self._make_task("")
-        assert classify_failure(task) == "CODE_ERROR"
+        assert classify_failure(task) == "AGENT_TIMEOUT"
 
     def test_provision_failure_disk_exhaustion(self):
         task = self._make_task("no space left on device")

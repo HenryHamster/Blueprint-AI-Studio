@@ -1152,7 +1152,13 @@ def cmd_autonomy_debug(args):
     data = api("GET", f"/api/admin/projects/{pid}/autonomy-debug")
 
     print("=== AUTONOMY DEBUG ===")
-    print(f"  can_spawn: {data.get('can_spawn', '?')}")
+    blocked = data.get('spawn_blocked')
+    if blocked is True:
+        print("  can_spawn: NO (blocked)")
+    elif blocked is False:
+        print("  can_spawn: YES — no guards; next tick will try to spawn")
+    else:
+        print("  can_spawn: ?")
 
     guards = data.get('blocking_guards', [])
     if guards:
@@ -1163,7 +1169,7 @@ def cmd_autonomy_debug(args):
                 if k not in ('guard', 'reason'):
                     print(f"    {k}: {v}")
     else:
-        print("  No blocking guards.")
+        print("  No blocking guards — autonomy should spawn on next tick.")
 
     cb = data.get('circuit_breaker', {})
     if cb:
@@ -1172,15 +1178,23 @@ def cmd_autonomy_debug(args):
         if cb.get('cooldown_ends_at'):
             print(f"  cooldown_until={cb['cooldown_ends_at']}")
 
-    dirs = data.get('eligible_directions', [])
+    dirs = data.get('directions', [])
     if dirs:
-        print(f"\n--- Eligible Directions ({len(dirs)}) ---")
+        eligible = [d for d in dirs if d.get('is_eligible')]
+        print(f"\n--- Directions ({len(eligible)}/{len(dirs)} eligible) ---")
         for d in dirs:
-            did = (d.get('id') or '?')[:8]
-            summary = (d.get('summary') or d.get('title') or '?')[:80]
-            cooldown = d.get('on_cooldown', False)
-            status = " (on cooldown)" if cooldown else ""
-            print(f"  {did}  {summary}{status}")
+            did = (d.get('id') or '?')[:10]
+            text = (d.get('text') or '?')[:70]
+            markers = []
+            if d.get('seconds_until_eligible'):
+                secs = d['seconds_until_eligible']
+                markers.append(f"cooldown {secs // 60}m")
+            if d.get('busy_reason'):
+                markers.append("busy")
+            if d.get('is_eligible'):
+                markers.append("eligible")
+            tag = f" [{', '.join(markers)}]" if markers else ""
+            print(f"  {did}  {text}{tag}")
 
     spawn = data.get('spawn_readiness', {})
     if spawn:

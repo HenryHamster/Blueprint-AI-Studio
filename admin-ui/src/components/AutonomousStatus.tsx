@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, type RefObject } from 'react';
-import { Zap, ZapOff, AlertTriangle, RefreshCw, Lock, Clock, PlayCircle, Gauge } from 'lucide-react';
+import { Zap, ZapOff, AlertTriangle, RefreshCw, Lock, Clock, PlayCircle, Gauge, Pause, Server } from 'lucide-react';
 import { API_BASE_URL, authHeaders, apiFetch } from '../api';
 import { secondsUntil, parseTimestamp } from '../utils/time';
 
@@ -22,14 +22,24 @@ interface BlockingGuard {
   failure_count?: number;
   // no_eligible_directions
   time_until_eligible_seconds?: number | null;
+  busy_direction_count?: number;
+  total_active_directions?: number;
   // research_task_active
   task_id?: string;
+  active_research_count?: number;
+  max_parallel?: number;
   // rate_limit_exceeded
   tasks_this_hour?: number;
   max_per_hour?: number;
   // waiting_for_interval
   next_check_at?: string;
   seconds_until_check?: number;
+  // vm_slots_full
+  vm_consuming?: number;
+  max_concurrent_vms?: number;
+  // pipeline_paused
+  pause_reason?: string | null;
+  paused_at?: string | null;
 }
 
 interface CircuitBreakerInfo {
@@ -71,9 +81,9 @@ const LIFECYCLE_STEPS = ['Idle', 'Checking', 'Spawning', 'Executing', 'Cooldowns
 
 function getLifecyclePhase(debug: AutonomyDebug): number {
   const guards = debug.blocking_guards.map(g => g.guard);
-  if (guards.includes('research_task_active')) return 3; // Executing
+  if (guards.includes('vm_slots_full') || guards.includes('research_task_active')) return 3; // Executing
   if (guards.includes('no_eligible_directions') || guards.includes('rate_limit_exceeded')) return 4; // Cooldowns
-  if (guards.includes('circuit_breaker_open')) return 4; // Cooldowns
+  if (guards.includes('circuit_breaker_open') || guards.includes('pipeline_paused')) return 4; // Cooldowns
   if (guards.includes('waiting_for_interval')) return 0; // Idle — waiting for next check window
   if (!debug.spawn_blocked) return 1; // Ready to check/spawn
   return 0; // Idle (disabled or other block)
@@ -114,6 +124,12 @@ function GuardIcon({ guard }: { guard: string }) {
       return <Gauge className="w-3 h-3 shrink-0 text-orange-400" />;
     case 'waiting_for_interval':
       return <Clock className="w-3 h-3 shrink-0 text-neutral-400" />;
+    case 'vm_slots_full':
+      return <Server className="w-3 h-3 shrink-0 text-blue-400" />;
+    case 'pipeline_paused':
+      return <Pause className="w-3 h-3 shrink-0 text-amber-400" />;
+    case 'no_available_accounts':
+      return <AlertTriangle className="w-3 h-3 shrink-0 text-red-400" />;
     default:
       return <AlertTriangle className="w-3 h-3 shrink-0 text-neutral-400" />;
   }
@@ -127,6 +143,9 @@ function guardColor(guard: string): string {
     case 'research_task_active': return 'text-blue-400';
     case 'rate_limit_exceeded': return 'text-orange-400';
     case 'waiting_for_interval': return 'text-neutral-400';
+    case 'vm_slots_full': return 'text-blue-400';
+    case 'pipeline_paused': return 'text-amber-400';
+    case 'no_available_accounts': return 'text-red-400';
     default: return 'text-neutral-400';
   }
 }
@@ -140,11 +159,20 @@ function guardLabel(g: BlockingGuard): string {
       return `Circuit breaker OPEN — resets in ${mins}m (${g.failure_count ?? '?'} consecutive failures)`;
     }
     case 'no_eligible_directions': {
-      if (g.time_until_eligible_seconds == null) return 'No active directions exist';
-      return `All directions in cooldown — next eligible in ${formatSeconds(g.time_until_eligible_seconds)}`;
+      const busy = g.busy_direction_count ?? 0;
+      const total = g.total_active_directions ?? 0;
+      if (total === 0) return 'No active directions exist';
+      if (busy > 0 && busy === total) return `All ${total} directions held by running research`;
+      if (g.time_until_eligible_seconds != null) {
+        const waitStr = formatSeconds(g.time_until_eligible_seconds);
+        return busy > 0
+          ? `${busy}/${total} held by running research; others cool down in ${waitStr}`
+          : `All directions in cooldown — next eligible in ${waitStr}`;
+      }
+      return g.reason;
     }
     case 'research_task_active':
-      return 'Research task already running';
+      return `Parallel research cap reached (${g.active_research_count ?? '?'}/${g.max_parallel ?? '?'})`;
     case 'rate_limit_exceeded':
       return `Rate limit: ${g.tasks_this_hour ?? '?'}/${g.max_per_hour ?? '?'} tasks this hour`;
     case 'waiting_for_interval': {
@@ -152,6 +180,12 @@ function guardLabel(g: BlockingGuard): string {
       if (secs <= 0) return 'Research eligible, waiting for VM slot';
       return `Next research check in ${formatSeconds(secs)}`;
     }
+    case 'vm_slots_full':
+      return `VM slots full (${g.vm_consuming ?? '?'}/${g.max_concurrent_vms ?? '?'}) — waiting for a task to finish`;
+    case 'pipeline_paused':
+      return `Pipeline paused${g.pause_reason ? ` — ${g.pause_reason}` : ''}`;
+    case 'no_available_accounts':
+      return 'No Max Plan accounts available for research model';
     default:
       return g.reason;
   }

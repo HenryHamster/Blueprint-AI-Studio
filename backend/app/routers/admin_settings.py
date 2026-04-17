@@ -1217,57 +1217,16 @@ async def get_autonomy_debug(
         "cooldown_ends_at": cooldown_ends_at,
     }
 
-    # Guard 3: no_eligible_directions
-    cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
-    cooldown_seconds_dir = cooldown_minutes * 60
-    directions_info = []
-    for d in (project.directions or []):
-        if d.get("status") != "active":
-            continue
-        last_researched_at = d.get("last_researched_at")
-        if last_researched_at:
-            last_dt = datetime.fromisoformat(last_researched_at)
-            elapsed = (now - last_dt).total_seconds()
-            remaining = cooldown_seconds_dir - elapsed
-            is_eligible = remaining <= 0
-            seconds_until_eligible = max(0, int(remaining)) if not is_eligible else None
-        else:
-            is_eligible = True
-            seconds_until_eligible = None
-        directions_info.append({
-            "id": d.get("id"),
-            "text": d.get("text", ""),
-            "status": d.get("status", "active"),
-            "last_researched_at": last_researched_at,
-            "cooldown_minutes": cooldown_minutes,
-            "is_eligible": is_eligible,
-            "seconds_until_eligible": seconds_until_eligible,
-        })
-
-    eligible_directions = [d for d in directions_info if d["is_eligible"]]
-    if not eligible_directions:
-        # Either no active directions at all, or all are in cooldown
-        min_wait = min(
-            (d["seconds_until_eligible"] for d in directions_info if d["seconds_until_eligible"] is not None),
-            default=None,
-        )
-        reason = (
-            "No active directions exist"
-            if not directions_info
-            else "All active directions are still in cooldown"
-        )
-        blocking_guards.append({
-            "guard": "no_eligible_directions",
-            "reason": reason,
-            "time_until_eligible_seconds": min_wait,
-        })
-
-    # Guard 4: research_task_active — only block on actively running research,
-    # not EVALUATING parents (they're just waiting on children to finish)
+    # Guard 4 prerequisite: identify research tasks that are actively holding a
+    # direction. Mirror `_spawn_research_task_inner` — EVALUATING parents still
+    # own the direction until their children merge.
     active_tasks_result = await session.execute(
         select(Task).where(
             Task.project_id == project_id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+            Task.status.in_([
+                TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+            ]),
         )
     )
     active_tasks = active_tasks_result.scalars().all()
@@ -1280,6 +1239,64 @@ async def get_autonomy_debug(
             did = payload.get("current_direction_id")
             if did:
                 busy_direction_ids.append(did)
+
+    # Guard 3: no_eligible_directions — a direction is eligible only if it's
+    # active, out of cooldown, AND not already held by another research task.
+    cooldown_minutes = _runtime_config.get("autonomous_direction_cooldown_minutes", 240)
+    cooldown_seconds_dir = cooldown_minutes * 60
+    directions_info = []
+    for d in (project.directions or []):
+        if d.get("status") != "active":
+            continue
+        last_researched_at = d.get("last_researched_at")
+        if last_researched_at:
+            last_dt = datetime.fromisoformat(last_researched_at)
+            elapsed = (now - last_dt).total_seconds()
+            remaining = cooldown_seconds_dir - elapsed
+            in_cooldown = remaining > 0
+            seconds_until_eligible = max(0, int(remaining)) if in_cooldown else None
+        else:
+            in_cooldown = False
+            seconds_until_eligible = None
+        is_busy = d.get("id") in busy_direction_ids
+        is_eligible = not in_cooldown and not is_busy
+        entry = {
+            "id": d.get("id"),
+            "text": d.get("text", ""),
+            "status": d.get("status", "active"),
+            "last_researched_at": last_researched_at,
+            "cooldown_minutes": cooldown_minutes,
+            "is_eligible": is_eligible,
+            "seconds_until_eligible": seconds_until_eligible,
+        }
+        if is_busy:
+            entry["busy_reason"] = "direction has active research task (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING)"
+        directions_info.append(entry)
+
+    eligible_directions = [d for d in directions_info if d["is_eligible"]]
+    if not eligible_directions:
+        min_wait = min(
+            (d["seconds_until_eligible"] for d in directions_info if d["seconds_until_eligible"] is not None),
+            default=None,
+        )
+        busy_count = sum(1 for d in directions_info if d.get("busy_reason"))
+        if not directions_info:
+            reason = "No active directions exist"
+        elif busy_count == len(directions_info):
+            reason = f"All {len(directions_info)} active directions are held by running research"
+        elif busy_count > 0:
+            reason = f"All remaining directions in cooldown; {busy_count} held by running research"
+        else:
+            reason = "All active directions are still in cooldown"
+        blocking_guards.append({
+            "guard": "no_eligible_directions",
+            "reason": reason,
+            "time_until_eligible_seconds": min_wait,
+            "busy_direction_count": busy_count,
+            "total_active_directions": len(directions_info),
+        })
+
+    # Guard 4: research_task_active — parallel-research cap (now matches spawn logic)
     max_parallel = _runtime_config.get("max_parallel_research_per_project", 2)
     if active_research_count >= max_parallel:
         blocking_guards.append({
@@ -1288,12 +1305,6 @@ async def get_autonomy_debug(
             "active_research_count": active_research_count,
             "max_parallel": max_parallel,
         })
-    if busy_direction_ids:
-        # Mark busy directions in the directions info for visibility
-        for d in directions_info:
-            if d["id"] in busy_direction_ids:
-                d["is_eligible"] = False
-                d["busy_reason"] = "direction has active research task"
 
     # Guard 5: rate_limit_exceeded
     one_hour_ago = now - timedelta(hours=1)
@@ -1313,6 +1324,33 @@ async def get_autonomy_debug(
             "reason": f"tasks_this_hour ({tasks_this_hour}) >= max_per_hour ({max_per_hour})",
             "tasks_this_hour": tasks_this_hour,
             "max_per_hour": max_per_hour,
+        })
+
+    # Guard 6a: pipeline_paused — admin-paused or auto-paused deployments halt dispatch,
+    # which means _check_idle_research silently skips spawning.
+    deploy_state = await session.get(DeploymentState, 1)
+    if deploy_state and deploy_state.status == DeploymentStatus.PAUSED:
+        blocking_guards.append({
+            "guard": "pipeline_paused",
+            "reason": f"Pipeline is PAUSED ({deploy_state.pause_reason or 'no reason recorded'})",
+            "pause_reason": deploy_state.pause_reason,
+            "paused_at": deploy_state.paused_at.isoformat() if deploy_state.paused_at else None,
+        })
+
+    # Guard 6b: vm_slots_full — _check_idle_research only spawns when VMs are available.
+    # This is the most common silent-return path when max_concurrent_vms is small.
+    vm_consuming = (await session.execute(
+        select(func.count()).select_from(Task).where(
+            Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        )
+    )).scalar() or 0
+    max_concurrent_vms = _runtime_config.get("max_concurrent_vms", 5)
+    if vm_consuming >= max_concurrent_vms:
+        blocking_guards.append({
+            "guard": "vm_slots_full",
+            "reason": f"VM slots full ({vm_consuming}/{max_concurrent_vms}) — waiting for a task to finish",
+            "vm_consuming": vm_consuming,
+            "max_concurrent_vms": max_concurrent_vms,
         })
 
     # Guard 6: waiting_for_interval — interval gate hasn't elapsed since last_idle_check
