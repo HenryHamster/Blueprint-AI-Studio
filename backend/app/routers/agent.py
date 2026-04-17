@@ -386,7 +386,14 @@ async def claim_task(
             )
         )
         if check.scalars().first():
-            raise HTTPException(status_code=503, detail="Task is temporarily locked, retry shortly")
+            # Use 429 (not 503) so Cloud Run doesn't classify this as ContainerError
+            # and quarantine the instance — see commit 88a77903 for the same pattern
+            # applied to agent_status.py.
+            raise HTTPException(
+                status_code=429,
+                detail="Task is temporarily locked, retry shortly",
+                headers={"Retry-After": "2"},
+            )
         raise HTTPException(status_code=404, detail="No queued task found for this VM instance.")
 
     task.status = TaskStatus.IN_PROGRESS
