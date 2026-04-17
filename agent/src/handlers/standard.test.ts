@@ -319,10 +319,10 @@ describe('handleRefactor configuration', () => {
     expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
   });
 
-  it('does not capture test baseline for small-scope refactor tasks', async () => {
+  it('captures test baseline for small-scope refactor tasks', async () => {
     const task = { title: 'Refactor task', description: '', context: { scope: 'small' } };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
   });
 });
 
@@ -1440,7 +1440,8 @@ describe('testFixLoop buildConfig propagation', () => {
       build_config: buildConfig,
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    // testFixLoop should be called with the buildConfig from task.build_config and no baseline (small scope)
+    // testFixLoop should be called with the buildConfig from task.build_config.
+    // Baseline defaults to undefined since captureTestBaseline's default mock resolves to null.
     expect(vi.mocked(testFixLoop)).toHaveBeenCalledWith(
       WS, expect.any(Object), undefined, undefined, buildConfig, undefined, [], undefined,
     );
@@ -1481,16 +1482,16 @@ describe('test baseline capture', () => {
     expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
   });
 
-  it('does not call captureTestBaseline for small scope create tasks', async () => {
+  it('calls captureTestBaseline for small scope create tasks', async () => {
     const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
   });
 
-  it('does not call captureTestBaseline when scope is not set', async () => {
+  it('calls captureTestBaseline when scope is not set', async () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
   });
 
   it('calls captureTestBaseline for medium scope refactor tasks', async () => {
@@ -1505,10 +1506,10 @@ describe('test baseline capture', () => {
     expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
   });
 
-  it('does not call captureTestBaseline for small scope refactor tasks', async () => {
+  it('calls captureTestBaseline for small scope refactor tasks', async () => {
     const task = { title: 'Refactor task', description: '', context: { scope: 'small' } };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
   });
 
   it('passes baseline result to testFixLoop when captureTestBaseline returns a Set', async () => {
@@ -1945,6 +1946,40 @@ describe('scope overflow gate', () => {
       expect.objectContaining({ failure_category: 'scope_overflow' }),
     );
   });
+
+  it('excludes test files when counting against small-scope overflow threshold', async () => {
+    vi.mocked(git)
+      .mockReset()
+      .mockReturnValueOnce('')  // baseCommit
+      // 2 production + 5 test files = 7 total, but only 2 non-test → within threshold
+      .mockReturnValueOnce(
+        'M src/file1.ts\nM src/file2.ts\nM src/file1.test.ts\nM src/file2.test.ts\nM testing/test_foo.py\nM src/__tests__/bar.ts\nM src/baz.spec.ts',
+      )
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ failure_category: 'scope_overflow' }),
+    );
+  });
+
+  it('still fails small-scope task when non-test files alone exceed threshold', async () => {
+    vi.mocked(git)
+      .mockReset()
+      .mockReturnValueOnce('')  // baseCommit
+      // 7 production files, no test files → still exceeds threshold of 6
+      .mockReturnValueOnce(
+        'M src/file1.ts\nM src/file2.ts\nM src/file3.ts\nM src/file4.ts\nM src/file5.ts\nM src/file6.ts\nM src/file7.ts',
+      )
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'scope_overflow' }),
+    );
+  });
 });
 
 // ── Scope trim prompt framing ─────────────────────────────────────────────────
@@ -2074,10 +2109,10 @@ describe('handleRefactor blocking gates', () => {
     expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
   });
 
-  it('does not call captureTestBaseline for small scope refactor tasks', async () => {
+  it('calls captureTestBaseline for small scope refactor tasks', async () => {
     const task = { title: 'Refactor task', description: '', context: { scope: 'small' }, project_context: {} };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
+    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
   });
 });
 
@@ -2185,5 +2220,40 @@ describe('post-self-review scope overflow gate', () => {
       TASK_ID,
       expect.objectContaining({ failure_category: 'scope_overflow' }),
     );
+  });
+
+  it('excludes test files from post-self-review scope overflow count', async () => {
+    // medium threshold = 10; 3 prod files + 9 test files = 12 total, but only 3 non-test
+    const mixedFiles = [
+      'M src/prod1.ts', 'M src/prod2.ts', 'M src/prod3.ts',
+      'M src/prod1.test.ts', 'M src/prod2.test.ts', 'M src/prod3.test.ts',
+      'M testing/test_a.py', 'M testing/test_b.py',
+      'M src/__tests__/c.ts', 'M src/__tests__/d.ts',
+      'M src/helper.spec.ts', 'M src/util.spec.tsx',
+    ].join('\n');
+    setupGitMocksWithPostReviewDiff(mixedFiles);
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ failure_category: 'scope_overflow' }),
+    );
+  });
+
+  it('still blocks PR when non-test files alone exceed post-self-review threshold', async () => {
+    // medium threshold = 10; 11 non-test files + 3 test files → still blocks
+    const tooManyProd = [
+      ...Array.from({ length: 11 }, (_, i) => `M src/prod${i}.ts`),
+      'M src/prod0.test.ts', 'M testing/test_a.py', 'M src/__tests__/c.ts',
+    ].join('\n');
+    setupGitMocksWithPostReviewDiff(tooManyProd);
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'scope_overflow' }),
+    );
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 });

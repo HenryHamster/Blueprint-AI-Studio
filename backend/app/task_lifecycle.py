@@ -78,11 +78,14 @@ def _build_retry_prompt_suffix(
 ) -> "tuple[str, str | None]":
     """Build failure-class-specific retry guidance for the agent prompt_suffix.
 
-    Returns (extra_guidance, scope_override). scope_override is set to a reduced
-    scope string when repeated AGENT_TIMEOUT should trigger a downgrade
-    (large→medium or medium→small); otherwise None. Reads
-    ``_previous_failing_tests`` and ``_previous_error_files`` from ctx for
-    CODE_ERROR hints.
+    Returns (extra_guidance, scope_override). scope_override is set to a
+    different scope string when the failure mode should route through a
+    different scope on retry:
+      - AGENT_TIMEOUT with attempt ≥ 2: downgrade large→medium or medium→small
+      - SCOPE_OVERFLOW on a medium task: escalate medium→large so the plan
+        agent decomposes the work into multiple small subtasks
+    Otherwise None. Reads ``_previous_failing_tests`` and ``_previous_error_files``
+    from ctx for CODE_ERROR hints.
     """
     extra_guidance = ""
     scope_override: "str | None" = None
@@ -99,6 +102,20 @@ def _build_retry_prompt_suffix(
             scope_override = "medium"
         elif attempt >= 2 and task_scope == "medium":
             scope_override = "small"
+
+    # Escalate medium→large when the previous attempt overflowed its scope budget.
+    # Routing through "large" invokes the plan agent, which decomposes the work
+    # into multiple small subtasks — turning a repeated same-scope failure into a
+    # productive decomposition pass. Matches both the canonical SCOPE_OVERFLOW class
+    # and the raw lowercase 'scope_overflow' label in case normalization didn't run.
+    elif failure_class == "SCOPE_OVERFLOW" or (ctx.get("failure_category") or "").lower() == "scope_overflow":
+        extra_guidance = (
+            "RETRY GUIDANCE: The previous attempt exceeded the scope's file-count budget.\n"
+            "- Focus on the single most critical change; limit production edits to 1-3 files\n"
+            "- Split unrelated concerns into follow-up work rather than bundling them here\n"
+        )
+        if task_scope == "medium":
+            scope_override = "large"
 
     elif failure_class == "CODE_ERROR":
         error_text = (original_status_message or "").lower()

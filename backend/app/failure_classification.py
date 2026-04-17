@@ -16,17 +16,24 @@ PROVISION_FAILURE = "PROVISION_FAILURE"
 AGENT_TIMEOUT = "AGENT_TIMEOUT"
 EXTERNAL_API = "EXTERNAL_API"
 RATE_LIMIT = "RATE_LIMIT"
+# Structural mismatch between task scope and actual change footprint — the agent
+# planned/produced more files than the scope budget allows. Not a code defect
+# and not an infra outage; retry logic uses this class to route through scope
+# escalation (medium→large decomposition) instead of a same-scope retry.
+SCOPE_OVERFLOW = "SCOPE_OVERFLOW"
 
 
 # Failure classes that don't penalize direction health / research productivity —
 # the task never really ran because the infra (VMs, rate limits, upstream APIs,
-# agent lifecycle) got in the way. Imported by direction_outcomes and
-# research_completion so both stay in sync.
+# agent lifecycle) got in the way, or the scope was structurally mismatched
+# (SCOPE_OVERFLOW — wrong budget, not bad code). Imported by direction_outcomes
+# and research_completion so both stay in sync.
 INFRA_CLASSES: frozenset[str] = frozenset({
     PROVISION_FAILURE,
     RATE_LIMIT,
     AGENT_TIMEOUT,
     EXTERNAL_API,
+    SCOPE_OVERFLOW,
 })
 
 
@@ -40,6 +47,7 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     'parse_failed': CODE_ERROR,
     'fatal': CODE_ERROR,
     'rate_limited': RATE_LIMIT,
+    'scope_overflow': SCOPE_OVERFLOW,
 }
 
 
@@ -67,6 +75,7 @@ _SEVERITY: dict[str, int] = {
     PROVISION_FAILURE: 1,
     EXTERNAL_API: 1,
     RATE_LIMIT: 1,
+    SCOPE_OVERFLOW: 1,
 }
 
 

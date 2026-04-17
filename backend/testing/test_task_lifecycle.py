@@ -451,6 +451,90 @@ async def test_requeue_agent_timeout_injects_scope_guidance(tl_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_requeue_scope_overflow_medium_escalates_to_large(tl_db, mocker):
+    """SCOPE_OVERFLOW on a medium task escalates retry scope to 'large' (plan decomposition)."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="SCOPE_OVERFLOW")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_attempt_number": 1, "scope": "medium", "failure_category": "SCOPE_OVERFLOW"},
+        latest_status_message="Scope overflow: 11 files changed",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    assert clone.context.get("scope") == "large"
+    assert clone.context.get("_scope_reduced") is True
+    prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
+    assert "scope" in prompt_suffix.lower()
+    assert "file-count budget" in prompt_suffix.lower()
+
+
+@pytest.mark.asyncio
+async def test_requeue_scope_overflow_small_does_not_escalate(tl_db, mocker):
+    """SCOPE_OVERFLOW on a small task keeps the same scope — only medium escalates to large."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="SCOPE_OVERFLOW")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_attempt_number": 1, "scope": "small", "failure_category": "SCOPE_OVERFLOW"},
+        latest_status_message="Scope overflow: 7 files changed for a small-scope task",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    # Scope stays small; guidance is still added
+    assert clone.context.get("scope") == "small"
+    prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
+    assert "file-count budget" in prompt_suffix.lower()
+
+
+@pytest.mark.asyncio
+async def test_requeue_scope_overflow_raw_lowercase_label_escalates(tl_db, mocker):
+    """Raw lowercase 'scope_overflow' in ctx (pre-normalization) also triggers escalation."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    # Simulate a case where classify_failure returned a different class but the raw
+    # agent label is still present in ctx (defensive path).
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="CODE_ERROR")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_attempt_number": 1, "scope": "medium", "failure_category": "scope_overflow"},
+        latest_status_message="Scope overflow: too many files",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    assert clone.context.get("scope") == "large"
+
+
+@pytest.mark.asyncio
 async def test_requeue_external_api_injects_api_guidance(tl_db, mocker):
     """EXTERNAL_API failure inserts API-specific retry guidance into prompt_suffix."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)

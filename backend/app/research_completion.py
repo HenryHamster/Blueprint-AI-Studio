@@ -1176,6 +1176,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 )
                 scope = "large"
                 scope_calibrated_from = "medium"
+        elif scope == "small":
+            _heuristic_files = finding.get("related_files") or []
+            if len(_heuristic_files) >= 3:
+                logger.info(
+                    "[RESEARCH] Upgrading scope small→medium for '%s' "
+                    "(file-count heuristic: %d related_files >= 3)",
+                    title, len(_heuristic_files),
+                )
+                scope = "medium"
+                scope_calibrated_from = "small"
 
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation

@@ -61,6 +61,21 @@ function computeFileDiffSummary(
   }
 }
 
+/**
+ * Returns true if the path looks like a test file. Test files are excluded
+ * from scope overflow counts since they are essential for merge quality and
+ * should not penalise well-tested tasks.
+ */
+function isTestFile(path: string): boolean {
+  if (!path) return false;
+  const segments = path.split('/');
+  if (segments.includes('testing') || segments.includes('__tests__')) return true;
+  const base = segments[segments.length - 1];
+  if (/^test_/.test(base)) return true;
+  if (/\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(base)) return true;
+  return false;
+}
+
 export interface StandardHandlerOpts {
   taskId: string;
   payload: Record<string, unknown>;
@@ -160,9 +175,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions(taskTypeKey);
 
-  // Capture test baseline for medium/large scope tasks on main branch.
-  // This lets the test fix loop distinguish pre-existing failures from newly-broken tests.
-  // We scope the baseline run to directories matching related_files to keep it fast.
+  // Capture test baseline on main branch so the test fix loop can distinguish
+  // pre-existing failures from newly-broken tests. Scoped to related_files to stay fast.
   let baselineFailures: Set<string> | undefined;
   if (captureBaseline && runTestFix && baseBranch === 'main') {
     const relatedFiles = (
@@ -333,13 +347,16 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     const diffSummary = computeFileDiffSummary(baseCommit, currentHead);
 
     // ── Scope overflow detection ───────────────────────────────────────────────
+    // Test files are excluded from the count since they are essential for merge
+    // quality and should not penalise well-tested tasks.
     const taskScope = strVal((task.context as Record<string, unknown> | undefined)?.scope);
     const overflowThreshold = taskScope ? SCOPE_OVERFLOW_THRESHOLDS[taskScope] : undefined;
-    const scopeOverflowWarning = overflowThreshold !== undefined && changedPaths.length > overflowThreshold
-      ? `This task has scope "${taskScope}" (expected few files) but ${changedPaths.length} files were changed, exceeding the ${overflowThreshold}-file threshold. Changed files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`
+    const nonTestChangedPaths = changedPaths.filter(p => !isTestFile(p));
+    const scopeOverflowWarning = overflowThreshold !== undefined && nonTestChangedPaths.length > overflowThreshold
+      ? `This task has scope "${taskScope}" (expected few files) but ${nonTestChangedPaths.length} non-test files were changed (${changedPaths.length} total including tests), exceeding the ${overflowThreshold}-file threshold. Changed files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`
       : undefined;
     if (scopeOverflowWarning) {
-      sendLog(ws, `\nWARNING: Scope overflow detected — ${changedPaths.length} files changed for a "${taskScope}" task (threshold: ${overflowThreshold}).\n`);
+      sendLog(ws, `\nWARNING: Scope overflow detected — ${nonTestChangedPaths.length} non-test files changed for a "${taskScope}" task (threshold: ${overflowThreshold}, ${changedPaths.length} total including tests).\n`);
     }
 
     // ── Scope Trim Enforcement (medium-scope only) ────────────────────────────
@@ -502,10 +519,10 @@ Output ONLY a JSON object in a \`\`\`json code fence:
     // retry can focus on fewer files. Medium tasks legitimately touch more files, so
     // keep the existing warning-only behaviour for them.
     if (taskScope === 'small' && scopeOverflowWarning) {
-      sendLog(ws, `\nScope overflow: failing small-scope task — ${changedPaths.length} files changed exceeds the ${overflowThreshold}-file threshold. Retry should focus on the single most critical change and limit to 1-3 files.\n`);
+      sendLog(ws, `\nScope overflow: failing small-scope task — ${nonTestChangedPaths.length} non-test files changed exceeds the ${overflowThreshold}-file threshold. Retry should focus on the single most critical change and limit to 1-3 files.\n`);
       await persistAndPostStatus(taskId, {
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-        logs: `Scope overflow: ${changedPaths.length} files changed for a small-scope task (threshold: ${overflowThreshold}). Retry guidance: focus on the single most critical change and limit to 1-3 files.\n\nChanged files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`,
+        logs: `Scope overflow: ${nonTestChangedPaths.length} non-test files changed for a small-scope task (threshold: ${overflowThreshold}, ${changedPaths.length} total including tests). Retry guidance: focus on the single most critical change and limit to 1-3 files.\n\nChanged files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`,
         failure_category: 'scope_overflow',
         changed_files: changedPaths.slice(0, 50),
         ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
@@ -966,7 +983,8 @@ Output ONLY a JSON object in a \`\`\`json code fence:
 
     // ── Guard: Post-self-review scope overflow check ─────────────────────────
     // Re-count changed files after self-review (which may have trimmed files).
-    // If count still exceeds the threshold, block PR creation.
+    // If count still exceeds the threshold, block PR creation. Test files are
+    // excluded from the count since they are essential for merge quality.
     if (overflowThreshold !== undefined) {
       const postReviewCommittedPaths = currentHead !== baseCommit
         ? git(['diff', '--name-only', `${baseCommit}..HEAD`]).split('\n').filter(Boolean)
@@ -976,10 +994,11 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         ? postReviewDiff.split('\n').map((l: string) => l.trim().split(/\s+/).pop() || '').filter(Boolean)
         : [];
       const postReviewPaths = [...new Set([...postReviewCommittedPaths, ...postReviewUncommitted])];
-      if (postReviewPaths.length > overflowThreshold) {
+      const postReviewNonTestPaths = postReviewPaths.filter((f: string) => !isTestFile(f));
+      if (postReviewNonTestPaths.length > overflowThreshold) {
         const fileList = postReviewPaths.map((f: string) => `- ${f}`).join('\n');
-        const failureLog = `Scope overflow: ${postReviewPaths.length} files changed for a "${taskScope}" task (threshold: ${overflowThreshold}).\n\nChanged files:\n${fileList}\n\nTrim unrelated files and retry with a focused change set.`;
-        sendLog(ws, `\nScope overflow gate: ${postReviewPaths.length} files changed (threshold: ${overflowThreshold}) — blocking PR creation.\n`);
+        const failureLog = `Scope overflow: ${postReviewNonTestPaths.length} non-test files changed for a "${taskScope}" task (threshold: ${overflowThreshold}, ${postReviewPaths.length} total including tests).\n\nChanged files:\n${fileList}\n\nTrim unrelated files and retry with a focused change set.`;
+        sendLog(ws, `\nScope overflow gate: ${postReviewNonTestPaths.length} non-test files changed (threshold: ${overflowThreshold}) — blocking PR creation.\n`);
         await persistAndPostStatus(taskId, {
           task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
           logs: failureLog,
@@ -1154,7 +1173,7 @@ export async function handleCreate(
     runLintFix: true,
     runTestFix: true,
     failOnTestFailure: true,
-    captureBaseline: isMediumOrLargeScope,
+    captureBaseline: true,
     runSelfReview: true,
     runSmallScopeAnalysis: true,
     lintContext: 'the code you just wrote',
@@ -1196,7 +1215,6 @@ export async function handleRefactor(
     : '';
 
   const refactorTitle = strVal(task.title, 'Refactor');
-  const isRefactorMediumOrLargeScope = refactorScope === 'medium' || refactorScope === 'large';
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
@@ -1219,7 +1237,7 @@ ${rp}`,
     runLintFix: true,
     runTestFix: true,
     failOnTestFailure: true,
-    captureBaseline: isRefactorMediumOrLargeScope,
+    captureBaseline: true,
     runSelfReview: true,
     lintContext: 'the refactored code',
   });

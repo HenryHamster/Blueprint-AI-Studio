@@ -210,7 +210,23 @@ def test_infra_classes_includes_external_api():
     assert "PROVISION_FAILURE" in INFRA_CLASSES
     assert "RATE_LIMIT" in INFRA_CLASSES
     assert "AGENT_TIMEOUT" in INFRA_CLASSES
+    assert "SCOPE_OVERFLOW" in INFRA_CLASSES
     assert "CODE_ERROR" not in INFRA_CLASSES
+
+
+def test_normalize_agent_category_scope_overflow_maps_to_scope_overflow():
+    """Agent posts lowercase 'scope_overflow' — must persist as canonical SCOPE_OVERFLOW
+    and NOT fall through to CODE_ERROR (which would penalize direction health)."""
+    t = _task("")
+    assert normalize_agent_failure_category("scope_overflow", t) == "SCOPE_OVERFLOW"
+
+
+def test_classify_failure_respects_scope_overflow_agent_category():
+    """A task with ctx['failure_category'] = 'SCOPE_OVERFLOW' must classify as SCOPE_OVERFLOW
+    regardless of the status message text."""
+    t = _task("some arbitrary error")
+    t.context = {"failure_category": "SCOPE_OVERFLOW"}
+    assert classify_failure(t) == "SCOPE_OVERFLOW"
 
 
 # ── Cascade cancellation classifier ───────────────────────────────────────────
