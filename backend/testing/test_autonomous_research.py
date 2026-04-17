@@ -1539,6 +1539,41 @@ async def test_medium_scope_with_few_related_files_stays_medium(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_medium_scope_cross_module_related_files_upgrades_to_large(db_session, mocker, monkeypatch):
+    """Medium finding whose related_files span 2+ top-level modules upgrades to large."""
+    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    direction = _active_direction("d-xmod01", "Cross-module heuristic direction")
+    project = Project(
+        name="Cross-Module Heuristic Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    finding = _make_finding("Change spanning backend and agent", direction["id"], scope="medium")
+    finding["related_files"] = ["backend/app/foo.py", "agent/src/bar.ts"]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    assert child_tasks[0].payloads[0]["type"] == "plan"
+    assert child_tasks[0].context["scope"] == "large"
+    assert child_tasks[0].context["scope_calibrated_from"] == "medium:cross_module"
+
+
+@pytest.mark.asyncio
 async def test_medium_scope_expansion_ratio_prediction_upgrades_to_large(db_session, mocker, monkeypatch):
     """Medium finding with 4 related_files × 3.0 avg_expansion_ratio predicts >10 → upgrade."""
     monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})

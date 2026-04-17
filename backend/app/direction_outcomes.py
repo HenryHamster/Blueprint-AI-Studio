@@ -252,6 +252,10 @@ async def _update_direction_research_outcomes(
             scope_breakdown: dict = {}
             expansion_sums: dict = {}
             expansion_counts: dict = {}
+            cplx_merged_sum: dict = {}
+            cplx_merged_n: dict = {}
+            cplx_failed_sum: dict = {}
+            cplx_failed_n: dict = {}
 
             def _ensure_scope(s: str) -> None:
                 if s not in scope_breakdown:
@@ -289,6 +293,26 @@ async def _update_direction_research_outcomes(
                     scope_breakdown[scope_key]["avg_expansion_ratio"] = round(
                         expansion_sums[scope_key] / count, 2
                     )
+            # Predictive accuracy: average complexity_score for merged vs failed tasks.
+            # If scoring is calibrated, merged > failed at each scope.
+            for ct in child_tasks_rows:
+                ctx2 = ct.context or {}
+                cs = ctx2.get("complexity_score")
+                if not isinstance(cs, (int, float)):
+                    continue
+                scope2 = ctx2.get("scope", "unknown")
+                if ct.status == TaskStatus.COMPLETED and ctx2.get("pr_merged"):
+                    cplx_merged_sum[scope2] = cplx_merged_sum.get(scope2, 0.0) + float(cs)
+                    cplx_merged_n[scope2] = cplx_merged_n.get(scope2, 0) + 1
+                elif ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                    cplx_failed_sum[scope2] = cplx_failed_sum.get(scope2, 0.0) + float(cs)
+                    cplx_failed_n[scope2] = cplx_failed_n.get(scope2, 0) + 1
+            for sk, n in cplx_merged_n.items():
+                if n > 0 and sk in scope_breakdown:
+                    scope_breakdown[sk]["avg_complexity_merged"] = round(cplx_merged_sum[sk] / n, 2)
+            for sk, n in cplx_failed_n.items():
+                if n > 0 and sk in scope_breakdown:
+                    scope_breakdown[sk]["avg_complexity_failed"] = round(cplx_failed_sum[sk] / n, 2)
             entry["scope_breakdown"] = scope_breakdown
 
             # Decomposition quality: per plan-parent metrics so future calibration

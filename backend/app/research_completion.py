@@ -35,6 +35,7 @@ from app.cochange_decomposition import (
     cluster_files_by_cochange as _cluster_files_by_cochange,  # noqa: F401 — re-exported for tests
 )
 from app.payload_schemas import validate_internal_payload
+from app.scope_complexity import _composite_complexity_score
 from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE
 from app.task_completion import (
     _extract_json_array,
@@ -275,6 +276,31 @@ def _calibrate_scope(
     if proposed_scope == "medium" and idx + 1 < len(_SCOPE_ORDER):
         small_rate = _merge_rate("small")
         if small_rate is not None and small_rate >= threshold:
+            # Suppress upgrade if prior plan decompositions for this direction
+            # produced poorly-merging subtasks — continuing to route medium→large
+            # would just generate more failing decompositions. Leave scope at
+            # medium and let predict_spawn_success gate it via confidence.
+            decomp_rates: list[float] = []
+            decomp_weights: list[int] = []
+            for entry in direction.get("research_history", [])[-3:]:
+                for dq in (entry.get("decomposition_quality") or []):
+                    rate_val = dq.get("subtask_merge_rate")
+                    count = dq.get("subtask_count") or 1
+                    if isinstance(rate_val, (int, float)):
+                        decomp_rates.append(float(rate_val))
+                        decomp_weights.append(count)
+            if decomp_rates and sum(decomp_weights) >= 3:
+                avg_decomp = sum(
+                    r * w for r, w in zip(decomp_rates, decomp_weights)
+                ) / sum(decomp_weights)
+                if avg_decomp < 0.3:
+                    logger.info(
+                        "[RESEARCH] Suppressing medium→large upgrade for direction '%s' "
+                        "(subtask_merge_rate %.0f%% < 30%% over %d subtasks)",
+                        direction.get("title", direction.get("id", "?")),
+                        avg_decomp * 100, sum(decomp_weights),
+                    )
+                    return proposed_scope, None
             larger = _SCOPE_ORDER[idx + 1]
             logger.info(
                 "[RESEARCH] Upgrading scope %s→%s(decompose) for direction '%s' "
@@ -1202,6 +1228,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 )
                 scope = "large"
                 scope_calibrated_from = "medium"
+            elif len({f.split("/", 1)[0] for f in _heuristic_files if "/" in f}) >= 2:
+                # Cross-module heuristic: related_files span 2+ top-level directories
+                # (e.g. backend + agent + admin-ui). These face language boundaries,
+                # separate build/test systems, and independent CI — upgrade to large
+                # for plan decomposition into per-module subtasks.
+                _modules = sorted({f.split("/", 1)[0] for f in _heuristic_files if "/" in f})
+                logger.info(
+                    "[RESEARCH] Upgrading scope medium→large for '%s' "
+                    "(cross-module heuristic: related_files span %d modules: %s)",
+                    title, len(_modules), ",".join(_modules),
+                )
+                scope = "large"
+                scope_calibrated_from = "medium:cross_module"
             elif _heuristic_files:
                 # Predictive expansion-ratio check: direction's historical avg_expansion_ratio
                 # (actual files touched / expected related_files) multiplied by this finding's
@@ -1229,6 +1268,25 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             )
                             scope = "large"
                             scope_calibrated_from = "medium"
+            # Composite complexity score: combines file count, historical expansion,
+            # cochange cluster density, and cross-module span into a single merge-
+            # probability estimate. Upgrades when score indicates low P(merge) even if
+            # individual binary checks above let the task through.
+            if scope == "medium":
+                _cc_dir = _directions_by_id.get(str(finding.get("direction_id") or _parent_direction_id)) if (finding.get("direction_id") or _parent_direction_id) else None
+                _cc_score, _cc_signals = _composite_complexity_score(
+                    finding.get("related_files") or [], _cc_dir, _cochange_index_for_decomp,
+                )
+                finding["_complexity_score"] = round(_cc_score, 3)
+                finding["_complexity_signals"] = _cc_signals
+                if _cc_score < 0.5:
+                    logger.info(
+                        "[RESEARCH] Upgrading scope medium→large for '%s' "
+                        "(composite complexity %.2f < 0.50, signals=%s)",
+                        title, _cc_score, _cc_signals,
+                    )
+                    scope = "large"
+                    scope_calibrated_from = "medium"
         elif scope == "small":
             _heuristic_files = finding.get("related_files") or []
             if len(_heuristic_files) >= 3:
@@ -1406,6 +1464,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **({"direction_id": direction_id} if direction_id else ({"direction_id": parent_direction_id} if parent_direction_id else {})),
                 **({"parent_direction_id": parent_direction_id} if parent_direction_id else {}),
                 **({"scope_calibrated_from": scope_calibrated_from} if scope_calibrated_from else {}),
+                **({"complexity_score": finding["_complexity_score"], "complexity_signals": finding.get("_complexity_signals", {})} if "_complexity_score" in finding else {}),
                 **({"low_confidence_spawn": True, "low_confidence_spawn_rate": round(_pred_p, 3)} if _low_confidence else {}),
                 **prior_retry_ctx,
             },
