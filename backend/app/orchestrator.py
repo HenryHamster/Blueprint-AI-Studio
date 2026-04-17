@@ -1967,9 +1967,30 @@ async def orchestrator_worker():
                             except (ValueError, TypeError):
                                 _null_elapsed = 0.0
                             if _null_count >= 5 and _null_elapsed >= 180:
+                                _reopen_cap = 3
+                                _reopen_tries = ci_loop.get("mergeable_null_reopen_attempts", 0)
+                                if _reopen_tries >= _reopen_cap:
+                                    if not ci_task.requires_approval:
+                                        ci_task.requires_approval = True
+                                        ci_task.latest_status_message = (
+                                            f"PR #{ci_pr_number} mergeability stuck after {_reopen_tries} "
+                                            f"close/reopen attempts — manual intervention required"
+                                        )
+                                        await _maybe_create_failure_alert(
+                                            ci_task, session,
+                                            f"PR #{ci_pr_number} mergeability stuck after {_reopen_tries} "
+                                            f"close/reopen attempts — escalating for manual intervention"
+                                        )
+                                    ci_loop["mergeable_null_count"] = 0
+                                    ci_loop["mergeable_null_first_ts"] = None
+                                    ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    continue
                                 logger.warning(
                                     f"[CI] PR #{ci_pr_number} mergeable=None for {_null_count} polls over "
-                                    f"{_null_elapsed:.0f}s — closing/reopening to force GitHub to recompute"
+                                    f"{_null_elapsed:.0f}s — closing/reopening to force GitHub to recompute "
+                                    f"(attempt {_reopen_tries + 1}/{_reopen_cap})"
                                 )
                                 _reset_ok = False
                                 _did_close = False
@@ -1985,6 +2006,7 @@ async def orchestrator_worker():
                                     logger.warning(f"[CI] close/reopen of PR #{ci_pr_number} raised: {_reset_exc}")
                                 ci_loop["mergeable_null_count"] = 0
                                 ci_loop["mergeable_null_first_ts"] = None
+                                ci_loop["mergeable_null_reopen_attempts"] = _reopen_tries + 1
                                 if _reset_ok:
                                     ci_task.latest_status_message = (
                                         f"PR #{ci_pr_number} mergeability stuck — closed/reopened to force recompute"

@@ -1571,3 +1571,83 @@ class TestExternalHealthGate:
         assert "claude_api" in result
         assert "gcp" not in result
         assert "db" not in result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test — mergeable=None close/reopen cap stops retrying after N attempts
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_ci_polling_mergeable_null_reopen_cap_stops_retrying(orch_db, mocker):
+    """When mergeable_null_reopen_attempts already >= cap (3), the orchestrator
+    must escalate to requires_approval and STOP calling close/reopen rather
+    than retry forever. Prior bug: unbounded close/reopen loop on a PR whose
+    mergeability never recomputes.
+    """
+    session, _Session = orch_db
+
+    project = Project(name="Mergeable Null Cap Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    # Conditions for the reopen branch: null_count>=5 after this cycle's +1,
+    # first_ts older than 180s, and reopen_attempts at the cap (3).
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "mergeable cap", "branch": "feat/cap"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 7777,
+                "branch": "feat/cap",
+                "base_branch": "main",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+                "mergeable_null_count": 4,
+                "mergeable_null_first_ts": _naive_utc_ago(seconds=240).isoformat(),
+                "mergeable_null_reopen_attempts": 3,
+            }
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+    task_id = ci_task.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "open", "merged": False,
+                               "head": {"sha": "abc123"}, "mergeable": None})
+    close_mock = mocker.patch("app.github.close_pull_request",
+                              new_callable=AsyncMock, return_value=True)
+    reopen_mock = mocker.patch("app.github.reopen_pull_request",
+                               new_callable=AsyncMock, return_value=True)
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert",
+                              new_callable=AsyncMock)
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify:
+        from sqlmodel import select as _select
+        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+
+    assert t is not None
+
+    # Close/reopen MUST NOT be attempted once the cap is already reached.
+    assert close_mock.call_count == 0, (
+        f"close_pull_request should not be called when reopen cap reached, "
+        f"got {close_mock.call_count} calls"
+    )
+    assert reopen_mock.call_count == 0, (
+        f"reopen_pull_request should not be called when reopen cap reached, "
+        f"got {reopen_mock.call_count} calls"
+    )
+    # Escalation: task flagged for manual intervention so an operator can act.
+    assert t.requires_approval is True, (
+        f"Task should be flagged requires_approval at cap, got {t.requires_approval}"
+    )
+    assert "manual intervention" in (t.latest_status_message or "").lower()
+    # Escalation fires a failure alert (operator visibility).
+    assert alert_mock.call_count >= 1

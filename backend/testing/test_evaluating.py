@@ -21,7 +21,7 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy import select
 from sqlmodel import SQLModel
 
-from app.services import _check_evaluating_timeouts
+from app.services import _check_evaluating_timeouts, _chain_has_active_pipeline_work
 from app.rollup_management import _check_and_trigger_rollup
 from app.models import Project, Task, TaskStatus, Alert, AlertSeverity
 
@@ -1016,3 +1016,143 @@ async def test_backstop_no_early_recovery_when_review_child_in_progress(eval_db,
     mock_spawn.assert_not_called()
     rl = (parent.context or {}).get("review_loop", {})
     assert rl.get("review_recovery_attempted") is not True
+
+
+# ── Chain-active / hard-timeout bypass tests ──────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_chain_active_queued_review_recent_counts_live(eval_db):
+    """A recently-created QUEUED review task on the same chain counts as live
+    pipeline work — _chain_has_active_pipeline_work returns True, which would
+    defer the parent's 6h hard timeout."""
+    project = Project(name="Chain Queued Recent", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+        context={"review_loop": {"pr_number": 77001, "original_task_id": "chain-abc"}},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    queued_review = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "review",
+            "pr_number": 77001,
+            "original_task_id": "chain-abc",
+        }],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=None,
+    )
+    queued_review.created_at = _naive_utc_ago(minutes=5)
+    eval_db.add(queued_review)
+    await eval_db.commit()
+
+    assert await _chain_has_active_pipeline_work(parent, eval_db) is True
+
+
+@pytest.mark.asyncio
+async def test_chain_active_stale_provisioning_does_not_count(eval_db):
+    """A PROVISIONING review/fix task created >30min ago is stuck (slot caps,
+    direction holds) and must NOT count as live work — otherwise it would
+    indefinitely defer the parent's 6h EVALUATING hard timeout."""
+    project = Project(name="Chain Stale Provisioning", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+        context={"review_loop": {"pr_number": 77002, "original_task_id": "chain-def"}},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    stale_fix = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "fix",
+            "pr_number": 77002,
+            "original_task_id": "chain-def",
+        }],
+        status=TaskStatus.PROVISIONING,
+        last_heartbeat=None,
+    )
+    # 40 minutes ago — past the 30-min queued_max_age_seconds threshold.
+    stale_fix.created_at = _naive_utc_ago(minutes=40)
+    eval_db.add(stale_fix)
+    await eval_db.commit()
+
+    assert await _chain_has_active_pipeline_work(parent, eval_db) is False
+
+
+@pytest.mark.asyncio
+async def test_evaluating_approval_gate_hard_timeout_fails(eval_db, mocker):
+    """An approval-gated parent (requires_approval=True) whose _approval_set_at
+    is older than APPROVAL_GATE_FAIL_SECONDS (2h) must be marked FAILED by the
+    companion timeout — otherwise it stalls indefinitely because the 6h
+    backstop can be deferred by _chain_has_active_pipeline_work."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Approval Gate Timeout", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    approval_since = _naive_utc_ago(hours=3)
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "approval-gated parent"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={"_approval_set_at": approval_since.isoformat()},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Expected FAILED after approval-gate hard timeout, got {parent.status}: "
+        f"{parent.latest_status_message!r}"
+    )
+    assert "approval" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_evaluating_approval_gate_within_window_not_failed(eval_db, mocker):
+    """Complement: an approval-gated parent within the 2h window must remain
+    EVALUATING (operators still have time to approve/deny)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Approval Gate Fresh", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "fresh approval gate"}],
+        status=TaskStatus.EVALUATING,
+        requires_approval=True,
+        context={"_approval_set_at": _naive_utc_ago(minutes=30).isoformat()},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING

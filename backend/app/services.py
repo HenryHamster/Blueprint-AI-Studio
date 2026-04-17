@@ -516,7 +516,12 @@ async def _persist_zone_health():
         logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
 
 
-async def _chain_has_active_pipeline_work(parent: Task, session, stale_seconds: int = 600) -> bool:
+async def _chain_has_active_pipeline_work(
+    parent: Task,
+    session,
+    stale_seconds: int = 600,
+    queued_max_age_seconds: int = 1800,
+) -> bool:
     """True if any review/fix task on this chain has heartbeated within ``stale_seconds``.
 
     The backstop uses wall-clock time as the sole kill signal, but a rollup PR
@@ -550,9 +555,14 @@ async def _chain_has_active_pipeline_work(parent: Task, session, stale_seconds: 
                 continue
             if t.last_heartbeat and t.last_heartbeat > cutoff:
                 return True
-            # QUEUED/PROVISIONING tasks have no heartbeat yet but are live work
+            # QUEUED/PROVISIONING tasks have no heartbeat yet but count as live
+            # work only if recently created — beyond queued_max_age_seconds they
+            # are likely stuck (slot caps, direction holds) and must not suppress
+            # the parent's hard timeout.
             if t.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING):
-                return True
+                queued_cutoff = _utcnow() - timedelta(seconds=queued_max_age_seconds)
+                if t.created_at and t.created_at > queued_cutoff:
+                    return True
     except Exception:
         logger.debug(
             f"[EVAL TIMEOUT] Failed to check chain activity for task {str(parent.id)[:8]}",
@@ -651,6 +661,10 @@ async def _check_evaluating_timeouts():
     EVALUATING_WARN_SECONDS = 2 * 3600   # 2 hours
     EVALUATING_FAIL_SECONDS = 6 * 3600   # 6 hours
     CI_BACKSTOP_SECONDS = 30 * 60         # 30 minutes — hard kill for CI-waiting tasks (CI takes 5-10 min)
+    # Approval-gate companion timeout: parents flagged requires_approval can
+    # otherwise stall indefinitely when _chain_has_active_pipeline_work defers
+    # the 6h backstop. 2h gives operators a reasonable window to approve/deny.
+    APPROVAL_GATE_FAIL_SECONDS = 2 * 3600
     TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 
     try:
@@ -665,6 +679,58 @@ async def _check_evaluating_timeouts():
 
             for task in evaluating_tasks:
                 ctx = task.context or {}
+
+                # Approval-gate hard timeout. Parents with requires_approval=True
+                # remain in EVALUATING waiting for human approval; the 6h backstop
+                # can be deferred by an active pipeline chain, so approval-gated
+                # parents need their own shorter companion timeout.
+                if task.requires_approval:
+                    approval_set_at = ctx.get("_approval_set_at")
+                    if not approval_set_at:
+                        from sqlalchemy.orm.attributes import flag_modified
+                        task.context = {**ctx, "_approval_set_at": now.isoformat()}
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await session.commit()
+                        continue
+                    try:
+                        approval_since = datetime.fromisoformat(approval_set_at)
+                        approval_elapsed = (now - approval_since).total_seconds()
+                    except (ValueError, TypeError):
+                        approval_elapsed = 0.0
+                    if approval_elapsed > APPROVAL_GATE_FAIL_SECONDS:
+                        hours = round(approval_elapsed / 3600, 1)
+                        logger.error(
+                            f"[EVAL TIMEOUT] Task {str(task.id)[:8]} has been "
+                            f"requires_approval for {hours}h without resolution — "
+                            f"approval-gate timeout, marking FAILED"
+                        )
+                        task.status = TaskStatus.FAILED
+                        task.latest_status_message = (
+                            f"Approval-gate timeout after {hours}h — no manual "
+                            f"approval received, escalating to FAILED"
+                        )
+                        from app.failure_classification import classify_failure, persist_failure_category
+                        from app.routers.agent_status import record_task_result
+                        _fc = classify_failure(task)
+                        persist_failure_category(task, _fc)
+                        record_task_result(
+                            success=False, failure_class=_fc, task_id=str(task.id),
+                            task_type=task.first_payload.get("type", ""),
+                        )
+                        session.add(task)
+                        await _maybe_create_failure_alert(
+                            task, session,
+                            f"Approval-gate timeout after {hours}h — parent failed "
+                            f"without manual resolution",
+                        )
+                        await session.commit()
+                        await broadcast_to_project(
+                            str(task.project_id), "task_updated",
+                            {"task_id": str(task.id), "status": task.status},
+                        )
+                        continue
+
                 ci_waiting = (
                     ctx.get("ci_waiting") is True
                     or ctx.get("review_loop", {}).get("ci_waiting") is True
