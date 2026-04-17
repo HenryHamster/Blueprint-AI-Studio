@@ -146,12 +146,40 @@ export async function handleReview(
   // Build iteration preamble
   const iterationPreamble = `This is review iteration ${iteration} of the automated review-fix cycle.${iteration > 1 ? '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.' : ''}`;
 
+  // Rollup PRs (head branch research/* or plan/*) contain N subtask squash-merge
+  // commits whose titles end in "(#NNNN)". The `(#NNNN)` marker means a PR was
+  // squash-merged — NOT that it landed on origin/main. Subtask PRs merge INTO
+  // the rollup branch. We've seen reviewers misread these as "already-on-main"
+  // and flag perfectly valid rollup PRs as empty, looping the fix agent on
+  // nothing. Make the verification steps explicit.
+  const isRollupHead = branch.startsWith('research/') || branch.startsWith('plan/');
+  const rollupGuidance = isRollupHead
+    ? `
+**Rollup-PR verification (IMPORTANT — head branch "${branch}" looks like a rollup):**
+A rollup PR aggregates subtask squash-merges into one branch. Commits titled like
+"Some feature (#1234)" are subtask merges INTO this rollup branch, not into
+${baseBranch}. Before concluding this PR is "empty" or "already merged", verify
+objectively:
+- Run \`git fetch origin ${baseBranch}\` then \`git merge-base --is-ancestor <sha> origin/${baseBranch}\`
+  for any commit SHA you suspect is already on ${baseBranch}. Exit code 0 means
+  it IS an ancestor; exit code 1 means it is NOT.
+- Run \`git diff --stat origin/${baseBranch}...HEAD\` — a non-empty stat means
+  the PR has real changes relative to ${baseBranch}, regardless of how commit
+  titles look.
+- \`(#NNNN)\` in a commit message is just GitHub's squash-merge format. It does
+  NOT imply the commit is on ${baseBranch}.
+Only claim "empty PR" / "already merged" if BOTH the merge-base check AND the
+diff --stat confirm it. Otherwise treat this as a normal rollup and review the
+actual changes.
+`
+    : '';
+
   // Build review prompt — Claude has full repo access, not just a diff blob
   const reviewPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const reviewPrompt = `${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
 
 ${iterationPreamble}
-
+${rollupGuidance}
 ${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}Files changed in this PR:
 ${changedFiles}
 
