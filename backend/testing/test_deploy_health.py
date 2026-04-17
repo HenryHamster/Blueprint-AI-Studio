@@ -1326,3 +1326,45 @@ async def test_orchestrator_persist_zone_health_round_trips_recent_auto_resumes(
     _dh._recent_auto_resumes.clear()
     _dh._restore_health_streaks(snapshot)
     assert list(_dh._recent_auto_resumes) == [t1, t2]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_persist_zone_health_round_trips_last_resume_was_forced(mocker):
+    """_last_resume_was_forced must survive persist/restore so forced-resume ramp gate holds across restarts."""
+    import threading
+    from collections import deque as _deque
+    from unittest.mock import MagicMock
+    from app.orchestrator import _persist_zone_health as _orch_persist
+
+    mocker.patch("app.compute._zone_health", {})
+    mocker.patch("app.compute._zone_lock", threading.Lock())
+    mocker.patch("app.deploy_health._pause_failure_streak", 0)
+    mocker.patch("app.deploy_health._health_recovery_history", _deque(maxlen=5))
+    mocker.patch("app.deploy_health._last_auto_resume_at", None)
+    mocker.patch("app.deploy_health._recent_auto_resumes", _deque())
+    mocker.patch("app.deploy_health._last_resume_was_forced", True)
+
+    mock_state = MagicMock()
+    mock_state.zone_health_state = None
+    mock_session = MagicMock()
+    mock_session.add = MagicMock()
+    mock_session.commit = AsyncMock()
+    mock_session_ctx = MagicMock()
+    mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
+    mocker.patch("app.orchestrator.AsyncSessionLocal", return_value=mock_session_ctx)
+    mocker.patch("app.deploy_health._get_deploy_state_for_update", AsyncMock(return_value=mock_state))
+
+    await _orch_persist()
+
+    snapshot = mock_state.zone_health_state
+    assert snapshot["_last_resume_was_forced"] is True
+
+    _dh._last_resume_was_forced = False
+    _dh._restore_health_streaks(snapshot)
+    assert _dh._last_resume_was_forced is True
+
+    # Missing key -> safe default False.
+    _dh._last_resume_was_forced = True
+    _dh._restore_health_streaks({})
+    assert _dh._last_resume_was_forced is False

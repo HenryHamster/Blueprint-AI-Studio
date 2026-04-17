@@ -103,8 +103,9 @@ def _restore_health_streaks(snapshot: dict) -> None:
     Called once at startup. Tolerates missing keys, legacy int history format, and
     invalid ISO timestamps — corrupt values fall back to safe defaults (0 / empty / None).
     """
-    global _pause_failure_streak, _last_auto_resume_at
+    global _pause_failure_streak, _last_auto_resume_at, _last_resume_was_forced
     _pause_failure_streak = int(snapshot.get("_pause_failure_streak") or 0)
+    _last_resume_was_forced = bool(snapshot.get("_last_resume_was_forced") or False)
     history = snapshot.get("_health_recovery_history")
     _health_recovery_history.clear()
     if isinstance(history, list):
