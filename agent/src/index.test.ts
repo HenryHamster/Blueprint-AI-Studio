@@ -48,7 +48,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
 
 // ── strVal ───────────────────────────────────────────────────────────────────
@@ -490,6 +490,76 @@ describe('testFixLoop directory scoping', () => {
 // `error instanceof RateLimitError` for classification) can't regress into
 // the old cast-and-rematch pattern that silently reclassified rate-limits
 // as CODE_ERROR when stderrBuffer was empty.
+describe('matchesRateLimit', () => {
+  it('detects "you\'ve hit your limit"', () => {
+    expect(matchesRateLimit("you've hit your limit")).toBe(true);
+  });
+
+  it('detects "you\'ve hit your usage limit"', () => {
+    expect(matchesRateLimit("you've hit your usage limit")).toBe(true);
+  });
+
+  it('detects "claude ai usage limit reached"', () => {
+    expect(matchesRateLimit('claude ai usage limit reached')).toBe(true);
+  });
+
+  it('detects "you\'re out of extra usage"', () => {
+    expect(matchesRateLimit("you're out of extra usage")).toBe(true);
+  });
+
+  it('detects "5-hour limit reached"', () => {
+    expect(matchesRateLimit('5-hour limit reached')).toBe(true);
+  });
+
+  it('detects "api error: rate limit reached"', () => {
+    expect(matchesRateLimit('api error: rate limit reached')).toBe(true);
+  });
+
+  it('detects "this request would exceed your account\'s rate limit"', () => {
+    expect(matchesRateLimit("this request would exceed your account's rate limit")).toBe(true);
+  });
+
+  it('matches case-insensitively (uppercase)', () => {
+    expect(matchesRateLimit('API ERROR: RATE LIMIT REACHED')).toBe(true);
+  });
+
+  it('matches case-insensitively (mixed case)', () => {
+    expect(matchesRateLimit('Claude AI Usage Limit Reached')).toBe(true);
+  });
+
+  it('matches when pattern is embedded in surrounding text', () => {
+    expect(matchesRateLimit('Error from Anthropic: API Error: Rate limit reached. Please retry later.')).toBe(true);
+  });
+
+  it('matches when pattern appears after other log lines', () => {
+    expect(matchesRateLimit('line 1\nline 2\nyou\'ve hit your usage limit\nline 4')).toBe(true);
+  });
+
+  it('returns false for a bare "429"', () => {
+    expect(matchesRateLimit('HTTP 429 received')).toBe(false);
+  });
+
+  it('returns false for the word "rate" alone', () => {
+    expect(matchesRateLimit('increased rate of errors')).toBe(false);
+  });
+
+  it('returns false for the word "limit" alone', () => {
+    expect(matchesRateLimit('limit exceeded on some resource')).toBe(false);
+  });
+
+  it('returns false for "overloaded"', () => {
+    expect(matchesRateLimit('server is overloaded')).toBe(false);
+  });
+
+  it('returns false for an empty string', () => {
+    expect(matchesRateLimit('')).toBe(false);
+  });
+
+  it('returns false for unrelated error output', () => {
+    expect(matchesRateLimit('TypeError: cannot read property of undefined')).toBe(false);
+  });
+});
+
 describe('RateLimitError', () => {
   it('is an instance of RateLimitError and Error', () => {
     const err = new RateLimitError('Claude API usage exhausted — banner');
