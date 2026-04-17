@@ -939,6 +939,15 @@ function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | n
                       <p className="text-[9px] text-neutral-600">{data.recent_30d.merged}/{data.recent_30d.created}</p>
                     </div>
                   )}
+                  {data.recent_7d && (
+                    <div className="text-center">
+                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 7d</p>
+                      <p className="text-lg font-bold font-mono text-neutral-300">
+                        {data.recent_7d.merge_rate != null ? `${Math.round(data.recent_7d.merge_rate * 100)}%` : '--'}
+                      </p>
+                      <p className="text-[9px] text-neutral-600">{data.recent_7d.merged}/{data.recent_7d.created}</p>
+                    </div>
+                  )}
                   {deltaPp != null && (
                     <div className="text-center">
                       <p className="text-[10px] text-neutral-500 mb-0.5">Delta</p>
