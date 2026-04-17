@@ -12,7 +12,7 @@ Extracted from app.main to reduce module size. Contains:
 
 import logging
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -57,6 +57,10 @@ _HEALTH_HISTORY_HEALTHY_REQUIRED = 3
 _health_recovery_history: "deque[bool]" = deque(maxlen=_HEALTH_HISTORY_SIZE)
 _last_exhausted_zones: set = set()  # tracks zone health for transition logging
 _last_auto_resume_at: "datetime | None" = None  # timestamp of most recent auto-resume (normal or forced)
+# True when the most recent auto-resume was forced (max pause duration exceeded).
+# Forced resume fires precisely because health checks never stabilized, so ramp-up past
+# 2 VMs additionally requires evidence of real task success (not just healthy probes).
+_last_resume_was_forced: bool = False
 # Timestamps of recent auto-resumes, used to detect pause/resume flapping.
 # Pruned to entries within `flap_window_seconds`; escalation kicks in when size
 # >= `flap_threshold`.
@@ -119,6 +123,15 @@ def _restore_health_streaks(snapshot: dict) -> None:
                 _recent_auto_resumes.append(parsed)
             except ValueError:
                 logger.warning(f"[DEPLOY] Invalid _recent_auto_resumes entry: {v!r}")
+
+
+def _has_recent_task_success(minutes: int = 5) -> bool:
+    """True if deploy_monitoring.task_results has any 'success' entry within the window."""
+    cutoff = (_utcnow() - timedelta(minutes=minutes)).isoformat()
+    for r in _shared_state.deploy_monitoring.get("task_results", ()):
+        if len(r) >= 2 and r[1] == "success" and r[0] >= cutoff:
+            return True
+    return False
 
 
 def should_rollback() -> tuple:
@@ -508,7 +521,7 @@ async def _check_pause_mode():
     auto-pause duration forces resume (with reduced VMs) if healthy probes never
     reach the threshold — preventing indefinite pause under intermittent failures.
     """
-    global _pause_failure_streak, _last_auto_resume_at
+    global _pause_failure_streak, _last_auto_resume_at, _last_resume_was_forced
     ext = _shared_state.external_health
     failed = ext.get("failed_deps", [])
     # Auto-pause on critical deps including Claude API (rate limits, not just missing credentials)
@@ -605,6 +618,15 @@ async def _check_pause_mode():
                 # Gradual ramp-up after auto-resume: DB holds the target, runtime starts low.
                 target = state.runtime_max_concurrent_vms
                 current = _runtime_config["max_concurrent_vms"]
+                # After a forced resume, health probes alone are weak signal — they're what
+                # failed to stabilize in the first place. Gate ramp-up past 2 VMs on evidence
+                # of a real task succeeding in the last 5 minutes.
+                if _last_resume_was_forced and current >= 2 and not _has_recent_task_success(minutes=5):
+                    logger.info(
+                        f"[RAMP] forced-resume gate: holding max_concurrent_vms at {current} "
+                        f"(target: {target}) — no task success in last 5 minutes"
+                    )
+                    return
                 step = min(2, target - current)
                 _runtime_config["max_concurrent_vms"] = current + step
                 logger.info(f"[RAMP] max_concurrent_vms {current} → {current + step} (target: {target})")
@@ -667,6 +689,8 @@ async def _check_pause_mode():
         _recent_auto_resumes.append(now)
         _prune_flap_window(now)
         flap_escalated = len(_recent_auto_resumes) >= _runtime_config.get("flap_threshold", 3)
+
+        _last_resume_was_forced = bool(should_force_resume)
 
         if should_force_resume:
             await _create_forced_resume_alerts(session, pause_duration, critical_failures)

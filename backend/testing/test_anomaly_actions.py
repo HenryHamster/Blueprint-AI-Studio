@@ -618,6 +618,46 @@ def test_fast_recovery_blocked_when_trigger_failures_still_occurring():
     assert _shared_state.runtime_config["max_concurrent_vms"] == 4
 
 
+def test_fast_recovery_tolerates_single_failure_below_rate_threshold():
+    """One triggering failure among many successes is tolerated (<10% rate)."""
+    proj_id = str(uuid.uuid4())
+    _setup_active_adjustment(proj_id, "PROVISION_FAILURE", max_vms=8)
+
+    # 19 successes + 1 PROVISION_FAILURE → 5% triggering rate, below 10% threshold
+    for _ in range(19):
+        _shared_state.deploy_monitoring["task_results"].append(
+            _make_result(success=True, failure_class="", task_type="create")
+        )
+    _shared_state.deploy_monitoring["task_results"].append(
+        _make_result(success=False, failure_class="PROVISION_FAILURE", task_type="create")
+    )
+
+    result = _check_anomaly_restoration()
+    assert result is True
+    assert _shared_state.anomaly_adjustments["active"] is False
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 8
+
+
+def test_fast_recovery_blocked_when_two_failures_exceed_tolerance():
+    """Two triggering failures exceed the max-tolerated count even if rate is low."""
+    proj_id = str(uuid.uuid4())
+    _setup_active_adjustment(proj_id, "PROVISION_FAILURE", max_vms=8)
+
+    # 50 successes + 2 PROVISION_FAILUREs → ~3.8% rate but exceeds count tolerance of 1
+    for _ in range(50):
+        _shared_state.deploy_monitoring["task_results"].append(
+            _make_result(success=True, failure_class="", task_type="create")
+        )
+    for _ in range(2):
+        _shared_state.deploy_monitoring["task_results"].append(
+            _make_result(success=False, failure_class="PROVISION_FAILURE", task_type="create")
+        )
+
+    result = _check_anomaly_restoration()
+    assert result is False
+    assert _shared_state.anomaly_adjustments["active"] is True
+
+
 def test_fast_recovery_blocked_when_sample_too_small():
     """Fast-recovery requires >= MIN_SAMPLE completions; fewer completions block it."""
     proj_id = str(uuid.uuid4())

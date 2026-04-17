@@ -72,11 +72,15 @@ def reset_module_state():
     _dh._reset_health_recovery_history()
     _dh._last_auto_resume_at = None
     _dh._recent_auto_resumes.clear()
+    _dh._last_resume_was_forced = False
+    _shared_state.deploy_monitoring["task_results"].clear()
     yield
     _dh._pause_failure_streak = 0
     _dh._reset_health_recovery_history()
     _dh._last_auto_resume_at = None
     _dh._recent_auto_resumes.clear()
+    _dh._last_resume_was_forced = False
+    _shared_state.deploy_monitoring["task_results"].clear()
 
 
 def _seed_recovery_history(*values):
@@ -573,6 +577,80 @@ async def test_resume_followed_by_rampup_reaches_target(dh_db):
     assert _shared_state.runtime_config["max_concurrent_vms"] == 6
     await _dh._check_pause_mode()
     assert _shared_state.runtime_config["max_concurrent_vms"] == 6  # held at target
+
+
+@pytest.mark.asyncio
+async def test_forced_resume_rampup_gated_without_task_success(dh_db):
+    """After a forced resume, ramp-up past 2 VMs requires a recent successful task."""
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state.runtime_max_concurrent_vms = 8
+    await dh_db.commit()
+
+    _dh._last_resume_was_forced = True
+    _shared_state.runtime_config["max_concurrent_vms"] = 2
+    _shared_state.deploy_monitoring["task_results"].clear()  # no successes
+    _set_healthy()
+
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 2  # gated
+
+
+@pytest.mark.asyncio
+async def test_forced_resume_rampup_proceeds_with_task_success(dh_db):
+    """A recent successful task unblocks forced-resume ramp-up."""
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state.runtime_max_concurrent_vms = 8
+    await dh_db.commit()
+
+    _dh._last_resume_was_forced = True
+    _shared_state.runtime_config["max_concurrent_vms"] = 2
+    _shared_state.deploy_monitoring["task_results"].append(
+        (_dh._utcnow().isoformat(), "success", None, "create")
+    )
+    _set_healthy()
+
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+
+
+@pytest.mark.asyncio
+async def test_forced_resume_gate_stale_success_does_not_count(dh_db):
+    """A success older than 5 minutes does not satisfy the forced-resume gate."""
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state.runtime_max_concurrent_vms = 8
+    await dh_db.commit()
+
+    _dh._last_resume_was_forced = True
+    _shared_state.runtime_config["max_concurrent_vms"] = 2
+    from datetime import timedelta
+    stale = (_dh._utcnow() - timedelta(minutes=10)).isoformat()
+    _shared_state.deploy_monitoring["task_results"].append(
+        (stale, "success", None, "create")
+    )
+    _set_healthy()
+
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 2  # gated
+
+
+@pytest.mark.asyncio
+async def test_normal_resume_rampup_unaffected_by_gate(dh_db):
+    """After a normal (non-forced) resume, ramp-up proceeds without task-success evidence."""
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state.runtime_max_concurrent_vms = 8
+    await dh_db.commit()
+
+    _dh._last_resume_was_forced = False
+    _shared_state.runtime_config["max_concurrent_vms"] = 2
+    _shared_state.deploy_monitoring["task_results"].clear()
+    _set_healthy()
+
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
 
 
 # ── Tests: recovery ring buffer tolerates a single flaky probe ───────────────

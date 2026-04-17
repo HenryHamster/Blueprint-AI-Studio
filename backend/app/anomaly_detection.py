@@ -263,6 +263,12 @@ _ANOMALY_ACTION_THRESHOLD = 3
 # Fast-recovery: rolling window (hours) and minimum completions required
 _FAST_RECOVERY_WINDOW_HOURS = 2
 _FAST_RECOVERY_MIN_SAMPLE = 5
+# Tolerance: allow at most this many triggering failures in the window if they
+# represent less than _FAST_RECOVERY_FAILURE_RATE_MAX of total results. Avoids
+# pinning the throttle for hours when one intermittent failure occurs amid
+# dozens of successes.
+_FAST_RECOVERY_MAX_TOLERATED_FAILURES = 1
+_FAST_RECOVERY_FAILURE_RATE_MAX = 0.10
 
 # Max-duration safeguard: force graduated restoration after this many hours
 # so an anomaly that never goes stale (due to ~12-24h intermittent failures)
@@ -545,10 +551,19 @@ def _check_fast_recovery() -> bool:
     if len(recent_results) < _FAST_RECOVERY_MIN_SAMPLE:
         return False
 
-    # Any failure of a triggering class blocks fast recovery
-    for r in recent_results:
-        if r[1] == "failure" and len(r) > 2 and r[2] in trigger_anomalies:
-            return False
+    # Tolerate a small number of triggering-class failures when they represent
+    # a tiny fraction of recent results (one intermittent failure shouldn't pin
+    # the throttle for hours). Genuine ongoing issues exceed either bound.
+    triggering_failures = sum(
+        1 for r in recent_results
+        if r[1] == "failure" and len(r) > 2 and r[2] in trigger_anomalies
+    )
+    if triggering_failures > _FAST_RECOVERY_MAX_TOLERATED_FAILURES:
+        return False
+    if triggering_failures > 0 and (
+        triggering_failures / len(recent_results) >= _FAST_RECOVERY_FAILURE_RATE_MAX
+    ):
+        return False
 
     # For PROVISION_FAILURE: also verify no recent provision timeout pipeline events
     if "PROVISION_FAILURE" in trigger_anomalies:

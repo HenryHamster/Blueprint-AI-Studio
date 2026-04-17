@@ -46,6 +46,16 @@ from app.time_utils import _utcnow, rate_limit_retry_minutes, set_retry_after
 logger = logging.getLogger("blueprint")
 
 
+def _clear_retry_after_state(ctx: dict) -> None:
+    """Clear retry_after hold and its reset counter.
+
+    Why: the counter feeds an escalation alert; leaving it across recovery
+    episodes causes false escalations on the next rate-limit episode.
+    """
+    ctx.pop("retry_after", None)
+    ctx.pop("_retry_after_resets", None)
+
+
 # ---------------------------------------------------------------------------
 # Module-level globals managed by orchestrator_worker
 # ---------------------------------------------------------------------------
@@ -805,7 +815,7 @@ async def orchestrator_worker():
                                 # pool has recovered. _infra_wait holds wait for zone recovery.
                                 if not (task.context or {}).get("_infra_wait") and await _user_has_available_account(task):
                                     ctx = dict(task.context or {})
-                                    ctx.pop("retry_after", None)
+                                    _clear_retry_after_state(ctx)
                                     task.context = ctx
                                     session.add(task)
                                     logger.info(f"[ORCHESTRATOR] Task {task.id} retry_after cleared early — account pool recovered")
@@ -818,7 +828,7 @@ async def orchestrator_worker():
                     if (task.context or {}).get("_infra_wait"):
                         ctx = dict(task.context or {})
                         ctx.pop("_infra_wait", None)
-                        ctx.pop("retry_after", None)
+                        _clear_retry_after_state(ctx)
                         task.context = ctx
                         session.add(task)
 

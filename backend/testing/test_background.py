@@ -3308,6 +3308,27 @@ async def test_reaper_clears_far_future_retry_after(reaper_db, mocker):
     )
 
 
+def test_clear_retry_after_state_resets_counter():
+    """Releasing a retry_after hold must also clear _retry_after_resets so the
+    next rate-limit episode does not resume from a stale counter and trigger
+    a false escalation."""
+    from app.orchestrator import _clear_retry_after_state
+
+    ctx = {
+        "retry_after": "2026-01-01T00:00:00",
+        "_retry_after_resets": 5,
+        "other": "preserved",
+    }
+    _clear_retry_after_state(ctx)
+    assert "retry_after" not in ctx
+    assert "_retry_after_resets" not in ctx
+    assert ctx["other"] == "preserved"
+
+    # Idempotent on already-clean context
+    _clear_retry_after_state(ctx)
+    assert ctx == {"other": "preserved"}
+
+
 def test_set_retry_after_clamps_to_30_minutes():
     """set_retry_after must cap delays at RETRY_AFTER_MAX_MINUTES."""
     from app.time_utils import set_retry_after, RETRY_AFTER_MAX_MINUTES, parse_retry_after
