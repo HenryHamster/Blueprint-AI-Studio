@@ -1,22 +1,27 @@
 """Targeted unit tests for app/reaper.py.
 
-Focus: the five high-risk branches of reaper logic — orphan detection state
+Focus: the high-risk branches of reaper logic — orphan detection state
 machine, provision failure classification (infra vs task-specific), rate-limit
-requeue path, the retry_after sweep (Step 5b), and the
-_copy_analysis_artifacts_to_previous helper.
+requeue path, non-provision failure classification & retry-delay selection,
+the retry_after sweep (Step 5b), the _copy_analysis_artifacts_to_previous
+helper, and the dependent-task unblocking pass that runs after terminal
+failures.
 """
 import uuid as _uuid_mod
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.sql.elements import TextClause
 from sqlmodel import SQLModel
 
-from app.models import Project, Task, TaskStatus
+from sqlmodel import select as _select
+
+from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.reaper import reaper_service, _copy_analysis_artifacts_to_previous, _reaper_skip_counts
 
 
@@ -408,6 +413,165 @@ async def test_rate_limit_requeue_blacklists_account_and_skips_budget(
     assert "retry_after" not in ctx, "stale retry_after must be cleared on rate-limit requeue"
     assert "provision_failures" not in ctx
     disable_mock.assert_awaited_with("acct-123", "sonnet")
+
+
+# ── Non-provision failure classification & retry delay selection ─────────
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_timeout_empty_logs_classified_as_agent_timeout(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Silent death (heartbeat timeout, no logs) must not default to CODE_ERROR."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-silent-crash",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        # No latest_status_message, no context.last_error — pure heartbeat timeout.
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED
+    assert ctx.get("_previous_failure_class") == "AGENT_TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_timeout_api_error_logs_classified_as_external_api(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Heartbeat timeout with API-error logs routes through EXTERNAL_API."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-api-err",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        context={"last_error": "api.github.com: 502 bad gateway"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED
+    assert ctx.get("_previous_failure_class") == "EXTERNAL_API"
+
+
+@pytest.mark.asyncio
+async def test_external_api_retry_delay_escalates_with_attempt_count(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """EXTERNAL_API attempt_count=2→3 picks the 30-minute tier of [5,15,30,60]."""
+    # Pin jitter below 1.0 so retry_after stays under the Step 5b 30-min cutoff
+    # (which runs in the same cycle and would otherwise clear a 30-min delay).
+    mocker.patch("app.reaper.random.uniform", return_value=0.9)
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-api-escalate",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=2,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        context={"last_error": "api.github.com: 502 bad gateway"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    before = datetime.utcnow()
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 3
+    ra = (t.context or {}).get("retry_after")
+    assert ra, "retry_after must be set after a reaped retry"
+    delay_min = (datetime.fromisoformat(ra) - before).total_seconds() / 60
+    # 30 min * 0.9 = 27 min. Without escalation (e.g. general backoff at attempt 3)
+    # we'd see min(2^2, 15) * 0.9 = 3.6 min, so the 20-min floor confirms escalation.
+    assert 20 <= delay_min <= 29, f"expected ~27min (30min * 0.9 jitter), got {delay_min:.1f}min"
+
+
+@pytest.mark.asyncio
+async def test_general_exponential_backoff_capped_at_15_minutes(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Non-provision, non-EXTERNAL_API retries cap at min(2^(n-1), 15) minutes."""
+    # Raise the AGENT_TIMEOUT budget so attempt_count=5 still retries; pin jitter
+    # to 1.0 so the asserted delay is exactly the cap value.
+    mocker.patch.dict(
+        "app.reaper._runtime_config",
+        {"retry_budgets_by_class": {"AGENT_TIMEOUT": 10, "CODE_ERROR": 2, "EXTERNAL_API": 4}},
+    )
+    mocker.patch("app.reaper.random.uniform", return_value=1.0)
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-expo-cap",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=5,  # will become 6 after the reaper retry increment
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        # Empty logs → classify_failure returns AGENT_TIMEOUT → general backoff.
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    before = datetime.utcnow()
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 6
+    ra = (t.context or {}).get("retry_after")
+    assert ra, "retry_after must be set after a reaped retry"
+    delay_min = (datetime.fromisoformat(ra) - before).total_seconds() / 60
+    # Cap: min(2^5, 15) = 15. Without the cap it would be 32 → clamped at 30 by set_retry_after.
+    assert 14 <= delay_min <= 16, f"expected 15-min cap, got {delay_min:.1f}min"
+
+
+@pytest.mark.asyncio
+async def test_per_class_budget_exhaustion_fails_task(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """CODE_ERROR budget is 2; a task reaped at attempt_count=2 terminally fails."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-budget-exhausted",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=2,  # equals CODE_ERROR budget → can_retry must be False
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        # Plain code-style error that classifies as CODE_ERROR (no special keywords).
+        context={"last_error": "NameError: foo is not defined"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED
+    assert t.attempt_count == 2, "fail path must not increment attempt_count"
+    msg = (t.latest_status_message or "").lower()
+    assert "failed after 2 retries" in msg
+    assert "code_error" in msg
 
 
 # ── Step 5b: retry_after sweep on QUEUED tasks ───────────────────────────
@@ -840,3 +1004,684 @@ async def test_skip_count_stale_entries_cleaned(
     await _run_reaper_once()
 
     assert stale_id not in clean_skip_counts
+
+
+# ── Step 6: QUEUED age alert tier escalation ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_step6_tier1_info_alert_fires_past_threshold(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """QUEUED task older than 1× threshold (2h) → tier-1 INFO alert with correct
+    title/message, and tier persisted in task.context."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        title="stalled-task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        created_at=datetime.utcnow() - timedelta(hours=2, minutes=30),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == t.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.INFO
+    assert "stalled-task" in alerts[0].title
+    assert "Task stalled in queue" in alerts[0].title
+    assert "tier 1" in alerts[0].message
+    assert "Queued for" in alerts[0].message
+    assert (t.context or {}).get("queued_age_alert_tier") == 1
+
+
+@pytest.mark.asyncio
+async def test_step6_tier2_warning_skips_tier1_when_age_exceeds_3x(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A task older than 3× threshold (6h) goes straight to tier-2 WARNING
+    without first firing a tier-1 INFO alert."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        created_at=datetime.utcnow() - timedelta(hours=7),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == t.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "tier 2" in alerts[0].message
+    assert (t.context or {}).get("queued_age_alert_tier") == 2
+
+
+@pytest.mark.asyncio
+async def test_step6_duplicate_tier1_suppressed(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A task whose context already records queued_age_alert_tier=1 must not
+    re-fire a tier-1 alert on the same age bucket."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        created_at=datetime.utcnow() - timedelta(hours=3),
+        context={"queued_age_alert_tier": 1},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == t.id)
+    )).scalars().all()
+    assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_step6_requires_approval_sets_likely_cause(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """When the task has requires_approval=True, the alert message diagnoses
+    the cause as awaiting operator approval."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+        created_at=datetime.utcnow() - timedelta(hours=2, minutes=30),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == t.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    assert "awaiting operator approval" in alerts[0].message
+
+
+# ── Terminal failure finalization (non-provision budget exhausted) ────────
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_non_provision_finalization(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """IN_PROGRESS task with attempt_count >= class budget reaches the terminal
+    failure path: status → FAILED, failure_category persisted, alert invoked,
+    broadcast sent, and the status message carries class + retry count."""
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    broadcast_mock = mocker.patch(
+        "app.broadcast.broadcast_to_project", new_callable=AsyncMock
+    )
+    record_mock = mocker.patch(
+        "app.routers.agent_status.record_task_result"
+    )
+
+    project = await _make_project(reaper_db)
+    # latest_status_message falls through classify_failure to CODE_ERROR (budget=2),
+    # so attempt_count=2 forces can_retry=False → terminal failure branch.
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-terminal",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=2,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        latest_status_message="TypeError: 'NoneType' object is not subscriptable",
+        context={"last_error": "TypeError in handler.py"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED
+
+    ctx = t.context or {}
+    # persist_failure_category writes the class returned by the terminal-path
+    # classify_failure call. Budget exhaustion is decided by the earlier call
+    # (CODE_ERROR), but the terminal call re-classifies after the reaper
+    # rewrites latest_status_message, so the persisted class reflects the
+    # refreshed signal rather than the budget-triggering class.
+    persisted = ctx.get("failure_category")
+    assert persisted in {"CODE_ERROR", "AGENT_TIMEOUT", "EXTERNAL_API", "RATE_LIMIT", "PROVISION_FAILURE"}, \
+        f"failure_category must be persisted as a canonical class, got {persisted!r}"
+
+    alert_mock.assert_awaited()
+    assert alert_mock.await_args.args[0].id == t.id
+
+    record_mock.assert_called_once()
+    kwargs = record_mock.call_args.kwargs
+    assert kwargs["success"] is False
+    assert kwargs["failure_class"] == persisted, \
+        "record_task_result must receive the same class that was persisted"
+    assert kwargs["task_id"] == str(t.id)
+    assert kwargs["task_type"] == "create"
+
+    failed_broadcasts = [
+        call for call in broadcast_mock.await_args_list
+        if call.args[1] == "task_updated"
+        and call.args[2].get("status") == TaskStatus.FAILED
+    ]
+    assert failed_broadcasts, "expected a task_updated broadcast with status FAILED"
+    assert failed_broadcasts[-1].args[0] == str(project.id)
+
+    msg = (t.latest_status_message or "")
+    # fail_reason ("failed after {N} retries ({class})") is passed through
+    # str.capitalize(), which lowercases everything after the first char.
+    assert "code_error" in msg.lower(), \
+        f"status message should carry budget class: {msg!r}"
+    assert "2 retries" in msg, \
+        f"status message should carry retry count: {msg!r}"
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_before_budget_exhausted_not_failed(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Guard: with attempt_count below the class budget, the reaper retries
+    (QUEUED) instead of finalizing. Ensures the terminal test above isolates
+    the budget-exhaustion branch rather than always-failing behavior."""
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-still-retrying",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        latest_status_message="TypeError: 'NoneType' object is not subscriptable",
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    assert (t.context or {}).get("failure_category") is None
+    alert_mock.assert_not_awaited()
+
+
+# ── Step 5: Infrastructure recovery resurrection ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_step5_provision_failure_resurrected_when_zone_available(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """FAILED + failure_category=PROVISION_FAILURE → resurrected to QUEUED
+    when any_zone_available() is True; infra context fields are cleared and
+    _resurrection_count is incremented."""
+    # reaper_side_effects already patches any_zone_available → True.
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        attempt_count=4,
+        context={
+            "failure_category": "PROVISION_FAILURE",
+            "provision_failures": 3,
+            "provision_failures_infra": 2,
+            "_infra_wait": True,
+            "blacklisted_accounts": ["acct-1"],
+            "max_plan_account_id": "acct-1",
+            "retry_after": "2030-01-01T00:00:00",
+            "_slot_released": True,
+            "_api_failure_retries": 4,
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 0
+    assert ctx.get("_resurrection_count") == 1
+    assert ctx.get("_resurrected_from") == "PROVISION_FAILURE"
+    for cleared in (
+        "provision_failures",
+        "provision_failures_infra",
+        "_infra_wait",
+        "blacklisted_accounts",
+        "max_plan_account_id",
+        "retry_after",
+        "_slot_released",
+        "failure_category",
+        "_api_failure_retries",
+    ):
+        assert cleared not in ctx, f"expected {cleared} cleared on resurrection"
+
+
+@pytest.mark.asyncio
+async def test_step5_rate_limit_resurrected_when_account_available(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """FAILED + failure_category=RATE_LIMIT → resurrected when at least one
+    non-blacklisted account is available for the task's model."""
+    mocker.patch(
+        "app.max_plan_pool._all_accounts",
+        return_value=[{"id": "acct-ok"}, {"id": "acct-bad"}],
+    )
+    mocker.patch(
+        "app.max_plan_pool._account_available_for_model",
+        side_effect=lambda acct, model: acct.get("id") == "acct-ok",
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        status=TaskStatus.FAILED,
+        attempt_count=2,
+        context={
+            "failure_category": "RATE_LIMIT",
+            "blacklisted_accounts": ["acct-bad"],
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    assert (t.context or {}).get("_resurrection_count") == 1
+    assert (t.context or {}).get("_resurrected_from") == "RATE_LIMIT"
+
+
+@pytest.mark.asyncio
+async def test_step5_rate_limit_not_resurrected_when_all_accounts_blacklisted(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """RATE_LIMIT with only blacklisted accounts available → NOT resurrected."""
+    mocker.patch(
+        "app.max_plan_pool._all_accounts",
+        return_value=[{"id": "acct-bad"}],
+    )
+    mocker.patch(
+        "app.max_plan_pool._account_available_for_model",
+        return_value=True,
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        status=TaskStatus.FAILED,
+        context={
+            "failure_category": "RATE_LIMIT",
+            "blacklisted_accounts": ["acct-bad"],
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED
+    assert "_resurrection_count" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_step5_resurrection_count_guard_skips_second_attempt(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Task with _resurrection_count >= 1 must not be resurrected again."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        context={
+            "failure_category": "PROVISION_FAILURE",
+            "_resurrection_count": 1,
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED
+    assert (t.context or {}).get("_resurrection_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_step5_parent_task_not_resurrected(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A FAILED parent with child rows must not be resurrected — parents
+    recover through Step 4, not Step 5."""
+    project = await _make_project(reaper_db)
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "PROVISION_FAILURE"},
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    reaper_db.add(Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+    ))
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(parent)
+
+    assert parent.status == TaskStatus.FAILED
+    assert "_resurrection_count" not in (parent.context or {})
+
+
+@pytest.mark.asyncio
+async def test_step5_resurrection_creates_info_alert(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Each resurrected task gets an INFO alert referencing its failure class."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        title="resurrected-task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "PROVISION_FAILURE"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == t.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.INFO
+    assert "PROVISION_FAILURE" in (alerts[0].message or "")
+
+
+# ── Dependent-task unblocking on terminal failure ────────────────────────
+
+
+def _install_dep_unblock_compat(mocker, blocked_id_str: str):
+    """Replace app.reaper.AsyncSessionLocal with a smart factory that routes
+    the dep-unblock session through a Python-level filter (SQLite lacks the
+    JSONB @> operator used by Task.depends_on.contains(...)). The first call
+    (main reaper session) returns the underlying session unchanged; every
+    subsequent call returns a proxy that rewrites the dep-unblock query."""
+    import app.reaper as _reaper_mod
+
+    real_asl = _reaper_mod.AsyncSessionLocal
+    call_count = {"n": 0}
+
+    class _DepSessionProxy:
+        def __init__(self, inner):
+            self._inner = inner
+
+        async def execute(self, stmt, *args, **kwargs):
+            # The dep-unblock query is the only one the proxy sees. Re-issue
+            # it without the JSONB .contains() predicate and filter in Python.
+            plain_stmt = select(Task).where(Task.status == TaskStatus.QUEUED)
+            result = await self._inner.execute(plain_stmt)
+            all_queued = result.scalars().all()
+            matching = [t for t in all_queued if blocked_id_str in (t.depends_on or [])]
+
+            class _FakeResult:
+                def scalars(self_):
+                    class _FakeScalars:
+                        def all(self_2):
+                            return matching
+                    return _FakeScalars()
+            return _FakeResult()
+
+        def add(self, obj):
+            self._inner.add(obj)
+
+        async def commit(self):
+            await self._inner.commit()
+
+        async def __aenter__(self):
+            await self._inner.__aenter__()
+            return self
+
+        async def __aexit__(self, *args):
+            return await self._inner.__aexit__(*args)
+
+    class _SmartASL:
+        def __call__(self):
+            call_count["n"] += 1
+            inner = real_asl()
+            if call_count["n"] == 1:
+                return inner
+            return _DepSessionProxy(inner)
+
+    mocker.patch("app.reaper.AsyncSessionLocal", _SmartASL())
+    return call_count
+
+
+@pytest.mark.asyncio
+async def test_dep_unblocking_removes_failed_id_from_queued_dependent(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """When a task FAILs terminally, a QUEUED task with its ID in depends_on
+    must have that ID removed."""
+    # Disable the Step 5 infra-recovery resurrection so the task stays FAILED.
+    mocker.patch("app.reaper.any_zone_available", return_value=False)
+
+    project = await _make_project(reaper_db)
+    failing = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-dep-fail",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,  # At max_retries budget — reaper will mark FAILED, not retry.
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(failing)
+    await reaper_db.commit()
+    await reaper_db.refresh(failing)
+
+    waiting = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(failing.id)],
+    )
+    reaper_db.add(waiting)
+    await reaper_db.commit()
+    await reaper_db.refresh(waiting)
+
+    _install_dep_unblock_compat(mocker, str(failing.id))
+
+    await _run_reaper_once()
+    await reaper_db.refresh(failing)
+    await reaper_db.refresh(waiting)
+
+    assert failing.status == TaskStatus.FAILED
+    assert str(failing.id) not in (waiting.depends_on or [])
+
+
+@pytest.mark.asyncio
+async def test_dep_unblocking_clears_multiple_dependents_in_one_pass(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """A single terminal failure unblocks every dependent in one cycle."""
+    mocker.patch("app.reaper.any_zone_available", return_value=False)
+
+    project = await _make_project(reaper_db)
+    failing = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-multi-dep",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(failing)
+    await reaper_db.commit()
+    await reaper_db.refresh(failing)
+
+    other_dep_id = str(_uuid_mod.uuid4())
+    waiters = [
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(failing.id)],
+        ),
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+            # Has an extra unrelated dep — only the failed ID should be removed.
+            depends_on=[str(failing.id), other_dep_id],
+        ),
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(failing.id)],
+        ),
+    ]
+    for w in waiters:
+        reaper_db.add(w)
+    await reaper_db.commit()
+    for w in waiters:
+        await reaper_db.refresh(w)
+
+    _install_dep_unblock_compat(mocker, str(failing.id))
+
+    await _run_reaper_once()
+    for w in waiters:
+        await reaper_db.refresh(w)
+
+    for w in waiters:
+        assert str(failing.id) not in (w.depends_on or [])
+    # Unrelated dep on the second waiter must be preserved.
+    assert other_dep_id in (waiters[1].depends_on or [])
+
+
+@pytest.mark.asyncio
+async def test_dep_unblocking_leaves_unrelated_queued_task_alone(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """A QUEUED task that does not depend on the failed task must be untouched."""
+    mocker.patch("app.reaper.any_zone_available", return_value=False)
+
+    project = await _make_project(reaper_db)
+    failing = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-unrelated",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(failing)
+    await reaper_db.commit()
+    await reaper_db.refresh(failing)
+
+    unrelated_dep_id = str(_uuid_mod.uuid4())
+    unrelated = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[unrelated_dep_id],
+    )
+    reaper_db.add(unrelated)
+    await reaper_db.commit()
+    await reaper_db.refresh(unrelated)
+
+    _install_dep_unblock_compat(mocker, str(failing.id))
+
+    await _run_reaper_once()
+    await reaper_db.refresh(unrelated)
+
+    assert unrelated.status == TaskStatus.QUEUED
+    assert unrelated.depends_on == [unrelated_dep_id]
+
+
+@pytest.mark.asyncio
+async def test_dep_unblocking_skipped_when_task_is_retried_not_failed(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """A task whose reap flips it back to QUEUED (retry, not terminal) must
+    not trigger dependent unblocking — dependents remain blocked."""
+    # any_zone_available already True via reaper_side_effects, but retry path
+    # doesn't depend on it; kept default.
+
+    project = await _make_project(reaper_db)
+    retrying = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-retry",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,  # Fresh attempt — reaper will QUEUE for retry, not FAIL.
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(retrying)
+    await reaper_db.commit()
+    await reaper_db.refresh(retrying)
+
+    waiting = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(retrying.id)],
+    )
+    reaper_db.add(waiting)
+    await reaper_db.commit()
+    await reaper_db.refresh(waiting)
+
+    call_tracker = _install_dep_unblock_compat(mocker, str(retrying.id))
+
+    await _run_reaper_once()
+    await reaper_db.refresh(retrying)
+    await reaper_db.refresh(waiting)
+
+    # Reaped into retry (QUEUED) — no terminal FAIL, so dep-unblock must not run.
+    assert retrying.status == TaskStatus.QUEUED
+    assert retrying.attempt_count == 1
+    assert waiting.depends_on == [str(retrying.id)]
+    # Only the main reaper session should have opened — never the dep-session.
+    assert call_tracker["n"] == 1
