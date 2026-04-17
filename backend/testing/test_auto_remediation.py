@@ -385,7 +385,7 @@ async def test_extract_ci_context_test_failure():
         "failed_logs": "FAILED tests/test_main.py::test_foo - AssertionError: 1 != 2\n2 failed",
     }
 
-    with patch("app.auto_remediation.get_check_runs", new_callable=AsyncMock) as mock_runs, \
+    with patch("app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock) as mock_runs, \
          patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
         mock_token.return_value = "ghp_test_token"
         mock_runs.return_value = mock_ci_result
@@ -411,7 +411,7 @@ async def test_extract_ci_context_build_failure():
         "failed_logs": "ImportError: No module named 'missing_dep'\nBuild failed.",
     }
 
-    with patch("app.auto_remediation.get_check_runs", new_callable=AsyncMock) as mock_runs, \
+    with patch("app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock) as mock_runs, \
          patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
         mock_token.return_value = "ghp_test_token"
         mock_runs.return_value = mock_ci_result

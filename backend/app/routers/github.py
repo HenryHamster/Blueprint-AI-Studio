@@ -529,15 +529,18 @@ async def github_webhook(
 
             return {'status': 'no_match'}
 
-        # Fetch full check status for this SHA (1 API call covers all check runs)
-        from app.github import get_check_runs as _get_check_runs
+        # Fetch full check status for this SHA once — every matching sibling
+        # shares the same head_sha, so the cached variant collapses N calls
+        # into 1 (webhook fan-out was one of the biggest per-event burners
+        # when rollup PRs had many children).
+        from app.github import get_check_runs_cached
         from app.routers.agent import get_github_token_for_task
         from app.ci_completion import handle_ci_completion
 
         for task in matching:
             try:
                 gh_token, gh_owner, gh_repo = await get_github_token_for_task(task.id, session)
-                ci_result = await _get_check_runs(gh_token, gh_owner, gh_repo, head_sha, project_id=str(task.project_id))
+                ci_result = await get_check_runs_cached(gh_token, gh_owner, gh_repo, head_sha, project_id=str(task.project_id))
 
                 if ci_result['status'] != 'completed':
                     # Some checks still pending — more webhooks will come

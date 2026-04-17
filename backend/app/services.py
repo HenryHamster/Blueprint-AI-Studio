@@ -3,11 +3,13 @@
 import asyncio
 import contextlib
 import logging
+import re
 import time
 from collections import deque
 from datetime import datetime, timedelta
 
-from sqlalchemy import or_
+from sqlalchemy import or_, cast, func
+from sqlalchemy.types import String
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
@@ -106,9 +108,44 @@ async def secret_reconciliation_service():
 
 _STALE_BRANCH_PREFIXES = ("blueprint/", "research/", "plan/")
 _PROTECTED_BRANCHES = frozenset(["main", "master", "develop", "dev"])
-_MAX_DELETES_PER_PROJECT = 20
-_MAX_DELETES_TOTAL = 50
+# Caps raised from 20/50 after the age check moved off the GitHub API onto the
+# local DB (task.updated_at). The per-branch cost is now a dict lookup + one
+# DELETE call on actually-deleted branches, so the cleanup can absorb much
+# larger backlogs in a single cycle without breaking the 5000/hr budget.
+_MAX_DELETES_PER_PROJECT = 500
+_MAX_DELETES_TOTAL = 1000
 _STALE_BRANCH_AGE_DAYS = 7
+# Skip an entire cleanup cycle when either quota bucket is low — leaves
+# headroom for task spawning and CI polling, and prevents the branch cleanup
+# from being the last straw when something else has already burned the budget.
+_QUOTA_FLOOR = 500       # install-token (5000/hr bucket)
+_JWT_QUOTA_FLOOR = 10    # App-JWT (~60/hr bucket)
+
+# Branch naming conventions these prefixes emit:
+#   blueprint/{task|fix|refactor|docs|deps|migrate}-{short_id}
+#   research/{short_id}
+#   plan/{short_id}
+# short_id is the first 8 hex chars of the owning task's UUID (dashes stripped).
+_BRANCH_SHORT_ID_RE = re.compile(
+    r"^(?:blueprint/(?:task|fix|refactor|docs|deps|migrate)-|research/|plan/)"
+    r"([a-f0-9]{8})$"
+)
+
+# Statuses a task can sit in after it's done. Only branches owned by tasks in
+# one of these states are eligible for stale-branch cleanup.
+_TERMINAL_TASK_STATUSES = frozenset({
+    TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED,
+})
+
+
+def _extract_branch_short_id(branch_name: str) -> str | None:
+    """Return the 8-char task short_id embedded in a branch name, or None.
+
+    Used by the stale branch cleanup to attribute each branch to the task that
+    created it without a GitHub API round-trip.
+    """
+    m = _BRANCH_SHORT_ID_RE.match(branch_name)
+    return m.group(1) if m else None
 
 
 async def _get_project_github_token(project, session):
@@ -136,9 +173,37 @@ async def _get_project_github_token(project, session):
 
 
 async def _run_stale_branch_cleanup():
-    """Delete branches that have no active task and are older than N days."""
+    """Delete branches whose owning task is terminal and >7 days old.
+
+    Uses `task.updated_at` (authoritative, from the local DB) as the age signal
+    instead of fetching commit metadata from GitHub. That drops per-branch cost
+    from one API call to a dict lookup and lets the caps be raised so a large
+    backlog can be cleared in a single cycle.
+
+    Safety: each branch must pass six independent gates before deletion — name
+    isn't protected, isn't on an active task, matches the known naming shape,
+    resolves to a task row we own, that task is terminal, and its updated_at
+    is older than the stale threshold.
+    """
     from app.models import Project
-    from app.github import list_branches, delete_branch, get_commit_date
+    from app.github import list_branches, delete_branch
+
+    # Quota gate — skip the whole cycle if either bucket is low. Avoids the
+    # fail-cascade pattern where cleanup tips an already-strained budget over.
+    it_remaining = _shared_state.github_quota.get("remaining")
+    jwt_remaining = _shared_state.github_jwt_quota.get("remaining")
+    if it_remaining is not None and it_remaining < _QUOTA_FLOOR:
+        logger.info(
+            f"[BRANCH CLEANUP] Skipping cycle — install-token quota "
+            f"{it_remaining} < floor {_QUOTA_FLOOR}"
+        )
+        return
+    if jwt_remaining is not None and jwt_remaining < _JWT_QUOTA_FLOOR:
+        logger.info(
+            f"[BRANCH CLEANUP] Skipping cycle — JWT quota "
+            f"{jwt_remaining} < floor {_JWT_QUOTA_FLOOR}"
+        )
+        return
 
     stale_age = timedelta(days=_STALE_BRANCH_AGE_DAYS)
     total_deleted = 0
@@ -214,11 +279,29 @@ async def _run_stale_branch_cleanup():
                 branches = await list_branches(
                     token, owner, repo,
                     prefixes=list(_STALE_BRANCH_PREFIXES),
-                    max_branches=500,
+                    max_branches=1000,
                 )
             except Exception as e:
                 logger.warning(f"[BRANCH CLEANUP] Failed to list branches for {owner}/{repo}: {e}")
                 continue
+
+            # Batch-load task metadata for every branch whose name matches our
+            # known short_id shape. One SQL query replaces ~N GitHub calls.
+            branch_short_ids = {
+                sid for b in branches
+                if (sid := _extract_branch_short_id(b["name"]))
+            }
+            task_meta: dict[str, tuple] = {}
+            if branch_short_ids:
+                rows = (await session.execute(
+                    select(Task.id, Task.status, Task.updated_at).where(
+                        Task.project_id == project.id,
+                        func.substr(cast(Task.id, String), 1, 8).in_(branch_short_ids),
+                    )
+                )).all()
+                for row in rows:
+                    sid = str(row.id).replace("-", "")[:8]
+                    task_meta[sid] = (row.status, row.updated_at)
 
             project_deleted = 0
             for branch_info in branches:
@@ -228,38 +311,51 @@ async def _run_stale_branch_cleanup():
                     break
 
                 name = branch_info["name"]
-                sha = branch_info["sha"]
 
-                # Safety: never touch protected branches
+                # Gate 1: never touch protected branches
                 if name in _PROTECTED_BRANCHES:
                     continue
 
-                # Skip if referenced by an active task
+                # Gate 2: skip if the name matches any active task's branch
                 if name in active_branches:
                     continue
 
-                # Get commit date to check age
-                try:
-                    commit_date = await get_commit_date(token, owner, repo, sha)
-                except Exception:
-                    continue
-                if commit_date is None:
-                    continue
-
-                # Normalise to naive UTC for comparison
-                if commit_date.tzinfo is not None:
-                    commit_date = commit_date.replace(tzinfo=None)
-                if (now - commit_date) < stale_age:
+                # Gate 3: name must match the known cleanup shape. Unknown
+                # shapes (hand-created branches someone kept around, legacy
+                # naming, etc.) are left alone.
+                short_id = _extract_branch_short_id(name)
+                if not short_id:
                     continue
 
-                # Delete the stale branch
+                # Gate 4: short_id must resolve to a task we own. Missing
+                # means the task row was deleted or the branch belongs to a
+                # different system — in either case, not ours to delete.
+                meta = task_meta.get(short_id)
+                if meta is None:
+                    continue
+
+                # Gate 5: task must be terminal. This catches the case where
+                # a research/plan task is active but active_branches didn't
+                # include its computed `research/{short_id}` or
+                # `plan/{short_id}` name (the existing active_branches
+                # derivation only computes `blueprint/{prefix}-{short_id}`).
+                status, updated_at = meta
+                if status not in _TERMINAL_TASK_STATUSES:
+                    continue
+
+                # Gate 6: DB-authoritative age check.
+                if updated_at.tzinfo is not None:
+                    updated_at = updated_at.replace(tzinfo=None)
+                if (now - updated_at) < stale_age:
+                    continue
+
                 try:
                     deleted = await delete_branch(token, owner, repo, name)
                     if deleted:
-                        age_days = (now - commit_date).days
+                        age_days = (now - updated_at).days
                         logger.info(
                             f"[BRANCH CLEANUP] Deleted {name} from {owner}/{repo} "
-                            f"(age: {age_days}d)"
+                            f"(task {short_id}, {status}, age: {age_days}d)"
                         )
                         project_deleted += 1
                         total_deleted += 1
@@ -295,7 +391,10 @@ async def _run_stale_branch_cleanup():
                     logger.warning(f"[BRANCH CLEANUP] Failed to create cleanup alert: {e}")
 
     if total_deleted > 0:
-        logger.info(f"[BRANCH CLEANUP] Total deleted this cycle: {total_deleted}")
+        logger.info(
+            f"[BRANCH CLEANUP] Total deleted this cycle: {total_deleted} "
+            f"(DB-authoritative age check, 0 commit-date API calls)"
+        )
 
 
 async def stale_branch_cleanup_service():
@@ -1023,7 +1122,18 @@ async def _recover_orphaned_tasks():
                 if any(t.first_payload.get("type") == "review" for t in children):
                     continue
 
-                # Orphaned — try to find PR on GitHub
+                # Orphan has no PR yet. Cap retries — if we've looked 3 times
+                # and found nothing, stop burning API quota on this row until
+                # new evidence (an artifact showing up via webhook) arrives.
+                # Recovery service runs every 120s; 3 attempts = ~6 min window
+                # which is enough to catch the usual "PR created a few seconds
+                # after agent reported done" race but won't keep polling for
+                # the full 55-minute scan window.
+                ctx = task.context or {}
+                attempts_so_far = int(ctx.get("_recovery_attempts", 0))
+                if attempts_so_far >= 3:
+                    continue
+
                 try:
                     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                 except Exception:
@@ -1046,7 +1156,11 @@ async def _recover_orphaned_tasks():
                     continue
 
                 if not prs:
-                    logger.info(f"[RECOVERY] Skipping orphan {str(task.id)[:8]} — no open PR found for branch {branch}")
+                    # Record the miss so we back off after N failed lookups.
+                    task.context = {**ctx, "_recovery_attempts": attempts_so_far + 1}
+                    session.add(task)
+                    await session.commit()
+                    logger.info(f"[RECOVERY] Skipping orphan {str(task.id)[:8]} — no open PR found for branch {branch} (attempt {attempts_so_far + 1}/3)")
                     continue
 
                 pr = prs[0]

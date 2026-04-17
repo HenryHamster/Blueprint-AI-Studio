@@ -9,7 +9,20 @@ imports (rollup_management is imported BY main indirectly via task_lifecycle)
 and preserve test-patchability.
 """
 import logging
+import time
+import uuid
 from datetime import timedelta
+
+
+# Module-level negative cache for PR-merge verification keyed by task.id.
+# When a cycle discovers a child's PR isn't merged yet, the reaper's next
+# 60s tick (plus any fan-out from sibling completion events) would otherwise
+# re-fetch the same PR.  Stamping here is session-independent — unlike a
+# task.context mutation, which only persists if the caller happens to commit
+# the attached object.  A 30s TTL is short enough that a merge happening
+# between checks is detected within one cycle.
+_PR_MERGE_NEGATIVE_TTL_S = 30
+_pr_merge_negative_cache: dict[uuid.UUID, float] = {}
 
 from fastapi import HTTPException
 from sqlalchemy import func as _func
@@ -69,6 +82,19 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
 
     if (task.context or {}).get("pr_merged"):
         return True
+
+    # Negative-result cache: when a batch of sibling children completes in
+    # quick succession, every completion event triggers _check_and_trigger_rollup
+    # which re-verifies every child.  Without this, 20 children completing at
+    # once == 400 PR lookups in a short window.  Module-level dict keyed by
+    # task.id — session-independent so the check works regardless of whether
+    # the caller commits between fan-out calls.
+    _last_negative = _pr_merge_negative_cache.get(task.id)
+    if _last_negative is not None and (time.time() - _last_negative) < _PR_MERGE_NEGATIVE_TTL_S:
+        import app.shared_state as _ss  # noqa: PLC0415
+        _ss.github_cache_hits["pr_merge_negative"] = _ss.github_cache_hits.get("pr_merge_negative", 0) + 1
+        return False
+
     # Look for PR artifact to verify via API
     art_result = await session.execute(
         select(Artifact).where(Artifact.task_id == task.id, Artifact.artifact_type == ArtifactType.PULL_REQUEST)
@@ -152,6 +178,14 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 return True  # Return True so callers don't block — task is now FAILED which they handle
         except Exception as e:
             logger.warning(f"[PR_VERIFY] Failed to verify PR merge for task {task.id}: {e}", exc_info=True)
+    # Stamp the negative cache so the next caller within the TTL skips the
+    # GitHub round-trip.  Lazy eviction: keep it lightweight, drop entries
+    # that are clearly stale whenever we detect the dict is oversized.
+    _pr_merge_negative_cache[task.id] = time.time()
+    if len(_pr_merge_negative_cache) > 2000:
+        cutoff = time.time() - (_PR_MERGE_NEGATIVE_TTL_S * 4)
+        for k in [k for k, ts in _pr_merge_negative_cache.items() if ts < cutoff]:
+            _pr_merge_negative_cache.pop(k, None)
     return False
 
 async def _cleanup_branches(task: Task, session: AsyncSession) -> None:

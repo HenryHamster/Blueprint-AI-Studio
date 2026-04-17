@@ -63,7 +63,6 @@ from app.github import (
     merge_pull_request,
     get_pull_request,
     get_pr_files,
-    get_check_runs,
     close_github_client,
 )
 from app.shared_state import limiter
@@ -1089,11 +1088,18 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
         key=lambda kv: kv[1],
         reverse=True,
     )[:15]
+    # Cache-hit counters — calls we did NOT send to GitHub thanks to dedup /
+    # short-circuit.  Compare against total_calls_this_window: if hits >> calls,
+    # the caches are earning their keep.  See github.py:get_check_runs_cached,
+    # security.py:scan_pr_for_injection, rollup_management.py:_verify_pr_merged.
+    _cache_hits = dict(_shared_state.github_cache_hits)
     components["github_quota"] = {
         **gq,
         "status": _q_status,
         "top_endpoints": [{"endpoint": ep, "count": n} for ep, n in _top_calls],
         "total_calls_this_window": sum(_shared_state.github_call_counts.values()),
+        "cache_hits_this_window": _cache_hits,
+        "calls_avoided_this_window": sum(_cache_hits.values()),
     }
 
     # --- Pipeline Health (rolling reaper signals) ---

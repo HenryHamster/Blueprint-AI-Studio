@@ -542,7 +542,7 @@ async def _process_post_commit(
     from app.security import scan_pr_for_injection
     from app.github import (
         create_pr_comment, merge_pull_request, get_pull_request,
-        get_pr_files, get_check_runs, submit_pr_review, update_check_run,
+        get_pr_files, get_check_runs_cached, submit_pr_review, update_check_run,
         close_pull_request,
     )
     from app.task_completion import (
@@ -1202,7 +1202,7 @@ async def _process_post_commit(
                         # Check CI status before merging (only for PRs targeting main)
                         head_sha = pr_data.get("head", {}).get("sha", "")
                         is_main_merge = base_branch == "main"
-                        ci_status = await get_check_runs(gh_token, owner, repo, head_sha, project_id=str(task.project_id)) if (head_sha and is_main_merge) else None
+                        ci_status = await get_check_runs_cached(gh_token, owner, repo, head_sha, project_id=str(task.project_id)) if (head_sha and is_main_merge) else None
 
                         if ci_status and ci_status["status"] != "completed":
                             # CI still running — park task in EVALUATING (no VM consumed)
@@ -1571,7 +1571,7 @@ async def _process_post_commit(
                         pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
                         head_sha = pr_data.get("head", {}).get("sha", "")
                         if head_sha:
-                            ci_check = await get_check_runs(gh_token, owner, repo, head_sha)
+                            ci_check = await get_check_runs_cached(gh_token, owner, repo, head_sha)
                             if ci_check.get("conclusion") == "failure" and ci_check.get("failed_logs"):
                                 ci_errors_text = f"\n\nCI build errors (also need fixing):\n{ci_check['failed_logs']}"
                     except Exception as e:

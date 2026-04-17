@@ -539,6 +539,19 @@ github_quota: Dict = {
     "last_updated": None,           # isoformat str, last observation
 }
 
+# Separate bucket for App-JWT (~60/hr). Used by /app/installations/*/access_tokens
+# and other /app/* endpoints that authenticate with a GitHub App JWT rather than
+# an installation token. Tracked separately so we don't mix the two — a drained
+# JWT bucket stalls token minting (which in turn stalls everything else), and we
+# want to short-circuit calls to that bucket when it's empty instead of retrying
+# and counting three 403s per logical request.
+github_jwt_quota: Dict = {
+    "remaining": None,
+    "limit": None,
+    "reset_at": None,
+    "last_updated": None,
+}
+
 # --- GitHub REST Call Counters ---
 # Every _github_request bumps the count for its normalized endpoint template
 # (e.g. "GET /repos/{owner}/{repo}/pulls/{n}") so we can see which endpoints
@@ -547,6 +560,18 @@ github_quota: Dict = {
 # (numbers, SHAs, branch refs) collapses the natural cardinality explosion.
 github_call_counts: Dict[str, int] = {}
 github_call_counts_window_reset_at: int | None = None
+
+# Cache-hit counters — exposed in /api/health/detailed so we can see whether
+# the dedup caches are actually firing in production.  Each entry here is a
+# request we didn't have to send to GitHub.  Reset on the same window as
+# github_call_counts so "hits per window" is directly comparable to "calls
+# per window" — if hits dominate, the caches are earning their keep.
+github_cache_hits: Dict[str, int] = {
+    "check_runs": 0,
+    "scan_pr": 0,
+    "pr_merge_negative": 0,
+    "bucket_short_circuit": 0,
+}
 
 # Track last successful GitHub API operation (tokens, PR comments, etc.)
 # Used by health check to passively verify GitHub is reachable without

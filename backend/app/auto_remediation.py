@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
-from app.github import get_check_runs, get_repo_installation_token
+from app.github import get_check_runs_cached, get_repo_installation_token
 from app.models import Project, Task, TaskStatus
 from app.notification_dispatch import post_auto_fix_spawned_message
 from app.time_utils import _utcnow
@@ -140,7 +140,7 @@ async def _handle_main_branch_ci_failure_inner(
             owner, repo, head_branch,
         )
         if latest_sha != head_sha:
-            latest_ci = await get_check_runs(
+            latest_ci = await get_check_runs_cached(
                 await get_repo_installation_token(owner, repo),
                 owner, repo, latest_sha,
             )
@@ -263,7 +263,7 @@ async def _extract_ci_context(
             logger.warning("[AUTO-REMEDIATION] No GitHub token available for %s/%s", owner, repo)
             return failed_checks, error_summary, failure_type
 
-        ci_result = await get_check_runs(token, owner, repo, head_sha, project_id=str(project_id))
+        ci_result = await get_check_runs_cached(token, owner, repo, head_sha, project_id=str(project_id))
         details = ci_result.get("details", [])
         failed_checks = [
             d["name"] for d in details

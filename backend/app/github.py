@@ -121,17 +121,49 @@ async def probe_rate_limit() -> bool:
         return False
 
 
-def _update_quota_state(remaining: int, limit: int | None, reset_ts: int | None) -> None:
-    """Mirror X-RateLimit-* headers into shared_state.github_quota.
+# Fail-fast threshold for the retry loop: if a rate-limited response's reset
+# window is further out than this, return the response immediately instead of
+# sleeping and retrying.  Caller sees the 403 and can decide; no amplified
+# counter increment, no blocked worker, no JWT bucket re-drained.
+RATE_LIMIT_FAST_FAIL_THRESHOLD_S = 5
+
+
+def _relevant_bucket(url: str, headers: dict | None) -> dict:
+    """Identify which shared_state bucket a request belongs to.
+
+    Install-token (ghs_/ghu_) → github_quota (5000/hr).
+    App JWT (Bearer eyJ...) or /app/* URL → github_jwt_quota (~60/hr).
+    Everything else (unauthenticated, PAT) → github_quota as the default; we
+    only *gate* on values we actually observed, so an unused bucket won't cause
+    spurious short-circuits.
+    """
+    import app.shared_state as _ss  # noqa: PLC0415
+    auth = (headers or {}).get("Authorization", "")
+    if "/app/" in url or auth.startswith("Bearer eyJ"):
+        return _ss.github_jwt_quota
+    return _ss.github_quota
+
+
+def _update_quota_state(
+    remaining: int, limit: int | None, reset_ts: int | None,
+    *, bucket_name: str = "install",
+) -> None:
+    """Mirror X-RateLimit-* headers into the correct shared_state quota bucket.
+
+    `bucket_name` ∈ {"install", "jwt"} — selects `github_quota` or
+    `github_jwt_quota`.  Previously only the install-token bucket was tracked;
+    splitting lets the JWT bucket get its own pre-call short-circuit and lets
+    the dashboard pill stay scoped to install-token.
 
     Keeps the LOWEST `remaining` seen before the reset time (so a later
     higher value doesn't mask a recent crisis until the window resets).
-    Resets the per-endpoint call counter on each quota-window rollover so
-    the counts always describe the current 1-hour window.
+    Resets the per-endpoint call counter on each install-bucket quota-window
+    rollover so the counts always describe the current 1-hour window; the JWT
+    bucket is tracked independently and does not affect the counter.
     """
     from datetime import datetime, timezone
     import app.shared_state as _ss  # noqa: PLC0415
-    q = _ss.github_quota
+    q = _ss.github_jwt_quota if bucket_name == "jwt" else _ss.github_quota
     now_iso = datetime.now(timezone.utc).isoformat()
     prev_reset = q.get("reset_at")
     prev_remaining = q.get("remaining")
@@ -152,9 +184,14 @@ def _update_quota_state(remaining: int, limit: int | None, reset_ts: int | None)
     )
     accept_unconditional = bucket_switched or rolled_over
     if accept_unconditional:
-        _ss.github_call_counts.clear()
-        if reset_ts is not None:
-            _ss.github_call_counts_window_reset_at = reset_ts
+        # Endpoint counter reset only makes sense for the install bucket — the
+        # counter scopes to "this 5000/hr window", not to JWT activity.
+        if bucket_name == "install":
+            _ss.github_call_counts.clear()
+            for k in _ss.github_cache_hits:
+                _ss.github_cache_hits[k] = 0
+            if reset_ts is not None:
+                _ss.github_call_counts_window_reset_at = reset_ts
         q["remaining"] = remaining
     elif prev_remaining is None or remaining < prev_remaining:
         q["remaining"] = remaining
@@ -162,9 +199,31 @@ def _update_quota_state(remaining: int, limit: int | None, reset_ts: int | None)
         q["limit"] = limit
     if reset_ts is not None:
         q["reset_at"] = reset_ts
-        if _ss.github_call_counts_window_reset_at is None:
+        if bucket_name == "install" and _ss.github_call_counts_window_reset_at is None:
             _ss.github_call_counts_window_reset_at = reset_ts
     q["last_updated"] = now_iso
+
+
+def _synthetic_rate_limited_response(bucket: dict) -> httpx.Response:
+    """Return a 403 rate-limited response without making a network call.
+
+    Used when we already know the relevant bucket is empty — keeps the caller's
+    error-handling path identical while avoiding the wasted retry and the
+    amplified per-endpoint counter increment.
+    """
+    reset = bucket.get("reset_at") or int(time.time()) + 60
+    headers = {
+        "X-RateLimit-Remaining": "0",
+        "X-RateLimit-Limit": str(bucket.get("limit") or 0),
+        "X-RateLimit-Reset": str(reset),
+        "Content-Type": "application/json",
+    }
+    return httpx.Response(
+        status_code=403,
+        headers=headers,
+        content=b'{"message":"rate limit exceeded (short-circuited locally)"}',
+        request=None,
+    )
 
 
 async def _github_request(
@@ -177,6 +236,26 @@ async def _github_request(
 ) -> httpx.Response:
     """Make a GitHub API request with retry on 5xx/network/rate-limit errors."""
     response = None
+    # Pre-call bucket check: if we've recently observed the relevant bucket at
+    # zero with a reset more than RATE_LIMIT_FAST_FAIL_THRESHOLD_S away, don't
+    # bother sending — the response will be a 403 anyway, which would count
+    # against the per-endpoint counter and trigger downstream retry loops.
+    bucket = _relevant_bucket(url, headers)
+    b_remaining = bucket.get("remaining")
+    b_reset = bucket.get("reset_at")
+    if (
+        b_remaining == 0
+        and b_reset is not None
+        and (b_reset - int(time.time())) > RATE_LIMIT_FAST_FAIL_THRESHOLD_S
+    ):
+        import app.shared_state as _ss  # noqa: PLC0415
+        label = "JWT" if bucket is _ss.github_jwt_quota else "install-token"
+        _ss.github_cache_hits["bucket_short_circuit"] = _ss.github_cache_hits.get("bucket_short_circuit", 0) + 1
+        logger.warning(
+            f"[GITHUB] {method} {url} short-circuited — {label} bucket empty, "
+            f"resets in {b_reset - int(time.time())}s"
+        )
+        return _synthetic_rate_limited_response(bucket)
     for attempt in range(max_retries):
         try:
             client = _get_client()
@@ -204,6 +283,16 @@ async def _github_request(
                     delay = min(max(0, int(reset_ts) - int(time.time())) + 1, 120)
                 else:
                     delay = min(2 ** attempt * 10, 120)
+                # Fail fast on "hard" rate limits: if the reset window is more
+                # than a few seconds out, retrying is guaranteed to burn extra
+                # 403s against the counter without changing the outcome. Return
+                # the response; the caller can decide whether to retry later.
+                if delay > RATE_LIMIT_FAST_FAIL_THRESHOLD_S:
+                    logger.warning(
+                        f"[GITHUB] {method} {url} rate limited ({response.status_code}); "
+                        f"reset in {delay}s — failing fast (no retry)"
+                    )
+                    return response
                 logger.warning(
                     f"[GITHUB] {method} {url} rate limited ({response.status_code}), "
                     f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})"
@@ -227,27 +316,28 @@ async def _github_request(
             # Mirror rate-limit headers into shared_state so /api/health/detailed
             # and the dashboard widget can show remaining quota + reset time.
             # GitHub has SEPARATE rate-limit buckets per token type:
-            #   - Installation token (ghs_... or ghu_...): 5000/hr
-            #   - App JWT (eyJ...): ~60/hr for app endpoints
-            #   - PAT / user token: 5000/hr
-            #   - Unauthenticated: 60/hr
-            # The pill tracks the installation-token bucket because that's
-            # what task-driven orchestrator calls hit.  App-JWT calls
-            # (probe_rate_limit, installation discovery) live in a much
-            # smaller bucket and would pollute the gauge with misleading
-            # "60 remaining" readings.  Skip the update when we can
-            # identify a non-installation-token call.
+            #   - Installation token (ghs_... or ghu_...): 5000/hr → github_quota
+            #   - App JWT (eyJ...) / /app/* endpoints: ~60/hr → github_jwt_quota
+            #   - PAT / user token: 5000/hr → github_quota (treated as install)
+            #   - Unauthenticated: 60/hr → not tracked (would pollute)
             if remaining is not None:
                 _auth = headers.get("Authorization", "") if headers else ""
                 _is_install_token = "Bearer ghs_" in _auth or "Bearer ghu_" in _auth
-                # No Authorization → unauthenticated (60/hr) → don't track.
-                # JWT (eyJ...) → App-JWT bucket → don't track.
+                _is_jwt = "/app/" in url or _auth.startswith("Bearer eyJ")
+                _bucket_name: str | None
                 if _is_install_token:
+                    _bucket_name = "install"
+                elif _is_jwt:
+                    _bucket_name = "jwt"
+                else:
+                    _bucket_name = None  # unauthenticated / unknown — don't track
+                if _bucket_name is not None:
                     try:
                         _update_quota_state(
                             remaining=int(remaining),
                             limit=int(response.headers.get("X-RateLimit-Limit", 0)) or None,
                             reset_ts=int(response.headers.get("X-RateLimit-Reset", 0)) or None,
+                            bucket_name=_bucket_name,
                         )
                     except (ValueError, TypeError):
                         pass  # Malformed headers, skip
@@ -1663,3 +1753,52 @@ async def get_check_runs(
         "details": details,
         "failed_logs": failed_logs,
     }
+
+
+# ─── Short-lived dedup cache for check-runs lookups ─────────────────────────
+# The CI-wait loop in the orchestrator and the check_run webhook handler both
+# fetch check-runs per task that's watching a PR.  When N sibling tasks share
+# the same head_sha (a rollup with N children is the common case), each task
+# was making its own API call — 20 children on one PR = 20 duplicate calls per
+# poll interval.  A 30s TTL cache collapses siblings into one call without
+# adding any cross-cycle staleness risk beyond the poll interval itself.
+_CHECK_RUNS_CACHE_TTL_S = 30
+_CHECK_RUNS_CACHE_MAX = 500  # entries; cheap eviction when oversized
+_check_runs_cache: dict[tuple[str, str, str], tuple[dict, float]] = {}
+
+
+def invalidate_check_runs_cache(owner: str, repo: str, head_sha: str) -> None:
+    """Drop the cached check-runs result for a SHA — call when the caller
+    observes a transition it needs to see immediately (e.g. a webhook arrived
+    indicating a new run started).  Safe to call when the key isn't present."""
+    _check_runs_cache.pop((owner, repo, head_sha), None)
+
+
+async def get_check_runs_cached(
+    token: str, owner: str, repo: str, head_sha: str,
+    *, project_id: str | None = None,
+    ttl: float = _CHECK_RUNS_CACHE_TTL_S,
+) -> dict:
+    """Cached wrapper around ``get_check_runs``.
+
+    TTL is short (30s) so a fresh webhook or a status change is picked up on
+    the next orchestrator cycle — the cache exists purely to deduplicate
+    simultaneous fan-out from siblings watching the same PR, not to mask
+    status changes over time.
+    """
+    import app.shared_state as _ss  # noqa: PLC0415
+    key = (owner, repo, head_sha)
+    now = time.time()
+    cached = _check_runs_cache.get(key)
+    if cached is not None and (now - cached[1]) < ttl:
+        _ss.github_cache_hits["check_runs"] = _ss.github_cache_hits.get("check_runs", 0) + 1
+        return cached[0]
+    result = await get_check_runs(token, owner, repo, head_sha, project_id=project_id)
+    _check_runs_cache[key] = (result, now)
+    # Lazy eviction: when the dict gets oversized, drop anything older than
+    # 2×TTL.  Cheap, avoids unbounded growth across long-lived processes.
+    if len(_check_runs_cache) > _CHECK_RUNS_CACHE_MAX:
+        cutoff = now - (ttl * 2)
+        for k in [k for k, (_, ts) in _check_runs_cache.items() if ts < cutoff]:
+            _check_runs_cache.pop(k, None)
+    return result

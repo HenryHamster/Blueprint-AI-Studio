@@ -425,16 +425,21 @@ async def cleanup_db(mocker):
     await engine.dispose()
 
 
+def _uuid_with_prefix(hex8: str) -> uuid.UUID:
+    """Build a deterministic UUID whose stringified short_id (first 8 hex) matches."""
+    return uuid.UUID(f"{hex8}-0000-0000-0000-000000000000")
+
+
 @pytest.mark.asyncio
 async def test_stale_branch_cleanup_preserves_active_task_branch(cleanup_db, mocker):
-    """Branches referenced by active tasks must not be deleted."""
+    """Branches owned by active (non-terminal) tasks must not be deleted."""
     project = Project(name="Cleanup Test", user_id="user1", github_owner="org", github_repo="repo")
     cleanup_db.add(project)
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
 
-    # Active task with a known branch in its context
     task = Task(
+        id=_uuid_with_prefix("abc12345"),
         project_id=project.id,
         payloads=[{"type": "create"}],
         status=TaskStatus.IN_PROGRESS,
@@ -443,38 +448,44 @@ async def test_stale_branch_cleanup_preserves_active_task_branch(cleanup_db, moc
     cleanup_db.add(task)
     await cleanup_db.commit()
 
-    # Mock GitHub: one stale branch belonging to the active task
-    old_date = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
     mocker.patch("app.services._get_project_github_token", return_value="tok")
     mocker.patch("app.github.list_branches", return_value=[
         {"name": "blueprint/task-abc12345", "sha": "sha1"},
     ])
-    mocker.patch("app.github.get_commit_date", return_value=datetime.utcnow() - timedelta(days=30))
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
     await _run_stale_branch_cleanup()
 
-    # Branch belongs to an active task — must not be deleted
+    # Gate 2 (name in active_branches) AND Gate 5 (status is IN_PROGRESS) both protect.
     mock_delete.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_stale_branch_cleanup_deletes_orphaned_branch(cleanup_db, mocker):
-    """Branches older than 7 days with no active task should be deleted."""
+    """Branches whose owning task is TERMINAL and >7 days stale should be deleted."""
     project = Project(name="Cleanup Test 2", user_id="user2", github_owner="org", github_repo="repo")
     cleanup_db.add(project)
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
 
-    # No active tasks — branch is truly orphaned
+    old = datetime.utcnow() - timedelta(days=10)
+    task = Task(
+        id=_uuid_with_prefix("deadbeef"),
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+    )
+    cleanup_db.add(task)
+    await cleanup_db.commit()
+    # Force updated_at into the past — default_factory set it to "now"
+    task.updated_at = old
+    cleanup_db.add(task)
+    await cleanup_db.commit()
+
     mocker.patch("app.services._get_project_github_token", return_value="tok")
     mocker.patch("app.github.list_branches", return_value=[
         {"name": "blueprint/task-deadbeef", "sha": "sha2"},
     ])
-    mocker.patch(
-        "app.github.get_commit_date",
-        return_value=datetime.utcnow() - timedelta(days=10),
-    )
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
     await _run_stale_branch_cleanup()
@@ -491,17 +502,99 @@ async def test_stale_branch_cleanup_spares_protected_branches(cleanup_db, mocker
     await cleanup_db.refresh(project)
 
     mocker.patch("app.services._get_project_github_token", return_value="tok")
-    # These start with "blueprint/" so they pass the prefix filter, but names are protected
-    # Use realistic names that start with the allowed prefixes — the protected check is by exact name
     mocker.patch("app.github.list_branches", return_value=[
         {"name": "main", "sha": "sha3"},
         {"name": "master", "sha": "sha4"},
         {"name": "develop", "sha": "sha5"},
     ])
-    mocker.patch(
-        "app.github.get_commit_date",
-        return_value=datetime.utcnow() - timedelta(days=30),
+    mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
+
+    await _run_stale_branch_cleanup()
+
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_cleanup_skips_active_task_with_old_updated_at(cleanup_db, mocker):
+    """A task that's still IN_PROGRESS must not have its branch deleted, even if
+    the row's updated_at is ancient (which can happen when a long-running task
+    predates the cleanup threshold). Gate 5 catches this."""
+    project = Project(name="Cleanup Test 4", user_id="user4", github_owner="org", github_repo="repo")
+    cleanup_db.add(project)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(project)
+
+    old = datetime.utcnow() - timedelta(days=30)
+    task = Task(
+        id=_uuid_with_prefix("cafef00d"),
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+        # Context deliberately lacks a branch key so name-based active_branches
+        # won't catch it — forces Gate 5 (status check) to do the work.
     )
+    cleanup_db.add(task)
+    await cleanup_db.commit()
+    task.updated_at = old
+    cleanup_db.add(task)
+    await cleanup_db.commit()
+
+    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.github.list_branches", return_value=[
+        {"name": "blueprint/task-cafef00d", "sha": "sha4"},
+    ])
+    mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
+
+    await _run_stale_branch_cleanup()
+
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_cleanup_skips_branch_with_no_matching_task(cleanup_db, mocker):
+    """If a branch's short_id doesn't resolve to any task in the DB, skip it —
+    we only delete what we can attribute. Gate 4."""
+    project = Project(name="Cleanup Test 5", user_id="user5", github_owner="org", github_repo="repo")
+    cleanup_db.add(project)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(project)
+
+    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.github.list_branches", return_value=[
+        {"name": "blueprint/task-ffffffff", "sha": "sha5"},  # no task owns this
+    ])
+    mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
+
+    await _run_stale_branch_cleanup()
+
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_cleanup_skips_recent_terminal_task(cleanup_db, mocker):
+    """Terminal task that finished <7 days ago should keep its branch. Gate 6."""
+    project = Project(name="Cleanup Test 6", user_id="user6", github_owner="org", github_repo="repo")
+    cleanup_db.add(project)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(project)
+
+    recent = datetime.utcnow() - timedelta(days=2)
+    task = Task(
+        id=_uuid_with_prefix("12345678"),
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+    )
+    cleanup_db.add(task)
+    await cleanup_db.commit()
+    task.updated_at = recent
+    cleanup_db.add(task)
+    await cleanup_db.commit()
+
+    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.github.list_branches", return_value=[
+        {"name": "blueprint/task-12345678", "sha": "sha6"},
+    ])
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
     await _run_stale_branch_cleanup()
@@ -730,9 +823,13 @@ async def test_requeue_rate_limit_no_scope_guidance(requeue_db, mocker):
         select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
     )).scalars().all()
     assert len(clones) == 1
-    # RATE_LIMIT → no guidance injected; prompt_suffix absent or empty
-    suffix = (clones[0].payloads or [{}])[0].get("prompt_suffix")
-    assert not suffix
+    # RATE_LIMIT gets retry-strategy guidance (backoff/Retry-After) but NOT
+    # the scope-reduction language reserved for AGENT_TIMEOUT — a rate limit
+    # isn't a signal to shrink the task, just to slow down retries.
+    suffix = (clones[0].payloads or [{}])[0].get("prompt_suffix") or ""
+    assert "reduce scope" not in suffix.lower()
+    assert "skip non-essential" not in suffix.lower()
+    assert "pick the 2-3 most important" not in suffix.lower()
 
 
 @pytest.mark.asyncio

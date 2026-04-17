@@ -468,7 +468,7 @@ async def orchestrator_worker():
     from app.services import _recover_orphaned_tasks, _check_evaluating_timeouts, _sweep_post_commit_pending
     from app.routers.agent import get_github_token_for_task
     from app.github import (
-        get_check_runs,
+        get_check_runs_cached,
         get_pull_request,
         update_branch,
     )
@@ -1734,7 +1734,7 @@ async def orchestrator_worker():
                             try:
                                 _conflict_head_sha = pr_data.get("head", {}).get("sha", "")
                                 if _conflict_head_sha:
-                                    _conflict_ci_result = await get_check_runs(ci_gh_token, ci_owner, ci_repo, _conflict_head_sha)
+                                    _conflict_ci_result = await get_check_runs_cached(ci_gh_token, ci_owner, ci_repo, _conflict_head_sha)
                                     if _conflict_ci_result.get("status") == "completed":
                                         _conflict_failed_logs = _conflict_ci_result.get("failed_logs", "")
                                         if _conflict_failed_logs:
@@ -1820,7 +1820,9 @@ async def orchestrator_worker():
                             logger.info(f"[CI] PR #{ci_pr_number} has no HEAD SHA — skipping CI check this cycle")
                             continue
 
-                        ci_result = await get_check_runs(ci_gh_token, ci_owner, ci_repo, ci_head_sha, project_id=str(ci_task.project_id))
+                        # Dedup cached — siblings on the same head_sha collapse
+                        # into one underlying GitHub call within the 30s TTL.
+                        ci_result = await get_check_runs_cached(ci_gh_token, ci_owner, ci_repo, ci_head_sha, project_id=str(ci_task.project_id))
 
                         # Track whether CI checks have ever been observed for this PR
                         ci_details = ci_result.get("details", [])

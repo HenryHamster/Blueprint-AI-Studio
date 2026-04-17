@@ -1,7 +1,7 @@
 import re
 import base64
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 # GitHub imports are deferred to scan_pr_for_injection() so pure functions
@@ -447,6 +447,18 @@ def format_findings_report(findings: List[Dict[str, str]], evaluation: Dict[str,
     return "\n".join(lines)
 
 
+# Cache scan results keyed by PR head_sha so that multiple triggers on the same
+# commit (re-review, CI retry, rollup verification) don't re-run all three
+# sub-fetches.  Keyed by (owner, repo, head_sha) — commit identity, not PR
+# number, because a force-push to the same PR changes head_sha and invalidates
+# the result.  TTL is generous (10 min) because scan output is purely a
+# function of the commit content; only force-pushes change it, and those
+# produce a new head_sha naturally.
+_SCAN_CACHE_TTL_S = 600
+_SCAN_CACHE_MAX = 200
+_scan_cache: Dict[Tuple[str, str, str], Tuple[Dict[str, Any], float]] = {}
+
+
 async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
     """
     Comprehensive PR security scan. Fetches and scans:
@@ -457,6 +469,29 @@ async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number:
     Returns {"clean": bool, "blocked": bool, "findings": [...], "report": str, "summary": str, "scanned": [...]}
     """
     from app.github import get_pull_request_diff, get_pull_request, get_pull_request_commits
+    import time as _time
+
+    # Cheap pre-check: look up the PR once to get head_sha, then check cache.
+    # Hit → skip the 2 heavier fetches (diff + commits) and return cached.
+    head_sha: str | None = None
+    pr_data: Dict[str, Any] | None = None
+    try:
+        pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+        if pr_data:
+            head_sha = (pr_data.get("head") or {}).get("sha")
+    except Exception as e:
+        logger.warning(f"[SECURITY] Failed to fetch PR data for PR #{pr_number}: {e}")
+
+    if head_sha:
+        cached = _scan_cache.get((owner, repo, head_sha))
+        if cached is not None and (_time.time() - cached[1]) < _SCAN_CACHE_TTL_S:
+            import app.shared_state as _ss  # noqa: PLC0415
+            _ss.github_cache_hits["scan_pr"] = _ss.github_cache_hits.get("scan_pr", 0) + 1
+            logger.debug(
+                f"[SECURITY] Using cached scan for {owner}/{repo}@{head_sha[:8]} "
+                f"(PR #{pr_number})"
+            )
+            return cached[0]
 
     all_findings: List[Dict[str, str]] = []
     scanned: List[str] = []
@@ -479,14 +514,10 @@ async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number:
     except Exception as e:
         logger.warning(f"[SECURITY] Failed to fetch commits for PR #{pr_number}: {e}")
 
-    # 3. Scan PR title and body
-    try:
-        pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
-        if pr_data:
-            all_findings.extend(scan_pr_metadata(pr_data))
-            scanned.append("pr_metadata")
-    except Exception as e:
-        logger.warning(f"[SECURITY] Failed to fetch PR data for PR #{pr_number}: {e}")
+    # 3. Use PR metadata already fetched above
+    if pr_data:
+        all_findings.extend(scan_pr_metadata(pr_data))
+        scanned.append("pr_metadata")
 
     # If we couldn't scan anything, don't block but flag it
     if not scanned:
@@ -505,7 +536,7 @@ async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number:
     context = f"PR #{pr_number}"
     report = format_findings_report(all_findings, evaluation, context)
 
-    return {
+    result = {
         "clean": len(all_findings) == 0,
         "blocked": evaluation["blocked"],
         "findings": all_findings,
@@ -513,3 +544,15 @@ async def scan_pr_for_injection(gh_token: str, owner: str, repo: str, pr_number:
         "summary": f"PR #{pr_number} — {evaluation['summary']}",
         "scanned": scanned,
     }
+
+    # Cache the final result for this head_sha so retriggers on the same
+    # commit skip the diff + commits fetches next time.
+    if head_sha:
+        now = _time.time()
+        _scan_cache[(owner, repo, head_sha)] = (result, now)
+        if len(_scan_cache) > _SCAN_CACHE_MAX:
+            cutoff = now - (_SCAN_CACHE_TTL_S * 2)
+            for k in [k for k, (_, ts) in _scan_cache.items() if ts < cutoff]:
+                _scan_cache.pop(k, None)
+
+    return result

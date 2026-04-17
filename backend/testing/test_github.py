@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import time
 import uuid
 from unittest.mock import AsyncMock
 
@@ -545,6 +546,304 @@ async def test_github_request_raises_network_error_after_max_retries(mocker):
 
     with pytest.raises(httpx_mod.ConnectError):
         await _github_request("GET", "https://api.github.com/test", {}, max_retries=3)
+
+
+@pytest.mark.asyncio
+async def test_github_request_fails_fast_when_reset_is_far(mocker):
+    """A 403 rate-limited response with a reset window further out than
+    RATE_LIMIT_FAST_FAIL_THRESHOLD_S must return immediately instead of
+    retrying three times.  Prevents the retry-amplification pattern where a
+    single logical call gets counted as 3 in the per-endpoint quota counter
+    while the bucket is empty anyway."""
+    from app.github import _github_request
+    import app.shared_state as _ss
+
+    # Clear both buckets so the pre-call short-circuit doesn't fire.
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+    _ss.github_jwt_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+
+    future_reset = int(time.time()) + 60  # 60s away, well past the 5s threshold
+    call_count = 0
+
+    async def mock_request(method, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return MockResponse(
+            403,
+            {"message": "API rate limit exceeded"},
+            headers={
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(future_reset),
+            },
+        )
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+    mock_sleep = mocker.patch("asyncio.sleep", return_value=None)
+
+    resp = await _github_request(
+        "GET", "https://api.github.com/test", {},
+        max_retries=3,
+    )
+    assert resp.status_code == 403
+    assert call_count == 1                    # no retry
+    assert mock_sleep.call_count == 0         # no sleep
+
+
+@pytest.mark.asyncio
+async def test_github_request_short_circuits_when_install_bucket_empty(mocker):
+    """If shared_state says the install-token bucket is at 0 and reset is far,
+    the request is never sent — a synthetic 403 is returned instead. Prevents
+    burning the per-endpoint counter on calls we know will 403 anyway."""
+    from app.github import _github_request
+    import app.shared_state as _ss
+
+    future_reset = int(time.time()) + 120
+    _ss.github_quota.update({
+        "remaining": 0, "limit": 5000, "reset_at": future_reset, "last_updated": None,
+    })
+    _ss.github_jwt_quota.update({
+        "remaining": None, "limit": None, "reset_at": None, "last_updated": None,
+    })
+
+    mock_request = mocker.patch("httpx.AsyncClient.request")
+
+    install_headers = {"Authorization": "Bearer ghs_fake_token"}
+    resp = await _github_request(
+        "GET", "https://api.github.com/test", install_headers,
+    )
+    assert resp.status_code == 403
+    # Request was never sent to GitHub
+    mock_request.assert_not_called()
+
+    # Cleanup so subsequent tests don't inherit the short-circuit state
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None})
+
+
+@pytest.mark.asyncio
+async def test_github_request_short_circuits_when_jwt_bucket_empty(mocker):
+    """Same short-circuit logic for App-JWT (/app/* endpoints). Without this,
+    a drained JWT bucket would keep burning retries against access-token
+    minting, cascade-stalling the entire pipeline."""
+    from app.github import _github_request
+    import app.shared_state as _ss
+
+    future_reset = int(time.time()) + 120
+    _ss.github_jwt_quota.update({
+        "remaining": 0, "limit": 60, "reset_at": future_reset, "last_updated": None,
+    })
+    _ss.github_quota.update({
+        "remaining": None, "limit": None, "reset_at": None, "last_updated": None,
+    })
+
+    mock_request = mocker.patch("httpx.AsyncClient.request")
+
+    # URL containing /app/ triggers the JWT bucket classification.
+    resp = await _github_request(
+        "GET", "https://api.github.com/app/installations/12345", {},
+    )
+    assert resp.status_code == 403
+    mock_request.assert_not_called()
+
+    _ss.github_jwt_quota.update({"remaining": None, "limit": None, "reset_at": None})
+
+
+# ---------------------------------------------------------------------------
+# Cache wrapper tests: check_runs dedup, TTL, counter bump
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_check_runs_cached_dedupes_within_ttl(mocker):
+    """Two calls for the same (owner, repo, head_sha) within TTL should only
+    invoke the underlying get_check_runs once.  This is the scaling fix for
+    rollup-with-N-children fan-out."""
+    import app.shared_state as _ss
+    import app.github as gh
+
+    # Clear cache + counter to isolate this test
+    gh._check_runs_cache.clear()
+    _ss.github_cache_hits["check_runs"] = 0
+
+    mock_inner = mocker.patch(
+        "app.github.get_check_runs",
+        new_callable=AsyncMock,
+        return_value={"status": "completed", "conclusion": "success", "details": [], "failed_logs": ""},
+    )
+
+    r1 = await gh.get_check_runs_cached("tok", "owner", "repo", "cache_sha_1")
+    r2 = await gh.get_check_runs_cached("tok", "owner", "repo", "cache_sha_1")
+    r3 = await gh.get_check_runs_cached("tok", "owner", "repo", "cache_sha_1")
+
+    assert r1 == r2 == r3
+    assert mock_inner.call_count == 1     # deduped
+    assert _ss.github_cache_hits["check_runs"] == 2  # two hits bump the counter
+
+
+@pytest.mark.asyncio
+async def test_get_check_runs_cached_expires_after_ttl(mocker):
+    """A stale cache entry must not be served past its TTL — call the wrapper
+    with ttl=0 to force an immediate miss."""
+    import app.github as gh
+
+    gh._check_runs_cache.clear()
+
+    mock_inner = mocker.patch(
+        "app.github.get_check_runs",
+        new_callable=AsyncMock,
+        return_value={"status": "completed", "conclusion": "success", "details": [], "failed_logs": ""},
+    )
+
+    await gh.get_check_runs_cached("tok", "owner", "repo", "cache_sha_ttl", ttl=0)
+    await gh.get_check_runs_cached("tok", "owner", "repo", "cache_sha_ttl", ttl=0)
+
+    assert mock_inner.call_count == 2  # ttl=0 ⇒ every call misses
+
+
+@pytest.mark.asyncio
+async def test_get_check_runs_cached_invalidate_clears_entry(mocker):
+    """``invalidate_check_runs_cache`` drops a specific key so the next call
+    hits GitHub instead of returning stale state."""
+    import app.github as gh
+
+    gh._check_runs_cache.clear()
+
+    mock_inner = mocker.patch(
+        "app.github.get_check_runs",
+        new_callable=AsyncMock,
+        return_value={"status": "completed", "conclusion": "success", "details": [], "failed_logs": ""},
+    )
+
+    await gh.get_check_runs_cached("tok", "o", "r", "cache_sha_inv")
+    gh.invalidate_check_runs_cache("o", "r", "cache_sha_inv")
+    await gh.get_check_runs_cached("tok", "o", "r", "cache_sha_inv")
+
+    assert mock_inner.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_scan_pr_for_injection_cached_by_head_sha(mocker):
+    """Two scans on the same PR head_sha should fetch PR data once (for the
+    head_sha lookup) but skip the diff + commits fetches on the second call."""
+    import app.shared_state as _ss
+    import app.security as sec
+
+    sec._scan_cache.clear()
+    _ss.github_cache_hits["scan_pr"] = 0
+
+    mock_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"head": {"sha": "scan_test_sha"}, "title": "x", "body": ""},
+    )
+    mock_diff = mocker.patch(
+        "app.github.get_pull_request_diff",
+        new_callable=AsyncMock,
+        return_value="+ hello world\n",
+    )
+    mock_commits = mocker.patch(
+        "app.github.get_pull_request_commits",
+        new_callable=AsyncMock,
+        return_value=[{"commit": {"message": "init"}}],
+    )
+
+    r1 = await sec.scan_pr_for_injection("tok", "o", "r", 1)
+    r2 = await sec.scan_pr_for_injection("tok", "o", "r", 1)
+
+    assert r1 == r2
+    # First call hit all three. Second call hits PR (for head_sha) then returns cache.
+    assert mock_pr.call_count == 2
+    assert mock_diff.call_count == 1       # skipped on cache hit
+    assert mock_commits.call_count == 1    # skipped on cache hit
+    assert _ss.github_cache_hits["scan_pr"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scan_pr_for_injection_no_head_sha_skips_cache(mocker):
+    """If PR lookup fails, head_sha is None and we must not crash — the scan
+    still runs (best effort) and nothing is cached."""
+    import app.security as sec
+
+    sec._scan_cache.clear()
+
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=Exception("transient"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new_callable=AsyncMock,
+        return_value="",
+    )
+    mocker.patch(
+        "app.github.get_pull_request_commits",
+        new_callable=AsyncMock,
+        return_value=[],
+    )
+
+    result = await sec.scan_pr_for_injection("tok", "o", "r", 2)
+    assert result["blocked"] is False
+    assert len(sec._scan_cache) == 0
+
+
+@pytest.mark.asyncio
+async def test_pr_merge_negative_cache_skips_refetch(mocker):
+    """_verify_pr_merged called twice within the negative-TTL should only
+    fetch the PR once — the second call returns False from the cache."""
+    import uuid as _uuid
+    import time as _time
+    from unittest.mock import AsyncMock as _AM, MagicMock
+    import app.shared_state as _ss
+    from app import rollup_management as rm
+
+    rm._pr_merge_negative_cache.clear()
+    _ss.github_cache_hits["pr_merge_negative"] = 0
+
+    # Build a task-shaped object the function is willing to read.  Use a real
+    # UUID so the cache keys compare correctly.
+    task = MagicMock()
+    task.id = _uuid.uuid4()
+    task.project_id = _uuid.uuid4()
+    task.context = {}
+
+    # Session returns a PR artifact so the function proceeds to the API call.
+    fake_artifact = MagicMock()
+    fake_artifact.pr_url = "https://github.com/o/r/pull/42"
+
+    class _ArtifactResult:
+        def scalars(self):
+            class _S:
+                def first(self_inner):
+                    return fake_artifact
+            return _S()
+
+    session = MagicMock()
+    session.execute = _AM(return_value=_ArtifactResult())
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=_AM,
+        return_value=("tok", "o", "r"),
+    )
+    mock_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=_AM,
+        return_value={"merged": False, "state": "open"},
+    )
+    mocker.patch(
+        "app.main._maybe_create_failure_alert",
+        new_callable=_AM,
+        return_value=None,
+    )
+
+    # First call: fetches PR, sees unmerged, stamps the negative cache.
+    r1 = await rm._verify_pr_merged(task, session)
+    # Second call within TTL: should NOT refetch.
+    r2 = await rm._verify_pr_merged(task, session)
+
+    assert r1 is False
+    assert r2 is False
+    assert mock_pr.call_count == 1
+    assert _ss.github_cache_hits["pr_merge_negative"] == 1
 
 
 @pytest.mark.asyncio
