@@ -234,3 +234,133 @@ async def filter_held_directions(
             f"[DISPATCH] Deferring task {eid} — direction {direction_id} is held: {reason}"
         )
     return non_held
+
+
+async def filter_pipeline_duplicates(
+    eligible_ids: list[uuid.UUID],
+    candidate_tasks: list[Task],
+    session,
+    broadcast_fn: Callable[..., Coroutine[Any, Any, None]],
+) -> list[uuid.UUID]:
+    """Cancel review/fix candidates that would duplicate an already-active task.
+
+    Belt-and-suspenders check against _spawn_pipeline_task's spawn-time dedup:
+    two concurrent spawns can race past the TOCTOU window on the active-task
+    query, or can resolve different ``original_task_id`` values for what is
+    effectively the same chain. This filter runs right before provisioning
+    and catches both cases by keying only on (pr_number, task_type).
+
+    Safety invariants — never break the pipeline:
+      * Only a review or fix candidate can be filtered here. Other task
+        types pass through unaffected.
+      * A candidate is cancelled only if SOMEONE ELSE on the same
+        (pr_number, task_type) is either (a) already claimed (PROVISIONING
+        / IN_PROGRESS / EVALUATING) or (b) an older QUEUED sibling still
+        in this eligible batch. The sole survivor — or the oldest of a set
+        of QUEUED tie — is always preserved.
+      * Cancellation marks the loser CANCELLED with a clear message so
+        operators can see it happened; broadcasts the event.
+    """
+    if not eligible_ids:
+        return eligible_ids
+
+    # Limit the DB fetch to review/fix candidates — non-pipeline tasks pass
+    # through, so we don't need to check them.
+    pipeline_candidates = [
+        t for t in candidate_tasks
+        if t.id in eligible_ids
+        and (t.first_payload).get("type") in ("review", "fix")
+        and (t.first_payload).get("pr_number") is not None
+    ]
+    if not pipeline_candidates:
+        return eligible_ids
+
+    project_ids = {t.project_id for t in pipeline_candidates}
+    # Fetch ALL active (non-terminal, non-cancelled) review/fix tasks in these
+    # projects, fully loaded. We need payloads for pr_number/task_type lookup.
+    active_pipeline = (await session.execute(
+        select(Task).where(
+            Task.project_id.in_(project_ids),
+            Task.status.in_([
+                TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+            ]),
+        )
+    )).scalars().all()
+
+    # Group by (project_id, pr_number, task_type). Using project_id in the
+    # key guards against the unlikely case of two projects reusing PR numbers.
+    groups: dict[tuple[uuid.UUID, int, str], list[Task]] = {}
+    for t in active_pipeline:
+        fp = t.first_payload
+        ttype = fp.get("type")
+        pr = fp.get("pr_number")
+        if ttype not in ("review", "fix") or pr is None:
+            continue
+        groups.setdefault((t.project_id, pr, ttype), []).append(t)
+
+    RUNNING = {TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING}
+    survivors: list[uuid.UUID] = []
+    for eid in eligible_ids:
+        candidate = next((t for t in pipeline_candidates if t.id == eid), None)
+        if candidate is None:
+            # Not a pipeline candidate — pass through unchanged.
+            survivors.append(eid)
+            continue
+
+        fp = candidate.first_payload
+        key = (candidate.project_id, fp.get("pr_number"), fp.get("type"))
+        group = groups.get(key, [])
+        # Drop self from the group for the comparison below.
+        others = [t for t in group if t.id != candidate.id]
+        if not others:
+            survivors.append(eid)
+            continue
+
+        # (a) Any other task is already claimed → cancel this one.
+        running_other = next((t for t in others if t.status in RUNNING), None)
+        if running_other:
+            candidate.status = TaskStatus.CANCELLED
+            candidate.latest_status_message = (
+                f"Deduplicated: {fp.get('type')} task {str(running_other.id)[:8]} "
+                f"is already {running_other.status.value if hasattr(running_other.status, 'value') else running_other.status} "
+                f"on PR #{fp.get('pr_number')}"
+            )
+            session.add(candidate)
+            try:
+                await broadcast_fn(str(candidate.project_id), "task_updated",
+                    {"task_id": str(eid), "status": "CANCELLED", "message": candidate.latest_status_message})
+            except Exception:
+                logger.debug(f"Failed to broadcast dedup cancel for {eid}", exc_info=True)
+            logger.warning(
+                f"[DISPATCH] Cancelling duplicate {fp.get('type')} {eid} — "
+                f"{running_other.status} sibling {running_other.id} on PR #{fp.get('pr_number')}"
+            )
+            continue
+
+        # (b) Only QUEUED siblings → keep the oldest, cancel newer duplicates.
+        # Ties broken by created_at then id (stable). Only cancel if THIS
+        # candidate is strictly newer than some QUEUED sibling.
+        queued_others = [t for t in others if t.status == TaskStatus.QUEUED]
+        if queued_others:
+            oldest_queued = min(queued_others, key=lambda t: (t.created_at, t.id))
+            if (candidate.created_at, candidate.id) > (oldest_queued.created_at, oldest_queued.id):
+                candidate.status = TaskStatus.CANCELLED
+                candidate.latest_status_message = (
+                    f"Deduplicated: older QUEUED {fp.get('type')} task "
+                    f"{str(oldest_queued.id)[:8]} already exists on PR #{fp.get('pr_number')}"
+                )
+                session.add(candidate)
+                try:
+                    await broadcast_fn(str(candidate.project_id), "task_updated",
+                        {"task_id": str(eid), "status": "CANCELLED", "message": candidate.latest_status_message})
+                except Exception:
+                    logger.debug(f"Failed to broadcast dedup cancel for {eid}", exc_info=True)
+                logger.warning(
+                    f"[DISPATCH] Cancelling duplicate {fp.get('type')} {eid} — "
+                    f"older QUEUED sibling {oldest_queued.id} on PR #{fp.get('pr_number')}"
+                )
+                continue
+
+        survivors.append(eid)
+    return survivors

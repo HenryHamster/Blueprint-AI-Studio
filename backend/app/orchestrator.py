@@ -34,7 +34,10 @@ from app.compute import (
 )
 from app.database import AsyncSessionLocal
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
-from app.orchestrator_filters import filter_file_conflicts, filter_rollup_conflicts, filter_held_directions
+from app.orchestrator_filters import (
+    filter_file_conflicts, filter_rollup_conflicts, filter_held_directions,
+    filter_pipeline_duplicates,
+)
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -1021,6 +1024,15 @@ async def orchestrator_worker():
 
                 # Step 2.7: Defer tasks whose direction is held due to consecutive code failures
                 eligible_ids = await filter_held_directions(
+                    eligible_ids, candidate_tasks, session, broadcast_to_project
+                )
+
+                # Step 2.75: Pre-dispatch dedup safety net for review/fix pipeline
+                # tasks. Catches duplicates that raced past _spawn_pipeline_task's
+                # spawn-time dedup (TOCTOU on active-task query, or different
+                # original_task_id resolutions for the same effective chain).
+                # Never cancels the sole survivor — see filter docstring.
+                eligible_ids = await filter_pipeline_duplicates(
                     eligible_ids, candidate_tasks, session, broadcast_to_project
                 )
 

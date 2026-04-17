@@ -1136,3 +1136,165 @@ async def test_strategic_context_propagates_to_spawned_fix(db_session, mocker):
     # review_loop is overridden with the pipeline's own iteration state, not carried verbatim.
     assert ctx.get("review_loop", {}).get("iteration") == 1
     assert ctx.get("review_loop", {}).get("pr_number") == 501
+
+
+# ── filter_pipeline_duplicates: pre-dispatch dedup safety net ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dedup_cancels_when_sibling_already_running(db_session, mocker):
+    """A review/fix candidate is cancelled if another task for the same
+    (pr_number, task_type) is already IN_PROGRESS. Sibling stays untouched."""
+    from datetime import datetime, timezone
+    from app.orchestrator_filters import filter_pipeline_duplicates
+    broadcast_mock = mocker.AsyncMock()
+
+    project = await _make_db_project(db_session)
+
+    # Sibling that's already running on PR #501.
+    running = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 501, "branch": "feat/x", "base_branch": "main"}],
+    )
+    # Candidate — a duplicate review spawned past the TOCTOU window.
+    candidate = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "review", "pr_number": 501, "branch": "feat/x", "base_branch": "main"}],
+        created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    db_session.add(running)
+    db_session.add(candidate)
+    await db_session.commit()
+    await db_session.refresh(running)
+    await db_session.refresh(candidate)
+
+    result = await filter_pipeline_duplicates(
+        [candidate.id], [candidate], db_session, broadcast_mock
+    )
+    await db_session.commit()
+    assert result == [], "Duplicate with running sibling must be filtered out"
+    await db_session.refresh(candidate)
+    assert candidate.status == TaskStatus.CANCELLED
+    assert "Deduplicated" in (candidate.latest_status_message or "")
+    # Sibling must not be touched.
+    await db_session.refresh(running)
+    assert running.status == TaskStatus.IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dedup_keeps_oldest_queued_cancels_newer(db_session, mocker):
+    """When all siblings are QUEUED, the oldest survives and newer ones are
+    cancelled — no running sibling yet, so the pipeline still moves forward."""
+    from datetime import datetime, timedelta, timezone
+    from app.orchestrator_filters import filter_pipeline_duplicates
+    broadcast_mock = mocker.AsyncMock()
+
+    project = await _make_db_project(db_session)
+    base_time = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    older = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "fix", "pr_number": 502, "branch": "feat/y", "base_branch": "main"}],
+        created_at=base_time,
+    )
+    newer = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "fix", "pr_number": 502, "branch": "feat/y", "base_branch": "main"}],
+        created_at=base_time + timedelta(seconds=5),
+    )
+    db_session.add(older)
+    db_session.add(newer)
+    await db_session.commit()
+    await db_session.refresh(older)
+    await db_session.refresh(newer)
+
+    # Both are eligible in this dispatch batch.
+    result = await filter_pipeline_duplicates(
+        [older.id, newer.id], [older, newer], db_session, broadcast_mock
+    )
+    await db_session.commit()
+    assert older.id in result, "Oldest QUEUED sibling must survive"
+    assert newer.id not in result, "Newer duplicate must be filtered"
+    await db_session.refresh(newer)
+    assert newer.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dedup_sole_candidate_never_cancelled(db_session, mocker):
+    """Invariant: if the candidate is the only task on its (pr, type), it
+    must pass through — safety net must not stall a legitimate pipeline."""
+    from app.orchestrator_filters import filter_pipeline_duplicates
+    broadcast_mock = mocker.AsyncMock()
+
+    project = await _make_db_project(db_session)
+    candidate = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "review", "pr_number": 503, "branch": "feat/z", "base_branch": "main"}],
+    )
+    db_session.add(candidate)
+    await db_session.commit()
+    await db_session.refresh(candidate)
+
+    result = await filter_pipeline_duplicates(
+        [candidate.id], [candidate], db_session, broadcast_mock
+    )
+    assert result == [candidate.id]
+    await db_session.refresh(candidate)
+    assert candidate.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dedup_non_pipeline_task_passes_through(db_session, mocker):
+    """Non-review/fix tasks (create, research, refactor, etc.) pass through
+    unaffected even if they happen to share a pr_number field."""
+    from app.orchestrator_filters import filter_pipeline_duplicates
+    broadcast_mock = mocker.AsyncMock()
+
+    project = await _make_db_project(db_session)
+    candidate = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+    )
+    db_session.add(candidate)
+    await db_session.commit()
+    await db_session.refresh(candidate)
+
+    result = await filter_pipeline_duplicates(
+        [candidate.id], [candidate], db_session, broadcast_mock
+    )
+    assert result == [candidate.id]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dedup_different_pr_numbers_pass_through(db_session, mocker):
+    """Two review tasks on DIFFERENT PR numbers are not duplicates — both pass."""
+    from app.orchestrator_filters import filter_pipeline_duplicates
+    broadcast_mock = mocker.AsyncMock()
+
+    project = await _make_db_project(db_session)
+    a = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "review", "pr_number": 601, "branch": "a", "base_branch": "main"}],
+    )
+    b = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "review", "pr_number": 602, "branch": "b", "base_branch": "main"}],
+    )
+    db_session.add(a)
+    db_session.add(b)
+    await db_session.commit()
+    await db_session.refresh(a)
+    await db_session.refresh(b)
+
+    result = await filter_pipeline_duplicates(
+        [a.id, b.id], [a, b], db_session, broadcast_mock
+    )
+    assert set(result) == {a.id, b.id}
