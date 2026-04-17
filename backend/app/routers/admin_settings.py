@@ -1386,6 +1386,129 @@ async def get_autonomy_debug(
     }
 
 
+@router.get("/projects/{project_id}/strategic-debug")
+async def get_strategic_debug(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return at-a-glance status for the project's strategic / architecture cycle.
+
+    Strategic cycles are triggered every N research spawns (strategic_research_frequency),
+    and every Mth strategic cycle also runs an architecture review (architecture_review_frequency).
+    This endpoint surfaces: current phase, next-trigger countdown, recent cycle outcomes,
+    and any blockers (failure threshold, missing purpose) so the user doesn't have to
+    dig into the Strategic tab to tell what's happening.
+    """
+    from app.shared_state import runtime_config as _runtime_config
+
+    project = await _get_user_project(project_id, current_user["user_id"], session)
+    vision = project.vision or {}
+    now = _utcnow()
+    blocking_guards: list[dict] = []
+
+    # Active strategic task (design_doc_update or strategic_review) — mirrors
+    # _has_active_strategic_task but without the FOR UPDATE lock (read-only view).
+    active_stmt = select(Task).where(
+        Task.project_id == project_id,
+        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+    )
+    active_strategic_task: Optional[Task] = None
+    active_phase: Optional[str] = None
+    for t in (await session.execute(active_stmt)).scalars().all():
+        ptype = (t.first_payload).get("type")
+        if ptype in ("design_doc_update", "strategic_review"):
+            active_strategic_task = t
+            active_phase = ptype
+            break
+
+    # Trigger countdowns
+    strategic_frequency = vision.get("_strategic_frequency_override") or \
+        _runtime_config.get("strategic_research_frequency", 6)
+    arch_frequency = _runtime_config.get("architecture_review_frequency", 3)
+    research_spawn_count = vision.get("_research_spawn_count", 0) or 0
+    strategic_cycle_count = vision.get("_strategic_cycle_count", 0) or 0
+
+    if strategic_frequency > 0:
+        remainder = research_spawn_count % strategic_frequency
+        next_strategic_in = strategic_frequency if remainder == 0 and research_spawn_count > 0 \
+            else strategic_frequency - remainder
+    else:
+        next_strategic_in = None
+
+    # Will the *next* strategic cycle also do architecture?
+    next_cycle_number = strategic_cycle_count + 1
+    next_is_architecture = arch_frequency > 0 and next_cycle_number % arch_frequency == 0
+
+    # Strategic failure state (auto-decays after 48h)
+    strategic_failures = vision.get("_strategic_failures", 0) or 0
+    failures_at_iso = vision.get("_strategic_failures_at")
+    failures_decay_at_iso: Optional[str] = None
+    if failures_at_iso:
+        try:
+            last_failure = datetime.fromisoformat(failures_at_iso.replace("Z", "+00:00"))
+            if last_failure.tzinfo is not None:
+                last_failure = last_failure.astimezone(timezone.utc).replace(tzinfo=None)
+            decay_deadline = last_failure + timedelta(hours=48)
+            failures_decay_at_iso = decay_deadline.isoformat()
+            if strategic_failures >= 3 and now < decay_deadline:
+                blocking_guards.append({
+                    "guard": "strategic_failures_high",
+                    "reason": f"{strategic_failures} consecutive strategic failures — auto-recovery in "
+                              f"{int((decay_deadline - now).total_seconds() / 3600)}h",
+                    "failures": strategic_failures,
+                    "decay_at": failures_decay_at_iso,
+                })
+        except (ValueError, TypeError):
+            pass
+
+    # Vision bootstrapping — without purpose, strategic can only attempt once
+    # and won't auto-advance if it fails (strategic_failures gates the retry loop).
+    has_purpose = bool(vision.get("purpose"))
+
+    # Recent cycle history (last 3, most recent first)
+    cycle_history = list(vision.get("_strategic_cycle_history") or [])
+    recent_cycles = list(reversed(cycle_history[-3:]))
+    last_cycle = recent_cycles[0] if recent_cycles else None
+
+    # Determine phase
+    # 2 = Running (task active), 3 = Waiting (blocked), 1 = Checking (near trigger,
+    # no blockers), 0 = Idle (not near trigger, no activity).
+    phase: int
+    if active_strategic_task is not None:
+        phase = 2
+    elif blocking_guards:
+        phase = 3
+    elif next_strategic_in is not None and next_strategic_in <= 1:
+        # One or zero spawns away from triggering a cycle — effectively "checking"
+        phase = 1
+    else:
+        phase = 0
+
+    return {
+        "phase": phase,
+        "blocking_guards": blocking_guards,
+        "has_purpose": has_purpose,
+        "research_spawn_count": research_spawn_count,
+        "strategic_cycle_count": strategic_cycle_count,
+        "strategic_frequency": strategic_frequency,
+        "architecture_review_frequency": arch_frequency,
+        "next_strategic_in": next_strategic_in,
+        "next_is_architecture": next_is_architecture,
+        "strategic_failures": strategic_failures,
+        "strategic_failures_at": failures_at_iso,
+        "strategic_failures_decay_at": failures_decay_at_iso,
+        "active_task": {
+            "id": str(active_strategic_task.id),
+            "phase": active_phase,
+            "status": active_strategic_task.status,
+            "started_at": active_strategic_task.started_at.isoformat() if active_strategic_task.started_at else None,
+        } if active_strategic_task else None,
+        "last_cycle": last_cycle,
+        "recent_cycles": recent_cycles,
+    }
+
+
 @router.post("/projects/{project_id}/circuit-breaker/reset")
 async def reset_circuit_breaker(
     project_id: uuid.UUID,

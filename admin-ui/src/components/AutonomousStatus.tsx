@@ -77,16 +77,23 @@ interface AutonomousStatusProps {
   pauseReason?: string | null;
 }
 
-const LIFECYCLE_STEPS = ['Idle', 'Checking', 'Spawning', 'Executing', 'Cooldowns'] as const;
+// Four-phase lifecycle: Idle (between ticks), Checking (evaluating), Running
+// (research task in flight), Waiting (blocked on something the user should see).
+// Spawning is collapsed into Running — it's transient and visually identical.
+// "Waiting" replaces "Cooldowns" since not all blockers are cooldowns (VMs full,
+// pipeline paused, rate limited, circuit breaker, etc.).
+const LIFECYCLE_STEPS = ['Idle', 'Checking', 'Running', 'Waiting'] as const;
 
 function getLifecyclePhase(debug: AutonomyDebug): number {
   const guards = debug.blocking_guards.map(g => g.guard);
-  if (guards.includes('vm_slots_full') || guards.includes('research_task_active')) return 3; // Executing
-  if (guards.includes('no_eligible_directions') || guards.includes('rate_limit_exceeded')) return 4; // Cooldowns
-  if (guards.includes('circuit_breaker_open') || guards.includes('pipeline_paused')) return 4; // Cooldowns
-  if (guards.includes('waiting_for_interval')) return 0; // Idle — waiting for next check window
-  if (!debug.spawn_blocked) return 1; // Ready to check/spawn
-  return 0; // Idle (disabled or other block)
+  // Autonomy's OWN research is running — genuine progress.
+  if (guards.includes('research_task_active')) return 2; // Running
+  // Any other blocker: autonomy is waiting on something external. Show as
+  // Waiting so the user can read the guard reason to learn why.
+  if (guards.some(g => g !== 'waiting_for_interval')) return 3; // Waiting
+  if (guards.includes('waiting_for_interval')) return 0; // Idle — between checks
+  if (!debug.spawn_blocked) return 1; // Checking — evaluating spawn eligibility now
+  return 0;
 }
 
 function formatSeconds(s: number): string {
