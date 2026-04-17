@@ -555,7 +555,7 @@ async def claim_task(
             t_related_files = (t_ctx.get("related_files") or [])[:10]
             t_direction_id = t_ctx.get("direction_id")
             is_failed = t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
-            t_changed_files = (t_ctx.get("_pr_changed_files") or [])[:10] if is_failed else None
+            t_changed_files = (t_ctx.get("_pr_changed_files") or [])[:10] or None
             recently_completed_tasks.append({
                 "id": str(t.id),
                 "title": t.title,
@@ -682,7 +682,7 @@ async def claim_task(
                     "prompt": t_prompt or None,
                     "related_files": (t_ctx.get("related_files") or [])[:10],
                     "direction_id": t_ctx.get("direction_id"),
-                    "changed_files": (t_ctx.get("_pr_changed_files") or [])[:10] if is_failed else None,
+                    "changed_files": (t_ctx.get("_pr_changed_files") or [])[:10] or None,
                 })
 
         # Open PRs: distinct pr_url from PULL_REQUEST artifacts for non-terminal tasks in project
@@ -752,9 +752,9 @@ async def claim_task(
                     if sib.latest_status_message:
                         entry["failure_class"] = classify_failure(sib)
                         entry["error_excerpt"] = sib.latest_status_message[:150]
-                    sib_changed = ((sib.context or {}).get("_pr_changed_files") or [])[:5]
-                    if sib_changed:
-                        entry["changed_files"] = sib_changed
+                sib_changed = ((sib.context or {}).get("_pr_changed_files") or [])[:5]
+                if sib_changed:
+                    entry["changed_files"] = sib_changed
                 sibling_tasks.append(entry)
 
         # Pipeline health summary (for gated task types; else-branch covers the rest)
@@ -1178,6 +1178,40 @@ async def claim_task(
                     total_chars += entry_len
                     direction_prior_analysis.append(entry)
 
+                # Pull recent successful sibling tasks with analysis artifacts
+                success_stmt = (
+                    select(Task)
+                    .where(
+                        Task.project_id == task.project_id,
+                        Task.id != task.id,
+                        Task.context["direction_id"].as_string() == str(direction_id),
+                        Task.status == TaskStatus.COMPLETED,
+                        Task.created_at >= prior_analysis_cutoff,
+                    )
+                    .order_by(Task.created_at.desc())
+                    .limit(5)
+                )
+                success_rows = (await session.execute(success_stmt)).scalars().all()
+                direction_successful_analysis: list = []
+                success_chars = 0
+                for st in success_rows:
+                    sctx = st.context or {}
+                    analysis_plan = sctx.get("_analysis_plan")
+                    if not analysis_plan:
+                        continue
+                    s_entry = {
+                        "title": st.title,
+                        "analysis_plan": str(analysis_plan)[:500],
+                    }
+                    changed_files = sctx.get("_pr_changed_files")
+                    if isinstance(changed_files, list) and changed_files:
+                        s_entry["pr_changed_files"] = [str(f) for f in changed_files[:10]]
+                    s_entry_len = len(json.dumps(s_entry))
+                    if success_chars + s_entry_len > 1500:
+                        break
+                    success_chars += s_entry_len
+                    direction_successful_analysis.append(s_entry)
+
                 response["direction_context"] = {
                     "title": direction.get("title", ""),
                     "priority": direction.get("priority", ""),
@@ -1185,6 +1219,7 @@ async def claim_task(
                     "recent_outcomes": recent_outcomes,
                     "failure_stage_pattern": failure_stage_pattern,
                     "direction_prior_analysis": direction_prior_analysis,
+                    "direction_successful_analysis": direction_successful_analysis,
                     "scope_success_rates": scope_success_rates,
                 }
 

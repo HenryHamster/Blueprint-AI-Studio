@@ -398,6 +398,43 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('**Prior analysis from failed attempts:**');
   });
 
+  it('renders direction_successful_analysis as Approaches that worked section', () => {
+    const task = {
+      direction_context: {
+        title: 'Refactor module',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        direction_successful_analysis: [
+          {
+            title: 'Successful task',
+            analysis_plan: 'Add helper in services.py and wire into router',
+            pr_changed_files: ['services.py', 'router.py'],
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('**Approaches that worked:**');
+    expect(result).toContain('- Successful task');
+    expect(result).toContain('Analysis plan: Add helper in services.py and wire into router');
+    expect(result).toContain('Files changed: services.py, router.py');
+  });
+
+  it('does not render Approaches that worked when direction_successful_analysis is empty or absent', () => {
+    const task = {
+      direction_context: {
+        title: 'Improve caching',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        direction_successful_analysis: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('**Approaches that worked:**');
+  });
+
   it('returns empty string for relativeTimeFromIso when iso is empty or unparseable', () => {
     expect(relativeTimeFromIso('')).toBe('');
     expect(relativeTimeFromIso('not-a-date')).toBe('');

@@ -534,14 +534,18 @@ async def test_recently_completed_tasks_include_outcome_context(client: AsyncCli
         latest_status_message="Tests failed on CI",
     )
     db_session.add(failed_task)
-    # A completed task (no changed_files expected)
+    # A completed task with changed_files (should also be exposed)
     completed_task = Task(
         project_id=project.id,
         title="Completed task",
         payloads=[{"type": "create", "prompt": "Short prompt"}],
         vm_instance_id="agent-vm-recent-done",
         status=TaskStatus.COMPLETED,
-        context={"direction_id": "dir-xyz", "related_files": ["a.py", "b.py"]},
+        context={
+            "direction_id": "dir-xyz",
+            "related_files": ["a.py", "b.py"],
+            "_pr_changed_files": ["modded1.py", "modded2.py"],
+        },
     )
     db_session.add(completed_task)
     await db_session.commit()
@@ -573,7 +577,7 @@ async def test_recently_completed_tasks_include_outcome_context(client: AsyncCli
     done_entry = next(e for e in recent if e["title"] == "Completed task")
     assert done_entry["direction_id"] == "dir-xyz"
     assert done_entry["related_files"] == ["a.py", "b.py"]
-    assert done_entry["changed_files"] is None  # not failed
+    assert done_entry["changed_files"] == ["modded1.py", "modded2.py"]
     assert done_entry["prompt"] == "Short prompt"
 
 
@@ -1805,6 +1809,77 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
     # Total payload stays under 2000-char cap
     import json as _json
     assert len(_json.dumps(dpa)) <= 2000
+
+
+@pytest.mark.asyncio
+async def test_claim_injects_direction_successful_analysis(client: AsyncClient, db_session):
+    """Claim endpoint surfaces analysis_plan from recent successful sibling tasks."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Success Analysis Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Refactor module Y",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    long_plan = "P" * 800  # truncated to 500
+    success = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "success"}],
+        vm_instance_id="vm-success-1",
+        context={
+            "direction_id": direction_id,
+            "_analysis_plan": long_plan,
+            "_pr_changed_files": ["svc.py", "route.py"],
+        },
+        status=TaskStatus.COMPLETED,
+        title="Successful task",
+    )
+    # Successful task with no analysis plan — should be skipped
+    success_no_plan = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "no plan"}],
+        vm_instance_id="vm-success-2",
+        context={"direction_id": direction_id},
+        status=TaskStatus.COMPLETED,
+        title="Successful no-plan task",
+    )
+    db_session.add_all([success, success_no_plan])
+    await db_session.commit()
+
+    current = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "current"}],
+        vm_instance_id="vm-current",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(current)
+    await db_session.commit()
+    await db_session.refresh(current)
+
+    token = create_agent_token(str(current.id), "vm-current")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dc = resp.json()["direction_context"]
+    assert "direction_successful_analysis" in dc
+    dsa = dc["direction_successful_analysis"]
+    assert len(dsa) == 1
+    entry = dsa[0]
+    assert entry["title"] == "Successful task"
+    assert len(entry["analysis_plan"]) == 500
+    assert entry["pr_changed_files"] == ["svc.py", "route.py"]
+    import json as _json
+    assert len(_json.dumps(dsa)) <= 1500
 
 
 @pytest.mark.asyncio

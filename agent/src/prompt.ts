@@ -433,6 +433,24 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         if (fp) dcLines.push(`  - Previous error fingerprint: ${fp}`);
       }
     }
+    const successfulAnalysis = Array.isArray(dirCtx.direction_successful_analysis)
+      ? dirCtx.direction_successful_analysis as Array<Record<string, unknown>>
+      : [];
+    if (successfulAnalysis.length > 0) {
+      dcLines.push('**Approaches that worked:**');
+      for (const entry of successfulAnalysis) {
+        const t = strVal(entry.title);
+        dcLines.push(`- ${t}`);
+        const plan = strVal(entry.analysis_plan);
+        if (plan) dcLines.push(`  - Analysis plan: ${plan}`);
+        const changedFiles = Array.isArray(entry.pr_changed_files)
+          ? (entry.pr_changed_files as unknown[]).map(f => strVal(f)).filter(Boolean)
+          : [];
+        if (changedFiles.length > 0) {
+          dcLines.push(`  - Files changed: ${changedFiles.join(', ')}`);
+        }
+      }
+    }
     dcLines.push('');
     prefix += dcLines.join('\n') + '\n';
   }
@@ -919,6 +937,8 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
         } else if (relatedFiles && relatedFiles.length > 0) {
           suffix += ` (files: ${relatedFiles.join(', ')})`;
         }
+      } else if (!isActive && changedFiles && changedFiles.length > 0) {
+        suffix = ` (modified: ${changedFiles.join(', ')})`;
       } else if (relatedFiles && relatedFiles.length > 0) {
         suffix = ` (files: ${relatedFiles.join(', ')})`;
       }
@@ -997,9 +1017,10 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       extras.push(`files: ${files}${relatedFiles.length > 3 ? ` +${relatedFiles.length - 3}` : ''}`);
     }
     const changedFiles = t.changed_files as unknown;
-    if (t.failure_reason && Array.isArray(changedFiles) && changedFiles.length > 0) {
+    if (Array.isArray(changedFiles) && changedFiles.length > 0) {
       const files = changedFiles.slice(0, 3).map((f) => strVal(f)).join(', ');
-      extras.push(`changed: ${files}${changedFiles.length > 3 ? ` +${changedFiles.length - 3}` : ''}`);
+      const label = t.failure_reason ? 'changed' : 'modified';
+      extras.push(`${label}: ${files}${changedFiles.length > 3 ? ` +${changedFiles.length - 3}` : ''}`);
     }
     let metaSuffix = extras.length > 0 ? ` [${extras.join('; ')}]` : '';
     if (metaSuffix.length > 100) metaSuffix = metaSuffix.slice(0, 97) + '...]';
