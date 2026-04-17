@@ -50,6 +50,63 @@ _SCOPE_ORDER = ["small", "medium", "large"]
 # the next research cycle.
 _DEGRADED_SPAWN_CAP = 2
 
+_HISTORY_AGG_DEFAULTS = {
+    "total_cycles": 0,
+    "total_tasks_created": 0,
+    "total_prs_merged": 0,
+    "total_prs_rejected": 0,
+    "total_tasks_failed": 0,
+    "total_tasks_cancelled": 0,
+    "first_cycle_at": None,
+}
+
+_DECOMP_AGG_DEFAULTS = {
+    "total_decompositions": 0,
+    "subtask_merge_rate_weighted_sum": 0.0,
+    "subtask_count_sum": 0,
+    "cross_module_count_sum": 0,
+}
+
+
+def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> dict:
+    """Fold evicted research_history entries into a running history_aggregate.
+
+    Preserves basic counters plus per-scope breakdown and decomposition-quality
+    signals that _calibrate_scope and predict_spawn_success read. Without this,
+    directions older than 10 cycles silently lost all scope/decomposition data.
+    """
+    agg = prev_agg or {}
+    for k, v in _HISTORY_AGG_DEFAULTS.items():
+        agg.setdefault(k, v)
+    sb = agg.setdefault("scope_breakdown", {})
+    dq = agg.setdefault("decomposition_quality", dict(_DECOMP_AGG_DEFAULTS))
+    for ev in evicted:
+        agg["total_cycles"] += 1
+        agg["total_tasks_created"] += ev.get("tasks_created", 0)
+        agg["total_prs_merged"] += ev.get("prs_merged", 0)
+        agg["total_prs_rejected"] += ev.get("prs_rejected", 0)
+        agg["total_tasks_failed"] += ev.get("tasks_failed", 0)
+        agg["total_tasks_cancelled"] += ev.get("tasks_cancelled", 0)
+        if not agg["first_cycle_at"] and ev.get("timestamp"):
+            agg["first_cycle_at"] = ev["timestamp"]
+        for scope, stats in (ev.get("scope_breakdown") or {}).items():
+            bucket = sb.setdefault(scope, {
+                "created": 0, "merged": 0, "failed": 0, "failed_infra": 0,
+            })
+            bucket["created"] += stats.get("created", 0)
+            bucket["merged"] += stats.get("merged", 0)
+            bucket["failed"] += stats.get("failed", 0)
+            bucket["failed_infra"] += stats.get("failed_infra", 0)
+        for qd in (ev.get("decomposition_quality") or []):
+            dq["total_decompositions"] += 1
+            count = qd.get("subtask_count") or 0
+            dq["subtask_count_sum"] += count
+            dq["cross_module_count_sum"] += qd.get("cross_module_count") or 0
+            rate = qd.get("subtask_merge_rate")
+            if isinstance(rate, (int, float)) and count > 0:
+                dq["subtask_merge_rate_weighted_sum"] += float(rate) * count
+    return agg
+
 
 def _assess_spawn_health() -> tuple[bool, str | None]:
     """Check pipeline health signals for spawn-time gating.
@@ -1433,23 +1490,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     # Keep last 10 history entries; aggregate evicted entries to preserve lifetime stats
                     new_history = history + [entry]
                     if len(new_history) > 10:
-                        evicted = new_history[:-10]
-                        prev_agg = d.get("history_aggregate", {
-                            "total_cycles": 0, "total_tasks_created": 0,
-                            "total_prs_merged": 0, "total_prs_rejected": 0,
-                            "total_tasks_failed": 0,
-                            "total_tasks_cancelled": 0, "first_cycle_at": None,
-                        })
-                        for ev in evicted:
-                            prev_agg["total_cycles"] += 1
-                            prev_agg["total_tasks_created"] += ev.get("tasks_created", 0)
-                            prev_agg["total_prs_merged"] += ev.get("prs_merged", 0)
-                            prev_agg["total_prs_rejected"] = prev_agg.get("total_prs_rejected", 0) + ev.get("prs_rejected", 0)
-                            prev_agg["total_tasks_failed"] += ev.get("tasks_failed", 0)
-                            prev_agg["total_tasks_cancelled"] += ev.get("tasks_cancelled", 0)
-                            if not prev_agg["first_cycle_at"] and ev.get("timestamp"):
-                                prev_agg["first_cycle_at"] = ev["timestamp"]
-                        d["history_aggregate"] = prev_agg
+                        d["history_aggregate"] = _fold_evicted_into_aggregate(
+                            d.get("history_aggregate"), new_history[:-10]
+                        )
                     d["research_history"] = new_history[-10:]
                     d["possibly_saturated"] = _compute_saturation(d["research_history"])
 
@@ -1818,23 +1861,9 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
     new_history = history + [entry]
     # Share the existing eviction/aggregate rule: keep last 10, aggregate older entries
     if len(new_history) > 10:
-        evicted = new_history[:-10]
-        prev_agg = target.get("history_aggregate", {
-            "total_cycles": 0, "total_tasks_created": 0,
-            "total_prs_merged": 0, "total_prs_rejected": 0,
-            "total_tasks_failed": 0,
-            "total_tasks_cancelled": 0, "first_cycle_at": None,
-        })
-        for ev in evicted:
-            prev_agg["total_cycles"] += 1
-            prev_agg["total_tasks_created"] += ev.get("tasks_created", 0)
-            prev_agg["total_prs_merged"] += ev.get("prs_merged", 0)
-            prev_agg["total_prs_rejected"] = prev_agg.get("total_prs_rejected", 0) + ev.get("prs_rejected", 0)
-            prev_agg["total_tasks_failed"] += ev.get("tasks_failed", 0)
-            prev_agg["total_tasks_cancelled"] += ev.get("tasks_cancelled", 0)
-            if not prev_agg["first_cycle_at"] and ev.get("timestamp"):
-                prev_agg["first_cycle_at"] = ev["timestamp"]
-        target["history_aggregate"] = prev_agg
+        target["history_aggregate"] = _fold_evicted_into_aggregate(
+            target.get("history_aggregate"), new_history[:-10]
+        )
     target["research_history"] = new_history[-10:]
     target["last_researched_at"] = now_iso
     project.directions = directions

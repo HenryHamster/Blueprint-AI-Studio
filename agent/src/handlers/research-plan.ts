@@ -203,6 +203,53 @@ export function formatCochangeHints(directionCtx: Record<string, unknown> | unde
   return `## Co-Change Affinity Hints\n\nBased on prior merged PRs, these files in your task's scope have historically changed together. Prefer to keep high-affinity pairs in the same subtask; files without listed affinity can safely be split into independent subtasks.\n\n${lines.join('\n')}\n\n`;
 }
 
+export function formatDecompositionOutcomes(directionCtx: Record<string, unknown> | undefined): string {
+  if (!directionCtx) return '';
+  const raw = directionCtx.decomposition_outcomes;
+  if (!raw || typeof raw !== 'object') return '';
+  const o = raw as Record<string, unknown>;
+  const count = typeof o.prior_decomposition_count === 'number' ? o.prior_decomposition_count : 0;
+  if (count <= 0) return '';
+
+  const lines: string[] = [`- Prior decompositions analyzed: ${count}`];
+  if (typeof o.avg_subtask_merge_rate === 'number') {
+    lines.push(`- Avg subtask merge rate: ${Math.round(o.avg_subtask_merge_rate * 100)}%`);
+  }
+  if (typeof o.avg_files_per_subtask === 'number') {
+    lines.push(`- Avg files per subtask: ${o.avg_files_per_subtask}`);
+  }
+  if (typeof o.max_files_in_subtask === 'number') {
+    lines.push(`- Max files in a single subtask: ${o.max_files_in_subtask}`);
+  }
+  if (typeof o.avg_dependency_depth === 'number') {
+    lines.push(`- Avg dependency depth: ${o.avg_dependency_depth}`);
+  }
+  if (typeof o.max_dependency_depth === 'number') {
+    lines.push(`- Max dependency depth: ${o.max_dependency_depth}`);
+  }
+
+  const hints: string[] = [];
+  const avgFiles = typeof o.avg_files_per_subtask === 'number' ? o.avg_files_per_subtask : 0;
+  const maxDep = typeof o.max_dependency_depth === 'number' ? o.max_dependency_depth : 0;
+  const mergeRate = typeof o.avg_subtask_merge_rate === 'number' ? o.avg_subtask_merge_rate : null;
+  const xmodCorr = o.high_cross_module_correlates_with_low_merge === true;
+  if (avgFiles > 5 && (mergeRate === null || mergeRate < 0.6)) {
+    hints.push('Prior subtasks averaged many files and had middling merge rates — prefer smaller subtasks.');
+  }
+  if (maxDep > 3) {
+    hints.push('Prior decompositions had deep dependency chains — flatten the dependency graph.');
+  }
+  if (xmodCorr) {
+    hints.push('Cross-module subtasks (>=2 top-level dirs) correlate with lower merge rates — keep each subtask scoped to one module where possible.');
+  }
+
+  const hintSection = hints.length > 0
+    ? `\n\nActionable guidance:\n${hints.map(h => `- ${h}`).join('\n')}`
+    : '';
+
+  return `## Prior Decomposition Outcomes\n\nMetrics from recent plan decompositions in this direction:\n${lines.join('\n')}${hintSection}\n\n`;
+}
+
 export function mapSubtaskToSpawnPayload(st: Record<string, unknown>, baseBranch: string): Record<string, unknown> {
   return {
     title: strVal(st.title, 'Untitled subtask'),
@@ -250,8 +297,9 @@ export async function handlePlan(
   const planRetryContext = buildRetryContext(task);
   const planFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const cochangeHintsSection = formatCochangeHints(task.direction_context as Record<string, unknown> | undefined);
+  const decompositionOutcomesSection = formatDecompositionOutcomes(task.direction_context as Record<string, unknown> | undefined);
 
-  const planPrompt = `${claudeMdPrefix}${planPlaybookSection}${planRetryContext}${contextPrefix}${cochangeHintsSection}You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
+  const planPrompt = `${claudeMdPrefix}${planPlaybookSection}${planRetryContext}${contextPrefix}${cochangeHintsSection}${decompositionOutcomesSection}You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
 
 Task to decompose:
 ${prompt}

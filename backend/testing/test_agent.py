@@ -2296,6 +2296,167 @@ async def test_claim_does_not_inject_cochange_hints_for_create_task(client: Asyn
 
 
 @pytest.mark.asyncio
+async def test_claim_injects_decomposition_outcomes_for_plan_task(client: AsyncClient, db_session):
+    """Claim endpoint summarizes decomposition_quality from last 3 productive research_history entries for plan tasks."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Decomp Plan Test", user_id="test-user-decomp-plan")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Refactor models",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [
+                # Non-productive cycle → excluded
+                {"tasks_created": 0, "prs_merged": 0, "decomposition_quality": [
+                    {"plan_task_id": "ignore-me", "subtask_count": 1, "subtask_merge_rate": 0.0,
+                     "avg_files_per_subtask": 0.0, "max_files_in_subtask": 0,
+                     "dependency_depth": 0, "cross_module_count": 0},
+                ]},
+                {"tasks_created": 2, "prs_merged": 2, "decomposition_quality": [
+                    {"plan_task_id": "p1", "subtask_count": 3, "subtask_merge_rate": 0.9,
+                     "avg_files_per_subtask": 2.0, "max_files_in_subtask": 3,
+                     "dependency_depth": 1, "cross_module_count": 0},
+                ]},
+                {"tasks_created": 2, "prs_merged": 1, "decomposition_quality": [
+                    {"plan_task_id": "p2", "subtask_count": 4, "subtask_merge_rate": 0.2,
+                     "avg_files_per_subtask": 7.0, "max_files_in_subtask": 10,
+                     "dependency_depth": 4, "cross_module_count": 3},
+                    {"plan_task_id": "p3", "subtask_count": 2, "subtask_merge_rate": 0.8,
+                     "avg_files_per_subtask": 3.0, "max_files_in_subtask": 4,
+                     "dependency_depth": 2, "cross_module_count": 0},
+                ]},
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "Decompose refactor"}],
+        vm_instance_id="agent-vm-decomp-plan",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-decomp-plan")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    dc = data.get("direction_context", {}) or {}
+    assert "decomposition_outcomes" in dc, f"Expected decomposition_outcomes, got: {list(dc.keys())}"
+    summary = dc["decomposition_outcomes"]
+    # 3 entries flattened from the 2 productive cycles (non-productive excluded)
+    assert summary["prior_decomposition_count"] == 3
+    # avg merge rate = (0.9 + 0.2 + 0.8) / 3 = 0.633
+    assert summary["avg_subtask_merge_rate"] == round((0.9 + 0.2 + 0.8) / 3, 3)
+    # avg files per subtask = (2 + 7 + 3) / 3 = 4.0
+    assert summary["avg_files_per_subtask"] == 4.0
+    assert summary["max_files_in_subtask"] == 10
+    assert summary["avg_dependency_depth"] == round((1 + 4 + 2) / 3, 2)
+    assert summary["max_dependency_depth"] == 4
+    # high cross_module (>=2) merge rate = 0.2; low = (0.9+0.8)/2 = 0.85; gap >= 0.1 → true
+    assert summary["high_cross_module_correlates_with_low_merge"] is True
+
+
+@pytest.mark.asyncio
+async def test_claim_omits_decomposition_outcomes_when_no_history(client: AsyncClient, db_session):
+    """Claim endpoint omits decomposition_outcomes when research_history has no decomposition_quality data."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Decomp Empty Test", user_id="test-user-decomp-empty")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "No decomp data",
+            "priority": "low",
+            "research_context": "",
+            "research_history": [
+                {"tasks_created": 2, "prs_merged": 1},
+                {"tasks_created": 3, "prs_merged": 2, "decomposition_quality": []},
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "Decompose nothing"}],
+        vm_instance_id="agent-vm-decomp-empty",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-decomp-empty")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    dc = resp.json().get("direction_context", {}) or {}
+    assert "decomposition_outcomes" not in dc
+
+
+@pytest.mark.asyncio
+async def test_claim_does_not_inject_decomposition_outcomes_for_create_task(client: AsyncClient, db_session):
+    """Claim endpoint omits decomposition_outcomes (plan-only signal) for create tasks."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Decomp Create Skip Test", user_id="test-user-decomp-skip")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Has decomp data",
+            "priority": "high",
+            "research_context": "",
+            "research_history": [
+                {"tasks_created": 2, "prs_merged": 2, "decomposition_quality": [
+                    {"plan_task_id": "p1", "subtask_count": 2, "subtask_merge_rate": 1.0,
+                     "avg_files_per_subtask": 2.0, "max_files_in_subtask": 3,
+                     "dependency_depth": 1, "cross_module_count": 0},
+                ]},
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Implement change"}],
+        vm_instance_id="agent-vm-decomp-create-skip",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-decomp-create-skip")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    dc = resp.json().get("direction_context", {}) or {}
+    assert "decomposition_outcomes" not in dc, (
+        f"decomposition_outcomes should be plan-only, got direction_context keys: {list(dc.keys())}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_claim_injects_module_feedback_warnings_for_create_task(client: AsyncClient, db_session):
     """Claim endpoint injects module_feedback_warnings for create tasks when related_files have profiles."""
     from sqlalchemy.orm.attributes import flag_modified

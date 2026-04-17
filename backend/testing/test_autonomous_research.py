@@ -3771,3 +3771,127 @@ def test_evicted_failed_preserves_category_with_long_title():
     unparseable = "no category here at all, just a long free-form note x" * 3
     fallback = _format_evicted_failed(unparseable)
     assert fallback == unparseable[:60]
+
+
+def test_fold_evicted_preserves_scope_and_decomposition():
+    """Rolloff aggregate retains scope_breakdown and decomposition_quality signals.
+
+    Without this, directions older than 10 cycles silently lose data that
+    _calibrate_scope and predict_spawn_success depend on.
+    """
+    from app.research_completion import _fold_evicted_into_aggregate
+
+    evicted = [
+        {
+            "timestamp": "2025-01-01T00:00:00",
+            "tasks_created": 2,
+            "prs_merged": 1,
+            "prs_rejected": 0,
+            "tasks_failed": 1,
+            "scope_breakdown": {
+                "small": {"created": 2, "merged": 1, "failed": 1, "failed_infra": 0},
+                "medium": {"created": 1, "merged": 0, "failed": 0, "failed_infra": 1},
+            },
+            "decomposition_quality": [
+                {"subtask_count": 4, "subtask_merge_rate": 0.5, "cross_module_count": 1},
+                {"subtask_count": 2, "subtask_merge_rate": None, "cross_module_count": 0},
+            ],
+        },
+        {
+            "timestamp": "2025-01-02T00:00:00",
+            "tasks_created": 3,
+            "prs_merged": 2,
+            "scope_breakdown": {
+                "small": {"created": 3, "merged": 2, "failed": 0, "failed_infra": 0},
+            },
+            "decomposition_quality": [
+                {"subtask_count": 5, "subtask_merge_rate": 0.8, "cross_module_count": 2},
+            ],
+        },
+    ]
+    agg = _fold_evicted_into_aggregate(None, evicted)
+
+    assert agg["total_cycles"] == 2
+    assert agg["total_tasks_created"] == 5
+    assert agg["total_prs_merged"] == 3
+    assert agg["first_cycle_at"] == "2025-01-01T00:00:00"
+
+    sb = agg["scope_breakdown"]
+    assert sb["small"] == {"created": 5, "merged": 3, "failed": 1, "failed_infra": 0}
+    assert sb["medium"] == {"created": 1, "merged": 0, "failed": 0, "failed_infra": 1}
+
+    dq = agg["decomposition_quality"]
+    assert dq["total_decompositions"] == 3
+    assert dq["subtask_count_sum"] == 11  # 4 + 2 + 5
+    assert dq["cross_module_count_sum"] == 3  # 1 + 0 + 2
+    # Only entries with a non-null rate contribute: 0.5*4 + 0.8*5 = 6.0
+    assert dq["subtask_merge_rate_weighted_sum"] == pytest.approx(6.0)
+
+
+def test_fold_evicted_accumulates_into_existing_aggregate():
+    """Subsequent rolloffs accumulate on top of prior aggregate without losing data."""
+    from app.research_completion import _fold_evicted_into_aggregate
+
+    prior = {
+        "total_cycles": 3,
+        "total_tasks_created": 4,
+        "total_prs_merged": 2,
+        "total_prs_rejected": 0,
+        "total_tasks_failed": 1,
+        "total_tasks_cancelled": 0,
+        "first_cycle_at": "2024-12-01T00:00:00",
+        "scope_breakdown": {"small": {"created": 4, "merged": 2, "failed": 1, "failed_infra": 0}},
+        "decomposition_quality": {
+            "total_decompositions": 1,
+            "subtask_merge_rate_weighted_sum": 3.0,
+            "subtask_count_sum": 5,
+            "cross_module_count_sum": 1,
+        },
+    }
+    evicted = [
+        {
+            "timestamp": "2025-02-01T00:00:00",
+            "tasks_created": 2,
+            "prs_merged": 1,
+            "scope_breakdown": {
+                "small": {"created": 2, "merged": 1, "failed": 0, "failed_infra": 0},
+                "large": {"created": 1, "merged": 0, "failed": 1, "failed_infra": 0},
+            },
+            "decomposition_quality": [
+                {"subtask_count": 3, "subtask_merge_rate": 1.0, "cross_module_count": 0},
+            ],
+        }
+    ]
+    agg = _fold_evicted_into_aggregate(prior, evicted)
+
+    assert agg["total_cycles"] == 4
+    assert agg["total_tasks_created"] == 6
+    # first_cycle_at stays at the oldest known timestamp
+    assert agg["first_cycle_at"] == "2024-12-01T00:00:00"
+
+    sb = agg["scope_breakdown"]
+    assert sb["small"]["created"] == 6
+    assert sb["small"]["merged"] == 3
+    assert sb["large"] == {"created": 1, "merged": 0, "failed": 1, "failed_infra": 0}
+
+    dq = agg["decomposition_quality"]
+    assert dq["total_decompositions"] == 2
+    assert dq["subtask_count_sum"] == 8
+    assert dq["cross_module_count_sum"] == 1
+    assert dq["subtask_merge_rate_weighted_sum"] == pytest.approx(6.0)  # 3.0 + 1.0*3
+
+
+def test_fold_evicted_handles_legacy_entries_without_scope_or_decomp():
+    """Old history entries predating scope_breakdown/decomposition_quality still roll off cleanly."""
+    from app.research_completion import _fold_evicted_into_aggregate
+
+    evicted = [
+        {"timestamp": "2025-01-01T00:00:00", "tasks_created": 1, "prs_merged": 0},
+        {"timestamp": "2025-01-02T00:00:00", "tasks_created": 2, "prs_merged": 1},
+    ]
+    agg = _fold_evicted_into_aggregate(None, evicted)
+    assert agg["total_cycles"] == 2
+    assert agg["total_tasks_created"] == 3
+    assert agg["scope_breakdown"] == {}
+    assert agg["decomposition_quality"]["total_decompositions"] == 0
+    assert agg["decomposition_quality"]["subtask_count_sum"] == 0

@@ -7,6 +7,7 @@ import {
   classifyFailureCategory,
   buildScopeCalibrationSignal,
   formatCochangeHints,
+  formatDecompositionOutcomes,
 } from './research-plan.js';
 
 describe('calcMessageAge', () => {
@@ -444,5 +445,88 @@ describe('formatCochangeHints', () => {
     expect(result).toContain('a.py');
     expect(result).toContain('c.py');
     expect(result).not.toContain('b.py');
+  });
+});
+
+describe('formatDecompositionOutcomes', () => {
+  it('returns empty string when direction context is undefined', () => {
+    expect(formatDecompositionOutcomes(undefined)).toBe('');
+  });
+
+  it('returns empty string when decomposition_outcomes is missing', () => {
+    expect(formatDecompositionOutcomes({ other: 'x' })).toBe('');
+  });
+
+  it('returns empty string when prior_decomposition_count is zero', () => {
+    expect(formatDecompositionOutcomes({
+      decomposition_outcomes: { prior_decomposition_count: 0 },
+    })).toBe('');
+  });
+
+  it('renders section with metrics when data is present', () => {
+    const result = formatDecompositionOutcomes({
+      decomposition_outcomes: {
+        prior_decomposition_count: 4,
+        avg_subtask_merge_rate: 0.75,
+        avg_files_per_subtask: 3.5,
+        max_files_in_subtask: 6,
+        avg_dependency_depth: 2.0,
+        max_dependency_depth: 3,
+        high_cross_module_correlates_with_low_merge: false,
+      },
+    });
+    expect(result).toContain('Prior Decomposition Outcomes');
+    expect(result).toContain('Prior decompositions analyzed: 4');
+    expect(result).toContain('Avg subtask merge rate: 75%');
+    expect(result).toContain('Avg files per subtask: 3.5');
+    expect(result).toContain('Max files in a single subtask: 6');
+    expect(result).toContain('Max dependency depth: 3');
+    // No actionable hints when thresholds aren't tripped
+    expect(result).not.toContain('Actionable guidance');
+  });
+
+  it('includes "flatten dependency graph" hint when max_dependency_depth > 3', () => {
+    const result = formatDecompositionOutcomes({
+      decomposition_outcomes: {
+        prior_decomposition_count: 2,
+        avg_subtask_merge_rate: 0.5,
+        max_dependency_depth: 5,
+      },
+    });
+    expect(result).toContain('flatten the dependency graph');
+  });
+
+  it('includes "smaller subtasks" hint when avg_files_per_subtask is high and merge rate modest', () => {
+    const result = formatDecompositionOutcomes({
+      decomposition_outcomes: {
+        prior_decomposition_count: 3,
+        avg_subtask_merge_rate: 0.3,
+        avg_files_per_subtask: 8.0,
+      },
+    });
+    expect(result).toContain('prefer smaller subtasks');
+  });
+
+  it('includes cross-module correlation warning when flagged', () => {
+    const result = formatDecompositionOutcomes({
+      decomposition_outcomes: {
+        prior_decomposition_count: 3,
+        avg_subtask_merge_rate: 0.6,
+        high_cross_module_correlates_with_low_merge: true,
+      },
+    });
+    expect(result).toContain('Cross-module subtasks');
+    expect(result).toContain('keep each subtask scoped to one module');
+  });
+
+  it('does not recommend smaller subtasks when merge rate is high despite many files', () => {
+    const result = formatDecompositionOutcomes({
+      decomposition_outcomes: {
+        prior_decomposition_count: 3,
+        avg_subtask_merge_rate: 0.9,
+        avg_files_per_subtask: 8.0,
+      },
+    });
+    expect(result).not.toContain('prefer smaller subtasks');
   });
 });

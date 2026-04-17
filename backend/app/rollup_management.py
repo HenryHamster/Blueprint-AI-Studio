@@ -913,6 +913,38 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             _pr_detail = {}
                             _pr_refetch_failed = True
                             logger.debug(f"[ROLLUP] Could not refetch PR #{rollup_pr_number} for behind-check: {_pr_exc}")
+                        # PR refetch retry budget: transient GitHub API errors (500,
+                        # 503, network timeouts) shouldn't burn a fix VM. Defer the
+                        # sweep on early failures; only fall through to fix-spawn
+                        # once consecutive failures exhaust the budget.
+                        if _pr_refetch_failed:
+                            _refetch_failures = parent_ctx.get("_refetch_failure_count", 0) + 1
+                            _refetch_budget = _runtime_config.get("rollup_refetch_failure_retries", 3)
+                            if _refetch_failures < _refetch_budget:
+                                parent.context = {
+                                    **parent_ctx,
+                                    "rollup_pr_url": rollup_pr_url,
+                                    "rollup_pr_number": rollup_pr_number,
+                                    "_refetch_failure_count": _refetch_failures,
+                                }
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{rollup_pr_number} refetch failed after merge attempt "
+                                    f"— deferring to next sweep ({_refetch_failures}/{_refetch_budget})"
+                                )
+                                session.add(parent)
+                                await session.commit()
+                                logger.info(
+                                    f"[ROLLUP] PR #{rollup_pr_number} refetch failed after failed merge "
+                                    f"(attempt {_refetch_failures}/{_refetch_budget}) — deferring fix spawn"
+                                )
+                                return
+                            parent_ctx = {k: v for k, v in parent_ctx.items() if k != "_refetch_failure_count"}
+                            logger.warning(
+                                f"[ROLLUP] PR #{rollup_pr_number} refetch failed {_refetch_failures} consecutive "
+                                f"sweeps — falling through to fix spawn"
+                            )
+                        elif "_refetch_failure_count" in parent_ctx:
+                            parent_ctx = {k: v for k, v in parent_ctx.items() if k != "_refetch_failure_count"}
                         # Classify mergeable_state before assuming this is a real
                         # conflict. Only 'dirty' (and 'behind' as fall-through if
                         # update_branch fails) warrant a fix VM. 'blocked' and

@@ -1966,29 +1966,112 @@ async def test_rollup_auto_merge_blocked_calls_enable_auto_merge(rollup_db, mock
     assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
 
 
-@pytest.mark.asyncio
-async def test_rollup_merge_failure_with_pr_refetch_failure_spawns_fix(rollup_db, mocker):
-    """When merge_pull_request fails AND the subsequent get_pull_request refetch
-    raises (so we can't classify the merge failure), fall through to fix-spawn
-    with the original merge_msg — deferring can't help when the merge already
-    failed and the refetch is only there to classify it."""
+def _patch_refetch_failure_mocks(mocker, *, merge_msg="merge_msg-from-failed-attempt"):
+    """Mocks where every get_pull_request call right after a failed
+    merge_pull_request raises — simulates a transient GitHub API outage on
+    the post-merge refetch while leaving size-check / state-verify calls intact.
+    Works across multiple rollup sweeps."""
     _patch_common_rollup_mocks(mocker)
-
-    # First get_pull_request call (size check) returns valid data;
-    # second call (refetch for mergeable_state) raises an exception.
     pr_size_detail = {
         "additions": 5, "deletions": 5,
         "state": "open", "merged": False,
     }
-    refetch_calls = {"n": 0}
+    merge_attempted = {"v": False}
+
+    async def _merge(*_args, **_kwargs):
+        merge_attempted["v"] = True
+        return {"merged": False, "message": merge_msg}
 
     async def _pr_get(*_args, **_kwargs):
-        refetch_calls["n"] += 1
-        if refetch_calls["n"] == 1:
-            return pr_size_detail
-        raise RuntimeError("GitHub API 502 on refetch")
+        if merge_attempted["v"]:
+            merge_attempted["v"] = False
+            raise RuntimeError("GitHub API 502 on refetch")
+        return pr_size_detail
 
     mocker.patch("app.github.get_pull_request", new=AsyncMock(side_effect=_pr_get))
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
+    )
+    mocker.patch("app.github.merge_pull_request", new=AsyncMock(side_effect=_merge))
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
+
+
+@pytest.mark.asyncio
+async def test_rollup_refetch_failure_defers_under_budget(rollup_db, mocker):
+    """A single transient refetch failure must defer to the next sweep instead
+    of burning a fix VM — the next sweep typically refetches successfully."""
+    _patch_refetch_failure_mocks(mocker)
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, None)),
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("_refetch_failure_count") == 1
+    assert mock_spawn.await_count == 0, "fix task must not be spawned on first refetch failure"
+    assert "refetch failed" in (parent.latest_status_message or "").lower()
+    assert "deferring" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_rollup_refetch_failure_exhausted_spawns_fix(rollup_db, mocker):
+    """Once consecutive refetch failures exhaust the budget, fall through to
+    fix-spawn with the original merge_msg so a persistently broken refetch
+    doesn't trap the rollup forever."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"rollup_refetch_failure_retries": 2},
+    )
+    _patch_refetch_failure_mocks(mocker)
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(MagicMock(id="fix-1"), None)),
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    # Sweep 1 — counter=1, under budget, defers
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_refetch_failure_count") == 1
+    assert mock_spawn.await_count == 0
+
+    # Sweep 2 — counter=2, meets budget, falls through to fix spawn
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert mock_spawn.await_count == 1, "fix task must spawn once refetch budget is exhausted"
+    fix_prompt = mock_spawn.await_args.kwargs.get("fix_prompt") or ""
+    assert "merge_msg-from-failed-attempt" in fix_prompt
+    # Counter cleared so a future refetch failure starts fresh.
+    assert "_refetch_failure_count" not in (parent.context or {})
+
+
+@pytest.mark.asyncio
+async def test_rollup_refetch_success_clears_failure_counter(rollup_db, mocker):
+    """A prior transient refetch failure leaves a counter in context; once the
+    refetch succeeds on a later sweep, the counter must reset so a future
+    transient failure starts from zero."""
+    _patch_common_rollup_mocks(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "additions": 5, "deletions": 5,
+            "state": "open", "merged": False,
+            "mergeable_state": "dirty",
+        },
+    )
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
@@ -1997,7 +2080,7 @@ async def test_rollup_merge_failure_with_pr_refetch_failure_spawns_fix(rollup_db
     mocker.patch(
         "app.github.merge_pull_request",
         new_callable=AsyncMock,
-        return_value={"merged": False, "message": "merge_msg-from-failed-attempt"},
+        return_value={"merged": False, "message": "real conflict"},
     )
     mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     mock_spawn = mocker.patch(
@@ -2008,20 +2091,18 @@ async def test_rollup_merge_failure_with_pr_refetch_failure_spawns_fix(rollup_db
     _, parent, child = await _make_rollup_parent_with_completed_child(
         rollup_db, target_branch="research/parent-xyz"
     )
+    parent.context = {**(parent.context or {}), "_refetch_failure_count": 2}
+    rollup_db.add(parent)
+    await rollup_db.commit()
 
     await _check_and_trigger_rollup(child, rollup_db)
     await rollup_db.refresh(parent)
 
-    assert mock_spawn.await_count == 1, (
-        "fix task must spawn when merge fails and refetch can't classify the failure"
+    assert "_refetch_failure_count" not in (parent.context or {}), (
+        "successful refetch must clear the failure counter"
     )
-    fix_prompt = mock_spawn.await_args.kwargs.get("fix_prompt") or ""
-    assert "merge_msg-from-failed-attempt" in fix_prompt, (
-        "original merge_msg must be passed into the fix prompt"
-    )
-    # No deferral counter should have been written.
-    assert "_merge_deferred_count" not in (parent.context or {})
-    assert "_merge_total_deferrals" not in (parent.context or {})
+    # Refetch succeeded and classified as 'dirty' → real conflict → fix spawned.
+    assert mock_spawn.await_count == 1
 
 
 # ── Rollup Behind-Branch Update Retry ───────────────────────────────────────
