@@ -173,7 +173,10 @@ describe('buildContextPrefix', () => {
       direction_context: {
         title: 'Improve auth flow',
         priority: 'high',
-        failed_approaches: ['JWT in cookies', 'Session-based auth'],
+        failed_approaches: [
+          { text: 'JWT in cookies', failure_type: 'CODE_ERROR' },
+          { text: 'Session-based auth', failure_type: '' },
+        ],
         recent_outcomes: [
           { tasks_created: 3, prs_merged: 2 },
           { tasks_created: 4, prs_merged: 1 },
@@ -185,11 +188,24 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('**Goal:** Improve auth flow');
     expect(result).toContain('**Priority:** high');
     expect(result).toContain('**Avoid (already tried and failed):**');
-    expect(result).toContain('- JWT in cookies');
+    expect(result).toContain('- JWT in cookies [CODE_ERROR]');
     expect(result).toContain('- Session-based auth');
     expect(result).toContain('Recent cycles:');
     expect(result).toContain('2/3 merged');
     expect(result).toContain('1/4 merged');
+  });
+
+  it('renders legacy string failed_approaches as bullet list (backward compatible)', () => {
+    const task = {
+      direction_context: {
+        title: 'Legacy direction',
+        priority: 'medium',
+        failed_approaches: ['Bare string approach'],
+        recent_outcomes: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('- Bare string approach');
   });
 
   it('renders direction_context without failed approaches or recent_outcomes when arrays are empty', () => {

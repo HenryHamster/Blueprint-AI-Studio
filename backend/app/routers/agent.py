@@ -270,6 +270,40 @@ def _has_local_cycle(adj: Dict[str, list]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Helper: parse a Failed Approaches entry into {text, failure_type}
+# ---------------------------------------------------------------------------
+
+_KNOWN_FAILURE_CATEGORIES = frozenset({
+    "CODE_ERROR", "PROVISION_FAILURE", "AGENT_TIMEOUT", "EXTERNAL_API", "RATE_LIMIT",
+    "rejected in review",
+})
+
+
+def _parse_failed_approach(line: str) -> dict:
+    """Parse '<title> (<category>) — <reason>' into {text, failure_type}.
+
+    Direction outcomes write entries with the failure category in parentheses
+    immediately after the title. Extract that category so agents can reason
+    about *why* a prior approach failed (technical infeasibility vs reviewer
+    rejection vs infra flakes) instead of just seeing the prose. Only recognise
+    parens whose contents match a known category so prose-level parens don't get
+    treated as metadata.
+    """
+    failure_type = ""
+    text = line
+    open_idx = line.find("(")
+    if open_idx > 0:
+        close_idx = line.find(")", open_idx)
+        if close_idx > open_idx:
+            inner = line[open_idx + 1:close_idx].strip()
+            if inner in _KNOWN_FAILURE_CATEGORIES:
+                failure_type = inner
+                stripped = (line[:open_idx].rstrip() + line[close_idx + 1:]).strip()
+                text = stripped if stripped else line
+    return {"text": text[:200], "failure_type": failure_type}
+
+
+# ---------------------------------------------------------------------------
 # Helper: failure stage pattern analysis
 # ---------------------------------------------------------------------------
 
@@ -481,6 +515,12 @@ async def claim_task(
                 if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
                     research_findings_summary = a.logs[:8000]
                     break
+            t_ctx = t.context or {}
+            t_prompt = (p.get("prompt") or p.get("description") or t.description or "")[:300]
+            t_related_files = (t_ctx.get("related_files") or [])[:10]
+            t_direction_id = t_ctx.get("direction_id")
+            is_failed = t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+            t_changed_files = (t_ctx.get("_pr_changed_files") or [])[:10] if is_failed else None
             recently_completed_tasks.append({
                 "id": str(t.id),
                 "title": t.title,
@@ -488,9 +528,13 @@ async def claim_task(
                 "status": t.status.value if hasattr(t.status, "value") else str(t.status),
                 "pr_url": pr_url,
                 "research_findings_summary": research_findings_summary,
-                "failure_reason": (t.latest_status_message or "")[:500] if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED) and t.latest_status_message else None,
-                "failure_class": classify_failure(t) if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED) and t.latest_status_message else None,
-                "review_iterations": (t.context or {}).get("review_loop", {}).get("iteration", 0) if (t.context or {}).get("review_loop") else None,
+                "failure_reason": (t.latest_status_message or "")[:500] if is_failed and t.latest_status_message else None,
+                "failure_class": classify_failure(t) if is_failed and t.latest_status_message else None,
+                "review_iterations": (t_ctx.get("review_loop", {}) or {}).get("iteration", 0) if t_ctx.get("review_loop") else None,
+                "prompt": t_prompt or None,
+                "related_files": t_related_files,
+                "direction_id": t_direction_id,
+                "changed_files": t_changed_files,
             })
 
         # Build lessons from high-iteration tasks (3+ review cycles)
@@ -514,12 +558,20 @@ async def claim_task(
                 continue
             review_hist = review_loop.get("review_history", [])
             if review_hist:
-                last_feedback = review_hist[-1].get("feedback", "")[:500]
-                lessons.append({
+                last_feedback = review_hist[-1].get("feedback", "")[:300]
+                first_entry = next(
+                    (e for e in review_hist if e.get("iteration") == 0),
+                    review_hist[0],
+                )
+                first_feedback = first_entry.get("feedback", "")[:300]
+                lesson = {
                     "task_title": ht.title,
                     "iterations": len(review_hist) + 1,
                     "last_feedback": last_feedback,
-                })
+                }
+                if first_feedback and first_feedback != last_feedback:
+                    lesson["first_feedback"] = first_feedback
+                lessons.append(lesson)
             if len(lessons) >= 8:
                 break
 
@@ -571,7 +623,41 @@ async def claim_task(
                     "status": sib.status,
                     "related_files": (sib.context or {}).get("related_files", []),
                     "task_type": (sib.first_payload).get("type", ""),
+                    "active": True,
                 })
+
+            terminal_sibling_result = await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == task.parent_task_id,
+                    Task.id != task.id,
+                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED])
+                ).order_by(Task.created_at.desc()).limit(5)
+            )
+            terminal_siblings = list(terminal_sibling_result.scalars().all())
+            terminal_sibling_pr_urls: dict = {}
+            if terminal_siblings:
+                sib_art_stmt = select(Artifact).where(
+                    Artifact.task_id.in_([s.id for s in terminal_siblings]),
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    Artifact.pr_url.isnot(None),
+                )
+                for art in (await session.execute(sib_art_stmt)).scalars().all():
+                    terminal_sibling_pr_urls.setdefault(art.task_id, art.pr_url)
+            for sib in terminal_siblings:
+                sib_status = sib.status.value if hasattr(sib.status, "value") else str(sib.status)
+                pr_url = (sib.context or {}).get("rollup_pr_url") or terminal_sibling_pr_urls.get(sib.id)
+                entry = {
+                    "id": str(sib.id),
+                    "title": sib.title,
+                    "status": sib_status,
+                    "related_files": (sib.context or {}).get("related_files", []),
+                    "task_type": (sib.first_payload).get("type", ""),
+                    "active": False,
+                    "pr_url": pr_url,
+                }
+                if sib.status == TaskStatus.FAILED and sib.latest_status_message:
+                    entry["failure_class"] = classify_failure(sib)
+                sibling_tasks.append(entry)
 
         # Pipeline health summary (for gated task types; else-branch covers the rest)
         pipeline_health = None
@@ -898,6 +984,9 @@ async def claim_task(
                         in_failed_section = False
                     elif in_failed_section and rc_stripped.startswith("- "):
                         failed_approaches.append(rc_stripped[2:])
+                structured_failed_approaches = [
+                    _parse_failed_approach(a) for a in failed_approaches[:5]
+                ]
                 recent_outcomes = [
                     {"tasks_created": h.get("tasks_created", 0), "prs_merged": h.get("prs_merged", 0)}
                     for h in history[-2:]
@@ -907,7 +996,7 @@ async def claim_task(
                 response["direction_context"] = {
                     "title": direction.get("title", ""),
                     "priority": direction.get("priority", ""),
-                    "failed_approaches": [a[:120] for a in failed_approaches[:5]],
+                    "failed_approaches": structured_failed_approaches,
                     "recent_outcomes": recent_outcomes,
                     "failure_stage_pattern": failure_stage_pattern,
                 }

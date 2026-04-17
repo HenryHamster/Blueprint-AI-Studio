@@ -505,6 +505,228 @@ async def test_agent_claim_active_tasks_related_files_defaults_to_empty(client: 
     assert active_tasks[0]["related_files"] == []
 
 
+@pytest.mark.asyncio
+async def test_recently_completed_tasks_include_outcome_context(client: AsyncClient, db_session):
+    """
+    Recently completed tasks in the claim response carry prompt, related_files,
+    direction_id, and (for failed tasks) changed_files so the next agent can
+    understand what the prior task tried and what it touched.
+    """
+    project = Project(name="Recent Outcome Context", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A failed task with changed_files and a direction
+    long_prompt = "Describe the change in detail. " * 20  # ~620 chars
+    failed_task = Task(
+        project_id=project.id,
+        title="Failed feature attempt",
+        description="desc",
+        payloads=[{"type": "create", "prompt": long_prompt}],
+        vm_instance_id="agent-vm-recent-failed",
+        status=TaskStatus.FAILED,
+        context={
+            "direction_id": "dir-abc",
+            "related_files": [f"file{i}.py" for i in range(15)],
+            "_pr_changed_files": [f"changed{i}.py" for i in range(15)],
+        },
+        latest_status_message="Tests failed on CI",
+    )
+    db_session.add(failed_task)
+    # A completed task (no changed_files expected)
+    completed_task = Task(
+        project_id=project.id,
+        title="Completed task",
+        payloads=[{"type": "create", "prompt": "Short prompt"}],
+        vm_instance_id="agent-vm-recent-done",
+        status=TaskStatus.COMPLETED,
+        context={"direction_id": "dir-xyz", "related_files": ["a.py", "b.py"]},
+    )
+    db_session.add(completed_task)
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Claimer",
+        payloads=[{"type": "research", "prompt": "Research"}],
+        vm_instance_id="agent-vm-recent-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-recent-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    recent = resp.json()["project_context"]["recently_completed_tasks"]
+
+    failed_entry = next(e for e in recent if e["title"] == "Failed feature attempt")
+    assert failed_entry["direction_id"] == "dir-abc"
+    assert len(failed_entry["related_files"]) == 10  # capped
+    assert failed_entry["related_files"][0] == "file0.py"
+    assert len(failed_entry["changed_files"]) == 10  # capped
+    assert failed_entry["prompt"] is not None
+    assert len(failed_entry["prompt"]) <= 300  # truncated
+    assert failed_entry["failure_reason"] == "Tests failed on CI"
+
+    done_entry = next(e for e in recent if e["title"] == "Completed task")
+    assert done_entry["direction_id"] == "dir-xyz"
+    assert done_entry["related_files"] == ["a.py", "b.py"]
+    assert done_entry["changed_files"] is None  # not failed
+    assert done_entry["prompt"] == "Short prompt"
+
+
+@pytest.mark.asyncio
+async def test_lessons_include_first_feedback_when_distinct(client: AsyncClient, db_session):
+    """
+    Lessons from high-iteration tasks include first_feedback (iteration 0) in
+    addition to last_feedback so the initial rejection reason is visible.
+    """
+    project = Project(name="Lessons First Feedback", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    lesson_task = Task(
+        project_id=project.id,
+        title="Lesson source",
+        payloads=[{"type": "create", "prompt": "Build stuff"}],
+        vm_instance_id="agent-vm-lesson",
+        status=TaskStatus.COMPLETED,
+        context={
+            "review_loop": {
+                "iteration": 2,
+                "review_history": [
+                    {"iteration": 0, "feedback": "Initial rejection: wrong approach"},
+                    {"iteration": 1, "feedback": "Still failing: missing tests"},
+                ],
+            }
+        },
+    )
+    db_session.add(lesson_task)
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Claimer",
+        payloads=[{"type": "research", "prompt": "Research"}],
+        vm_instance_id="agent-vm-lesson-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-lesson-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    lessons = resp.json()["project_context"]["lessons"]
+    assert len(lessons) == 1
+    lesson = lessons[0]
+    assert lesson["first_feedback"] == "Initial rejection: wrong approach"
+    assert lesson["last_feedback"] == "Still failing: missing tests"
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_sibling_tasks_include_terminal_outcomes(client: AsyncClient, db_session):
+    """
+    Tests that sibling_tasks in the claim response includes both active and terminal
+    siblings. Terminal entries carry status, failure_class (if FAILED), pr_url (if any),
+    and an active=False flag so the agent can distinguish in-progress conflicts from
+    historical outcomes.
+    """
+    project = Project(name="Sibling Outcomes Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="Parent task",
+        payloads=[{"type": "research", "prompt": "investigate"}],
+        vm_instance_id="agent-vm-sib-parent",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    completed_sib = Task(
+        project_id=project.id,
+        title="Completed sibling",
+        payloads=[{"type": "create", "prompt": "ship feature A"}],
+        vm_instance_id="agent-vm-sib-completed",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    failed_sib = Task(
+        project_id=project.id,
+        title="Failed sibling",
+        payloads=[{"type": "create", "prompt": "ship feature B"}],
+        vm_instance_id="agent-vm-sib-failed",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        latest_status_message="ImportError in module xyz",
+        context={"related_files": ["backend/app/bar.py"], "failure_category": "CODE_ERROR"},
+    )
+    in_progress_sib = Task(
+        project_id=project.id,
+        title="In-progress sibling",
+        payloads=[{"type": "create", "prompt": "ship feature C"}],
+        vm_instance_id="agent-vm-sib-active",
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent.id,
+        context={"related_files": ["backend/app/baz.py"]},
+    )
+    db_session.add_all([completed_sib, failed_sib, in_progress_sib])
+    await db_session.commit()
+    await db_session.refresh(completed_sib)
+
+    pr_artifact = Artifact(
+        task_id=completed_sib.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/example/repo/pull/42",
+    )
+    db_session.add(pr_artifact)
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Claiming sibling",
+        payloads=[{"type": "create", "prompt": "ship feature D"}],
+        vm_instance_id="agent-vm-sib-claimer",
+        status=TaskStatus.QUEUED,
+        parent_task_id=parent.id,
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-sib-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    siblings = resp.json().get("project_context", {}).get("sibling_tasks", [])
+    by_title = {s["title"]: s for s in siblings}
+    assert set(by_title.keys()) == {"Completed sibling", "Failed sibling", "In-progress sibling"}
+
+    active_entry = by_title["In-progress sibling"]
+    assert active_entry["active"] is True
+    assert active_entry["related_files"] == ["backend/app/baz.py"]
+
+    completed_entry = by_title["Completed sibling"]
+    assert completed_entry["active"] is False
+    assert completed_entry["status"] == TaskStatus.COMPLETED.value
+    assert completed_entry["pr_url"] == "https://github.com/example/repo/pull/42"
+    assert "failure_class" not in completed_entry
+
+    failed_entry = by_title["Failed sibling"]
+    assert failed_entry["active"] is False
+    assert failed_entry["status"] == TaskStatus.FAILED.value
+    assert failed_entry["failure_class"] == "CODE_ERROR"
+    assert failed_entry["pr_url"] is None
+
+
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_playbook_set_and_get(client: AsyncClient, db_session):
@@ -1133,8 +1355,8 @@ async def test_claim_injects_direction_context_for_create_task(client: AsyncClie
     dc = data["direction_context"]
     assert dc["title"] == "Improve auth flow"
     assert dc["priority"] == "high"
-    assert "JWT in cookies caused CSRF issues" in dc["failed_approaches"]
-    assert "Session-based auth had scaling problems" in dc["failed_approaches"]
+    assert {"text": "JWT in cookies caused CSRF issues", "failure_type": ""} in dc["failed_approaches"]
+    assert {"text": "Session-based auth had scaling problems", "failure_type": ""} in dc["failed_approaches"]
     # recent_outcomes: last 2 history entries with tasks_created > 0
     assert len(dc["recent_outcomes"]) == 2
     assert dc["recent_outcomes"][0]["prs_merged"] == 2
@@ -1286,6 +1508,45 @@ async def test_compute_failure_stage_pattern_no_pattern():
 
     # Empty history
     assert _compute_failure_stage_pattern([]) is None
+
+
+def test_parse_failed_approach_extracts_known_category():
+    """Known failure categories in parens are extracted into failure_type."""
+    from app.routers.agent import _parse_failed_approach
+
+    result = _parse_failed_approach("Use jwt in cookies (CODE_ERROR) — CSRF vulnerability")
+    assert result["failure_type"] == "CODE_ERROR"
+    assert "CODE_ERROR" not in result["text"]
+    assert "Use jwt in cookies" in result["text"]
+    assert "CSRF" in result["text"]
+
+
+def test_parse_failed_approach_without_category_passes_through():
+    """Lines without a parenthesised category return text unchanged and empty failure_type."""
+    from app.routers.agent import _parse_failed_approach
+
+    result = _parse_failed_approach("Session auth had scaling issues")
+    assert result["failure_type"] == ""
+    assert result["text"] == "Session auth had scaling issues"
+
+
+def test_parse_failed_approach_ignores_unknown_parens():
+    """Parens whose contents aren't in the known-category set are kept as prose."""
+    from app.routers.agent import _parse_failed_approach
+
+    result = _parse_failed_approach("Try batching (see issue #42) to reduce round trips")
+    assert result["failure_type"] == ""
+    # Prose parens must be preserved — they're part of the description, not metadata
+    assert "(see issue #42)" in result["text"]
+
+
+def test_parse_failed_approach_truncates_long_text():
+    """Text is capped at 200 chars to avoid bloat in agent prompts."""
+    from app.routers.agent import _parse_failed_approach
+
+    long_line = "x" * 300
+    result = _parse_failed_approach(long_line)
+    assert len(result["text"]) == 200
 
 
 @pytest.mark.smoketest

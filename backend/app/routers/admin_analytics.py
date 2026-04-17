@@ -563,16 +563,9 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         and "_first_attempt_succeeded" in (t.context or {})
     ]
 
-    tasks_with_arch_context = [
-        t for t in terminal_tasks_24h
-        if (t.context or {}).get("_had_arch_context") is True
-        and "_first_attempt_succeeded" in (t.context or {})
-    ]
-    tasks_without_arch_context = [
-        t for t in terminal_tasks_24h
-        if (t.context or {}).get("_had_arch_context") is False
-        and "_first_attempt_succeeded" in (t.context or {})
-    ]
+    _arch_eligible = [t for t in terminal_tasks_24h if "_first_attempt_succeeded" in (t.context or {})]
+    tasks_with_arch_context = [t for t in _arch_eligible if (t.context or {}).get("_had_arch_context") is True]
+    tasks_without_arch_context = [t for t in _arch_eligible if (t.context or {}).get("_had_arch_context") is False]
 
     tasks_with_review_measurements = [
         t for t in terminal_tasks_24h
@@ -706,18 +699,11 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         }
 
     def _arch_rejection_rate(tasks: list) -> float | None:
-        """Fraction of first-attempt failures in tasks that had 'architecture' as a rejection category."""
-        failed_with_cats = [
-            t for t in tasks
-            if "_first_attempt_rejection_categories" in (t.context or {})
-        ]
-        if not failed_with_cats:
+        failed = [t for t in tasks if "_first_attempt_rejection_categories" in (t.context or {})]
+        if not failed:
             return None
-        arch_count = sum(
-            1 for t in failed_with_cats
-            if "architecture" in (t.context or {}).get("_first_attempt_rejection_categories", {})
-        )
-        return round(arch_count / len(failed_with_cats), 2)
+        arch = sum(1 for t in failed if "architecture" in (t.context or {}).get("_first_attempt_rejection_categories", {}))
+        return round(arch / len(failed), 2)
 
     first_attempt_success_rate = {
         "overall": current_first_attempt_rate,
@@ -2619,14 +2605,11 @@ def _fetch_orchestrator_error_entries(hours: int) -> List[Any]:
 
 
 def _parse_bucket_last_seen(last_seen_iso: str) -> Optional[datetime]:
-    """Parse a bucket's last_seen_iso string into a naive UTC datetime for ack comparison."""
     try:
         dt = datetime.fromisoformat(last_seen_iso)
     except (TypeError, ValueError):
         return None
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-    return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo is not None else dt
 
 
 def _filter_acknowledged_buckets(

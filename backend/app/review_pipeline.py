@@ -453,6 +453,22 @@ async def _spawn_pipeline_task(
     payload_data = validate_internal_payload(payload_data, f"review_pipeline:{task_type}:pr#{pr_number}")
     source_ctx = source_task.context or {}
     propagated_scope = source_ctx.get('scope', source_loop.get('scope', 'medium'))
+    # Carry strategic context (direction_id, related_files, parent_context, scope, …)
+    # from source task so fix/review agents see the same direction/intent the create
+    # task had. Skip underscore-prefixed internal flags and override review_loop below.
+    propagated_ctx = {
+        k: v for k, v in source_ctx.items()
+        if not k.startswith('_') and k != 'review_loop'
+    }
+    propagated_ctx['scope'] = propagated_scope
+    propagated_ctx['review_loop'] = {
+        "pr_number": pr_number, "branch": branch,
+        "base_branch": base_branch,
+        "original_task_id": resolved_original_id,
+        "iteration": iteration,
+        **({"review_history": new_review_history} if new_review_history else {}),
+        **({"fix_reason": fix_reason} if fix_reason else {}),
+    }
     new_task = Task(
         project_id=source_task.project_id,
         title=title,
@@ -460,13 +476,7 @@ async def _spawn_pipeline_task(
         parent_task_id=parent_id,
         priority=inherited_priority,
         payloads=[payload_data],
-        context={"scope": propagated_scope,
-                 "review_loop": {"pr_number": pr_number, "branch": branch,
-                                  "base_branch": base_branch,
-                                  "original_task_id": resolved_original_id,
-                                  "iteration": iteration,
-                                  **({"review_history": new_review_history} if new_review_history else {}),
-                                  **({"fix_reason": fix_reason} if fix_reason else {})}},
+        context=propagated_ctx,
         vm_instance_id=vm_name,
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",

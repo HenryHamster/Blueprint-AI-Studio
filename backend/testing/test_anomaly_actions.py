@@ -18,6 +18,7 @@ from app.anomaly_detection import (
     _apply_anomaly_adjustments,
     _check_anomaly_restoration,
     _check_fast_recovery,
+    _check_max_duration_safeguard,
     _expire_stale_anomalies,
     anomaly_maintenance_sweep,
     check_anomaly_actions,
@@ -25,6 +26,7 @@ from app.anomaly_detection import (
     _ANOMALY_ACTION_THRESHOLD,
     _FAST_RECOVERY_MIN_SAMPLE,
     _FAST_RECOVERY_WINDOW_HOURS,
+    _MAX_ADJUSTMENT_DURATION_HOURS,
 )
 from app.time_utils import _utcnow
 from collections import deque
@@ -38,6 +40,8 @@ _DEFAULT_ADJUSTMENTS = {
     "pre_adjustment_max_vms": None,
     "pre_adjustment_failure_gate": None,
     "failure_gate_threshold": 0.8,
+    "forced_restoration_count": 0,
+    "forced_restored_at": None,
 }
 
 
@@ -444,6 +448,9 @@ async def test_maintenance_sweep_restores_after_expiry():
     """Sweep expires the triggering anomaly, then restoration runs in same call."""
     proj = str(uuid.uuid4())
     stale_iso = (_utcnow() - timedelta(hours=49)).isoformat()
+    # `adjusted_at` must be recent enough that the max-duration safeguard
+    # doesn't fire — the point of this test is the expiry → restore path.
+    recent_iso = _utcnow().isoformat()
     _shared_state.persistent_anomalies[proj] = {
         "PROVISION_FAILURE": {
             "severity": "high", "occurrence_count": 5,
@@ -454,7 +461,7 @@ async def test_maintenance_sweep_restores_after_expiry():
     # Pre-existing adjustment that should be restored
     _shared_state.anomaly_adjustments.update({
         "active": True,
-        "adjusted_at": stale_iso,
+        "adjusted_at": recent_iso,
         "trigger_anomalies": ["PROVISION_FAILURE"],
         "pre_adjustment_max_vms": 10,
         "pre_adjustment_failure_gate": 0.8,
@@ -700,3 +707,111 @@ def test_admin_override_respected_during_fast_recovery():
     # Failure gate is still restored
     assert _shared_state.anomaly_adjustments["failure_gate_threshold"] == 0.8
     assert _shared_state.anomaly_adjustments["active"] is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Max-duration safeguard
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _backdate_adjusted_at(hours: float) -> None:
+    """Rewrite adjusted_at to simulate an adjustment that has been active for `hours`."""
+    _shared_state.anomaly_adjustments["adjusted_at"] = (
+        _utcnow() - timedelta(hours=hours)
+    ).isoformat()
+
+
+def test_max_duration_no_safeguard_before_limit():
+    """Before the max duration elapses, the safeguard does not fire."""
+    proj_id = str(uuid.uuid4())
+    _setup_active_adjustment(proj_id, "PROVISION_FAILURE", max_vms=8)
+    # Only slightly past 1 hour — well below the 6h limit
+    _backdate_adjusted_at(hours=_MAX_ADJUSTMENT_DURATION_HOURS - 1)
+
+    result = _check_max_duration_safeguard()
+    assert result is False
+    assert _shared_state.anomaly_adjustments["active"] is True
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+
+
+def test_max_duration_forced_graduated_restoration():
+    """After the max duration, forced restoration returns max_vms to 75% of pre-adjustment."""
+    proj_id = str(uuid.uuid4())
+    _setup_active_adjustment(proj_id, "PROVISION_FAILURE", max_vms=8)
+    # Simulate persistent anomaly that never cleared — throttle has been active for >6h
+    _backdate_adjusted_at(hours=_MAX_ADJUSTMENT_DURATION_HOURS + 0.1)
+
+    result = _check_max_duration_safeguard()
+    assert result is True
+
+    # Failure gate fully restored
+    assert _shared_state.anomaly_adjustments["failure_gate_threshold"] == 0.8
+    # max_vms restored to 75% of pre-adjustment (8 * 0.75 = 6), not the full 8
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 6
+    # State reset
+    assert _shared_state.anomaly_adjustments["active"] is False
+    assert _shared_state.anomaly_adjustments["adjusted_at"] is None
+    assert _shared_state.anomaly_adjustments["pre_adjustment_max_vms"] is None
+    # Observability: forced_restoration_count bumped, timestamp set
+    assert _shared_state.anomaly_adjustments["forced_restoration_count"] == 1
+    assert _shared_state.anomaly_adjustments["forced_restored_at"] is not None
+
+
+def test_max_duration_safeguard_respects_admin_override():
+    """If admin changed max_vms during the adjustment, keep that value on forced restoration."""
+    proj_id = str(uuid.uuid4())
+    _setup_active_adjustment(proj_id, "PROVISION_FAILURE", max_vms=8)
+    # Admin manually changes the value
+    _shared_state.runtime_config["max_concurrent_vms"] = 5
+    _backdate_adjusted_at(hours=_MAX_ADJUSTMENT_DURATION_HOURS + 0.5)
+
+    result = _check_max_duration_safeguard()
+    assert result is True
+    # Admin's value preserved (would have been 6 under graduated restoration)
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 5
+    # Gate is still fully restored
+    assert _shared_state.anomaly_adjustments["failure_gate_threshold"] == 0.8
+    assert _shared_state.anomaly_adjustments["forced_restoration_count"] == 1
+
+
+def test_max_duration_safeguard_noop_when_inactive():
+    """Safeguard does nothing when no adjustments are active."""
+    result = _check_max_duration_safeguard()
+    assert result is False
+    assert _shared_state.anomaly_adjustments["forced_restoration_count"] == 0
+
+
+def test_reapply_within_reentry_window_resets_timer():
+    """Anomaly re-triggering within the reentry window re-applies adjustments with a fresh timer."""
+    proj_id = str(uuid.uuid4())
+    _setup_active_adjustment(proj_id, "PROVISION_FAILURE", max_vms=8)
+    _backdate_adjusted_at(hours=_MAX_ADJUSTMENT_DURATION_HOURS + 0.1)
+
+    # Force-restore (simulates persistent anomaly hitting the 6h limit)
+    assert _check_max_duration_safeguard() is True
+    assert _shared_state.anomaly_adjustments["active"] is False
+    forced_ts = _shared_state.anomaly_adjustments["forced_restored_at"]
+
+    # Anomaly re-triggers immediately — persistent_anomalies still has it
+    result = _apply_anomaly_adjustments()
+    assert result is True
+    assert _shared_state.anomaly_adjustments["active"] is True
+    # Timer resets (adjusted_at set fresh) and max_vms drops again
+    # from the 75%-restored baseline (6 // 2 = 3)
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 3
+    # forced_restored_at is preserved for observability of the reentry event
+    assert _shared_state.anomaly_adjustments["forced_restored_at"] == forced_ts
+
+
+@pytest.mark.asyncio
+async def test_check_anomaly_actions_returns_forced_restored():
+    """check_anomaly_actions surfaces forced_restored when the safeguard fires."""
+    proj_id = str(uuid.uuid4())
+    _setup_active_adjustment(proj_id, "PROVISION_FAILURE", max_vms=8)
+    _backdate_adjusted_at(hours=_MAX_ADJUSTMENT_DURATION_HOURS + 0.5)
+
+    result = await check_anomaly_actions()
+    assert result["action"] == "forced_restored"
+    assert result["max_concurrent_vms"] == 6
+    assert result["failure_gate_threshold"] == 0.8
+    assert result["forced_restoration_count"] == 1

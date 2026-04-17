@@ -246,11 +246,15 @@ async def _update_direction_research_outcomes(
                     if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
                         # Move matching proposed finding to Failed Approaches
                         reason = (ct.latest_status_message or "")[:120]
+                        category = (ct.context or {}).get("failure_category") or _classify_failure(ct)
+                        title_with_cat = f"{title} ({category})"
                         new_established = []
                         moved = False
                         for item in parsed["established"]:
                             if title.lower() in item.lower():
-                                parsed["failed"].append(f"{title} — {reason}" if reason else title)
+                                parsed["failed"].append(
+                                    f"{title_with_cat} — {reason}" if reason else title_with_cat
+                                )
                                 moved = True
                             else:
                                 new_established.append(item)

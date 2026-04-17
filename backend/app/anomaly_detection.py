@@ -251,6 +251,18 @@ _ANOMALY_ACTION_THRESHOLD = 3
 _FAST_RECOVERY_WINDOW_HOURS = 2
 _FAST_RECOVERY_MIN_SAMPLE = 5
 
+# Max-duration safeguard: force graduated restoration after this many hours
+# so an anomaly that never goes stale (due to ~12-24h intermittent failures)
+# doesn't pin the pipeline in throttled mode indefinitely.
+_MAX_ADJUSTMENT_DURATION_HOURS = 6
+# Fraction of pre-adjustment max_concurrent_vms to restore after forced
+# restoration (hedge — not full value — in case the anomaly re-triggers).
+_FORCED_RESTORATION_VMS_FRACTION = 0.75
+# Re-entry window: if the anomaly re-triggers within this many minutes of a
+# forced restoration, log it so the reapply is distinguishable from a fresh
+# surge (the adjusted_at timer resets normally on reapply).
+_FORCED_RESTORATION_REENTRY_WINDOW_MINUTES = 30
+
 
 def _apply_anomaly_adjustments() -> bool:
     """Check persistent anomalies across all projects and apply runtime adjustments.
@@ -284,6 +296,15 @@ def _apply_anomaly_adjustments() -> bool:
         adjustments["trigger_anomalies"] = sorted(set(triggered_keys))
         return True
 
+    # Detect re-entry shortly after a forced restoration so the log line
+    # reflects the context (same anomaly coming back, timer restarts).
+    forced_restored_at = _parse_adjustments_ts(adjustments.get("forced_restored_at"))
+    is_reentry = (
+        forced_restored_at is not None
+        and (_utcnow() - forced_restored_at)
+        < timedelta(minutes=_FORCED_RESTORATION_REENTRY_WINDOW_MINUTES)
+    )
+
     # Store pre-adjustment values for restoration
     adjustments["pre_adjustment_max_vms"] = rc["max_concurrent_vms"]
     adjustments["pre_adjustment_failure_gate"] = adjustments["failure_gate_threshold"]
@@ -297,10 +318,105 @@ def _apply_anomaly_adjustments() -> bool:
     adjustments["adjusted_at"] = _utcnow().isoformat()
     adjustments["trigger_anomalies"] = sorted(set(triggered_keys))
 
-    logger.info(
-        f"[ANOMALY_ACTION] Applied pipeline adjustments: "
-        f"max_vms={new_max_vms}, failure_gate=0.6 "
-        f"(triggers: {', '.join(triggered_keys)})"
+    if is_reentry:
+        logger.info(
+            f"[ANOMALY_ACTION] Reapplied pipeline adjustments within "
+            f"{_FORCED_RESTORATION_REENTRY_WINDOW_MINUTES}min of forced restoration: "
+            f"max_vms={new_max_vms}, failure_gate=0.6 "
+            f"(triggers: {', '.join(triggered_keys)}). Max-duration timer reset."
+        )
+    else:
+        logger.info(
+            f"[ANOMALY_ACTION] Applied pipeline adjustments: "
+            f"max_vms={new_max_vms}, failure_gate=0.6 "
+            f"(triggers: {', '.join(triggered_keys)})"
+        )
+    return True
+
+
+def _parse_adjustments_ts(iso_value: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO timestamp stored in anomaly_adjustments back into a naive UTC datetime."""
+    if not iso_value:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_value)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _check_max_duration_safeguard() -> bool:
+    """Force a graduated restoration if adjustments have been active beyond the max duration.
+
+    When intermittent infra failures recur every ~12-24h, the anomaly
+    occurrence_count never drops below threshold (it's cleared only by 48h
+    staleness) and fast-recovery never triggers (a fresh failure in the 2h
+    window keeps resetting it). Without this safeguard the throttle can
+    persist indefinitely.
+
+    Graduated restoration on forced path:
+      - failure_gate_threshold is fully restored to the pre-adjustment value
+      - max_concurrent_vms is restored to 75% of the pre-adjustment value
+        (hedge in case the anomaly re-triggers, not full)
+
+    Returns True if a forced restoration was applied.
+    """
+    adjustments = _shared_state.anomaly_adjustments
+    rc = _shared_state.runtime_config
+
+    if not adjustments["active"]:
+        return False
+
+    adjusted_at = _parse_adjustments_ts(adjustments.get("adjusted_at"))
+    if adjusted_at is None:
+        return False
+
+    elapsed = _utcnow() - adjusted_at
+    if elapsed < timedelta(hours=_MAX_ADJUSTMENT_DURATION_HOURS):
+        return False
+
+    pre_max_vms = adjustments["pre_adjustment_max_vms"]
+    pre_gate = adjustments["pre_adjustment_failure_gate"]
+
+    # Failure gate: always restore fully.
+    if pre_gate is not None:
+        adjustments["failure_gate_threshold"] = pre_gate
+
+    # max_concurrent_vms: graduated restoration to 75% of pre-adjustment,
+    # but only if the current value still matches what we set (respect
+    # admin overrides made while adjustments were active).
+    if pre_max_vms is not None:
+        current_max_vms = rc["max_concurrent_vms"]
+        expected_adjusted_vms = max(2, pre_max_vms // 2)
+        if current_max_vms == expected_adjusted_vms:
+            graduated = max(2, int(pre_max_vms * _FORCED_RESTORATION_VMS_FRACTION))
+            rc["max_concurrent_vms"] = graduated
+        else:
+            logger.info(
+                f"[ANOMALY_ACTION] max_concurrent_vms was manually changed "
+                f"({expected_adjusted_vms} → {current_max_vms}) during anomaly adjustment — "
+                f"keeping current value on forced restoration"
+            )
+
+    adjustments["forced_restoration_count"] = (
+        adjustments.get("forced_restoration_count", 0) + 1
+    )
+    adjustments["forced_restored_at"] = _utcnow().isoformat()
+    adjustments["active"] = False
+    adjustments["adjusted_at"] = None
+    adjustments["trigger_anomalies"] = []
+    adjustments["pre_adjustment_max_vms"] = None
+    adjustments["pre_adjustment_failure_gate"] = None
+
+    logger.warning(
+        f"[ANOMALY_ACTION] Forced restoration after "
+        f"{elapsed.total_seconds() / 3600:.1f}h of anomaly adjustments "
+        f"(max: {_MAX_ADJUSTMENT_DURATION_HOURS}h). "
+        f"max_vms={rc['max_concurrent_vms']}, "
+        f"failure_gate={adjustments['failure_gate_threshold']}. "
+        f"forced_restoration_count={adjustments['forced_restoration_count']}"
     )
     return True
 
@@ -442,7 +558,22 @@ async def check_anomaly_actions() -> dict:
     Returns a dict describing what happened for broadcast purposes.
     'is_new' is True only on the first activation (not on repeat cycles while
     already active), so callers can avoid creating duplicate alerts.
+
+    Ordering:
+    1. Max-duration safeguard — if adjustments have been active beyond the
+       limit, force graduated restoration regardless of anomaly state.
+    2. Apply adjustments when triggering anomalies still qualify.
+    3. Check normal/fast-recovery restoration otherwise.
     """
+    forced = _check_max_duration_safeguard()
+    if forced:
+        return {
+            "action": "forced_restored",
+            "max_concurrent_vms": _shared_state.runtime_config["max_concurrent_vms"],
+            "failure_gate_threshold": _shared_state.anomaly_adjustments["failure_gate_threshold"],
+            "forced_restoration_count": _shared_state.anomaly_adjustments["forced_restoration_count"],
+        }
+
     was_active = _shared_state.anomaly_adjustments["active"]
     applied = _apply_anomaly_adjustments()
     if applied:

@@ -140,6 +140,8 @@ anomaly_adjustments: Dict[str, Any] = {
     "pre_adjustment_max_vms": None,  # stored to restore on clearing
     "pre_adjustment_failure_gate": None,
     "failure_gate_threshold": 0.8,   # default; lowered to 0.6 during anomaly response
+    "forced_restoration_count": 0,   # cumulative count of max-duration forced restorations
+    "forced_restored_at": None,      # ISO timestamp of last forced restoration
 }
 
 # --- Circuit Breaker (Hystrix-inspired) ---

@@ -318,11 +318,20 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     if (title) dcLines.push(`**Goal:** ${title}`);
     const priority = strVal(dirCtx.priority);
     if (priority) dcLines.push(`**Priority:** ${priority}`);
-    const failedApproaches = Array.isArray(dirCtx.failed_approaches) ? dirCtx.failed_approaches as string[] : [];
+    const failedApproaches = Array.isArray(dirCtx.failed_approaches) ? dirCtx.failed_approaches as unknown[] : [];
     if (failedApproaches.length > 0) {
       dcLines.push('**Avoid (already tried and failed):**');
       for (const fa of failedApproaches) {
-        dcLines.push(`- ${fa}`);
+        if (typeof fa === 'string') {
+          dcLines.push(`- ${fa}`);
+        } else if (fa && typeof fa === 'object') {
+          const obj = fa as Record<string, unknown>;
+          const text = strVal(obj.text);
+          const ftype = strVal(obj.failure_type);
+          if (text) {
+            dcLines.push(ftype ? `- ${text} [${ftype}]` : `- ${text}`);
+          }
+        }
       }
     }
     const recentOutcomes = Array.isArray(dirCtx.recent_outcomes) ? dirCtx.recent_outcomes as Array<Record<string, unknown>> : [];

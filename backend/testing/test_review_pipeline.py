@@ -8,6 +8,8 @@ Covers:
   5. Edge cases: empty review_history, issues without severity,
      zero issues in current iteration.
 """
+import uuid
+
 import pytest
 from unittest.mock import AsyncMock, patch
 
@@ -868,3 +870,67 @@ async def test_edge_only_major_issues_count_for_stuck_cycle(db_session, mocker):
 
     await db_session.refresh(original_task)
     assert original_task.requires_approval is True
+
+
+# ── Strategic context propagation ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_strategic_context_propagates_to_spawned_fix(db_session, mocker):
+    """A spawned fix task must inherit direction_id, related_files, parent_context,
+    and scope from the source task's context so downstream agents see the same
+    strategic context (direction, intent, relevant files) the create task had.
+    Internal underscore-prefixed flags must not leak into the spawned task."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    direction_id = str(uuid.uuid4())
+    related_files = ["backend/app/foo.py", "backend/app/bar.py"]
+    parent_context = "Parent research: improve foo subsystem reliability"
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 501, "branch": "feat/ctx",
+                   "base_branch": "main", "prompt": "Build X"}],
+        context={
+            "scope": "small",
+            "direction_id": direction_id,
+            "related_files": related_files,
+            "parent_context": parent_context,
+            "architecture_context": "Some architecture note",
+            "_is_rollup_review": True,   # internal flag — must NOT propagate
+            "_rollup_retries": 2,          # internal flag — must NOT propagate
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=501, branch="feat/ctx", base_branch="main",
+        fix_prompt="Address the review feedback",
+    )
+
+    assert created is True
+    assert result is not None
+
+    ctx = result.context or {}
+    assert ctx.get("direction_id") == direction_id, "direction_id must propagate to spawned task"
+    assert ctx.get("related_files") == related_files, "related_files must propagate to spawned task"
+    assert ctx.get("parent_context") == parent_context, "parent_context must propagate to spawned task"
+    assert ctx.get("scope") == "small", "scope must propagate to spawned task"
+    assert ctx.get("architecture_context") == "Some architecture note", (
+        "non-private strategic context should also propagate"
+    )
+
+    # Internal flags must not leak into the spawned task's context.
+    assert "_is_rollup_review" not in ctx, "underscore-prefixed internal flags must not propagate"
+    assert "_rollup_retries" not in ctx, "underscore-prefixed internal flags must not propagate"
+
+    # review_loop is overridden with the pipeline's own iteration state, not carried verbatim.
+    assert ctx.get("review_loop", {}).get("iteration") == 1
+    assert ctx.get("review_loop", {}).get("pr_number") == 501
