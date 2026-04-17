@@ -2295,13 +2295,23 @@ def _compute_medium_scope_measurement(
         post_investment = _window_stats(post_tasks, investment_start, post_end)
 
     # --- Recent rolling windows (independent of investment_start) ---
+    # 24h and 3d added 2026-04-17: at 20-40 tasks/day, 7d+ windows drown recent
+    # movement in old data. Overlapping windows let operators see "is this
+    # a 24h blip or a 7d trend" at a glance, mirroring the strategic agent's
+    # rolling_rates view.
     _now = _utcnow()
-    recent_30d_start = _now - timedelta(days=30)
+    recent_24h_start = _now - timedelta(hours=24)
+    recent_3d_start = _now - timedelta(days=3)
     recent_7d_start = _now - timedelta(days=7)
-    recent_30d_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= recent_30d_start]
+    recent_30d_start = _now - timedelta(days=30)
+    recent_24h_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= recent_24h_start]
+    recent_3d_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= recent_3d_start]
     recent_7d_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= recent_7d_start]
-    recent_30d = _window_stats(recent_30d_tasks, recent_30d_start, _now) if recent_30d_tasks else None
+    recent_30d_tasks = [t for t in medium_tasks if t.created_at and t.created_at >= recent_30d_start]
+    recent_24h = _window_stats(recent_24h_tasks, recent_24h_start, _now) if recent_24h_tasks else None
+    recent_3d = _window_stats(recent_3d_tasks, recent_3d_start, _now) if recent_3d_tasks else None
     recent_7d = _window_stats(recent_7d_tasks, recent_7d_start, _now) if recent_7d_tasks else None
+    recent_30d = _window_stats(recent_30d_tasks, recent_30d_start, _now) if recent_30d_tasks else None
 
     # --- Weekly time series ---
     week_bucket: Dict[str, Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0, "direction_merges": 0})
@@ -2342,6 +2352,45 @@ def _compute_medium_scope_measurement(
 
     week_rate_delta: Dict[str, Optional[float]] = {e["week"]: e["merge_rate_delta"] for e in weekly_series}
 
+    # --- Daily time series (for finer-grained trend chart) ---
+    # Kept alongside weekly_series so existing UI / callers don't break.
+    # Daily buckets are the right granularity at this pipeline's velocity
+    # (20-40 medium tasks/day) — weekly reads as "one dot per week" and
+    # hides within-week movement.
+    daily_cutoff = _now - timedelta(days=lookback_days)
+    day_bucket: Dict[str, Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0, "direction_merges": 0})
+    for t in medium_tasks:
+        if not t.created_at or t.created_at < daily_cutoff:
+            continue
+        day_key = t.created_at.date().isoformat()
+        day_bucket[day_key]["created"] += 1
+        is_merged = t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
+        if is_merged:
+            day_bucket[day_key]["merged"] += 1
+        if is_merged and resolved_direction_id and (t.context or {}).get("direction_id") == resolved_direction_id:
+            day_bucket[day_key]["direction_merges"] += 1
+
+    sorted_days = sorted(day_bucket.keys())
+    daily_series: List[Dict[str, Any]] = []
+    for i, day_key in enumerate(sorted_days):
+        counts = day_bucket[day_key]
+        created = counts["created"]
+        merged = counts["merged"]
+        merge_rate = round(merged / created, 3) if created > 0 else None
+        if i == 0:
+            merge_rate_delta = None
+        else:
+            prev_rate = daily_series[i - 1]["merge_rate"]
+            merge_rate_delta = round(merge_rate - prev_rate, 3) if (merge_rate is not None and prev_rate is not None) else None
+        daily_series.append({
+            "day": day_key,
+            "created": created,
+            "merged": merged,
+            "merge_rate": merge_rate,
+            "direction_merges": counts["direction_merges"],
+            "merge_rate_delta": merge_rate_delta,
+        })
+
     # --- Correlated changes: direction-associated merged tasks with weekly delta ---
     correlated_changes: List[Dict[str, Any]] = []
     if resolved_direction_id:
@@ -2370,7 +2419,10 @@ def _compute_medium_scope_measurement(
         "post_investment": post_investment,
         "recent_30d": recent_30d,
         "recent_7d": recent_7d,
+        "recent_3d": recent_3d,
+        "recent_24h": recent_24h,
         "weekly_series": weekly_series,
+        "daily_series": daily_series,
         "correlated_changes": correlated_changes,
     }
 

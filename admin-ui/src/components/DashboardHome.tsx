@@ -135,6 +135,15 @@ interface WeeklySeries {
   merge_rate_delta: number | null;
 }
 
+interface DailySeries {
+  day: string;
+  created: number;
+  merged: number;
+  merge_rate: number | null;
+  direction_merges: number;
+  merge_rate_delta: number | null;
+}
+
 interface CorrelatedChange {
   title: string;
   week: string;
@@ -150,7 +159,10 @@ interface MediumScopeMeasurement {
   post_investment: WindowStats | null;
   recent_30d: WindowStats | null;
   recent_7d: WindowStats | null;
+  recent_3d: WindowStats | null;
+  recent_24h: WindowStats | null;
   weekly_series: WeeklySeries[];
+  daily_series: DailySeries[];
   correlated_changes: CorrelatedChange[];
 }
 
@@ -979,13 +991,22 @@ function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | n
                       <p className="text-[9px] text-neutral-600">{data.post_investment.merged}/{data.post_investment.created}</p>
                     </div>
                   )}
-                  {data.recent_30d && (
+                  {data.recent_24h && (
                     <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 30d</p>
+                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 24h</p>
                       <p className="text-lg font-bold font-mono text-neutral-300">
-                        {data.recent_30d.merge_rate != null ? `${Math.round(data.recent_30d.merge_rate * 100)}%` : '--'}
+                        {data.recent_24h.merge_rate != null ? `${Math.round(data.recent_24h.merge_rate * 100)}%` : '--'}
                       </p>
-                      <p className="text-[9px] text-neutral-600">{data.recent_30d.merged}/{data.recent_30d.created}</p>
+                      <p className="text-[9px] text-neutral-600">{data.recent_24h.merged}/{data.recent_24h.created}</p>
+                    </div>
+                  )}
+                  {data.recent_3d && (
+                    <div className="text-center">
+                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 3d</p>
+                      <p className="text-lg font-bold font-mono text-neutral-300">
+                        {data.recent_3d.merge_rate != null ? `${Math.round(data.recent_3d.merge_rate * 100)}%` : '--'}
+                      </p>
+                      <p className="text-[9px] text-neutral-600">{data.recent_3d.merged}/{data.recent_3d.created}</p>
                     </div>
                   )}
                   {data.recent_7d && (
@@ -995,6 +1016,15 @@ function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | n
                         {data.recent_7d.merge_rate != null ? `${Math.round(data.recent_7d.merge_rate * 100)}%` : '--'}
                       </p>
                       <p className="text-[9px] text-neutral-600">{data.recent_7d.merged}/{data.recent_7d.created}</p>
+                    </div>
+                  )}
+                  {data.recent_30d && (
+                    <div className="text-center">
+                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 30d</p>
+                      <p className="text-lg font-bold font-mono text-neutral-300">
+                        {data.recent_30d.merge_rate != null ? `${Math.round(data.recent_30d.merge_rate * 100)}%` : '--'}
+                      </p>
+                      <p className="text-[9px] text-neutral-600">{data.recent_30d.merged}/{data.recent_30d.created}</p>
                     </div>
                   )}
                   {deltaPp != null && (
@@ -1021,14 +1051,17 @@ function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | n
             return <p className={`text-[11px] ${color}`}>{text}</p>;
           })()}
 
-          {/* Weekly trend chart */}
-          {data.weekly_series.length >= 2 && (
+          {/* Daily trend chart (swapped from weekly 2026-04-17) — weekly buckets
+              are too coarse for this pipeline's velocity; within-week movement
+              was invisible. Daily dots preserve the same line shape but show
+              the real cadence. */}
+          {data.daily_series.length >= 2 && (
             <div className="h-32">
               <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
-                <LineChart data={data.weekly_series} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
+                <LineChart data={data.daily_series} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
                   <XAxis
-                    dataKey="week"
+                    dataKey="day"
                     tick={{ fill: '#737373', fontSize: 9 }}
                     tickFormatter={(v: string) => v.slice(5)}
                   />
@@ -1040,7 +1073,7 @@ function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | n
                   <Tooltip
                     {...TOOLTIP_STYLE}
                     formatter={(v: unknown) => [typeof v === 'number' ? `${Math.round(v * 100)}%` : '--', 'Merge rate']}
-                    labelFormatter={(label: unknown) => `Week of ${label}`}
+                    labelFormatter={(label: unknown) => `Day ${label}`}
                   />
                   <Line
                     type="monotone"
