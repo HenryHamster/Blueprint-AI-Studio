@@ -828,9 +828,6 @@ async def claim_task(
                 except Exception:
                     logger.exception("[AGENT] Failed to compute direction_top_first_review_issues (non-critical)")
 
-                # Scope-specific recurring issues: filter to tasks matching the
-                # current task's scope so medium-scope patterns aren't diluted
-                # by small-scope data.
                 try:
                     if current_task_scope:
                         scope_specific_review_issues = compute_recurring_first_review_descriptions(

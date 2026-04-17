@@ -869,6 +869,228 @@ async def test_ci_polling_transient_failure_retries(orch_db, mocker):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Test 5b — CI polling non-dirty mergeable_state deferral tracking
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _make_ci_waiting_task(session, pr_number: int, project_name: str):
+    project = Project(name=project_name, user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "ci defer test", "branch": "feat/defer"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": pr_number,
+                "branch": "feat/defer",
+                "base_branch": "main",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+            }
+        },
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_non_dirty_state_tracks_deferral_and_alerts(orch_db, mocker):
+    """When CI polling observes a non-dirty non-behind mergeable_state, it must
+    record consecutive-same-state defers in ci_loop and fire exactly one alert
+    when the per-state threshold is crossed (10 for blocked/unstable).
+    """
+    session, _Session = orch_db
+    task = await _make_ci_waiting_task(session, pr_number=551, project_name="CI Defer Blocked")
+    task_id = task.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "open", "merged": False,
+                               "mergeable": False, "mergeable_state": "blocked",
+                               "head": {"sha": "sha-blocked"}})
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    from sqlmodel import select as _select
+    for expected_count in range(1, 11):
+        await _run_one_cycle(mocker)
+        async with _Session() as verify:
+            t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+        rl = (t.context or {}).get("review_loop", {})
+        assert rl.get("_conflict_deferred_count") == expected_count, (
+            f"sweep {expected_count}: expected _conflict_deferred_count={expected_count}, "
+            f"got {rl.get('_conflict_deferred_count')}"
+        )
+        assert rl.get("_conflict_deferred_state") == "blocked"
+        assert t.status == TaskStatus.EVALUATING
+        assert f"deferral {expected_count}" in (t.latest_status_message or "")
+        # Alert fires only when the per-state threshold (10) is crossed
+        expected_alerts = 1 if expected_count >= 10 else 0
+        assert alert_mock.await_count == expected_alerts, (
+            f"sweep {expected_count}: expected {expected_alerts} alerts, got {alert_mock.await_count}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_state_change_resets_deferral_counter(orch_db, mocker):
+    """When mergeable_state changes between sweeps, the deferral counter must
+    reset to 1 so transient flapping does not accidentally escalate."""
+    session, _Session = orch_db
+    task = await _make_ci_waiting_task(session, pr_number=552, project_name="CI Defer Flap")
+    task_id = task.id
+
+    pr_state = {"ms": "blocked"}
+
+    async def _fake_pr(*_a, **_kw):
+        return {"state": "open", "merged": False, "mergeable": False,
+                "mergeable_state": pr_state["ms"], "head": {"sha": "sha-flap"}}
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request", side_effect=_fake_pr)
+
+    from sqlmodel import select as _select
+
+    # Two blocked sweeps → counter=2
+    await _run_one_cycle(mocker)
+    await _run_one_cycle(mocker)
+    async with _Session() as verify:
+        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+    assert (t.context or {}).get("review_loop", {}).get("_conflict_deferred_count") == 2
+
+    # Switch to unstable → counter resets to 1 on state change
+    pr_state["ms"] = "unstable"
+    await _run_one_cycle(mocker)
+    async with _Session() as verify:
+        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+    rl = (t.context or {}).get("review_loop", {})
+    assert rl.get("_conflict_deferred_count") == 1
+    assert rl.get("_conflict_deferred_state") == "unstable"
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_unrecognized_state_uses_lower_threshold(orch_db, mocker):
+    """Unrecognized / 'unknown' mergeable_states alert faster (threshold=5) than
+    the known blocked/unstable states, since they indicate GitHub can't compute
+    mergeability or returned a value we don't understand."""
+    session, _Session = orch_db
+    task = await _make_ci_waiting_task(session, pr_number=553, project_name="CI Defer Unknown")
+    task_id = task.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "open", "merged": False,
+                               "mergeable": False, "mergeable_state": "unknown",
+                               "head": {"sha": "sha-unknown"}})
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    from sqlmodel import select as _select
+    for expected_count in range(1, 6):
+        await _run_one_cycle(mocker)
+        async with _Session() as verify:
+            t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+        rl = (t.context or {}).get("review_loop", {})
+        assert rl.get("_conflict_deferred_count") == expected_count
+        expected_alerts = 1 if expected_count >= 5 else 0
+        assert alert_mock.await_count == expected_alerts, (
+            f"sweep {expected_count}: expected {expected_alerts} alerts, got {alert_mock.await_count}"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mergeable_state",
+    ["blocked", "unknown", "unstable", "weird_new_state"],
+)
+async def test_ci_polling_non_dirty_state_continues_without_fix_spawn(
+    orch_db, mocker, mergeable_state,
+):
+    """When a CI-waiting PR reports mergeable=False with a non-'dirty'
+    mergeable_state (blocked / unknown / unstable / unrecognized), the
+    orchestrator must continue CI polling — the task stays EVALUATING with
+    ci_waiting=True and no fix task is spawned. A fix VM is only warranted for
+    real merge conflicts (mergeable_state='dirty').
+
+    Regression: a future change that accidentally treats non-dirty states as
+    conflicts would burn a review/fix cycle on a PR that can still merge once
+    checks/reviews complete or GitHub finishes computing mergeability.
+    """
+    session, _Session = orch_db
+
+    project = Project(name=f"CI {mergeable_state} Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "ci polling task",
+                   "branch": "feat/non-dirty", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 555,
+                "branch": "feat/non-dirty",
+                "base_branch": "main",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+            }
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+    task_id = ci_task.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    # Open PR, mergeable=False, non-dirty state → polling must continue.
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "open", "merged": False,
+                               "mergeable": False,
+                               "mergeable_state": mergeable_state,
+                               "head": {"sha": "abc123"}})
+    # The orchestrator imports _spawn_pipeline_task from app.review_pipeline at
+    # call time; patching the source module catches any invocation.
+    spawn_mock = mocker.patch("app.review_pipeline._spawn_pipeline_task",
+                              new_callable=AsyncMock)
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify:
+        from sqlmodel import select as _select
+        updated = (await verify.execute(
+            _select(Task).where(Task.id == task_id)
+        )).scalars().first()
+        all_tasks = (await verify.execute(_select(Task))).scalars().all()
+
+    assert updated is not None
+    assert updated.status == TaskStatus.EVALUATING, (
+        f"Task with mergeable_state={mergeable_state!r} must remain EVALUATING "
+        f"for continued CI polling, got {updated.status}"
+    )
+    rl = (updated.context or {}).get("review_loop", {})
+    assert rl.get("ci_waiting") is True, (
+        f"ci_waiting must stay True so the task continues polling, got rl={rl!r}"
+    )
+    assert "conflict_fix_spawned" not in rl, (
+        f"conflict_fix_spawned must NOT be set for non-dirty state "
+        f"{mergeable_state!r}, got rl={rl!r}"
+    )
+    spawn_mock.assert_not_called()
+    assert len(all_tasks) == 1, (
+        f"No fix task should be created for mergeable_state={mergeable_state!r}; "
+        f"found {len(all_tasks)} tasks in DB"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Test 6 — Deadlock detection clears failed dependencies
 # ══════════════════════════════════════════════════════════════════════════════
 

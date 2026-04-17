@@ -1966,6 +1966,154 @@ async def test_rollup_auto_merge_blocked_calls_enable_auto_merge(rollup_db, mock
     assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
 
 
+# ── Rollup Behind-Branch Update Retry ───────────────────────────────────────
+
+def _patch_behind_branch_mocks(mocker, update_branch_result):
+    """Mocks so the rollup flow reaches the mergeable_state='behind' branch and
+    observes the supplied update_branch result.
+
+    `update_branch_result` is either a dict returned by update_branch_with_sha_retry
+    or a callable producing one per call (for varying results across sweeps).
+    """
+    _patch_common_rollup_mocks(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "additions": 5, "deletions": 5,
+            "state": "open", "merged": False,
+            "mergeable_state": "behind",
+            "head": {"sha": "abc123"},
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "merge blocked"},
+    )
+    if callable(update_branch_result):
+        mocker.patch(
+            "app.github.update_branch_with_sha_retry",
+            new_callable=AsyncMock,
+            side_effect=update_branch_result,
+        )
+    else:
+        mocker.patch(
+            "app.github.update_branch_with_sha_retry",
+            new_callable=AsyncMock,
+            return_value=update_branch_result,
+        )
+
+
+@pytest.mark.asyncio
+async def test_rollup_behind_update_branch_failure_defers_without_fix_spawn(rollup_db, mocker):
+    """When the PR is 'behind' and update_branch fails transiently, defer to the
+    next sweep (track a retry counter) instead of falling through to fix spawn.
+    A single transient API failure must not burn a review/fix cycle."""
+    _patch_behind_branch_mocks(
+        mocker,
+        {"updated": False, "message": "GitHub 500 temporary failure"},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, None)),
+    )
+    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("_behind_update_retries") == 1
+    assert mock_spawn.await_count == 0, "fix task must not be spawned on first behind-update failure"
+    assert mock_alert.await_count == 0, "alert must not fire before retry budget is exhausted"
+    assert "retrying" in (parent.latest_status_message or "").lower()
+    assert "behind" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_rollup_behind_update_branch_exhausted_spawns_fix_with_alert(rollup_db, mocker):
+    """Once consecutive behind-update failures exhaust the retry budget,
+    fall through to the fix-spawn path and fire an alert so operators know
+    the update-branch path stalled out."""
+    # Tight budget keeps the test compact.
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"rollup_behind_update_retries": 2},
+    )
+    _patch_behind_branch_mocks(
+        mocker,
+        {"updated": False, "message": "GitHub 500 temporary failure"},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(MagicMock(id="fix-1"), None)),
+    )
+    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    # Sweep 1 — counter=1, under budget, defers
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_behind_update_retries") == 1
+    assert mock_spawn.await_count == 0
+
+    # Sweep 2 — counter=2, meets budget, falls through to fix spawn + alert
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert mock_spawn.await_count == 1, "fix task must spawn once budget is exhausted"
+    assert mock_alert.await_count == 1
+    msg = mock_alert.await_args.args[2]
+    assert "behind" in msg.lower()
+    assert "update_branch" in msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_rollup_behind_update_branch_success_clears_retry_counter(rollup_db, mocker):
+    """A prior transient update_branch failure leaves a counter in context; once
+    update_branch succeeds on a later sweep, the counter must reset so a future
+    behind-state starts from zero."""
+    _patch_behind_branch_mocks(
+        mocker,
+        {"updated": True, "message": "branch updated"},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, None)),
+    )
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+    # Seed a prior retry counter to simulate an earlier transient failure.
+    parent.context = {**(parent.context or {}), "_behind_update_retries": 2}
+    rollup_db.add(parent)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert "_behind_update_retries" not in (parent.context or {}), (
+        "successful update_branch must clear the retry counter"
+    )
+    assert mock_spawn.await_count == 0, "successful update_branch must skip fix spawn"
+    assert "updated branch" in (parent.latest_status_message or "").lower()
+
+
 # ── Strategic Completion Handler ─────────────────────────────────────────────
 
 @pytest_asyncio.fixture()

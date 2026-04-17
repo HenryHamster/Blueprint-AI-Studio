@@ -2039,17 +2039,43 @@ async def orchestrator_worker():
                                     logger.info(f"[CI] PR #{ci_pr_number} behind base — update_branch succeeded, skipped fix spawn")
                                     continue
                                 logger.info(f"[CI] PR #{ci_pr_number} behind base but update_branch failed: {_upd.get('message')} — falling through to fix spawn")
-                            elif _ms == "unknown":
-                                logger.debug(f"[CI] PR #{ci_pr_number} mergeable=False, mergeable_state=unknown — GitHub still computing, will recheck next cycle")
-                                continue
-                            elif _ms == "blocked":
-                                logger.debug(f"[CI] PR #{ci_pr_number} mergeable=False, mergeable_state=blocked — pending required checks/reviews, continuing CI polling")
-                                continue
-                            elif _ms == "unstable":
-                                logger.debug(f"[CI] PR #{ci_pr_number} mergeable=False, mergeable_state=unstable — CI failing but PR mergeable, continuing CI polling")
-                                continue
                             elif _ms != "dirty":
-                                logger.warning(f"[CI] PR #{ci_pr_number} mergeable=False with unrecognized mergeable_state={_ms!r} — continuing CI polling, not spawning fix")
+                                # Non-dirty non-behind mergeable_state values (blocked,
+                                # unstable, unknown, empty, or anything unrecognized) are
+                                # all recoverable by waiting rather than spawning a fix VM.
+                                # Track consecutive same-state defers so silent stalls
+                                # surface an alert before the 30-min CI backstop kills the
+                                # task with no diagnostic breadcrumbs.
+                                _ms_key = _ms or "empty"
+                                _is_unrecognized = _ms_key not in ("blocked", "unstable", "unknown")
+                                prev_state = ci_loop.get("_conflict_deferred_state")
+                                deferred_count = (
+                                    ci_loop.get("_conflict_deferred_count", 0) + 1
+                                    if prev_state == _ms_key else 1
+                                )
+                                ci_loop["_conflict_deferred_count"] = deferred_count
+                                ci_loop["_conflict_deferred_state"] = _ms_key
+                                alert_threshold = 10 if _ms_key in ("blocked", "unstable") else 5
+                                ci_task.latest_status_message = (
+                                    f"PR #{ci_pr_number} merge deferred "
+                                    f"(mergeable_state={_ms_key}, deferral {deferred_count}) — CI polling continues"
+                                )
+                                if deferred_count == alert_threshold:
+                                    await _maybe_create_failure_alert(
+                                        ci_task, session,
+                                        f"PR #{ci_pr_number} stuck in mergeable_state={_ms_key} "
+                                        f"for {deferred_count} consecutive CI polls"
+                                    )
+                                from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                flag_modified(ci_task, "context")
+                                session.add(ci_task)
+                                await session.commit()
+                                _log = logger.warning if _is_unrecognized else logger.debug
+                                _log(
+                                    f"[CI] PR #{ci_pr_number} mergeable=False, mergeable_state={_ms_key!r} "
+                                    f"(deferral {deferred_count}/alert@{alert_threshold}) — continuing CI polling, not spawning fix"
+                                )
                                 continue
                             ci_payload = ci_task.first_payload
                             ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")

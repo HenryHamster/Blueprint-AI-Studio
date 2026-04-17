@@ -874,7 +874,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 project_id=str(parent.project_id),
                             )
                             if _upd.get("updated"):
-                                parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                                # Reset the behind-retry counter — update succeeded, so any
+                                # prior transient failures were just that, transient.
+                                _new_ctx = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                                _new_ctx.pop("_behind_update_retries", None)
+                                parent.context = _new_ctx
                                 parent.latest_status_message = (
                                     f"Rollup PR #{rollup_pr_number} was behind {target_branch} — updated branch, "
                                     f"awaiting fresh CI; next rollup sweep will re-attempt merge"
@@ -885,9 +889,43 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                     f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch succeeded, skipped fix spawn"
                                 )
                                 return
-                            logger.info(
-                                f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} but update_branch failed: "
-                                f"{_upd.get('message')} — falling through to fix spawn"
+                            # update_branch failed — this is a transient GitHub API error,
+                            # not a real merge conflict. Defer like the non-dirty path
+                            # (counter + status message), retry on the next sweep, and
+                            # only fall through to fix spawn once the retry budget is
+                            # exhausted. Prevents premature fix VMs from wasting a
+                            # review/fix cycle on a PR that just needs another API call.
+                            _behind_retries = parent_ctx.get("_behind_update_retries", 0) + 1
+                            _behind_budget = _runtime_config.get("rollup_behind_update_retries", 3)
+                            _upd_msg = _upd.get("message") or "unknown"
+                            if _behind_retries < _behind_budget:
+                                parent.context = {
+                                    **parent_ctx,
+                                    "rollup_pr_url": rollup_pr_url,
+                                    "rollup_pr_number": rollup_pr_number,
+                                    "_behind_update_retries": _behind_retries,
+                                }
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
+                                    f"({_upd_msg}); retrying next sweep ({_behind_retries}/{_behind_budget})"
+                                )
+                                session.add(parent)
+                                await session.commit()
+                                logger.info(
+                                    f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
+                                    f"(attempt {_behind_retries}/{_behind_budget}): {_upd_msg} — deferring to next sweep"
+                                )
+                                return
+                            await _maybe_create_failure_alert(
+                                parent, session,
+                                f"Rollup PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
+                                f"{_behind_retries} consecutive sweeps ({_upd_msg}); falling through to fix spawn"
+                            )
+                            # Clear the counter so a future behind state starts fresh.
+                            parent_ctx = {k: v for k, v in parent_ctx.items() if k != "_behind_update_retries"}
+                            logger.warning(
+                                f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
+                                f"{_behind_retries} times ({_upd_msg}); falling through to fix spawn"
                             )
                         elif _ms != "dirty":
                             # Non-conflict states: known stalls (blocked/unstable/unknown),
