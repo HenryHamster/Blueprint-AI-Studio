@@ -320,6 +320,110 @@ async def test_create_task_spawns_review_on_pr_completion(
 
 
 @pytest.mark.asyncio
+async def test_review_request_changes_empty_pr_closes_rollup_instead_of_spawning_fix(
+    client: AsyncClient, db_session, mocker
+):
+    """When REQUEST_CHANGES is issued on a PR whose diff is empty (the branch was
+    flattened onto base during a prior fix cycle), we must NOT spawn another fix
+    (there's nothing to fix) — instead close the PR and mark the rollup parent
+    COMPLETED. This is the "empty rollup orphan" guard."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch("app.routers.agent.get_github_token_for_task", return_value=("fake-token", "owner", "repo"))
+    # Empty diff — PR has no file changes.
+    mocker.patch("app.github.get_pr_files", return_value=[])
+    close_mock = mocker.patch("app.github.close_pull_request", return_value=True)
+
+    project = Project(name="Empty Rollup Guard Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Rollup parent parking in CI wait
+    parent_task = Task(
+        project_id=project.id,
+        title="Rollup: empty branch",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        context={"review_loop": {
+            "pr_number": 999,
+            "branch": "research/abc123",
+            "base_branch": "main",
+            "ci_waiting": True,
+            "ci_passed": True,
+            "iteration": 6,
+        }},
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    vm_id = "agent-vm-empty-review-001"
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #999",
+        payloads=[{
+            "type": "review",
+            "pr_number": 999,
+            "branch": "research/abc123",
+            "base_branch": "main",
+            "original_task_id": str(parent_task.id),
+        }],
+        context={"review_loop": {
+            "pr_number": 999,
+            "branch": "research/abc123",
+            "base_branch": "main",
+            "iteration": 6,
+            "original_task_id": str(parent_task.id),
+        }},
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    verdict_json = json.dumps({
+        "verdict": "REQUEST_CHANGES",
+        "feedback": "PR #999 is empty — branch tip equals main tip",
+    })
+    await _status(
+        client, review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Review: empty PR",
+    )
+
+    # No fix task should have been spawned
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id.not_in([review_task.id, parent_task.id]),
+        )
+    )
+    spawned = result.scalars().all()
+    fix_tasks = [t for t in spawned if _task_type(t) == "fix"]
+    assert len(fix_tasks) == 0, f"Empty PR should not spawn a fix; got {fix_tasks}"
+
+    # The PR should have been closed on GitHub
+    assert close_mock.called, "Empty PR should be closed via GitHub API"
+    close_args = close_mock.call_args
+    assert 999 in close_args.args or close_args.kwargs.get("pr_number") == 999
+
+    # Parent rollup parking task should be COMPLETED, ci_waiting cleared
+    await db_session.refresh(parent_task)
+    assert parent_task.status == TaskStatus.COMPLETED
+    parent_loop = (parent_task.context or {}).get("review_loop", {})
+    assert "ci_waiting" not in parent_loop
+    assert (parent_task.context or {}).get("pr_closed_empty") is True
+
+    # Review task itself should be COMPLETED (short-circuited)
+    await db_session.refresh(review_task)
+    assert review_task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_review_request_changes_spawns_fix(
     client: AsyncClient, db_session, mocker
 ):

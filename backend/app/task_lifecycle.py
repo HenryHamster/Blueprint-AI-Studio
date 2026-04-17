@@ -478,6 +478,7 @@ async def _process_post_commit(
     from app.github import (
         create_pr_comment, merge_pull_request, get_pull_request,
         get_pr_files, get_check_runs, submit_pr_review, update_check_run,
+        close_pull_request,
     )
     from app.task_completion import (
         _handle_plan_completion, _handle_design_doc_completion,
@@ -1451,6 +1452,54 @@ async def _process_post_commit(
                     # After verdict normalization above this is the only non-APPROVE branch;
                     # any non-standard verdict (e.g., legacy COMMENT) has already been
                     # rewritten to REQUEST_CHANGES and lands here.
+
+                    # Empty-PR short-circuit: if the PR has no file changes (because a
+                    # prior fix cycle rebased the branch flat so all its commits are in
+                    # the base), spawning another fix is futile — there's nothing to
+                    # fix. Close the PR and mark the rollup parent COMPLETED so it
+                    # stops blocking the pipeline.
+                    try:
+                        _empty_gh, _empty_owner, _empty_repo = await get_github_token_for_task(task.id, session)
+                        _pr_files = await get_pr_files(_empty_gh, _empty_owner, _empty_repo, pr_number, project_id=str(task.project_id))
+                    except Exception as _empty_err:
+                        logger.warning(f"[REVIEW PIPELINE] Empty-PR check failed for #{pr_number}: {_empty_err} — proceeding with fix spawn")
+                        _pr_files = None
+                    if _pr_files == []:
+                        logger.info(f"[REVIEW PIPELINE] PR #{pr_number} has no file changes — closing as empty rollup")
+                        try:
+                            await close_pull_request(_empty_gh, _empty_owner, _empty_repo, pr_number, project_id=str(task.project_id))
+                        except Exception as _close_err:
+                            logger.warning(f"[REVIEW PIPELINE] Failed to close empty PR #{pr_number}: {_close_err}")
+                        if original_task_id:
+                            try:
+                                _orig_q = select(Task).where(Task.id == uuid.UUID(original_task_id)).with_for_update()
+                                _orig = (await session.execute(_orig_q)).scalars().first()
+                                if _orig:
+                                    _orig_loop = (_orig.context or {}).get("review_loop", {}) or {}
+                                    _orig_loop.pop("ci_waiting", None)
+                                    _orig.context = {**(_orig.context or {}), "review_loop": _orig_loop, "pr_closed_empty": True}
+                                    flag_modified(_orig, "context")
+                                    _orig.status = TaskStatus.COMPLETED
+                                    _orig.latest_status_message = (
+                                        f"✓ Rollup PR #{pr_number} closed — branch equivalent to {base_branch}, no new changes to merge"
+                                    )
+                                    session.add(_orig)
+                            except Exception as _orig_err:
+                                logger.warning(f"[REVIEW PIPELINE] Failed to update rollup parent after empty-PR close: {_orig_err}")
+                        task.status = TaskStatus.COMPLETED
+                        task.latest_status_message = f"Review complete — PR #{pr_number} closed as empty (obsolete rollup)"
+                        session.add(task)
+                        await session.commit()
+                        if original_task_id:
+                            try:
+                                await broadcast_to_project(
+                                    str(task.project_id), "task_updated",
+                                    {"task_id": original_task_id, "status": TaskStatus.COMPLETED},
+                                )
+                            except Exception:
+                                pass
+                        return {"status": "accepted"}
+
                     ci_errors_text = ""
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
