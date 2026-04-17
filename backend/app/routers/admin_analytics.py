@@ -1131,8 +1131,8 @@ async def get_digest(
                         if atm is not None:
                             merge_time_values.append(float(atm))
                         for scope, stats in (entry.get("scope_breakdown") or {}).items():
-                            agg = dir_scope_agg.setdefault(scope, {"created": 0, "merged": 0, "failed": 0, "calibrated_in": 0, "calibrated_out": 0})
-                            for k in ("created", "merged", "failed", "calibrated_in", "calibrated_out"):
+                            agg = dir_scope_agg.setdefault(scope, {"created": 0, "merged": 0, "failed": 0, "failed_infra": 0, "failed_code_error": 0, "failed_scope_overflow": 0, "calibrated_in": 0, "calibrated_out": 0})
+                            for k in ("created", "merged", "failed", "failed_infra", "failed_code_error", "failed_scope_overflow", "calibrated_in", "calibrated_out"):
                                 agg[k] += stats.get(k, 0)
                         pr = entry.get("product_ratio")
                         if pr is not None:

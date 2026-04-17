@@ -1442,6 +1442,54 @@ async def test_digest_scope_merge_rates_aggregated(client: AsyncClient, db_sessi
 
 
 @pytest.mark.asyncio
+async def test_digest_scope_breakdown_preserves_failure_sub_counts(client: AsyncClient, db_session):
+    """scope_breakdown in direction_progress aggregates failed_infra/failed_code_error/failed_scope_overflow."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-1",
+                "text": "Direction 1",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 1,
+                        "tasks_created": 5,
+                        "scope_breakdown": {
+                            "small": {
+                                "created": 5, "merged": 1, "failed": 4,
+                                "failed_infra": 1, "failed_code_error": 2, "failed_scope_overflow": 1,
+                            },
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    sb = response.json()["direction_progress"][0]["scope_breakdown"]["small"]
+    assert sb["failed_infra"] == 1
+    assert sb["failed_code_error"] == 2
+    assert sb["failed_scope_overflow"] == 1
+
+
+@pytest.mark.asyncio
 async def test_digest_scope_merge_rates_absent_without_project(client: AsyncClient, db_session):
     """scope_merge_rates is null when no project_id is provided."""
     response = await client.get("/api/admin/digest")

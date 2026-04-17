@@ -2434,6 +2434,30 @@ class TestPredictSpawnSuccessPipelineSignal:
             runtime_config["pipeline_scope_merge_rates"] = {}
 
 
+class TestPredictSpawnSuccessInfraFailureExclusion:
+    """Infra failures (provision/rate-limit/timeout) must not reduce spawn confidence."""
+
+    def test_infra_failures_excluded_from_failure_rate(self):
+        """All failures are infra → code-attributable failure rate is 0 → signal contributes 1.0."""
+        d = {
+            "research_history": [
+                {"tasks_created": 3, "tasks_failed": 3, "tasks_failed_infra": 3},
+            ],
+        }
+        # Only Signal 3 present: 1.0 - 0/3 = 1.0
+        assert predict_spawn_success("medium", d) == pytest.approx(1.0)
+
+    def test_code_failures_still_reduce_confidence(self):
+        """Non-infra failures still count against the direction."""
+        d = {
+            "research_history": [
+                {"tasks_created": 4, "tasks_failed": 3, "tasks_failed_infra": 1},
+            ],
+        }
+        # Signal 3: code_failed=2, failure_rate=0.5 → 0.5
+        assert predict_spawn_success("medium", d) == pytest.approx(0.5)
+
+
 class TestPredictSpawnSuccessDecompositionSignal:
     """Unit tests for the large-scope decomposition_quality signal."""
 

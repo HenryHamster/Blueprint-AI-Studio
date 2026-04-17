@@ -33,7 +33,7 @@ interface DirectionProgress {
   product_ratio?: number | null;
   estimated_cost_usd?: number | null;
   cost_per_merged_pr?: number | null;
-  scope_breakdown?: Record<string, { created: number; merged: number; failed: number }> | null;
+  scope_breakdown?: Record<string, { created: number; merged: number; failed: number; failed_infra?: number; failed_code_error?: number; failed_scope_overflow?: number; calibrated_in?: number; calibrated_out?: number }> | null;
   taxonomy_summary?: Record<string, number> | null;
   recent_failed_titles?: string[] | null;
 }
