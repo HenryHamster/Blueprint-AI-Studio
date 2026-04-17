@@ -2193,6 +2193,16 @@ describe('buildAnalysisPrompt', () => {
     expect(result).toContain('**Tests at risk of breaking**');
   });
 
+  it('includes the callers-to-verify section', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Do thing',
+      taskTitle: 'Title',
+      relatedFiles: ['a.ts'],
+      fileTree: '',
+    });
+    expect(result).toContain('**Callers to verify after implementation**');
+  });
+
   it('mentions the file limit when fileLimit is provided', () => {
     const result = buildAnalysisPrompt({
       rawPrompt: 'Do thing',

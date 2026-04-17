@@ -21,6 +21,7 @@ vi.mock('../index.js', () => ({
   lintFixLoop: vi.fn().mockResolvedValue(true),
   testFixLoop: vi.fn().mockResolvedValue({ testFailuresDetected: false, passed: true }),
   captureTestBaseline: vi.fn().mockResolvedValue(null),
+  condensedAnalysisSections: vi.fn((s: string) => s),
   runProjectLintChecks: vi.fn(),
   cloneWithRetry: vi.fn(),
   sendHeartbeatSync: vi.fn(),

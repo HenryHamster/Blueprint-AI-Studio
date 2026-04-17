@@ -993,7 +993,7 @@ export async function captureTestBaseline(
  */
 
 /** Extracts 'Interfaces to preserve' and 'Key dependencies' sections from analysis context. */
-function condensedAnalysisSections(analysisContext: string): string {
+export function condensedAnalysisSections(analysisContext: string): string {
   // Split at section boundaries (lines starting a new **[A-Z] heading)
   const sectionBreak = /(?=\n\*\*[A-Z])/;
   const sections = analysisContext.split(sectionBreak);

@@ -4,7 +4,7 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, git, setupWorkspace, pushAndCreatePR,
   runClaudeCode, lintFixLoop, testFixLoop, captureTestBaseline, matchesRateLimit,
-  runProjectLintChecks,
+  runProjectLintChecks, condensedAnalysisSections,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
@@ -529,6 +529,9 @@ Output ONLY a JSON object in a \`\`\`json code fence:
       const persistentReviewIssues = selfReviewPipelineHealth?.persistent_review_issues as string[] | undefined;
 
       const selfReviewTaskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
+      const selfReviewAnalysisPlan = selfReviewTaskScope === 'medium' && analysisContext
+        ? condensedAnalysisSections(analysisContext)
+        : undefined;
       const selfReviewPrompt = buildSelfReviewPrompt({
         diff: reviewDiff,
         reviewPlaybook,
@@ -540,6 +543,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         scopeOverflowWarning,
         firstAttemptByCategory: firstAttemptByCat,
         persistentReviewIssues,
+        analysisPlan: selfReviewAnalysisPlan,
       });
 
       const headBeforeReview = git(['rev-parse', 'HEAD']);
@@ -624,7 +628,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
           }
 
           // Validate checks_performed contains all mandatory items
-          const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined);
+          const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined, !!selfReviewAnalysisPlan);
           if (!parsedChecks) {
             reviewCategories.push('self_review_failed', 'validation_failed');
             parseFailed = true;
@@ -745,7 +749,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         if (failOnTestFailure) {
           // Validation failure: retry once with explicit guidance about what was missing
           if (parseFailed) {
-            const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined);
+            const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined, !!selfReviewAnalysisPlan);
             const missingChecks = parsedChecks
               ? mandatory.filter(m => !parsedChecks!.includes(m))
               : mandatory;

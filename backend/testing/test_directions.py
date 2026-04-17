@@ -1987,6 +1987,71 @@ class TestCalibrateScope:
         ])
         assert _calibrate_scope("xlarge", d) == ("xlarge", None)
 
+    def _project(self, dirs_history: list[list[dict]]):
+        """Build a minimal project stub with .directions populated."""
+        class _P:
+            pass
+        p = _P()
+        p.directions = [
+            {"id": f"d{i}", "research_history": [{"scope_breakdown": bd} for bd in hist]}
+            for i, hist in enumerate(dirs_history)
+        ]
+        return p
+
+    def test_project_fallback_downgrades_when_direction_data_insufficient(self):
+        """Direction has < 3 data points; project-wide rate < 30% → downgrade."""
+        d = self._direction([])  # no direction history
+        # Project-wide medium scope: 10 created / 1 merged = 10% < 30%
+        # Project-wide small scope: 5 created / 4 merged = 80% — acceptable target
+        project = self._project([
+            [{"medium": {"created": 5, "merged": 0}}, {"small": {"created": 3, "merged": 3}}],
+            [{"medium": {"created": 5, "merged": 1}}, {"small": {"created": 2, "merged": 1}}],
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d, project)
+        assert result_scope == "small"
+        assert calibrated_from == "medium"
+
+    def test_project_fallback_softer_threshold_30_percent(self):
+        """Project-wide rate at exactly 30% → not downgraded (threshold >= 0.3)."""
+        d = self._direction([])
+        # Project-wide medium: 10 created / 3 merged = 30% (not below threshold)
+        project = self._project([
+            [{"medium": {"created": 10, "merged": 3}}],
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d, project)
+        assert result_scope == "medium"
+        assert calibrated_from is None
+
+    def test_project_fallback_skipped_when_direction_has_enough_data(self):
+        """Direction has >= 3 data points → use direction-specific 40% threshold,
+        ignore project-wide data."""
+        # Direction medium: 5 created / 2 merged = 40% — acceptable at direction threshold
+        d = self._direction([
+            {"medium": {"created": 5, "merged": 2}},
+        ])
+        # Project-wide medium would be 0% (very bad), but should be ignored
+        project = self._project([
+            [{"medium": {"created": 100, "merged": 0}}],
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d, project)
+        assert result_scope == "medium"
+        assert calibrated_from is None
+
+    def test_project_fallback_returns_unchanged_when_project_data_also_thin(self):
+        """Both direction and project-wide data insufficient → no calibration."""
+        d = self._direction([])
+        project = self._project([
+            [{"medium": {"created": 1, "merged": 0}}],
+        ])  # project-wide total = 1 < 3
+        result_scope, calibrated_from = _calibrate_scope("medium", d, project)
+        assert result_scope == "medium"
+        assert calibrated_from is None
+
+    def test_project_fallback_omitted_returns_unchanged(self):
+        """No project passed AND direction insufficient → unchanged (back-compat)."""
+        d = self._direction([])
+        assert _calibrate_scope("medium", d) == ("medium", None)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pipeline awareness: stalled-cycle detection and research failure recording

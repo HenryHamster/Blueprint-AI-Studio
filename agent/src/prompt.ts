@@ -1796,7 +1796,7 @@ ${titleLine}${opts.rawPrompt.slice(0, 1500)}${narrowingBlock}
    - What it imports from other local files
    - Key interfaces or type contracts it defines or depends on
 
-3. Map the dependencies between files: which files import from which others.
+3. Map the dependencies between files: which files import from which others. For each module you plan to change, search the codebase for production files (non-test) that import from it and note the specific symbols they consume — these are the callers you will need to verify after implementation.
 
 4. Output a compact structured implementation plan using exactly these headings:
 
@@ -1807,6 +1807,8 @@ ${titleLine}${opts.rawPrompt.slice(0, 1500)}${narrowingBlock}
 **Key dependencies** (which modules call into which — determines safe change order)
 
 **Implementation approach** (2-3 sentences describing the strategy to make changes correctly without breaking type contracts)
+
+**Callers to verify after implementation** (for each module being changed, list the production files that import it and the specific symbols they use — format: \`consumer/file.ts (uses: symbolA, symbolB)\`. Write "none found" with a one-line justification if no external callers exist. This is the concrete post-implementation verification checklist.)
 
 **Tests to add or update** (list each test file you will create or modify, one per line, with the case name or behavior covered)
 
@@ -1866,18 +1868,20 @@ export function parseAnalysisPlanFiles(analysisOutput: string): string[] {
  * Returns the mandatory check IDs for the given task scope.
  * These must appear in the `checks_performed` field of the structured self-review output.
  */
-export function getMandatoryChecks(taskScope?: string): string[] {
+export function getMandatoryChecks(taskScope?: string, hasAnalysisPlan?: boolean): string[] {
   if (taskScope === 'small') {
-    return ['correctness', 'test_coverage'];
+    return ['correctness', 'test_coverage', 'import_verification'];
   }
   if (taskScope === 'large') {
     return ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'data_model_safety', 'import_verification'];
   }
   // medium or unspecified
-  return ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'import_verification'];
+  const base = ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'import_verification'];
+  if (hasAnalysisPlan) base.unshift('plan_alignment');
+  return base;
 }
 
-function buildSelfReviewChecklist(taskScope?: string): string {
+function buildSelfReviewChecklist(taskScope?: string, hasAnalysisPlan?: boolean): string {
   if (taskScope === 'small') {
     return `Severity guide: CRITICAL = data loss / security breach / crash; MAJOR = incorrect behavior / missing coverage; MINOR = style / naming (skip).
 
@@ -1886,7 +1890,7 @@ Check for:
 2. **Missing test coverage** (MAJOR) — Is there new behavior with no corresponding test?
 3. **Error handling** (MAJOR) — Are async operations properly awaited, exceptions caught where needed, null checks present?
 4. **Security quick-check** (CRITICAL) — Are any user inputs passed unsanitized to queries, commands, or HTML output?
-5. **Import and type verification** (MAJOR) — Are new imports available and type annotations correct?`;
+5. **Import and type verification** (MAJOR) — Are new imports available, type annotations correct, and do modified exports match their callers?`;
   }
   if (taskScope === 'large') {
     return `Check for:
@@ -1901,10 +1905,13 @@ Check for:
 9. **Import/dependency verification** — Are new imports available and correctly referenced?`;
   }
   // medium or unspecified: 8-item checklist (includes cross-file and import checks for multi-file changes)
+  const planAlignmentItem = hasAnalysisPlan
+    ? `0. **Plan alignment** — Do the files you actually changed match the "Files to change" list from the analysis plan? Were any interfaces marked "preserve" altered? If yes to either, justify or revert.\n`
+    : '';
   return `This is a multi-file change — verify that types, imports, and function signatures are consistent across all changed files.
 
 Check for:
-1. **Missing test coverage** — Is there new behavior with no corresponding test?
+${planAlignmentItem}1. **Missing test coverage** — Is there new behavior with no corresponding test?
 2. **Type safety violations** — TypeScript errors, incorrect type assertions, or missing type guards?
 3. **Scope violations** — Are there changes unrelated to the task requirements?
 4. **Security issues** — Command injection, SQL injection, XSS, exposed secrets or tokens?
@@ -1930,6 +1937,7 @@ export function buildSelfReviewPrompt(opts: {
   scopeOverflowWarning?: string;
   firstAttemptByCategory?: Record<string, number>;
   persistentReviewIssues?: string[];
+  analysisPlan?: string;
 }): string {
   const restrictionsSection = opts.claudeMd
     ? `\n## File Restrictions (from CLAUDE.md)\n${opts.claudeMd.slice(0, 500)}\n`
@@ -1995,16 +2003,21 @@ export function buildSelfReviewPrompt(opts: {
     ? `\n## ⚠️ Scope Overflow Warning\n${opts.scopeOverflowWarning}\nFor each file listed, confirm it is necessary for this task. Revert any files that are not essential.\n`
     : '';
 
-  const mandatoryChecks = getMandatoryChecks(opts.taskScope);
+  const planSection = opts.analysisPlan && opts.analysisPlan.trim()
+    ? `\n## Pre-Implementation Plan (verify changes align with this)\n${opts.analysisPlan.trim()}\n`
+    : '';
+
+  const hasAnalysisPlan = !!(opts.analysisPlan && opts.analysisPlan.trim());
+  const mandatoryChecks = getMandatoryChecks(opts.taskScope, hasAnalysisPlan);
   const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
 
   return `You are performing a self-review of the changes you just made for this task.
-${restrictionsSection}${issueDistSection}${firstAttemptSection}${playbookSection}${scopeOverflowSection}${diffSection}${buildVerificationSection}
+${restrictionsSection}${issueDistSection}${firstAttemptSection}${playbookSection}${scopeOverflowSection}${planSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.
 
-${buildSelfReviewChecklist(opts.taskScope)}
+${buildSelfReviewChecklist(opts.taskScope, hasAnalysisPlan)}
 
 If you find CRITICAL or MAJOR issues, fix them and stage the changes with \`git add\`.
 

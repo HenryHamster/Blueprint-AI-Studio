@@ -89,54 +89,78 @@ def _assess_spawn_health() -> tuple[bool, str | None]:
     return False, None
 
 
-def _calibrate_scope(proposed_scope: str, direction: dict) -> tuple[str, str | None]:
+def _calibrate_scope(
+    proposed_scope: str,
+    direction: dict,
+    project: Any | None = None,
+) -> tuple[str, str | None]:
     """Downgrade scope if historical merge rate at that scope is below threshold.
 
     Returns (final_scope, calibrated_from) where calibrated_from is the original
     scope if a downgrade occurred, else None.
+
+    Uses direction's last-3 research_history (40% threshold) when it has >= 3
+    data points. Otherwise falls back to project-wide aggregation across all
+    directions with a softer 30% threshold to avoid over-aggressive downgrades.
     """
-    history = direction.get("research_history", [])[-3:]
-    if not history:
+    try:
+        idx = _SCOPE_ORDER.index(proposed_scope)
+    except ValueError:
         return proposed_scope, None
 
-    # Aggregate scope_breakdown across last 3 history entries
+    # Aggregate direction-specific scope_breakdown across last 3 history entries
     aggregated: dict[str, dict] = {}
-    for entry in history:
+    for entry in direction.get("research_history", [])[-3:]:
         for scope, stats in (entry.get("scope_breakdown") or {}).items():
             if scope not in aggregated:
                 aggregated[scope] = {"created": 0, "merged": 0}
             aggregated[scope]["created"] += stats.get("created", 0)
             aggregated[scope]["merged"] += stats.get("merged", 0)
 
-    total_data_points = sum(v["created"] for v in aggregated.values())
-    if total_data_points < 3:
+    direction_data_points = sum(v["created"] for v in aggregated.values())
+
+    if direction_data_points >= 3:
+        agg = aggregated
+        threshold = 0.4
+        source = "direction"
+    elif project is not None:
+        # Fallback: aggregate scope_breakdown across all directions in the project
+        proj_agg: dict[str, dict] = {}
+        for d in (project.directions or []):
+            for entry in (d.get("research_history") or []):
+                for s, stats in (entry.get("scope_breakdown") or {}).items():
+                    if s not in proj_agg:
+                        proj_agg[s] = {"created": 0, "merged": 0}
+                    proj_agg[s]["created"] += stats.get("created", 0)
+                    proj_agg[s]["merged"] += stats.get("merged", 0)
+        if sum(v["created"] for v in proj_agg.values()) < 3:
+            return proposed_scope, None
+        agg = proj_agg
+        threshold = 0.3
+        source = "project"
+    else:
         return proposed_scope, None
 
     def _merge_rate(scope: str) -> float | None:
-        stats = aggregated.get(scope)
+        stats = agg.get(scope)
         if not stats or stats["created"] < 3:
             return None
         return stats["merged"] / stats["created"]
 
     rate = _merge_rate(proposed_scope)
-    if rate is None or rate >= 0.4:
+    if rate is None or rate >= threshold:
         return proposed_scope, None
 
     # Downgrade to next smaller scope with acceptable rate
-    try:
-        idx = _SCOPE_ORDER.index(proposed_scope)
-    except ValueError:
-        return proposed_scope, None
-
     for smaller_scope in reversed(_SCOPE_ORDER[:idx]):
         smaller_rate = _merge_rate(smaller_scope)
-        if smaller_rate is None or smaller_rate >= 0.4:
+        if smaller_rate is None or smaller_rate >= threshold:
             logger.info(
                 "[RESEARCH] Downgrading scope %s→%s for direction '%s' "
-                "(merge rate %.0f%% < 40%%)",
+                "(%s merge rate %.0f%% < %.0f%%)",
                 proposed_scope, smaller_scope,
                 direction.get("title", direction.get("id", "?")),
-                rate * 100,
+                source, rate * 100, threshold * 100,
             )
             return smaller_scope, proposed_scope
 
@@ -952,7 +976,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _dir_id = finding.get("direction_id") or _parent_direction_id
             _direction = _directions_by_id.get(str(_dir_id)) if _dir_id else None
             if _direction:
-                scope, scope_calibrated_from = _calibrate_scope(scope, _direction)
+                scope, scope_calibrated_from = _calibrate_scope(scope, _direction, _scope_cal_project)
 
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation
