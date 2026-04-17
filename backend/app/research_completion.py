@@ -747,6 +747,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if t.context and t.context.get("finding_hash")
         and t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
     }
+    # Build a map of finding_hash -> most-recent failed task for prior-attempt context injection.
+    # When a re-spawned finding passes dedup (e.g. CODE_ERROR cooldown elapsed), inject the
+    # prior failure's retry context so the new agent avoids repeating the same approach.
+    prior_failure_by_hash: dict[str, Task] = {}
+    for _pt in recent_tasks_for_dedup:
+        if not _pt.context:
+            continue
+        _pfh = _pt.context.get("finding_hash")
+        if not _pfh:
+            continue
+        if _pt.status not in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+            continue
+        _existing = prior_failure_by_hash.get(_pfh)
+        if _existing is None or (_pt.created_at or _dedup_now) > (_existing.created_at or _dedup_now):
+            prior_failure_by_hash[_pfh] = _pt
     # Also suppress tasks that have an active suppress_until field (set on user-cancelled low-priority tasks)
     now_iso = _utcnow().isoformat()
     for t in recent_tasks_for_dedup:
@@ -1005,6 +1020,29 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         finding_priority = TASK_PRIORITY_MAP.get(finding.get("priority", "medium"), 50)
         # Inherit parent direction_id if the finding doesn't specify one
         parent_direction_id = (task.context or {}).get("direction_id")
+
+        # If this finding matches a prior failed task (e.g. re-spawn after CODE_ERROR cooldown),
+        # inject its failure context using the _previous_* naming convention so the agent's
+        # buildRetryContext renders prior-attempt guidance.
+        prior_retry_ctx: dict = {}
+        _prior = prior_failure_by_hash.get(fhash)
+        if _prior is not None:
+            _prior_ctx = _prior.context or {}
+            prior_retry_ctx["_attempt_number"] = 2
+            if _prior.latest_status_message:
+                prior_retry_ctx["_previous_error"] = _prior.latest_status_message[:5000]
+            try:
+                prior_retry_ctx["_previous_failure_class"] = classify_failure(_prior)
+            except Exception:
+                pass
+            if _prior_ctx.get("_analysis_plan"):
+                prior_retry_ctx["_previous_analysis_plan"] = _prior_ctx["_analysis_plan"]
+            if _prior_ctx.get("_pr_changed_files"):
+                prior_retry_ctx["_previous_changed_files"] = _prior_ctx["_pr_changed_files"]
+            if _prior_ctx.get("_pr_diff_summary"):
+                prior_retry_ctx["_previous_diff_summary"] = _prior_ctx["_pr_diff_summary"]
+            if _prior_ctx.get("_pr_url"):
+                prior_retry_ctx["_previous_pr_url"] = _prior_ctx["_pr_url"]
         finding_payload = validate_internal_payload({
             "type": task_type,
             "prompt": full_prompt,
@@ -1034,6 +1072,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **({"parent_direction_id": parent_direction_id} if parent_direction_id else {}),
                 **({"scope_calibrated_from": scope_calibrated_from} if scope_calibrated_from else {}),
                 **({"low_confidence_spawn": True, "low_confidence_spawn_rate": round(_pred_p, 3)} if _low_confidence else {}),
+                **prior_retry_ctx,
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,

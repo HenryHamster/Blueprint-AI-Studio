@@ -181,6 +181,55 @@ async def test_reaper_retry_path(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_reaper_retry_preserves_analysis_artifacts(reaper_db, mocker):
+    """Reaper requeue must copy _pr_diff_summary / _test_failure_summary /
+    _self_review_outcome / _analysis_plan to their _previous_* equivalents so
+    the agent's buildRetryContext can surface them on the next attempt."""
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+
+    project = Project(name="Reaper Artifact Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    original_ctx = {
+        "_pr_diff_summary": [{"file": "a.py", "added": 3}],
+        "_test_failure_summary": "pytest failed in test_x",
+        "_self_review_outcome": {"verdict": "needs_changes"},
+        "_analysis_plan": "step1: refactor; step2: test",
+    }
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="artifact-vm",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context=dict(original_ctx),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    ctx = task.context or {}
+    assert ctx.get("_previous_diff_summary") == original_ctx["_pr_diff_summary"]
+    assert ctx.get("_previous_test_failure_summary") == original_ctx["_test_failure_summary"]
+    assert ctx.get("_previous_self_review_outcome") == original_ctx["_self_review_outcome"]
+    assert ctx.get("_previous_analysis_plan") == original_ctx["_analysis_plan"]
+
+
+@pytest.mark.asyncio
 async def test_reaper_terminal_failure(reaper_db, mocker):
     """
     Tests that a task at its retry limit is permanently marked FAILED

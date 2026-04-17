@@ -25,6 +25,25 @@ logger = logging.getLogger(__name__)
 _reaper_skip_counts: Dict[uuid.UUID, int] = {}
 
 
+def _copy_analysis_artifacts_to_previous(ctx: dict) -> None:
+    """Mirror the _pr_diff_summary/_test_failure_summary/_self_review_outcome/
+    _analysis_plan artifacts from the failed attempt into their _previous_*
+    equivalents so the agent's buildRetryContext can surface them. Matches the
+    conversion in task_lifecycle._requeue_parent_task."""
+    prev_diff_summary = ctx.get("_pr_diff_summary", [])
+    prev_test_failure_summary = ctx.get("_test_failure_summary", "")
+    prev_self_review_outcome = ctx.get("_self_review_outcome")
+    prev_analysis_plan = ctx.get("_analysis_plan", "")
+    if prev_diff_summary:
+        ctx["_previous_diff_summary"] = prev_diff_summary
+    if prev_test_failure_summary:
+        ctx["_previous_test_failure_summary"] = prev_test_failure_summary
+    if prev_self_review_outcome:
+        ctx["_previous_self_review_outcome"] = prev_self_review_outcome
+    if prev_analysis_plan:
+        ctx["_previous_analysis_plan"] = prev_analysis_plan
+
+
 async def reaper_service():
     """
     Background worker that scans for orphaned VMs.
@@ -310,6 +329,7 @@ async def reaper_service():
                                     account_id=rl_acct_id,
                                 )
                             rl_ctx["blacklisted_accounts"] = blacklisted
+                        _copy_analysis_artifacts_to_previous(rl_ctx)
                         rl_ctx.pop("max_plan_account_id", None)
                         rl_ctx.pop("_slot_released", None)
                         rl_ctx.pop("retry_after", None)  # clear any stale delay
@@ -485,6 +505,7 @@ async def reaper_service():
                                     reaper_ctx["_previous_failure_class"] = _reap_failure_class
                                     if _reap_failure_class == "CODE_ERROR":
                                         reaper_ctx["_previous_error_summary"] = (task.latest_status_message or "")[:500]
+                                    _copy_analysis_artifacts_to_previous(reaper_ctx)
                             except Exception:
                                 logger.exception("[REAPER] Failed to enrich retry context for task %s", task.id)
                             if is_provision_failure and (task.context or {}).get("_infra_wait"):

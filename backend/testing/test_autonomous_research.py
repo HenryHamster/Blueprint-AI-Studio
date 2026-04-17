@@ -3455,3 +3455,78 @@ async def test_anomaly_restoration_creates_info_alert(db_session, mocker):
     assert alert.severity == AlertSeverity.INFO
     assert "8" in alert.message  # restored max_concurrent_vms
     assert "0.8" in alert.message  # restored failure gate
+
+
+@pytest.mark.asyncio
+async def test_respawn_after_cooldown_injects_prior_failure_context(db_session, mocker):
+    """A finding re-spawned after CODE_ERROR cooldown receives _previous_* retry context
+    from the prior failed task so buildRetryContext renders prior-attempt guidance."""
+    direction = _active_direction("d-respawn1", "Re-spawn context direction")
+    project = Project(
+        name="Respawn Prior Context Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    title = "Add retry logic to webhook dispatcher"
+    desc = "Webhook dispatcher fails silently on transient 5xx responses"
+    fhash = hashlib.sha256((title + desc).encode()).hexdigest()[:16]
+
+    prior_failed = Task(
+        project_id=project.id,
+        title=title,
+        payloads=[{"type": "create", "prompt": "add retry", "base_branch": "main"}],
+        context={
+            "finding_hash": fhash,
+            "_analysis_plan": "Planned to wrap dispatcher in tenacity retry decorator",
+            "_pr_changed_files": ["app/webhooks.py", "testing/test_webhooks.py"],
+            "_pr_diff_summary": [{"file": "app/webhooks.py", "added": 12, "removed": 2}],
+            "_pr_url": "https://github.com/example/repo/pull/999",
+        },
+        status=TaskStatus.FAILED,
+        latest_status_message="Tests failed: AssertionError in test_webhooks.py line 42",
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        created_at=datetime.utcnow() - timedelta(hours=72),
+    )
+    db_session.add(prior_failed)
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": title,
+            "description": desc,
+            "prompt": "Add retry logic",
+            "priority": "medium",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    children = result.scalars().all()
+    assert len(children) == 1, "Re-spawn after cooldown should produce one child task"
+    ctx = children[0].context or {}
+    assert ctx.get("_attempt_number") == 2
+    assert "AssertionError" in (ctx.get("_previous_error") or "")
+    assert ctx.get("_previous_failure_class") == "CODE_ERROR"
+    assert ctx.get("_previous_analysis_plan") == "Planned to wrap dispatcher in tenacity retry decorator"
+    assert ctx.get("_previous_changed_files") == ["app/webhooks.py", "testing/test_webhooks.py"]
+    assert ctx.get("_previous_diff_summary") == [{"file": "app/webhooks.py", "added": 12, "removed": 2}]
+    assert ctx.get("_previous_pr_url") == "https://github.com/example/repo/pull/999"
