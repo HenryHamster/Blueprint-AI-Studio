@@ -1241,6 +1241,195 @@ async def test_ci_polling_behind_update_branch_success_clears_retry_counter(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Test 5d — Rollup parent stays EVALUATING when conflict fix is spawned
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fix_was_created", [True, False])
+async def test_ci_polling_rollup_parent_stays_evaluating_on_conflict_fix(
+    orch_db, mocker, fix_was_created,
+):
+    """When the CI-waiting task is itself a rollup parent (``_is_rollup_review=True``
+    with ``rollup_pr_number`` set and ``pr_merged`` unset), and the rollup PR is
+    reported as ``mergeable_state='dirty'``, the orchestrator must NOT mark the
+    parent COMPLETED on conflict-fix spawn.
+
+    Regression: previously, after spawning (or reusing) a fix task for a rollup
+    parent, ``ci_task.status = TaskStatus.COMPLETED`` fired unconditionally — so
+    the research/strategic parent reported success while the rollup PR still had
+    conflicts and a fix task was mid-flight. The parent must stay in EVALUATING
+    so ``ci_completion`` can promote it via ``pr_merged=True`` only after the
+    fix lands and the PR actually merges.
+    """
+    session, _Session = orch_db
+
+    project = Project(name=f"Rollup Conflict {fix_was_created}", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    rollup_parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup parent",
+                   "branch": "rollup/feat-x", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "_is_rollup_review": True,
+            "rollup_pr_number": 2077,
+            "rollup_pr_url": "https://github.com/o/r/pull/2077",
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 2077,
+                "branch": "rollup/feat-x",
+                "base_branch": "main",
+                "original_task_id": None,
+                "ci_wait_started": _naive_utcnow().isoformat(),
+            },
+        },
+    )
+    session.add(rollup_parent)
+    await session.commit()
+    await session.refresh(rollup_parent)
+    rollup_parent.context = {
+        **rollup_parent.context,
+        "review_loop": {**rollup_parent.context["review_loop"],
+                        "original_task_id": str(rollup_parent.id)},
+    }
+    session.add(rollup_parent)
+    await session.commit()
+    task_id = rollup_parent.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "open", "merged": False,
+                               "mergeable": False, "mergeable_state": "dirty",
+                               "head": {"sha": "conflictsha"}})
+    mocker.patch("app.github.get_check_runs_cached",
+                 new=AsyncMock(return_value={"status": "in_progress", "details": []}))
+    # Return a fake fix task; ``fix_was_created=False`` simulates the
+    # "existing fix continues" branch observed in the original incident.
+    fake_fix = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "resolving conflicts", "pr_number": 2077}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    session.add(fake_fix)
+    await session.commit()
+    await session.refresh(fake_fix)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(fake_fix, fix_was_created)),
+    )
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify:
+        from sqlmodel import select as _select
+        updated = (await verify.execute(
+            _select(Task).where(Task.id == task_id)
+        )).scalars().first()
+
+    assert updated is not None
+    assert updated.status == TaskStatus.EVALUATING, (
+        f"Rollup parent must stay EVALUATING while the rollup PR is unmerged "
+        f"and a fix is in flight, got {updated.status}. "
+        f"Marking COMPLETED here produces a ghost success: the research/strategic "
+        f"parent reports done while the rollup PR still has merge conflicts."
+    )
+    rl = (updated.context or {}).get("review_loop", {})
+    assert rl.get("conflict_fix_spawned") == str(fake_fix.id), (
+        f"conflict_fix_spawned must record the fix task so subsequent CI sweeps "
+        f"skip this parent until the fix resolves, got rl={rl!r}"
+    )
+    assert rl.get("ci_waiting") is False, (
+        f"ci_waiting must be cleared once a fix is in flight (otherwise the sweep "
+        f"would re-spawn a fix every cycle), got rl={rl!r}"
+    )
+    assert (updated.context or {}).get("pr_merged") is not True, (
+        "pr_merged must only be set by ci_completion after a real merge, "
+        "never pre-emptively when spawning a conflict fix"
+    )
+    spawn_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_non_rollup_task_completes_on_conflict_fix(
+    orch_db, mocker,
+):
+    """Baseline counterpart to the rollup-parent test: a plain review/CI task
+    (no ``_is_rollup_review`` and no ``rollup_pr_number``) MUST still be marked
+    COMPLETED when it spawns a conflict fix, because that review iteration has
+    delegated its work to the fix task and has no further responsibility.
+
+    Protects against the rollup-parent guard being widened too far and
+    accidentally leaking non-rollup CI tasks back into EVALUATING.
+    """
+    session, _Session = orch_db
+
+    project = Project(name="Plain CI Conflict", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "plain ci task",
+                   "branch": "feat/plain", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 777,
+                "branch": "feat/plain",
+                "base_branch": "main",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+            }
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+    task_id = ci_task.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "open", "merged": False,
+                               "mergeable": False, "mergeable_state": "dirty",
+                               "head": {"sha": "plainsha"}})
+    mocker.patch("app.github.get_check_runs_cached",
+                 new=AsyncMock(return_value={"status": "in_progress", "details": []}))
+    fake_fix = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "plain fix", "pr_number": 777}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    session.add(fake_fix)
+    await session.commit()
+    await session.refresh(fake_fix)
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(fake_fix, True)),
+    )
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify:
+        from sqlmodel import select as _select
+        updated = (await verify.execute(
+            _select(Task).where(Task.id == task_id)
+        )).scalars().first()
+
+    assert updated is not None
+    assert updated.status == TaskStatus.COMPLETED, (
+        f"A plain (non-rollup) CI task must be marked COMPLETED once it delegates "
+        f"conflict resolution to a fix task — the review iteration itself is done. "
+        f"Got {updated.status}."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Test 6 — Deadlock detection clears failed dependencies
 # ══════════════════════════════════════════════════════════════════════════════
 

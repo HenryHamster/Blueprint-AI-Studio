@@ -2218,11 +2218,17 @@ async def orchestrator_worker():
                                 fix_prompt=fix_prompt, original_task_id=ci_orig_id
                             )
                             if fix_task:
-                                ci_task.status = TaskStatus.COMPLETED
+                                from app.rollup_state import _is_rollup_parent_awaiting_merge
                                 ci_loop_ctx = dict(ci_loop)
                                 ci_loop_ctx["ci_waiting"] = False
                                 ci_loop_ctx["conflict_fix_spawned"] = str(fix_task.id)
                                 ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop_ctx}
+                                # Rollup parents must stay in EVALUATING until the rollup PR
+                                # actually merges — ci_completion will promote them via
+                                # pr_merged=True. Marking COMPLETED here produces a ghost
+                                # success while the fix task is still resolving conflicts.
+                                if not _is_rollup_parent_awaiting_merge(ci_task.context):
+                                    ci_task.status = TaskStatus.COMPLETED
                                 if fix_was_created:
                                     ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}"
                                     logger.info(f"[CI] PR #{ci_pr_number} has merge conflicts, spawned fix → {fix_task.id}")

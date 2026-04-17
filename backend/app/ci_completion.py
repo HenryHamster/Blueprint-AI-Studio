@@ -280,7 +280,11 @@ async def handle_ci_completion(
             None
         )
         if existing_fix:
-            task.status = TaskStatus.COMPLETED
+            from app.rollup_state import _is_rollup_parent_awaiting_merge
+            # Rollup parents stay in EVALUATING — ci_completion will promote them
+            # via pr_merged=True once the fix lands and the PR merges.
+            if not _is_rollup_parent_awaiting_merge(task.context):
+                task.status = TaskStatus.COMPLETED
             task.latest_status_message = f"CI failed on PR #{ci_pr_number}, fix already active → {existing_fix.id}"
             logger.error(f"[CI] PR #{ci_pr_number} CI failed, fix already exists → {existing_fix.id} ({source})")
             session.add(task)
@@ -315,11 +319,15 @@ async def handle_ci_completion(
             fix_reason="ci_failure"
         )
         if fix_task:
+            from app.rollup_state import _is_rollup_parent_awaiting_merge
             ci_loop_ctx = dict(ci_loop)
             ci_loop_ctx["ci_waiting"] = False
             ci_loop_ctx["ci_fix_spawned"] = str(fix_task.id)
             task.context = {**(task.context or {}), "review_loop": ci_loop_ctx}
-            task.status = TaskStatus.COMPLETED
+            # Rollup parents stay in EVALUATING — ci_completion will promote them
+            # via pr_merged=True once the fix lands and the PR merges.
+            if not _is_rollup_parent_awaiting_merge(task.context):
+                task.status = TaskStatus.COMPLETED
             task.latest_status_message = f"CI failed on PR #{ci_pr_number}, spawned fix → {fix_task.id}"
             logger.error(f"[CI] PR #{ci_pr_number} CI failed, spawned fix → {fix_task.id} ({source})")
         else:

@@ -36,3 +36,20 @@ def _clear_rollup_transient_state(ctx: dict | None) -> dict:
     if not ctx:
         return {}
     return {k: v for k, v in ctx.items() if k not in _ROLLUP_TRANSIENT_CTX_KEYS}
+
+
+def _is_rollup_parent_awaiting_merge(ctx: dict | None) -> bool:
+    """True if this task is a rollup parent whose rollup PR has not yet merged.
+
+    Rollup parents park in EVALUATING with ``_is_rollup_review=True`` and
+    ``rollup_pr_number`` set while the review/CI/fix pipeline lands the PR.
+    Intermediate pipeline events (conflict-fix spawn, ci-fix spawn, existing
+    fix reuse) must NOT mark the parent COMPLETED — that terminates the
+    parent before the PR is actually merged, leaving a "ghost success" and
+    preventing ``ci_completion`` from promoting it via ``pr_merged=True``.
+    """
+    if not ctx:
+        return False
+    if ctx.get("_is_rollup_review") is True:
+        return True
+    return bool(ctx.get("rollup_pr_number")) and not ctx.get("pr_merged")
