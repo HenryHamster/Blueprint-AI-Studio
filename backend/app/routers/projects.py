@@ -335,7 +335,17 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
             try:
                 parsed = json.loads(data)
                 if isinstance(parsed, dict) and parsed.get("type") == "ping":
-                    await websocket.send_json({"event": "pong", "data": {}})
+                    # Client can close between receive and send; suppress the
+                    # resulting ConnectionClosed/WebSocketDisconnect so the
+                    # finally block handles cleanup instead of logging a crash.
+                    # Catches websockets.ConnectionClosedError (raw library
+                    # exception), WebSocketDisconnect (starlette wrapper), and
+                    # RuntimeError (starlette state errors).
+                    try:
+                        await websocket.send_json({"event": "pong", "data": {}})
+                    except Exception as _ws_exc:
+                        logger.debug(f"[WS] pong send failed, client disconnected: {_ws_exc}")
+                        return
                     continue
             except (json.JSONDecodeError, AttributeError):
                 pass

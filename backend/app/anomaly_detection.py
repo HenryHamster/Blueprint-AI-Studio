@@ -23,6 +23,19 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
+def _as_iso(v) -> str:
+    """Return ``v`` as an ISO-8601 string.
+
+    ``persistent_anomalies`` stores ``first_seen`` / ``last_seen`` as ISO strings,
+    but a legacy persisted snapshot (before the restore was fixed) may still
+    leave datetime objects in memory across a pod restart. This coerces both
+    shapes so string comparison against ``stale_cutoff`` is well-defined.
+    """
+    if isinstance(v, datetime):
+        return v.isoformat()
+    return v or ""
+
+
 def _normalize_error_message(msg: str) -> str:
     """Strip task-specific identifiers from an error message so identical root causes group together.
 
@@ -231,7 +244,7 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     # Expire anomalies not seen for 48h
     stale_cutoff = (now - timedelta(hours=48)).isoformat()
     for key in list(proj_anomalies):
-        if key not in seen_keys and proj_anomalies[key]["last_seen"] < stale_cutoff:
+        if key not in seen_keys and _as_iso(proj_anomalies[key].get("last_seen")) < stale_cutoff:
             del proj_anomalies[key]
 
     return anomalies
@@ -607,7 +620,7 @@ def _expire_stale_anomalies() -> int:
     expired = 0
     for proj_key, proj_anomalies in list(_shared_state.persistent_anomalies.items()):
         for key in list(proj_anomalies):
-            last_seen = proj_anomalies[key].get("last_seen", "")
+            last_seen = _as_iso(proj_anomalies[key].get("last_seen"))
             if last_seen and last_seen < stale_cutoff:
                 del proj_anomalies[key]
                 expired += 1

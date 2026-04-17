@@ -474,7 +474,12 @@ async def trigger_strategic_cycle(
     """Manually trigger a strategic cycle. Phase: 'design_doc' (Phase 1 → chains to Phase 2) or 'strategic_review' (Phase 2 only)."""
     project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
-    # Guard: no strategic task already running
+    # Guard: no strategic task already running. Lock the project row so the
+    # check+insert is transactionally atomic with concurrent spawn attempts
+    # (design_doc completion chain, autonomous-research tick, other manual triggers).
+    await session.execute(
+        select(Project.id).where(Project.id == project.id).with_for_update()
+    )
     active = (await session.execute(
         select(Task).where(
             Task.project_id == project.id,

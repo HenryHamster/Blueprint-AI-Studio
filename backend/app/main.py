@@ -421,11 +421,12 @@ async def _init_deployment_state():
                     for k, v in proj_anomalies.items():
                         entry: dict = {}
                         for fk, fv in v.items():
-                            if isinstance(fv, str) and fk in ("first_seen", "last_seen"):
-                                try:
-                                    entry[fk] = datetime.fromisoformat(fv)
-                                except ValueError:
-                                    entry[fk] = fv
+                            # first_seen/last_seen are ISO strings everywhere they're
+                            # written and compared (anomaly_detection.py). Coerce any
+                            # pre-existing datetime back to isoformat so legacy
+                            # persisted pods don't crash the stale-cutoff comparison.
+                            if fk in ("first_seen", "last_seen") and isinstance(fv, datetime):
+                                entry[fk] = fv.isoformat()
                             else:
                                 entry[fk] = fv
                         restored_proj[k] = entry

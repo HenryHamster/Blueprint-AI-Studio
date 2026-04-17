@@ -813,7 +813,9 @@ STATICENV
                     zone=zone,
                     instance_resource=instance_config
                 )
-                operation.result(timeout=300)
+                # Inner wait is bounded below the outer 420s wait_for so we
+                # don't routinely burn the full budget on a single zone.
+                operation.result(timeout=240)
 
                 with _zone_lock:
                     _vm_zones[vm_instance_id] = zone
@@ -839,6 +841,42 @@ STATICENV
             except Exception as e:
                 last_error = e
                 err_str = str(e)
+                # 409 "already exists": a prior in-flight insert for this same
+                # vm_id landed a VM in this zone despite our outer timeout.
+                # Adopt it if it's healthy, otherwise delete and retry the
+                # insert in the same zone once.
+                if "409" in err_str and "already exists" in err_str.lower():
+                    try:
+                        existing = instance_client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+                        existing_status = getattr(existing, "status", "") or ""
+                        if existing_status in ("RUNNING", "STAGING", "PROVISIONING"):
+                            logger.warning(
+                                f"[PROVISION] {vm_instance_id} already exists in {zone} "
+                                f"(status={existing_status}) — adopting rather than recreating"
+                            )
+                            with _zone_lock:
+                                _vm_zones[vm_instance_id] = zone
+                                health = _zone_health.setdefault(zone, {})
+                                health["last_success"] = datetime.now(timezone.utc)
+                                health["consecutive_failures"] = 0
+                                health.pop("cooldown_expires_at", None)
+                                outcomes = health.setdefault("recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW))
+                                outcomes.append(True)
+                                _zone_failures.pop(zone, None)
+                            return f"adopted-{vm_instance_id}-in-{zone}"
+                        logger.warning(
+                            f"[PROVISION] {vm_instance_id} exists in {zone} but status={existing_status} — "
+                            f"deleting and retrying insert"
+                        )
+                        del_op = instance_client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+                        del_op.result(timeout=180)
+                    except Exception as adopt_exc:
+                        logger.warning(
+                            f"[PROVISION] {vm_instance_id} 409 recovery in {zone} failed: {adopt_exc}"
+                        )
+                    # Fall through to the retryable-error branch so we try the next zone
+                    # if adoption didn't succeed.
+                    continue
                 # Retryable zone/infra errors — try next zone
                 retryable = (
                     "does not have enough resources" in err_str
@@ -923,7 +961,7 @@ STATICENV
                     zone_region = "-".join(wait_zone.split("-")[:-1])
                     network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{wait_subnet}"
                     operation = instance_client.insert(project=GCP_PROJECT_ID, zone=wait_zone, instance_resource=instance_config)
-                    operation.result(timeout=300)
+                    operation.result(timeout=240)
                     with _zone_lock:
                         _vm_zones[vm_instance_id] = wait_zone
                         health = _zone_health.setdefault(wait_zone, {})
@@ -956,7 +994,11 @@ STATICENV
 
     try:
         async with _gcp_provision_semaphore:  # Local guard still useful for thread pool
-            operation_name = await asyncio.wait_for(asyncio.to_thread(_insert_instance), timeout=360)
+            # 420s outer = 240s inner insert + 180s headroom for stale-delete,
+            # zone iteration, and secret setup. Previously 360s, which routinely
+            # cancelled near-complete GCP operations (surfaced as
+            # OPERATION_CANCELED_BY_USER 409 from the in-flight thread).
+            operation_name = await asyncio.wait_for(asyncio.to_thread(_insert_instance), timeout=420)
         logger.info(f"GCP Operation completed: {operation_name}")
         return True
     except (asyncio.TimeoutError, asyncio.CancelledError) as e:
@@ -969,8 +1011,19 @@ STATICENV
         return False
     except Exception as e:
         _cancel_event.set()
-        logger.exception(f"Failed to provision VM {vm_instance_id}")
-        _last_provision_error[vm_instance_id] = str(e)[:300]
+        err_str = str(e)
+        # OPERATION_CANCELED_BY_USER is a side-effect of our own outer timeout
+        # firing while GCP's insert long-running-op was still executing — not
+        # a novel error. Log at WARN instead of exception so it stops fouling
+        # "UnknownError" dashboards.
+        if "OPERATION_CANCELED_BY_USER" in err_str:
+            logger.warning(
+                f"[PROVISION] {vm_instance_id} GCP operation cancelled mid-flight "
+                f"(our outer timeout fired while insert was still running): {err_str[:200]}"
+            )
+        else:
+            logger.exception(f"Failed to provision VM {vm_instance_id}")
+        _last_provision_error[vm_instance_id] = err_str[:300]
         if len(_last_provision_error) > _PROVISION_ERROR_MAX:
             _last_provision_error.popitem(last=False)
         await asyncio.to_thread(_delete_agent_secret, vm_instance_id)

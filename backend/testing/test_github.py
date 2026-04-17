@@ -479,6 +479,41 @@ async def test_github_request_raises_network_error_after_max_retries(mocker):
         await _github_request("GET", "https://api.github.com/test", {}, max_retries=3)
 
 
+@pytest.mark.asyncio
+async def test_github_request_resets_client_on_connect_error(mocker):
+    """
+    On transport-layer failure (ConnectError/PoolTimeout/ReadError), the shared
+    httpx client is torn down so the retry rebuilds TCP+TLS instead of reusing
+    a potentially-dead connection from the pool. Without this, a single bad
+    keep-alive can silently blackhole the pool for its entire lifetime.
+    """
+    import httpx as httpx_mod
+    import app.github as gh
+
+    # Prime the module's shared client so we have something to reset.
+    gh._github_client = None
+    first_client = gh._get_client()
+    assert first_client is not None
+
+    call_count = 0
+
+    async def mock_request(method, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise httpx_mod.ConnectError("Connection refused")
+        return MockResponse(200, {"ok": True})
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+    mocker.patch("asyncio.sleep", return_value=None)
+
+    resp = await gh._github_request("GET", "https://api.github.com/test", {})
+    assert resp.status_code == 200
+    assert call_count == 2
+    # Client was reset after the first failure — next call built a new instance.
+    assert gh._github_client is not first_client
+
+
 # ---------------------------------------------------------------------------
 # Webhook tests: PR closed-without-merge sets pr_rejected on matching task
 # ---------------------------------------------------------------------------

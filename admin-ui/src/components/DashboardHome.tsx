@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   TrendingUp,
   TrendingDown,
@@ -9,6 +9,7 @@ import {
   GitMerge,
   Minus,
   ChevronRight,
+  RefreshCw,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts';
 import { apiFetch } from '../api';
@@ -93,16 +94,20 @@ interface DigestData {
   prev_scope_merge_rates?: Record<string, { created: number; merged: number }> | null;
 }
 
+interface OpenPRTask {
+  task_id: string;
+  task_status: string;
+  task_type: string;
+  task_title: string | null;
+}
+
 interface OpenPR {
   pr_number: number;
   pr_url: string;
   pr_title: string;
   pr_branch: string;
   pr_created_at: string;
-  task_id: string | null;
-  task_status: string | null;
-  task_type: string | null;
-  task_title: string | null;
+  tasks: OpenPRTask[];
   is_orphaned: boolean;
 }
 
@@ -270,11 +275,28 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
   const [measurementData, setMeasurementData] = useState<MediumScopeMeasurement | null>(null);
   const [loading, setLoading] = useState(true);
+  const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
   const [lastFetchError, setLastFetchError] = useState(false);
   const [showAllIssues, setShowAllIssues] = useState(false);
   const [windowHours, setWindowHours] = useState(24);
   const sparkRef = useRef<SparkPoint[]>([]);
   const [sparkData, setSparkData] = useState<SparkPoint[]>([]);
+
+  // Fetch open PRs only — used by manual refresh button
+  const fetchOpenPRs = useCallback(async () => {
+    if (!selectedProjectId) return;
+    setOpenPRsRefreshing(true);
+    try {
+      const res = await apiFetch(`/api/admin/open-prs?project_id=${encodeURIComponent(selectedProjectId)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setOpenPRs(data.open_prs ?? []);
+      }
+    } catch { /* silent */ }
+    finally {
+      setOpenPRsRefreshing(false);
+    }
+  }, [selectedProjectId]);
 
   // Fetch data
   const fetchData = useCallback(async () => {
@@ -372,7 +394,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const productPct = digest?.overall_product_ratio != null ? Math.round(digest.overall_product_ratio * 100) : null;
 
   return (
-    <div className="flex-1 overflow-auto space-y-4">
+    <div className="flex-1 overflow-auto custom-scrollbar space-y-4">
       {/* Backend unreachable banner */}
       {lastFetchError && !loading && (
         <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
@@ -577,7 +599,15 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           </div>
 
           {/* Section 5: PR Monitor */}
-          <PRMonitorSection openPRs={openPRs} loading={loading} hasProject={!!selectedProjectId} />
+          <PRMonitorSection
+            openPRs={openPRs}
+            loading={loading}
+            refreshing={openPRsRefreshing}
+            onRefresh={fetchOpenPRs}
+            hasProject={!!selectedProjectId}
+            tasks={tasks}
+            onViewTask={onViewTask}
+          />
         </div>
       </div>
     </div>
@@ -654,19 +684,33 @@ const PR_STATUS_COLORS: Record<string, string> = {
   CANCELLED: 'bg-neutral-500/20 text-neutral-500',
 };
 
-function PRMonitorSection({ openPRs, loading, hasProject }: { openPRs: OpenPR[]; loading: boolean; hasProject: boolean }) {
+function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void }) {
   const [expanded, setExpanded] = useState(true);
+  const tasksById = React.useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
+  const busy = loading || refreshing;
 
   return (
     <section className="mt-4">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-1.5 mb-2 group"
-      >
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Open PRs</h2>
-        <span className="text-[10px] text-neutral-500 font-mono">{openPRs.length}</span>
-        <ChevronRight className={`w-3 h-3 text-neutral-500 transition-transform ${expanded ? 'rotate-90' : ''}`} />
-      </button>
+      <div className="flex items-center gap-1.5 mb-2">
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="flex items-center gap-1.5 group"
+        >
+          <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Open PRs</h2>
+          <span className="text-[10px] text-neutral-500 font-mono">{openPRs.length}</span>
+          <ChevronRight className={`w-3 h-3 text-neutral-500 transition-transform ${expanded ? 'rotate-90' : ''}`} />
+        </button>
+        {hasProject && (
+          <button
+            onClick={onRefresh}
+            disabled={busy}
+            title={refreshing ? 'Refreshing…' : 'Refresh open PRs'}
+            className="ml-1 text-neutral-500 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            <RefreshCw className={`w-3 h-3 ${busy ? 'animate-spin' : ''}`} />
+          </button>
+        )}
+      </div>
       {expanded && (
         !hasProject ? (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">Select a project</div>
@@ -675,42 +719,58 @@ function PRMonitorSection({ openPRs, loading, hasProject }: { openPRs: OpenPR[];
         ) : openPRs.length === 0 ? (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No open PRs</div>
         ) : (
-          <div className="space-y-1.5 max-h-[400px] overflow-y-auto">
-            {openPRs.map(pr => {
-              const typeCls = TASK_TYPE_COLORS[pr.task_type ?? ''] ?? 'bg-neutral-500/20 text-neutral-400';
-              const statusCls = PR_STATUS_COLORS[pr.task_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-500';
-              return (
-                <div key={pr.pr_number} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5">
-                  <div className="flex items-start gap-2">
-                    <div className={`w-1.5 h-1.5 rounded-full mt-1.5 shrink-0 ${pr.is_orphaned ? 'bg-red-400' : 'bg-emerald-400'}`} />
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-xs text-neutral-300 font-mono">#{pr.pr_number}</span>
-                        <p className="text-xs text-neutral-200 truncate">{pr.pr_title}</p>
-                      </div>
-                      <div className="flex items-center gap-1.5 mt-1 flex-wrap">
-                        {pr.task_type && (
-                          <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${typeCls}`}>{pr.task_type}</span>
-                        )}
-                        {pr.task_status && (
-                          <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${statusCls}`}>{pr.task_status}</span>
-                        )}
-                        {pr.is_orphaned && (
-                          <span className="text-[9px] text-red-400 font-medium">No active task</span>
-                        )}
-                        <span className="text-[10px] text-neutral-500">{timeAgo(pr.pr_created_at)}</span>
-                      </div>
-                      <p className="text-[9px] text-neutral-600 font-mono truncate mt-0.5">{pr.pr_branch}</p>
+          <div className="space-y-1.5 max-h-[400px] overflow-y-auto custom-scrollbar">
+            {openPRs.map(pr => (
+              <div key={pr.pr_number} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5">
+                <div className="flex items-start gap-2">
+                  <div className={`w-1.5 h-1.5 rounded-full mt-1.5 shrink-0 ${pr.is_orphaned ? 'bg-red-400' : 'bg-emerald-400'}`} />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs text-neutral-300 font-mono">#{pr.pr_number}</span>
+                      <p className="text-xs text-neutral-200 truncate">{pr.pr_title}</p>
+                      <span className="text-[10px] text-neutral-500 ml-auto">{timeAgo(pr.pr_created_at)}</span>
                     </div>
-                    {pr.pr_url && isSafeUrl(pr.pr_url) && (
-                      <a href={pr.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300 shrink-0">
-                        <ExternalLink className="w-3.5 h-3.5" />
-                      </a>
+                    <p className="text-[9px] text-neutral-600 font-mono truncate mt-0.5">{pr.pr_branch}</p>
+                    {pr.is_orphaned ? (
+                      <div className="mt-1.5 text-[9px] text-red-400 font-medium">No active task</div>
+                    ) : (
+                      <div className="mt-1.5 space-y-1">
+                        {pr.tasks.map(t => {
+                          const typeCls = TASK_TYPE_COLORS[t.task_type] ?? 'bg-neutral-500/20 text-neutral-400';
+                          const statusCls = PR_STATUS_COLORS[t.task_status] ?? 'bg-neutral-500/20 text-neutral-500';
+                          const fullTask = tasksById.get(t.task_id);
+                          const row = (
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${typeCls}`}>{t.task_type}</span>
+                              <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${statusCls}`}>{t.task_status}</span>
+                              {t.task_title && (
+                                <span className="text-[10px] text-neutral-400 truncate min-w-0 flex-1">{t.task_title}</span>
+                              )}
+                            </div>
+                          );
+                          return fullTask ? (
+                            <button
+                              key={t.task_id}
+                              onClick={() => onViewTask(fullTask)}
+                              className="w-full text-left hover:bg-neutral-800/40 rounded px-1 -mx-1 py-0.5 transition-colors"
+                            >
+                              {row}
+                            </button>
+                          ) : (
+                            <div key={t.task_id} className="px-1 py-0.5">{row}</div>
+                          );
+                        })}
+                      </div>
                     )}
                   </div>
+                  {pr.pr_url && isSafeUrl(pr.pr_url) && (
+                    <a href={pr.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300 shrink-0">
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  )}
                 </div>
-              );
-            })}
+              </div>
+            ))}
           </div>
         )
       )}

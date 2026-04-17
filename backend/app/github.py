@@ -117,6 +117,15 @@ async def _github_request(
         except httpx.HTTPError as exc:
             if attempt == max_retries - 1:
                 raise
+            # Transport-layer failures (connect/read/pool) often mean a
+            # keep-alive in the shared pool is dead. Close the client so the
+            # next attempt rebuilds TCP+TLS instead of reusing the broken
+            # connection. Non-transport HTTPErrors (timeouts on a fresh conn,
+            # invalid URL, etc.) don't benefit from a pool reset.
+            if isinstance(exc, (httpx.ConnectError, httpx.ReadError,
+                                httpx.WriteError, httpx.PoolTimeout)):
+                await close_github_client()
+                logger.warning(f"[GITHUB] Reset HTTP client after transport error: {type(exc).__name__}")
             delay = 2 ** attempt * (0.5 + random.random() * 0.5)  # jittered: 0.5x–1x base
             logger.warning(
                 f"[GITHUB] {method} {url} network error: {exc}, "
@@ -1125,8 +1134,14 @@ async def merge_pull_request(
         msg = data.get("message", "Merge failed")
         logger.warning(f"PR #{pr_number} merge blocked ({response.status_code}): {msg}")
         return {"merged": False, "conflict": response.status_code == 409, "message": msg}
-    logger.error(f"Failed to merge PR #{pr_number}: {response.text}")
-    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to merge PR #{pr_number}")
+    body_snippet = (response.text or "")[:500]
+    logger.error(
+        f"Failed to merge PR #{pr_number} (status={response.status_code}): {body_snippet}"
+    )
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=f"Failed to merge PR #{pr_number} (upstream status {response.status_code})",
+    )
 
 
 async def enable_auto_merge(

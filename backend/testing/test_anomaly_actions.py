@@ -443,6 +443,30 @@ def test_expire_stale_anomalies_drops_empty_project():
     assert proj not in _shared_state.persistent_anomalies
 
 
+def test_expire_stale_anomalies_tolerates_datetime_last_seen():
+    """Legacy persisted snapshots may round-trip ``last_seen`` as a datetime
+    instead of an ISO string (main.py used to call ``datetime.fromisoformat``
+    during restore). The stale-cutoff comparison must coerce both shapes
+    rather than raising ``TypeError: '<' not supported between datetime/str``.
+    """
+    proj = str(uuid.uuid4())
+    fresh_dt = _utcnow()
+    stale_dt = _utcnow() - timedelta(hours=49)
+    _shared_state.persistent_anomalies[proj] = {
+        "FRESH": {"severity": "high", "occurrence_count": 3,
+                  "first_seen": fresh_dt, "last_seen": fresh_dt,
+                  "latest_details": ""},
+        "STALE": {"severity": "high", "occurrence_count": 3,
+                  "first_seen": stale_dt, "last_seen": stale_dt,
+                  "latest_details": ""},
+    }
+    # Must not raise.
+    expired = _expire_stale_anomalies()
+    assert expired == 1
+    assert "FRESH" in _shared_state.persistent_anomalies[proj]
+    assert "STALE" not in _shared_state.persistent_anomalies[proj]
+
+
 @pytest.mark.asyncio
 async def test_maintenance_sweep_restores_after_expiry():
     """Sweep expires the triggering anomaly, then restoration runs in same call."""

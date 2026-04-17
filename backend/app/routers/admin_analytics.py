@@ -2821,9 +2821,11 @@ async def get_open_prs(
         token, project.github_owner, project.github_repo
     )
 
-    # Build task lookup: pr_number -> most relevant active task
-    # Prefer active tasks (IN_PROGRESS > QUEUED > EVALUATING > COMPLETED)
-    pr_task_map: Dict[int, Task] = {}
+    # Build task lookup: pr_number -> list of linked active tasks.
+    # Terminal statuses (COMPLETED/FAILED/CANCELLED) are excluded — the widget
+    # is for in-flight work. Dedupe by task.id since a task can match via
+    # both a PR artifact and a context pr_number.
+    pr_task_map: Dict[int, Dict[uuid.UUID, Task]] = {}
 
     # Source 1: PR artifacts (agent-created PRs — extract number from URL)
     artifact_rows = (await session.execute(
@@ -2833,6 +2835,7 @@ async def get_open_prs(
             Artifact.artifact_type == ArtifactType.PULL_REQUEST,
             Artifact.pr_url.isnot(None),
             Task.project_id == project_id,
+            Task.status.in_(list(_ACTIVE_STATUSES)),
         )
     )).all()
     for art, task in artifact_rows:
@@ -2840,9 +2843,7 @@ async def get_open_prs(
             pr_num = int(art.pr_url.rstrip("/").split("/")[-1])
         except (ValueError, IndexError):
             continue
-        existing = pr_task_map.get(pr_num)
-        if not existing or (task.status in _ACTIVE_STATUSES and existing.status not in _ACTIVE_STATUSES):
-            pr_task_map[pr_num] = task
+        pr_task_map.setdefault(pr_num, {})[task.id] = task
 
     # Source 2: Tasks with pr_number in context (review/fix pipeline + rollups)
     active_tasks = (await session.execute(
@@ -2858,29 +2859,31 @@ async def get_open_prs(
             or ctx.get("rollup_pr_number")
         )
         if pr_num and isinstance(pr_num, int):
-            existing = pr_task_map.get(pr_num)
-            # Prefer active over non-active, then most recent
-            if not existing or existing.status not in _ACTIVE_STATUSES:
-                pr_task_map[pr_num] = t
-
+            pr_task_map.setdefault(pr_num, {})[t.id] = t
 
     result = []
     for gh_pr in github_prs:
         pr_number = gh_pr.get("number")
         pr_url = gh_pr.get("html_url", "")
-        task = pr_task_map.get(pr_number)
-        is_orphaned = task is None or task.status not in _ACTIVE_STATUSES
+        linked = list(pr_task_map.get(pr_number, {}).values())
+        linked.sort(key=lambda t: t.created_at or datetime.min, reverse=True)
+        tasks_payload = [
+            {
+                "task_id": str(t.id),
+                "task_status": t.status,
+                "task_type": t.first_payload.get("type", "create"),
+                "task_title": t.title,
+            }
+            for t in linked
+        ]
         result.append({
             "pr_number": gh_pr.get("number"),
             "pr_url": pr_url,
             "pr_title": gh_pr.get("title", ""),
             "pr_branch": (gh_pr.get("head") or {}).get("ref", ""),
             "pr_created_at": gh_pr.get("created_at"),
-            "task_id": str(task.id) if task else None,
-            "task_status": task.status if task else None,
-            "task_type": task.first_payload.get("type", "create") if task else None,
-            "task_title": task.title if task else None,
-            "is_orphaned": is_orphaned,
+            "tasks": tasks_payload,
+            "is_orphaned": len(tasks_payload) == 0,
         })
 
     return {"open_prs": result}
