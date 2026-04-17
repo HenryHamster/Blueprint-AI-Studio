@@ -245,15 +245,29 @@ async def _update_direction_research_outcomes(
                         continue
                     if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
                         # Move matching proposed finding to Failed Approaches
+                        from app.task_lifecycle import _derive_failure_stage  # noqa: PLC0415
+
                         reason = (ct.latest_status_message or "")[:120]
                         category = (ct.context or {}).get("failure_category") or _classify_failure(ct)
-                        title_with_cat = f"{title} ({category})"
+                        ts = ct.vm_stopped_at or ct.updated_at
+                        failed_at_iso = ts.date().isoformat() if ts else ""
+                        stage = (ct.context or {}).get("_previous_failure_stage") or _derive_failure_stage(
+                            category, ct.latest_status_message or ""
+                        ) or ""
+                        meta_parts = []
+                        if failed_at_iso:
+                            meta_parts.append(f"at={failed_at_iso}")
+                        if stage:
+                            meta_parts.append(f"stage={stage}")
+                        head = f"{title} ({category})"
+                        if meta_parts:
+                            head = f"{head} [{' '.join(meta_parts)}]"
                         new_established = []
                         moved = False
                         for item in parsed["established"]:
                             if title.lower() in item.lower():
                                 parsed["failed"].append(
-                                    f"{title_with_cat} — {reason}" if reason else title_with_cat
+                                    f"{head} — {reason}" if reason else head
                                 )
                                 moved = True
                             else:

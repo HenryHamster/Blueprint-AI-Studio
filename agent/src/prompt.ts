@@ -48,6 +48,25 @@ function strVal(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v : fallback;
 }
 
+// Render an ISO date/datetime as a compact relative time suffix ("3h ago",
+// "2d ago", "1w ago"). Returns '' when the input can't be parsed.
+export function relativeTimeFromIso(iso: string, now: Date = new Date()): string {
+  if (!iso) return '';
+  const then = new Date(iso);
+  if (Number.isNaN(then.getTime())) return '';
+  const diffMs = now.getTime() - then.getTime();
+  if (diffMs < 0) return 'just now';
+  const minutes = Math.floor(diffMs / 60000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  const weeks = Math.floor(days / 7);
+  return `${weeks}w ago`;
+}
+
 // ── Task Type Hints (appended to prompts for known task types) ───────────
 export const TASK_TYPE_HINTS: Record<string, string> = {
   'qa': 'Focus on writing tests. Run the existing test suite first to understand patterns. Do not modify production code unless fixing a test setup issue.',
@@ -329,8 +348,17 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
           const obj = fa as Record<string, unknown>;
           const text = strVal(obj.text);
           const ftype = strVal(obj.failure_type);
+          const failedAt = strVal(obj.failed_at);
+          const stage = strVal(obj.failure_stage);
           if (text) {
-            dcLines.push(ftype ? `- ${text} [${ftype}]` : `- ${text}`);
+            const headParts = [`- ${text}`];
+            if (ftype) headParts.push(`[${ftype}]`);
+            const qualifiers: string[] = [];
+            const rel = relativeTimeFromIso(failedAt);
+            if (rel) qualifiers.push(rel);
+            if (stage) qualifiers.push(`failed at ${stage}`);
+            if (qualifiers.length > 0) headParts.push(`(${qualifiers.join(', ')})`);
+            dcLines.push(headParts.join(' '));
           }
         }
       }
@@ -830,9 +858,27 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   if (siblingTasks && siblingTasks.length > 0) {
     siblingLines.push('## Sibling Tasks (parallel tasks from the same parent — avoid duplicating their work)');
     for (const t of siblingTasks) {
-      const files = (t.related_files as string[] | undefined);
-      const filesSuffix = files && files.length > 0 ? ` (files: ${files.join(', ')})` : '';
-      siblingLines.push(`- [${strVal(t.status)}] ${strVal(t.title)}${filesSuffix}`);
+      const status = strVal(t.status);
+      const isActive = t.active === true;
+      const failureClass = strVal(t.failure_class);
+      const errorExcerpt = strVal(t.error_excerpt);
+      const changedFiles = (t.changed_files as string[] | undefined);
+      const relatedFiles = (t.related_files as string[] | undefined);
+      let suffix = '';
+      if (!isActive && (failureClass || errorExcerpt)) {
+        const inner = failureClass && errorExcerpt
+          ? `${failureClass}: ${errorExcerpt}`
+          : (failureClass || errorExcerpt);
+        suffix += ` [${inner}]`;
+        if (changedFiles && changedFiles.length > 0) {
+          suffix += ` (changed: ${changedFiles.join(', ')})`;
+        } else if (relatedFiles && relatedFiles.length > 0) {
+          suffix += ` (files: ${relatedFiles.join(', ')})`;
+        }
+      } else if (relatedFiles && relatedFiles.length > 0) {
+        suffix = ` (files: ${relatedFiles.join(', ')})`;
+      }
+      siblingLines.push(`- [${status}] ${strVal(t.title)}${suffix}`);
     }
     siblingLines.push('');
   }

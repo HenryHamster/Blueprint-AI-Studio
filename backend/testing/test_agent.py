@@ -667,8 +667,19 @@ async def test_agent_claim_sibling_tasks_include_terminal_outcomes(client: Async
         vm_instance_id="agent-vm-sib-failed",
         status=TaskStatus.FAILED,
         parent_task_id=parent.id,
-        latest_status_message="ImportError in module xyz",
-        context={"related_files": ["backend/app/bar.py"], "failure_category": "CODE_ERROR"},
+        latest_status_message="ImportError in module xyz: cannot find symbol foo across 3 modules",
+        context={
+            "related_files": ["backend/app/bar.py"],
+            "failure_category": "CODE_ERROR",
+            "_pr_changed_files": [
+                "backend/app/bar.py",
+                "backend/app/baz.py",
+                "backend/app/qux.py",
+                "backend/app/quux.py",
+                "backend/app/corge.py",
+                "backend/app/grault.py",
+            ],
+        },
     )
     in_progress_sib = Task(
         project_id=project.id,
@@ -725,6 +736,19 @@ async def test_agent_claim_sibling_tasks_include_terminal_outcomes(client: Async
     assert failed_entry["status"] == TaskStatus.FAILED.value
     assert failed_entry["failure_class"] == "CODE_ERROR"
     assert failed_entry["pr_url"] is None
+    # New: failure surfaces an error excerpt and capped changed files list
+    assert failed_entry["error_excerpt"].startswith("ImportError in module xyz")
+    assert len(failed_entry["error_excerpt"]) <= 150
+    assert failed_entry["changed_files"] == [
+        "backend/app/bar.py",
+        "backend/app/baz.py",
+        "backend/app/qux.py",
+        "backend/app/quux.py",
+        "backend/app/corge.py",
+    ]
+    # Completed sibling does not get error_excerpt / changed_files
+    assert "error_excerpt" not in completed_entry
+    assert "changed_files" not in completed_entry
 
 
 @pytest.mark.smoketest
@@ -1355,8 +1379,18 @@ async def test_claim_injects_direction_context_for_create_task(client: AsyncClie
     dc = data["direction_context"]
     assert dc["title"] == "Improve auth flow"
     assert dc["priority"] == "high"
-    assert {"text": "JWT in cookies caused CSRF issues", "failure_type": ""} in dc["failed_approaches"]
-    assert {"text": "Session-based auth had scaling problems", "failure_type": ""} in dc["failed_approaches"]
+    assert {
+        "text": "JWT in cookies caused CSRF issues",
+        "failure_type": "",
+        "failed_at": "",
+        "failure_stage": "",
+    } in dc["failed_approaches"]
+    assert {
+        "text": "Session-based auth had scaling problems",
+        "failure_type": "",
+        "failed_at": "",
+        "failure_stage": "",
+    } in dc["failed_approaches"]
     # recent_outcomes: last 2 history entries with tasks_created > 0
     assert len(dc["recent_outcomes"]) == 2
     assert dc["recent_outcomes"][0]["prs_merged"] == 2
@@ -1547,6 +1581,42 @@ def test_parse_failed_approach_truncates_long_text():
     long_line = "x" * 300
     result = _parse_failed_approach(long_line)
     assert len(result["text"]) == 200
+
+
+def test_parse_failed_approach_extracts_failed_at_and_stage_metadata():
+    """``[at=... stage=...]`` metadata after the category is parsed and removed."""
+    from app.routers.agent import _parse_failed_approach
+
+    line = "Use jwt in cookies (CODE_ERROR) [at=2026-04-15 stage=test] — CSRF vulnerability"
+    result = _parse_failed_approach(line)
+    assert result["failure_type"] == "CODE_ERROR"
+    assert result["failed_at"] == "2026-04-15"
+    assert result["failure_stage"] == "test"
+    # Metadata block should not leak into text
+    assert "at=" not in result["text"]
+    assert "stage=" not in result["text"]
+    assert "Use jwt in cookies" in result["text"]
+    assert "CSRF" in result["text"]
+
+
+def test_parse_failed_approach_stage_only_metadata():
+    """Metadata block may contain only one of the two fields."""
+    from app.routers.agent import _parse_failed_approach
+
+    result = _parse_failed_approach("Approach X (CODE_ERROR) [stage=lint] — ruff flagged style")
+    assert result["failure_type"] == "CODE_ERROR"
+    assert result["failed_at"] == ""
+    assert result["failure_stage"] == "lint"
+
+
+def test_parse_failed_approach_without_metadata_returns_empty_fields():
+    """Legacy entries without a metadata block still parse cleanly."""
+    from app.routers.agent import _parse_failed_approach
+
+    result = _parse_failed_approach("Legacy (CODE_ERROR) — some reason")
+    assert result["failure_type"] == "CODE_ERROR"
+    assert result["failed_at"] == ""
+    assert result["failure_stage"] == ""
 
 
 @pytest.mark.smoketest

@@ -280,16 +280,19 @@ _KNOWN_FAILURE_CATEGORIES = frozenset({
 
 
 def _parse_failed_approach(line: str) -> dict:
-    """Parse '<title> (<category>) — <reason>' into {text, failure_type}.
+    """Parse '<title> (<category>) [at=<iso> stage=<stage>] — <reason>'.
 
-    Direction outcomes write entries with the failure category in parentheses
-    immediately after the title. Extract that category so agents can reason
-    about *why* a prior approach failed (technical infeasibility vs reviewer
-    rejection vs infra flakes) instead of just seeing the prose. Only recognise
-    parens whose contents match a known category so prose-level parens don't get
-    treated as metadata.
+    Returns {text, failure_type, failed_at, failure_stage}. Direction outcomes
+    write entries with the failure category in parentheses immediately after the
+    title, optionally followed by a ``[at=YYYY-MM-DD stage=<stage>]`` metadata
+    block. Extract those so agents can reason about *why* a prior approach
+    failed, *when* it failed, and *at what stage*. Only recognise parens whose
+    contents match a known category so prose-level parens don't get treated as
+    metadata.
     """
     failure_type = ""
+    failed_at = ""
+    failure_stage = ""
     text = line
     open_idx = line.find("(")
     if open_idx > 0:
@@ -298,9 +301,34 @@ def _parse_failed_approach(line: str) -> dict:
             inner = line[open_idx + 1:close_idx].strip()
             if inner in _KNOWN_FAILURE_CATEGORIES:
                 failure_type = inner
-                stripped = (line[:open_idx].rstrip() + line[close_idx + 1:]).strip()
+                rest = line[close_idx + 1:]
+                # Look for a [at=... stage=...] metadata block that follows the
+                # category paren with only whitespace in between.
+                meta_start = -1
+                for i, ch in enumerate(rest):
+                    if ch == "[":
+                        meta_start = i
+                        break
+                    if not ch.isspace():
+                        break
+                if meta_start >= 0:
+                    meta_end = rest.find("]", meta_start)
+                    if meta_end > meta_start:
+                        meta = rest[meta_start + 1:meta_end]
+                        for part in meta.split():
+                            if part.startswith("at="):
+                                failed_at = part[len("at="):]
+                            elif part.startswith("stage="):
+                                failure_stage = part[len("stage="):]
+                        rest = rest[:meta_start].rstrip() + rest[meta_end + 1:]
+                stripped = (line[:open_idx].rstrip() + rest).strip()
                 text = stripped if stripped else line
-    return {"text": text[:200], "failure_type": failure_type}
+    return {
+        "text": text[:200],
+        "failure_type": failure_type,
+        "failed_at": failed_at,
+        "failure_stage": failure_stage,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -720,8 +748,13 @@ async def claim_task(
                     "active": False,
                     "pr_url": pr_url,
                 }
-                if sib.status == TaskStatus.FAILED and sib.latest_status_message:
-                    entry["failure_class"] = classify_failure(sib)
+                if sib.status == TaskStatus.FAILED:
+                    if sib.latest_status_message:
+                        entry["failure_class"] = classify_failure(sib)
+                        entry["error_excerpt"] = sib.latest_status_message[:150]
+                    sib_changed = ((sib.context or {}).get("_pr_changed_files") or [])[:5]
+                    if sib_changed:
+                        entry["changed_files"] = sib_changed
                 sibling_tasks.append(entry)
 
         # Pipeline health summary (for gated task types; else-branch covers the rest)

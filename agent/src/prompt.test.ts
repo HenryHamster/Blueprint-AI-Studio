@@ -51,6 +51,7 @@ import {
   buildSelfReviewPrompt,
   extractModuleInterfaces,
   discoverAffectedConsumers,
+  relativeTimeFromIso,
 } from './prompt.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
@@ -195,6 +196,31 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('1/4 merged');
   });
 
+  it('renders recency and failure_stage qualifiers for failed approaches when fields are present', () => {
+    const now = new Date();
+    const twoDaysAgo = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
+    const iso = twoDaysAgo.toISOString().slice(0, 10); // YYYY-MM-DD
+    const task = {
+      direction_context: {
+        title: 'Improve auth flow',
+        priority: 'high',
+        failed_approaches: [
+          { text: 'JWT in cookies', failure_type: 'CODE_ERROR', failed_at: iso, failure_stage: 'test' },
+          { text: 'Redis session store', failure_type: 'CODE_ERROR', failed_at: iso, failure_stage: '' },
+          { text: 'CSRF double submit', failure_type: 'CODE_ERROR', failed_at: '', failure_stage: 'lint' },
+        ],
+        recent_outcomes: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    // Both recency and stage present → combined qualifier
+    expect(result).toContain('- JWT in cookies [CODE_ERROR] (2d ago, failed at test)');
+    // Recency only (no stage) → only relative time qualifier
+    expect(result).toContain('- Redis session store [CODE_ERROR] (2d ago)');
+    // Stage only (no date) → only stage qualifier
+    expect(result).toContain('- CSRF double submit [CODE_ERROR] (failed at lint)');
+  });
+
   it('renders legacy string failed_approaches as bullet list (backward compatible)', () => {
     const task = {
       direction_context: {
@@ -323,6 +349,19 @@ describe('buildContextPrefix', () => {
     const result = buildContextPrefix(task);
     expect(result).not.toContain('**Prior analysis from failed attempts:**');
   });
+
+  it('returns empty string for relativeTimeFromIso when iso is empty or unparseable', () => {
+    expect(relativeTimeFromIso('')).toBe('');
+    expect(relativeTimeFromIso('not-a-date')).toBe('');
+  });
+
+  it('formats days and hours for relativeTimeFromIso', () => {
+    const now = new Date('2026-04-17T12:00:00Z');
+    expect(relativeTimeFromIso('2026-04-15', now)).toBe('2d ago');
+    expect(relativeTimeFromIso('2026-04-17T09:00:00Z', now)).toBe('3h ago');
+    expect(relativeTimeFromIso('2026-04-10', now)).toBe('1w ago');
+  });
+
 
   it('renders ## Task Scope section for create task with small scope', () => {
     const task = {
@@ -483,12 +522,52 @@ describe('formatProjectContext', () => {
   it('includes Sibling Tasks section when sibling_tasks is populated', () => {
     const ctx = {
       sibling_tasks: [
-        { status: 'IN_PROGRESS', title: 'Write documentation', related_files: [] },
+        { status: 'IN_PROGRESS', title: 'Write documentation', related_files: [], active: true },
       ],
     };
     const result = formatProjectContext(ctx);
     expect(result).toContain('Sibling Tasks');
     expect(result).toContain('Write documentation');
+  });
+
+  it('renders failure details (failure_class, error excerpt, changed files) for terminal siblings', () => {
+    const ctx = {
+      sibling_tasks: [
+        {
+          status: 'FAILED',
+          title: 'Fix auth flow',
+          active: false,
+          failure_class: 'CODE_ERROR',
+          error_excerpt: 'test assertions failed in auth_test.py',
+          changed_files: ['src/auth.py', 'src/middleware.py'],
+          related_files: ['src/auth.py'],
+        },
+      ],
+    };
+    const result = formatProjectContext(ctx);
+    expect(result).toContain('[FAILED] Fix auth flow');
+    expect(result).toContain('[CODE_ERROR: test assertions failed in auth_test.py]');
+    expect(result).toContain('(changed: src/auth.py, src/middleware.py)');
+    // Should not duplicate the related_files-based files: suffix when changed_files is present
+    expect(result).not.toContain('(files: src/auth.py)');
+  });
+
+  it('falls back to related_files when terminal sibling has no changed_files', () => {
+    const ctx = {
+      sibling_tasks: [
+        {
+          status: 'FAILED',
+          title: 'Refactor cache',
+          active: false,
+          failure_class: 'INFRA',
+          error_excerpt: 'provisioning failed',
+          related_files: ['src/cache.py'],
+        },
+      ],
+    };
+    const result = formatProjectContext(ctx);
+    expect(result).toContain('[INFRA: provisioning failed]');
+    expect(result).toContain('(files: src/cache.py)');
   });
 
   it('includes Recently Completed Tasks section when populated', () => {
