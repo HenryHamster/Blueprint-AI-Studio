@@ -14,6 +14,7 @@ vi.mock('../index.js', () => ({
   readHandlerOutput: vi.fn(),
   validateBranchName: vi.fn((b: string, _label: string) => b),
   git: vi.fn().mockReturnValue(''),
+  gitAsync: vi.fn().mockResolvedValue(''),
   setupWorkspace: vi.fn(),
   pushAndCreatePR: vi.fn(),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
@@ -21,6 +22,7 @@ vi.mock('../index.js', () => ({
   testFixLoop: vi.fn(),
   cloneWithRetry: vi.fn().mockResolvedValue(undefined),
   sendHeartbeatSync: vi.fn(),
+  listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock('../prompt.js', () => ({
@@ -84,8 +86,12 @@ import {
   handleDebug,
   handlePerf,
   handleInvestigate,
+  handleMigrate,
 } from './specialized.js';
-import { persistAndPostStatus, readHandlerOutput, runClaudeCode } from '../index.js';
+import {
+  persistAndPostStatus, readHandlerOutput, runClaudeCode,
+  git, apiGet, apiPost, listOpenPullRequestsForBranch,
+} from '../index.js';
 import { execFileSync } from 'child_process';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
@@ -422,6 +428,143 @@ describe('handleInvestigate — report reading and status mapping', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
+  });
+});
+
+// ── handleMigrate — stale-branch handling and migration workflow ─────────────
+describe('handleMigrate — stale-branch handling and workflow', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    // Default: ls-remote throws (work branch does not exist on remote)
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'ls-remote') throw new Error('exit code 2: branch not found');
+      return '';
+    });
+    vi.mocked(listOpenPullRequestsForBranch).mockResolvedValue([]);
+  });
+
+  it('completes full migration flow with PR creation when Claude produces changes', async () => {
+    // Non-empty porcelain output triggers hasChanges; rev-parse returns a commit SHA
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'ls-remote') throw new Error('exit code 2');
+      if (args[0] === 'status' && args[1] === '--porcelain') return 'M backend/app/models.py\n';
+      if (args[0] === 'rev-parse') return 'abc1234567';
+      return '';
+    });
+    vi.mocked(apiGet).mockResolvedValue({ data: { token: 'fresh-token' } });
+    vi.mocked(apiPost).mockResolvedValue({ data: { html_url: 'https://github.com/owner/repo/pull/99' } });
+
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add user_role column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('PULL_REQUEST');
+    expect(call.pr_url).toBe('https://github.com/owner/repo/pull/99');
+    expect(call.commit_hash).toBe('abc1234567');
+    // PR creation endpoint should have been called (shortId = taskId sans dashes, first 8 chars)
+    expect(apiPost).toHaveBeenCalledWith(
+      '/api/agent/github/pull-requests',
+      expect.objectContaining({
+        task_id: TASK_ID,
+        owner: OWNER,
+        repo: REPO,
+        head: 'blueprint/migrate-taskabc1',
+        base: 'main',
+      }),
+      undefined,
+      90_000,
+    );
+  });
+
+  it('throws when stale remote branch has open PRs (refuses to delete)', async () => {
+    // ls-remote succeeds (branch exists); simulate open PR on that branch
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'ls-remote') return 'abc\trefs/heads/blueprint/migrate-xxx';
+      return '';
+    });
+    vi.mocked(listOpenPullRequestsForBranch).mockResolvedValue([
+      { number: 42, html_url: 'https://github.com/owner/repo/pull/42' },
+    ]);
+
+    await expect(
+      handleMigrate(
+        TASK_ID,
+        { ...BASE_PAYLOAD, prompt: 'Add column' },
+        BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+      )
+    ).rejects.toThrow(/Refusing to delete stale branch.*#42/);
+
+    // Must not have pushed --delete when refusing
+    const deleteCall = vi.mocked(git).mock.calls.find(c => {
+      const a = c[0] as string[];
+      return a[0] === 'push' && a.includes('--delete');
+    });
+    expect(deleteCall).toBeUndefined();
+  });
+
+  it('deletes stale remote branch and continues when no open PRs exist', async () => {
+    // ls-remote succeeds (branch exists); no open PRs
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'ls-remote') return 'abc\trefs/heads/blueprint/migrate-xxx';
+      return '';
+    });
+    vi.mocked(listOpenPullRequestsForBranch).mockResolvedValue([]);
+
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const deleteCall = vi.mocked(git).mock.calls.find(c => {
+      const a = c[0] as string[];
+      return a[0] === 'push' && a.includes('--delete');
+    });
+    expect(deleteCall).toBeDefined();
+    // No changes were generated (default git mock returns '') → COMPLETED with "no changes" message
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).toBe('No migration changes generated.');
+  });
+
+  it('reports FAILED with claude_code_failed category when Claude exits non-zero', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 1, allOutput: 'migration error trace', lastResultText: '',
+    });
+
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('claude_code_failed');
+    // No PR should have been created on failure
+    expect(apiPost).not.toHaveBeenCalledWith(
+      '/api/agent/github/pull-requests',
+      expect.anything(),
+      undefined,
+      90_000,
+    );
+  });
+
+  it('throws when no prompt is provided in payload or task', async () => {
+    await expect(
+      handleMigrate(
+        TASK_ID,
+        { base_branch: 'main' },
+        { title: '', description: '', context: {}, project_context: {} },
+        GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+      )
+    ).rejects.toThrow(/No prompt found/);
   });
 });
 

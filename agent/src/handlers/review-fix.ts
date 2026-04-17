@@ -791,11 +791,19 @@ export async function handleFix(
         try {
           execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', 'blueprint: resolve remaining conflict markers'], { encoding: 'utf-8' });
         } catch { /* nothing to commit — markers may have already been staged */ }
-        // Final check — if markers persist after retry, warn but proceed
+        // Final check — if markers persist after retry, fail this cycle so the
+        // retry mechanism can spawn a fresh attempt. Pushing conflict markers
+        // guarantees a CI failure and burns a full review-fix iteration.
         try {
           const stillConflicting = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
           if (stillConflicting) {
-            sendLog(ws, `WARNING: Conflict markers persist after retry in:\n${stillConflicting}\n`);
+            sendLog(ws, `Conflict markers persist after retry in:\n${stillConflicting}\nFailing this cycle — will not push known-broken code.\n`);
+            await persistAndPostStatus(taskId, {
+              task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+              logs: `Conflict markers still present after retry, refusing to push:\n${stillConflicting}`,
+              failure_category: 'unresolved_conflicts',
+            });
+            return;
           }
         } catch { /* no markers — resolved successfully */ }
       }
@@ -831,7 +839,13 @@ export async function handleFix(
         runProjectLintChecks(revalidatePaths, ws, fixBuildConfig);
       } catch (revalidateErr: unknown) {
         const revalidateMsg = revalidateErr instanceof Error ? revalidateErr.message : String(revalidateErr);
-        sendLog(ws, `WARNING: post-rebase lint still failing after fix attempt — pushing anyway, CI will catch it:\n${revalidateMsg.slice(0, 2000)}\n`);
+        sendLog(ws, `Post-rebase lint still failing after fix attempt — failing this cycle, will not push known-broken code:\n${revalidateMsg.slice(0, 2000)}\n`);
+        await persistAndPostStatus(taskId, {
+          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+          logs: `Post-rebase lint still failing after fix attempt:\n${revalidateMsg.slice(0, 5000)}`,
+          failure_category: 'lint_failed',
+        });
+        return;
       }
     }
   }

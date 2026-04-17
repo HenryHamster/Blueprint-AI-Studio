@@ -89,7 +89,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson } from './standard.js';
 import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks } from '../index.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles } from '../prompt.js';
 
@@ -2255,5 +2255,71 @@ describe('post-self-review scope overflow gate', () => {
       expect.objectContaining({ status: 'FAILED', failure_category: 'scope_overflow' }),
     );
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+});
+
+// ── extractSelfReviewJson parsing ─────────────────────────────────────────────
+describe('extractSelfReviewJson', () => {
+  it('parses a valid ```json fenced block', () => {
+    const output = '```json\n{"verdict":"LGTM","confidence":0.9}\n```';
+    expect(extractSelfReviewJson(output)).toEqual({ verdict: 'LGTM', confidence: 0.9 });
+  });
+
+  it('parses fenced JSON even when surrounded by prose', () => {
+    const output = 'Here is my review:\n```json\n{"ok":true}\n```\nThanks!';
+    expect(extractSelfReviewJson(output)).toEqual({ ok: true });
+  });
+
+  it('prefers fenced JSON over a later unfenced object', () => {
+    const output = '```json\n{"first":true}\n```\nlater {"second":true}';
+    expect(extractSelfReviewJson(output)).toEqual({ first: true });
+  });
+
+  it('falls back to brace scanning when the closing fence is missing', () => {
+    // No closing ``` — regex can't match, but the braces still form valid JSON.
+    const output = '```json\n{"a":1}';
+    expect(extractSelfReviewJson(output)).toEqual({ a: 1 });
+  });
+
+  it('recovers via brace fallback when fenced content has no parseable object', () => {
+    // Fence captures non-JSON text (no braces), so fallback can safely slice
+    // the outer {...} without being polluted by the broken fenced block.
+    const output = '```json\nnothing here\n```\n{"valid":true}';
+    expect(extractSelfReviewJson(output)).toEqual({ valid: true });
+  });
+
+  it('handles nested fence markers inside a JSON string via the brace fallback', () => {
+    // The non-greedy regex stops at the first inner ``` so the fenced parse
+    // fails; the fallback then slices the outermost { ... } which is valid.
+    const output = '```json\n{"code":"```foo```"}\n```';
+    expect(extractSelfReviewJson(output)).toEqual({ code: '```foo```' });
+  });
+
+  it('returns null when multiple JSON objects make the fallback slice unparseable', () => {
+    // start = first `{`, end = last `}` — the combined slice spans prose between
+    // the two objects, so JSON.parse fails and no object is returned.
+    const output = '{"a":1} and {"b":2}';
+    expect(extractSelfReviewJson(output)).toBeNull();
+  });
+
+  it('returns null for an empty string', () => {
+    expect(extractSelfReviewJson('')).toBeNull();
+  });
+
+  it('returns null for a string containing only `{`', () => {
+    expect(extractSelfReviewJson('{')).toBeNull();
+  });
+
+  it('returns null for a string containing only `}`', () => {
+    expect(extractSelfReviewJson('}')).toBeNull();
+  });
+
+  it('parses JSON embedded in surrounding prose via the brace fallback', () => {
+    const output = 'Review result: {"verdict":"LGTM","notes":"looks good"} — done.';
+    expect(extractSelfReviewJson(output)).toEqual({ verdict: 'LGTM', notes: 'looks good' });
+  });
+
+  it('returns null when no JSON-like structure is present', () => {
+    expect(extractSelfReviewJson('no json here at all')).toBeNull();
   });
 });

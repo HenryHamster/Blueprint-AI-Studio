@@ -791,7 +791,7 @@ describe('handleFix — post-rebase lint re-validation', () => {
     }) as unknown as typeof indexMod.git);
   };
 
-  it('re-runs runProjectLintChecks after the fix attempt and warns when lint still fails', async () => {
+  it('fails the cycle and refuses to push when re-validation lint still fails after fix attempt', async () => {
     setupGitForLintPath();
     let lintCalls = 0;
     vi.mocked(indexMod.runProjectLintChecks).mockImplementation((() => {
@@ -810,6 +810,14 @@ describe('handleFix — post-rebase lint re-validation', () => {
     expect(lintCalls).toBe(2);
     const sendLogMessages = vi.mocked(indexMod.sendLog).mock.calls.map(c => String(c[1]));
     expect(sendLogMessages.some(m => /still failing/i.test(m))).toBe(true);
+    // Task finalized as FAILED with lint_failed category.
+    const statusCalls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
+    const finalStatus = statusCalls[statusCalls.length - 1][1] as Record<string, unknown>;
+    expect(finalStatus.status).toBe('FAILED');
+    expect(finalStatus.failure_category).toBe('lint_failed');
+    expect(String(finalStatus.logs)).toContain('Post-rebase lint still failing');
+    // Push must not be attempted — apiGet fetches the fresh push token right before push.
+    expect(vi.mocked(indexMod.apiGet)).not.toHaveBeenCalled();
   });
 
   it('does not warn when re-validation passes after the fix attempt', async () => {
@@ -831,6 +839,35 @@ describe('handleFix — post-rebase lint re-validation', () => {
     expect(lintCalls).toBe(2);
     const sendLogMessages = vi.mocked(indexMod.sendLog).mock.calls.map(c => String(c[1]));
     expect(sendLogMessages.some(m => /still failing/i.test(m))).toBe(false);
+  });
+});
+
+// ── handleFix: conflict markers persist after retry -> fail cycle ───────────
+describe('handleFix — conflict-marker retry failure', () => {
+  it('fails the cycle and refuses to push when conflict markers persist after Claude retry', async () => {
+    // First grep (pre-Claude enrichedPrompt) finds markers → enriched-prompt path.
+    // Post-retry grep ALSO finds markers → fail cycle.
+    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'git' && args && args.includes('grep')) {
+        return 'agent/src/foo.ts\n';
+      }
+      return '';
+    }) as unknown as typeof execFileSync);
+
+    await handleFix(
+      'task-markers-persist',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 90, prompt: 'resolve conflicts' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const statusCalls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
+    const finalStatus = statusCalls[statusCalls.length - 1][1] as Record<string, unknown>;
+    expect(finalStatus.status).toBe('FAILED');
+    expect(finalStatus.failure_category).toBe('unresolved_conflicts');
+    expect(String(finalStatus.logs)).toContain('Conflict markers still present');
+    // Push must not be attempted.
+    expect(vi.mocked(indexMod.apiGet)).not.toHaveBeenCalled();
   });
 });
 

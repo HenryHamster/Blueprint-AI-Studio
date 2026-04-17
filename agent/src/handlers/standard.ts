@@ -109,7 +109,7 @@ export interface StandardHandlerOpts {
  * Looks for a ```json ... ``` code fence first, then falls back to finding
  * the first `{` that can be parsed as JSON.
  */
-function extractSelfReviewJson(output: string): Record<string, unknown> | null {
+export function extractSelfReviewJson(output: string): Record<string, unknown> | null {
   const fenceMatch = output.match(/```json\s*\n?([\s\S]*?)\n?```/);
   if (fenceMatch) {
     try { return JSON.parse(fenceMatch[1].trim()) as Record<string, unknown>; } catch { /* fallthrough */ }
