@@ -1538,6 +1538,256 @@ async def test_medium_scope_with_few_related_files_stays_medium(db_session, mock
     assert "scope_calibrated_from" not in child_tasks[0].context
 
 
+@pytest.mark.asyncio
+async def test_medium_scope_expansion_ratio_prediction_upgrades_to_large(db_session, mocker, monkeypatch):
+    """Medium finding with 4 related_files × 3.0 avg_expansion_ratio predicts >10 → upgrade."""
+    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    direction = _active_direction("d-exprat01", "Expansion ratio prediction direction")
+    direction["research_history"] = [
+        {"scope_breakdown": {"medium": {"created": 3, "merged": 2, "avg_expansion_ratio": 3.0}}},
+    ]
+    project = Project(
+        name="Expansion Ratio Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    finding = _make_finding("Refactor four related modules", direction["id"], scope="medium")
+    finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(4)]
+
+    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    assert child_tasks[0].payloads[0]["type"] == "plan"
+    assert child_tasks[0].context["scope"] == "large"
+    assert child_tasks[0].context["scope_calibrated_from"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_medium_scope_without_expansion_ratio_history_stays_medium(db_session, mocker, monkeypatch):
+    """No historical avg_expansion_ratio → predictive check skipped, finding stays medium."""
+    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    direction = _active_direction("d-exprat02", "No expansion ratio history")
+    project = Project(
+        name="No Expansion Ratio Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    finding = _make_finding("Refactor four related modules", direction["id"], scope="medium")
+    finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(4)]
+
+    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    assert child_tasks[0].payloads[0]["type"] == "create"
+    assert child_tasks[0].context["scope"] == "medium"
+    assert "scope_calibrated_from" not in child_tasks[0].context
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8b. _handle_research_completion — Auto-decomposition via co-change clustering
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_medium_with_independent_clusters_decomposes_to_smalls(
+    db_session, mocker, monkeypatch
+):
+    """Medium finding whose related_files form 2 independent clusters splits into 2 small tasks."""
+    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    direction = _active_direction("d-decomp01", "Decomposition direction")
+    cochange_index = {
+        "a.py": {"b.py": 2.0},
+        "b.py": {"a.py": 2.0},
+        "c.py": {"d.py": 2.0},
+        "d.py": {"c.py": 2.0},
+    }
+    project = Project(
+        name="Decomp Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        design_doc={"cochange_index": cochange_index},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    finding = _make_finding("Touch two unrelated clusters", direction["id"], scope="medium")
+    finding["related_files"] = ["a.py", "b.py", "c.py", "d.py"]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 2
+    for ct in child_tasks:
+        assert ct.payloads[0]["type"] == "create"
+        assert ct.context["scope"] == "small"
+        assert ct.context["scope_calibrated_from"] == "medium"
+    cluster_sets = {frozenset(ct.context["related_files"]) for ct in child_tasks}
+    assert cluster_sets == {frozenset({"a.py", "b.py"}), frozenset({"c.py", "d.py"})}
+
+
+@pytest.mark.asyncio
+async def test_medium_with_single_cluster_stays_medium(db_session, mocker, monkeypatch):
+    """When all related_files co-change together, decomposition is skipped."""
+    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    direction = _active_direction("d-decomp02", "Single cluster direction")
+    cochange_index = {
+        "a.py": {"b.py": 2.0, "c.py": 2.0},
+        "b.py": {"a.py": 2.0, "c.py": 2.0},
+        "c.py": {"a.py": 2.0, "b.py": 2.0},
+    }
+    project = Project(
+        name="Single Cluster Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        design_doc={"cochange_index": cochange_index},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    finding = _make_finding("Touch one cohesive module", direction["id"], scope="medium")
+    finding["related_files"] = ["a.py", "b.py", "c.py"]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    assert child_tasks[0].context["scope"] == "medium"
+    assert "scope_calibrated_from" not in child_tasks[0].context
+
+
+@pytest.mark.asyncio
+async def test_medium_skips_decomposition_when_cochange_is_sparse(
+    db_session, mocker, monkeypatch
+):
+    """Without cochange data for the finding's files, decomposition is skipped."""
+    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    direction = _active_direction("d-decomp03", "Sparse direction")
+    project = Project(
+        name="Sparse Cochange Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        design_doc={"cochange_index": {"unrelated.py": {"other.py": 2.0}}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    finding = _make_finding("New area no history", direction["id"], scope="medium")
+    finding["related_files"] = ["new_a.py", "new_b.py", "new_c.py"]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    assert child_tasks[0].context["scope"] == "medium"
+
+
+def test_cluster_files_by_cochange_returns_none_when_empty():
+    """_cluster_files_by_cochange returns None for sparse / empty input."""
+    from app.research_completion import _cluster_files_by_cochange
+    assert _cluster_files_by_cochange([], {"a.py": {"b.py": 2.0}}) is None
+    assert _cluster_files_by_cochange(["a.py"], {"a.py": {"b.py": 2.0}}) is None
+    assert _cluster_files_by_cochange(["x.py", "y.py"], {}) is None
+    assert _cluster_files_by_cochange(["x.py", "y.py"], {"a.py": {"b.py": 2.0}}) is None
+
+
+def test_cluster_files_by_cochange_splits_independent_groups():
+    """_cluster_files_by_cochange groups co-changing files and separates independent ones."""
+    from app.research_completion import _cluster_files_by_cochange
+    idx = {
+        "a.py": {"b.py": 2.0},
+        "b.py": {"a.py": 2.0},
+        "c.py": {"d.py": 2.0},
+        "d.py": {"c.py": 2.0},
+    }
+    clusters = _cluster_files_by_cochange(["a.py", "b.py", "c.py", "d.py"], idx)
+    assert clusters is not None
+    cluster_sets = {frozenset(c) for c in clusters}
+    assert cluster_sets == {frozenset({"a.py", "b.py"}), frozenset({"c.py", "d.py"})}
+
+
+def test_cluster_files_by_cochange_merges_transitive_affinity():
+    """Transitive co-change (a-b, b-c) unifies all three files into one cluster."""
+    from app.research_completion import _cluster_files_by_cochange
+    idx = {
+        "a.py": {"b.py": 2.0},
+        "b.py": {"a.py": 2.0, "c.py": 2.0},
+        "c.py": {"b.py": 2.0},
+    }
+    clusters = _cluster_files_by_cochange(["a.py", "b.py", "c.py"], idx)
+    assert clusters is not None
+    assert len(clusters) == 1
+    assert set(clusters[0]) == {"a.py", "b.py", "c.py"}
+
+
+def test_cluster_files_by_cochange_ignores_below_threshold_scores():
+    """Affinity scores below 1.0 threshold don't merge files."""
+    from app.research_completion import _cluster_files_by_cochange
+    idx = {
+        "a.py": {"b.py": 0.5},
+        "b.py": {"a.py": 0.5},
+    }
+    clusters = _cluster_files_by_cochange(["a.py", "b.py"], idx)
+    assert clusters is not None
+    assert len(clusters) == 2
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. _handle_research_completion — JSONB research_history Updates
 # ─────────────────────────────────────────────────────────────────────────────

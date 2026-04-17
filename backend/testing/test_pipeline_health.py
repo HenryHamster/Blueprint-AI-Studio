@@ -485,7 +485,7 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "medium_scope_review_iterations", "direction_first_attempt_feedback", "medium_scope_measurement"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "scope_file_budgets", "medium_scope_review_iterations", "direction_first_attempt_feedback", "medium_scope_measurement"}
     fa = result["first_attempt_success_rate"]
     assert "first_attempt_by_review_category" in fa
     assert "with_arch_context" in fa
@@ -944,6 +944,19 @@ async def test_scope_merge_rates_no_data_returns_empty_dict():
     result = await compute_pipeline_health_summary(session, project_id)
 
     assert result["scope_merge_rates"] == {}
+
+
+@pytest.mark.asyncio
+async def test_scope_file_budgets_surfaced_with_agent_limits():
+    """scope_file_budgets exposes the hard file-count caps implementing agents enforce."""
+    session = _make_mock_session(tasks=[], project=make_project(directions=[]))
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+
+    budgets = result["scope_file_budgets"]
+    assert budgets["small"]["total_files_max"] == 6
+    assert budgets["medium"]["production_files_max"] == 7
+    assert budgets["medium"]["total_files_max"] == 10
+    assert budgets["large"]["total_files_max"] == 20
 
 
 @pytest.mark.asyncio

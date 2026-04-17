@@ -30,6 +30,10 @@ from app.models import (
     TaskStatus,
 )
 from app.broadcast import broadcast_to_project
+from app.cochange_decomposition import (
+    auto_decompose_findings_by_cochange,
+    cluster_files_by_cochange as _cluster_files_by_cochange,  # noqa: F401 — re-exported for tests
+)
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE
 from app.task_completion import (
@@ -44,6 +48,16 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 _SCOPE_ORDER = ["small", "medium", "large"]
+
+# Hard file-count budgets enforced by implementing agents per scope.
+# Surfaced to research agents via pipeline_health so they can align finding
+# scope with these limits. Values mirror SCOPE_OVERFLOW_THRESHOLDS and
+# MEDIUM_ANALYSIS_PLAN_FILE_LIMIT in agent/src/constants.ts — keep in sync.
+SCOPE_FILE_BUDGETS: dict[str, dict[str, int]] = {
+    "small": {"total_files_max": 6},
+    "medium": {"production_files_max": 7, "total_files_max": 10},
+    "large": {"total_files_max": 20},
+}
 
 # Maximum implementation tasks to spawn when pipeline health is degraded.
 # Remaining findings are deferred to task.context['deferred_findings'] for
@@ -1080,6 +1094,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Also index by parent_direction_id in task context as fallback
     _parent_direction_id = (task.context or {}).get("direction_id")
 
+    _cochange_index_for_decomp = (
+        (_scope_cal_project.design_doc or {}).get("cochange_index")
+        if _scope_cal_project
+        else None
+    )
+    deduplicated = auto_decompose_findings_by_cochange(
+        deduplicated,
+        _cochange_index_for_decomp,
+        task.context,
+        _finding_hash,
+    )
+
     for orig_i, finding, fhash in deduplicated:
         scope = finding.get("scope", DEFAULT_TASK_SCOPE)
         risk = finding.get("risk", "low")
@@ -1155,8 +1181,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             continue
 
         # Apply scope calibration from direction's historical merge rates (skip if already calibrated)
-        scope_calibrated_from: str | None = None
-        if not (finding.get("scope_calibrated_from") or (task.context or {}).get("scope_calibrated_from")):
+        scope_calibrated_from: str | None = finding.get("scope_calibrated_from")
+        if not (scope_calibrated_from or (task.context or {}).get("scope_calibrated_from")):
             _dir_id = finding.get("direction_id") or _parent_direction_id
             _direction = _directions_by_id.get(str(_dir_id)) if _dir_id else None
             if _direction:
@@ -1176,6 +1202,33 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 )
                 scope = "large"
                 scope_calibrated_from = "medium"
+            elif _heuristic_files:
+                # Predictive expansion-ratio check: direction's historical avg_expansion_ratio
+                # (actual files touched / expected related_files) multiplied by this finding's
+                # related_files predicts how many files the task will actually touch. If that
+                # exceeds the medium overflow threshold (10 in SCOPE_OVERFLOW_THRESHOLDS), route
+                # to large for plan decomposition before burning 5-10 minutes on a task that
+                # will almost certainly scope-overflow during implementation.
+                _exp_dir_id = finding.get("direction_id") or _parent_direction_id
+                _exp_direction = _directions_by_id.get(str(_exp_dir_id)) if _exp_dir_id else None
+                if _exp_direction:
+                    _ratios = [
+                        (entry.get("scope_breakdown") or {}).get("medium", {}).get("avg_expansion_ratio")
+                        for entry in (_exp_direction.get("research_history") or [])[-3:]
+                    ]
+                    _ratios = [float(r) for r in _ratios if isinstance(r, (int, float))]
+                    if _ratios:
+                        _avg_ratio = sum(_ratios) / len(_ratios)
+                        _predicted_files = len(_heuristic_files) * _avg_ratio
+                        if _predicted_files > 10:
+                            logger.info(
+                                "[RESEARCH] Upgrading scope medium→large for '%s' "
+                                "(expansion-ratio prediction: %d related_files × %.2f avg_ratio "
+                                "= %.1f predicted files > 10 threshold)",
+                                title, len(_heuristic_files), _avg_ratio, _predicted_files,
+                            )
+                            scope = "large"
+                            scope_calibrated_from = "medium"
         elif scope == "small":
             _heuristic_files = finding.get("related_files") or []
             if len(_heuristic_files) >= 3:

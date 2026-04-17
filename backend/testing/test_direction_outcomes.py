@@ -693,6 +693,116 @@ async def test_scope_breakdown_tracks_calibration(db_session: AsyncSession):
     assert sb["medium"]["calibrated_out"] == 1
 
 
+@pytest.mark.asyncio
+async def test_scope_breakdown_avg_expansion_ratio(db_session: AsyncSession):
+    """avg_expansion_ratio per scope is mean of len(_pr_changed_files)/len(related_files)
+    for completed tasks that have both fields populated."""
+    direction_id = "d-expand"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=5)]
+    await db_session.flush()
+
+    # small #1: 2 expected, 4 changed → ratio 2.0
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "small",
+                 "related_files": ["a.py", "b.py"],
+                 "_pr_changed_files": ["a.py", "b.py", "c.py", "d.py"]},
+        payloads=[{"type": "create"}],
+        title="s1",
+    )
+    # small #2: 1 expected, 1 changed → ratio 1.0  → avg small = 1.5
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "small",
+                 "related_files": ["x.py"],
+                 "_pr_changed_files": ["x.py"]},
+        payloads=[{"type": "create"}],
+        title="s2",
+    )
+    # medium: 2 expected, 6 changed → ratio 3.0
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "medium",
+                 "related_files": ["m1.py", "m2.py"],
+                 "_pr_changed_files": ["m1.py", "m2.py", "m3.py", "m4.py", "m5.py", "m6.py"]},
+        payloads=[{"type": "create"}],
+        title="m1",
+    )
+    # small with empty related_files: should be excluded (division by zero guard)
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "small",
+                 "related_files": [],
+                 "_pr_changed_files": ["y.py"]},
+        payloads=[{"type": "create"}],
+        title="s-no-related",
+    )
+    # failed task: excluded even with both fields
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "medium",
+                 "related_files": ["z.py"],
+                 "_pr_changed_files": ["z.py", "q.py", "r.py"]},
+        payloads=[{"type": "create"}],
+        title="failed-m",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    sb = project.directions[0]["research_history"][0]["scope_breakdown"]
+    assert sb["small"]["avg_expansion_ratio"] == 1.5
+    assert sb["medium"]["avg_expansion_ratio"] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_scope_breakdown_no_expansion_ratio_when_no_data(db_session: AsyncSession):
+    """avg_expansion_ratio is omitted when no qualifying tasks exist for a scope."""
+    direction_id = "d-no-expand"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    await db_session.flush()
+
+    # Task missing _pr_changed_files entirely
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "small", "related_files": ["a.py"]},
+        payloads=[{"type": "create"}],
+        title="no-changed",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    sb = project.directions[0]["research_history"][0]["scope_breakdown"]
+    assert "avg_expansion_ratio" not in sb["small"]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Co-change affinity index
 # ─────────────────────────────────────────────────────────────────────────────

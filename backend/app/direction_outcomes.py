@@ -250,6 +250,8 @@ async def _update_direction_research_outcomes(
             # effective scope). calibrated_out: tasks originally proposed at this scope but
             # calibrated to a smaller one (counted at the original scope).
             scope_breakdown: dict = {}
+            expansion_sums: dict = {}
+            expansion_counts: dict = {}
 
             def _ensure_scope(s: str) -> None:
                 if s not in scope_breakdown:
@@ -274,6 +276,19 @@ async def _update_direction_research_outcomes(
                     scope_breakdown[scope]["calibrated_in"] += 1
                     _ensure_scope(calibrated_from)
                     scope_breakdown[calibrated_from]["calibrated_out"] += 1
+                # File expansion ratio: actual files touched / expected files.
+                # Leading indicator of scope overflow risk.
+                related = ctx_.get("related_files") or []
+                changed = ctx_.get("_pr_changed_files") or []
+                if ct.status == TaskStatus.COMPLETED and related and changed:
+                    ratio = len(changed) / len(related)
+                    expansion_sums[scope] = expansion_sums.get(scope, 0.0) + ratio
+                    expansion_counts[scope] = expansion_counts.get(scope, 0) + 1
+            for scope_key, count in expansion_counts.items():
+                if count > 0:
+                    scope_breakdown[scope_key]["avg_expansion_ratio"] = round(
+                        expansion_sums[scope_key] / count, 2
+                    )
             entry["scope_breakdown"] = scope_breakdown
 
             # Decomposition quality: per plan-parent metrics so future calibration

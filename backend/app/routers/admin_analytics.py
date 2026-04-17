@@ -939,6 +939,8 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
     except Exception:
         logger.exception("[ANALYTICS] medium_scope_measurement computation failed (non-critical)")
 
+    from app.research_completion import SCOPE_FILE_BUDGETS  # noqa: PLC0415
+
     return {
         "success_rate": success_rate,
         "trend": trend,
@@ -954,6 +956,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "review_effectiveness_trends": review_effectiveness_trends,
         "review_recurrence_by_category": review_recurrence_by_category,
         "scope_merge_rates": scope_merge_rates,
+        "scope_file_budgets": SCOPE_FILE_BUDGETS,
         "medium_scope_review_iterations": medium_scope_review_iterations,
         "direction_first_attempt_feedback": direction_first_attempt_feedback,
         "medium_scope_measurement": medium_scope_measurement,
