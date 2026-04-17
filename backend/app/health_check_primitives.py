@@ -13,7 +13,7 @@ from typing import Optional
 
 import app.shared_state as _shared_state
 from app.database import AsyncSessionLocal
-from app.max_plan_pool import _account_available_for_model, _account_by_id
+from app.max_plan_pool import _OPUS_MODEL, _account_available_for_model, _account_by_id
 from app.models import Task
 from sqlmodel import select
 
@@ -109,16 +109,25 @@ def check_claude_api_health(ext: dict) -> Optional[str]:
             disabled_names = [a["name"] for a in all_accounts]
             logger.warning(f"[HEALTH] All Claude API accounts unavailable: {', '.join(disabled_names)}")
             return "claude_api"
-        else:
-            ext["claude_api"] = True
-            # Log partial degradation for visibility (not a pipeline pause)
-            unavailable_accounts = [a for a in all_accounts if not _account_available_for_model(a, None)]
-            if unavailable_accounts:
-                logger.info(
-                    f"[HEALTH] Claude API degraded — {len(unavailable_accounts)}/{len(all_accounts)} "
-                    f"accounts unavailable, {len(available_accounts)} still available"
-                )
-            return None
+        # Also verify at least one account can dispatch on the primary model (Opus).
+        # Without this, all-accounts-Opus-rate-limited reports healthy even though
+        # no task can actually dispatch, defeating auto-pause.
+        opus_available = [a for a in available_accounts if _account_available_for_model(a, _OPUS_MODEL)]
+        if not opus_available:
+            ext["claude_api"] = False
+            logger.warning(
+                f"[HEALTH] All Claude API accounts rate-limited for {_OPUS_MODEL} — "
+                f"0/{len(available_accounts)} can dispatch primary model"
+            )
+            return "claude_api"
+        ext["claude_api"] = True
+        if len(opus_available) < len(available_accounts):
+            logger.info(
+                f"[HEALTH] Claude API degraded — {len(available_accounts) - len(opus_available)}/"
+                f"{len(available_accounts)} accounts rate-limited for {_OPUS_MODEL}, "
+                f"{len(opus_available)} still available"
+            )
+        return None
     else:
         # No account pool — using raw ANTHROPIC_API_KEY. Fall back to burst detection
         # since there's no per-account cooldown mechanism for a single key.

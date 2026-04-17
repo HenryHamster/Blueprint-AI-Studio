@@ -84,6 +84,21 @@ export function classifyFailureCategory(rawCat: string): string {
 
 const _INFRA_CLASSES = new Set(['PROVISION_FAILURE', 'RATE_LIMIT', 'AGENT_TIMEOUT', 'EXTERNAL_API']);
 
+// Reads a progress artifact written by the agent (research/plan handlers).
+// Returns content prefixed with "## Pre-Implementation Analysis" so retry
+// context rendering (buildRetryContext in prompt.ts) treats it like the
+// standard handler's analysis_plan. Returns undefined if file is missing/empty.
+export function readProgressArtifact(taskId: string, kind: 'plan' | 'research'): string | undefined {
+  const path = `/tmp/${kind}_progress_${taskId}.md`;
+  try {
+    if (fs.existsSync(path)) {
+      const content = fs.readFileSync(path, 'utf-8').trim();
+      if (content) return `## Pre-Implementation Analysis\n\n${content}`;
+    }
+  } catch { /* ignore */ }
+  return undefined;
+}
+
 /**
  * Builds a compact (0-2 line) failure-calibration signal from direction history.
  * Line 1: last cycle's failures with class and actionability hint.
@@ -275,7 +290,8 @@ Rules:
 - If any subtask modifies SQLAlchemy/SQLModel models (backend/app/models.py) or adds new database tables/columns, include a separate subtask with set type="migrate" (e.g., title "feat: add index for user lookup", type "migrate"). This subtask should depend on the model change subtask. The migration agent will handle Alembic generation.
 - If any subtask adds new user-facing functionality, consider whether a test subtask is needed. New API endpoints should have corresponding integration tests. New agent handlers should have at least one smoke test. Add a test subtask with depends_on_indices pointing to the implementation subtask.
 - If any subtask changes a public API interface (endpoint signatures, request/response shapes, TypeScript types exported to frontend), include explicit notes in the prompt about backward compatibility requirements.
-- IMPORTANT: Write your plan JSON to /tmp/plan_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.${planPromptSuffix}${planFirstTaskSection}${PLAYBOOK_GUIDANCE}
+- IMPORTANT: Write your plan JSON to /tmp/plan_output_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.
+- ALSO write /tmp/plan_progress_${taskId}.md — a concise markdown summary (under ~3000 chars) of your decomposition: which areas of the codebase you explored, the rationale for how you split the work, the file targets and key constraints per subtask, and any risks or open questions. This artifact is surfaced to retry agents if this task fails, so they can pick up without re-investigating.${planPromptSuffix}${planFirstTaskSection}${PLAYBOOK_GUIDANCE}
 
 ${DEFAULT_TOOL_GUIDANCE}`;
 
@@ -349,6 +365,7 @@ ${DEFAULT_TOOL_GUIDANCE}`;
   }
 
   const finalStatus = spawnFailed ? 'FAILED' : (exitCode === 0 ? 'COMPLETED' : 'FAILED');
+  const planProgress = readProgressArtifact(taskId, 'plan');
   try {
     await persistAndPostStatus(taskId, {
       task_id: taskId,
@@ -356,6 +373,7 @@ ${DEFAULT_TOOL_GUIDANCE}`;
       ...(finalStatus === 'FAILED' ? { artifact_type: 'ERROR_LOG' } : {}),
       logs: spawnFailed ? `Spawn failed — subtasks not created. Plan output: ${logs}` : logs,
       ...(finalStatus === 'FAILED' ? { failure_category: 'claude_code_failed' } : {}),
+      ...(planProgress ? { analysis_plan: planProgress.slice(0, 5000) } : {}),
     });
   } catch (e) {
     sendLog(ws, `[ERROR] Failed to post plan completion status: ${e}\n`);
@@ -976,7 +994,9 @@ Think about the WHAT, not the HOW. Direction text should describe outcomes ("use
 
 If you have questions for the user — about priorities, intent, or things you can't resolve from the data — ask them now using \`./messages send 'question' QUESTION\`. Better to ask during analysis than to guess wrong during execution. If there are open messages, respond to them.
 
-Don't worry about formatting, JSON, or direction operations. Just think and write. A follow-up step will translate your analysis into concrete actions.`;
+Don't worry about formatting, JSON, or direction operations. Just think and write. A follow-up step will translate your analysis into concrete actions.
+
+Before finishing, ALSO write /tmp/research_progress_${taskId}.md — a concise markdown summary (under ~3000 chars) of your analysis: the gap you identified between vision and current state, the bold moves you considered, and the rationale for your recommendations. This is surfaced to retry agents if this task fails.`;
 
     statusRef.value = 'Running strategic analysis (pass 1: thinking)...';
     const thinkerResult = await runClaudeCode(thinkerPrompt, ws, statusRef, model, effort, disallowedTools);
@@ -1155,6 +1175,7 @@ ${analysisText.slice(0, 50_000)}
       logs = sanitize(stratObj ? JSON.stringify(stratObj) : (lastResultText || allOutput.slice(-50_000)));
     }
 
+    const strategicProgress = readProgressArtifact(taskId, 'research');
     try {
       await persistAndPostStatus(taskId, {
         task_id: taskId,
@@ -1162,6 +1183,7 @@ ${analysisText.slice(0, 50_000)}
         ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'RESEARCH_FINDINGS' }),
         logs,
         ...(exitCode !== 0 ? { failure_category: 'claude_code_failed' } : {}),
+        ...(strategicProgress ? { analysis_plan: strategicProgress.slice(0, 5000) } : {}),
       });
     } catch (e) {
       sendLog(ws, `[ERROR] Failed to post strategic completion status: ${e}\n`);
@@ -1337,6 +1359,8 @@ When in doubt, keep the finding — false negatives (missing good work) are wors
 
 Write findings to /tmp/research_findings_${taskId}.json. Output the JSON array as the last thing in your response.
 
+ALSO write /tmp/research_progress_${taskId}.md — a concise markdown summary (under ~3000 chars) of your investigation: which areas/directories you explored, which files you read, key observations and patterns discovered, and any remaining gaps or open questions. This is surfaced to retry agents if this task fails, so they can resume instead of re-investigating from scratch.
+
 ## Finding types
 
 **Implementation findings** — these are your primary output. Each one spawns an agent that writes code:
@@ -1396,6 +1420,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
     }
   }
 
+  const researchProgress = readProgressArtifact(taskId, 'research');
   try {
     await persistAndPostStatus(taskId, {
       task_id: taskId,
@@ -1403,6 +1428,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
       ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG' } : { artifact_type: 'RESEARCH_FINDINGS' }),
       logs,
       ...(exitCode !== 0 ? { failure_category: 'claude_code_failed' } : {}),
+      ...(researchProgress ? { analysis_plan: researchProgress.slice(0, 5000) } : {}),
     });
   } catch (e) {
     sendLog(ws, `[ERROR] Failed to post research completion status: ${e}\n`);

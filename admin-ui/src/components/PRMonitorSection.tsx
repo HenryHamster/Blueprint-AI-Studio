@@ -1,0 +1,139 @@
+import React, { useState } from 'react';
+import { ChevronRight, ExternalLink, RefreshCw } from 'lucide-react';
+import { timeAgo } from '../utils/time';
+import { isSafeUrl } from './TaskCard';
+import type { Task } from '../types/task';
+
+export interface OpenPRTask {
+  task_id: string;
+  task_status: string;
+  task_type: string;
+  task_title: string | null;
+}
+
+export interface OpenPR {
+  pr_number: number;
+  pr_url: string;
+  pr_title: string;
+  pr_branch: string;
+  pr_created_at: string;
+  tasks: OpenPRTask[];
+  is_orphaned: boolean;
+}
+
+const TASK_TYPE_COLORS: Record<string, string> = {
+  create: 'bg-emerald-500/20 text-emerald-400',
+  fix: 'bg-red-500/20 text-red-400',
+  review: 'bg-amber-500/20 text-amber-400',
+  research: 'bg-blue-500/20 text-blue-400',
+  plan: 'bg-purple-500/20 text-purple-400',
+  refactor: 'bg-cyan-500/20 text-cyan-400',
+};
+
+const PR_STATUS_COLORS: Record<string, string> = {
+  QUEUED: 'bg-blue-500/20 text-blue-400',
+  PROVISIONING: 'bg-blue-500/20 text-blue-400',
+  IN_PROGRESS: 'bg-emerald-500/20 text-emerald-400',
+  EVALUATING: 'bg-amber-500/20 text-amber-400',
+  COMPLETED: 'bg-neutral-500/20 text-neutral-400',
+  FAILED: 'bg-red-500/20 text-red-400',
+  CANCELLED: 'bg-neutral-500/20 text-neutral-500',
+};
+
+function SkeletonRow() {
+  return <div className="animate-pulse bg-neutral-800/60 rounded h-10 w-full" />;
+}
+
+export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void }) {
+  const [expanded, setExpanded] = useState(true);
+  const tasksById = React.useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
+  const busy = loading || refreshing;
+
+  return (
+    <section className="mt-4">
+      <div className="flex items-center gap-1.5 mb-2">
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="flex items-center gap-1.5 group"
+        >
+          <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Open PRs</h2>
+          <span className="text-[10px] text-neutral-500 font-mono">{openPRs.length}</span>
+          <ChevronRight className={`w-3 h-3 text-neutral-500 transition-transform ${expanded ? 'rotate-90' : ''}`} />
+        </button>
+        {hasProject && (
+          <button
+            onClick={onRefresh}
+            disabled={busy}
+            title={refreshing ? 'Refreshing…' : 'Refresh open PRs'}
+            className="ml-1 text-neutral-500 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            <RefreshCw className={`w-3 h-3 ${busy ? 'animate-spin' : ''}`} />
+          </button>
+        )}
+      </div>
+      {expanded && (
+        !hasProject ? (
+          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">Select a project</div>
+        ) : loading ? (
+          <div className="space-y-2"><SkeletonRow /><SkeletonRow /></div>
+        ) : openPRs.length === 0 ? (
+          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No open PRs</div>
+        ) : (
+          <div className="space-y-1.5 max-h-[400px] overflow-y-auto custom-scrollbar">
+            {openPRs.map(pr => (
+              <div key={pr.pr_number} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5">
+                <div className="flex items-start gap-2">
+                  <div className={`w-1.5 h-1.5 rounded-full mt-1.5 shrink-0 ${pr.is_orphaned ? 'bg-red-400' : 'bg-emerald-400'}`} />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs text-neutral-300 font-mono">#{pr.pr_number}</span>
+                      <p className="text-xs text-neutral-200 truncate">{pr.pr_title}</p>
+                      <span className="text-[10px] text-neutral-500 ml-auto">{timeAgo(pr.pr_created_at)}</span>
+                    </div>
+                    <p className="text-[9px] text-neutral-600 font-mono truncate mt-0.5">{pr.pr_branch}</p>
+                    {pr.is_orphaned ? (
+                      <div className="mt-1.5 text-[9px] text-red-400 font-medium">No active task</div>
+                    ) : (
+                      <div className="mt-1.5 space-y-1">
+                        {pr.tasks.map(t => {
+                          const typeCls = TASK_TYPE_COLORS[t.task_type] ?? 'bg-neutral-500/20 text-neutral-400';
+                          const statusCls = PR_STATUS_COLORS[t.task_status] ?? 'bg-neutral-500/20 text-neutral-500';
+                          const fullTask = tasksById.get(t.task_id);
+                          const row = (
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${typeCls}`}>{t.task_type}</span>
+                              <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${statusCls}`}>{t.task_status}</span>
+                              {t.task_title && (
+                                <span className="text-[10px] text-neutral-400 truncate min-w-0 flex-1">{t.task_title}</span>
+                              )}
+                            </div>
+                          );
+                          return fullTask ? (
+                            <button
+                              key={t.task_id}
+                              onClick={() => onViewTask(fullTask)}
+                              className="w-full text-left hover:bg-neutral-800/40 rounded px-1 -mx-1 py-0.5 transition-colors"
+                            >
+                              {row}
+                            </button>
+                          ) : (
+                            <div key={t.task_id} className="px-1 py-0.5">{row}</div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                  {pr.pr_url && isSafeUrl(pr.pr_url) && (
+                    <a href={pr.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300 shrink-0">
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )
+      )}
+    </section>
+  );
+}
