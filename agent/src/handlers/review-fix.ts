@@ -111,6 +111,17 @@ export async function handleReview(
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
   await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', branch, cloneUrl, WORKSPACE]);
+  // Fetch the base branch into the shallow clone so `git diff origin/${baseBranch}...HEAD`
+  // and `git merge-base --is-ancestor ... origin/${baseBranch}` actually work.  Without
+  // this, the changed-files list and every verification instruction in the review prompt
+  // silently fail — the reviewer then hallucinates verdicts from commit-title patterns
+  // (notably flagging valid rollup PRs as "empty" because it pattern-matched "(#NNNN)"
+  // without a real diff to look at).
+  try {
+    git(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`, '--depth', String(DEFAULT_CLONE_DEPTH)]);
+  } catch (e) {
+    sendLog(ws, `WARNING: Failed to fetch origin/${baseBranch} for diff comparison: ${String(e)}\n`);
+  }
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('review');
