@@ -176,6 +176,34 @@ async def test_merge_pull_request_conflict(mocker):
     assert "message" in result
 
 
+@pytest.mark.asyncio
+async def test_reopen_pull_request_success(mocker):
+    """reopen_pull_request() returns True on a 200 response."""
+    from app.github import reopen_pull_request
+
+    mock_request = mocker.patch("httpx.AsyncClient.request")
+    mock_request.return_value = MockResponse(200, {"number": 42, "state": "open"})
+
+    result = await reopen_pull_request("token", "owner", "repo", 42)
+
+    assert result is True
+    _, kwargs = mock_request.call_args
+    assert kwargs.get("json") == {"state": "open"}
+
+
+@pytest.mark.asyncio
+async def test_reopen_pull_request_failure(mocker):
+    """reopen_pull_request() returns False on a non-200 response."""
+    from app.github import reopen_pull_request
+
+    mock_request = mocker.patch("httpx.AsyncClient.request")
+    mock_request.return_value = MockResponse(422, {"message": "cannot reopen"}, text="cannot reopen")
+
+    result = await reopen_pull_request("token", "owner", "repo", 42)
+
+    assert result is False
+
+
 # ---------------------------------------------------------------------------
 # enable_auto_merge — GraphQL enablePullRequestAutoMerge mutation
 # ---------------------------------------------------------------------------

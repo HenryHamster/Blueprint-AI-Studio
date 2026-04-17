@@ -468,8 +468,10 @@ async def orchestrator_worker():
     from app.services import _recover_orphaned_tasks, _check_evaluating_timeouts, _sweep_post_commit_pending
     from app.routers.agent import get_github_token_for_task
     from app.github import (
+        close_pull_request,
         get_check_runs_cached,
         get_pull_request,
+        reopen_pull_request,
         update_branch,
     )
     global _last_pool_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
@@ -1691,8 +1693,32 @@ async def orchestrator_worker():
 
                         pr_state = pr_data.get("state", "open")
 
-                        # Check if PR was already merged (prevents double merge)
+                        # Check if PR was already merged (prevents double merge).
+                        # If we self-closed for a mergeability reset and reopen failed,
+                        # retry the reopen instead of marking COMPLETED — otherwise a
+                        # transient reopen failure would silently discard the work.
                         if pr_state == "closed" or pr_data.get("merged"):
+                            if pr_state == "closed" and not pr_data.get("merged") and ci_loop.get("pending_reopen"):
+                                try:
+                                    if await reopen_pull_request(
+                                        ci_gh_token, ci_owner, ci_repo, ci_pr_number,
+                                        project_id=str(ci_task.project_id),
+                                    ):
+                                        ci_loop["pending_reopen"] = False
+                                        ci_loop["polls_since_pr_fetch"] = 999
+                                        ci_task.latest_status_message = (
+                                            f"PR #{ci_pr_number} reopened after prior reset failure"
+                                        )
+                                        ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                        session.add(ci_task)
+                                        await session.commit()
+                                        continue
+                                except Exception as _reopen_exc:
+                                    logger.warning(f"[CI] retry reopen of PR #{ci_pr_number} raised: {_reopen_exc}")
+                                ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                session.add(ci_task)
+                                await session.commit()
+                                continue
                             ci_task.status = TaskStatus.COMPLETED
                             ci_task.latest_status_message = f"PR #{ci_pr_number} already merged/closed"
                             session.add(ci_task)
@@ -1702,17 +1728,73 @@ async def orchestrator_worker():
                             logger.info(f"[CI] PR #{ci_pr_number} already merged/closed, skipping")
                             continue
 
-                        # Check for merge conflicts — CI won't trigger on conflicting PRs
-                        # GitHub returns None while computing mergeability — skip this cycle and recheck later
+                        # Check for merge conflicts — CI won't trigger on conflicting PRs.
+                        # GitHub returns None while computing mergeability; usually transient
+                        # but can get stuck after force-pushes or branch-protection changes.
+                        # Track consecutive nulls and force a recompute via close+reopen
+                        # before the 30-min CI backstop kills the task and discards all work.
                         if pr_data.get("mergeable") is None:
+                            _null_count = ci_loop.get("mergeable_null_count", 0) + 1
+                            ci_loop["mergeable_null_count"] = _null_count
+                            _null_first_ts = ci_loop.get("mergeable_null_first_ts") or _utcnow().isoformat()
+                            ci_loop["mergeable_null_first_ts"] = _null_first_ts
+                            try:
+                                _null_elapsed = (_utcnow() - datetime.fromisoformat(_null_first_ts)).total_seconds()
+                            except (ValueError, TypeError):
+                                _null_elapsed = 0.0
+                            if _null_count >= 5 and _null_elapsed >= 180:
+                                logger.warning(
+                                    f"[CI] PR #{ci_pr_number} mergeable=None for {_null_count} polls over "
+                                    f"{_null_elapsed:.0f}s — closing/reopening to force GitHub to recompute"
+                                )
+                                _reset_ok = False
+                                _did_close = False
+                                try:
+                                    if await close_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number,
+                                                                project_id=str(ci_task.project_id)):
+                                        _did_close = True
+                                        _reset_ok = await reopen_pull_request(
+                                            ci_gh_token, ci_owner, ci_repo, ci_pr_number,
+                                            project_id=str(ci_task.project_id),
+                                        )
+                                except Exception as _reset_exc:
+                                    logger.warning(f"[CI] close/reopen of PR #{ci_pr_number} raised: {_reset_exc}")
+                                ci_loop["mergeable_null_count"] = 0
+                                ci_loop["mergeable_null_first_ts"] = None
+                                if _reset_ok:
+                                    ci_task.latest_status_message = (
+                                        f"PR #{ci_pr_number} mergeability stuck — closed/reopened to force recompute"
+                                    )
+                                    ci_loop["polls_since_pr_fetch"] = 999
+                                    ci_loop["pending_reopen"] = False
+                                else:
+                                    if _did_close:
+                                        ci_loop["pending_reopen"] = True
+                                        ci_loop["polls_since_pr_fetch"] = 999
+                                    await _maybe_create_failure_alert(
+                                        ci_task, session,
+                                        f"PR #{ci_pr_number} mergeability stuck ({_null_count} null polls) — close/reopen failed, still polling"
+                                    )
+                            ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                            session.add(ci_task)
+                            await session.commit()
                             continue
+                        if ci_loop.get("mergeable_null_count"):
+                            ci_loop["mergeable_null_count"] = 0
+                            ci_loop["mergeable_null_first_ts"] = None
                         if pr_data.get("mergeable") is False:
-                            # Distinguish "behind base" (trivially resolvable via
-                            # GitHub's update-branch API) from real conflicts. For
-                            # 'behind' PRs, update the branch in-place instead of
-                            # burning a VM fix cycle; the merge-commit triggers fresh
-                            # CI and the next poll re-evaluates mergeability.
-                            if pr_data.get("mergeable_state") == "behind":
+                            # GitHub's mergeable_state has several values that don't
+                            # indicate a real merge conflict — only 'dirty' (and
+                            # 'behind' as a fall-through fallback) should burn a VM
+                            # fix cycle. Other states are recoverable by waiting:
+                            # 'blocked' clears when required checks/reviews land,
+                            # 'unstable' means CI is failing but the PR is mergeable,
+                            # 'unknown' means GitHub is still computing.
+                            _ms = (pr_data.get("mergeable_state") or "").lower()
+                            if _ms == "behind":
+                                # Trivially resolvable via GitHub's update-branch API.
+                                # Update the branch in-place; the merge-commit
+                                # triggers fresh CI and the next poll re-evaluates.
                                 try:
                                     _upd = await update_branch(
                                         ci_gh_token, ci_owner, ci_repo, ci_pr_number,
@@ -1738,6 +1820,18 @@ async def orchestrator_worker():
                                     logger.info(f"[CI] PR #{ci_pr_number} behind base — update_branch succeeded, skipped fix spawn")
                                     continue
                                 logger.info(f"[CI] PR #{ci_pr_number} behind base but update_branch failed: {_upd.get('message')} — falling through to fix spawn")
+                            elif _ms == "unknown":
+                                logger.debug(f"[CI] PR #{ci_pr_number} mergeable=False, mergeable_state=unknown — GitHub still computing, will recheck next cycle")
+                                continue
+                            elif _ms == "blocked":
+                                logger.debug(f"[CI] PR #{ci_pr_number} mergeable=False, mergeable_state=blocked — pending required checks/reviews, continuing CI polling")
+                                continue
+                            elif _ms == "unstable":
+                                logger.debug(f"[CI] PR #{ci_pr_number} mergeable=False, mergeable_state=unstable — CI failing but PR mergeable, continuing CI polling")
+                                continue
+                            elif _ms != "dirty":
+                                logger.warning(f"[CI] PR #{ci_pr_number} mergeable=False with unrecognized mergeable_state={_ms!r} — continuing CI polling, not spawning fix")
+                                continue
                             ci_payload = ci_task.first_payload
                             ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
                             ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")

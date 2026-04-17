@@ -849,7 +849,14 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         except Exception as _pr_exc:
                             _pr_detail = {}
                             logger.debug(f"[ROLLUP] Could not refetch PR #{rollup_pr_number} for behind-check: {_pr_exc}")
-                        if _pr_detail.get("mergeable_state") == "behind":
+                        # Classify mergeable_state before assuming this is a real
+                        # conflict. Only 'dirty' (and 'behind' as fall-through if
+                        # update_branch fails) warrant a fix VM. 'blocked' and
+                        # 'unstable' resolve when checks/reviews complete; 'unknown'
+                        # means GitHub is still computing — all should be retried by
+                        # the next rollup sweep instead of burning a fix cycle.
+                        _ms = (_pr_detail.get("mergeable_state") or "").lower()
+                        if _ms == "behind":
                             try:
                                 _upd = await update_branch(
                                     gh_token, owner, repo, rollup_pr_number,
@@ -876,6 +883,32 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} but update_branch failed: "
                                 f"{_upd.get('message')} — falling through to fix spawn"
                             )
+                        elif _ms in ("blocked", "unstable", "unknown"):
+                            parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                            parent.latest_status_message = (
+                                f"Rollup PR #{rollup_pr_number} merge deferred (mergeable_state={_ms}) — "
+                                f"next rollup sweep will re-attempt"
+                            )
+                            session.add(parent)
+                            await session.commit()
+                            logger.info(
+                                f"[ROLLUP] PR #{rollup_pr_number} merge skipped: mergeable_state={_ms} "
+                                f"(not a conflict) — deferring to next rollup sweep, no fix spawn"
+                            )
+                            return
+                        elif _ms and _ms != "dirty":
+                            parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                            parent.latest_status_message = (
+                                f"Rollup PR #{rollup_pr_number} merge deferred — unrecognized "
+                                f"mergeable_state={_ms!r}, next sweep will re-attempt"
+                            )
+                            session.add(parent)
+                            await session.commit()
+                            logger.warning(
+                                f"[ROLLUP] PR #{rollup_pr_number} merge skipped: unrecognized "
+                                f"mergeable_state={_ms!r} — deferring to next rollup sweep, no fix spawn"
+                            )
+                            return
                         # Observability: check if concurrent rollups may explain this conflict
                         try:
                             recent_rollups = (await session.execute(

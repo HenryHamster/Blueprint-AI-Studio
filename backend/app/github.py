@@ -1559,6 +1559,27 @@ async def close_pull_request(
     return False
 
 
+async def reopen_pull_request(
+    token: str, owner: str, repo: str, pr_number: int,
+    project_id: str | None = None,
+) -> bool:
+    """Reopen a previously closed PR. Returns True on success."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    response = await _github_request(
+        "PATCH", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+        headers, json={"state": "open"}, project_id=project_id,
+    )
+    if response.status_code == 200:
+        logger.info(f"Reopened PR #{pr_number} on {owner}/{repo}")
+        return True
+    logger.warning(f"Failed to reopen PR #{pr_number}: {response.status_code} {response.text[:200]}")
+    return False
+
+
 async def get_pr_files(
     token: str, owner: str, repo: str, pr_number: int,
     project_id: str | None = None,
