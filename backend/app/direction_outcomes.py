@@ -11,7 +11,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.failure_classification import INFRA_CLASSES, classify_failure as _classify_failure
+from app.failure_classification import (
+    INFRA_CLASSES,
+    TAXONOMY_CODE_DEFECT,
+    TAXONOMY_INFRA_RELATED,
+    TAXONOMY_REVIEW_QUALITY,
+    TAXONOMY_SCOPE_RELATED,
+    classify_failure as _classify_failure,
+    classify_failure_taxonomy as _classify_taxonomy,
+)
 from app.models import Project, Task, TaskStatus
 
 
@@ -180,15 +188,29 @@ async def _update_direction_research_outcomes(
             # Capture failed task details so research agents can see WHY tasks failed
             failed_details = []
             infra_failures = 0
+            taxonomy_summary = {
+                TAXONOMY_SCOPE_RELATED: 0,
+                TAXONOMY_REVIEW_QUALITY: 0,
+                TAXONOMY_INFRA_RELATED: 0,
+                TAXONOMY_CODE_DEFECT: 0,
+            }
             for ct in child_tasks_rows:
                 if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
                     reason = (ct.latest_status_message or "")[:120]
                     category = (ct.context or {}).get("failure_category", "")
-                    failed_details.append({"title": ct.title or "", "reason": reason, "category": category})
+                    taxonomy = _classify_taxonomy(ct)
+                    taxonomy_summary[taxonomy] = taxonomy_summary.get(taxonomy, 0) + 1
+                    failed_details.append({
+                        "title": ct.title or "",
+                        "reason": reason,
+                        "category": category,
+                        "taxonomy": taxonomy,
+                    })
                     if category in INFRA_CLASSES:
                         infra_failures += 1
             entry["failed_task_details"] = failed_details[:5]  # cap at 5 to avoid bloat
             entry["tasks_failed_infra"] = infra_failures
+            entry["taxonomy_summary"] = taxonomy_summary
 
             # Stage dropout: per-cycle breakdown of why tasks didn't reach main
             sd_code_error = 0

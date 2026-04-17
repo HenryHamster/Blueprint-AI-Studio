@@ -435,6 +435,31 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         sorted(failure_counts.items(), key=lambda x: x[1], reverse=True)[:3]
     )
 
+    from app.failure_classification import (
+        classify_failure_taxonomy as _classify_taxonomy,
+        TAXONOMY_REVIEW_QUALITY, TAXONOMY_SCOPE_RELATED,
+        TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED,
+    )
+    _taxonomy_keys = (
+        TAXONOMY_SCOPE_RELATED, TAXONOMY_REVIEW_QUALITY,
+        TAXONOMY_INFRA_RELATED, TAXONOMY_CODE_DEFECT,
+    )
+    taxonomy_counts: Dict[str, int] = {k: 0 for k in _taxonomy_keys}
+    for t in failed_tasks:
+        taxonomy_counts[_classify_taxonomy(t)] += 1
+    _tax_total = sum(taxonomy_counts.values())
+    failure_taxonomy = {
+        "categories": {
+            k: {
+                "count": taxonomy_counts[k],
+                "percentage": round(taxonomy_counts[k] / _tax_total * 100, 1) if _tax_total else 0.0,
+            }
+            for k in _taxonomy_keys
+        },
+        "total_failures": _tax_total,
+        "dominant_category": max(_taxonomy_keys, key=lambda k: taxonomy_counts[k]) if _tax_total else None,
+    }
+
     # Direction stats: merge_rate and cycle count per active direction
     direction_stats: List[Dict[str, Any]] = []
     project = await session.get(Project, project_id)
@@ -945,6 +970,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "success_rate": success_rate,
         "trend": trend,
         "failure_distribution": failure_distribution,
+        "failure_taxonomy": failure_taxonomy,
         "direction_stats": direction_stats,
         "first_attempt_success_rate": first_attempt_success_rate,
         "first_review_approval_rate": first_review_approval_rate,
@@ -1301,6 +1327,32 @@ async def get_digest(
         reverse=True,
     )
 
+    # Taxonomy distribution (4-category: scope/review/infra/code_defect)
+    from app.failure_classification import (
+        classify_failure_taxonomy as _classify_taxonomy,
+        TAXONOMY_REVIEW_QUALITY, TAXONOMY_SCOPE_RELATED,
+        TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED,
+    )
+    _tax_keys = (
+        TAXONOMY_SCOPE_RELATED, TAXONOMY_REVIEW_QUALITY,
+        TAXONOMY_INFRA_RELATED, TAXONOMY_CODE_DEFECT,
+    )
+    _tax_counts: Dict[str, int] = {k: 0 for k in _tax_keys}
+    for t in failed_tasks:
+        _tax_counts[_classify_taxonomy(t)] += 1
+    _tax_total = sum(_tax_counts.values())
+    failure_taxonomy_distribution = {
+        "categories": {
+            k: {
+                "count": _tax_counts[k],
+                "percentage": round(_tax_counts[k] / _tax_total * 100, 1) if _tax_total else 0.0,
+            }
+            for k in _tax_keys
+        },
+        "total_failures": _tax_total,
+        "dominant_category": max(_tax_keys, key=lambda k: _tax_counts[k]) if _tax_total else None,
+    }
+
     # --- recent_completions (up to 10, desc) ---
     sorted_completions = sorted(completed_tasks, key=_derive_completed_at, reverse=True)
     recent_completions = []
@@ -1574,6 +1626,7 @@ async def get_digest(
         "needs_attention": needs_attention,
         "recent_failures": recent_failures,
         "failure_groups": failure_groups,
+        "failure_taxonomy_distribution": failure_taxonomy_distribution,
         "recent_completions": recent_completions,
         "direction_progress": direction_progress_list,
         "overall_product_ratio": overall_product_ratio,

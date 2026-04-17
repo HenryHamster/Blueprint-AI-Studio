@@ -325,3 +325,68 @@ def test_worst_child_failure_category_all_infra_returns_infra():
     children = [_child("PROVISION_FAILURE"), _child("RATE_LIMIT")]
     result = worst_child_failure_category(children)
     assert result in ("PROVISION_FAILURE", "RATE_LIMIT")
+
+
+# ── classify_failure_taxonomy ──────────────────────────────────────────────
+
+from app.failure_classification import (  # noqa: E402
+    TAXONOMY_CODE_DEFECT,
+    TAXONOMY_INFRA_RELATED,
+    TAXONOMY_REVIEW_QUALITY,
+    TAXONOMY_SCOPE_RELATED,
+    classify_failure_taxonomy,
+)
+
+
+def _task_with_ctx(msg: str, ctx: dict) -> Task:
+    t = MagicMock(spec=Task)
+    t.latest_status_message = msg
+    t.context = ctx
+    return t
+
+
+def test_taxonomy_review_quality_from_test_failure():
+    t = _task_with_ctx("pytest failed: AssertionError in test_foo", {"scope": "small"})
+    assert classify_failure_taxonomy(t) == TAXONOMY_REVIEW_QUALITY
+
+
+def test_taxonomy_review_quality_from_lint_failure():
+    t = _task_with_ctx("ruff lint failed with 3 errors", {"scope": "small"})
+    assert classify_failure_taxonomy(t) == TAXONOMY_REVIEW_QUALITY
+
+
+def test_taxonomy_scope_related_from_medium_scope():
+    t = _task_with_ctx("TypeError: unsupported operand", {"scope": "medium"})
+    assert classify_failure_taxonomy(t) == TAXONOMY_SCOPE_RELATED
+
+
+def test_taxonomy_scope_related_from_calibrated_from():
+    t = _task_with_ctx("NameError: foo not defined",
+                       {"scope": "small", "scope_calibrated_from": "medium"})
+    assert classify_failure_taxonomy(t) == TAXONOMY_SCOPE_RELATED
+
+
+def test_taxonomy_scope_related_from_complexity_message():
+    t = _task_with_ctx("aborted: too many files changed", {"scope": "small"})
+    assert classify_failure_taxonomy(t) == TAXONOMY_SCOPE_RELATED
+
+
+def test_taxonomy_code_defect_default():
+    t = _task_with_ctx("AssertionError: expected 3, got 4", {"scope": "small"})
+    assert classify_failure_taxonomy(t) == TAXONOMY_CODE_DEFECT
+
+
+def test_taxonomy_infra_for_rate_limit():
+    t = _task_with_ctx("API Error: Rate limit reached", {})
+    assert classify_failure_taxonomy(t) == TAXONOMY_INFRA_RELATED
+
+
+def test_taxonomy_infra_for_provision_failure():
+    t = _task_with_ctx("failed to provision VM", {})
+    assert classify_failure_taxonomy(t) == TAXONOMY_INFRA_RELATED
+
+
+def test_taxonomy_review_quality_beats_scope():
+    """Test/lint signal takes precedence over scope — review quality is the root cause."""
+    t = _task_with_ctx("pytest failure in test_x", {"scope": "large"})
+    assert classify_failure_taxonomy(t) == TAXONOMY_REVIEW_QUALITY

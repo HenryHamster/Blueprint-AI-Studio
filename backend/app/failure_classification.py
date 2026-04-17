@@ -37,6 +37,58 @@ INFRA_CLASSES: frozenset[str] = frozenset({
 })
 
 
+# Taxonomy sub-categories — finer-grained grouping for failure-mode analysis.
+# INFRA_RELATED covers everything in INFRA_CLASSES; the other three partition
+# CODE_ERROR failures into review-quality (test/lint/style), scope-related
+# (complexity/size), and residual code defects.
+TAXONOMY_REVIEW_QUALITY = "review_quality"
+TAXONOMY_SCOPE_RELATED = "scope_related"
+TAXONOMY_CODE_DEFECT = "code_defect"
+TAXONOMY_INFRA_RELATED = "infra_related"
+
+
+_REVIEW_QUALITY_KEYWORDS = (
+    "pytest", "jest", "ruff", "eslint", "tsc", "mypy",
+    "lint_failed", "test_failed", "build_failed",
+    "lint error", "lint failed", "tests failed", "test failure",
+    "type error", "typecheck", "type check",
+    "style", "formatting",
+)
+
+_SCOPE_KEYWORDS = (
+    "too many changes", "too many files", "multi-file conflict",
+    "scope too large", "complexity", "exceeds scope",
+)
+
+
+def classify_failure_taxonomy(task: "Task") -> str:
+    """Return a 4-category taxonomy label for a failed task.
+
+    Buckets CODE_ERROR failures into review_quality / scope_related / code_defect
+    based on status-message signals and task context; all INFRA_CLASSES map to
+    infra_related. Reuses classify_failure() for the base class.
+    """
+    base = classify_failure(task)
+    if base in INFRA_CLASSES:
+        return TAXONOMY_INFRA_RELATED
+
+    status_msg = (task.latest_status_message or "").lower()
+    ctx = task.context or {}
+
+    if any(kw in status_msg for kw in _REVIEW_QUALITY_KEYWORDS):
+        return TAXONOMY_REVIEW_QUALITY
+
+    scope = ctx.get("scope")
+    if (
+        scope in ("medium", "large")
+        or ctx.get("scope_calibrated_from")
+        or any(kw in status_msg for kw in _SCOPE_KEYWORDS)
+    ):
+        return TAXONOMY_SCOPE_RELATED
+
+    return TAXONOMY_CODE_DEFECT
+
+
 _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     'clone_failed': PROVISION_FAILURE,
     'build_failed': CODE_ERROR,

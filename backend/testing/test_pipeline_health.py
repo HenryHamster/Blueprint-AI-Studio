@@ -136,6 +136,52 @@ async def test_failure_distribution_uses_classify_failure_categories():
 
 
 @pytest.mark.asyncio
+async def test_failure_taxonomy_distribution_mixed():
+    """failure_taxonomy bucket counts and percentages sum to ~100%."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        # review_quality (test/lint keywords)
+        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=1),
+                  latest_status_message="pytest tests failed"),
+        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=2),
+                  latest_status_message="ruff lint error"),
+        # scope_related (scope in context)
+        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=3),
+                  latest_status_message="build error", context={"scope": "large"}),
+        # infra_related
+        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=4),
+                  latest_status_message="API Error: Rate limit reached"),
+        # code_defect (no scope, no keywords)
+        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=5),
+                  latest_status_message="SyntaxError: unexpected"),
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+    tax = result["failure_taxonomy"]
+    assert tax["total_failures"] == 5
+    assert tax["categories"]["review_quality"]["count"] == 2
+    assert tax["categories"]["scope_related"]["count"] == 1
+    assert tax["categories"]["infra_related"]["count"] == 1
+    assert tax["categories"]["code_defect"]["count"] == 1
+    total_pct = sum(v["percentage"] for v in tax["categories"].values())
+    assert 99.9 <= total_pct <= 100.1
+    assert tax["dominant_category"] == "review_quality"
+
+
+@pytest.mark.asyncio
+async def test_failure_taxonomy_empty():
+    """No failures → zero counts, None dominant_category."""
+    session = _make_mock_session(tasks=[], project=make_project(directions=[]))
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+    tax = result["failure_taxonomy"]
+    assert tax["total_failures"] == 0
+    assert tax["dominant_category"] is None
+    assert all(v["count"] == 0 for v in tax["categories"].values())
+
+
+@pytest.mark.asyncio
 async def test_failure_distribution_top_3_only():
     """Failure distribution is capped at top 3 classes by count."""
     now = _utcnow()
@@ -485,7 +531,7 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "scope_file_budgets", "medium_scope_review_iterations", "direction_first_attempt_feedback", "medium_scope_measurement"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "failure_taxonomy", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "scope_file_budgets", "medium_scope_review_iterations", "direction_first_attempt_feedback", "medium_scope_measurement"}
     fa = result["first_attempt_success_rate"]
     assert "first_attempt_by_review_category" in fa
     assert "with_arch_context" in fa

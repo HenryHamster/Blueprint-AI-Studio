@@ -583,6 +583,73 @@ async def test_failed_task_reason_truncated_to_120(db_session: AsyncSession):
     assert len(entry["failed_task_details"][0]["reason"]) == 120
 
 
+@pytest.mark.asyncio
+async def test_taxonomy_fields_in_outcome_entries(db_session: AsyncSession):
+    """Each failed_task_details entry has a 'taxonomy' label; taxonomy_summary counts
+    all failed tasks across the 4 categories (not just the capped 5)."""
+    direction_id = "d-taxonomy"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=8)]
+    await db_session.flush()
+
+    # infra_related: PROVISION_FAILURE
+    await _create_child_task(db_session, research_task.id, project.id,
+                              status=TaskStatus.FAILED,
+                              context={"failure_category": "PROVISION_FAILURE"},
+                              title="infra1", latest_status_message="VM failed")
+    # infra_related: AGENT_TIMEOUT
+    await _create_child_task(db_session, research_task.id, project.id,
+                              status=TaskStatus.CANCELLED,
+                              context={"failure_category": "AGENT_TIMEOUT"},
+                              title="infra2", latest_status_message="Timed out")
+    # review_quality: CODE_ERROR with pytest signal
+    await _create_child_task(db_session, research_task.id, project.id,
+                              status=TaskStatus.FAILED,
+                              context={"failure_category": "CODE_ERROR", "scope": "small"},
+                              title="rq1", latest_status_message="pytest failed in tests")
+    # scope_related: CODE_ERROR on medium scope
+    await _create_child_task(db_session, research_task.id, project.id,
+                              status=TaskStatus.FAILED,
+                              context={"failure_category": "CODE_ERROR", "scope": "medium"},
+                              title="sc1", latest_status_message="something broke")
+    # code_defect: CODE_ERROR small with no classifying signal
+    await _create_child_task(db_session, research_task.id, project.id,
+                              status=TaskStatus.FAILED,
+                              context={"failure_category": "CODE_ERROR", "scope": "small"},
+                              title="cd1", latest_status_message="unknown failure")
+    # Extra failures to push total above the cap of 5
+    for i in range(3):
+        await _create_child_task(db_session, research_task.id, project.id,
+                                  status=TaskStatus.FAILED,
+                                  context={"failure_category": "PROVISION_FAILURE"},
+                                  title=f"extra-{i}", latest_status_message="vm crashed")
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # failed_task_details remains capped at 5 with taxonomy on each
+    assert len(entry["failed_task_details"]) == 5
+    for d in entry["failed_task_details"]:
+        assert "taxonomy" in d
+        assert d["taxonomy"] in {"scope_related", "review_quality", "infra_related", "code_defect"}
+    # taxonomy_summary counts ALL 8 failed tasks, not just capped 5
+    ts = entry["taxonomy_summary"]
+    assert ts["infra_related"] == 5  # 1 provision + 1 agent_timeout + 3 extra provision
+    assert ts["review_quality"] == 1
+    assert ts["scope_related"] == 1
+    assert ts["code_defect"] == 1
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. Scope breakdown
 # ─────────────────────────────────────────────────────────────────────────────
