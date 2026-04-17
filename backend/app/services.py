@@ -149,27 +149,59 @@ def _extract_branch_short_id(branch_name: str) -> str | None:
 
 
 async def _get_project_github_token(project, session):
-    """Retrieve a GitHub token for a project via its UserIntegration."""
+    """Retrieve a GitHub token for a project via its UserIntegration.
+
+    Reuses the same in-process cache as ``get_github_token_for_task`` so a
+    dashboard endpoint polling /api/admin/open-prs every 10s (with its own
+    60s cache) doesn't mint a fresh install token on every cache-miss.  That
+    pattern was silently draining the ~60/hr App-JWT bucket even with zero
+    agents running.
+    """
     from app.models import UserIntegration
     from app.github import (
         generate_installation_access_token,
         get_repo_installation_token,
     )
     from app.secrets_manager import get_user_secret
+    from app.routers.agent import (
+        _github_token_cache, _github_token_cache_lock, _GITHUB_TOKEN_TTL,
+    )
+
+    project_id_str = str(project.id)
+
+    # Cache check — installation tokens are good for 60min; we treat them as
+    # valid for 50min (3000s) to leave safety margin for clock skew.
+    async with _github_token_cache_lock:
+        cached = _github_token_cache.get(project_id_str)
+        if cached and (_utcnow() - cached["fetched_at"]).total_seconds() < _GITHUB_TOKEN_TTL:
+            return cached["token"]
 
     integration = (await session.execute(
         select(UserIntegration).where(UserIntegration.user_id == project.user_id)
     )).scalars().first()
 
+    token: str | None = None
     if integration and integration.github_installation_id:
-        return await generate_installation_access_token(
+        token = await generate_installation_access_token(
             integration.github_installation_id,
             repositories=[project.github_repo],
         )
-    if integration and integration.github_pat:
-        return await get_user_secret(integration.github_pat)
-    # Fallback: discover via GitHub App
-    return await get_repo_installation_token(project.github_owner, project.github_repo)
+    elif integration and integration.github_pat:
+        # PATs are long-lived — caching isn't necessary but is harmless and
+        # keeps every code path symmetric.
+        token = await get_user_secret(integration.github_pat)
+    else:
+        token = await get_repo_installation_token(project.github_owner, project.github_repo)
+
+    if token and project.github_owner and project.github_repo:
+        async with _github_token_cache_lock:
+            _github_token_cache[project_id_str] = {
+                "token": token,
+                "owner": project.github_owner,
+                "repo": project.github_repo,
+                "fetched_at": _utcnow(),
+            }
+    return token
 
 
 async def _run_stale_branch_cleanup():
