@@ -401,7 +401,9 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       for (const entry of priorAnalysis) {
         const t = strVal(entry.title);
         const cat = strVal(entry.failure_category);
-        const header = cat ? `- ${t} [${cat}]` : `- ${t}`;
+        const scope = strVal(entry.scope);
+        const tags = [cat, scope].filter(Boolean).join(', ');
+        const header = tags ? `- ${t} [${tags}]` : `- ${t}`;
         dcLines.push(header);
         const plan = strVal(entry.analysis_plan);
         if (plan) dcLines.push(`  - Analysis plan: ${plan}`);
@@ -447,6 +449,13 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         }
         const fp = strVal(entry.previous_error_fingerprint);
         if (fp) dcLines.push(`  - Previous error fingerprint: ${fp}`);
+        if (typeof entry.review_iterations === 'number') {
+          const iter = entry.review_iterations;
+          const label = iter === 0
+            ? 'Review iterations: 0 (failed before review)'
+            : `Review iterations: ${iter} (${iter === 1 ? '1 cycle' : `${iter} cycles`} before failure)`;
+          dcLines.push(`  - ${label}`);
+        }
       }
     }
     const successfulAnalysis = Array.isArray(dirCtx.direction_successful_analysis)
@@ -1027,6 +1036,7 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     const reviewSuffix = (typeof t.review_iterations === 'number' && t.review_iterations > 1) ? ` (${t.review_iterations} review cycles)` : '';
     const extras: string[] = [];
     if (t.direction_id) extras.push(`dir=${strVal(t.direction_id)}`);
+    if (t.scope) extras.push(`scope=${strVal(t.scope)}`);
     const relatedFiles = t.related_files as unknown;
     if (Array.isArray(relatedFiles) && relatedFiles.length > 0) {
       const files = relatedFiles.slice(0, 3).map((f) => strVal(f)).join(', ');

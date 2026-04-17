@@ -694,6 +694,7 @@ async def claim_task(
                     "prompt": t_prompt or None,
                     "related_files": (t_ctx.get("related_files") or [])[:10],
                     "direction_id": t_ctx.get("direction_id"),
+                    "scope": t_ctx.get("scope"),
                     "changed_files": (t_ctx.get("_pr_changed_files") or [])[:10] or None,
                 })
 
@@ -1156,6 +1157,9 @@ async def claim_task(
                         "title": pt.title,
                         "failure_category": classify_failure(pt),
                     }
+                    scope = pctx.get("scope")
+                    if isinstance(scope, str) and scope:
+                        entry["scope"] = scope
                     if analysis_plan:
                         entry["analysis_plan"] = str(analysis_plan)[:500]
                     if test_failure_summary:
@@ -1207,6 +1211,11 @@ async def claim_task(
                     fingerprint = pctx.get("_previous_error_fingerprint")
                     if fingerprint:
                         entry["previous_error_fingerprint"] = str(fingerprint)
+                    review_loop = pctx.get("review_loop")
+                    if isinstance(review_loop, dict):
+                        iteration = review_loop.get("iteration", 0)
+                        if isinstance(iteration, int):
+                            entry["review_iterations"] = iteration
                     entry_len = len(json.dumps(entry))
                     if total_chars + entry_len > 2000:
                         break

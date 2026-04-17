@@ -1786,6 +1786,7 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
                     "types": {"passed": False},
                 },
             },
+            "review_loop": {"iteration": 3},
         },
         status=TaskStatus.FAILED,
         title="Prior failed task",
@@ -1836,6 +1837,7 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
     assert entry["self_review_outcome"]["verdict"] == "FAIL"
     assert entry["self_review_outcome"]["notes"] == "lint errors remain"
     assert set(entry["self_review_outcome"]["failed_checks"]) == {"lint", "types"}
+    assert entry["review_iterations"] == 3
     # Total payload stays under 2000-char cap
     import json as _json
     assert len(_json.dumps(dpa)) <= 2000

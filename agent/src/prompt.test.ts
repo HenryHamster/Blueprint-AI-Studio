@@ -410,6 +410,55 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('Files changed: foo.py, bar.ts');
   });
 
+  it('renders review_iterations in prior analysis entries', () => {
+    const task = {
+      direction_context: {
+        title: 'Refactor module',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        direction_prior_analysis: [
+          {
+            title: 'Almost worked',
+            failure_category: 'CODE_ERROR',
+            analysis_plan: 'Try X',
+            review_iterations: 3,
+          },
+          {
+            title: 'Fundamentally broken',
+            failure_category: 'CODE_ERROR',
+            analysis_plan: 'Try Y',
+            review_iterations: 0,
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('Review iterations: 3 (3 cycles before failure)');
+    expect(result).toContain('Review iterations: 0 (failed before review)');
+  });
+
+  it('renders scope alongside failure_category in prior analysis header', () => {
+    const task = {
+      direction_context: {
+        title: 'Refactor module',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        direction_prior_analysis: [
+          {
+            title: 'feat: add caching',
+            failure_category: 'CODE_ERROR',
+            scope: 'medium',
+            analysis_plan: 'Try X',
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('- feat: add caching [CODE_ERROR, medium]');
+  });
+
   it('does not render Prior analysis section when direction_prior_analysis is empty or absent', () => {
     const task = {
       direction_context: {
