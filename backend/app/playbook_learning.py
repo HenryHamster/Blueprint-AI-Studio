@@ -41,6 +41,13 @@ _PLAYBOOK_CAPACITY_BYTES = 25 * 1024
 _STALE_AGE_DAYS = 30
 _STALE_CONFIRM_THRESHOLD = 3
 
+# Review-extracted playbook entries are refreshed in-place when their
+# updated_at exceeds _REVIEW_PLAYBOOK_REFRESH_DAYS, and flagged
+# potentially_stale once they exceed _REVIEW_PLAYBOOK_STALE_DAYS without
+# being observed again.
+_REVIEW_PLAYBOOK_REFRESH_DAYS = 30
+_REVIEW_PLAYBOOK_STALE_DAYS = 60
+
 # Regex patterns that match source-file paths embedded in playbook entry content.
 # Used to detect references to files that may have been renamed or removed.
 _FILE_PATH_RE = re.compile(
@@ -219,6 +226,35 @@ def _archive_least_useful_entry(doc: dict) -> dict:
         victim_key,
     )
     return doc
+
+
+def _mark_stale_review_entries(doc: dict) -> bool:
+    """Flag review-extracted entries whose ``updated_at`` exceeds
+    ``_REVIEW_PLAYBOOK_STALE_DAYS`` with ``potentially_stale: True``.
+
+    Returns True if any entry was changed.
+    """
+    now = _utcnow()
+    changed = False
+    for k, v in doc.items():
+        if not k.startswith("playbook/review-") or not isinstance(v, dict):
+            continue
+        if v.get("source") != "review-extracted":
+            continue
+        updated_at_str = v.get("updated_at") or ""
+        try:
+            dt = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
+        except (ValueError, TypeError):
+            continue
+        is_stale = (now - dt).days >= _REVIEW_PLAYBOOK_STALE_DAYS
+        if is_stale and not v.get("potentially_stale"):
+            entry = dict(v)
+            entry["potentially_stale"] = True
+            doc[k] = entry
+            changed = True
+    return changed
 
 
 def maybe_archive_for_capacity(doc: dict, new_entry_estimate: int = 0) -> dict:
@@ -675,9 +711,50 @@ async def capture_success_pattern(
 
 _MODULE_FEEDBACK_KEY = "module_feedback"
 _MODULE_FEEDBACK_MAX_ENTRIES = 50
+# Grace window (in days) before stale module-feedback entries start to decay.
+_MODULE_FEEDBACK_DECAY_AGE_DAYS = 14
+# Half-life (in days) of the exponential decay applied past the grace window.
+_MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS = 14
 
 _DIRECTION_FIRST_ATTEMPT_KEY = "direction_first_attempt_feedback"
 _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD = 5
+
+
+def _decay_module_feedback_entry(entry: dict, now: datetime) -> dict:
+    """Return *entry* with category counts exponentially decayed by age.
+
+    No-op when ``last_updated`` is missing/unparseable or the entry is still
+    within the grace window. Otherwise multiplies each integer category count
+    (and ``total``) by ``0.5 ** (overage_days / half_life)``; categories that
+    round to zero are dropped so resolved patterns fade out completely.
+    """
+    last_str = entry.get("last_updated")
+    if not last_str:
+        return entry
+    try:
+        last_dt = datetime.fromisoformat(last_str.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return entry
+    if last_dt.tzinfo is not None:
+        last_dt = last_dt.replace(tzinfo=None)
+    overage = (now - last_dt).total_seconds() / 86400.0 - _MODULE_FEEDBACK_DECAY_AGE_DAYS
+    if overage <= 0:
+        return entry
+    factor = 0.5 ** (overage / _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS)
+    decayed: dict = {}
+    new_total = 0
+    for k, v in entry.items():
+        if k in ("total", "last_updated"):
+            continue
+        if not isinstance(v, int):
+            decayed[k] = v
+            continue
+        new_count = round(v * factor)
+        if new_count > 0:
+            decayed[k] = new_count
+            new_total += new_count
+    decayed["total"] = new_total
+    return decayed
 
 
 def _update_module_feedback_profiles(
@@ -690,12 +767,15 @@ def _update_module_feedback_profiles(
     For each file in *related_files*, accumulates the count of issues per
     review category.  Caps the total number of tracked modules at
     ``_MODULE_FEEDBACK_MAX_ENTRIES``; when the cap is exceeded the entry with
-    the oldest ``last_updated`` timestamp is evicted.
+    the oldest ``last_updated`` timestamp is evicted. Existing entries are
+    decayed before the new counts are added so old, resolved patterns fade
+    out instead of accumulating indefinitely.
     """
     if not related_files or not buckets:
         return
 
-    now_iso = _utcnow().isoformat()
+    now = _utcnow()
+    now_iso = now.isoformat()
     profiles: dict = dict(doc.get(_MODULE_FEEDBACK_KEY) or {})
 
     # Flatten bucket issue counts: {category: count}
@@ -706,7 +786,8 @@ def _update_module_feedback_profiles(
     for file_path in related_files:
         if not file_path:
             continue
-        entry = dict(profiles.get(file_path) or {})
+        existing = profiles.get(file_path)
+        entry = _decay_module_feedback_entry(dict(existing), now) if existing else {}
         for cat, count in cat_counts.items():
             entry[cat] = entry.get(cat, 0) + count
         entry["total"] = entry.get("total", 0) + sum(cat_counts.values())
@@ -857,7 +938,11 @@ async def extract_review_feedback_to_playbook(
 
     created_keys: list[str] = list(first_attempt_keys)
 
-    # Create full playbook entries only for 3+ iteration reviews
+    # Flag review-extracted entries that have not been observed for >60 days.
+    # Runs on every invocation so coaching guidance reflects current patterns.
+    review_entries_touched = _mark_stale_review_entries(doc)
+
+    # Create or refresh full playbook entries only for 3+ iteration reviews
     if iteration >= 3 and buckets:
         # Pick the top-2 categories by severity-weighted score (CRITICAL=3, MAJOR=2, MINOR=1)
         _severity_weights = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
@@ -869,13 +954,6 @@ async def extract_review_feedback_to_playbook(
 
         for cat_name, issues in top_cats:
             playbook_full_key = f"playbook/review-{cat_name}"
-
-            if playbook_full_key in doc:
-                logger.debug(
-                    "[REVIEW_PLAYBOOK] project=%s key='%s' already exists — skipping",
-                    task.project_id, playbook_full_key,
-                )
-                continue
 
             # Surface up to 3 highest-severity examples
             severity_order = {"CRITICAL": 0, "MAJOR": 1, "MINOR": 2}
@@ -889,11 +967,41 @@ async def extract_review_feedback_to_playbook(
                 f"Applicable to: {original_task_type} tasks."
             )
 
+            existing = doc.get(playbook_full_key)
+            if isinstance(existing, dict):
+                # Refresh existing entry: always bump hit_count; rewrite content
+                # and reset timestamp only when older than the refresh threshold.
+                entry = dict(existing)
+                entry["hit_count"] = entry.get("hit_count", 1) + 1
+
+                updated_at_str = entry.get("updated_at") or ""
+                is_stale = True
+                try:
+                    dt = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
+                    if dt.tzinfo is not None:
+                        dt = dt.replace(tzinfo=None)
+                    is_stale = (_utcnow() - dt).days >= _REVIEW_PLAYBOOK_REFRESH_DAYS
+                except (ValueError, TypeError):
+                    pass
+
+                if is_stale:
+                    entry["content"] = content
+                    entry["updated_at"] = _utcnow().isoformat()
+                    entry["source_task_id"] = str(task.id)
+                    entry["pr_number"] = pr_number
+                    entry["iteration_count"] = iteration
+                    entry.pop("potentially_stale", None)
+
+                doc[playbook_full_key] = entry
+                review_entries_touched = True
+                continue
+
             entry: dict = {
                 "content": content,
                 "source_task_id": str(task.id),
                 "updated_at": _utcnow().isoformat(),
                 "confirmed_count": 0,
+                "hit_count": 1,
                 "source": "review-extracted",
                 "applicable_types": [original_task_type],
                 "pr_number": pr_number,
@@ -907,7 +1015,7 @@ async def extract_review_feedback_to_playbook(
             doc[playbook_full_key] = entry
             created_keys.append(f"review-{cat_name}")
 
-    if created_keys or module_profiles_updated or direction_tally_updated:
+    if created_keys or module_profiles_updated or direction_tally_updated or review_entries_touched:
         meta = dict(doc.get("_meta", {"revision": 0}))
         meta["revision"] = meta.get("revision", 0) + 1
         meta["last_updated"] = _utcnow().isoformat()

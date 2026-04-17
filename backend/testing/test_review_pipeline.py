@@ -16,8 +16,11 @@ from unittest.mock import AsyncMock, patch
 from app.models import Project, Task, TaskStatus
 from app.review_pipeline import (
     MAX_REVIEW_FIX_ITERATIONS,
+    STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT,
+    STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR,
     STUCK_CYCLE_THRESHOLD_DEFAULT,
     STUCK_CYCLE_THRESHOLD_REFACTOR,
+    _feedback_jaccard,
     _max_review_iterations,
     _spawn_pipeline_task,
 )
@@ -1149,6 +1152,278 @@ async def test_edge_only_major_issues_count_for_stuck_cycle(db_session, mocker):
 
     await db_session.refresh(original_task)
     assert original_task.requires_approval is True
+
+
+# ── Stuck-cycle detection: feedback-text fallback ─────────────────────────────
+
+
+def test_feedback_jaccard_unit():
+    """_feedback_jaccard returns intersection/union over normalized tokens (≥3 chars)."""
+    assert _feedback_jaccard("", "anything") == 0.0
+    assert _feedback_jaccard("a b c", "a b c") == 0.0  # all tokens <3 chars → empty sets
+    # Identical content (after lowercasing) → 1.0
+    assert _feedback_jaccard("Null pointer in handler", "null POINTER in HANDLER") == 1.0
+    # Disjoint content → 0.0
+    assert _feedback_jaccard("memory leak", "race condition") == 0.0
+    # Partial overlap: {"missing", "error", "handling"} ∩ {"missing", "error", "checks"}
+    # → 2 / 4 = 0.5
+    assert _feedback_jaccard("missing error handling", "missing error checks") == 0.5
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_text_fallback_blocks_when_feedback_repeats(db_session, mocker):
+    """When neither prior nor current iteration carries a structured `issues` list
+    but their feedback text is highly similar (Jaccard ≥ 0.7), the fallback path
+    detects a stuck cycle and escalates for manual review."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Prior history entry has feedback only, no `issues` key — exactly the shape
+    # produced when verdict parsing falls back to log/keyword scraping.
+    prior_feedback = (
+        "Tests are failing in test_pipeline_health.py "
+        "because retry backoff exceeds the configured timeout window."
+    )
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 601, "branch": "b20", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 601,
+                "branch": "b20",
+                "base_branch": "main",
+                "review_history": [
+                    {"iteration": 0, "feedback": prior_feedback},  # no `issues` key
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Current iteration also has no structured issues, and its feedback is nearly
+    # identical to the prior iteration's — the fix agent made no progress.
+    current_feedback = (
+        "Tests are failing in test_pipeline_health.py "
+        "because retry backoff exceeds the configured timeout window now."
+    )
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=601, branch="b20", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Same failure",
+        current_feedback=current_feedback,
+        current_issues=None,  # no structured issues this iteration either
+    )
+
+    assert result is None, (
+        "Highly-similar feedback text across iterations (no structured issues on "
+        "either side) should trigger the stuck-cycle fallback"
+    )
+
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True, (
+        "Text-fallback stuck detection must escalate via requires_approval=True"
+    )
+    assert "stuck" in (original_task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_text_fallback_allows_distinct_feedback(db_session, mocker):
+    """When structured issues are absent but feedback text is genuinely different
+    between iterations, the fallback must NOT trigger — the fix agent is making
+    progress on different problems each time."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 602, "branch": "b21", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 602,
+                "branch": "b21",
+                "base_branch": "main",
+                "review_history": [
+                    {"iteration": 0, "feedback": "Linting errors in admin_settings.py"},
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=602, branch="b21", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="New problem",
+        current_feedback="Database migration produces duplicate key constraint violation",
+        current_issues=None,
+    )
+
+    assert result is not None, (
+        "Distinct feedback text must not trigger the fallback stuck-cycle path"
+    )
+    assert result.status == TaskStatus.QUEUED
+
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is not True
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_text_fallback_when_only_one_side_lacks_issues(db_session, mocker):
+    """The fallback must also fire when only ONE side lacks structured issues
+    (asymmetric case): prior has no `issues` key, current does — but neither
+    direction can run the structured comparison, so feedback similarity governs."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    prior_feedback = "Refactor breaks public interface used by external consumers"
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 603, "branch": "b22", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 603,
+                "branch": "b22",
+                "base_branch": "main",
+                "review_history": [
+                    {"iteration": 0, "feedback": prior_feedback},  # no `issues` key
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Current iteration has structured issues but with similar feedback text.
+    current_feedback = "Refactor breaks public interface used by external consumers."
+    current_issues = [_issue("interface stability", "CRITICAL")]
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=603, branch="b22", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Still breaking interface",
+        current_feedback=current_feedback,
+        current_issues=current_issues,
+    )
+
+    assert result is None, (
+        "When prior entry lacks `issues`, structured comparison cannot run; "
+        "highly-similar feedback text must trigger the fallback"
+    )
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_text_fallback_skipped_when_feedback_empty(db_session, mocker):
+    """When structured issues are absent AND one side has empty feedback, the
+    fallback cannot compute similarity and must safely allow the spawn."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 604, "branch": "b23", "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "pr_number": 604,
+                "branch": "b23",
+                "base_branch": "main",
+                "review_history": [
+                    {"iteration": 0, "feedback": ""},  # empty feedback, no issues
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=604, branch="b23", base_branch="main",
+        fix_prompt="Try again",
+        current_feedback="Some new feedback",
+        current_issues=None,
+    )
+
+    assert result is not None, (
+        "Empty prior feedback must not trigger stuck-cycle (cannot compare)"
+    )
+
+
+def test_stuck_cycle_text_threshold_constants():
+    """Tripwire: text-fallback thresholds must remain higher than the structured
+    thresholds to compensate for the noisier comparison."""
+    assert STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT == 0.7
+    assert STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR == 0.85
+    assert STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT > STUCK_CYCLE_THRESHOLD_DEFAULT
+    assert STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR > STUCK_CYCLE_THRESHOLD_REFACTOR
 
 
 # ── Strategic context propagation ─────────────────────────────────────────────

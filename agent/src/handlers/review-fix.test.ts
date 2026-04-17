@@ -60,7 +60,7 @@ vi.mock('child_process', () => ({
 import fs from 'fs';
 import { execFileSync } from 'child_process';
 import * as indexMod from '../index.js';
-import { computeMaxFixIterations, handleReview, handleFix } from './review-fix.js';
+import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS } from './review-fix.js';
 
 const statusRef = () => ({ value: '' });
 
@@ -131,6 +131,66 @@ describe('computeMaxFixIterations — mirrors backend _max_review_iterations', (
     // Empty object is the realistic edge; the guard coerces to ctx={}.
     expect(() => computeMaxFixIterations({ context: {} })).not.toThrow();
     expect(() => computeMaxFixIterations({})).not.toThrow();
+  });
+});
+
+// ── Review history text truncation: reviewer and fixer must align ───────────
+describe('review history feedback truncation — reviewer sees at least as much as fixer', () => {
+  const longFeedback = 'x'.repeat(3000);
+  const histWithStructured = [{
+    iteration: 1,
+    feedback: longFeedback,
+    issues: [{ severity: 'major', description: 'real problem', file: 'a.ts', line: 10 }],
+  }];
+  const histNoStructured = [{ iteration: 1, feedback: longFeedback }];
+
+  it('reviewer truncates fallback feedback at the shared constant (no structured issues)', async () => {
+    await handleReview(
+      'task-trunc-review',
+      { pr_number: 5, branch: 'feat/y', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'medium', review_loop: { iteration: 2, review_history: histNoStructured } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    const iterMatch = prompt.match(/- Iteration 1: (x+)/);
+    expect(iterMatch?.[1]?.length).toBe(REVIEW_FEEDBACK_HISTORY_CHARS);
+  });
+
+  it('fixer truncates fallback feedback at the same constant (no structured issues)', async () => {
+    await handleFix(
+      'task-trunc-fix',
+      { branch: 'feat/y', base_branch: 'main', pr_number: 5, prompt: 'address review' },
+      { context: { scope: 'small', review_loop: { iteration: 2, review_history: histNoStructured } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    const iterMatch = prompt.match(/- Iteration 1: (x+)/);
+    expect(iterMatch?.[1]?.length).toBe(REVIEW_FEEDBACK_HISTORY_CHARS);
+  });
+
+  it('reviewer prefers structured issues over raw feedback (no truncation applied)', async () => {
+    await handleReview(
+      'task-structured-review',
+      { pr_number: 6, branch: 'feat/z', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'medium', review_loop: { iteration: 2, review_history: histWithStructured } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+    // fallback text must NOT appear when structured issues exist
+    expect(prompt).not.toMatch(/- Iteration 1: x+/);
+  });
+
+  it('fixer prefers structured issues over raw feedback (no truncation applied)', async () => {
+    await handleFix(
+      'task-structured-fix',
+      { branch: 'feat/z', base_branch: 'main', pr_number: 6, prompt: 'address review' },
+      { context: { scope: 'small', review_loop: { iteration: 2, review_history: histWithStructured } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+    expect(prompt).not.toMatch(/- Iteration 1: x+/);
   });
 });
 

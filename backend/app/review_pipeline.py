@@ -7,6 +7,7 @@ All imports are module-level — no circular dependency risk with app.main
 or app.task_lifecycle.
 """
 import logging
+import re
 import uuid
 from datetime import timedelta
 
@@ -26,6 +27,27 @@ MAX_REVIEW_FIX_ITERATIONS = 16
 
 STUCK_CYCLE_THRESHOLD_DEFAULT = 0.5
 STUCK_CYCLE_THRESHOLD_REFACTOR = 0.75
+
+# Token-level Jaccard thresholds used by the feedback-text fallback when one or
+# both review_history entries lack a structured `issues` list (e.g. verdict
+# parsing fell back to log/keyword scraping). Set higher than the structured
+# thresholds because text comparison is noisier.
+STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT = 0.7
+STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR = 0.85
+
+_FEEDBACK_TOKEN_RE = re.compile(r"[a-z0-9_]+")
+
+
+def _feedback_token_set(text: str) -> set[str]:
+    return {t for t in _FEEDBACK_TOKEN_RE.findall(text.lower()) if len(t) >= 3}
+
+
+def _feedback_jaccard(a: str, b: str) -> float:
+    tokens_a = _feedback_token_set(a)
+    tokens_b = _feedback_token_set(b)
+    if not tokens_a or not tokens_b:
+        return 0.0
+    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
 
 # A pipeline task is considered 'stale' (effectively dead, safe to supersede)
 # when it has not heartbeated for this long. Matches the orchestrator's own
@@ -407,54 +429,73 @@ async def _spawn_pipeline_task(
             if i.get("severity", "").upper() in ("CRITICAL", "MAJOR")
             and i.get("description", "").strip()
         ]
+        # Refactor tasks get a higher threshold — structural review feedback often repeats
+        # because the fix agent cannot fully resolve architectural concerns in scope
+        source_type = (source_task.first_payload or {}).get("type", "")
+        is_refactor = source_type == "refactor"
+
+        is_stuck = False
+        stuck_detail = ""
+
         if curr_critical_major and prev_critical_major:
             matched_count = sum(
                 1 for desc in curr_critical_major
                 if desc in prev_critical_major
             )
             total_count = len(curr_critical_major)
-            # Refactor tasks get a higher threshold — structural review feedback often repeats
-            # because the fix agent cannot fully resolve architectural concerns in scope
-            source_type = (source_task.first_payload or {}).get("type", "")
-            stuck_threshold = STUCK_CYCLE_THRESHOLD_REFACTOR if source_type == "refactor" else STUCK_CYCLE_THRESHOLD_DEFAULT
+            stuck_threshold = STUCK_CYCLE_THRESHOLD_REFACTOR if is_refactor else STUCK_CYCLE_THRESHOLD_DEFAULT
             if matched_count / total_count >= stuck_threshold:
-                logger.warning(
-                    f"[PIPELINE] Stuck cycle detected for PR #{pr_number}: "
-                    f"{matched_count}/{total_count} issues repeated"
-                )
-                # resolved_original_id is always non-empty (falls back to str(source_task.id))
-                try:
-                    stuck_orig = await session.get(Task, uuid.UUID(resolved_original_id))
-                    if stuck_orig:
-                        stuck_orig.requires_approval = True
-                        stuck_orig.latest_status_message = (
-                            f"Review-fix cycle appears stuck — same issues repeated across "
-                            f"{iteration} iterations. Manual review required."
-                        )
-                        session.add(stuck_orig)
-                        await session.commit()
-                        try:
-                            import asyncio as _asyncio
-                            from app.notification_dispatch import dispatch_external_notification
-                            _asyncio.ensure_future(dispatch_external_notification(
-                                stuck_orig.project_id,
-                                "APPROVAL_NEEDED",
-                                {
-                                    "task_id": str(stuck_orig.id),
-                                    "task_title": stuck_orig.title or str(stuck_orig.id)[:8],
-                                    "pr_number": pr_number,
-                                    "iteration": iteration,
-                                    "reason": "Review-fix cycle stuck — manual review required",
-                                },
-                            ))
-                        except Exception as _ne:
-                            logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}")
-                except Exception as e:
-                    logger.warning(
-                        f"[PIPELINE] Failed to mark stuck cycle on {resolved_original_id}: {e}",
-                        exc_info=True,
+                is_stuck = True
+                stuck_detail = f"{matched_count}/{total_count} issues repeated"
+        elif not prev_issues_list or not curr_issues_list:
+            # Fallback when at least one side lacks structured issues (verdict parsing
+            # fell back to log/keyword scraping). Compare normalized feedback text.
+            prev_feedback = (prev_entry.get("feedback") or "").strip()
+            curr_feedback = (curr_entry.get("feedback") or "").strip()
+            if prev_feedback and curr_feedback:
+                similarity = _feedback_jaccard(prev_feedback, curr_feedback)
+                text_threshold = STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR if is_refactor else STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT
+                if similarity >= text_threshold:
+                    is_stuck = True
+                    stuck_detail = f"feedback similarity {similarity:.0%} ≥ {text_threshold:.0%}"
+
+        if is_stuck:
+            logger.warning(
+                f"[PIPELINE] Stuck cycle detected for PR #{pr_number}: {stuck_detail}"
+            )
+            # resolved_original_id is always non-empty (falls back to str(source_task.id))
+            try:
+                stuck_orig = await session.get(Task, uuid.UUID(resolved_original_id))
+                if stuck_orig:
+                    stuck_orig.requires_approval = True
+                    stuck_orig.latest_status_message = (
+                        f"Review-fix cycle appears stuck — same issues repeated across "
+                        f"{iteration} iterations. Manual review required."
                     )
-                return (None, False)
+                    session.add(stuck_orig)
+                    await session.commit()
+                    try:
+                        import asyncio as _asyncio
+                        from app.notification_dispatch import dispatch_external_notification
+                        _asyncio.ensure_future(dispatch_external_notification(
+                            stuck_orig.project_id,
+                            "APPROVAL_NEEDED",
+                            {
+                                "task_id": str(stuck_orig.id),
+                                "task_title": stuck_orig.title or str(stuck_orig.id)[:8],
+                                "pr_number": pr_number,
+                                "iteration": iteration,
+                                "reason": "Review-fix cycle stuck — manual review required",
+                            },
+                        ))
+                    except Exception as _ne:
+                        logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}")
+            except Exception as e:
+                logger.warning(
+                    f"[PIPELINE] Failed to mark stuck cycle on {resolved_original_id}: {e}",
+                    exc_info=True,
+                )
+            return (None, False)
 
     payload_data = validate_internal_payload(payload_data, f"review_pipeline:{task_type}:pr#{pr_number}")
     source_ctx = source_task.context or {}

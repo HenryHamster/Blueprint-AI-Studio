@@ -51,6 +51,13 @@ function fmtIssueLoc(i: { file?: string; line?: number }): string {
   return '';
 }
 
+// Truncation budget for raw review-feedback text in the per-iteration history
+// section. Used identically in the reviewer and fixer prompt builders below —
+// if they diverge, a fix agent may address feedback that the next reviewer
+// cannot see, causing false "not addressed" flags. Preferring structured
+// `issues` (which have no truncation) happens before this cap kicks in.
+export const REVIEW_FEEDBACK_HISTORY_CHARS = 1500;
+
 // Mirrors backend _max_review_iterations (review_pipeline.py): ci_failure=8,
 // small=10, medium=12, else=16. Keep in sync — if this drifts, the agent will
 // claim "FINAL attempt" at the wrong iteration and collapse targeted fixes
@@ -172,7 +179,7 @@ export async function handleReview(
           const minor = e.issues.filter(i => i.severity === 'minor').map(i => `  [MINOR]${fmtIssueLoc(i)} ${i.description}`);
           return `- Iteration ${e.iteration}:\n` + [...critical, ...major, ...minor].join('\n');
         }
-        return `- Iteration ${e.iteration}: ` + e.feedback.slice(0, 800);
+        return `- Iteration ${e.iteration}: ` + e.feedback.slice(0, REVIEW_FEEDBACK_HISTORY_CHARS);
       }).join('\n')}\n\n`
     : '';
 
@@ -395,7 +402,7 @@ export async function handleFix(
           const minor = issues.filter(i => i.severity === 'minor').map(i => `  [MINOR]${fmtIssueLoc(i)} ${i.description}`);
           return `- Iteration ${e.iteration}:\n${[...critical, ...major, ...minor].join('\n')}`;
         } else {
-          return `- Iteration ${e.iteration}: ${e.feedback.slice(0, 1500)}`;
+          return `- Iteration ${e.iteration}: ${e.feedback.slice(0, REVIEW_FEEDBACK_HISTORY_CHARS)}`;
         }
       })
       .join('\n');

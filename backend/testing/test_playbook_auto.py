@@ -1108,15 +1108,16 @@ def test_update_module_feedback_profiles_creates_new_entries():
 
 
 def test_update_module_feedback_profiles_accumulates_counts():
-    """Subsequent calls accumulate counts for already-tracked files."""
+    """Subsequent calls accumulate counts for already-tracked files within the decay grace window."""
     from app.playbook_learning import _update_module_feedback_profiles
 
+    recent = (_utcnow() - timedelta(days=1)).isoformat()
     doc: dict = {
         "module_feedback": {
             "backend/app/orchestrator.py": {
                 "test-coverage": 3,
                 "total": 3,
-                "last_updated": "2026-01-01T00:00:00",
+                "last_updated": recent,
             }
         }
     }
@@ -1129,6 +1130,71 @@ def test_update_module_feedback_profiles_accumulates_counts():
     entry = doc["module_feedback"]["backend/app/orchestrator.py"]
     assert entry["test-coverage"] == 4
     assert entry["total"] == 4
+
+
+def test_update_module_feedback_profiles_decays_stale_counts():
+    """Stale entries (last_updated past the grace window) decay before new counts are added."""
+    from app.playbook_learning import (
+        _update_module_feedback_profiles,
+        _MODULE_FEEDBACK_DECAY_AGE_DAYS,
+        _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS,
+    )
+
+    # 14-day grace + 14-day half-life = 28 days → existing counts halve.
+    stale = (
+        _utcnow()
+        - timedelta(days=_MODULE_FEEDBACK_DECAY_AGE_DAYS + _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS)
+    ).isoformat()
+    doc: dict = {
+        "module_feedback": {
+            "backend/app/orchestrator.py": {
+                "test-coverage": 10,
+                "error-handling": 4,
+                "total": 14,
+                "last_updated": stale,
+            }
+        }
+    }
+    buckets = {
+        "test-coverage": [{"desc": "missing test", "severity": "MAJOR", "iteration": 1}],
+    }
+
+    _update_module_feedback_profiles(doc, ["backend/app/orchestrator.py"], buckets)
+
+    entry = doc["module_feedback"]["backend/app/orchestrator.py"]
+    # 10 → 5 then +1 from new bucket
+    assert entry["test-coverage"] == 6
+    # 4 → 2 (no new contribution)
+    assert entry["error-handling"] == 2
+    assert entry["total"] == 8
+
+
+def test_update_module_feedback_profiles_drops_categories_that_decay_to_zero():
+    """Categories whose decayed count rounds to zero are dropped from the entry."""
+    from app.playbook_learning import _update_module_feedback_profiles
+
+    very_stale = (_utcnow() - timedelta(days=365)).isoformat()
+    doc: dict = {
+        "module_feedback": {
+            "backend/app/orchestrator.py": {
+                "test-coverage": 2,
+                "error-handling": 50,
+                "total": 52,
+                "last_updated": very_stale,
+            }
+        }
+    }
+    buckets = {
+        "test-coverage": [{"desc": "missing test", "severity": "MAJOR", "iteration": 1}],
+    }
+
+    _update_module_feedback_profiles(doc, ["backend/app/orchestrator.py"], buckets)
+
+    entry = doc["module_feedback"]["backend/app/orchestrator.py"]
+    # error-handling decayed to 0 and was dropped; test-coverage came back via the new bucket.
+    assert "error-handling" not in entry
+    assert entry["test-coverage"] == 1
+    assert entry["total"] == 1
 
 
 def test_update_module_feedback_profiles_evicts_oldest_when_over_cap():
@@ -1890,3 +1956,223 @@ async def test_extract_review_feedback_stores_learned_from_direction(db_session:
             continue  # skip first-attempt-pattern keys
         entry = doc[f"playbook/{key}"]
         assert entry.get("learned_from_direction") == direction_id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for review-extracted entry refresh and stale-marking
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_multi_iter_review_loop(desc: str = "missing unit tests") -> dict:
+    return {
+        "iteration": 3,
+        "review_history": [
+            {"iteration": 0, "issues": [{"description": desc, "severity": "MAJOR"}]},
+            {"iteration": 1, "issues": [{"description": desc, "severity": "MAJOR"}]},
+            {"iteration": 2, "issues": []},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_increments_hit_count_when_pattern_recurs(
+    db_session: AsyncSession,
+):
+    """Re-observing the same review pattern bumps hit_count on the existing entry."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    project = await _make_project(db_session, design_doc={})
+
+    async def _run(pr: int) -> Task:
+        task = Task(
+            project_id=project.id,
+            title="Task",
+            payloads=[{"type": "create", "prompt": "do"}],
+            status=TaskStatus.COMPLETED,
+            context={},
+        )
+        db_session.add(task)
+        await db_session.flush()
+        await extract_review_feedback_to_playbook(
+            task, _make_multi_iter_review_loop(), pr_number=pr,
+            original_task_type="create", session=db_session,
+        )
+        await db_session.flush()
+        return task
+
+    await _run(1)
+    doc = project.design_doc or {}
+    entry = doc["playbook/review-test-coverage"]
+    assert entry["hit_count"] == 1
+
+    await _run(2)
+    await _run(3)
+    entry = (project.design_doc or {})["playbook/review-test-coverage"]
+    assert entry["hit_count"] == 3, f"hit_count should accumulate, got {entry['hit_count']}"
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_refreshes_stale_entry(db_session: AsyncSession):
+    """Existing entry older than 30 days is refreshed with new content and timestamp."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    old_iso = (_utcnow() - timedelta(days=45)).isoformat()
+    existing_doc = {
+        "playbook/review-test-coverage": {
+            "content": "Stale content from PR #1",
+            "source": "review-extracted",
+            "applicable_types": ["create"],
+            "confirmed_count": 0,
+            "hit_count": 4,
+            "updated_at": old_iso,
+            "pr_number": 1,
+            "iteration_count": 3,
+            "scope": "universal",
+            "potentially_stale": True,
+        }
+    }
+    project = await _make_project(db_session, design_doc=existing_doc)
+
+    task = Task(
+        project_id=project.id,
+        title="Task",
+        payloads=[{"type": "create", "prompt": "do"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    await extract_review_feedback_to_playbook(
+        task, _make_multi_iter_review_loop("missing unit tests for new module"),
+        pr_number=99, original_task_type="create", session=db_session,
+    )
+    await db_session.flush()
+
+    entry = (project.design_doc or {})["playbook/review-test-coverage"]
+    assert entry["hit_count"] == 5
+    assert entry["pr_number"] == 99
+    assert "PR #99" in entry["content"]
+    assert "potentially_stale" not in entry
+    refreshed_at = datetime.fromisoformat(entry["updated_at"].replace("Z", "+00:00"))
+    if refreshed_at.tzinfo is not None:
+        refreshed_at = refreshed_at.replace(tzinfo=None)
+    assert (_utcnow() - refreshed_at).total_seconds() < 60
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_keeps_fresh_entry_content(db_session: AsyncSession):
+    """Entry younger than 30 days has hit_count bumped but content/timestamp untouched."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    fresh_iso = (_utcnow() - timedelta(days=5)).isoformat()
+    existing_doc = {
+        "playbook/review-test-coverage": {
+            "content": "Fresh content from PR #7",
+            "source": "review-extracted",
+            "applicable_types": ["create"],
+            "confirmed_count": 0,
+            "hit_count": 2,
+            "updated_at": fresh_iso,
+            "pr_number": 7,
+            "iteration_count": 3,
+            "scope": "universal",
+        }
+    }
+    project = await _make_project(db_session, design_doc=existing_doc)
+
+    task = Task(
+        project_id=project.id,
+        title="Task",
+        payloads=[{"type": "create", "prompt": "do"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    await extract_review_feedback_to_playbook(
+        task, _make_multi_iter_review_loop(),
+        pr_number=200, original_task_type="create", session=db_session,
+    )
+    await db_session.flush()
+
+    entry = (project.design_doc or {})["playbook/review-test-coverage"]
+    assert entry["hit_count"] == 3
+    assert entry["pr_number"] == 7, "fresh entry pr_number should be unchanged"
+    assert entry["updated_at"] == fresh_iso, "fresh entry timestamp should be unchanged"
+    assert entry["content"] == "Fresh content from PR #7"
+
+
+@pytest.mark.asyncio
+async def test_extract_review_feedback_marks_unobserved_entry_potentially_stale(
+    db_session: AsyncSession,
+):
+    """Entries not observed for >60 days are marked potentially_stale on next call."""
+    from app.playbook_learning import extract_review_feedback_to_playbook
+
+    very_old_iso = (_utcnow() - timedelta(days=75)).isoformat()
+    existing_doc = {
+        "playbook/review-error-handling": {
+            "content": "Old error-handling pattern",
+            "source": "review-extracted",
+            "applicable_types": ["create"],
+            "confirmed_count": 0,
+            "hit_count": 1,
+            "updated_at": very_old_iso,
+            "pr_number": 1,
+            "iteration_count": 3,
+            "scope": "universal",
+        }
+    }
+    project = await _make_project(db_session, design_doc=existing_doc)
+
+    task = Task(
+        project_id=project.id,
+        title="Task",
+        payloads=[{"type": "create", "prompt": "do"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    await extract_review_feedback_to_playbook(
+        task, _make_multi_iter_review_loop(),
+        pr_number=300, original_task_type="create", session=db_session,
+    )
+    await db_session.flush()
+
+    entry = (project.design_doc or {})["playbook/review-error-handling"]
+    assert entry.get("potentially_stale") is True
+    assert entry["updated_at"] == very_old_iso, "stale entry timestamp should not change"
+    assert entry["hit_count"] == 1
+
+
+def test_mark_stale_review_entries_ignores_non_review_and_fresh():
+    """Stale-marker only touches review-extracted entries past the 60-day threshold."""
+    from app.playbook_learning import _mark_stale_review_entries
+
+    now = _utcnow()
+    doc = {
+        "playbook/review-test-coverage": {
+            "source": "review-extracted",
+            "updated_at": (now - timedelta(days=10)).isoformat(),
+        },
+        "playbook/review-old": {
+            "source": "review-extracted",
+            "updated_at": (now - timedelta(days=90)).isoformat(),
+        },
+        "playbook/auto-bug": {
+            "source": "auto-generated",
+            "updated_at": (now - timedelta(days=120)).isoformat(),
+        },
+    }
+    changed = _mark_stale_review_entries(doc)
+    assert changed is True
+    assert doc["playbook/review-old"].get("potentially_stale") is True
+    assert "potentially_stale" not in doc["playbook/review-test-coverage"]
+    assert "potentially_stale" not in doc["playbook/auto-bug"]
+
+    # Idempotent: a second call does not re-flag.
+    assert _mark_stale_review_entries(doc) is False
