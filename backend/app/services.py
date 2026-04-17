@@ -584,8 +584,22 @@ async def _summarize_latest_review_for_chain(parent: Task, session) -> dict | No
     if not pr_number:
         return None
     try:
+        # Bound the candidate set: filter to relevant statuses and recent rows.
+        # Payload-based filtering (type/pr_number/original_task_id) still happens
+        # in Python since these live in JSONB.
         candidates = (await session.execute(
-            select(Task).where(Task.project_id == parent.project_id)
+            select(Task)
+            .where(Task.project_id == parent.project_id)
+            .where(Task.status.in_((
+                TaskStatus.QUEUED,
+                TaskStatus.PROVISIONING,
+                TaskStatus.IN_PROGRESS,
+                TaskStatus.EVALUATING,
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+            )))
+            .order_by(Task.created_at.desc())
+            .limit(100)
         )).scalars().all()
         matches = [
             t for t in candidates

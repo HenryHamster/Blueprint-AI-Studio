@@ -433,6 +433,25 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 if review_task and review_task.id != c.id:
                     respawned += 1
                     logger.warning(f"[ROLLUP] Respawned review for stale child {str(c.id)[:8]} PR #{pr_number} → review {str(review_task.id)[:8]}")
+                elif review_task is None and c.requires_approval:
+                    # Cap exhaustion: _spawn_pipeline_task sets requires_approval=True on
+                    # the child. But the child is COMPLETED, so the EVALUATING approval-gate
+                    # timeout never fires on it — the parent would otherwise wait the full
+                    # 6-hour hard timeout. Escalate: set requires_approval on the parent so
+                    # the 2-hour approval gate fires, and raise a failure alert.
+                    if not parent.requires_approval:
+                        parent.requires_approval = True
+                        logger.warning(
+                            f"[ROLLUP] Child {str(c.id)[:8]} PR #{pr_number} hit review-fix cap — "
+                            f"escalating: marked parent {parent.id} requires_approval"
+                        )
+                        try:
+                            await _maybe_create_failure_alert(
+                                parent, session,
+                                f"Rollup blocked: child PR #{pr_number} review-fix cap exhausted — manual intervention required",
+                            )
+                        except Exception as _alert_err:
+                            logger.warning(f"[ROLLUP] Failed to create cap-exhaustion alert for parent {parent.id}: {_alert_err}")
 
             titles = [c.title[:40] for c in unmerged]
             if respawned:
@@ -510,6 +529,33 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         failed_children = [c for c in children if c.status == TaskStatus.FAILED]
         failed_count = len(failed_children)
         completed_count = len(children) - cancelled_count - failed_count
+
+        # Guard: _verify_pr_merged may have flipped COMPLETED children to FAILED
+        # (e.g. PR closed without merging) after the all_done loop evaluated their
+        # status. If every non-cancelled child is now FAILED, there is nothing
+        # to roll up — fail the parent instead of creating an empty rollup PR
+        # that would trip the zero-diff guard and spuriously mark it COMPLETED.
+        if completed_count == 0 and failed_count > 0:
+            parent.status = TaskStatus.FAILED
+            parent.latest_status_message = (
+                f"{failed_count} of {len(children)} subtask(s) failed, none succeeded"
+            )
+            from app.failure_classification import worst_child_failure_category, persist_failure_category  # noqa: PLC0415
+            persist_failure_category(parent, worst_child_failure_category(failed_children))
+            session.add(parent)
+            await _maybe_create_failure_alert(
+                parent, session,
+                f"{failed_count} subtasks failed, none succeeded"
+            )
+            await session.commit()
+            await broadcast_to_project(str(parent.project_id), "task_updated",
+                {"task_id": str(parent.id), "status": TaskStatus.FAILED})
+            logger.error(
+                f"[ROLLUP] Parent {parent.id} — all {failed_count} non-cancelled "
+                f"children failed after PR verification, marking parent FAILED"
+            )
+            return
+
         rollup_note = ""
         if cancelled_count > 0:
             rollup_note += f"\n\n*{cancelled_count} subtask(s) were cancelled and excluded from this rollup.*"
