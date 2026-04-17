@@ -387,12 +387,12 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             # All children terminal and none succeeded — they're all CANCELLED
             # (if any were FAILED, retried_count would be > 0).  Nothing to
             # recover from; mark parent FAILED so reaper Step 4 stops looping.
-            from app.failure_classification import persist_failure_category
+            from app.failure_classification import AGENT_TIMEOUT, persist_failure_category
             parent.status = TaskStatus.FAILED
             parent.latest_status_message = (
                 "No failed subtasks to retry and no successful subtasks to roll up"
             )
-            persist_failure_category(parent, "UNKNOWN")
+            persist_failure_category(parent, AGENT_TIMEOUT)
             session.add(parent)
             await session.commit()
             await _maybe_create_failure_alert(parent, session, parent.latest_status_message)

@@ -1178,6 +1178,9 @@ async def test_pipeline_dedup_cancels_when_sibling_already_running(db_session, m
     await db_session.refresh(candidate)
     assert candidate.status == TaskStatus.CANCELLED
     assert "Deduplicated" in (candidate.latest_status_message or "")
+    # Cancelled candidate must carry an infra failure_category so rollup parents
+    # don't get upgraded to CODE_ERROR by worst_child_failure_category.
+    assert (candidate.context or {}).get("failure_category") == "AGENT_TIMEOUT"
     # Sibling must not be touched.
     await db_session.refresh(running)
     assert running.status == TaskStatus.IN_PROGRESS
@@ -1221,6 +1224,7 @@ async def test_pipeline_dedup_keeps_oldest_queued_cancels_newer(db_session, mock
     assert newer.id not in result, "Newer duplicate must be filtered"
     await db_session.refresh(newer)
     assert newer.status == TaskStatus.CANCELLED
+    assert (newer.context or {}).get("failure_category") == "AGENT_TIMEOUT"
 
 
 @pytest.mark.asyncio
@@ -1298,3 +1302,131 @@ async def test_pipeline_dedup_different_pr_numbers_pass_through(db_session, mock
         [a.id, b.id], [a, b], db_session, broadcast_mock
     )
     assert set(result) == {a.id, b.id}
+
+
+# ── _spawn_pipeline_task: supersession paths persist AGENT_TIMEOUT ─────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_pipeline_supersedes_stale_task_with_agent_timeout(db_session, mocker):
+    """A review/fix candidate older than PIPELINE_TASK_STALE_MINUTES with no
+    heartbeat is superseded: status flips to CANCELLED and failure_category
+    must be AGENT_TIMEOUT so rollup parents don't treat it as a code defect."""
+    from datetime import timedelta
+    from app.review_pipeline import PIPELINE_TASK_STALE_MINUTES, _utcnow
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Stale in-flight review with no heartbeat for > threshold.
+    stale_started = _utcnow() - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES + 5)
+    stale_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 701, "branch": "feat/s",
+                   "base_branch": "main", "original_task_id": str(original_task.id)}],
+        started_at=stale_started,
+        last_heartbeat=None,
+    )
+    db_session.add(stale_review)
+
+    # Source task driving a fresh review spawn on the same chain.
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 701, "branch": "feat/s",
+                   "base_branch": "main", "prompt": "Build X"}],
+        context={"scope": "small", "review_loop": {"iteration": 0,
+                                                    "original_task_id": str(original_task.id)}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(stale_review)
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=701, branch="feat/s", base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    await db_session.commit()
+
+    assert created is True and result is not None, "Fresh review must spawn after supersession"
+    await db_session.refresh(stale_review)
+    assert stale_review.status == TaskStatus.CANCELLED
+    assert "Superseded" in (stale_review.latest_status_message or "")
+    assert (stale_review.context or {}).get("failure_category") == "AGENT_TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_spawn_fix_cancels_in_flight_review_with_agent_timeout(db_session, mocker):
+    """When a fix is spawned on a chain that has an in-flight review, the review
+    is cancelled (snapshot is stale). The cancelled review must carry
+    failure_category=AGENT_TIMEOUT so it doesn't poison rollup classification."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Fresh in-flight review (not stale — has a recent heartbeat).
+    in_flight_review = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 702, "branch": "feat/r",
+                   "base_branch": "main", "original_task_id": str(original_task.id)}],
+        started_at=_utcnow_for_test(),
+        last_heartbeat=_utcnow_for_test(),
+    )
+    db_session.add(in_flight_review)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 702, "branch": "feat/r",
+                   "base_branch": "main", "prompt": "Build X"}],
+        context={"scope": "small", "review_loop": {"iteration": 0,
+                                                    "original_task_id": str(original_task.id)}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(in_flight_review)
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=702, branch="feat/r", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Resolve issues",
+    )
+    await db_session.commit()
+
+    assert created is True and result is not None, "Fresh fix must spawn after cancelling review"
+    await db_session.refresh(in_flight_review)
+    assert in_flight_review.status == TaskStatus.CANCELLED
+    assert "Superseded by fix" in (in_flight_review.latest_status_message or "")
+    assert (in_flight_review.context or {}).get("failure_category") == "AGENT_TIMEOUT"
+
+
+def _utcnow_for_test():
+    """Naive UTC timestamp matching app/time_utils.py _utcnow()."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).replace(tzinfo=None)

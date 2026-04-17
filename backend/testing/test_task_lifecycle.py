@@ -396,7 +396,9 @@ async def test_requeue_all_cancelled_children_marks_parent_failed(tl_db):
     await session.refresh(parent)
     assert parent.status == TaskStatus.FAILED
     assert "No failed subtasks to retry" in (parent.latest_status_message or "")
-    assert parent.context.get("failure_category") == "UNKNOWN"
+    # Must be a valid _SEVERITY key so worst_child_failure_category ranks it
+    # correctly; the prior "UNKNOWN" literal silently fell back to CODE_ERROR.
+    assert parent.context.get("failure_category") == "AGENT_TIMEOUT"
 
 
 @pytest.mark.asyncio

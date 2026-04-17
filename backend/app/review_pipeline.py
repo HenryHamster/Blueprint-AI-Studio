@@ -184,11 +184,13 @@ async def _spawn_pipeline_task(
             continue
 
         if _is_pipeline_task_stale(t):
+            from app.failure_classification import AGENT_TIMEOUT, persist_failure_category  # noqa: PLC0415
             t.status = TaskStatus.CANCELLED
             t.latest_status_message = (
                 f"Superseded by new {task_type} for PR #{pr_number}: "
                 f"no heartbeat for >{PIPELINE_TASK_STALE_MINUTES}min"
             )
+            persist_failure_category(t, AGENT_TIMEOUT)
             session.add(t)
             logger.warning(
                 f"[PIPELINE] Superseding stale {t_type} task {t.id} "
@@ -210,11 +212,13 @@ async def _spawn_pipeline_task(
             return (t, False)
 
         if task_type == "fix" and t_type == "review":
+            from app.failure_classification import AGENT_TIMEOUT, persist_failure_category  # noqa: PLC0415
             t.status = TaskStatus.CANCELLED
             t.latest_status_message = (
                 f"Superseded by fix on PR #{pr_number}: review was scoped to "
                 f"a pre-conflict / pre-CI-failure snapshot"
             )
+            persist_failure_category(t, AGENT_TIMEOUT)
             session.add(t)
             logger.warning(
                 f"[PIPELINE] Cancelling in-flight review {t.id} on PR #{pr_number} "

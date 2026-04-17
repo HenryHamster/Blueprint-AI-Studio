@@ -320,12 +320,14 @@ async def filter_pipeline_duplicates(
         # (a) Any other task is already claimed → cancel this one.
         running_other = next((t for t in others if t.status in RUNNING), None)
         if running_other:
+            from app.failure_classification import AGENT_TIMEOUT, persist_failure_category  # noqa: PLC0415
             candidate.status = TaskStatus.CANCELLED
             candidate.latest_status_message = (
                 f"Deduplicated: {fp.get('type')} task {str(running_other.id)[:8]} "
                 f"is already {running_other.status.value if hasattr(running_other.status, 'value') else running_other.status} "
                 f"on PR #{fp.get('pr_number')}"
             )
+            persist_failure_category(candidate, AGENT_TIMEOUT)
             session.add(candidate)
             try:
                 await broadcast_fn(str(candidate.project_id), "task_updated",
@@ -345,11 +347,13 @@ async def filter_pipeline_duplicates(
         if queued_others:
             oldest_queued = min(queued_others, key=lambda t: (t.created_at, t.id))
             if (candidate.created_at, candidate.id) > (oldest_queued.created_at, oldest_queued.id):
+                from app.failure_classification import AGENT_TIMEOUT, persist_failure_category  # noqa: PLC0415
                 candidate.status = TaskStatus.CANCELLED
                 candidate.latest_status_message = (
                     f"Deduplicated: older QUEUED {fp.get('type')} task "
                     f"{str(oldest_queued.id)[:8]} already exists on PR #{fp.get('pr_number')}"
                 )
+                persist_failure_category(candidate, AGENT_TIMEOUT)
                 session.add(candidate)
                 try:
                     await broadcast_fn(str(candidate.project_id), "task_updated",
