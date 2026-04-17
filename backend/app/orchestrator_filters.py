@@ -122,6 +122,7 @@ async def filter_rollup_conflicts(
     )).scalars().all()
     if not eval_parent_ids:
         return eligible_ids
+    eval_parent_id_set = set(eval_parent_ids)
 
     pending_children = (await session.execute(
         select(Task).where(
@@ -147,6 +148,15 @@ async def filter_rollup_conflicts(
     for eid in eligible_ids:
         candidate = next((t for t in candidate_tasks if t.id == eid), None)
         if not candidate:
+            non_rollup_conflicting.append(eid)
+            continue
+        # Siblings of the rollup parent (review/fix/ci tasks for sibling PRs, or
+        # intra-tree refactors) live on the same rollup branch and are part of
+        # the rollup itself — not external work blocked by it. Deferring them
+        # would deadlock the rollup: e.g. a review task for a child's PR shares
+        # related_files with that child by construction, so blocking it would
+        # prevent the review that's required to land the child into the rollup.
+        if candidate.parent_task_id in eval_parent_id_set:
             non_rollup_conflicting.append(eid)
             continue
         # Only check rollup conflicts within the same project
