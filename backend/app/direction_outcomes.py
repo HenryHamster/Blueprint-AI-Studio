@@ -222,17 +222,33 @@ async def _update_direction_research_outcomes(
             entry["product_ratio"] = round(product_count / total_typed, 2) if total_typed > 0 else 0.0
             entry["structural_count"] = structural_count
 
-            # Track per-scope merge rates so research agents can calibrate scope assignments
+            # Track per-scope merge rates so research agents can calibrate scope assignments.
+            # calibrated_in: tasks calibrated INTO this scope from a larger one (counted at the
+            # effective scope). calibrated_out: tasks originally proposed at this scope but
+            # calibrated to a smaller one (counted at the original scope).
             scope_breakdown: dict = {}
+
+            def _ensure_scope(s: str) -> None:
+                if s not in scope_breakdown:
+                    scope_breakdown[s] = {
+                        "created": 0, "merged": 0, "failed": 0,
+                        "calibrated_in": 0, "calibrated_out": 0,
+                    }
+
             for ct in child_tasks_rows:
-                scope = (ct.context or {}).get("scope", "unknown")
-                if scope not in scope_breakdown:
-                    scope_breakdown[scope] = {"created": 0, "merged": 0, "failed": 0}
+                ctx_ = ct.context or {}
+                scope = ctx_.get("scope", "unknown")
+                _ensure_scope(scope)
                 scope_breakdown[scope]["created"] += 1
-                if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged"):
+                if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):
                     scope_breakdown[scope]["merged"] += 1
                 if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
                     scope_breakdown[scope]["failed"] += 1
+                calibrated_from = ctx_.get("scope_calibrated_from")
+                if calibrated_from:
+                    scope_breakdown[scope]["calibrated_in"] += 1
+                    _ensure_scope(calibrated_from)
+                    scope_breakdown[calibrated_from]["calibrated_out"] += 1
             entry["scope_breakdown"] = scope_breakdown
 
             # Maintain research_context: promote proposed findings based on outcomes

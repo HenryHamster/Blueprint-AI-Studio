@@ -620,9 +620,11 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 continue
             for scope, counts in sb.items():
                 if scope not in target:
-                    target[scope] = {"created": 0, "merged": 0}
+                    target[scope] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
                 target[scope]["created"] += counts.get("created") or 0
                 target[scope]["merged"] += counts.get("merged") or 0
+                target[scope]["calibrated_in"] += counts.get("calibrated_in") or 0
+                target[scope]["calibrated_out"] += counts.get("calibrated_out") or 0
 
     all_scopes = set(_scope_cur) | set(_scope_prev)
     scope_merge_rates: Dict[str, Any] = {}
@@ -647,6 +649,10 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
             "prev_rate": prev_rate,
             "delta": delta,
             "trend": scope_trend,
+            "created": cur_created,
+            "merged": cur.get("merged", 0),
+            "calibrated_in": cur.get("calibrated_in", 0),
+            "calibrated_out": cur.get("calibrated_out", 0),
         }
 
     # Medium-scope review iterations: average iteration count for medium-scope terminal tasks
@@ -1091,16 +1097,20 @@ async def get_digest(
                                 merge_time_values.append(float(atm))
                             for scope, stats in (entry.get("scope_breakdown") or {}).items():
                                 if scope not in dir_scope_agg:
-                                    dir_scope_agg[scope] = {"created": 0, "merged": 0, "failed": 0}
+                                    dir_scope_agg[scope] = {"created": 0, "merged": 0, "failed": 0, "calibrated_in": 0, "calibrated_out": 0}
                                 dir_scope_agg[scope]["created"] += stats.get("created", 0)
                                 dir_scope_agg[scope]["merged"] += stats.get("merged", 0)
                                 dir_scope_agg[scope]["failed"] += stats.get("failed", 0)
+                                dir_scope_agg[scope]["calibrated_in"] += stats.get("calibrated_in", 0)
+                                dir_scope_agg[scope]["calibrated_out"] += stats.get("calibrated_out", 0)
                         elif entry_ts >= prev_window_start:
                             for scope, stats in (entry.get("scope_breakdown") or {}).items():
                                 if scope not in prev_dir_scope_agg:
-                                    prev_dir_scope_agg[scope] = {"created": 0, "merged": 0}
+                                    prev_dir_scope_agg[scope] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
                                 prev_dir_scope_agg[scope]["created"] += stats.get("created", 0)
                                 prev_dir_scope_agg[scope]["merged"] += stats.get("merged", 0)
+                                prev_dir_scope_agg[scope]["calibrated_in"] += stats.get("calibrated_in", 0)
+                                prev_dir_scope_agg[scope]["calibrated_out"] += stats.get("calibrated_out", 0)
                     except (ValueError, TypeError):
                         pass
 
@@ -1138,14 +1148,18 @@ async def get_digest(
                 # Accumulate into project-level scope rate aggregates
                 for _s, _st in dir_scope_agg.items():
                     if _s not in scope_merge_rates:
-                        scope_merge_rates[_s] = {"created": 0, "merged": 0}
+                        scope_merge_rates[_s] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
                     scope_merge_rates[_s]["created"] += _st["created"]
                     scope_merge_rates[_s]["merged"] += _st["merged"]
+                    scope_merge_rates[_s]["calibrated_in"] += _st.get("calibrated_in", 0)
+                    scope_merge_rates[_s]["calibrated_out"] += _st.get("calibrated_out", 0)
                 for _s, _st in prev_dir_scope_agg.items():
                     if _s not in prev_scope_merge_rates:
-                        prev_scope_merge_rates[_s] = {"created": 0, "merged": 0}
+                        prev_scope_merge_rates[_s] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
                     prev_scope_merge_rates[_s]["created"] += _st["created"]
                     prev_scope_merge_rates[_s]["merged"] += _st["merged"]
+                    prev_scope_merge_rates[_s]["calibrated_in"] += _st.get("calibrated_in", 0)
+                    prev_scope_merge_rates[_s]["calibrated_out"] += _st.get("calibrated_out", 0)
 
                 direction_progress_list.append({
                     "direction_id": did,

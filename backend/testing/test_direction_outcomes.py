@@ -599,6 +599,54 @@ async def test_scope_breakdown_per_scope_counters(db_session: AsyncSession):
     assert sb["unknown"]["created"] == 1
 
 
+@pytest.mark.asyncio
+async def test_scope_breakdown_tracks_calibration(db_session: AsyncSession):
+    """A task with scope=small + scope_calibrated_from=medium increments small.calibrated_in
+    and medium.calibrated_out so consumers see scope ambition vs effective scope."""
+    direction_id = "d-calibrate"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    # Calibrated task: proposed medium, ran as small, merged
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "small", "scope_calibrated_from": "medium"},
+        payloads=[{"type": "create"}],
+        title="calibrated",
+    )
+    # Non-calibrated small task
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"scope": "small"},
+        payloads=[{"type": "create"}],
+        title="plain-small",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    sb = project.directions[0]["research_history"][0]["scope_breakdown"]
+    assert sb["small"]["created"] == 2
+    assert sb["small"]["calibrated_in"] == 1
+    assert sb["small"]["calibrated_out"] == 0
+    # medium gets a calibrated_out entry even though no task ran AT medium
+    assert sb["medium"]["created"] == 0
+    assert sb["medium"]["calibrated_in"] == 0
+    assert sb["medium"]["calibrated_out"] == 1
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Co-change affinity index
 # ─────────────────────────────────────────────────────────────────────────────
