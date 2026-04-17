@@ -6,6 +6,7 @@ import {
   mapSubtaskToSpawnPayload,
   classifyFailureCategory,
   buildScopeCalibrationSignal,
+  formatCochangeHints,
 } from './research-plan.js';
 
 describe('calcMessageAge', () => {
@@ -396,5 +397,52 @@ describe('buildScopeCalibrationSignal', () => {
     const result = buildScopeCalibrationSignal(history);
     expect(result).toContain('CODE_ERROR');
     expect(result).not.toContain('Scope success');
+  });
+});
+
+describe('formatCochangeHints', () => {
+  it('returns empty string when direction context is undefined', () => {
+    expect(formatCochangeHints(undefined)).toBe('');
+  });
+
+  it('returns empty string when cochange_hints is missing', () => {
+    expect(formatCochangeHints({ other: 'data' })).toBe('');
+  });
+
+  it('returns empty string when cochange_hints is empty', () => {
+    expect(formatCochangeHints({ cochange_hints: {} })).toBe('');
+  });
+
+  it('renders deduplicated pairs sorted by score (highest first)', () => {
+    const ctx = {
+      cochange_hints: {
+        'a.py': { 'b.py': 1.5, 'c.py': 3.0 },
+        'b.py': { 'a.py': 1.5 },
+        'c.py': { 'a.py': 3.0 },
+      },
+    };
+    const result = formatCochangeHints(ctx);
+    expect(result).toContain('Co-Change Affinity Hints');
+    // Each pair appears once (deduplicated)
+    const aBMatches = result.match(/a\.py.*b\.py/g) || [];
+    const aCMatches = result.match(/a\.py.*c\.py/g) || [];
+    expect(aBMatches.length).toBe(1);
+    expect(aCMatches.length).toBe(1);
+    // Higher-affinity pair comes first
+    expect(result.indexOf('c.py')).toBeLessThan(result.indexOf('b.py'));
+    expect(result).toContain('affinity: 3');
+    expect(result).toContain('affinity: 1.5');
+  });
+
+  it('skips non-numeric scores gracefully', () => {
+    const ctx = {
+      cochange_hints: {
+        'a.py': { 'b.py': 'not-a-number' as unknown as number, 'c.py': 2.0 },
+      },
+    };
+    const result = formatCochangeHints(ctx);
+    expect(result).toContain('a.py');
+    expect(result).toContain('c.py');
+    expect(result).not.toContain('b.py');
   });
 });

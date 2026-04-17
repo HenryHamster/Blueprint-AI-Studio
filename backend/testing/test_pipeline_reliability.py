@@ -1091,6 +1091,156 @@ async def test_ci_polling_non_dirty_state_continues_without_fix_spawn(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Test 5c — CI polling 'behind' update-branch retry budget
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_ci_polling_behind_update_branch_failure_defers_without_fix_spawn(
+    orch_db, mocker,
+):
+    """When CI polling sees mergeable_state='behind' and update_branch fails
+    transiently, the orchestrator must defer to the next sweep (track a retry
+    counter) rather than burning a fix iteration. A single transient API
+    failure must not cost a review/fix cycle."""
+    session, _Session = orch_db
+    task = await _make_ci_waiting_task(session, pr_number=601, project_name="CI Behind Defer")
+    task_id = task.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "open", "merged": False,
+                               "mergeable": False, "mergeable_state": "behind",
+                               "head": {"sha": "sha-behind"}})
+    update_mock = mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new=AsyncMock(return_value={"updated": False, "message": "GitHub 500 temp"}),
+    )
+    spawn_mock = mocker.patch("app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock)
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    await _run_one_cycle(mocker)
+
+    from sqlmodel import select as _select
+    async with _Session() as verify:
+        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+
+    assert t.status == TaskStatus.EVALUATING
+    rl = (t.context or {}).get("review_loop", {})
+    assert rl.get("_behind_update_retries") == 1, rl
+    assert rl.get("ci_waiting") is True
+    assert update_mock.await_count == 1
+    spawn_mock.assert_not_called()
+    alert_mock.assert_not_called()
+    msg = (t.latest_status_message or "").lower()
+    assert "behind" in msg and "retrying" in msg
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_behind_update_branch_exhausted_spawns_fix_with_alert(
+    orch_db, mocker,
+):
+    """Once the behind-update retry budget is exhausted, the orchestrator falls
+    through to fix spawn AND fires an alert. The fix prompt must describe the
+    behind state, not nonexistent merge conflicts."""
+    session, _Session = orch_db
+    # Tight budget keeps the test compact.
+    mocker.patch.dict("app.shared_state.runtime_config", {"ci_behind_update_retries": 2})
+
+    task = await _make_ci_waiting_task(session, pr_number=602, project_name="CI Behind Exhaust")
+    task_id = task.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "open", "merged": False,
+                               "mergeable": False, "mergeable_state": "behind",
+                               "head": {"sha": "sha-behind-2"}})
+    mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new=AsyncMock(return_value={"updated": False, "message": "GitHub 500 temp"}),
+    )
+    mocker.patch("app.github.get_check_runs_cached",
+                 new=AsyncMock(return_value={"status": "in_progress"}))
+    # A truthy fix_task is needed for the spawn-success branch — the orchestrator
+    # only reads .id from the returned object.
+    from types import SimpleNamespace
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(SimpleNamespace(id="fix-task-7"), True)),
+    )
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    # Sweep 1 — counter=1, defers under budget
+    await _run_one_cycle(mocker)
+    from sqlmodel import select as _select
+    async with _Session() as verify:
+        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+    assert (t.context or {}).get("review_loop", {}).get("_behind_update_retries") == 1
+    spawn_mock.assert_not_called()
+    alert_mock.assert_not_called()
+
+    # Sweep 2 — counter would hit 2, meets budget, falls through to fix spawn + alert
+    await _run_one_cycle(mocker)
+    async with _Session() as verify:
+        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+
+    assert spawn_mock.await_count == 1, "fix task must spawn once budget is exhausted"
+    assert alert_mock.await_count == 1
+    alert_msg = alert_mock.await_args.args[2]
+    assert "behind" in alert_msg.lower()
+    assert "update_branch" in alert_msg.lower()
+
+    # Fix prompt must describe behind state, NOT merge conflicts
+    fix_prompt = spawn_mock.await_args.kwargs.get("fix_prompt", "")
+    assert "BEHIND" in fix_prompt, fix_prompt
+    assert "UNMERGEABLE" not in fix_prompt
+    assert "merge conflicts against" not in fix_prompt
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_behind_update_branch_success_clears_retry_counter(
+    orch_db, mocker,
+):
+    """A prior transient update_branch failure leaves a counter in review_loop;
+    when update_branch later succeeds, the counter must reset so a future
+    behind state starts from zero."""
+    session, _Session = orch_db
+    task = await _make_ci_waiting_task(session, pr_number=603, project_name="CI Behind Reset")
+    # Seed a prior retry counter.
+    rl = dict((task.context or {}).get("review_loop", {}))
+    rl["_behind_update_retries"] = 2
+    task.context = {**(task.context or {}), "review_loop": rl}
+    session.add(task)
+    await session.commit()
+    task_id = task.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "open", "merged": False,
+                               "mergeable": False, "mergeable_state": "behind",
+                               "head": {"sha": "sha-behind-3"}})
+    mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new=AsyncMock(return_value={"updated": True, "message": "branch updated"}),
+    )
+    spawn_mock = mocker.patch("app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock)
+
+    await _run_one_cycle(mocker)
+
+    from sqlmodel import select as _select
+    async with _Session() as verify:
+        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+    rl = (t.context or {}).get("review_loop", {})
+    assert "_behind_update_retries" not in rl, (
+        f"successful update_branch must clear the retry counter; got rl={rl!r}"
+    )
+    assert rl.get("ci_waiting") is True
+    spawn_mock.assert_not_called()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Test 6 — Deadlock detection clears failed dependencies
 # ══════════════════════════════════════════════════════════════════════════════
 

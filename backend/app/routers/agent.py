@@ -1345,6 +1345,25 @@ async def claim_task(
                         response["project_context"] = {}
                     response["project_context"]["cochange_files"] = [f for f, _ in top_cochange]
 
+    # Inject within-set co-change affinity hints for plan tasks so the planner
+    # can group high-affinity files into the same subtask and split low-affinity
+    # files into independent ones. Only pairs where both files are in the
+    # finding's related_files and score >= 1.0 are surfaced.
+    if task_type == "plan" and project_for_playbook:
+        plan_related_files = (task.context or {}).get("related_files", [])
+        if plan_related_files:
+            cochange_index = (project_for_playbook.design_doc or {}).get("cochange_index") or {}
+            cochange_hints: dict[str, dict[str, float]] = {}
+            related_set = set(plan_related_files)
+            for rf in plan_related_files:
+                for co_file, score in (cochange_index.get(rf) or {}).items():
+                    if co_file in related_set and isinstance(score, (int, float)) and score >= 1.0:
+                        cochange_hints.setdefault(rf, {})[co_file] = round(float(score), 3)
+            if cochange_hints:
+                if "direction_context" not in response:
+                    response["direction_context"] = {}
+                response["direction_context"]["cochange_hints"] = cochange_hints
+
     # Inject per-module review feedback warnings for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
         module_feedback = (project_for_playbook.design_doc or {}).get("module_feedback")

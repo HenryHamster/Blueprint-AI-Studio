@@ -180,6 +180,29 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
   return line1 + line2 + line3;
 }
 
+export function formatCochangeHints(directionCtx: Record<string, unknown> | undefined): string {
+  if (!directionCtx) return '';
+  const rawHints = directionCtx.cochange_hints;
+  if (!rawHints || typeof rawHints !== 'object') return '';
+  const seen = new Set<string>();
+  const pairs: Array<[string, string, number]> = [];
+  for (const [fileA, affinities] of Object.entries(rawHints as Record<string, unknown>)) {
+    if (!affinities || typeof affinities !== 'object') continue;
+    for (const [fileB, scoreRaw] of Object.entries(affinities as Record<string, unknown>)) {
+      const score = typeof scoreRaw === 'number' ? scoreRaw : Number(scoreRaw);
+      if (!Number.isFinite(score)) continue;
+      const key = [fileA, fileB].sort().join('|');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      pairs.push([fileA, fileB, score]);
+    }
+  }
+  if (pairs.length === 0) return '';
+  pairs.sort((a, b) => b[2] - a[2]);
+  const lines = pairs.map(([a, b, s]) => `- ${a} \u2194 ${b} (affinity: ${s})`);
+  return `## Co-Change Affinity Hints\n\nBased on prior merged PRs, these files in your task's scope have historically changed together. Prefer to keep high-affinity pairs in the same subtask; files without listed affinity can safely be split into independent subtasks.\n\n${lines.join('\n')}\n\n`;
+}
+
 export function mapSubtaskToSpawnPayload(st: Record<string, unknown>, baseBranch: string): Record<string, unknown> {
   return {
     title: strVal(st.title, 'Untitled subtask'),
@@ -226,8 +249,9 @@ export async function handlePlan(
   const planPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const planRetryContext = buildRetryContext(task);
   const planFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
+  const cochangeHintsSection = formatCochangeHints(task.direction_context as Record<string, unknown> | undefined);
 
-  const planPrompt = `${claudeMdPrefix}${planPlaybookSection}${planRetryContext}${contextPrefix}You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
+  const planPrompt = `${claudeMdPrefix}${planPlaybookSection}${planRetryContext}${contextPrefix}${cochangeHintsSection}You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
 
 Task to decompose:
 ${prompt}

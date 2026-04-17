@@ -15,6 +15,29 @@ from app.failure_classification import INFRA_CLASSES, classify_failure as _class
 from app.models import Project, Task, TaskStatus
 
 
+def _longest_chain_length(deps_map: dict[str, list[str]]) -> int:
+    """Longest path length in a subtask dependency DAG.
+
+    deps_map keys are subtask UUID strings; values are lists of UUID strings
+    that the key depends on. Returns 0 when the map is empty. Self-references
+    and external IDs are filtered out; cycles are broken (counted as 0).
+    """
+    memo: dict[str, int] = {}
+    nodes = set(deps_map.keys())
+
+    def depth(n: str, stack: frozenset) -> int:
+        if n in memo:
+            return memo[n]
+        if n in stack:
+            return 0
+        inner = stack | {n}
+        ds = [d for d in deps_map.get(n, []) if d in nodes and d != n]
+        memo[n] = 1 + max((depth(d, inner) for d in ds), default=0)
+        return memo[n]
+
+    return max((depth(n, frozenset()) for n in nodes), default=0)
+
+
 def _update_cochange_index(project: Project, merged_files_lists: list[list[str]]) -> None:
     """Update the co-change affinity index in project.design_doc.
 
@@ -250,6 +273,58 @@ async def _update_direction_research_outcomes(
                     _ensure_scope(calibrated_from)
                     scope_breakdown[calibrated_from]["calibrated_out"] += 1
             entry["scope_breakdown"] = scope_breakdown
+
+            # Decomposition quality: per plan-parent metrics so future calibration
+            # can correlate decomposition shape (breadth, file overlap, cross-module
+            # coupling, dep depth) with subtask merge success.
+            plan_child_ids = [
+                ct.id for ct in child_tasks_rows
+                if (ct.first_payload or {}).get("type") == "plan"
+                and ct.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+            ]
+            decomposition_quality: list = []
+            if plan_child_ids:
+                subtask_rows = (await session.execute(
+                    select(Task).where(Task.parent_task_id.in_(plan_child_ids))
+                )).scalars().all()
+                by_parent: dict = {}
+                for st in subtask_rows:
+                    by_parent.setdefault(st.parent_task_id, []).append(st)
+                for plan_id, sts in by_parent.items():
+                    merged_ct = sum(
+                        1 for st in sts
+                        if st.status == TaskStatus.COMPLETED and (st.context or {}).get("pr_merged")
+                    )
+                    failed_nc = sum(
+                        1 for st in sts
+                        if st.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+                        and _classify_failure(st) not in INFRA_CLASSES
+                    )
+                    file_counts = [
+                        len((st.context or {}).get("_pr_changed_files") or [])
+                        for st in sts
+                        if (st.context or {}).get("_pr_changed_files")
+                    ]
+                    cross_mod = sum(
+                        1 for st in sts
+                        if len({
+                            f.split("/", 1)[0]
+                            for f in ((st.context or {}).get("_pr_changed_files") or [])
+                            if "/" in f
+                        }) >= 2
+                    )
+                    deps_map = {str(st.id): list(st.depends_on or []) for st in sts}
+                    denom = merged_ct + failed_nc
+                    decomposition_quality.append({
+                        "plan_task_id": str(plan_id),
+                        "subtask_count": len(sts),
+                        "subtask_merge_rate": round(merged_ct / denom, 3) if denom > 0 else None,
+                        "avg_files_per_subtask": round(sum(file_counts) / len(file_counts), 2) if file_counts else 0.0,
+                        "max_files_in_subtask": max(file_counts) if file_counts else 0,
+                        "dependency_depth": _longest_chain_length(deps_map),
+                        "cross_module_count": cross_mod,
+                    })
+            entry["decomposition_quality"] = decomposition_quality
 
             # Maintain research_context: promote proposed findings based on outcomes
             ctx = d.get("research_context", "")

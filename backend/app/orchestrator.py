@@ -2037,6 +2037,7 @@ async def orchestrator_worker():
                             # 'unstable' means CI is failing but the PR is mergeable,
                             # 'unknown' means GitHub is still computing.
                             _ms = (pr_data.get("mergeable_state") or "").lower()
+                            _behind_fallthrough = False
                             if _ms == "behind":
                                 # Trivially resolvable via GitHub's update-branch API.
                                 # Update the branch in-place; the merge-commit
@@ -2053,14 +2054,54 @@ async def orchestrator_worker():
                                     # Force a refetch next cycle so mergeable/head_sha refresh.
                                     ci_loop["polls_since_pr_fetch"] = 999
                                     ci_loop["head_sha"] = ""
+                                    # Reset behind-retry counter — any prior transient failures resolved.
+                                    ci_loop.pop("_behind_update_retries", None)
+                                    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
                                     ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                    flag_modified(ci_task, "context")
                                     session.add(ci_task)
                                     await session.commit()
                                     await broadcast_to_project(str(ci_task.project_id), "task_updated",
                                                                {"task_id": str(ci_task.id), "status": ci_task.status})
                                     logger.info(f"[CI] PR #{ci_pr_number} behind base — update_branch succeeded, skipped fix spawn")
                                     continue
-                                logger.info(f"[CI] PR #{ci_pr_number} behind base but update_branch failed: {_upd.get('message')} — falling through to fix spawn")
+                                # update_branch failed — likely a transient GitHub API error,
+                                # not a real merge conflict. Defer to the next CI sweep with a
+                                # bounded retry budget instead of immediately burning a fix
+                                # iteration. Mirrors the rollup_management behind-update pattern.
+                                _behind_retries = ci_loop.get("_behind_update_retries", 0) + 1
+                                _behind_budget = _runtime_config.get("ci_behind_update_retries", 3)
+                                _upd_msg = _upd.get("message") or "unknown"
+                                if _behind_retries < _behind_budget:
+                                    ci_loop["_behind_update_retries"] = _behind_retries
+                                    ci_task.latest_status_message = (
+                                        f"PR #{ci_pr_number} behind base — update_branch failed "
+                                        f"({_upd_msg}); retrying next sweep ({_behind_retries}/{_behind_budget})"
+                                    )
+                                    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                    ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                    flag_modified(ci_task, "context")
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} behind base — update_branch failed "
+                                        f"(attempt {_behind_retries}/{_behind_budget}): {_upd_msg} — deferring to next sweep"
+                                    )
+                                    continue
+                                # Budget exhausted — alert, clear the counter, and fall through
+                                # to fix spawn so a real engineer-style fix can resolve whatever
+                                # GitHub can't auto-update.
+                                await _maybe_create_failure_alert(
+                                    ci_task, session,
+                                    f"PR #{ci_pr_number} behind base — update_branch failed "
+                                    f"{_behind_retries} consecutive sweeps ({_upd_msg}); falling through to fix spawn"
+                                )
+                                ci_loop.pop("_behind_update_retries", None)
+                                _behind_fallthrough = True
+                                logger.warning(
+                                    f"[CI] PR #{ci_pr_number} behind base — update_branch failed "
+                                    f"{_behind_retries} times ({_upd_msg}); falling through to fix spawn"
+                                )
                             elif _ms != "dirty":
                                 # Non-dirty non-behind mergeable_state values (blocked,
                                 # unstable, unknown, empty, or anything unrecognized) are
@@ -2123,26 +2164,55 @@ async def orchestrator_worker():
                                             )
                             except Exception as _ci_preview_exc:
                                 logger.debug(f"[CI] conflict-fix CI preview fetch failed for PR #{ci_pr_number}: {_ci_preview_exc}")
-                            fix_prompt = (
-                                f"PR #{ci_pr_number} is currently blocking the pipeline.\n\n"
-                                f"Orchestrator observation at spawn time: GitHub reported the PR as UNMERGEABLE "
-                                f"(merge conflicts against `{ci_base}`).\n\n"
-                                f"IMPORTANT — verify current state before acting. The `mergeable` flag can flip "
-                                f"between spawn and execution (a concurrent rollup may have resolved the conflict, "
-                                f"or new commits may have reintroduced one). After cloning:\n"
-                                f"  1. Attempt `git rebase origin/{ci_base}` — note whether it succeeds cleanly.\n"
-                                f"  2. Check `git status` and `git diff --name-only --diff-filter=U` for unmerged paths.\n"
-                                f"  3. If neither shows conflicts, the premise is stale — re-query the PR's "
-                                f"current mergeable state and failing check runs via the GitHub API "
-                                f"(`curl -H \"Authorization: Bearer $GITHUB_TOKEN\" "
-                                f"https://api.github.com/repos/{ci_owner}/{ci_repo}/pulls/{ci_pr_number}`) "
-                                f"and fix whatever is actually blocking the merge now.\n\n"
-                                f"Primary action: rebase onto `{ci_base}` and resolve any conflicts."
-                                f"{ci_preview_section}\n\n"
-                                f"Before declaring done: ensure (a) no conflict markers remain in any file, "
-                                f"(b) local lint/type/test suites pass on changed files, and (c) you've committed "
-                                f"every fix — do not leave uncommitted changes."
-                            )
+                            if _behind_fallthrough:
+                                # The PR is merely BEHIND base, not conflicting — but the
+                                # GitHub update-branch API failed across the retry budget,
+                                # so a manual rebase is needed. Describe the actual state
+                                # (behind, not conflicting) so the agent does not chase
+                                # nonexistent conflict markers.
+                                fix_prompt = (
+                                    f"PR #{ci_pr_number} is currently blocking the pipeline.\n\n"
+                                    f"Orchestrator observation at spawn time: GitHub reported the PR as BEHIND `{ci_base}` "
+                                    f"(no conflicts — just out-of-date). The orchestrator attempted to update the branch "
+                                    f"via the GitHub update-branch API across the retry budget but every attempt failed; "
+                                    f"a manual rebase is needed to unblock the merge.\n\n"
+                                    f"IMPORTANT — verify current state before acting. The `mergeable` flag can flip "
+                                    f"between spawn and execution. After cloning:\n"
+                                    f"  1. Run `git fetch origin && git rebase origin/{ci_base}`.\n"
+                                    f"  2. If the rebase surfaces unexpected conflicts (it shouldn't, given the "
+                                    f"behind state), check `git status` and `git diff --name-only --diff-filter=U` "
+                                    f"and resolve them.\n"
+                                    f"  3. Re-query the PR's current state via the GitHub API "
+                                    f"(`curl -H \"Authorization: Bearer $GITHUB_TOKEN\" "
+                                    f"https://api.github.com/repos/{ci_owner}/{ci_repo}/pulls/{ci_pr_number}`) "
+                                    f"to confirm what is actually blocking the merge now.\n\n"
+                                    f"Primary action: rebase onto `{ci_base}` and force-push so the PR is no longer behind."
+                                    f"{ci_preview_section}\n\n"
+                                    f"Before declaring done: ensure (a) no conflict markers remain (if any surfaced), "
+                                    f"(b) local lint/type/test suites pass on changed files, and (c) you've committed "
+                                    f"every fix — do not leave uncommitted changes."
+                                )
+                            else:
+                                fix_prompt = (
+                                    f"PR #{ci_pr_number} is currently blocking the pipeline.\n\n"
+                                    f"Orchestrator observation at spawn time: GitHub reported the PR as UNMERGEABLE "
+                                    f"(merge conflicts against `{ci_base}`).\n\n"
+                                    f"IMPORTANT — verify current state before acting. The `mergeable` flag can flip "
+                                    f"between spawn and execution (a concurrent rollup may have resolved the conflict, "
+                                    f"or new commits may have reintroduced one). After cloning:\n"
+                                    f"  1. Attempt `git rebase origin/{ci_base}` — note whether it succeeds cleanly.\n"
+                                    f"  2. Check `git status` and `git diff --name-only --diff-filter=U` for unmerged paths.\n"
+                                    f"  3. If neither shows conflicts, the premise is stale — re-query the PR's "
+                                    f"current mergeable state and failing check runs via the GitHub API "
+                                    f"(`curl -H \"Authorization: Bearer $GITHUB_TOKEN\" "
+                                    f"https://api.github.com/repos/{ci_owner}/{ci_repo}/pulls/{ci_pr_number}`) "
+                                    f"and fix whatever is actually blocking the merge now.\n\n"
+                                    f"Primary action: rebase onto `{ci_base}` and resolve any conflicts."
+                                    f"{ci_preview_section}\n\n"
+                                    f"Before declaring done: ensure (a) no conflict markers remain in any file, "
+                                    f"(b) local lint/type/test suites pass on changed files, and (c) you've committed "
+                                    f"every fix — do not leave uncommitted changes."
+                                )
                             fix_task, fix_was_created = await _spawn_pipeline_task(
                                 ci_task, "fix", session, ci_pr_number, ci_branch, ci_base,
                                 fix_prompt=fix_prompt, original_task_id=ci_orig_id

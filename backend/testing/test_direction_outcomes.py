@@ -14,7 +14,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.direction_outcomes import _update_cochange_index, _update_direction_research_outcomes
+from app.direction_outcomes import (
+    _longest_chain_length,
+    _update_cochange_index,
+    _update_direction_research_outcomes,
+)
 from app.models import Project, Task, TaskStatus
 
 
@@ -879,3 +883,163 @@ async def test_scope_breakdown_unknown_default(db_session: AsyncSession):
     assert entry["scope_breakdown"]["small"]["created"] == 1
     assert "unknown" in entry["scope_breakdown"]
     assert entry["scope_breakdown"]["unknown"]["created"] == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Decomposition quality (plan parent metrics)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_longest_chain_length_empty_and_linear():
+    assert _longest_chain_length({}) == 0
+    # A -> B -> C (depth 3)
+    assert _longest_chain_length({"a": [], "b": ["a"], "c": ["b"]}) == 3
+
+
+def test_longest_chain_length_breaks_cycles_and_drops_external():
+    # Cycle a→b→a is treated as depth 0 for the cycling node; external IDs ignored.
+    chain = _longest_chain_length({"a": ["b"], "b": ["a", "zzz-external"]})
+    assert chain >= 1
+
+
+@pytest.mark.asyncio
+async def test_decomposition_quality_basic(db_session: AsyncSession):
+    """For a terminal plan child with subtasks, metrics are captured."""
+    direction_id = "d-decomp"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    await db_session.flush()
+
+    plan = await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        payloads=[{"type": "plan"}],
+        title="plan-a",
+    )
+    # Subtask 1: merged, 2 files, cross-module (backend + tests)
+    s1 = await _create_child_task(
+        db_session, plan.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "_pr_changed_files": ["backend/app/x.py", "tests/test_x.py"]},
+        title="s1",
+    )
+    # Subtask 2: merged, 1 file (single module)
+    s2 = await _create_child_task(
+        db_session, plan.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "_pr_changed_files": ["backend/app/y.py"]},
+        title="s2",
+    )
+    # Subtask 3: failed with non-infra error; depends on s1 and s2
+    s3 = await _create_child_task(
+        db_session, plan.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+        title="s3",
+        latest_status_message="unit test failed",
+    )
+    s3.depends_on = [str(s1.id), str(s2.id)]
+    db_session.add(s3)
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+
+    dq = project.directions[0]["research_history"][0]["decomposition_quality"]
+    assert len(dq) == 1
+    q = dq[0]
+    assert q["plan_task_id"] == str(plan.id)
+    assert q["subtask_count"] == 3
+    # merged=2, failed non-infra=1 → 2/3
+    assert q["subtask_merge_rate"] == round(2 / 3, 3)
+    # file counts: 2, 1 → avg 1.5, max 2
+    assert q["avg_files_per_subtask"] == 1.5
+    assert q["max_files_in_subtask"] == 2
+    # dependency depth: s3 -> (s1|s2) = 2
+    assert q["dependency_depth"] == 2
+    # cross-module: only s1 touches >=2 top-level dirs
+    assert q["cross_module_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_decomposition_quality_ignores_infra_failures_in_merge_rate(db_session: AsyncSession):
+    """Infra-class failures are excluded from the merge rate denominator."""
+    direction_id = "d-decomp-infra"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    plan = await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "plan"}],
+        title="plan-b",
+    )
+    await _create_child_task(
+        db_session, plan.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "_pr_changed_files": ["a.py"]},
+        title="m",
+    )
+    await _create_child_task(
+        db_session, plan.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "RATE_LIMIT"},
+        title="infra",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    dq = project.directions[0]["research_history"][0]["decomposition_quality"]
+    # merged=1, failed_non_infra=0 → 1/1
+    assert dq[0]["subtask_merge_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_decomposition_quality_skips_non_terminal_plans(db_session: AsyncSession):
+    """Plan tasks still EVALUATING/running are not included."""
+    direction_id = "d-decomp-skip"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    await db_session.flush()
+
+    plan = await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "plan"}],
+        title="plan-open",
+    )
+    await _create_child_task(
+        db_session, plan.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "_pr_changed_files": ["a.py"]},
+        title="s",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    dq = project.directions[0]["research_history"][0]["decomposition_quality"]
+    assert dq == []

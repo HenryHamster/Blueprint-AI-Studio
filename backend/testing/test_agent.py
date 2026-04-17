@@ -2168,6 +2168,134 @@ async def test_claim_does_not_inject_cochange_files_for_review_task(client: Asyn
 
 
 @pytest.mark.asyncio
+async def test_claim_injects_cochange_hints_for_plan_task(client: AsyncClient, db_session):
+    """Claim endpoint injects cochange_hints in direction_context for plan tasks restricted to related_files."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    cochange_index = {
+        "backend/app/models.py": {
+            "backend/app/schemas.py": 3.0,
+            "backend/testing/test_models.py": 2.5,
+            "backend/app/orchestrator.py": 0.5,  # below 1.0 threshold
+        },
+        "backend/app/schemas.py": {
+            "backend/app/models.py": 3.0,
+            "backend/testing/test_schemas.py": 1.2,  # not in related_files
+        },
+        "backend/testing/test_models.py": {
+            "backend/app/models.py": 2.5,
+        },
+    }
+    project = Project(name="Cochange Plan Test", user_id="test-user-123", design_doc={"cochange_index": cochange_index})
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "Decompose model refactor"}],
+        vm_instance_id="agent-vm-cochange-plan",
+        context={
+            "related_files": [
+                "backend/app/models.py",
+                "backend/app/schemas.py",
+                "backend/testing/test_models.py",
+            ],
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cochange-plan")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    direction_ctx = data.get("direction_context", {})
+    assert "cochange_hints" in direction_ctx, f"Expected cochange_hints in direction_context, got: {list(direction_ctx.keys())}"
+    hints = direction_ctx["cochange_hints"]
+    # models.py paired with both schemas.py (3.0) and test_models.py (2.5) — both in related_files, both >= 1.0
+    assert hints["backend/app/models.py"]["backend/app/schemas.py"] == 3.0
+    assert hints["backend/app/models.py"]["backend/testing/test_models.py"] == 2.5
+    # orchestrator.py is in the index but NOT in related_files — must be excluded
+    assert "backend/app/orchestrator.py" not in hints["backend/app/models.py"]
+    # schemas.py only pairs with models.py from related_files; test_schemas.py is not in related_files
+    assert hints["backend/app/schemas.py"] == {"backend/app/models.py": 3.0}
+
+
+@pytest.mark.asyncio
+async def test_claim_omits_cochange_hints_when_below_threshold(client: AsyncClient, db_session):
+    """Claim endpoint omits cochange_hints when no within-set pairs meet the >= 1.0 threshold."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    cochange_index = {
+        "backend/app/a.py": {"backend/app/b.py": 0.7},  # below threshold
+        "backend/app/b.py": {"backend/app/a.py": 0.7},
+    }
+    project = Project(name="Cochange Plan Threshold Test", user_id="test-user-123", design_doc={"cochange_index": cochange_index})
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "Decompose"}],
+        vm_instance_id="agent-vm-cochange-plan-thresh",
+        context={"related_files": ["backend/app/a.py", "backend/app/b.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cochange-plan-thresh")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    direction_ctx = data.get("direction_context", {})
+    assert "cochange_hints" not in direction_ctx
+
+
+@pytest.mark.asyncio
+async def test_claim_does_not_inject_cochange_hints_for_create_task(client: AsyncClient, db_session):
+    """Claim endpoint does NOT inject cochange_hints (a plan-only signal) into direction_context for create tasks."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    cochange_index = {
+        "backend/app/models.py": {"backend/app/schemas.py": 3.0},
+        "backend/app/schemas.py": {"backend/app/models.py": 3.0},
+    }
+    project = Project(name="Cochange Hint Skip Test", user_id="test-user-123", design_doc={"cochange_index": cochange_index})
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add field"}],
+        vm_instance_id="agent-vm-cochange-create-skip",
+        context={"related_files": ["backend/app/models.py", "backend/app/schemas.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cochange-create-skip")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    direction_ctx = data.get("direction_context", {}) or {}
+    assert "cochange_hints" not in direction_ctx, (
+        f"cochange_hints should be plan-only, got direction_context keys: {list(direction_ctx.keys())}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_claim_injects_module_feedback_warnings_for_create_task(client: AsyncClient, db_session):
     """Claim endpoint injects module_feedback_warnings for create tasks when related_files have profiles."""
     from sqlalchemy.orm.attributes import flag_modified
