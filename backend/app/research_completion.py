@@ -1031,10 +1031,32 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             prior_retry_ctx["_attempt_number"] = 2
             if _prior.latest_status_message:
                 prior_retry_ctx["_previous_error"] = _prior.latest_status_message[:5000]
+            failure_class_val: str | None = None
             try:
-                prior_retry_ctx["_previous_failure_class"] = classify_failure(_prior)
+                failure_class_val = classify_failure(_prior)
+                prior_retry_ctx["_previous_failure_class"] = failure_class_val
             except Exception:
                 pass
+            # Enriched failure diagnosis to mirror task_lifecycle._requeue_parent_task,
+            # so research-spawned retries get the same buildRetryContext rendering as
+            # inline retries (failure stage labels, recurring warnings, error summary).
+            try:
+                from app.anomaly_detection import _error_fingerprint, _is_recurring_failure_class  # noqa: PLC0415
+                from app.task_lifecycle import _derive_failure_stage  # noqa: PLC0415
+                from app import shared_state as _ss  # noqa: PLC0415
+                error_msg = _prior.latest_status_message or ""
+                prior_retry_ctx["_previous_error_fingerprint"] = _error_fingerprint(error_msg)
+                if failure_class_val:
+                    stage = _derive_failure_stage(failure_class_val, error_msg)
+                    if stage:
+                        prior_retry_ctx["_previous_failure_stage"] = stage
+                    if failure_class_val == "CODE_ERROR":
+                        prior_retry_ctx["_previous_error_summary"] = error_msg[:500]
+                    proj_anomalies = _ss.persistent_anomalies.get(str(_prior.project_id), {})
+                    if _is_recurring_failure_class(proj_anomalies, failure_class_val):
+                        prior_retry_ctx["_previous_is_recurring"] = True
+            except Exception:
+                logger.exception("[RESEARCH_COMPLETION] Failed to enrich prior_retry_ctx for finding %s", fhash)
             if _prior_ctx.get("_analysis_plan"):
                 prior_retry_ctx["_previous_analysis_plan"] = _prior_ctx["_analysis_plan"]
             if _prior_ctx.get("_pr_changed_files"):

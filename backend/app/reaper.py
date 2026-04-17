@@ -928,8 +928,25 @@ async def reaper_service():
                             continue
 
                         _qt_type = (_qt.first_payload or {}).get("type", "unknown")
+                        _ra_raw = _qctx.get("retry_after")
+                        _ra_dt = parse_retry_after(_ra_raw) if _ra_raw else None
+                        _ra_recent_cutoff = now - timedelta(minutes=5)
                         if _qt.requires_approval:
                             _likely_cause = "awaiting operator approval"
+                        elif _ra_dt is not None and _ra_dt >= _ra_recent_cutoff:
+                            _resets = int(_qctx.get("_retry_after_resets") or 0)
+                            if _ra_dt > now:
+                                _held_min = (now - _qt.created_at).total_seconds() / 60
+                                _likely_cause = (
+                                    f"rate-limit retry delay active (retry_after={_ra_raw}, "
+                                    f"held {_held_min:.1f}m, reset {_resets} times)"
+                                )
+                            else:
+                                _expired_min = (now - _ra_dt).total_seconds() / 60
+                                _likely_cause = (
+                                    f"rate-limit retry delay recently expired ({_expired_min:.1f}m ago, "
+                                    f"reset {_resets} times)"
+                                )
                         else:
                             _rate, _sample = _shared_state.get_task_type_failure_rate(_qt_type, window_minutes=15)
                             if _sample >= 3 and _rate >= 0.7:

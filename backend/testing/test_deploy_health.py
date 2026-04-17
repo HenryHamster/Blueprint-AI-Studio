@@ -71,10 +71,12 @@ def reset_module_state():
     _dh._pause_failure_streak = 0
     _dh._reset_health_recovery_history()
     _dh._last_auto_resume_at = None
+    _dh._recent_auto_resumes.clear()
     yield
     _dh._pause_failure_streak = 0
     _dh._reset_health_recovery_history()
     _dh._last_auto_resume_at = None
+    _dh._recent_auto_resumes.clear()
 
 
 def _seed_recovery_history(*values):
@@ -995,3 +997,159 @@ def test_check_claude_api_health_fresh_rate_limits_return_failed(mocker):
     ext = {"errors": {}}
     assert _hcp.check_claude_api_health(ext) == "claude_api"
     assert ext["claude_api"] is False
+
+
+# ── Tests: flap detection ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_single_resume_no_flap_escalation(dh_db):
+    """A normal single pause/resume records one entry but stays below the flap threshold."""
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: db",
+        pre_pause_max_vms=4,
+    )
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.runtime_config["flap_window_seconds"] = 1800
+    _shared_state.runtime_config["flap_threshold"] = 3
+    _shared_state.deploy_monitoring["window_start"] = None
+    _set_healthy()
+    _seed_recovery_history(True, True)
+
+    await _dh._check_pause_mode()
+
+    assert len(_dh._recent_auto_resumes) == 1
+    # Not flapping yet → INFO alert (flapping=False)
+    _dh._create_auto_resume_alerts.assert_awaited_once()
+    _, kwargs = _dh._create_auto_resume_alerts.call_args
+    assert kwargs.get("flapping", False) is False
+
+
+@pytest.mark.asyncio
+async def test_flap_escalation_requires_5_of_5_recovery(dh_db):
+    """When already flapping (threshold met), recovery demands 5-of-5 healthy probes."""
+    from datetime import timedelta
+    now = _dh._utcnow()
+    # Seed prior recent resumes so we are at the threshold BEFORE this cycle.
+    _dh._recent_auto_resumes.extend([
+        now - timedelta(seconds=600),
+        now - timedelta(seconds=400),
+        now - timedelta(seconds=200),
+    ])
+    _shared_state.runtime_config["flap_window_seconds"] = 1800
+    _shared_state.runtime_config["flap_threshold"] = 3
+
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: claude_api",
+        pre_pause_max_vms=4,
+    )
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.deploy_monitoring["window_start"] = None
+    _set_healthy()
+    # 3-of-5 would normally resume; with flap escalation we need 5-of-5.
+    _seed_recovery_history(True, True)
+
+    await _dh._check_pause_mode()
+
+    # Still paused — 3-of-3 did not meet the escalated 5-of-5 bar.
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    assert state.status == DeploymentStatus.PAUSED.value
+    _dh._create_auto_resume_alerts.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_flap_escalated_resume_creates_error_alert(dh_db):
+    """After the 3rd resume lands inside the window, the auto-resume alert is ERROR-severity."""
+    from datetime import timedelta
+    now = _dh._utcnow()
+    _dh._recent_auto_resumes.extend([
+        now - timedelta(seconds=600),
+        now - timedelta(seconds=400),
+    ])
+    _shared_state.runtime_config["flap_window_seconds"] = 1800
+    _shared_state.runtime_config["flap_threshold"] = 3
+
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: claude_api",
+        pre_pause_max_vms=4,
+    )
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.deploy_monitoring["window_start"] = None
+    _set_healthy()
+    # Full 5-of-5 healthy to clear even the escalated bar.
+    _seed_recovery_history(True, True, True, True)
+
+    await _dh._check_pause_mode()
+
+    # Third resume recorded; alert fired with flapping=True.
+    assert len(_dh._recent_auto_resumes) == 3
+    _dh._create_auto_resume_alerts.assert_awaited_once()
+    _, kwargs = _dh._create_auto_resume_alerts.call_args
+    assert kwargs.get("flapping") is True
+
+
+def test_flap_window_prunes_stale_entries():
+    """Entries older than flap_window_seconds are dropped on the next prune."""
+    from datetime import timedelta
+    _shared_state.runtime_config["flap_window_seconds"] = 300
+    _shared_state.runtime_config["flap_threshold"] = 3
+    now = _dh._utcnow()
+    _dh._recent_auto_resumes.extend([
+        now - timedelta(seconds=10_000),  # very stale
+        now - timedelta(seconds=5_000),   # stale
+        now - timedelta(seconds=60),      # fresh
+    ])
+
+    _dh._prune_flap_window(now)
+
+    assert len(_dh._recent_auto_resumes) == 1
+    assert _dh._is_flapping(now) is False
+
+
+@pytest.mark.asyncio
+async def test_flap_doubles_grace_period(dh_db, mocker):
+    """While flapping, the post-resume grace period that suppresses re-pause is doubled."""
+    from datetime import timedelta
+    mocker.patch("app.deploy_health.manager.broadcast_to_all", new_callable=AsyncMock)
+
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    _shared_state.runtime_config["max_concurrent_vms"] = 4
+    _shared_state.runtime_config["auto_resume_grace_period_seconds"] = 300
+    _shared_state.runtime_config["flap_window_seconds"] = 1800
+    _shared_state.runtime_config["flap_threshold"] = 3
+
+    now = _dh._utcnow()
+    # Trip flap threshold.
+    _dh._recent_auto_resumes.extend([
+        now - timedelta(seconds=600),
+        now - timedelta(seconds=400),
+        now - timedelta(seconds=200),
+    ])
+    # Resumed 400s ago — past the 300s base grace, but within 2*300s=600s flap-doubled grace.
+    _dh._last_auto_resume_at = now - timedelta(seconds=400)
+
+    _set_critical_failures("db")
+    _dh._pause_failure_streak = 2
+
+    await _dh._check_pause_mode()
+
+    # No pause — doubled grace period absorbed the reading.
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    assert state.status == DeploymentStatus.STABLE.value
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+
+
+def test_restore_health_streaks_restores_recent_auto_resumes():
+    """_restore_health_streaks rehydrates the flap-detection deque."""
+    from datetime import datetime as _dt
+    t1 = _dt(2026, 4, 17, 10, 30, 0)
+    t2 = _dt(2026, 4, 17, 10, 40, 0)
+    snapshot = {"_recent_auto_resumes": [t1.isoformat(), t2.isoformat(), "not-a-date"]}
+    _dh._restore_health_streaks(snapshot)
+    assert list(_dh._recent_auto_resumes) == [t1, t2]

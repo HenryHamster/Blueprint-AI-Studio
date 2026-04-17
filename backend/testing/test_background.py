@@ -3082,6 +3082,57 @@ async def test_reaper_queued_age_alert_includes_requires_approval(reaper_db, moc
 
 
 @pytest.mark.asyncio
+async def test_reaper_queued_age_alert_retry_after_cause(reaper_db, mocker):
+    """
+    Reaper Step 6: a QUEUED task with an active future retry_after should be
+    diagnosed as blocked by rate-limit retry delay, not the generic fallback.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    class StopLoopException(Exception):
+        pass
+    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("app.reaper._runtime_config", {
+        "max_concurrent_vms": 8,
+        "max_retries": 3,
+        "max_provision_retries": 3,
+        "queued_age_alert_hours": 2,
+    })
+
+    project = Project(name="Retry After Cause Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    future = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=10)).isoformat()
+    stale_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "rate-limited"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=False,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=3),
+        context={"retry_after": future, "_retry_after_resets": 4},
+    )
+    reaper_db.add(stale_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(stale_task)
+
+    try:
+        await reaper_service()
+    except StopLoopException:
+        pass
+
+    from sqlmodel import select as _select
+    alerts = (await reaper_db.execute(
+        _select(Alert).where(Alert.task_id == stale_task.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    assert "rate-limit retry delay" in alerts[0].message
+    assert "reset 4 times" in alerts[0].message
+
+
+@pytest.mark.asyncio
 async def test_reaper_queued_age_alert_escalates(reaper_db, mocker):
     """
     Reaper Step 6: a task already at tier 1 (INFO) that ages past the tier 2

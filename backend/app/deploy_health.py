@@ -57,11 +57,30 @@ _HEALTH_HISTORY_HEALTHY_REQUIRED = 3
 _health_recovery_history: "deque[bool]" = deque(maxlen=_HEALTH_HISTORY_SIZE)
 _last_exhausted_zones: set = set()  # tracks zone health for transition logging
 _last_auto_resume_at: "datetime | None" = None  # timestamp of most recent auto-resume (normal or forced)
+# Timestamps of recent auto-resumes, used to detect pause/resume flapping.
+# Pruned to entries within `flap_window_seconds`; escalation kicks in when size
+# >= `flap_threshold`.
+_recent_auto_resumes: "deque[datetime]" = deque()
+_FLAP_ESCALATED_HEALTHY_REQUIRED = _HEALTH_HISTORY_SIZE  # 5-of-5 when flapping
 
 
 def _reset_health_recovery_history() -> None:
     """Clear the recovery ring buffer (called on pause, on resume, and on manual reset)."""
     _health_recovery_history.clear()
+
+
+def _prune_flap_window(now: datetime) -> None:
+    """Drop _recent_auto_resumes entries older than the configured flap window."""
+    window = _runtime_config.get("flap_window_seconds", 1800)
+    while _recent_auto_resumes and (now - _recent_auto_resumes[0]).total_seconds() > window:
+        _recent_auto_resumes.popleft()
+
+
+def _is_flapping(now: datetime) -> bool:
+    """Return True if recent auto-resume count within the window meets the threshold."""
+    _prune_flap_window(now)
+    threshold = _runtime_config.get("flap_threshold", 3)
+    return len(_recent_auto_resumes) >= threshold
 
 
 def _restore_health_streaks(snapshot: dict) -> None:
@@ -87,6 +106,19 @@ def _restore_health_streaks(snapshot: dict) -> None:
             _last_auto_resume_at = parsed
         except ValueError:
             logger.warning(f"[DEPLOY] Invalid _last_auto_resume_at in persisted state: {raw!r}")
+    _recent_auto_resumes.clear()
+    raw_resumes = snapshot.get("_recent_auto_resumes")
+    if isinstance(raw_resumes, list):
+        for v in raw_resumes:
+            if not isinstance(v, str):
+                continue
+            try:
+                parsed = datetime.fromisoformat(v)
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+                _recent_auto_resumes.append(parsed)
+            except ValueError:
+                logger.warning(f"[DEPLOY] Invalid _recent_auto_resumes entry: {v!r}")
 
 
 def should_rollback() -> tuple:
@@ -427,10 +459,19 @@ async def _create_forced_resume_alerts(session: AsyncSession, pause_duration_sec
         )
 
 
-async def _create_auto_resume_alerts(session: AsyncSession) -> None:
-    """Create INFO alerts and dismiss existing auto-pause warnings when the pipeline auto-resumes."""
+async def _create_auto_resume_alerts(session: AsyncSession, flapping: bool = False) -> None:
+    """Create INFO alerts and dismiss existing auto-pause warnings when the pipeline auto-resumes.
+
+    When ``flapping`` is True (rapid pause/resume cycles detected), escalate to an ERROR alert
+    so operators investigate the intermittent dependency instead of silently accepting churn.
+    """
     pause_title = "Pipeline auto-paused: external dependencies down"
-    resume_title = "Pipeline auto-resumed: all external dependencies healthy."
+    if flapping:
+        resume_title = "Pipeline auto-resumed (FLAPPING): rapid pause/resume cycles detected."
+        severity = AlertSeverity.ERROR
+    else:
+        resume_title = "Pipeline auto-resumed: all external dependencies healthy."
+        severity = AlertSeverity.INFO
     now = _utcnow()
     projects = (await session.execute(select(Project))).scalars().all()
     for project in projects:
@@ -446,10 +487,9 @@ async def _create_auto_resume_alerts(session: AsyncSession) -> None:
         for w in existing_warnings:
             w.dismissed_at = now
             session.add(w)
-        # Create INFO resume alert
         alert = Alert(
             project_id=project.id,
-            severity=AlertSeverity.INFO,
+            severity=severity,
             title=resume_title,
             message=resume_title,
         )
@@ -457,7 +497,7 @@ async def _create_auto_resume_alerts(session: AsyncSession) -> None:
         await broadcast_to_project(
             str(project.id),
             "alert_created",
-            {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
+            {"alert_id": str(alert.id), "severity": severity.name, "title": alert.title},
         )
 
 
@@ -511,6 +551,9 @@ async def _check_pause_mode():
             grace_remaining = 0.0
             if _last_auto_resume_at is not None:
                 grace = _runtime_config.get("auto_resume_grace_period_seconds", 300)
+                # Double the grace period while flapping to damp rapid re-pauses.
+                if _is_flapping(_utcnow()):
+                    grace *= 2
                 elapsed = (_utcnow() - _last_auto_resume_at).total_seconds()
                 if 0 <= elapsed < grace:
                     in_grace_period = True
@@ -584,16 +627,23 @@ async def _check_pause_mode():
                 paused_at = paused_at.replace(tzinfo=None)
             pause_duration = (now - paused_at).total_seconds()
 
+        # When flapping, tighten the recovery bar so we don't resume on marginal signal.
+        flapping_now = _is_flapping(_utcnow())
+        healthy_required = (
+            _FLAP_ESCALATED_HEALTHY_REQUIRED if flapping_now else _HEALTH_HISTORY_HEALTHY_REQUIRED
+        )
+
         should_force_resume = pause_duration >= max_duration > 0
         should_normal_resume = (
-            len(history_snapshot) >= _HEALTH_HISTORY_HEALTHY_REQUIRED
-            and healthy_count >= _HEALTH_HISTORY_HEALTHY_REQUIRED
+            len(history_snapshot) >= healthy_required
+            and healthy_count >= healthy_required
         )
 
         if not (should_force_resume or should_normal_resume):
             logger.info(
                 f"[PAUSE] Recovery progress: {healthy_count}/{len(history_snapshot)} healthy "
-                f"(need {_HEALTH_HISTORY_HEALTHY_REQUIRED}-of-{_HEALTH_HISTORY_SIZE}); "
+                f"(need {healthy_required}-of-{_HEALTH_HISTORY_SIZE}"
+                f"{' FLAPPING' if flapping_now else ''}); "
                 f"paused {int(pause_duration)}s/{max_duration}s"
             )
             return
@@ -613,14 +663,19 @@ async def _check_pause_mode():
         # nested pause cycles to ratchet capacity down permanently.
         state.runtime_max_concurrent_vms = restore
         session.add(state)
+        now = _utcnow()
+        _recent_auto_resumes.append(now)
+        _prune_flap_window(now)
+        flap_escalated = len(_recent_auto_resumes) >= _runtime_config.get("flap_threshold", 3)
+
         if should_force_resume:
             await _create_forced_resume_alerts(session, pause_duration, critical_failures)
         else:
-            await _create_auto_resume_alerts(session)
+            await _create_auto_resume_alerts(session, flapping=flap_escalated)
         await session.commit()
         _runtime_config["max_concurrent_vms"] = initial_vms
         _reset_health_recovery_history()
-        _last_auto_resume_at = _utcnow()
+        _last_auto_resume_at = now
 
         if should_force_resume:
             logger.error(
@@ -634,6 +689,17 @@ async def _check_pause_mode():
                     "max_auto_pause_duration_seconds": max_duration,
                     "health_history": history_snapshot,
                     "failed_deps": critical_failures,
+                },
+            )
+        elif flap_escalated:
+            logger.error(
+                f"[PAUSE] FLAPPING auto-resume (#{len(_recent_auto_resumes)} in window) "
+                f"with {initial_vms} VMs (target: {restore}). "
+                f"Recovery bar raised to {_FLAP_ESCALATED_HEALTHY_REQUIRED}-of-{_HEALTH_HISTORY_SIZE}.",
+                extra={
+                    "alert": True,
+                    "type": "flapping_resume",
+                    "recent_resume_count": len(_recent_auto_resumes),
                 },
             )
         else:

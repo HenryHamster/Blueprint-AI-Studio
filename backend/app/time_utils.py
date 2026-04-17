@@ -27,6 +27,10 @@ def set_retry_after(context: dict, minutes: float) -> str:
     # Round-trip to validate ISO format before persisting.
     datetime.fromisoformat(iso)
     context["retry_after"] = iso
+    try:
+        context["_retry_after_resets"] = int(context.get("_retry_after_resets") or 0) + 1
+    except (TypeError, ValueError):
+        context["_retry_after_resets"] = 1
     return iso
 
 

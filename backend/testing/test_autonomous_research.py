@@ -3536,3 +3536,76 @@ async def test_respawn_after_cooldown_injects_prior_failure_context(db_session, 
     assert ctx.get("_previous_test_failure_summary") == "1 failed: test_webhooks.py::test_retry_on_5xx"
     assert ctx.get("_previous_self_review_outcome") == {"status": "failed", "notes": "missing retry count assertion"}
     assert ctx.get("_previous_file_change_details") == [{"file": "app/webhooks.py", "summary": "added retry decorator"}]
+    # Enriched failure diagnosis fields (mirror task_lifecycle._requeue_parent_task)
+    assert ctx.get("_previous_error_summary") == "Tests failed: AssertionError in test_webhooks.py line 42"
+    assert ctx.get("_previous_failure_stage") == "test"
+    assert isinstance(ctx.get("_previous_error_fingerprint"), str) and ctx["_previous_error_fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_respawn_after_cooldown_marks_recurring_failure(db_session, mocker):
+    """When the project has the failure class flagged as recurring in persistent_anomalies,
+    the prior_retry_ctx must include _previous_is_recurring=True."""
+    direction = _active_direction("d-recur001", "Recurring failure direction")
+    project = Project(
+        name="Recurring Failure Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    title = "Refactor session manager"
+    desc = "Session manager has a race condition under high load"
+    fhash = hashlib.sha256((title + desc).encode()).hexdigest()[:16]
+
+    prior_failed = Task(
+        project_id=project.id,
+        title=title,
+        payloads=[{"type": "create", "prompt": "refactor", "base_branch": "main"}],
+        context={"finding_hash": fhash},
+        status=TaskStatus.FAILED,
+        latest_status_message="pytest assert failed in test_session.py",
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        created_at=datetime.utcnow() - timedelta(hours=72),
+    )
+    db_session.add(prior_failed)
+    await db_session.commit()
+
+    # Mark CODE_ERROR as a recurring failure class on this project
+    _shared_state.persistent_anomalies[str(project.id)] = {
+        "recurring_classes": ["CODE_ERROR"],
+    }
+    mocker.patch(
+        "app.anomaly_detection._is_recurring_failure_class",
+        return_value=True,
+    )
+
+    task = await _make_research_task(project, direction, db_session)
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": title, "description": desc, "prompt": "Refactor",
+            "priority": "medium", "scope": "small", "risk": "low",
+            "type": "improvement", "direction_id": direction["id"],
+        }],
+    )
+
+    try:
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        _shared_state.persistent_anomalies.pop(str(project.id), None)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    children = result.scalars().all()
+    assert len(children) == 1
+    ctx = children[0].context or {}
+    assert ctx.get("_previous_is_recurring") is True

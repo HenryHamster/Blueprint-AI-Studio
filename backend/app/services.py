@@ -483,6 +483,7 @@ async def _persist_zone_health():
         _pause_failure_streak,
         _health_recovery_history,
         _last_auto_resume_at,
+        _recent_auto_resumes,
     )
 
     try:
@@ -504,6 +505,7 @@ async def _persist_zone_health():
         snapshot["_last_auto_resume_at"] = (
             _last_auto_resume_at.isoformat() if _last_auto_resume_at else None
         )
+        snapshot["_recent_auto_resumes"] = [t.isoformat() for t in _recent_auto_resumes]
         async with AsyncSessionLocal() as session:
             state = await _get_deploy_state_for_update(session)
             if state:
