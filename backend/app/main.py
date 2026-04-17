@@ -1077,7 +1077,9 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
     # --- GitHub API Quota (populated by _github_request on every response) ---
     # Surfaces X-RateLimit-Remaining so the dashboard can show a live quota
     # widget.  critical < 100, degraded < 500, ok otherwise (unknown = no
-    # recent call observed).
+    # recent call observed).  top_endpoints shows the per-endpoint call
+    # breakdown for the current reset window so we can see what's actually
+    # burning the quota when it gets low (instead of guessing).
     gq = dict(_shared_state.github_quota)
     _q_remaining = gq.get("remaining")
     if _q_remaining is None:
@@ -1088,7 +1090,19 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
         _q_status = "degraded"
     else:
         _q_status = "ok"
-    components["github_quota"] = {**gq, "status": _q_status}
+    # Top 15 most-called endpoint templates this window.  Caps the payload
+    # regardless of how many distinct endpoints we've seen.
+    _top_calls = sorted(
+        _shared_state.github_call_counts.items(),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )[:15]
+    components["github_quota"] = {
+        **gq,
+        "status": _q_status,
+        "top_endpoints": [{"endpoint": ep, "count": n} for ep, n in _top_calls],
+        "total_calls_this_window": sum(_shared_state.github_call_counts.values()),
+    }
 
     # --- Pipeline Health (rolling reaper signals) ---
     ph_snapshot = _shared_state.get_pipeline_health_snapshot()

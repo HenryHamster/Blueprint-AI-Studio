@@ -540,6 +540,15 @@ github_quota: Dict = {
     "last_updated": None,           # isoformat str, last observation
 }
 
+# --- GitHub REST Call Counters ---
+# Every _github_request bumps the count for its normalized endpoint template
+# (e.g. "GET /repos/{owner}/{repo}/pulls/{n}") so we can see which endpoints
+# actually consume the 5000/hr REST budget. Reset on each quota-reset window
+# rollover so the dashboard shows "this window"'s burn. Template normalization
+# (numbers, SHAs, branch refs) collapses the natural cardinality explosion.
+github_call_counts: Dict[str, int] = {}
+github_call_counts_window_reset_at: int | None = None
+
 # Track last successful GitHub API operation (tokens, PR comments, etc.)
 # Used by health check to passively verify GitHub is reachable without
 # making an active API call that competes for the shared connection pool.

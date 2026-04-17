@@ -40,12 +40,48 @@ async def close_github_client():
         _github_client = None
 
 
+import re as _re
+
+
+def _normalize_endpoint_template(method: str, url: str) -> str:
+    """Collapse a concrete GitHub URL into an endpoint template for counting.
+
+    ``GET https://api.github.com/repos/foo/bar/pulls/1852`` becomes
+    ``GET /repos/{owner}/{repo}/pulls/{n}`` so per-call counters don't
+    explode on PR numbers, SHAs, or branch refs.  The mapping is a
+    handful of regexes — cheap, doesn't require parsing the URL.
+    """
+    path = url.split("api.github.com", 1)[-1]
+    # Strip query string; it's not useful for grouping hotspots.
+    path = path.split("?", 1)[0]
+    # Collapse /repos/{owner}/{repo}/
+    path = _re.sub(r"^/repos/[^/]+/[^/]+", "/repos/{owner}/{repo}", path)
+    # Collapse /app/installations/{id}/
+    path = _re.sub(r"^/app/installations/\d+", "/app/installations/{id}", path)
+    # Numeric IDs (PR numbers, issue numbers, check-run IDs)
+    path = _re.sub(r"/\d+(?=/|$)", "/{n}", path)
+    # 40-char SHA or 7+ hex
+    path = _re.sub(r"/[a-f0-9]{7,40}(?=/|$)", "/{sha}", path)
+    # git refs like /git/ref/heads/anything
+    path = _re.sub(r"/(heads|refs|tags)/[^/]+", r"/\1/{ref}", path)
+    return f"{method} {path}"
+
+
+def _record_call(method: str, url: str) -> None:
+    """Bump the per-endpoint counter so we can see which endpoints drain
+    the 5000/hr quota when the window runs low."""
+    import app.shared_state as _ss  # noqa: PLC0415
+    template = _normalize_endpoint_template(method, url)
+    _ss.github_call_counts[template] = _ss.github_call_counts.get(template, 0) + 1
+
+
 def _update_quota_state(remaining: int, limit: int | None, reset_ts: int | None) -> None:
     """Mirror X-RateLimit-* headers into shared_state.github_quota.
 
     Keeps the LOWEST `remaining` seen before the reset time (so a later
     higher value doesn't mask a recent crisis until the window resets).
-    Fires a WARNING alert once per reset window when remaining < 100.
+    Resets the per-endpoint call counter on each quota-window rollover so
+    the counts always describe the current 1-hour window.
     """
     from datetime import datetime, timezone
     import app.shared_state as _ss  # noqa: PLC0415
@@ -53,14 +89,21 @@ def _update_quota_state(remaining: int, limit: int | None, reset_ts: int | None)
     now_iso = datetime.now(timezone.utc).isoformat()
     prev_reset = q.get("reset_at")
     prev_remaining = q.get("remaining")
-    # If the reset window rolled over, accept the new value unconditionally.
+    # If the reset window rolled over, accept the new value unconditionally
+    # and clear the call counter — the old counts are for a past window.
     rolled_over = prev_reset is not None and reset_ts is not None and reset_ts > prev_reset
-    if rolled_over or prev_remaining is None or remaining < prev_remaining:
+    if rolled_over:
+        _ss.github_call_counts.clear()
+        _ss.github_call_counts_window_reset_at = reset_ts
+        q["remaining"] = remaining
+    elif prev_remaining is None or remaining < prev_remaining:
         q["remaining"] = remaining
     if limit is not None:
         q["limit"] = limit
     if reset_ts is not None:
         q["reset_at"] = reset_ts
+        if _ss.github_call_counts_window_reset_at is None:
+            _ss.github_call_counts_window_reset_at = reset_ts
     q["last_updated"] = now_iso
 
 
@@ -77,6 +120,11 @@ async def _github_request(
     for attempt in range(max_retries):
         try:
             client = _get_client()
+            # Count each attempt against the per-endpoint counter BEFORE the
+            # call — even a 403 rate-limit response counts as "we tried this
+            # endpoint" which is what we care about when diagnosing burn
+            # (though per GitHub docs 403s don't consume quota themselves).
+            _record_call(method, url)
             response = await client.request(method, url, headers=headers, **kwargs)
             # 429 or 403 rate limit — GitHub uses 403 for primary rate limit
             # exhaustion (5,000 req/hr) and 429 for secondary/search limits.
