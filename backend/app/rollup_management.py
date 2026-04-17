@@ -889,6 +889,33 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             _ms_key = _ms or "empty"
                             _ms_display = _ms or "missing (refetch failed)"
                             _is_unrecognized = _ms_key not in ("blocked", "unstable", "unknown", "empty")
+                            # For blocked/unstable, ask GitHub to auto-merge once gates
+                            # clear — mirrors the task_lifecycle auto-merge fallback so a
+                            # passing rollup PR lands without waiting on the reaper's
+                            # 15-minute stale-parent sweep. Deferral counters below still
+                            # run so a genuinely stuck PR still escalates to approval.
+                            if _ms_key in ("blocked", "unstable"):
+                                try:
+                                    from app.github import enable_auto_merge
+                                    am_result = await enable_auto_merge(
+                                        gh_token, owner, repo, rollup_pr_number,
+                                        project_id=str(parent.project_id),
+                                    )
+                                    if am_result.get("enabled"):
+                                        logger.info(
+                                            f"[ROLLUP] PR #{rollup_pr_number} mergeable_state={_ms_key} "
+                                            f"— enabled GitHub auto-merge"
+                                        )
+                                    else:
+                                        logger.info(
+                                            f"[ROLLUP] PR #{rollup_pr_number} auto-merge enablement "
+                                            f"declined: {am_result.get('message')}"
+                                        )
+                                except Exception as _am_exc:
+                                    logger.warning(
+                                        f"[ROLLUP] Auto-merge enablement failed for PR "
+                                        f"#{rollup_pr_number}: {_am_exc}"
+                                    )
                             prev_state = parent_ctx.get("_merge_deferred_state")
                             deferred_count = (parent_ctx.get("_merge_deferred_count", 0) + 1) if prev_state == _ms_key else 1
                             # Total-deferral counter: increments on every deferral regardless

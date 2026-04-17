@@ -1853,25 +1853,72 @@ async def orchestrator_worker():
                         # transient reopen failure would silently discard the work.
                         if pr_state == "closed" or pr_data.get("merged"):
                             if pr_state == "closed" and not pr_data.get("merged") and ci_loop.get("pending_reopen"):
+                                from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                _reopen_attempts = ci_loop.get("reopen_attempts", 0) + 1
+                                ci_loop["reopen_attempts"] = _reopen_attempts
+                                _reopen_ok = False
                                 try:
-                                    if await reopen_pull_request(
+                                    _reopen_ok = bool(await reopen_pull_request(
                                         ci_gh_token, ci_owner, ci_repo, ci_pr_number,
                                         project_id=str(ci_task.project_id),
-                                    ):
-                                        ci_loop["pending_reopen"] = False
-                                        ci_loop["polls_since_pr_fetch"] = 999
-                                        ci_task.latest_status_message = (
-                                            f"PR #{ci_pr_number} reopened after prior reset failure"
-                                        )
-                                        ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
-                                        session.add(ci_task)
-                                        await session.commit()
-                                        continue
+                                    ))
                                 except Exception as _reopen_exc:
                                     logger.warning(f"[CI] retry reopen of PR #{ci_pr_number} raised: {_reopen_exc}")
+                                if _reopen_ok:
+                                    ci_loop["pending_reopen"] = False
+                                    ci_loop["reopen_attempts"] = 0
+                                    ci_loop.pop("reopen_alert_fired", None)
+                                    ci_loop["polls_since_pr_fetch"] = 999
+                                    ci_task.latest_status_message = (
+                                        f"PR #{ci_pr_number} reopened after prior reset failure "
+                                        f"(after {_reopen_attempts} attempt{'s' if _reopen_attempts != 1 else ''})"
+                                    )
+                                    ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                    flag_modified(ci_task, "context")
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    continue
+                                _reopen_alert_threshold = _runtime_config.get("ci_reopen_alert_threshold", 5)
+                                _reopen_approval_cap = _runtime_config.get("ci_reopen_approval_cap", 10)
+                                ci_task.latest_status_message = (
+                                    f"PR #{ci_pr_number} reopen failed (attempt {_reopen_attempts}) — "
+                                    f"will retry on next poll"
+                                )
+                                if _reopen_attempts >= _reopen_alert_threshold and not ci_loop.get("reopen_alert_fired"):
+                                    ci_loop["reopen_alert_fired"] = True
+                                    await _maybe_create_failure_alert(
+                                        ci_task, session,
+                                        f"PR #{ci_pr_number} reopen failed {_reopen_attempts} times — "
+                                        f"GitHub may be rejecting the reopen, still retrying"
+                                    )
+                                if _reopen_attempts >= _reopen_approval_cap and not ci_task.requires_approval:
+                                    ci_task.status = TaskStatus.FAILED
+                                    ci_task.requires_approval = True
+                                    ci_task.latest_status_message = (
+                                        f"PR #{ci_pr_number} reopen failed {_reopen_attempts} times — "
+                                        f"manual intervention required"
+                                    )
+                                    from app.failure_classification import persist_failure_category as _pfc_reopen
+                                    _pfc_reopen(ci_task, "EXTERNAL_API")
+                                    record_task_result(success=False, failure_class="EXTERNAL_API",
+                                                       task_id=str(ci_task.id),
+                                                       task_type=(ci_task.first_payload).get("type", ""))
+                                    await _maybe_create_failure_alert(
+                                        ci_task, session,
+                                        f"PR #{ci_pr_number} reopen cap exhausted ({_reopen_attempts} attempts) — "
+                                        f"task FAILED, manual intervention required"
+                                    )
+                                    logger.warning(
+                                        f"[CI] PR #{ci_pr_number} reopen attempts ({_reopen_attempts}) "
+                                        f"hit cap — marking task {ci_task.id} FAILED (requires_approval)"
+                                    )
                                 ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                flag_modified(ci_task, "context")
                                 session.add(ci_task)
                                 await session.commit()
+                                if ci_task.status == TaskStatus.FAILED:
+                                    await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                               {"task_id": str(ci_task.id), "status": ci_task.status})
                                 continue
                             if pr_data.get("merged"):
                                 ci_task.status = TaskStatus.COMPLETED

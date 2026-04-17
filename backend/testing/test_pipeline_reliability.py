@@ -588,6 +588,174 @@ async def test_ci_polling_closed_without_merge_fails_task(orch_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_ci_polling_pending_reopen_retry_escalates(orch_db, mocker):
+    """When pending_reopen retries fail repeatedly, the orchestrator must:
+      1. increment a reopen_attempts counter on each failed retry,
+      2. fire a failure alert at the configured threshold (default 5),
+      3. escalate to FAILED + requires_approval at the cap (default 10),
+      4. surface the attempt count in latest_status_message.
+
+    Without these guards a transient close-without-reopen reset for a stuck
+    mergeable=None PR would silently retry forever with no operator visibility.
+    """
+    session, _Session = orch_db
+
+    project = Project(name="CI Reopen Retry Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "ci reopen task", "branch": "feat/reopen"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 4242,
+                "branch": "feat/reopen",
+                "base_branch": "main",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+                "pending_reopen": True,
+            }
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+    task_id = ci_task.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    # Simulate a closed PR that needs reopening; reopen always fails
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "closed", "merged": False,
+                               "head": {"sha": "abc123"}, "mergeable": None})
+    reopen_mock = mocker.patch("app.github.reopen_pull_request",
+                               new_callable=AsyncMock, return_value=False)
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    # Run cycle 1 — counter = 1, no alert yet
+    await _run_one_cycle(mocker)
+    async with _Session() as verify:
+        from sqlmodel import select as _select
+        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+    assert t.status == TaskStatus.EVALUATING, "Should still be EVALUATING after 1 attempt"
+    assert (t.context or {}).get("review_loop", {}).get("reopen_attempts") == 1, (
+        f"reopen_attempts should be 1, got {(t.context or {}).get('review_loop', {}).get('reopen_attempts')}"
+    )
+    assert "attempt 1" in (t.latest_status_message or "").lower()
+    assert alert_mock.call_count == 0, "No alert should fire on the first failure"
+
+    # Run cycles 2-5 — counter reaches alert threshold (5), alert fires once
+    for _ in range(4):
+        await _run_one_cycle(mocker)
+    async with _Session() as verify:
+        from sqlmodel import select as _select
+        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+    assert t.status == TaskStatus.EVALUATING, "Should still be EVALUATING at threshold"
+    assert (t.context or {}).get("review_loop", {}).get("reopen_attempts") == 5
+    assert (t.context or {}).get("review_loop", {}).get("reopen_alert_fired") is True
+    assert alert_mock.call_count == 1, (
+        f"Threshold alert should fire exactly once at attempt 5, got {alert_mock.call_count} calls"
+    )
+    threshold_alert_msg = alert_mock.call_args_list[0][0][2]
+    assert "5 times" in threshold_alert_msg, (
+        f"Alert should mention attempt count, got: {threshold_alert_msg!r}"
+    )
+
+    # Run cycles 6-9 — alert should NOT re-fire (one-shot flag)
+    for _ in range(4):
+        await _run_one_cycle(mocker)
+    assert alert_mock.call_count == 1, (
+        f"Threshold alert must not re-fire after first trigger, got {alert_mock.call_count}"
+    )
+
+    # Run cycle 10 — hits the cap, escalates to FAILED + requires_approval
+    await _run_one_cycle(mocker)
+    async with _Session() as verify:
+        from sqlmodel import select as _select
+        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+    assert t.status == TaskStatus.FAILED, (
+        f"Should escalate to FAILED at cap (10 attempts), got {t.status}"
+    )
+    assert t.requires_approval is True, "Should require approval at cap"
+    assert (t.context or {}).get("review_loop", {}).get("reopen_attempts") == 10
+    assert "manual intervention" in (t.latest_status_message or "").lower()
+    # Cap escalation fires a second alert (the approval/cap alert)
+    assert alert_mock.call_count == 2, (
+        f"Cap escalation should fire a second alert, got {alert_mock.call_count}"
+    )
+    cap_alert_msg = alert_mock.call_args_list[1][0][2]
+    assert "cap" in cap_alert_msg.lower() or "manual intervention" in cap_alert_msg.lower(), (
+        f"Cap alert should mention escalation, got: {cap_alert_msg!r}"
+    )
+    # reopen_pull_request was attempted on every failed cycle
+    assert reopen_mock.call_count == 10, (
+        f"reopen_pull_request should be called once per cycle, got {reopen_mock.call_count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_pending_reopen_success_resets_counter(orch_db, mocker):
+    """A successful reopen after prior failures must reset reopen_attempts and
+    clear the alert-fired flag so a future stall starts fresh.
+    """
+    session, _Session = orch_db
+
+    project = Project(name="CI Reopen Reset Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "ci reopen reset", "branch": "feat/reset"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 4243,
+                "branch": "feat/reset",
+                "base_branch": "main",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+                "pending_reopen": True,
+                "reopen_attempts": 3,
+                "reopen_alert_fired": True,
+            }
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+    task_id = ci_task.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "closed", "merged": False,
+                               "head": {"sha": "abc123"}, "mergeable": None})
+    mocker.patch("app.github.reopen_pull_request",
+                 new_callable=AsyncMock, return_value=True)
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify:
+        from sqlmodel import select as _select
+        t = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+
+    rl = (t.context or {}).get("review_loop", {})
+    assert rl.get("pending_reopen") is False, "pending_reopen should be cleared on success"
+    assert rl.get("reopen_attempts") == 0, (
+        f"reopen_attempts should reset to 0 on success, got {rl.get('reopen_attempts')}"
+    )
+    assert "reopen_alert_fired" not in rl, (
+        "reopen_alert_fired flag should be cleared so a future stall alerts again"
+    )
+    assert "reopened" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
 async def test_ci_polling_merged_pr_marks_completed(orch_db, mocker):
     """When CI polling finds a truly merged PR, the task must transition to
     COMPLETED with pr_merged=True in context.

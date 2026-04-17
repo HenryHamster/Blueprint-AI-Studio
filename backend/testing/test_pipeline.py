@@ -1805,6 +1805,40 @@ async def test_rollup_merge_unrecognized_state_escalates(rollup_db, mocker):
     assert mock_approval_dispatch.await_args.kwargs.get("pr_number") == 777
 
 
+@pytest.mark.asyncio
+async def test_rollup_auto_merge_blocked_calls_enable_auto_merge(rollup_db, mocker):
+    """When the rollup auto-merge path hits mergeable_state=blocked, call
+    enable_auto_merge so GitHub lands the PR once required checks pass —
+    mirroring the task_lifecycle auto-merge fallback. The deferral counter
+    path still runs so a genuinely stuck PR escalates normally."""
+    state = {"state": "blocked"}
+    _patch_deferred_counter_mocks(mocker, state)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock)
+    mock_enable = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True, "message": "Auto-merge enabled at 2026-04-17"},
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    mock_enable.assert_awaited_once()
+    call_kwargs = mock_enable.await_args.kwargs
+    call_args = mock_enable.await_args.args
+    # Accept either positional or keyword call style — the important thing is PR #777
+    pr_number_arg = call_kwargs.get("pr_number") if "pr_number" in call_kwargs else call_args[3]
+    assert pr_number_arg == 777
+    # Deferral counter path still ran in parallel
+    assert (parent.context or {}).get("_merge_deferred_count") == 1
+    assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
+
+
 # ── Strategic Completion Handler ─────────────────────────────────────────────
 
 @pytest_asyncio.fixture()
