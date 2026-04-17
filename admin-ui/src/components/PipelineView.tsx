@@ -9,8 +9,8 @@ const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
 const STATUS_COLORS: Record<string, string> = {
   COMPLETED: 'bg-emerald-500',
   IN_PROGRESS: 'bg-yellow-500',
-  PROVISIONING: 'bg-blue-400',
-  EVALUATING: 'bg-violet-400',
+  PROVISIONING: 'bg-sky-700/50',
+  EVALUATING: 'bg-indigo-600/50',
   FAILED: 'bg-red-500',
   CANCELLED: 'bg-neutral-600',
   QUEUED: 'bg-neutral-500',
@@ -507,9 +507,9 @@ function RootGroup({
         const queuedInGroup = totalInGroup - completedInGroup - runningInGroup - failedInGroup - cancelledInGroup;
         const segments = [
           { count: queuedInGroup, color: 'bg-neutral-700' },
-          { count: provisioningInGroup, color: 'bg-blue-400' },
+          { count: provisioningInGroup, color: 'bg-sky-700/50' },
           { count: inProgressInGroup, color: 'bg-yellow-500' },
-          { count: evaluatingInGroup, color: 'bg-violet-400' },
+          { count: evaluatingInGroup, color: 'bg-indigo-600/50' },
           { count: failedInGroup, color: 'bg-red-500' },
           { count: completedInGroup, color: 'bg-emerald-500' },
         ].filter(s => s.count > 0);

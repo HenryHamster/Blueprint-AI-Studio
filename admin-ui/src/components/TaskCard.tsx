@@ -253,8 +253,8 @@ export function ResearchFindings({ findings }: { findings: ResearchFinding[] }) 
 
 export function StatusBadge({ status }: { status: TaskStatus }) {
   const configs: Partial<Record<TaskStatus, { bg: string; text: string; icon: typeof Activity; label: string; spin?: boolean }>> = {
-    PROVISIONING: { bg: 'bg-blue-500/10 border-blue-500/20', text: 'text-blue-400', icon: Activity, label: 'Provisioning…', spin: true },
-    EVALUATING: { bg: 'bg-blue-500/10 border-blue-500/20', text: 'text-blue-400', icon: Clock, label: 'Evaluating' },
+    PROVISIONING: { bg: 'bg-sky-500/5 border-sky-500/10', text: 'text-sky-400/70', icon: Activity, label: 'Provisioning…', spin: true },
+    EVALUATING: { bg: 'bg-indigo-500/5 border-indigo-500/10', text: 'text-indigo-400/70', icon: Clock, label: 'Evaluating' },
     CANCELLED: { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-500', icon: X, label: 'Cancelled' },
   };
   const cfg = configs[status];
