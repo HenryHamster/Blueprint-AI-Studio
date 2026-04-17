@@ -13,7 +13,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+from typing import Dict, Tuple
 
 from fastapi import HTTPException
 from sqlalchemy import func as _func
@@ -774,18 +774,22 @@ async def orchestrator_worker():
                 # dispatching user's own pool recovers. Checking the global pool
                 # would release tasks whose user pool is still exhausted, only to
                 # re-block them at dispatch.
-                _user_pool_available: Dict[str, bool] = {}
+                # Keyed by (user_id, model) — model=None is conservative and would
+                # hold a Sonnet task when only Opus is rate-limited (or vice versa).
+                _user_pool_available: Dict[Tuple[str, str | None], bool] = {}
 
                 async def _user_has_available_account(task: Task) -> bool:
                     user_id = task.launched_by_user_id
                     if not user_id:
                         proj = await session.get(Project, task.project_id)
                         user_id = proj.user_id if proj else ""
-                    if user_id in _user_pool_available:
-                        return _user_pool_available[user_id]
+                    model = _extract_task_model(task)
+                    cache_key = (user_id, model)
+                    if cache_key in _user_pool_available:
+                        return _user_pool_available[cache_key]
                     pool = _max_plan_pools.get(user_id, [])
-                    available = any(_account_available_for_model(a, None) for a in pool)
-                    _user_pool_available[user_id] = available
+                    available = any(_account_available_for_model(a, model) for a in pool)
+                    _user_pool_available[cache_key] = available
                     return available
 
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
@@ -1308,6 +1312,49 @@ async def orchestrator_worker():
                             stall_ctx = dict(task.context or {})
                             set_retry_after(stall_ctx, rate_limit_retry_minutes(earliest_recovery))
                             task.context = stall_ctx
+                            # Escalate when a task is stuck cycling through retry_after holds.
+                            # Each reset is up to RETRY_AFTER_MAX_MINUTES (30m), so 8 resets ≈ 4h.
+                            try:
+                                _resets = int(stall_ctx.get("_retry_after_resets") or 0)
+                                _reset_threshold = _runtime_config.get("retry_after_reset_alert_threshold", 8)
+                                if _resets >= _reset_threshold:
+                                    from app.models import Alert, AlertSeverity  # noqa: PLC0415
+                                    from app.max_plan_pool import describe_pool_blockage  # noqa: PLC0415
+                                    _stuck_title = f"Task stuck in retry_after cycle: {task.title or str(task.id)[:8]}"
+                                    _existing_stuck = (await session.execute(
+                                        select(Alert).where(
+                                            Alert.task_id == task.id,
+                                            Alert.title == _stuck_title,
+                                            Alert.dismissed_at.is_(None),
+                                        )
+                                    )).scalars().first()
+                                    if _existing_stuck is None:
+                                        _hold_min = (_utcnow() - task.created_at).total_seconds() / 60 if task.created_at else 0.0
+                                        _blockage = describe_pool_blockage(task_model, user_id=dispatch_user_id)
+                                        _stuck_msg = (
+                                            f"Task {task.id} has been cycling through retry_after holds "
+                                            f"{_resets} times (threshold {_reset_threshold}); held for "
+                                            f"{_hold_min:.0f}m total. Pool state: {_blockage}."
+                                        )
+                                        _stuck_alert = Alert(
+                                            project_id=task.project_id,
+                                            severity=AlertSeverity.WARNING,
+                                            title=_stuck_title,
+                                            message=_stuck_msg,
+                                            task_id=task.id,
+                                        )
+                                        session.add(_stuck_alert)
+                                        await broadcast_to_project(
+                                            str(task.project_id),
+                                            "alert_created",
+                                            {"alert_id": str(_stuck_alert.id), "severity": "WARNING", "title": _stuck_title},
+                                        )
+                                        logger.warning(
+                                            f"[ORCHESTRATOR] Retry-after escalation alert for task {task.id} "
+                                            f"(resets={_resets}, blockage={_blockage})"
+                                        )
+                            except Exception:
+                                logger.exception(f"[ORCHESTRATOR] Failed to evaluate retry_after escalation for task {task.id}")
                             if not (task.latest_status_message or "").startswith("All accounts"):
                                 # Update directly on the locked task object (separate session would deadlock)
                                 task.latest_status_message = stall_msg

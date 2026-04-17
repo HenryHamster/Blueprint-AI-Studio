@@ -51,6 +51,7 @@ runtime_config: Dict = {
     "max_provision_retries": int(os.getenv("MAX_PROVISION_RETRIES", "3")),
     "max_rollup_retries": int(os.getenv("MAX_ROLLUP_RETRIES", "5")),
     "queued_age_alert_hours": int(os.getenv("QUEUED_AGE_ALERT_HOURS", "2")),
+    "retry_after_reset_alert_threshold": int(os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")),
     "max_autonomous_tasks_per_hour": 5,
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
