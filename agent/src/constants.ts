@@ -53,6 +53,12 @@ export const SCOPE_OVERFLOW_THRESHOLDS: Record<string, number> = {
   large: 20,  // large expects 5+ files; warn at >20
 };
 
+// Pre-implementation analysis plan gate. If a medium-scope analysis plan
+// proposes more files than this, the handler retries the analysis with a
+// narrowing directive once, then fails fast rather than burning the
+// implementation budget on a task that will hit SCOPE_OVERFLOW_THRESHOLDS.
+export const MEDIUM_ANALYSIS_PLAN_FILE_LIMIT = 7;
+
 // Claude Code runner
 export const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
 export const MAX_OUTPUT_BYTES = 10_000_000;

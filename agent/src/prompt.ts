@@ -311,6 +311,77 @@ export function readClaudeMd(): string {
 }
 
 // ── Shared prompt assembly helpers ──────────────────────────────────────
+
+// Detect test files across Python/JS/TS conventions used in this repo.
+function isTestFilePath(f: string): boolean {
+  return /(?:^|\/)(?:tests?|testing|__tests__)\//i.test(f)
+    || /(?:^|\/)test_[^/]+$/i.test(f)
+    || /(?:^|\/)[^/]+\.(?:test|spec)\.[a-z]+$/i.test(f)
+    || /_test\.[a-z]+$/i.test(f);
+}
+
+// Synthesize concise tactical guidance from scope_success_rates and
+// direction_{prior,successful}_analysis. Returns up to 2 sentences.
+export function synthesizeSuccessPatterns(
+  dirCtx: Record<string, unknown>,
+  taskScope: string,
+): string[] {
+  const sentences: string[] = [];
+
+  const scopeRates = dirCtx.scope_success_rates as Record<string, Record<string, unknown>> | undefined;
+  if (scopeRates && typeof scopeRates === 'object' && taskScope) {
+    const rateFor = (scope: string) => {
+      const s = scopeRates[scope];
+      if (!s) return null;
+      const created = Number(s.created ?? 0);
+      const merged = Number(s.merged ?? 0);
+      if (created < 1) return null;
+      return { merged, created, pct: Math.round((merged / created) * 100) };
+    };
+    const current = rateFor(taskScope);
+    if (current && current.pct < 50) {
+      let best: { scope: string; pct: number; merged: number; created: number } | null = null;
+      for (const [scope, counts] of Object.entries(scopeRates)) {
+        if (scope === taskScope) continue;
+        const created = Number(counts?.created ?? 0);
+        const merged = Number(counts?.merged ?? 0);
+        if (created < 2) continue;
+        const pct = Math.round((merged / created) * 100);
+        if (!best || pct > best.pct) best = { scope, pct, merged, created };
+      }
+      if (best && best.pct - current.pct >= 20) {
+        sentences.push(
+          `${taskScope}-scope tasks in this direction merge at ${current.pct}% (${current.merged}/${current.created}) while ${best.scope}-scope tasks merge at ${best.pct}% (${best.merged}/${best.created}) — consider constraining your changes to the smallest viable surface.`,
+        );
+      }
+    }
+  }
+
+  const successful = Array.isArray(dirCtx.direction_successful_analysis)
+    ? dirCtx.direction_successful_analysis as Array<Record<string, unknown>>
+    : [];
+  const failed = Array.isArray(dirCtx.direction_prior_analysis)
+    ? dirCtx.direction_prior_analysis as Array<Record<string, unknown>>
+    : [];
+  const entryHasTest = (e: Record<string, unknown>): boolean => {
+    const files = Array.isArray(e.pr_changed_files) ? e.pr_changed_files as unknown[] : [];
+    return files.some(f => typeof f === 'string' && isTestFilePath(f));
+  };
+  if (successful.length >= 2 && failed.length >= 1) {
+    const succWithTests = successful.filter(entryHasTest).length;
+    const failWithTests = failed.filter(entryHasTest).length;
+    const succRatio = succWithTests / successful.length;
+    const failRatio = failWithTests / failed.length;
+    if (succRatio >= 0.75 && failRatio <= 0.25) {
+      sentences.push(
+        'Successful tasks in this direction consistently touch test files while failed tasks typically did not — add or update tests for the behavior you change.',
+      );
+    }
+  }
+
+  return sentences;
+}
+
 export function buildContextPrefix(task: Record<string, unknown>): string {
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
@@ -475,6 +546,11 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
           dcLines.push(`  - Files changed: ${changedFiles.join(', ')}`);
         }
       }
+    }
+    const patterns = synthesizeSuccessPatterns(dirCtx, taskScope);
+    if (patterns.length > 0) {
+      dcLines.push('**What tends to work:**');
+      for (const s of patterns) dcLines.push(`- ${s}`);
     }
     dcLines.push('');
     prefix += dcLines.join('\n') + '\n';
@@ -1686,16 +1762,24 @@ export function buildAnalysisPrompt(opts: {
   taskTitle: string;
   relatedFiles: string[];
   fileTree: string;
+  narrowingGuidance?: string;
+  fileLimit?: number;
 }): string {
   const filesList = opts.relatedFiles.length > 0
     ? `## Files Relevant to This Task\n${opts.relatedFiles.map(f => `- ${f}`).join('\n')}\n\n`
     : '';
   const titleLine = opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : '';
+  const limitClause = typeof opts.fileLimit === 'number'
+    ? ` Aim for ${opts.fileLimit} or fewer files; if you cannot stay at or below ${opts.fileLimit}, list only the smallest viable set and note in **Implementation approach** what was deferred.`
+    : '';
+  const narrowingBlock = opts.narrowingGuidance
+    ? `\n\n## Narrowing Directive (from prior analysis pass)\n${opts.narrowingGuidance}\n`
+    : '';
 
   return `${opts.fileTree}${filesList}You are performing a pre-implementation analysis for a medium-scope task. This is a READ-ONLY pass — do not modify any files.
 
 ## Task
-${titleLine}${opts.rawPrompt.slice(0, 1500)}
+${titleLine}${opts.rawPrompt.slice(0, 1500)}${narrowingBlock}
 
 ## Instructions
 
@@ -1710,7 +1794,7 @@ ${titleLine}${opts.rawPrompt.slice(0, 1500)}
 
 4. Output a compact structured implementation plan using exactly these headings:
 
-**Files to change** (list in recommended change order, one per line with brief reason)
+**Files to change** (list in recommended change order, one per line with brief reason).${limitClause}
 
 **Interfaces to preserve** (function signatures, exported types, or API contracts that must not be broken)
 
@@ -1718,7 +1802,56 @@ ${titleLine}${opts.rawPrompt.slice(0, 1500)}
 
 **Implementation approach** (2-3 sentences describing the strategy to make changes correctly without breaking type contracts)
 
-Keep the total output under 600 words. Be specific and concrete — name actual function signatures, type names, and import paths. Do NOT write any implementation code.`;
+**Tests to add or update** (list each test file you will create or modify, one per line, with the case name or behavior covered)
+
+**Tests at risk of breaking** (list existing tests whose assertions or fixtures may need adjustment because of the planned change — name the file and the specific test or describe "none expected" with a one-line justification)
+
+Keep the total output under 700 words. Be specific and concrete — name actual function signatures, type names, and import paths. Do NOT write any implementation code.`;
+}
+
+/**
+ * Parses the **Files to change** section of an analysis prompt's output and
+ * returns the list of file paths the agent intends to modify. The parser is
+ * intentionally permissive: it accepts bullet (`-`, `*`, `•`) and numbered
+ * (`1.`, `1)`) list markers, with or without backticks, and stops at the next
+ * bold heading.
+ *
+ * Returns an empty array when the section is missing or unparsable.
+ */
+export function parseAnalysisPlanFiles(analysisOutput: string): string[] {
+  if (!analysisOutput) return [];
+  const lines = analysisOutput.split('\n');
+  const headingRe = /^\s*\*\*Files to change\*\*/i;
+  let i = 0;
+  for (; i < lines.length; i++) {
+    if (headingRe.test(lines[i])) break;
+  }
+  if (i >= lines.length) return [];
+  i++; // move past the heading line itself
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  // Stop at the next **Bold heading** line (any bold heading).
+  const nextHeadingRe = /^\s*\*\*[^*]+\*\*/;
+  // Strip leading list markers: -, *, •, "1.", "1)", optional whitespace.
+  const markerRe = /^\s*(?:[-*•]|\d+[.)])\s+/;
+
+  for (; i < lines.length; i++) {
+    const raw = lines[i];
+    if (raw.trim() === '') continue;
+    if (nextHeadingRe.test(raw)) break;
+    if (!markerRe.test(raw)) continue;
+    const stripped = raw.replace(markerRe, '');
+    // Take the first whitespace-delimited token, peeling backticks/quotes/punctuation.
+    let token = stripped.trim().split(/\s+/)[0] || '';
+    token = token.replace(/^[`"'(]+|[`"',.;:)]+$/g, '');
+    // Skip obvious non-paths (e.g., lines that start with prose like "Add").
+    if (!token || !/[/.]/.test(token)) continue;
+    if (seen.has(token)) continue;
+    seen.add(token);
+    out.push(token);
+  }
+  return out;
 }
 
 // ── Self-review helpers ───────────────────────────────────────────────────────

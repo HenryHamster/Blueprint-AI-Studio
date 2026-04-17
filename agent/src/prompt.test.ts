@@ -49,9 +49,12 @@ import {
   getTaskTypeHints,
   TASK_TYPE_HINTS,
   buildSelfReviewPrompt,
+  buildAnalysisPrompt,
+  parseAnalysisPlanFiles,
   extractModuleInterfaces,
   discoverAffectedConsumers,
   relativeTimeFromIso,
+  synthesizeSuccessPatterns,
 } from './prompt.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
@@ -510,6 +513,95 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('**Approaches that worked:**');
   });
 
+  it('renders What tends to work with scope-constraint guidance when current scope underperforms', () => {
+    const task = {
+      context: { scope: 'medium' },
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        scope_success_rates: {
+          small: { created: 5, merged: 4, failed: 1 },
+          medium: { created: 3, merged: 0, failed: 3 },
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('**What tends to work:**');
+    expect(result).toContain('medium-scope tasks in this direction merge at 0% (0/3)');
+    expect(result).toContain('small-scope tasks merge at 80% (4/5)');
+    expect(result).toContain('constraining your changes');
+  });
+
+  it('does not emit scope guidance when current-scope merge rate is already healthy', () => {
+    const task = {
+      context: { scope: 'small' },
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        scope_success_rates: {
+          small: { created: 5, merged: 4, failed: 1 },
+          medium: { created: 3, merged: 0, failed: 3 },
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('**What tends to work:**');
+  });
+
+  it('does not emit scope guidance when gap between scopes is small', () => {
+    const task = {
+      context: { scope: 'medium' },
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        scope_success_rates: {
+          small: { created: 10, merged: 3, failed: 7 },
+          medium: { created: 10, merged: 2, failed: 8 },
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('**What tends to work:**');
+  });
+
+  it('emits test-inclusion guidance when successful tasks touch tests and failed tasks do not', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        direction_successful_analysis: [
+          { title: 's1', pr_changed_files: ['backend/app/foo.py', 'backend/testing/test_foo.py'] },
+          { title: 's2', pr_changed_files: ['agent/src/bar.ts', 'agent/src/bar.test.ts'] },
+        ],
+        direction_prior_analysis: [
+          { title: 'f1', failure_category: 'CODE_ERROR', pr_changed_files: ['backend/app/baz.py'] },
+          { title: 'f2', failure_category: 'CODE_ERROR', pr_changed_files: ['backend/app/qux.py'] },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('**What tends to work:**');
+    expect(result).toContain('consistently touch test files');
+  });
+
+  it('does not emit test-inclusion guidance when both successful and failed tasks touch tests', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        direction_successful_analysis: [
+          { title: 's1', pr_changed_files: ['foo.py', 'test_foo.py'] },
+          { title: 's2', pr_changed_files: ['bar.ts', 'bar.test.ts'] },
+        ],
+        direction_prior_analysis: [
+          { title: 'f1', failure_category: 'CODE_ERROR', pr_changed_files: ['baz.py', 'test_baz.py'] },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('**What tends to work:**');
+  });
+
   it('returns empty string for relativeTimeFromIso when iso is empty or unparseable', () => {
     expect(relativeTimeFromIso('')).toBe('');
     expect(relativeTimeFromIso('not-a-date')).toBe('');
@@ -644,6 +736,55 @@ describe('buildContextPrefix', () => {
     };
     const result = buildContextPrefix(task);
     expect(result).not.toContain('## Architecture Context');
+  });
+});
+
+// ── synthesizeSuccessPatterns ────────────────────────────────────────────────
+describe('synthesizeSuccessPatterns', () => {
+  it('returns empty when no relevant signal is present', () => {
+    expect(synthesizeSuccessPatterns({}, 'small')).toEqual([]);
+    expect(synthesizeSuccessPatterns({ scope_success_rates: {} }, '')).toEqual([]);
+  });
+
+  it('requires at least 2 tasks in the comparison scope to avoid noise', () => {
+    const out = synthesizeSuccessPatterns(
+      {
+        scope_success_rates: {
+          medium: { created: 4, merged: 0 },
+          small: { created: 1, merged: 1 },
+        },
+      },
+      'medium',
+    );
+    expect(out).toEqual([]);
+  });
+
+  it('skips scope guidance when no taskScope is provided', () => {
+    const out = synthesizeSuccessPatterns(
+      {
+        scope_success_rates: {
+          small: { created: 5, merged: 4 },
+          medium: { created: 3, merged: 0 },
+        },
+      },
+      '',
+    );
+    expect(out).toEqual([]);
+  });
+
+  it('does not emit test-inclusion guidance with only one successful task', () => {
+    const out = synthesizeSuccessPatterns(
+      {
+        direction_successful_analysis: [
+          { title: 's', pr_changed_files: ['foo.py', 'test_foo.py'] },
+        ],
+        direction_prior_analysis: [
+          { title: 'f', pr_changed_files: ['bar.py'] },
+        ],
+      },
+      '',
+    );
+    expect(out).toEqual([]);
   });
 });
 
@@ -2003,5 +2144,105 @@ describe('discoverAffectedConsumers', () => {
     vi.mocked(execFileSync).mockImplementation(() => { throw new Error('git grep failed'); });
     const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
     expect(result).toBe('');
+  });
+});
+
+// ── buildAnalysisPrompt ──────────────────────────────────────────────────────
+describe('buildAnalysisPrompt', () => {
+  it('includes the test-planning sections', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Do thing',
+      taskTitle: 'Title',
+      relatedFiles: ['a.ts'],
+      fileTree: '',
+    });
+    expect(result).toContain('**Tests to add or update**');
+    expect(result).toContain('**Tests at risk of breaking**');
+  });
+
+  it('mentions the file limit when fileLimit is provided', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Do thing',
+      taskTitle: 'Title',
+      relatedFiles: [],
+      fileTree: '',
+      fileLimit: 7,
+    });
+    expect(result).toContain('7 or fewer files');
+  });
+
+  it('omits the file-limit clause when fileLimit is not provided', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Do thing',
+      taskTitle: 'Title',
+      relatedFiles: [],
+      fileTree: '',
+    });
+    expect(result).not.toContain('or fewer files');
+  });
+
+  it('embeds the narrowing directive when one is provided', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Do thing',
+      taskTitle: 'Title',
+      relatedFiles: [],
+      fileTree: '',
+      narrowingGuidance: 'Cut the plan to fewer files.',
+    });
+    expect(result).toContain('Narrowing Directive');
+    expect(result).toContain('Cut the plan to fewer files.');
+  });
+});
+
+// ── parseAnalysisPlanFiles ────────────────────────────────────────────────────
+describe('parseAnalysisPlanFiles', () => {
+  it('returns [] for empty input', () => {
+    expect(parseAnalysisPlanFiles('')).toEqual([]);
+  });
+
+  it('returns [] when the heading is missing', () => {
+    expect(parseAnalysisPlanFiles('No heading here\nSome body')).toEqual([]);
+  });
+
+  it('extracts dash-bulleted file paths under the heading', () => {
+    const out = parseAnalysisPlanFiles(
+      '**Files to change**\n- agent/src/foo.ts — reason\n- agent/src/bar.ts (other reason)\n\n**Interfaces to preserve**\n- something else',
+    );
+    expect(out).toEqual(['agent/src/foo.ts', 'agent/src/bar.ts']);
+  });
+
+  it('extracts numbered file paths and strips backticks', () => {
+    const out = parseAnalysisPlanFiles(
+      '**Files to change**\n1. `agent/src/foo.ts` — first\n2. `agent/src/bar.ts` — second\n',
+    );
+    expect(out).toEqual(['agent/src/foo.ts', 'agent/src/bar.ts']);
+  });
+
+  it('stops at the next bold heading', () => {
+    const out = parseAnalysisPlanFiles(
+      '**Files to change**\n- a.ts\n- b.ts\n\n**Implementation approach**\n- not-a-file.ts',
+    );
+    expect(out).toEqual(['a.ts', 'b.ts']);
+  });
+
+  it('skips bullets without a path-like token', () => {
+    const out = parseAnalysisPlanFiles(
+      '**Files to change**\n- (none — analysis only)\n- agent/src/foo.ts\n',
+    );
+    expect(out).toEqual(['agent/src/foo.ts']);
+  });
+
+  it('deduplicates repeated paths', () => {
+    const out = parseAnalysisPlanFiles(
+      '**Files to change**\n- a.ts\n- a.ts\n- b.ts\n',
+    );
+    expect(out).toEqual(['a.ts', 'b.ts']);
+  });
+
+  it('handles asterisk and bullet-character markers', () => {
+    const out = parseAnalysisPlanFiles(
+      '**Files to change**\n* a.ts\n• b.ts\n',
+    );
+    expect(out).toEqual(['a.ts', 'b.ts']);
   });
 });

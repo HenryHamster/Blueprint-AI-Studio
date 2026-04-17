@@ -10,11 +10,11 @@ import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
-  buildSelfReviewPrompt, buildAnalysisPrompt, extractModuleInterfaces, getMandatoryChecks,
+  buildSelfReviewPrompt, buildAnalysisPrompt, parseAnalysisPlanFiles, extractModuleInterfaces, getMandatoryChecks,
   discoverAffectedConsumers, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
-import { SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
+import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 
@@ -195,6 +195,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       taskTitle,
       relatedFiles: analysisRelatedFiles,
       fileTree,
+      fileLimit: MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
     });
 
     const { exitCode: analysisExitCode, lastResultText: analysisResult } = await runClaudeCode(
@@ -204,7 +205,50 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     );
 
     if (analysisExitCode === 0 && analysisResult.trim()) {
-      analysisContext = `## Pre-Implementation Analysis\n\n${analysisResult.trim()}\n\n`;
+      let effectiveAnalysis = analysisResult.trim();
+      let plannedFiles = parseAnalysisPlanFiles(effectiveAnalysis);
+
+      // Scope feasibility gate: if the analysis plans more files than the
+      // medium-scope limit, retry the analysis once with explicit narrowing
+      // guidance. If still over budget, fail fast — the implementation pass
+      // would otherwise burn ~5-10 minutes only to hit scope_overflow.
+      if (plannedFiles.length > MEDIUM_ANALYSIS_PLAN_FILE_LIMIT) {
+        sendLog(ws, `[Analysis Phase] Plan lists ${plannedFiles.length} files (limit ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT}); retrying with narrowing directive.\n`);
+        const narrowingGuidance = `The previous analysis pass planned ${plannedFiles.length} files to change, exceeding the ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT}-file limit for medium-scope tasks. Cut the plan down to the minimum viable change set (target: ≤${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT} files). Drop any files that are nice-to-have refactors, peripheral cleanups, or follow-on test/doc updates that could ship in a separate task. In **Implementation approach**, briefly note what was deferred so the next task can pick it up. Previously planned files:\n${plannedFiles.map(f => `- ${f}`).join('\n')}`;
+        const retryPrompt = buildAnalysisPrompt({
+          rawPrompt,
+          taskTitle,
+          relatedFiles: analysisRelatedFiles,
+          fileTree,
+          fileLimit: MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
+          narrowingGuidance,
+        });
+        const { exitCode: retryExitCode, lastResultText: retryResult } = await runClaudeCode(
+          retryPrompt,
+          ws, statusRef, model, effort,
+          ['Write', 'Edit', 'NotebookEdit'],
+        );
+        if (retryExitCode === 0 && retryResult.trim()) {
+          effectiveAnalysis = retryResult.trim();
+          plannedFiles = parseAnalysisPlanFiles(effectiveAnalysis);
+        }
+
+        if (plannedFiles.length > MEDIUM_ANALYSIS_PLAN_FILE_LIMIT) {
+          const fileList = plannedFiles.map(f => `- ${f}`).join('\n');
+          const failureLog = `Pre-implementation analysis planned ${plannedFiles.length} files to change, exceeding the medium-scope analysis limit of ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT}. The narrowing retry could not bring the plan within budget. Split this task into smaller subtasks or scope it down to a single concern before retrying.\n\nPlanned files:\n${fileList}`;
+          sendLog(ws, `[Analysis Phase] Plan still exceeds limit after retry (${plannedFiles.length} files) — failing fast.\n`);
+          await persistAndPostStatus(taskId, {
+            task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+            logs: failureLog,
+            failure_category: 'scope_overflow',
+            analysis_plan: effectiveAnalysis.slice(0, 5000),
+          });
+          return;
+        }
+        sendLog(ws, `[Analysis Phase] Plan narrowed to ${plannedFiles.length} files.\n`);
+      }
+
+      analysisContext = `## Pre-Implementation Analysis\n\n${effectiveAnalysis}\n\n`;
       sendLog(ws, '[Analysis Phase] Complete.\n');
     } else {
       sendLog(ws, '[Analysis Phase] Skipped — proceeding to implementation.\n');
@@ -592,9 +636,44 @@ Output ONLY a JSON object in a \`\`\`json code fence:
             }
           }
 
-          // When diff was truncated, validate that the agent actually read the files
+          // When diff was truncated, validate that the agent actually read the files.
+          // For hard-gated tasks (failOnTestFailure), retry once with an explicit list of
+          // files that weren't shown in the diff. If the retry still reports zero files
+          // read, flag the review as incomplete and force PASS so the PR is not blocked
+          // by an untrusted verdict — but the flag surfaces the gap for downstream review.
           if (diffTruncated && (!parsedTruncatedFiles || parsedTruncatedFiles.length === 0)) {
             reviewCategories.push('truncation_not_verified');
+
+            if (failOnTestFailure && !parseFailed) {
+              const fileListForRetry = changedFiles && changedFiles.length > 0
+                ? changedFiles.map(f => `- ${f}`).join('\n')
+                : '(no file list available — use `git diff --name-only` to find changed files)';
+              sendLog(ws, '\nSelf-review: diff truncated but no files were read — retrying with explicit file-read guidance...\n');
+              const truncationRetryPrompt = `${selfReviewPrompt}\n\nCRITICAL: Your previous self-review did not read the truncated files. You MUST read each of the following files in full with the Read tool before issuing a verdict, and list them in "truncated_files_read":\n${fileListForRetry}\n\nReturn ONLY a valid JSON object with truncated_files_read populated.`;
+              const { exitCode: truncRetryExit, allOutput: truncRetryOutput, lastResultText: truncRetryResult } = await runClaudeCode(
+                truncationRetryPrompt, ws, statusRef, model, effort,
+              );
+              if (truncRetryExit === 0) {
+                const truncRetryParsed = extractSelfReviewJson(truncRetryResult || truncRetryOutput);
+                if (truncRetryParsed) {
+                  const retryTruncatedFiles = Array.isArray(truncRetryParsed.truncated_files_read)
+                    ? (truncRetryParsed.truncated_files_read as unknown[]).filter((f): f is string => typeof f === 'string')
+                    : [];
+                  if (retryTruncatedFiles.length > 0) {
+                    parsedTruncatedFiles = retryTruncatedFiles;
+                    const retryVerdict = typeof truncRetryParsed.verdict === 'string' ? truncRetryParsed.verdict : undefined;
+                    if (retryVerdict !== undefined) parsedVerdict = retryVerdict;
+                    sendLog(ws, `Self-review: truncation retry succeeded — ${retryTruncatedFiles.length} file(s) read.\n`);
+                  }
+                }
+              }
+
+              if (!parsedTruncatedFiles || parsedTruncatedFiles.length === 0) {
+                reviewCategories.push('incomplete_review');
+                parsedVerdict = 'PASS';
+                sendLog(ws, 'Self-review: truncation retry still reported zero files read — flagging review as incomplete and forcing PASS.\n');
+              }
+            }
           }
         }
 
@@ -630,6 +709,34 @@ Output ONLY a JSON object in a \`\`\`json code fence:
               return;
             }
             sendLog(ws, `\nWARNING: Lint check after self-review fixes failed — proceeding anyway:\n${msg.slice(0, 2000)}\n`);
+          }
+
+          // Re-run tests after self-review fixes to catch regressions before PR creation.
+          // Without this, regressions only surface in CI and spawn a fix task adding 2+ review iterations.
+          if (runTestFix && failOnTestFailure && baseBranch === 'main') {
+            sendLog(ws, '\nRe-running tests after self-review fixes...\n');
+            statusRef.value = 'Re-running tests after self-review...';
+            const postReviewTestResult = await testFixLoop(
+              ws, statusRef, model, effort, buildConfig, baselineFailures, relatedFiles, analysisContext || undefined,
+            );
+            testsPassed = postReviewTestResult.passed;
+            testFailuresDetected = postReviewTestResult.testFailuresDetected;
+            if (postReviewTestResult.failureSummary) testFailureSummary = postReviewTestResult.failureSummary;
+            if (postReviewTestResult.testFailuresDetected && !postReviewTestResult.passed) {
+              sendLog(ws, '\nTests failed after self-review fixes — marking task as FAILED.\n');
+              const failedLogs = postReviewTestResult.failureSummary
+                ? `Test suite failed after self-review fixes. Failing tests:\n${postReviewTestResult.failureSummary}`
+                : `Test suite failed after self-review fixes.`;
+              await persistAndPostStatus(taskId, {
+                task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+                logs: failedLogs,
+                failure_category: 'test_failed_after_self_review',
+                changed_files: changedPaths.slice(0, 50),
+                ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+                ...(postReviewTestResult.failureSummary ? { test_failure_summary: postReviewTestResult.failureSummary.slice(0, 5000) } : {}),
+              });
+              return;
+            }
           }
         }
 
