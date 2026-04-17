@@ -395,7 +395,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     research_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("research")
     # Every Nth cycle is "undirected" — the agent explores the whole codebase
     # without a specific direction lens, finding cross-cutting improvements.
-    undirected_frequency = _runtime_config.get("undirected_research_frequency", 4)
+    # Default raised from 4 → 12 on 2026-04-17: cross-cutting research was
+    # producing diminishing returns relative to directed cycles, and it burns
+    # just as much GitHub/account budget per run.  Still configurable via
+    # runtime_config for repos that need more exploratory cycles.
+    undirected_frequency = _runtime_config.get("undirected_research_frequency", 12)
     is_undirected = undirected_frequency > 0 and research_spawn_count > 0 and research_spawn_count % undirected_frequency == 0
     # Don't run undirected on strategic cycles
     if is_strategic:
