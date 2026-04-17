@@ -135,12 +135,26 @@ def _update_quota_state(remaining: int, limit: int | None, reset_ts: int | None)
     now_iso = datetime.now(timezone.utc).isoformat()
     prev_reset = q.get("reset_at")
     prev_remaining = q.get("remaining")
-    # If the reset window rolled over, accept the new value unconditionally
-    # and clear the call counter — the old counts are for a past window.
-    rolled_over = prev_reset is not None and reset_ts is not None and reset_ts > prev_reset
-    if rolled_over:
+    prev_limit = q.get("limit")
+    # Accept the new observation unconditionally (treating this like a
+    # rollover) when any of these are true:
+    #   - reset_ts advanced (natural hourly rollover)
+    #   - limit changed (we're now tracking a different bucket type —
+    #     e.g. install-token 5000 after previously seeing App-JWT 60 —
+    #     the prior remaining value is meaningless for the new bucket)
+    #   - reset_ts moved backward (shouldn't normally happen, but if it
+    #     does we definitely aren't in the same window anymore)
+    bucket_switched = (
+        prev_limit is not None and limit is not None and prev_limit != limit
+    )
+    rolled_over = (
+        prev_reset is not None and reset_ts is not None and reset_ts != prev_reset
+    )
+    accept_unconditional = bucket_switched or rolled_over
+    if accept_unconditional:
         _ss.github_call_counts.clear()
-        _ss.github_call_counts_window_reset_at = reset_ts
+        if reset_ts is not None:
+            _ss.github_call_counts_window_reset_at = reset_ts
         q["remaining"] = remaining
     elif prev_remaining is None or remaining < prev_remaining:
         q["remaining"] = remaining

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
+import { RefreshCw } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { timeAgo, parseTimestamp, formatDurationSec } from '../utils/time';
+import { apiFetch } from '../api';
 
 interface OrchestratorHealth {
   last_cycle_seconds_ago: number | null;
@@ -82,11 +84,24 @@ function monitoringDuration(since: string): string {
 export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsConnected, lastFetchTime, tasks, pipelineThrottle }: OrchestratorHealthBarProps) {
   const [now, setNow] = useState(() => Date.now());
   const [circuitExpanded, setCircuitExpanded] = useState(false);
+  const [refreshingQuota, setRefreshingQuota] = useState(false);
 
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
+
+  const refreshQuota = async () => {
+    if (refreshingQuota) return;
+    setRefreshingQuota(true);
+    try {
+      await apiFetch('/api/admin/github-quota/refresh', { method: 'POST' });
+    } catch {
+      // Ignored — the pill will keep showing last-known values.
+    } finally {
+      setRefreshingQuota(false);
+    }
+  };
 
   const staleHeartbeatCount = useMemo(() => {
     const fiveMinutesAgo = now - 5 * 60 * 1000;
@@ -291,9 +306,9 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
           </>
         )}
 
-        {/* GitHub quota — only show when degraded/critical or unknown-with-recent-fetch.
-            Hidden when healthy to avoid noise; visible the moment it matters. */}
-        {detailedHealth?.github_quota && detailedHealth.github_quota.status !== 'ok' && (
+        {/* GitHub quota — always shown so the manual refresh button is accessible.
+            Text stays low-intensity when healthy; amber/red when degraded/critical. */}
+        {detailedHealth?.github_quota && (
           <>
             <div className="w-px h-3 bg-neutral-800 shrink-0" />
             {(() => {
@@ -301,6 +316,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
               const dotColor =
                 q.status === 'critical' ? 'bg-red-500 animate-pulse' :
                 q.status === 'degraded' ? 'bg-amber-400' :
+                q.status === 'ok' ? 'bg-emerald-500' :
                 'bg-neutral-600';
               const textColor =
                 q.status === 'critical' ? 'text-red-400' :
@@ -312,8 +328,8 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
               const remainingDisplay = q.remaining == null ? '?' : q.remaining;
               const limitDisplay = q.limit ?? 5000;
               const title = q.remaining == null
-                ? 'GitHub quota: no recent observation'
-                : `GitHub API quota: ${remainingDisplay}/${limitDisplay} remaining${resetIn != null ? `, resets in ~${resetIn}min` : ''}`;
+                ? 'GitHub quota: no recent observation (click ↻ to probe)'
+                : `GitHub API quota: ${remainingDisplay}/${limitDisplay} remaining${resetIn != null ? `, resets in ~${resetIn}min` : ''} (click ↻ to refresh)`;
               return (
                 <div className="flex items-center gap-1.5" title={title}>
                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
@@ -321,6 +337,15 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                     GH: {remainingDisplay}{q.status === 'critical' ? ' ⚠' : ''}
                     {resetIn != null && resetIn > 0 && ` (${resetIn}m)`}
                   </span>
+                  <button
+                    type="button"
+                    onClick={refreshQuota}
+                    disabled={refreshingQuota}
+                    className="text-neutral-500 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Probe GitHub rate_limit endpoint now"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${refreshingQuota ? 'animate-spin' : ''}`} />
+                  </button>
                 </div>
               );
             })()}

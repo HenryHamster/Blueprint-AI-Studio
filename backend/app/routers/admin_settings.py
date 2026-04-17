@@ -1048,6 +1048,49 @@ async def restart_orchestrator(
     return {"status": "restarted"}
 
 
+@router.post("/github-quota/refresh")
+async def refresh_github_quota(
+    current_user: dict = Depends(require_admin),
+):
+    """Force an immediate probe of GitHub's /rate_limit endpoint.
+
+    Returns the refreshed shared_state.github_quota dict so the UI can
+    update without waiting for the next 30s health-detailed poll.
+    Useful after the pill shows suspicious stale values (e.g. a
+    remaining=0 reading that got stuck across a bucket switch).
+    """
+    import app.shared_state as _ss  # noqa: PLC0415
+    from app.github import probe_rate_limit  # noqa: PLC0415
+    ok = await probe_rate_limit()
+    return {
+        "probed": bool(ok),
+        "github_quota": dict(_ss.github_quota),
+    }
+
+
+@router.post("/github-quota/reset-tracking")
+async def reset_github_quota_tracking(
+    current_user: dict = Depends(require_admin),
+):
+    """Clear the in-memory quota tracking state.
+
+    Forces the next _github_request response to repopulate from scratch —
+    useful to unstick a stale `remaining` value from a polluted bucket
+    observation (e.g. App-JWT contamination before the install-token
+    filter deployed).
+    """
+    import app.shared_state as _ss  # noqa: PLC0415
+    _ss.github_quota.update({
+        "remaining": None, "limit": None, "reset_at": None, "last_updated": None,
+    })
+    _ss.github_call_counts.clear()
+    _ss.github_call_counts_window_reset_at = None
+    # Immediately probe to repopulate with a fresh observation.
+    from app.github import probe_rate_limit  # noqa: PLC0415
+    await probe_rate_limit()
+    return {"status": "reset", "github_quota": dict(_ss.github_quota)}
+
+
 @router.post("/repair-state")
 async def repair_state(
     session: AsyncSession = Depends(get_session),
