@@ -479,6 +479,20 @@ async def _check_pause_mode():
                     _runtime_config["max_concurrent_vms"] = 0
                     logger.warning(f"[PAUSE] Auto-paused pipeline — {', '.join(critical_failures)} down")
                     await broadcast_deploy_state()
+            elif (
+                not critical_failures
+                and state.status in (DeploymentStatus.MONITORING, DeploymentStatus.STABLE)
+                and state.pre_pause_max_vms is None
+                and state.runtime_max_concurrent_vms is not None
+                and 0 < _runtime_config["max_concurrent_vms"] < state.runtime_max_concurrent_vms
+            ):
+                # Gradual ramp-up after auto-resume: DB holds the target, runtime starts low.
+                target = state.runtime_max_concurrent_vms
+                current = _runtime_config["max_concurrent_vms"]
+                step = min(2, target - current)
+                _runtime_config["max_concurrent_vms"] = current + step
+                logger.info(f"[RAMP] max_concurrent_vms {current} → {current + step} (target: {target})")
+                await broadcast_deploy_state()
             return
 
         # --- Recovery path (we are in our own auto-pause) ----------------------

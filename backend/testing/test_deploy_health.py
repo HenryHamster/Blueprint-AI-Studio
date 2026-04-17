@@ -479,6 +479,98 @@ async def test_already_paused_state_skips_re_pause(dh_db):
     _dh._create_auto_pause_alerts.assert_not_awaited()
 
 
+# ── Tests: ramp-up after auto-resume ─────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_rampup_increases_toward_target(dh_db):
+    """After auto-resume, a healthy cycle with runtime < DB target ramps up by up to 2."""
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state.runtime_max_concurrent_vms = 8
+    await dh_db.commit()
+
+    _shared_state.runtime_config["max_concurrent_vms"] = 2  # initial post-resume
+    _set_healthy()
+
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 6
+
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 8  # reached target
+
+    # No further ramp once target reached
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 8
+
+
+@pytest.mark.asyncio
+async def test_rampup_partial_step_to_target(dh_db):
+    """When only 1 VM short of target, ramp-up adds exactly 1 (not 2)."""
+    await _make_deploy_state(dh_db, status=DeploymentStatus.MONITORING)
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state.runtime_max_concurrent_vms = 3
+    await dh_db.commit()
+
+    _shared_state.runtime_config["max_concurrent_vms"] = 2
+    _set_healthy()
+
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 3
+
+
+@pytest.mark.asyncio
+async def test_rampup_skipped_when_paused_state(dh_db):
+    """While PAUSED, ramp-up must not fire (auto-resume branch handles the transition)."""
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: db",
+        pre_pause_max_vms=8,
+        paused_at=_dh._utcnow(),
+    )
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    state.runtime_max_concurrent_vms = 8
+    await dh_db.commit()
+
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.deploy_monitoring["window_start"] = None
+    _set_healthy()
+
+    # First healthy cycle: ring buffer at 1/5, does not resume, does not ramp.
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_followed_by_rampup_reaches_target(dh_db):
+    """End-to-end: auto-resume sets runtime to min(2,target), subsequent cycles ramp up."""
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: gcp",
+        pre_pause_max_vms=6,
+        paused_at=_dh._utcnow(),
+    )
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.deploy_monitoring["window_start"] = None
+    _set_healthy()
+
+    _seed_recovery_history(True, True)
+    await _dh._check_pause_mode()  # triggers resume (3rd healthy probe)
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 2
+
+    # Subsequent healthy cycles ramp up
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 6
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 6  # held at target
+
+
 # ── Tests: recovery ring buffer tolerates a single flaky probe ───────────────
 
 @pytest.mark.asyncio
@@ -591,3 +683,70 @@ async def test_forced_resume_after_max_duration(dh_db):
     _dh._create_forced_resume_alerts.assert_awaited_once()
     # Normal resume alert helper should NOT be called on the forced path.
     _dh._create_auto_resume_alerts.assert_not_awaited()
+
+
+# ── Tests: task_results staleness guard (auto-resume deadlock) ───────────────
+
+import os
+from datetime import datetime, timedelta, timezone
+from collections import deque
+import app.health_check_primitives as _hcp
+
+
+def _ts(minutes_ago: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
+
+def test_check_gcp_health_stale_provision_failures_return_healthy():
+    """Pre-pause PROVISION_FAILURE entries that have aged past the staleness window
+    must not keep GCP health failing, or auto-resume deadlocks."""
+    _shared_state.deploy_monitoring["task_results"] = deque([
+        (_ts(30), "failure", "PROVISION_FAILURE", "create"),
+        (_ts(25), "failure", "PROVISION_FAILURE", "create"),
+        (_ts(20), "failure", "PROVISION_FAILURE", "create"),
+    ], maxlen=100)
+    ext = {"errors": {}}
+    assert _hcp.check_gcp_health(ext) is None
+    assert ext["gcp"] is True
+
+
+def test_check_gcp_health_fresh_provision_failures_return_failed():
+    _shared_state.deploy_monitoring["task_results"] = deque([
+        (_ts(5), "failure", "PROVISION_FAILURE", "create"),
+        (_ts(4), "failure", "PROVISION_FAILURE", "create"),
+        (_ts(3), "failure", "PROVISION_FAILURE", "create"),
+    ], maxlen=100)
+    ext = {"errors": {}}
+    assert _hcp.check_gcp_health(ext) == "gcp"
+    assert ext["gcp"] is False
+
+
+def test_check_claude_api_health_stale_rate_limits_return_healthy(mocker):
+    """Single-key path: stale RATE_LIMIT entries must not keep Claude API failing."""
+    mocker.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "x"}, clear=False)
+    mocker.patch.object(_hcp, "_account_by_id", {})
+    _shared_state.deploy_monitoring["task_results"] = deque([
+        (_ts(30), "failure", "RATE_LIMIT", "create"),
+        (_ts(25), "failure", "RATE_LIMIT", "create"),
+        (_ts(20), "failure", "RATE_LIMIT", "create"),
+        (_ts(19), "failure", "RATE_LIMIT", "create"),
+        (_ts(18), "failure", "RATE_LIMIT", "create"),
+    ], maxlen=100)
+    ext = {"errors": {}}
+    assert _hcp.check_claude_api_health(ext) is None
+    assert ext["claude_api"] is True
+
+
+def test_check_claude_api_health_fresh_rate_limits_return_failed(mocker):
+    mocker.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "x"}, clear=False)
+    mocker.patch.object(_hcp, "_account_by_id", {})
+    _shared_state.deploy_monitoring["task_results"] = deque([
+        (_ts(5), "failure", "RATE_LIMIT", "create"),
+        (_ts(4), "failure", "RATE_LIMIT", "create"),
+        (_ts(3), "failure", "RATE_LIMIT", "create"),
+        (_ts(2), "failure", "RATE_LIMIT", "create"),
+        (_ts(1), "failure", "RATE_LIMIT", "create"),
+    ], maxlen=100)
+    ext = {"errors": {}}
+    assert _hcp.check_claude_api_health(ext) == "claude_api"
+    assert ext["claude_api"] is False

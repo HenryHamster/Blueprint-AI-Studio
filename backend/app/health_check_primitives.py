@@ -8,7 +8,7 @@ None if healthy.
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import app.shared_state as _shared_state
@@ -18,6 +18,12 @@ from app.models import Task
 from sqlmodel import select
 
 logger = logging.getLogger("blueprint")
+
+# Entries older than this in task_results are considered stale and ignored by
+# health checks. This prevents an auto-pause/auto-resume deadlock: while paused
+# (max_concurrent_vms=0) no new results are appended, so the last pre-pause
+# failures would otherwise keep tripping checks forever.
+_TASK_RESULT_STALENESS_MINUTES = 15
 
 
 async def check_db_health(ext: dict) -> Optional[str]:
@@ -117,7 +123,9 @@ def check_claude_api_health(ext: dict) -> Optional[str]:
         # No account pool — using raw ANTHROPIC_API_KEY. Fall back to burst detection
         # since there's no per-account cooldown mechanism for a single key.
         recent_results = list(_shared_state.deploy_monitoring["task_results"])[-5:]
-        rate_limit_count = sum(1 for r in recent_results if r[2] == "RATE_LIMIT")
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=_TASK_RESULT_STALENESS_MINUTES)).isoformat()
+        fresh_results = [r for r in recent_results if r[0] >= cutoff]
+        rate_limit_count = sum(1 for r in fresh_results if r[2] == "RATE_LIMIT")
         if rate_limit_count >= 3:
             ext["claude_api"] = False
             logger.warning(
@@ -134,12 +142,12 @@ def check_gcp_health(ext: dict) -> Optional[str]:
 
     Returns 'gcp' if failed, None if healthy.
     """
-    recent_provisions = [
-        r for r in _shared_state.deploy_monitoring["task_results"] if r[2] == "PROVISION_FAILURE"
-    ]
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=_TASK_RESULT_STALENESS_MINUTES)).isoformat()
+    fresh_all = [r for r in _shared_state.deploy_monitoring["task_results"] if r[0] >= cutoff]
+    recent_provisions = [r for r in fresh_all if r[2] == "PROVISION_FAILURE"]
     if len(recent_provisions) >= 3:
         # Check if ALL recent failures are provision failures (guard against empty filter)
-        recent_all = list(_shared_state.deploy_monitoring["task_results"])[-5:]
+        recent_all = fresh_all[-5:]
         recent_failures = [r for r in recent_all if r[1] == "failure"]
         if recent_failures and all(r[2] == "PROVISION_FAILURE" for r in recent_failures):
             ext["gcp"] = False
