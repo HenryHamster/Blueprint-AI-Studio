@@ -4248,6 +4248,85 @@ def test_fold_evicted_accumulates_into_existing_aggregate():
     assert dq["subtask_merge_rate_weighted_sum"] == pytest.approx(6.0)  # 3.0 + 1.0*3
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# _assess_spawn_health — direct validation of the decision logic
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_assess_spawn_health_all_healthy(mocker, monkeypatch):
+    """Zone available, account available, empty ring buffer → (False, None)."""
+    from app.research_completion import _assess_spawn_health
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    mocker.patch("app.compute.any_zone_available", return_value=True)
+    mocker.patch("app.max_plan_pool._account_available_for_model", return_value=True)
+    _shared_state.deploy_monitoring["task_results"].clear()
+
+    degraded, reason = _assess_spawn_health()
+    assert degraded is False
+    assert reason is None
+
+
+def test_assess_spawn_health_zone_cooldown(mocker, monkeypatch):
+    """All zones in cooldown → degraded with zone-related reason."""
+    from app.research_completion import _assess_spawn_health
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    mocker.patch("app.compute.any_zone_available", return_value=False)
+
+    degraded, reason = _assess_spawn_health()
+    assert degraded is True
+    assert reason is not None
+    assert "zone" in reason.lower()
+
+
+def test_assess_spawn_health_no_accounts_available(mocker, monkeypatch):
+    """No accounts usable for the create model → degraded with account reason."""
+    from app.research_completion import _assess_spawn_health
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    mocker.patch("app.compute.any_zone_available", return_value=True)
+    mocker.patch("app.max_plan_pool._account_available_for_model", return_value=False)
+    # Autouse fixture populates _account_by_id, so all_accounts is non-empty
+    # and the "no accounts available" branch actually fires.
+
+    degraded, reason = _assess_spawn_health()
+    assert degraded is True
+    assert reason is not None
+    assert "account" in reason.lower()
+
+
+def test_assess_spawn_health_high_failure_rate(mocker, monkeypatch):
+    """Ring buffer with >50% recent failures → degraded with failure-rate reason."""
+    from app.research_completion import _assess_spawn_health
+    from app.time_utils import _utcnow
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    mocker.patch("app.compute.any_zone_available", return_value=True)
+    mocker.patch("app.max_plan_pool._account_available_for_model", return_value=True)
+
+    now_iso = _utcnow().isoformat()
+    buf = _shared_state.deploy_monitoring["task_results"]
+    buf.clear()
+    for _ in range(6):
+        buf.append((now_iso, "failure"))
+    for _ in range(4):
+        buf.append((now_iso, "success"))
+
+    degraded, reason = _assess_spawn_health()
+    assert degraded is True
+    assert reason is not None
+    assert "failure rate" in reason.lower()
+
+
+def test_assess_spawn_health_empty_ring_buffer_cold_start(mocker, monkeypatch):
+    """Empty ring buffer (cold start) must not block spawning."""
+    from app.research_completion import _assess_spawn_health
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    mocker.patch("app.compute.any_zone_available", return_value=True)
+    mocker.patch("app.max_plan_pool._account_available_for_model", return_value=True)
+    _shared_state.deploy_monitoring["task_results"].clear()
+
+    degraded, reason = _assess_spawn_health()
+    assert degraded is False
+    assert reason is None
+
+
 def test_fold_evicted_handles_legacy_entries_without_scope_or_decomp():
     """Old history entries predating scope_breakdown/decomposition_quality still roll off cleanly."""
     from app.research_completion import _fold_evicted_into_aggregate

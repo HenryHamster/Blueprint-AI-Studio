@@ -1119,3 +1119,151 @@ async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(cle
         "rollup_pr_number": 8888,
         "rollup_pr_url": "https://x/8888",
     }
+
+
+# ── Error recovery: target/staging branch issues and all-cancelled ────────────
+
+@pytest.mark.asyncio
+async def test_target_branch_404_fails_parent(cleanup_db, mocker):
+    """When get_branch_sha returns 404 for the target branch, the parent
+    transitions to FAILED with a rollup-PR-creation-failed message (the 404
+    raises a non-transient exception that the outer handler converts to FAILED)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new_callable=AsyncMock,
+        side_effect=HTTPException(status_code=404, detail="Not Found"),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "research_branch": "research/stg-branch",
+            "parent_base": "deleted-target-branch",
+            "_rollup_retries": 99,  # ensure non-transient path runs immediately
+        },
+        plan_output="some plan",
+    )
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "rollup PR creation failed" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_staging_branch_missing_all_children_completed_marks_completed(cleanup_db, mocker):
+    """Staging branch is gone (404) but every child completed successfully —
+    the work already landed on the target branch. Parent transitions to
+    COMPLETED with a 'no actionable changes' message."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    # Target branch exists; staging branch 404
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new_callable=AsyncMock,
+        side_effect=[
+            "target-sha",  # target_branch exists
+            HTTPException(status_code=404, detail="Not Found"),  # staging missing
+        ],
+    )
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "research_branch": "research/gone-staging",
+            "parent_base": "main",
+        },
+        plan_output="some plan",
+    )
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+    assert "no actionable" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_all_children_cancelled_marks_parent_cancelled(cleanup_db, mocker):
+    """When every child is CANCELLED (none completed, none failed), the
+    parent transitions to CANCELLED with a message noting all subtasks
+    were cancelled. No rollup PR is created."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mock_create_pr = mocker.patch("app.github.create_pull_request", new_callable=AsyncMock)
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "research_branch": "research/all-cancelled",
+            "parent_base": "main",
+        },
+        plan_output="some plan",
+    )
+    child1 = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.CANCELLED,
+    )
+    await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.CANCELLED,
+    )
+
+    await _check_and_trigger_rollup(child1, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.CANCELLED
+    assert "cancelled" in (parent.latest_status_message or "").lower()
+    mock_create_pr.assert_not_called()

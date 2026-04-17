@@ -5,6 +5,7 @@ machine, provision failure classification (infra vs task-specific), rate-limit
 requeue path, the retry_after sweep (Step 5b), and the
 _copy_analysis_artifacts_to_previous helper.
 """
+import uuid as _uuid_mod
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta
@@ -12,10 +13,11 @@ from unittest.mock import AsyncMock
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from sqlalchemy.sql.elements import TextClause
 from sqlmodel import SQLModel
 
 from app.models import Project, Task, TaskStatus
-from app.reaper import reaper_service, _copy_analysis_artifacts_to_previous
+from app.reaper import reaper_service, _copy_analysis_artifacts_to_previous, _reaper_skip_counts
 
 
 class _StopLoop(Exception):
@@ -453,6 +455,214 @@ async def test_retry_after_sweep_clears_far_future(
     assert "retry_after" not in (t.context or {})
 
 
+# ── Step 3: EVALUATING parent sweep (re-trigger rollup on stale parents) ──
+
+
+@pytest.mark.asyncio
+async def test_step3_evaluating_parent_with_completed_child_triggers_rollup(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Stale EVALUATING parent + COMPLETED child → rollup re-entry with the child."""
+    rollup_mock = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+    )
+    reaper_db.add(child)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    assert rollup_mock.await_count >= 1
+    called_child = rollup_mock.await_args_list[0].args[0]
+    assert called_child.id == child.id
+
+
+@pytest.mark.asyncio
+async def test_step3_evaluating_parent_without_completed_child_skipped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Stale EVALUATING parent with no COMPLETED child → Step 3 does not call rollup."""
+    rollup_mock = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    # Prevent Step 4 from rescuing (stub _requeue_parent_task so the assertion is clean).
+    mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+    )
+    reaper_db.add(child)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    assert rollup_mock.await_count == 0
+
+
+# ── Step 4: Rescue all-children-failed EVALUATING parents ────────────────
+
+
+@pytest.mark.asyncio
+async def test_step4_all_failed_children_triggers_requeue(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Stale EVALUATING parent whose children all FAILED → _requeue_parent_task called."""
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    requeue_mock = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    for _ in range(2):
+        reaper_db.add(Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.FAILED,
+            context={"failure_category": "CODE_ERROR"},
+        ))
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    assert requeue_mock.await_count == 1
+    assert requeue_mock.await_args.args[0].id == parent.id
+
+
+@pytest.mark.asyncio
+async def test_step4_mixed_active_children_not_rescued(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Some children still active → Step 4 must not rescue the parent."""
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    requeue_mock = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    reaper_db.add(Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+    ))
+    reaper_db.add(Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=None,  # avoid Step 2 orphan reap
+        last_heartbeat=datetime.utcnow(),
+    ))
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    assert requeue_mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_step4_diagnostic_summarizes_failure_categories(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Rescue diagnostic message must include counts and failure categories from child contexts."""
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    reaper_db.add(Task(
+        project_id=project.id, parent_task_id=parent.id,
+        payloads=[{"type": "create"}], status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+    ))
+    reaper_db.add(Task(
+        project_id=project.id, parent_task_id=parent.id,
+        payloads=[{"type": "create"}], status=TaskStatus.FAILED,
+        context={"failure_category": "AGENT_TIMEOUT"},
+    ))
+    reaper_db.add(Task(
+        project_id=project.id, parent_task_id=parent.id,
+        payloads=[{"type": "create"}], status=TaskStatus.CANCELLED,
+    ))
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(parent)
+
+    msg = parent.latest_status_message or ""
+    assert "2 failed" in msg
+    assert "CODE_ERROR" in msg
+    assert "AGENT_TIMEOUT" in msg
+    assert "1 cancelled" in msg
+
+
 @pytest.mark.asyncio
 async def test_retry_after_sweep_preserves_valid(
     reaper_db, stop_after_one_cycle, reaper_side_effects
@@ -473,3 +683,160 @@ async def test_retry_after_sweep_preserves_valid(
     await reaper_db.refresh(t)
 
     assert (t.context or {}).get("retry_after") == valid
+
+
+# ── skip_locked / force-lock mechanism (Step 2) ──────────────────────────
+
+class _FakeResult:
+    """Minimal stand-in for an async result so scalars().all()/first() work."""
+    def __init__(self, items):
+        self._items = list(items)
+    def scalars(self):
+        return self
+    def all(self):
+        return list(self._items)
+    def first(self):
+        return self._items[0] if self._items else None
+
+
+@pytest.fixture()
+def clean_skip_counts():
+    _reaper_skip_counts.clear()
+    yield _reaper_skip_counts
+    _reaper_skip_counts.clear()
+
+
+def _install_lock_filter(mocker, skip_ids, *, force_raises=False):
+    """Patch AsyncSession.execute so for_update queries skip rows in skip_ids on
+    the first call (simulating skip_locked contention) and either succeed
+    or raise on the second call (the force-lock query)."""
+    real_execute = AsyncSession.execute
+    state = {"for_update_calls": 0}
+
+    async def mock_execute(self, stmt, *args, **kwargs):
+        # SQLite doesn't understand "SET LOCAL lock_timeout"; short-circuit it.
+        if isinstance(stmt, TextClause):
+            return _FakeResult([])
+        if getattr(stmt, "_for_update_arg", None) is not None:
+            state["for_update_calls"] += 1
+            if state["for_update_calls"] == 1:
+                # Skip-locked contention: filter out skip_ids
+                result = await real_execute(self, stmt, *args, **kwargs)
+                rows = result.scalars().all()
+                return _FakeResult([r for r in rows if getattr(r, "id", None) not in skip_ids])
+            # Second for_update call is the force-lock query.
+            if force_raises:
+                raise RuntimeError("force-lock timeout")
+            result = await real_execute(self, stmt, *args, **kwargs)
+            return _FakeResult(result.scalars().all())
+        return await real_execute(self, stmt, *args, **kwargs)
+
+    mocker.patch.object(AsyncSession, "execute", mock_execute)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_skip_locked_adds_to_skip_counts(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_skip_counts, mocker
+):
+    """Orphans whose lock is skipped accumulate in _reaper_skip_counts."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-skip",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    _install_lock_filter(mocker, {t.id})
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert clean_skip_counts.get(t.id) == 1
+    assert t.status == TaskStatus.IN_PROGRESS, "skipped task must not be reaped this cycle"
+
+
+@pytest.mark.asyncio
+async def test_force_lock_triggered_after_five_skips(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_skip_counts, mocker
+):
+    """With skip count already at 4, one more skip triggers force-lock; on
+    success the task is reaped and its skip-count entry is cleared."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-force",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    clean_skip_counts[t.id] = 4  # threshold is 5
+    state = _install_lock_filter(mocker, {t.id})
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert state["for_update_calls"] >= 2, "force-lock query must run after skip threshold"
+    assert t.id not in clean_skip_counts, "skip count cleared once force-lock succeeds"
+    assert t.status == TaskStatus.QUEUED, "force-locked task gets reaped/retried like any orphan"
+    assert t.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_force_lock_timeout_resets_skip_count(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_skip_counts, mocker
+):
+    """If the force-lock query raises, the skip count for that id is popped
+    so the next cycle retries from scratch."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-force-timeout",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    clean_skip_counts[t.id] = 4
+    _install_lock_filter(mocker, {t.id}, force_raises=True)
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.id not in clean_skip_counts, "force-lock failure must pop skip-count entry"
+    assert t.status == TaskStatus.IN_PROGRESS, "task remains active until next cycle succeeds"
+
+
+@pytest.mark.asyncio
+async def test_skip_count_stale_entries_cleaned(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_skip_counts
+):
+    """Entries in _reaper_skip_counts whose ids aren't in the current orphaned
+    set are removed (prevents unbounded growth)."""
+    stale_id = _uuid_mod.uuid4()
+    clean_skip_counts[stale_id] = 3
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-live",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    assert stale_id not in clean_skip_counts

@@ -28,6 +28,8 @@ from app.task_lifecycle import (
     _merge_with_retry,
     _process_post_commit,
     _is_transient_scan_error,
+    _extract_failing_tests,
+    _extract_error_files,
 )
 
 # SQLite JSONB compatibility — defensive, conftest.py also sets this
@@ -1114,3 +1116,79 @@ async def test_scan_transient_retry_exhausted(tl_db, mocker):
     assert task.requires_approval is True
     assert (task.context or {}).get("scan_transient_failure") is True
     assert "infrastructure error" in (task.latest_status_message or "")
+
+
+# ── _extract_failing_tests / _extract_error_files ──────────────────────────────
+
+class TestExtractFailingTests:
+    def test_pytest_failed_line(self):
+        assert _extract_failing_tests("FAILED tests/test_foo.py::test_bar") == [
+            "tests/test_foo.py::test_bar"
+        ]
+
+    def test_jest_vitest_fail_line(self):
+        assert _extract_failing_tests("FAIL src/components/App.test.tsx") == [
+            "src/components/App.test.tsx"
+        ]
+
+    def test_generic_error_line_truncated(self):
+        long = "Error: " + "x" * 200
+        result = _extract_failing_tests(long)
+        assert len(result) == 1
+        assert len(result[0]) == 120
+        assert result[0].startswith("Error: x")
+
+    def test_deduplicates_repeats(self):
+        text = "FAILED tests/test_a.py::test_x\nFAILED tests/test_a.py::test_x\n"
+        assert _extract_failing_tests(text) == ["tests/test_a.py::test_x"]
+
+    def test_caps_at_ten(self):
+        lines = "\n".join(f"FAILED tests/test_{i}.py::test_x" for i in range(15))
+        assert len(_extract_failing_tests(lines)) == 10
+
+    def test_empty_input(self):
+        assert _extract_failing_tests("") == []
+
+    def test_mixed_formats(self):
+        text = (
+            "FAILED tests/test_a.py::test_x\n"
+            "FAIL src/b.test.ts\n"
+            "Error: boom\n"
+        )
+        result = _extract_failing_tests(text)
+        assert "tests/test_a.py::test_x" in result
+        assert "src/b.test.ts" in result
+        assert any(r.startswith("Error: boom") for r in result)
+
+
+class TestExtractErrorFiles:
+    def test_python_traceback(self):
+        assert _extract_error_files('File "backend/app/main.py", line 42') == [
+            "backend/app/main.py"
+        ]
+
+    def test_typescript_error(self):
+        assert _extract_error_files("src/index.ts:15:3") == ["src/index.ts"]
+
+    def test_path_without_separator_skipped(self):
+        assert _extract_error_files("file.ts:1:1") == []
+
+    def test_empty_input(self):
+        assert _extract_error_files("") == []
+
+    def test_deduplicates_repeats(self):
+        text = 'File "a/b.py", line 1\nFile "a/b.py", line 2\n'
+        assert _extract_error_files(text) == ["a/b.py"]
+
+    def test_caps_at_five(self):
+        text = "\n".join(f'File "a/f{i}.py", line 1' for i in range(8))
+        assert len(_extract_error_files(text)) == 5
+
+    def test_mixed_patterns(self):
+        text = (
+            'File "backend/app/main.py", line 42\n'
+            "src/index.ts:15:3 error\n"
+        )
+        result = _extract_error_files(text)
+        assert "backend/app/main.py" in result
+        assert "src/index.ts" in result

@@ -9,6 +9,7 @@ Covers:
      zero issues in current iteration.
 """
 import uuid
+from datetime import timedelta
 
 import pytest
 from unittest.mock import AsyncMock, patch
@@ -16,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 from app.models import Project, Task, TaskStatus
 from app.review_pipeline import (
     MAX_REVIEW_FIX_ITERATIONS,
+    PIPELINE_TASK_STALE_MINUTES,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR,
     STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT,
@@ -23,6 +25,8 @@ from app.review_pipeline import (
     STUCK_CYCLE_THRESHOLD_DEFAULT,
     STUCK_CYCLE_THRESHOLD_REFACTOR,
     _feedback_jaccard,
+    _feedback_token_set,
+    _is_pipeline_task_stale,
     _max_review_iterations,
     _spawn_pipeline_task,
 )
@@ -2332,3 +2336,96 @@ def _utcnow_for_test():
     """Naive UTC timestamp matching app/time_utils.py _utcnow()."""
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# ── _is_pipeline_task_stale ───────────────────────────────────────────────────
+
+
+class TestIsPipelineTaskStale:
+    """Unit tests for the stale-task detection helper. No DB required."""
+
+    def _task(self, *, last_heartbeat=None, started_at=None) -> Task:
+        return make_task(last_heartbeat=last_heartbeat, started_at=started_at)
+
+    def test_recent_heartbeat_is_not_stale(self):
+        now = _utcnow_for_test()
+        task = self._task(last_heartbeat=now - timedelta(minutes=5))
+        assert _is_pipeline_task_stale(task) is False
+
+    def test_old_heartbeat_is_stale(self):
+        now = _utcnow_for_test()
+        task = self._task(last_heartbeat=now - timedelta(minutes=30))
+        assert _is_pipeline_task_stale(task) is True
+
+    def test_queued_task_no_heartbeat_no_started_is_not_stale(self):
+        task = self._task()
+        assert _is_pipeline_task_stale(task) is False
+
+    def test_no_heartbeat_recent_started_is_not_stale(self):
+        now = _utcnow_for_test()
+        task = self._task(started_at=now - timedelta(minutes=5))
+        assert _is_pipeline_task_stale(task) is False
+
+    def test_no_heartbeat_old_started_is_stale(self):
+        now = _utcnow_for_test()
+        task = self._task(started_at=now - timedelta(minutes=30))
+        assert _is_pipeline_task_stale(task) is True
+
+    def test_heartbeat_takes_precedence_over_started_at(self):
+        now = _utcnow_for_test()
+        # Recent heartbeat but very old started_at → not stale.
+        task = self._task(
+            last_heartbeat=now - timedelta(minutes=1),
+            started_at=now - timedelta(hours=5),
+        )
+        assert _is_pipeline_task_stale(task) is False
+
+    def test_boundary_heartbeat_just_past_threshold_is_stale(self):
+        now = _utcnow_for_test()
+        task = self._task(
+            last_heartbeat=now - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES, seconds=1)
+        )
+        assert _is_pipeline_task_stale(task) is True
+
+    def test_boundary_heartbeat_just_inside_threshold_is_not_stale(self):
+        now = _utcnow_for_test()
+        task = self._task(
+            last_heartbeat=now - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES - 1)
+        )
+        assert _is_pipeline_task_stale(task) is False
+
+
+# ── _feedback_token_set ───────────────────────────────────────────────────────
+
+
+class TestFeedbackTokenSet:
+    """Unit tests for the feedback tokenizer used by stuck-cycle detection."""
+
+    def test_normal_sentence_tokenized(self):
+        assert _feedback_token_set("The quick brown fox jumps") == {
+            "the",
+            "quick",
+            "brown",
+            "fox",
+            "jumps",
+        }
+
+    def test_short_tokens_filtered(self):
+        # "a" and "is" are shorter than 3 chars and must be dropped.
+        assert _feedback_token_set("a cat is here") == {"cat", "here"}
+
+    def test_tokens_lowercased(self):
+        assert _feedback_token_set("FOO Bar BAZ") == {"foo", "bar", "baz"}
+
+    def test_empty_string_returns_empty_set(self):
+        assert _feedback_token_set("") == set()
+
+    def test_punctuation_split_into_tokens(self):
+        # Regex matches [a-z0-9_]+ so punctuation is treated as a separator.
+        assert _feedback_token_set("foo, bar. baz!") == {"foo", "bar", "baz"}
+
+    def test_underscores_kept_inside_tokens(self):
+        assert _feedback_token_set("snake_case_var other") == {
+            "snake_case_var",
+            "other",
+        }
