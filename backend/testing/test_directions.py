@@ -1893,8 +1893,8 @@ class TestCalibrateScope:
     def test_insufficient_data_points_returns_unchanged(self):
         """Less than 3 total tasks across history → no calibration (insufficient signal)."""
         d = self._direction([
-            {"small": {"created": 1, "merged": 0}},
-            {"small": {"created": 1, "merged": 0}},
+            {"small": {"created": 1, "merged": 0, "failed": 1}},
+            {"small": {"created": 1, "merged": 0, "failed": 1}},
         ])
         # total_data_points = 2 < 3
         assert _calibrate_scope("small", d) == ("small", None)
@@ -1902,14 +1902,14 @@ class TestCalibrateScope:
     def test_acceptable_rate_returns_unchanged(self):
         """Proposed scope at >= 40% merge rate → no downgrade."""
         d = self._direction([
-            {"medium": {"created": 5, "merged": 2}},  # 40%
+            {"medium": {"created": 5, "merged": 2, "failed": 3}},  # 40%
         ])
         assert _calibrate_scope("medium", d) == ("medium", None)
 
     def test_exactly_40_percent_returns_unchanged(self):
         """Exactly 40% merge rate → not downgraded (rate >= 0.4 threshold)."""
         d = self._direction([
-            {"medium": {"created": 5, "merged": 2}},  # 40% exactly
+            {"medium": {"created": 5, "merged": 2, "failed": 3}},  # 40% exactly
         ])
         result_scope, calibrated_from = _calibrate_scope("medium", d)
         assert result_scope == "medium"
@@ -1922,8 +1922,8 @@ class TestCalibrateScope:
         medium→large(decompose) upgrade.
         """
         d = self._direction([
-            {"large": {"created": 10, "merged": 3}},   # 30% < 40%
-            {"medium": {"created": 5, "merged": 3}},   # 60% >= 40%
+            {"large": {"created": 10, "merged": 3, "failed": 7}},   # 30% < 40%
+            {"medium": {"created": 5, "merged": 3, "failed": 2}},   # 60% >= 40%
         ])
         result_scope, calibrated_from = _calibrate_scope("large", d)
         assert result_scope == "medium"
@@ -1932,8 +1932,8 @@ class TestCalibrateScope:
     def test_smaller_scope_also_bad_returns_unchanged(self):
         """Proposed scope below 40% but no smaller scope has acceptable rate → no downgrade."""
         d = self._direction([
-            {"medium": {"created": 10, "merged": 2}},  # 20%
-            {"small": {"created": 5, "merged": 1}},    # 20%
+            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20%
+            {"small": {"created": 5, "merged": 1, "failed": 4}},    # 20%
         ])
         result_scope, calibrated_from = _calibrate_scope("medium", d)
         assert result_scope == "medium"
@@ -1942,7 +1942,7 @@ class TestCalibrateScope:
     def test_smaller_scope_with_no_data_is_acceptable(self):
         """Smaller scope with no historical data (rate=None) is treated as acceptable."""
         d = self._direction([
-            {"medium": {"created": 10, "merged": 2}},  # 20% < 40%
+            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20% < 40%
             # no "small" data
         ])
         result_scope, calibrated_from = _calibrate_scope("medium", d)
@@ -1955,8 +1955,8 @@ class TestCalibrateScope:
         Uses 'large' scope to bypass the medium→large(decompose) upgrade path.
         """
         d = self._direction([
-            {"large": {"created": 10, "merged": 3}},   # 30% — triggers downgrade search
-            {"medium": {"created": 5, "merged": 2}},   # 40% — should be accepted (>= 0.4)
+            {"large": {"created": 10, "merged": 3, "failed": 7}},   # 30% — triggers downgrade search
+            {"medium": {"created": 5, "merged": 2, "failed": 3}},   # 40% — should be accepted (>= 0.4)
         ])
         result_scope, calibrated_from = _calibrate_scope("large", d)
         assert result_scope == "medium"
@@ -1965,9 +1965,9 @@ class TestCalibrateScope:
     def test_large_scope_downgrades_through_medium_to_small(self):
         """Large scope below threshold downgrades: picks first smaller scope with acceptable rate."""
         d = self._direction([
-            {"large": {"created": 10, "merged": 2}},   # 20%
-            {"medium": {"created": 10, "merged": 2}},  # 20%
-            {"small": {"created": 5, "merged": 3}},    # 60%
+            {"large": {"created": 10, "merged": 2, "failed": 8}},   # 20%
+            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20%
+            {"small": {"created": 5, "merged": 3, "failed": 2}},    # 60%
         ])
         result_scope, calibrated_from = _calibrate_scope("large", d)
         assert result_scope == "small"
@@ -1976,7 +1976,7 @@ class TestCalibrateScope:
     def test_small_scope_cannot_be_downgraded(self):
         """Small is the smallest scope — even with low rate, no downgrade possible."""
         d = self._direction([
-            {"small": {"created": 10, "merged": 1}},  # 10%
+            {"small": {"created": 10, "merged": 1, "failed": 9}},  # 10%
         ])
         result_scope, calibrated_from = _calibrate_scope("small", d)
         assert result_scope == "small"
@@ -1985,8 +1985,8 @@ class TestCalibrateScope:
     def test_uses_only_last_3_history_entries(self):
         """Only the last 3 history entries are considered; older entries are ignored."""
         # Older entries show bad rate for small, recent entries show good rate for medium
-        older_bad = {"small": {"created": 100, "merged": 0}}   # very bad
-        recent_good = {"medium": {"created": 5, "merged": 4}}  # 80% good
+        older_bad = {"small": {"created": 100, "merged": 0, "failed": 100}}   # very bad
+        recent_good = {"medium": {"created": 5, "merged": 4, "failed": 1}}  # 80% good
         d = self._direction([older_bad, older_bad, older_bad, older_bad, recent_good, recent_good, recent_good])
         # Only last 3 (recent_good x3) used → medium rate 80%, no downgrade
         assert _calibrate_scope("medium", d) == ("medium", None)
@@ -2019,8 +2019,10 @@ class TestCalibrateScope:
         # Project-wide large scope: 10 created / 1 merged = 10% < 30%
         # Project-wide medium scope: 5 created / 4 merged = 80% — acceptable target
         project = self._project([
-            [{"large": {"created": 5, "merged": 0}}, {"medium": {"created": 3, "merged": 3}}],
-            [{"large": {"created": 5, "merged": 1}}, {"medium": {"created": 2, "merged": 1}}],
+            [{"large": {"created": 5, "merged": 0, "failed": 5}},
+             {"medium": {"created": 3, "merged": 3, "failed": 0}}],
+            [{"large": {"created": 5, "merged": 1, "failed": 4}},
+             {"medium": {"created": 2, "merged": 1, "failed": 1}}],
         ])
         result_scope, calibrated_from = _calibrate_scope("large", d, project)
         assert result_scope == "medium"
@@ -2031,7 +2033,7 @@ class TestCalibrateScope:
         d = self._direction([])
         # Project-wide medium: 10 created / 3 merged = 30% (not below threshold)
         project = self._project([
-            [{"medium": {"created": 10, "merged": 3}}],
+            [{"medium": {"created": 10, "merged": 3, "failed": 7}}],
         ])
         result_scope, calibrated_from = _calibrate_scope("medium", d, project)
         assert result_scope == "medium"
@@ -2042,11 +2044,11 @@ class TestCalibrateScope:
         ignore project-wide data."""
         # Direction medium: 5 created / 2 merged = 40% — acceptable at direction threshold
         d = self._direction([
-            {"medium": {"created": 5, "merged": 2}},
+            {"medium": {"created": 5, "merged": 2, "failed": 3}},
         ])
         # Project-wide medium would be 0% (very bad), but should be ignored
         project = self._project([
-            [{"medium": {"created": 100, "merged": 0}}],
+            [{"medium": {"created": 100, "merged": 0, "failed": 100}}],
         ])
         result_scope, calibrated_from = _calibrate_scope("medium", d, project)
         assert result_scope == "medium"
@@ -2058,7 +2060,7 @@ class TestCalibrateScope:
         monkeypatch.setitem(_rc, "pipeline_scope_baseline_rates", {})
         d = self._direction([])
         project = self._project([
-            [{"medium": {"created": 1, "merged": 0}}],
+            [{"medium": {"created": 1, "merged": 0, "failed": 1}}],
         ])  # project-wide total = 1 < 3
         result_scope, calibrated_from = _calibrate_scope("medium", d, project)
         assert result_scope == "medium"
@@ -2090,7 +2092,7 @@ class TestCalibrateScope:
         )
         d = self._direction([])
         project = self._project([
-            [{"medium": {"created": 1, "merged": 0}}],
+            [{"medium": {"created": 1, "merged": 0, "failed": 1}}],
         ])
         result_scope, calibrated_from = _calibrate_scope("medium", d, project)
         assert result_scope == "large"
@@ -2146,8 +2148,8 @@ class TestCalibrateScope:
         prompt.ts calibration note, admin analytics) receive a valid scope.
         """
         d = self._direction([
-            {"medium": {"created": 10, "merged": 2}},  # 20% < 40%
-            {"small": {"created": 5, "merged": 4}},    # 80% >= 40% (healthy)
+            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20% < 40%
+            {"small": {"created": 5, "merged": 4, "failed": 1}},    # 80% >= 40% (healthy)
         ])
         result_scope, calibrated_from = _calibrate_scope("medium", d)
         assert result_scope == "large"
@@ -2159,8 +2161,8 @@ class TestCalibrateScope:
         Falls through to downgrade loop; since small also fails, returns unchanged.
         """
         d = self._direction([
-            {"medium": {"created": 10, "merged": 2}},  # 20%
-            {"small": {"created": 5, "merged": 1}},    # 20% < 40%
+            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20%
+            {"small": {"created": 5, "merged": 1, "failed": 4}},    # 20% < 40%
         ])
         result_scope, calibrated_from = _calibrate_scope("medium", d)
         assert result_scope == "medium"
@@ -2173,7 +2175,7 @@ class TestCalibrateScope:
         through to existing downgrade behavior (which treats no-data as acceptable).
         """
         d = self._direction([
-            {"medium": {"created": 10, "merged": 2}},  # 20%
+            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20%
             # no "small" data
         ])
         result_scope, calibrated_from = _calibrate_scope("medium", d)
@@ -2183,15 +2185,55 @@ class TestCalibrateScope:
     def test_large_does_not_upgrade(self):
         """Upgrade path only fires for medium — large below threshold still downgrades normally."""
         d = self._direction([
-            {"large": {"created": 10, "merged": 2}},   # 20%
-            {"medium": {"created": 5, "merged": 1}},   # 20% — bad, skipped
-            {"small": {"created": 5, "merged": 4}},    # 80% — healthy
+            {"large": {"created": 10, "merged": 2, "failed": 8}},   # 20%
+            {"medium": {"created": 5, "merged": 1, "failed": 4}},   # 20% — bad, skipped
+            {"small": {"created": 5, "merged": 4, "failed": 1}},    # 80% — healthy
         ])
         result_scope, calibrated_from = _calibrate_scope("large", d)
         # Despite small being healthy (the trigger condition for upgrade), large
         # only ever downgrades — calibrated_from is the bare scope, not a "→...(decompose)" marker.
         assert result_scope == "small"
         assert calibrated_from == "large"
+
+    def test_in_flight_tasks_excluded_from_denominator(self):
+        """16 medium created, only 4 terminal (1 merged + 3 failed) → rate reads 25%, not 6%.
+
+        Guards against in-flight bias: the older formula (created - true_infra)
+        would read 1/16 = 6% because still-QUEUED/IN_PROGRESS tasks inflate
+        `created`. Terminal-outcome denominator (merged + failed - true_infra)
+        restores the honest 1/4 = 25% rate.
+        """
+        d = self._direction([
+            # 16 medium spawned, 12 still in-flight (not in merged/failed counters);
+            # 5 small with 4 merged (healthy) to trigger the decompose-upgrade path.
+            {
+                "medium": {"created": 16, "merged": 1, "failed": 3},
+                "small": {"created": 5, "merged": 4, "failed": 1},
+            },
+        ])
+        # With the old formula, medium rate = 1/16 = 6% < 40% (in-flight bias).
+        # With the terminal denominator, rate = 1/4 = 25% < 40%. Medium still
+        # downgrades here, but the *reason* is the honest terminal rate, not
+        # the artificial in-flight skew. Small at 4/5 = 80% triggers the
+        # medium→large(decompose) upgrade path.
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "large"
+        assert calibrated_from == "medium"
+
+    def test_in_flight_bias_does_not_force_downgrade(self):
+        """Early-cycle medium task (many in-flight, few terminal) is not downgraded
+        prematurely by an artificially low rate."""
+        d = self._direction([
+            # 10 spawned, only 2 terminal: both merged (100% true rate).
+            # Old formula: rate = 2/10 = 20% → would downgrade.
+            # New formula: rate = 2/(2+0) = 100% but effective=2 < 3 → rate=None → unchanged.
+            {"medium": {"created": 10, "merged": 2, "failed": 0}},
+        ])
+        # direction_data_points uses created (10 >= 3), so we enter calibration.
+        # effective denominator = 2 + 0 - 0 = 2 < 3 → rate=None → unchanged.
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "medium"
+        assert calibrated_from is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2401,7 +2443,7 @@ class TestPredictSpawnSuccessPipelineSignal:
         try:
             d = {
                 "research_history": [
-                    {"scope_breakdown": {"medium": {"created": 5, "merged": 5}}},
+                    {"scope_breakdown": {"medium": {"created": 5, "merged": 5, "failed": 0}}},
                 ],
             }
             # Signal 1: 1.0 (weight 2.0); Signal 4: 0.0 (weight 0.5).
@@ -2502,7 +2544,7 @@ class TestPredictSpawnSuccessDecompositionSignal:
         d = {
             "research_history": [
                 {
-                    "scope_breakdown": {"large": {"created": 2, "merged": 2}},
+                    "scope_breakdown": {"large": {"created": 2, "merged": 2, "failed": 0}},
                     "decomposition_quality": [{"subtask_merge_rate": 0.0}],
                 },
             ],

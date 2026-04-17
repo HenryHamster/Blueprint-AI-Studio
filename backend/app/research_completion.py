@@ -219,22 +219,24 @@ def _aggregate_scope_breakdown(history_entries: list[dict]) -> dict[str, dict]:
     for entry in history_entries:
         for scope, stats in (entry.get("scope_breakdown") or {}).items():
             bucket = agg.setdefault(scope, {
-                "created": 0, "merged": 0, "failed_infra": 0, "failed_scope_overflow": 0,
+                "created": 0, "merged": 0, "failed": 0,
+                "failed_infra": 0, "failed_scope_overflow": 0,
             })
-            for key in ("created", "merged", "failed_infra", "failed_scope_overflow"):
+            for key in ("created", "merged", "failed", "failed_infra", "failed_scope_overflow"):
                 bucket[key] += stats.get(key, 0)
     return agg
 
 
 def _effective_scope_denominator(stats: dict) -> int:
-    """Denominator for scope merge rate: created minus true-infra failures.
+    """Denominator for scope merge rate: terminal tasks minus true-infra failures.
 
-    SCOPE_OVERFLOW is tracked under failed_infra for direction-health purposes
-    but excluded here — it signals the scope assessment was wrong (scope-quality
-    signal), so it belongs in the denominator, not subtracted from it.
+    Counts merged + failed (terminal) rather than `created` to exclude in-flight
+    QUEUED/IN_PROGRESS/EVALUATING tasks that would bias rates downward (mirrors
+    strategic_spawning._window_counts). SCOPE_OVERFLOW stays in the denominator
+    (scope-quality signal); only non-overflow infra fails are excluded.
     """
     infra_excl_overflow = stats.get("failed_infra", 0) - stats.get("failed_scope_overflow", 0)
-    return stats["created"] - infra_excl_overflow
+    return stats.get("merged", 0) + stats.get("failed", 0) - infra_excl_overflow
 
 
 def _calibrate_scope(

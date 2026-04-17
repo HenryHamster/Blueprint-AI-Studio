@@ -1770,6 +1770,7 @@ describe('analysis-phase scope feasibility gate', () => {
     expect(failureCall).toBeDefined();
     if (failureCall) {
       expect(typeof failureCall[1].analysis_plan).toBe('string');
+      expect(failureCall[1].scope_gate_triggered).toBe('analysis_overflow');
     }
     // implementation run must NOT have happened (only analysis + retry)
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
@@ -1933,7 +1934,11 @@ describe('scope overflow gate', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
       TASK_ID,
-      expect.objectContaining({ status: 'FAILED', failure_category: 'scope_overflow' }),
+      expect.objectContaining({
+        status: 'FAILED',
+        failure_category: 'scope_overflow',
+        scope_gate_triggered: 'small_overflow',
+      }),
     );
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
@@ -2165,7 +2170,11 @@ describe('post-self-review scope overflow gate', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
       TASK_ID,
-      expect.objectContaining({ status: 'FAILED', failure_category: 'scope_overflow' }),
+      expect.objectContaining({
+        status: 'FAILED',
+        failure_category: 'scope_overflow',
+        scope_gate_triggered: 'post_review_overflow',
+      }),
     );
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });

@@ -685,6 +685,24 @@ export async function handleFix(
     enrichedPrompt = `## Parent Task Context\nThis task is a subtask of: **${strVal(fixParentCtx.parent_title)}**\nParent goal: ${strVal(fixParentCtx.parent_prompt)}\n\n${enrichedPrompt}`;
   }
 
+  // Scope-pressure hint: warn the agent when the PR is already close to its
+  // scope file budget so it prefers minimal fixes over expansive refactoring.
+  // The percentage + counts are computed backend-side in review_pipeline.py.
+  const scopeUtilization = (task.context as Record<string, unknown> | undefined)?.scope_budget_utilization as
+    { scope?: string; file_count?: number; non_test_file_count?: number; budget?: number; percentage?: number } | undefined;
+  if (scopeUtilization && typeof scopeUtilization.percentage === 'number' && scopeUtilization.percentage >= 70) {
+    const nonTest = scopeUtilization.non_test_file_count ?? 0;
+    const budget = scopeUtilization.budget ?? 0;
+    const pct = scopeUtilization.percentage;
+    const scopeLabel = scopeUtilization.scope ?? 'unknown';
+    enrichedPrompt =
+      `## Scope-Pressure Warning\n` +
+      `This PR already touches ${nonTest} non-test files against a ${scopeLabel}-scope budget of ${budget} (${pct}% utilized). ` +
+      `Prefer the minimal fix that addresses the review feedback — avoid expansive refactoring or touching additional files. ` +
+      `Defer peripheral cleanup, drive-by improvements, and adjacent refactors to follow-up tasks so this PR stays within scope and merges.\n\n` +
+      enrichedPrompt;
+  }
+
   // Prepend related test context so the agent knows which tests to update
   if (fixRelatedTestContext) {
     enrichedPrompt = `${fixRelatedTestContext}${enrichedPrompt}`;

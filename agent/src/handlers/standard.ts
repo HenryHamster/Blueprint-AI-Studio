@@ -286,6 +286,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
             task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
             logs: failureLog,
             failure_category: 'scope_overflow',
+            scope_gate_triggered: 'analysis_overflow',
             analysis_plan: effectiveAnalysis.slice(0, 5000),
           });
           return;
@@ -524,6 +525,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
         logs: `Scope overflow: ${nonTestChangedPaths.length} non-test files changed for a small-scope task (threshold: ${overflowThreshold}, ${changedPaths.length} total including tests). Retry guidance: focus on the single most critical change and limit to 1-3 files.\n\nChanged files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`,
         failure_category: 'scope_overflow',
+        scope_gate_triggered: 'small_overflow',
         changed_files: changedPaths.slice(0, 50),
         ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
       });
@@ -1003,6 +1005,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
           task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
           logs: failureLog,
           failure_category: 'scope_overflow',
+          scope_gate_triggered: 'post_review_overflow',
           changed_files: postReviewPaths.slice(0, 50),
         });
         return;
@@ -1099,6 +1102,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
       ...(selfReviewOutcome ? { self_review_outcome: selfReviewOutcome } : {}),
       ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
       ...(analysisContext ? { analysis_plan: analysisContext.slice(0, 5000) } : {}),
+      ...(scopeTrimReverted.length > 0 ? { scope_gate_triggered: 'scope_trim', scope_trim_reverted: scopeTrimReverted } : {}),
     });
   } else if (exitCode === 0) {
     await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: noChangesMessage });

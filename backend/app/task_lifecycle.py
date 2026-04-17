@@ -43,6 +43,52 @@ from app.failure_stage import (  # noqa: E402, F401 — re-exported for legacy c
 )
 
 
+# Mirrors SCOPE_OVERFLOW_THRESHOLDS in agent/src/constants.ts — keep in sync.
+_SCOPE_OVERFLOW_THRESHOLDS = {"small": 6, "medium": 10, "large": 20}
+
+
+def _build_scope_overflow_details(ctx: dict, task_scope: str) -> str:
+    """Render a decomposition-hint block from the previous attempt's scope overflow.
+
+    Uses ``_previous_changed_files`` (and optional ``_previous_diff_summary``) to
+    surface: module distribution (files per top-level path), the expansion ratio
+    vs. the scope threshold, and the specific files the agent touched. This lets
+    the plan agent split along the actual fault lines (e.g. backend/app vs.
+    agent/src) instead of re-analysing the whole scope. Returns "" if no signal.
+    """
+    changed_files = ctx.get("_previous_changed_files") or []
+    if not changed_files:
+        return ""
+
+    module_counts: dict[str, int] = {}
+    for f in changed_files:
+        parts = str(f).split("/")
+        key = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
+        module_counts[key] = module_counts.get(key, 0) + 1
+
+    lines = ["OVERFLOW DETAILS FROM PREVIOUS ATTEMPT:",
+             f"- Files touched: {len(changed_files)}"]
+    threshold = _SCOPE_OVERFLOW_THRESHOLDS.get(task_scope)
+    if threshold:
+        lines.append(
+            f"- Scope budget: {task_scope}={threshold} files "
+            f"(over by {len(changed_files) - threshold}, "
+            f"{len(changed_files) / threshold:.1f}x budget)"
+        )
+    if module_counts:
+        dist = ", ".join(
+            f"{m}={n}" for m, n in sorted(module_counts.items(), key=lambda kv: -kv[1])
+        )
+        lines.append(f"- Module distribution: {dist}")
+        if len(module_counts) > 1:
+            lines.append(
+                "- Decomposition hint: split along the module boundaries above — "
+                "each module can likely become a separate subtask."
+            )
+    lines.append("- Changed files: " + ", ".join(str(f) for f in changed_files[:10]))
+    return "\n".join(lines) + "\n"
+
+
 def _build_retry_prompt_suffix(
     failure_class: "str | None",
     original_status_message: "str | None",
@@ -88,6 +134,7 @@ def _build_retry_prompt_suffix(
             "- Focus on the single most critical change; limit production edits to 1-3 files\n"
             "- Split unrelated concerns into follow-up work rather than bundling them here\n"
         )
+        extra_guidance += _build_scope_overflow_details(ctx, task_scope)
         if task_scope == "medium":
             scope_override = "large"
 

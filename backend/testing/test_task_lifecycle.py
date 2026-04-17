@@ -30,6 +30,7 @@ from app.task_lifecycle import (
     _is_transient_scan_error,
     _extract_failing_tests,
     _extract_error_files,
+    _build_scope_overflow_details,
 )
 
 # SQLite JSONB compatibility — defensive, conftest.py also sets this
@@ -534,6 +535,79 @@ async def test_requeue_scope_overflow_raw_lowercase_label_escalates(tl_db, mocke
     )).scalars().first()
     assert clone is not None
     assert clone.context.get("scope") == "large"
+
+
+@pytest.mark.asyncio
+async def test_requeue_scope_overflow_injects_module_distribution(tl_db, mocker):
+    """SCOPE_OVERFLOW retry surfaces module distribution and expansion ratio to the plan agent."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="SCOPE_OVERFLOW")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "_attempt_number": 1,
+            "scope": "medium",
+            "failure_category": "SCOPE_OVERFLOW",
+            "_pr_changed_files": [
+                "backend/app/orchestrator.py",
+                "backend/app/review_pipeline.py",
+                "backend/app/task_lifecycle.py",
+                "agent/src/handlers/standard.ts",
+                "agent/src/prompt.ts",
+                "admin-ui/src/components/DashboardHome.tsx",
+            ],
+        },
+        latest_status_message="Scope overflow: 6 non-test files changed",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
+    assert "OVERFLOW DETAILS FROM PREVIOUS ATTEMPT" in prompt_suffix
+    assert "backend/app=3" in prompt_suffix
+    assert "agent/src=2" in prompt_suffix
+    assert "admin-ui/src=1" in prompt_suffix
+    assert "module boundaries" in prompt_suffix
+
+
+def test_build_scope_overflow_details_returns_empty_without_changed_files():
+    """No _previous_changed_files → no overflow block (caller keeps the generic guidance)."""
+    assert _build_scope_overflow_details({}, "medium") == ""
+    assert _build_scope_overflow_details({"_previous_changed_files": []}, "medium") == ""
+
+
+def test_build_scope_overflow_details_reports_expansion_ratio():
+    """Expansion ratio is computed against SCOPE_OVERFLOW_THRESHOLDS for the failed scope."""
+    ctx = {
+        "_previous_changed_files": [f"backend/app/f{i}.py" for i in range(15)],
+    }
+    block = _build_scope_overflow_details(ctx, "medium")
+    assert "Files touched: 15" in block
+    # medium threshold is 10 -> over by 5, 1.5x budget
+    assert "medium=10" in block
+    assert "over by 5" in block
+    assert "1.5x" in block
+
+
+def test_build_scope_overflow_details_single_module_omits_split_hint():
+    """When all files live in one module, the split-along-boundaries hint is skipped."""
+    ctx = {
+        "_previous_changed_files": [
+            "backend/app/a.py", "backend/app/b.py", "backend/app/c.py",
+        ],
+    }
+    block = _build_scope_overflow_details(ctx, "small")
+    assert "backend/app=3" in block
+    assert "module boundaries" not in block
 
 
 @pytest.mark.asyncio

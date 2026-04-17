@@ -1991,6 +1991,156 @@ async def test_self_review_outcome_absent_when_not_on_source(db_session, mocker)
     assert "_self_review_outcome" not in ctx
 
 
+# ── Scope-budget utilization on spawned fix ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_scope_budget_utilization_attached_to_fix_from_source_files(db_session, mocker):
+    """When the source task carries _pr_changed_files, the spawned fix task's
+    context exposes a scope_budget_utilization block with a non-test count
+    compared against the scope's file budget."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 601, "branch": "feat/sb",
+                   "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            "_pr_changed_files": [
+                "backend/app/a.py", "backend/app/b.py", "backend/app/c.py",
+                "backend/app/d.py", "backend/app/e.py",
+                "backend/testing/test_a.py", "backend/testing/test_b.py",
+            ],
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=601, branch="feat/sb", base_branch="main",
+        fix_prompt="Address the review feedback",
+    )
+    assert created is True and result is not None
+
+    util = (result.context or {}).get("scope_budget_utilization")
+    assert util is not None
+    assert util["scope"] == "medium"
+    assert util["file_count"] == 7
+    assert util["non_test_file_count"] == 5
+    assert util["budget"] == 7  # medium production_files_max
+    assert util["percentage"] == 71
+
+
+@pytest.mark.asyncio
+async def test_scope_budget_utilization_falls_back_to_create_task(db_session, mocker):
+    """When the source task has no _pr_changed_files but the original (create)
+    task does, the utilization is computed against the create task's snapshot."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "X", "base_branch": "main"}],
+        context={
+            "scope": "small",
+            "_pr_changed_files": ["backend/app/a.py", "backend/app/b.py",
+                                  "backend/testing/test_a.py"],
+        },
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 602, "branch": "feat/fb",
+                   "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={"scope": "small",
+                 "review_loop": {"iteration": 0,
+                                 "original_task_id": str(original_task.id)}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=602, branch="feat/fb", base_branch="main",
+        fix_prompt="fix",
+        original_task_id=str(original_task.id),
+    )
+    assert created is True and result is not None
+    util = (result.context or {}).get("scope_budget_utilization")
+    assert util is not None
+    assert util["non_test_file_count"] == 2
+    assert util["budget"] == 6  # small total_files_max
+    assert util["scope"] == "small"
+
+
+@pytest.mark.asyncio
+async def test_scope_budget_utilization_absent_when_no_changed_files(db_session, mocker):
+    """No _pr_changed_files anywhere → no utilization block emitted (can't bluff)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 603, "branch": "feat/no",
+                   "base_branch": "main"}],
+        context={"scope": "medium", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=603, branch="feat/no", base_branch="main",
+        fix_prompt="fix",
+    )
+    assert created is True and result is not None
+    assert "scope_budget_utilization" not in (result.context or {})
+
+
+@pytest.mark.asyncio
+async def test_scope_budget_utilization_not_attached_to_review_spawn(db_session, mocker):
+    """Utilization is a fix-task signal only — review spawns must not carry it."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 604, "branch": "feat/rv",
+                   "base_branch": "main", "prompt": "X"}],
+        context={
+            "scope": "small",
+            "_pr_changed_files": ["a.py", "b.py"],
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=604, branch="feat/rv", base_branch="main",
+    )
+    assert created is True and result is not None
+    assert "scope_budget_utilization" not in (result.context or {})
+
+
 # ── filter_pipeline_duplicates: pre-dispatch dedup safety net ─────────────────
 
 

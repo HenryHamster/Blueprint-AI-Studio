@@ -46,6 +46,47 @@ STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR = 0.8
 
 _FEEDBACK_TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
+# Utilization at/above this fraction of the scope file budget signals the fix
+# agent to prefer minimal fixes over expansive refactoring — gives headroom
+# before a fix iteration would tip the PR into scope-overflow territory.
+SCOPE_PRESSURE_WARN_THRESHOLD = 0.7
+
+
+def _is_test_file(path: str) -> bool:
+    p = path.lower()
+    if "/testing/" in p or p.startswith("testing/") or "/tests/" in p or p.startswith("tests/"):
+        return True
+    name = p.rsplit("/", 1)[-1]
+    if name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    return ".test." in name or ".spec." in name
+
+
+def _compute_scope_budget_utilization(
+    changed_files: list[str] | None, scope: str
+) -> dict | None:
+    """Summarize how close a PR's file count is to its scope budget.
+
+    Returns None when no signal is available (no files known, or unknown scope).
+    ``percentage`` is a whole number (0-100+); callers surface guidance when it
+    crosses ``SCOPE_PRESSURE_WARN_THRESHOLD``.
+    """
+    from app.research_completion import SCOPE_FILE_BUDGETS  # noqa: PLC0415
+    if not changed_files:
+        return None
+    budget_info = SCOPE_FILE_BUDGETS.get(scope) or {}
+    budget = budget_info.get("production_files_max") or budget_info.get("total_files_max")
+    if not budget:
+        return None
+    non_test_count = sum(1 for f in changed_files if not _is_test_file(f))
+    return {
+        "scope": scope,
+        "file_count": len(changed_files),
+        "non_test_file_count": non_test_count,
+        "budget": budget,
+        "percentage": round(non_test_count / budget * 100),
+    }
+
 
 def _feedback_token_set(text: str) -> set[str]:
     return {t for t in _FEEDBACK_TOKEN_RE.findall(text.lower()) if len(t) >= 3}
@@ -459,6 +500,7 @@ async def _spawn_pipeline_task(
     # resolved_original_id was computed at the top of this function.
     parent_id = None
     inherited_priority = source_task.priority
+    orig: Task | None = None
     try:
         orig = await session.get(Task, uuid.UUID(resolved_original_id))
         if orig and orig.parent_task_id:
@@ -634,6 +676,18 @@ async def _spawn_pipeline_task(
     prev_self_review_outcome = source_ctx.get('_self_review_outcome')
     if prev_self_review_outcome:
         propagated_ctx['_self_review_outcome'] = prev_self_review_outcome
+    # Scope-pressure awareness for fix tasks: if the PR already fills most of
+    # its file budget, expose utilization so the fix agent can prefer minimal
+    # fixes and defer peripheral edits rather than tipping into overflow.
+    if task_type == "fix":
+        changed_files = (
+            source_ctx.get("_pr_changed_files")
+            or ((orig.context or {}).get("_pr_changed_files") if orig else None)
+            or []
+        )
+        utilization = _compute_scope_budget_utilization(changed_files, propagated_scope)
+        if utilization:
+            propagated_ctx['scope_budget_utilization'] = utilization
     propagated_ctx['review_loop'] = {
         "pr_number": pr_number, "branch": branch,
         "base_branch": base_branch,
