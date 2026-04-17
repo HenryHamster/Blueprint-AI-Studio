@@ -298,33 +298,35 @@ async def bulk_archive_tasks(
                 valid_uuids.append(uuid.UUID(raw_id))
             except (ValueError, AttributeError):
                 continue
-        if valid_uuids:
-            query = select(Task).where(
-                Task.id.in_(valid_uuids),
-                Task.status.in_(TERMINAL_STATUSES),
-                Task.archived.is_(False),
-                Task.project_id.in_(user_project_ids),
-            )
-            result = await session.execute(query)
-            archived = result.scalars().all()
-            for task in archived:
-                task.archived = True
-                session.add(task)
-        else:
-            archived = []
+        if not valid_uuids:
+            return {"archived_count": 0}
+        # Use SKIP LOCKED to avoid contending with concurrent orchestrator transactions
+        # holding row locks. Skipping locked tasks is safe — terminal tasks normally aren't
+        # locked, and if one is, we don't want to block archiving the rest of the column.
+        select_stmt = select(Task.id).where(
+            Task.id.in_(valid_uuids),
+            Task.status.in_(TERMINAL_STATUSES),
+            Task.archived.is_(False),
+            Task.project_id.in_(user_project_ids),
+        ).with_for_update(skip_locked=True)
     elif request.filter in ('completed', 'terminal'):
         statuses = [TaskStatus.COMPLETED] if request.filter == 'completed' else TERMINAL_STATUSES
-        query = select(Task).where(Task.archived.is_(False), Task.status.in_(statuses), Task.project_id.in_(user_project_ids))
-        result = await session.execute(query)
-        archived = result.scalars().all()
-        for task in archived:
-            task.archived = True
-            session.add(task)
+        select_stmt = select(Task.id).where(
+            Task.archived.is_(False),
+            Task.status.in_(statuses),
+            Task.project_id.in_(user_project_ids),
+        ).with_for_update(skip_locked=True)
     else:
         raise HTTPException(status_code=400, detail="Must provide task_ids or a valid filter ('completed' or 'terminal')")
 
+    lockable_ids = (await session.execute(select_stmt)).scalars().all()
+    if not lockable_ids:
+        return {"archived_count": 0}
+    await session.execute(
+        update(Task).where(Task.id.in_(lockable_ids)).values(archived=True)
+    )
     await session.commit()
-    return {"archived_count": len(archived)}
+    return {"archived_count": len(lockable_ids)}
 
 class BulkActionRequest(BaseModel):
     action: str  # 'approve' or 'retry'

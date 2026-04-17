@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import type { Task } from './types/task';
 import type { Project, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig } from './types/project';
 import type { Alert } from './types/alert';
-import { API_BASE_URL, authHeaders, authGet } from './api';
+import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api';
 import { useToasts } from './components/Toasts';
 import { STATUS_OPTIONS } from './constants';
 import { usePersistedState } from './hooks/usePersistedState';
@@ -789,16 +789,22 @@ export function useAppState() {
 
   const handleBulkArchiveColumn = async (taskIds: string[]) => {
     if (taskIds.length === 0) return;
+    // Chunk to avoid large single requests that can hit Cloud Run request timeouts.
+    const CHUNK_SIZE = 100;
     try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
-        method: 'POST',
-        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task_ids: taskIds }),
-      });
-      if (!res.ok) throw new Error('Request failed');
-      const data = await res.json();
+      let totalArchived = 0;
+      for (let i = 0; i < taskIds.length; i += CHUNK_SIZE) {
+        const chunk = taskIds.slice(i, i + CHUNK_SIZE);
+        const res = await apiFetch('/api/admin/tasks/bulk-archive', {
+          method: 'POST',
+          body: JSON.stringify({ task_ids: chunk }),
+        });
+        if (!res.ok) throw new Error(`Request failed (${res.status})`);
+        const data = await res.json();
+        totalArchived += data.archived_count ?? 0;
+      }
       fetchTasks();
-      addToast(`Archived ${data.archived_count} task${data.archived_count !== 1 ? 's' : ''}`, 'success');
+      addToast(`Archived ${totalArchived} task${totalArchived !== 1 ? 's' : ''}`, 'success');
     } catch (error) {
       console.error('Failed to archive column tasks:', error);
       addToast('Failed to archive tasks', 'error');
