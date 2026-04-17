@@ -81,18 +81,32 @@ async def probe_rate_limit() -> bool:
     /rate_limit is a free call — doesn't count against the 5000/hr REST
     budget (per GitHub docs).  We use it as a heartbeat so the dashboard
     quota pill shows real numbers even when the pipeline is idle and no
-    task-driven GitHub calls have happened recently.  Returns True on
-    success.
+    task-driven GitHub calls have happened recently.
+
+    Uses a cached installation token (not App JWT) — GitHub reports
+    SEPARATE rate-limit buckets per token type, and the pill is only
+    meaningful for the installation-token bucket (which is what every
+    task-driven call uses).  Probing with App JWT populates the pill
+    with the App's narrower ~60/hr bucket, making it look like quota
+    is exhausted when in fact the 5000/hr install bucket is fine.
+
+    Returns True on success, False if no cached install token is
+    available (in which case the pill waits for organic task traffic).
     """
-    if not GITHUB_APP_ID or not GITHUB_PRIVATE_KEY:
-        return False
-    try:
-        app_jwt = generate_github_app_jwt()
-    except Exception as e:
-        logger.debug(f"[GITHUB] probe_rate_limit: could not generate JWT: {e}")
+    # Pull any currently-cached installation token — doesn't spend quota
+    # on a refresh.  If nothing's cached, skip the probe; real activity
+    # will populate the pill soon enough.
+    from app.routers.agent import _github_token_cache  # noqa: PLC0415
+    cached_token: str | None = None
+    for entry in _github_token_cache.values():
+        token = entry.get("token")
+        if token and token.startswith(("ghs_", "ghu_")):
+            cached_token = token
+            break
+    if not cached_token:
         return False
     headers = {
-        "Authorization": f"Bearer {app_jwt}",
+        "Authorization": f"Bearer {cached_token}",
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
@@ -101,8 +115,6 @@ async def probe_rate_limit() -> bool:
             "GET", "https://api.github.com/rate_limit", headers,
             max_retries=1,
         )
-        # Even non-200 responses populate the quota headers (GitHub still
-        # attaches them on errors), so just return True if we got a response.
         return resp is not None
     except Exception as e:
         logger.debug(f"[GITHUB] probe_rate_limit failed: {e}")
@@ -199,18 +211,32 @@ async def _github_request(
                 except (ValueError, TypeError):
                     pass  # Malformed header, skip rate limit check
             # Mirror rate-limit headers into shared_state so /api/health/detailed
-            # and the dashboard widget can show remaining quota + reset time
-            # without every consumer re-implementing header parsing. Observed
-            # on every response (success or error) — cheap.
+            # and the dashboard widget can show remaining quota + reset time.
+            # GitHub has SEPARATE rate-limit buckets per token type:
+            #   - Installation token (ghs_... or ghu_...): 5000/hr
+            #   - App JWT (eyJ...): ~60/hr for app endpoints
+            #   - PAT / user token: 5000/hr
+            #   - Unauthenticated: 60/hr
+            # The pill tracks the installation-token bucket because that's
+            # what task-driven orchestrator calls hit.  App-JWT calls
+            # (probe_rate_limit, installation discovery) live in a much
+            # smaller bucket and would pollute the gauge with misleading
+            # "60 remaining" readings.  Skip the update when we can
+            # identify a non-installation-token call.
             if remaining is not None:
-                try:
-                    _update_quota_state(
-                        remaining=int(remaining),
-                        limit=int(response.headers.get("X-RateLimit-Limit", 0)) or None,
-                        reset_ts=int(response.headers.get("X-RateLimit-Reset", 0)) or None,
-                    )
-                except (ValueError, TypeError):
-                    pass  # Malformed headers, skip
+                _auth = headers.get("Authorization", "") if headers else ""
+                _is_install_token = "Bearer ghs_" in _auth or "Bearer ghu_" in _auth
+                # No Authorization → unauthenticated (60/hr) → don't track.
+                # JWT (eyJ...) → App-JWT bucket → don't track.
+                if _is_install_token:
+                    try:
+                        _update_quota_state(
+                            remaining=int(remaining),
+                            limit=int(response.headers.get("X-RateLimit-Limit", 0)) or None,
+                            reset_ts=int(response.headers.get("X-RateLimit-Reset", 0)) or None,
+                        )
+                    except (ValueError, TypeError):
+                        pass  # Malformed headers, skip
             if response.status_code == 401:
                 logger.warning(
                     f"[GITHUB] {method} {url} returned 401 Unauthorized — "

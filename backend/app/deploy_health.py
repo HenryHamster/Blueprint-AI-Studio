@@ -49,6 +49,7 @@ def _get_zone_health_summary() -> dict:
 # ---------------------------------------------------------------------------
 
 _pause_failure_streak: int = 0   # consecutive health check cycles with critical failures
+_last_quota_probe: "datetime | None" = None  # gate probe_rate_limit to every 5min
 # Ring buffer of the last 5 health check results while PAUSED (True == healthy).
 # Auto-resume fires once >= 3 of the last 5 are healthy, tolerating a single flaky probe.
 _HEALTH_HISTORY_SIZE = 5
@@ -304,15 +305,18 @@ async def _check_external_health():
     ext["failed_deps"] = failed
 
     # Probe /rate_limit to keep github_quota warm for the dashboard pill.
-    # /rate_limit is free (doesn't count against the 5000/hr budget) and
-    # populates X-RateLimit-* headers which _github_request mirrors into
-    # shared_state.github_quota.  Without this the pill stays gray after a
-    # backend restart until the first task-driven GitHub call happens.
-    try:
-        from app.github import probe_rate_limit  # noqa: PLC0415
-        await probe_rate_limit()
-    except Exception:
-        logger.debug("[HEALTH] GitHub rate_limit probe failed", exc_info=True)
+    # Gated to every 5 minutes — the probe itself is free against the
+    # install-token 5000/hr bucket, but running it every 60s from the
+    # health cycle adds ~60 calls/hr against whatever token we use.
+    # 5min cadence = 12 probes/hr, immaterial to the install budget.
+    global _last_quota_probe
+    if _last_quota_probe is None or (now - _last_quota_probe).total_seconds() >= 300:
+        _last_quota_probe = now
+        try:
+            from app.github import probe_rate_limit  # noqa: PLC0415
+            await probe_rate_limit()
+        except Exception:
+            logger.debug("[HEALTH] GitHub rate_limit probe failed", exc_info=True)
 
     # Track consecutive failure counts per dependency (used by dispatch gate)
     consec = ext.setdefault("consecutive_failures", {})

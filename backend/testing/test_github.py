@@ -394,7 +394,11 @@ async def test_github_request_mirrors_rate_limit_headers_into_shared_state(mocke
 
     mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
 
-    resp = await _github_request("GET", "https://api.github.com/test", {})
+    # Install-token auth (ghs_ prefix) — only these responses update the
+    # shared_state pill; App-JWT and unauthenticated responses live in
+    # different rate-limit buckets and are intentionally filtered out.
+    install_headers = {"Authorization": "Bearer ghs_fake_token"}
+    resp = await _github_request("GET", "https://api.github.com/test", install_headers)
     assert resp.status_code == 200
     assert _ss.github_quota["remaining"] == 3421
     assert _ss.github_quota["limit"] == 5000
@@ -422,8 +426,9 @@ async def test_github_quota_keeps_lowest_remaining_within_reset_window(mocker):
         return next(it)
 
     mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+    install_headers = {"Authorization": "Bearer ghs_fake_token"}
     for _ in range(3):
-        await _github_request("GET", "https://api.github.com/test", {})
+        await _github_request("GET", "https://api.github.com/test", install_headers)
     # Lowest-observed within window wins.
     assert _ss.github_quota["remaining"] == 50
 
@@ -432,7 +437,7 @@ async def test_github_quota_keeps_lowest_remaining_within_reset_window(mocker):
     async def fresh_window(*args, **kwargs):
         return MockResponse(200, {}, headers={"X-RateLimit-Remaining": "4800", "X-RateLimit-Reset": "1776403600"})
     mocker.patch("httpx.AsyncClient.request", side_effect=fresh_window)
-    await _github_request("GET", "https://api.github.com/test", {})
+    await _github_request("GET", "https://api.github.com/test", install_headers)
     assert _ss.github_quota["remaining"] == 4800
     assert _ss.github_quota["reset_at"] == 1776403600
 
