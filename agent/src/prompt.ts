@@ -2021,13 +2021,20 @@ ${buildSelfReviewChecklist(opts.taskScope, hasAnalysisPlan)}
 
 If you find CRITICAL or MAJOR issues, fix them and stage the changes with \`git add\`.
 
-When done (whether or not you found issues), output a JSON block exactly like this:
+When done (whether or not you found issues), output a JSON block like one of these:
+
+PASS example (all checks passed):
 \`\`\`json
-{"verdict":"PASS","check_results":{"test_coverage":{"passed":true},"type_safety":{"passed":false,"issue":"Missing return type on exportFoo"}},"checks_performed":["test_coverage","type_safety"],"issues_found":0,"files_reviewed":3,"truncated_files_read":[]}
+{"verdict":"PASS","check_results":{"test_coverage":{"passed":true},"type_safety":{"passed":true}},"checks_performed":["test_coverage","type_safety"],"issues_found":0,"files_reviewed":3,"truncated_files_read":[]}
+\`\`\`
+
+FAIL example (at least one check failed — verdict MUST be FAIL and issues_found MUST be ≥1):
+\`\`\`json
+{"verdict":"FAIL","check_results":{"test_coverage":{"passed":true},"type_safety":{"passed":false,"issue":"Missing return type on exportFoo"}},"checks_performed":["test_coverage","type_safety"],"issues_found":1,"files_reviewed":3,"truncated_files_read":[]}
 \`\`\`
 
 Fields:
-- \`verdict\`: "PASS" if no blocking issues remain, "FAIL" if unresolvable issues were found — derive this from check_results (FAIL if any check has passed:false)
+- \`verdict\`: "PASS" if every check has passed:true, "FAIL" if any check has passed:false — these MUST be consistent with check_results
 - \`check_results\`: object mapping each mandatory check ID to \`{passed: boolean, issue?: string}\` — ${checkIdsNote}. Set \`issue\` to a short description of what was found (omit if passed).
 - \`checks_performed\`: IDs of every checklist item you examined (same keys as check_results, kept for backwards compatibility)
 - \`issues_found\`: number of issues found (0 if none)

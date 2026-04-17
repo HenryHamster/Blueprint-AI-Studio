@@ -635,6 +635,20 @@ Output ONLY a JSON object in a \`\`\`json code fence:
             }
           }
 
+          // Enforce verdict/check_results consistency: if any check has passed:false,
+          // verdict MUST be FAIL. Agents sometimes mimic example formatting over
+          // instruction text, so programmatically override PASS→FAIL when inconsistent.
+          if (parsedCheckResults) {
+            const failedCheckIds = Object.entries(parsedCheckResults)
+              .filter(([, r]) => r && r.passed === false)
+              .map(([id]) => id);
+            if (failedCheckIds.length > 0 && parsedVerdict !== 'FAIL') {
+              reviewCategories.push('verdict_check_mismatch');
+              parseFailed = true;
+              parsedVerdict = 'FAIL';
+            }
+          }
+
           // Validate checks_performed contains all mandatory items
           const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined, !!selfReviewAnalysisPlan);
           if (!parsedChecks) {
@@ -761,12 +775,24 @@ Output ONLY a JSON object in a \`\`\`json code fence:
             const missingChecks = parsedChecks
               ? mandatory.filter(m => !parsedChecks!.includes(m))
               : mandatory;
-            const retryNote = missingChecks.length > 0
-              ? `The checks_performed field was missing these mandatory items: ${missingChecks.join(', ')}.`
-              : 'The JSON output could not be parsed as valid JSON.';
+            const hadVerdictMismatch = reviewCategories.includes('verdict_check_mismatch');
+            const failedCheckIds = parsedCheckResults
+              ? Object.entries(parsedCheckResults).filter(([, r]) => r && r.passed === false).map(([id]) => id)
+              : [];
+            const retryNoteParts: string[] = [];
+            if (missingChecks.length > 0) {
+              retryNoteParts.push(`The checks_performed field was missing these mandatory items: ${missingChecks.join(', ')}.`);
+            }
+            if (hadVerdictMismatch) {
+              retryNoteParts.push(`The verdict was inconsistent with check_results: ${failedCheckIds.join(', ')} had passed:false but verdict was not FAIL. When any check has passed:false, verdict MUST be FAIL and issues_found MUST be ≥1.`);
+            }
+            if (retryNoteParts.length === 0) {
+              retryNoteParts.push('The JSON output could not be parsed as valid JSON.');
+            }
+            const retryNote = retryNoteParts.join(' ');
             sendLog(ws, `\nSelf-review: validation failed — retrying with explicit guidance...\n`);
             const { exitCode: retryExitCode, allOutput: retryOutput, lastResultText: retryResult } = await runClaudeCode(
-              `${selfReviewPrompt}\n\nCRITICAL: Your previous self-review response was invalid. ${retryNote} Return ONLY a valid JSON object with all mandatory checks_performed items.`,
+              `${selfReviewPrompt}\n\nCRITICAL: Your previous self-review response was invalid. ${retryNote} Return ONLY a valid JSON object with all mandatory checks_performed items and verdict consistent with check_results.`,
               ws, statusRef, model, effort,
             );
             let retryValid = false;
@@ -777,7 +803,20 @@ Output ONLY a JSON object in a \`\`\`json code fence:
                 const retryMissing = mandatory.filter(m => !retryChecks?.includes(m));
                 if (retryChecks && retryMissing.length === 0) {
                   retryValid = true;
-                  const retryVerdict = typeof retryParsed.verdict === 'string' ? retryParsed.verdict : undefined;
+                  let retryVerdict = typeof retryParsed.verdict === 'string' ? retryParsed.verdict : undefined;
+                  const retryCheckResults = retryParsed.check_results && typeof retryParsed.check_results === 'object' && !Array.isArray(retryParsed.check_results)
+                    ? retryParsed.check_results as Record<string, { passed: boolean; issue?: string }>
+                    : undefined;
+                  // Re-enforce verdict/check_results consistency on retry response.
+                  if (retryCheckResults) {
+                    const retryFailedIds = Object.entries(retryCheckResults)
+                      .filter(([, r]) => r && r.passed === false)
+                      .map(([id]) => id);
+                    if (retryFailedIds.length > 0 && retryVerdict !== 'FAIL') {
+                      retryVerdict = 'FAIL';
+                    }
+                    selfReviewOutcome!.check_results = retryCheckResults;
+                  }
                   if (retryVerdict !== undefined) selfReviewOutcome!.verdict = retryVerdict;
                 }
               }

@@ -992,13 +992,17 @@ export async function captureTestBaseline(
  * Returns whether tests passed and whether failures were detected (for commit note).
  */
 
-/** Extracts 'Interfaces to preserve' and 'Key dependencies' sections from analysis context. */
+/** Extracts plan-alignment-relevant sections ('Files to change', 'Interfaces to preserve',
+ * 'Key dependencies', 'Callers to verify after implementation') from analysis context. */
 export function condensedAnalysisSections(analysisContext: string): string {
   // Split at section boundaries (lines starting a new **[A-Z] heading)
   const sectionBreak = /(?=\n\*\*[A-Z])/;
   const sections = analysisContext.split(sectionBreak);
   const wanted = sections.filter(s =>
-    s.includes('**Interfaces to preserve**') || s.includes('**Key dependencies**')
+    s.includes('**Files to change**')
+    || s.includes('**Interfaces to preserve**')
+    || s.includes('**Key dependencies**')
+    || s.includes('**Callers to verify after implementation**')
   );
   if (wanted.length === 0) return analysisContext.slice(0, 800).trim();
   return wanted.map(s => s.trim()).join('\n\n');

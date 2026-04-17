@@ -774,8 +774,8 @@ describe('self-review phase', () => {
     vi.mocked(getMandatoryChecks).mockReturnValue(['test_coverage', 'type_safety']);
     const reviewJson = JSON.stringify({
       verdict: 'PASS',
-      check_results: { test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing type annotation' } },
-      issues_found: 1,
+      check_results: { test_coverage: { passed: true }, type_safety: { passed: true } },
+      issues_found: 0,
       files_reviewed: 2,
       truncated_files_read: [],
     });
@@ -797,7 +797,7 @@ describe('self-review phase', () => {
     expect(payload.failure_category).toBe('self_review_rejected');
     const outcome = payload.self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
-    expect(outcome.check_results).toEqual({ test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing type annotation' } });
+    expect(outcome.check_results).toEqual({ test_coverage: { passed: true }, type_safety: { passed: true } });
     expect(outcome.checks_performed).toEqual(['test_coverage', 'type_safety']);
     expect(outcome.verdict).toBe('FAIL');
     expect(outcome.parse_failed).toBeUndefined();
@@ -1033,6 +1033,85 @@ describe('self-review phase', () => {
       expect.objectContaining({ status: 'FAILED', failure_category: 'self_review_rejected' }),
     );
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('forces verdict to FAIL when check_results has passed:false but agent reported PASS, and blocks PR via retry-then-FAIL gate', async () => {
+    const { getMandatoryChecks } = await import('../prompt.js');
+    vi.mocked(getMandatoryChecks).mockReturnValue(['test_coverage', 'type_safety']);
+    // Pass 1: inconsistent PASS with a failed check → parseFailed=true, verdict forced to FAIL
+    const inconsistentJson = JSON.stringify({
+      verdict: 'PASS',
+      check_results: { test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing return type' } },
+      checks_performed: ['test_coverage', 'type_safety'],
+      issues_found: 0,
+      files_reviewed: 2,
+      truncated_files_read: [],
+    });
+    // Retry: agent corrects to FAIL verdict consistent with failed check
+    const retryJson = JSON.stringify({
+      verdict: 'FAIL',
+      check_results: { test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing return type' } },
+      checks_performed: ['test_coverage', 'type_safety'],
+      issues_found: 1,
+      files_reviewed: 2,
+      truncated_files_read: [],
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${inconsistentJson}\n\`\`\``, lastResultText: '' }) // pass 1: inconsistent
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${retryJson}\n\`\`\``, lastResultText: '' }); // retry: consistent FAIL
+    vi.mocked(git)
+      .mockReturnValueOnce('')         // baseCommit
+      .mockReturnValueOnce('M file')   // hasChanges
+      .mockReturnValueOnce('')         // currentHead
+      .mockReturnValueOnce('')         // uncommittedDiff
+      .mockReturnValueOnce('abc123')   // headBeforeReview
+      .mockReturnValueOnce('')         // statusBeforeReview
+      .mockReturnValueOnce('abc123')   // headAfterPass1 — SAME → no fixes → no pass 2
+      .mockReturnValueOnce('')         // statusAfterPass1 — SAME
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // Retry produces consistent FAIL → FAIL gate blocks PR creation.
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'self_review_rejected' }),
+    );
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+
+  it('retry prompt tells agent explicitly which checks had verdict-check mismatch', async () => {
+    const { getMandatoryChecks } = await import('../prompt.js');
+    vi.mocked(getMandatoryChecks).mockReturnValue(['test_coverage', 'type_safety']);
+    const inconsistentJson = JSON.stringify({
+      verdict: 'PASS',
+      check_results: { test_coverage: { passed: true }, type_safety: { passed: false, issue: 'x' } },
+      checks_performed: ['test_coverage', 'type_safety'],
+      issues_found: 0,
+      files_reviewed: 2,
+      truncated_files_read: [],
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${inconsistentJson}\n\`\`\``, lastResultText: '' }) // pass 1
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'not valid', lastResultText: '' }); // retry still bad → FAILED
+    vi.mocked(git)
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('M file')
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('abc123')
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('abc123')
+      .mockReturnValueOnce('')
+      .mockReturnValue('');
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const retryCall = vi.mocked(runClaudeCode).mock.calls[2];
+    const retryPrompt = retryCall[0] as string;
+    expect(retryPrompt).toContain('type_safety');
+    expect(retryPrompt).toContain('passed:false');
+    expect(retryPrompt).toContain('verdict MUST be FAIL');
   });
 
   it('re-runs testFixLoop after self-review applies fixes (handleCreate, main branch)', async () => {

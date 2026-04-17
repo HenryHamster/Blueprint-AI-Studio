@@ -1794,6 +1794,27 @@ describe('buildSelfReviewPrompt', () => {
     expect(issueDistPos).toBeGreaterThan(-1);
     expect(firstAttemptPos).toBeGreaterThan(issueDistPos);
   });
+
+  it('JSON example blocks are internally consistent (verdict matches check_results, issues_found matches failed-check count)', () => {
+    const result = buildSelfReviewPrompt(baseOpts);
+    const jsonBlocks = [...result.matchAll(/```json\s*\n([\s\S]*?)\n```/g)].map(m => m[1]);
+    expect(jsonBlocks.length).toBeGreaterThan(0);
+    for (const block of jsonBlocks) {
+      const parsed = JSON.parse(block) as {
+        verdict: string;
+        check_results: Record<string, { passed: boolean; issue?: string }>;
+        issues_found: number;
+      };
+      const failedCount = Object.values(parsed.check_results).filter(r => r.passed === false).length;
+      if (failedCount > 0) {
+        expect(parsed.verdict).toBe('FAIL');
+        expect(parsed.issues_found).toBeGreaterThanOrEqual(1);
+      } else {
+        expect(parsed.verdict).toBe('PASS');
+        expect(parsed.issues_found).toBe(0);
+      }
+    }
+  });
 });
 
 // ── buildSelfReviewChecklist (via buildSelfReviewPrompt) ─────────────────────
