@@ -582,6 +582,61 @@ def _categorize_review_issues(review_history: list) -> dict[str, list[dict]]:
     return buckets
 
 
+def summarize_decomposition_outcomes(direction: dict) -> Optional[dict]:
+    """Summarize decomposition_quality from the last 3 productive research cycles.
+
+    Returns None if there is no decomposition data to summarize.
+    """
+    history = direction.get("research_history", []) or []
+    productive = [h for h in history if h.get("tasks_created", 0) > 0][-3:]
+    flat: list[dict] = []
+    for cycle in productive:
+        dq = cycle.get("decomposition_quality") or []
+        if isinstance(dq, list):
+            flat.extend(e for e in dq if isinstance(e, dict))
+    if not flat:
+        return None
+
+    def _nums(key, cast=float):
+        return [cast(e[key]) for e in flat if isinstance(e.get(key), (int, float))]
+
+    merge_rates = _nums("subtask_merge_rate")
+    files_per = _nums("avg_files_per_subtask")
+    max_files_vals = _nums("max_files_in_subtask", int)
+    dep_depths = _nums("dependency_depth", int)
+    high_xmod = [
+        float(e["subtask_merge_rate"]) for e in flat
+        if isinstance(e.get("subtask_merge_rate"), (int, float))
+        and isinstance(e.get("cross_module_count"), (int, float))
+        and int(e["cross_module_count"]) >= 2
+    ]
+    low_xmod = [
+        float(e["subtask_merge_rate"]) for e in flat
+        if isinstance(e.get("subtask_merge_rate"), (int, float))
+        and isinstance(e.get("cross_module_count"), (int, float))
+        and int(e["cross_module_count"]) < 2
+    ]
+    high_corr_low = False
+    if high_xmod and low_xmod:
+        if (sum(high_xmod) / len(high_xmod)) + 0.1 <= (sum(low_xmod) / len(low_xmod)):
+            high_corr_low = True
+
+    out: dict = {
+        "prior_decomposition_count": len(flat),
+        "high_cross_module_correlates_with_low_merge": high_corr_low,
+    }
+    if merge_rates:
+        out["avg_subtask_merge_rate"] = round(sum(merge_rates) / len(merge_rates), 3)
+    if files_per:
+        out["avg_files_per_subtask"] = round(sum(files_per) / len(files_per), 2)
+    if max_files_vals:
+        out["max_files_in_subtask"] = max(max_files_vals)
+    if dep_depths:
+        out["avg_dependency_depth"] = round(sum(dep_depths) / len(dep_depths), 2)
+        out["max_dependency_depth"] = max(dep_depths)
+    return out
+
+
 def compute_recurring_first_review_descriptions(
     rows,
     cutoff,

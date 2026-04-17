@@ -634,12 +634,25 @@ describe('condensedAnalysisSections', () => {
       '',
       '**Callers to verify after implementation**',
       '- caller.ts (uses: foo)',
+      '',
+      '**Tests at risk of breaking**',
+      '- testing/test_x.py — fixture change',
     ].join('\n');
     const out = condensedAnalysisSections(ctx);
     expect(out).toContain('**Files to change**');
     expect(out).toContain('**Interfaces to preserve**');
     expect(out).toContain('**Key dependencies**');
     expect(out).toContain('**Callers to verify after implementation**');
+    expect(out).toContain('**Tests at risk of breaking**');
+    expect(out).toContain('- testing/test_x.py — fixture change');
+  });
+
+  it('extracts "Tests at risk of breaking" section', () => {
+    const ctx = '**Tests at risk of breaking**\n- testing/test_foo.py — assertion change\n\n**Implementation approach**\n- step';
+    const out = condensedAnalysisSections(ctx);
+    expect(out).toContain('**Tests at risk of breaking**');
+    expect(out).toContain('- testing/test_foo.py — assertion change');
+    expect(out).not.toContain('Implementation approach');
   });
 
   it('matches case-insensitively', () => {

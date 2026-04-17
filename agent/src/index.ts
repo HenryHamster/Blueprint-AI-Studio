@@ -993,9 +993,9 @@ export async function captureTestBaseline(
  */
 
 /** Extracts plan-alignment-relevant sections ('Files to change', 'Interfaces to preserve',
- * 'Key dependencies', 'Callers to verify after implementation') from analysis context.
- * Heading match is fuzzy (lowercased, key-term based) so minor wording variations from
- * the analysis agent (e.g. 'Files to modify') still produce complete section data. */
+ * 'Key dependencies', 'Callers to verify after implementation', 'Tests at risk of breaking')
+ * from analysis context. Heading match is fuzzy (lowercased, key-term based) so minor wording
+ * variations from the analysis agent (e.g. 'Files to modify') still produce complete section data. */
 export function condensedAnalysisSections(analysisContext: string): string {
   // Split at section boundaries (lines starting a new **[A-Z] heading)
   const sectionBreak = /(?=\n\*\*[A-Z])/;
@@ -1009,6 +1009,7 @@ export function condensedAnalysisSections(analysisContext: string): string {
       || (h.includes('interfaces') && h.includes('preserve'))
       || h.includes('dependencies')
       || (h.includes('callers') && h.includes('verify'))
+      || (h.includes('tests') && h.includes('risk'))
     );
   };
   const wanted = sections.filter(isWantedHeading);

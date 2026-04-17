@@ -1364,87 +1364,15 @@ async def claim_task(
                     response["direction_context"] = {}
                 response["direction_context"]["cochange_hints"] = cochange_hints
 
-    # Inject prior decomposition outcomes for plan tasks so the planner can
-    # correlate decomposition shape (files per subtask, dependency depth,
-    # cross-module spread) with historical subtask merge success.
     if task_type == "plan" and direction_id and project_for_playbook:
         direction_for_decomp = next(
             (d for d in (project_for_playbook.directions or []) if d.get("id") == direction_id),
             None,
         )
         if direction_for_decomp:
-            decomp_history = direction_for_decomp.get("research_history", []) or []
-            decomp_productive = [
-                h for h in decomp_history if h.get("tasks_created", 0) > 0
-            ][-3:]
-            flat_dq: list[dict] = []
-            for _cycle in decomp_productive:
-                dq_list = _cycle.get("decomposition_quality") or []
-                if isinstance(dq_list, list):
-                    for _entry in dq_list:
-                        if isinstance(_entry, dict):
-                            flat_dq.append(_entry)
-            if flat_dq:
-                merge_rates = [
-                    float(e["subtask_merge_rate"])
-                    for e in flat_dq
-                    if isinstance(e.get("subtask_merge_rate"), (int, float))
-                ]
-                files_per = [
-                    float(e["avg_files_per_subtask"])
-                    for e in flat_dq
-                    if isinstance(e.get("avg_files_per_subtask"), (int, float))
-                ]
-                max_files_vals = [
-                    int(e["max_files_in_subtask"])
-                    for e in flat_dq
-                    if isinstance(e.get("max_files_in_subtask"), (int, float))
-                ]
-                dep_depths = [
-                    int(e["dependency_depth"])
-                    for e in flat_dq
-                    if isinstance(e.get("dependency_depth"), (int, float))
-                ]
-                high_xmod_rates = [
-                    float(e["subtask_merge_rate"])
-                    for e in flat_dq
-                    if isinstance(e.get("subtask_merge_rate"), (int, float))
-                    and isinstance(e.get("cross_module_count"), (int, float))
-                    and int(e["cross_module_count"]) >= 2
-                ]
-                low_xmod_rates = [
-                    float(e["subtask_merge_rate"])
-                    for e in flat_dq
-                    if isinstance(e.get("subtask_merge_rate"), (int, float))
-                    and isinstance(e.get("cross_module_count"), (int, float))
-                    and int(e["cross_module_count"]) < 2
-                ]
-                high_corr_low = False
-                if high_xmod_rates and low_xmod_rates:
-                    mean_high = sum(high_xmod_rates) / len(high_xmod_rates)
-                    mean_low = sum(low_xmod_rates) / len(low_xmod_rates)
-                    # Flag only when high-cross-module cohort is measurably worse
-                    if mean_high + 0.1 <= mean_low:
-                        high_corr_low = True
-                decomposition_outcomes: dict = {
-                    "prior_decomposition_count": len(flat_dq),
-                    "high_cross_module_correlates_with_low_merge": high_corr_low,
-                }
-                if merge_rates:
-                    decomposition_outcomes["avg_subtask_merge_rate"] = round(
-                        sum(merge_rates) / len(merge_rates), 3
-                    )
-                if files_per:
-                    decomposition_outcomes["avg_files_per_subtask"] = round(
-                        sum(files_per) / len(files_per), 2
-                    )
-                if max_files_vals:
-                    decomposition_outcomes["max_files_in_subtask"] = max(max_files_vals)
-                if dep_depths:
-                    decomposition_outcomes["avg_dependency_depth"] = round(
-                        sum(dep_depths) / len(dep_depths), 2
-                    )
-                    decomposition_outcomes["max_dependency_depth"] = max(dep_depths)
+            from app.playbook_learning import summarize_decomposition_outcomes
+            decomposition_outcomes = summarize_decomposition_outcomes(direction_for_decomp)
+            if decomposition_outcomes:
                 if "direction_context" not in response:
                     response["direction_context"] = {}
                 response["direction_context"]["decomposition_outcomes"] = decomposition_outcomes

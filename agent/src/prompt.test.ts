@@ -2108,6 +2108,74 @@ describe('buildSelfReviewPrompt', () => {
       .not.toContain('## Specific Patterns That Cause First-Review Rejections');
   });
 
+  it('renders Plan Completion Status section with counts and missing files when planCompletion is provided', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      planCompletion: {
+        plannedProductionCount: 4,
+        changedPlannedProductionCount: 3,
+        plannedTestCount: 2,
+        changedPlannedTestCount: 1,
+        missingProduction: ['backend/app/foo.py'],
+        missingTest: ['testing/test_foo.py'],
+      },
+    });
+    expect(result).toContain('## Plan Completion Status');
+    expect(result).toContain('3/4 planned production files changed');
+    expect(result).toContain('1/2 planned test files created or modified');
+    expect(result).toContain('- backend/app/foo.py (production)');
+    expect(result).toContain('- testing/test_foo.py (test)');
+  });
+
+  it('omits Missing block in Plan Completion Status when nothing is missing', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      planCompletion: {
+        plannedProductionCount: 2,
+        changedPlannedProductionCount: 2,
+        plannedTestCount: 1,
+        changedPlannedTestCount: 1,
+        missingProduction: [],
+        missingTest: [],
+      },
+    });
+    expect(result).toContain('## Plan Completion Status');
+    expect(result).toContain('2/2 planned production files changed');
+    expect(result).not.toContain('\nMissing:\n');
+  });
+
+  it('omits Plan Completion Status when planCompletion has zero planned files', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      planCompletion: {
+        plannedProductionCount: 0,
+        changedPlannedProductionCount: 0,
+        plannedTestCount: 0,
+        changedPlannedTestCount: 0,
+        missingProduction: [],
+        missingTest: [],
+      },
+    });
+    expect(result).not.toContain('## Plan Completion Status');
+  });
+
+  it('omits Plan Completion Status when planCompletion is undefined', () => {
+    const result = buildSelfReviewPrompt(baseOpts);
+    expect(result).not.toContain('## Plan Completion Status');
+  });
+
+  it('plan_alignment checklist item is bidirectional when analysisPlan is provided', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      taskScope: 'medium',
+      analysisPlan: '**Files to change**\n- agent/src/foo.ts\n',
+    });
+    expect(result).toContain('Plan alignment');
+    expect(result).toContain('Bidirectional check');
+    expect(result).toContain('Tests to add or update');
+    expect(result).toContain('Plan Completion Status');
+  });
+
   it('JSON example blocks are internally consistent (verdict matches check_results, issues_found matches failed-check count)', () => {
     const result = buildSelfReviewPrompt(baseOpts);
     const jsonBlocks = [...result.matchAll(/```json\s*\n([\s\S]*?)\n```/g)].map(m => m[1]);

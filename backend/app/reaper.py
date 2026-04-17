@@ -658,28 +658,17 @@ async def reaper_service():
                 try:
                     _terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
                     rescued = 0
-                    # Independent query: don't rely on Step 3's result set, which can miss
-                    # parents whose children all terminated within the 15-minute staleness
-                    # window of the parent's last update, or whose child status changed
-                    # between Step 3 and Step 4.
-                    _step4_cutoff = now - timedelta(minutes=15)
-                    _step4_parents = (await session.execute(
-                        select(Task).where(
-                            Task.status == TaskStatus.EVALUATING,
-                            Task.updated_at < _step4_cutoff,
-                        )
-                    )).scalars().all()
                     # Batch-fetch all children for all evaluating parents in a single query
                     # to avoid an N+1 pattern (one query per parent).
                     _children_by_parent: Dict[uuid.UUID, list] = {}
-                    if _step4_parents:
-                        _parent_ids = [p.id for p in _step4_parents]
+                    if evaluating_parents:
+                        _parent_ids = [p.id for p in evaluating_parents]
                         _all_children = (await session.execute(
                             select(Task).where(Task.parent_task_id.in_(_parent_ids))
                         )).scalars().all()
                         for _c in _all_children:
                             _children_by_parent.setdefault(_c.parent_task_id, []).append(_c)
-                    for parent in _step4_parents:
+                    for parent in evaluating_parents:
                         children = _children_by_parent.get(parent.id, [])
                         if not children:
                             continue

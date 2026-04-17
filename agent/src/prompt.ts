@@ -2055,7 +2055,7 @@ Check for:
   }
   // medium or unspecified: 8-item checklist (includes cross-file and import checks for multi-file changes)
   const planAlignmentItem = hasAnalysisPlan
-    ? `0. **Plan alignment (HARD GATE — verdict MUST be FAIL if violated)** — Do the files you actually changed match the "Files to change" list from the analysis plan? Test files corresponding to planned production files count as in-plan; any other unplanned non-test file is a scope violation. Were any interfaces marked "preserve" altered? If either condition is violated, the verdict MUST be FAIL — revert the unplanned changes and re-attempt within scope. Justification is NOT acceptable.\n`
+    ? `0. **Plan alignment (HARD GATE — verdict MUST be FAIL if violated)** — Bidirectional check: (a) Do the files you actually changed match the "Files to change" list from the analysis plan? Test files corresponding to planned production files count as in-plan; any other unplanned non-test file is a scope violation. (b) Were all planned production files actually changed, and were files listed under "Tests to add or update" actually created or modified? See "Plan Completion Status" above — for each missing file, complete the planned change. Were any interfaces marked "preserve" altered? If any condition is violated, the verdict MUST be FAIL — revert unplanned changes and complete missing planned files. Justification is NOT acceptable.\n`
     : '';
   const scopeViolationsItem = hasAnalysisPlan
     ? `3. **Scope violations (HARD GATE — verdict MUST be FAIL if violated)** — Any changed non-test file not listed in the analysis plan's "Files to change" section is a scope violation and MUST result in a FAIL verdict. Test files for planned production files are in-scope. Revert unplanned non-test files; do not justify them.`
@@ -2090,6 +2090,14 @@ export function buildSelfReviewPrompt(opts: {
   firstAttemptByCategory?: Record<string, number>;
   persistentReviewIssues?: string[];
   analysisPlan?: string;
+  planCompletion?: {
+    plannedProductionCount: number;
+    changedPlannedProductionCount: number;
+    plannedTestCount: number;
+    changedPlannedTestCount: number;
+    missingProduction: string[];
+    missingTest: string[];
+  };
   topFirstReviewIssues?: Array<{ description: string; count: number; category: string }>;
   scopeSpecificReviewIssues?: Array<{ description: string; count: number; category: string; scope: string }>;
 }): string {
@@ -2182,12 +2190,26 @@ export function buildSelfReviewPrompt(opts: {
     ? `\n## Pre-Implementation Plan (verify changes align with this)\n${opts.analysisPlan.trim()}\n`
     : '';
 
+  const pc = opts.planCompletion;
+  const planCompletionSection = pc && (pc.plannedProductionCount > 0 || pc.plannedTestCount > 0)
+    ? (() => {
+        const missingLines = [
+          ...pc.missingProduction.map(f => `- ${f} (production)`),
+          ...pc.missingTest.map(f => `- ${f} (test)`),
+        ];
+        const missingBlock = missingLines.length > 0
+          ? `\nMissing:\n${missingLines.join('\n')}`
+          : '';
+        return `\n## Plan Completion Status\n${pc.changedPlannedProductionCount}/${pc.plannedProductionCount} planned production files changed, ${pc.changedPlannedTestCount}/${pc.plannedTestCount} planned test files created or modified.${missingBlock}\n`;
+      })()
+    : '';
+
   const hasAnalysisPlan = !!(opts.analysisPlan && opts.analysisPlan.trim());
   const mandatoryChecks = getMandatoryChecks(opts.taskScope, hasAnalysisPlan);
   const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
 
   return `You are performing a self-review of the changes you just made for this task.
-${restrictionsSection}${scopeSpecificSection}${issueDistSection}${firstAttemptSection}${topIssuesSection}${playbookSection}${scopeOverflowSection}${planSection}${diffSection}${buildVerificationSection}
+${restrictionsSection}${scopeSpecificSection}${issueDistSection}${firstAttemptSection}${topIssuesSection}${playbookSection}${scopeOverflowSection}${planSection}${planCompletionSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.

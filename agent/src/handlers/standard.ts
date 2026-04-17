@@ -587,6 +587,35 @@ Output ONLY a JSON object in a \`\`\`json code fence:
       const selfReviewAnalysisPlan = selfReviewTaskScope === 'medium' && analysisContext
         ? condensedAnalysisSections(analysisContext)
         : undefined;
+
+      // Plan completion: compare planned file lists against actual changed files so
+      // the self-review can flag planned files that were skipped in implementation.
+      let planCompletion: {
+        plannedProductionCount: number;
+        changedPlannedProductionCount: number;
+        plannedTestCount: number;
+        changedPlannedTestCount: number;
+        missingProduction: string[];
+        missingTest: string[];
+      } | undefined;
+      if (selfReviewTaskScope === 'medium' && analysisContext) {
+        const plannedProduction = parseAnalysisPlanFiles(analysisContext);
+        const plannedTest = parseAnalysisPlanTestFiles(analysisContext);
+        if (plannedProduction.length > 0 || plannedTest.length > 0) {
+          const changedSet = new Set(changedPaths);
+          const missingProduction = plannedProduction.filter(f => !changedSet.has(f));
+          const missingTest = plannedTest.filter(f => !changedSet.has(f));
+          planCompletion = {
+            plannedProductionCount: plannedProduction.length,
+            changedPlannedProductionCount: plannedProduction.length - missingProduction.length,
+            plannedTestCount: plannedTest.length,
+            changedPlannedTestCount: plannedTest.length - missingTest.length,
+            missingProduction,
+            missingTest,
+          };
+        }
+      }
+
       const selfReviewPrompt = buildSelfReviewPrompt({
         diff: reviewDiff,
         reviewPlaybook,
@@ -599,6 +628,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         firstAttemptByCategory: firstAttemptByCat,
         persistentReviewIssues,
         analysisPlan: selfReviewAnalysisPlan,
+        planCompletion,
         topFirstReviewIssues,
         scopeSpecificReviewIssues,
       });
@@ -1126,6 +1156,7 @@ export async function handleCreate(
     failOnTestFailure: true,
     captureBaseline: isMediumOrLargeScope,
     runSelfReview: true,
+    runSmallScopeAnalysis: true,
     lintContext: 'the code you just wrote',
     includeTaskTypeHints: true,
     issueReference,

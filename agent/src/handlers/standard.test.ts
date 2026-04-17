@@ -432,10 +432,14 @@ describe('pre-implementation analysis note', () => {
     vi.clearAllMocks();
   });
 
-  it('does not inject Pre-Implementation Analysis for handleCreate with scope=small', async () => {
+  it('injects small-scope Pre-Implementation Analysis prefix for handleCreate with scope=small', async () => {
     const task = { title: 'Task', description: '', context: { scope: 'small' } };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(capturedPrompt()).not.toContain('## Pre-Implementation Analysis');
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('## Pre-Implementation Analysis');
+    expect(prompt).toContain('under ~50 lines across 1–3 files');
+    // Small-scope adds only the prefix — no separate Claude Code analysis run.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
   });
 
   it('does not inject Pre-Implementation Analysis for handleCreate with scope=medium', async () => {
