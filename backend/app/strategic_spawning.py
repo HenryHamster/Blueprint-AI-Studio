@@ -297,7 +297,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         total_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
         total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (agg.get("total_prs_rejected") or 0)
         total_failed = sum(h.get("tasks_failed", 0) for h in history) + (agg.get("total_tasks_failed") or 0)
-        total_failed_infra = sum(h.get("tasks_failed_infra", 0) for h in history)
+        total_failed_infra = sum(h.get("tasks_failed_infra", 0) for h in history) + (agg.get("total_tasks_failed_infra") or 0)
         recent_history = history[-5:]
         recent_findings = []
         recent_failures = []

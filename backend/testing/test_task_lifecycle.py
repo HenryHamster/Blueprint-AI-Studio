@@ -450,6 +450,61 @@ async def test_requeue_agent_timeout_injects_scope_guidance(tl_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_requeue_external_api_injects_api_guidance(tl_db, mocker):
+    """EXTERNAL_API failure inserts API-specific retry guidance into prompt_suffix."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="EXTERNAL_API")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_attempt_number": 1},
+        latest_status_message="GitHub API returned 503 Service Unavailable",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
+    assert "GitHub API" in prompt_suffix
+    assert "503" in prompt_suffix
+    assert "backoff" in prompt_suffix.lower()
+
+
+@pytest.mark.asyncio
+async def test_requeue_rate_limit_injects_rate_limit_guidance(tl_db, mocker):
+    """RATE_LIMIT failure inserts rate-limit retry guidance into prompt_suffix."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="RATE_LIMIT")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_attempt_number": 1},
+        latest_status_message="429 Too Many Requests",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
+    assert "rate limit" in prompt_suffix.lower()
+    assert "backoff" in prompt_suffix.lower()
+
+
+@pytest.mark.asyncio
 async def test_requeue_remaps_depends_on_to_new_clone_ids(tl_db, mocker):
     """depends_on entries pointing to cancelled children are remapped to their clones."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)

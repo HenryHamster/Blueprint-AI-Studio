@@ -432,6 +432,47 @@ async def test_operator_rejection_rate_zero_rejected_in_history_aggregate(db_ses
     assert "prs_rejected" not in d_stat
 
 
+@pytest.mark.asyncio
+async def test_tasks_failed_infra_includes_history_aggregate(db_session):
+    """tasks_failed_infra aggregates from both research_history and history_aggregate."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-agg03",
+                "status": "active",
+                "text": "Direction with archived infra failures",
+                "priority": "high",
+                "research_history": [
+                    {"tasks_failed": 1, "tasks_failed_infra": 1},
+                ],
+                "history_aggregate": {
+                    "total_cycles": 5,
+                    "total_prs_merged": 0,
+                    "total_prs_rejected": 0,
+                    "total_tasks_failed": 4,
+                    "total_tasks_failed_infra": 3,
+                },
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-agg03")
+
+    # history: 1 failed (1 infra); aggregate: 4 failed (3 infra)
+    assert d_stat["tasks_failed"] == 5
+    assert d_stat.get("tasks_failed_infra") == 4
+
+
 # ── Active-task guard in _spawn_design_doc_update / _spawn_strategic_review ───
 
 @pytest.mark.asyncio

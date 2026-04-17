@@ -321,6 +321,32 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 if error_files:
                     extra_guidance += "Error file locations:\n" + "".join(f"  {f}\n" for f in error_files)
 
+            elif failure_class == "EXTERNAL_API":
+                error_text = (original_status_message or "")
+                lower = error_text.lower()
+                if "github" in lower:
+                    service = "GitHub API"
+                elif "anthropic" in lower or "claude" in lower:
+                    service = "Claude API"
+                else:
+                    service = "external API"
+                code_match = re.search(r"\b([45]\d{2})\b", error_text)
+                code_hint = f" (status {code_match.group(1)})" if code_match else ""
+                extra_guidance = (
+                    f"RETRY GUIDANCE: The previous attempt failed due to an {service} error{code_hint}.\n"
+                    "- Check the service's status page before making calls\n"
+                    "- Implement exponential backoff with jitter on retries\n"
+                    "- Handle transient 5xx and network errors gracefully\n"
+                )
+
+            elif failure_class == "RATE_LIMIT":
+                extra_guidance = (
+                    "RETRY GUIDANCE: The previous attempt hit a rate limit.\n"
+                    "- Respect Retry-After headers when present\n"
+                    "- Use exponential backoff with jitter between retries\n"
+                    "- Batch or reduce request volume where possible\n"
+                )
+
             if extra_guidance:
                 new_payloads[0]["prompt_suffix"] = extra_guidance + ("\n" + existing_suffix if existing_suffix else "")
 

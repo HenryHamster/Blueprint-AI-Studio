@@ -119,7 +119,7 @@ async def _update_direction_research_outcomes(
             )
             entry["prs_rejected"] = sum(
                 1 for ct in child_tasks_rows
-                if (ct.context or {}).get("pr_rejected")
+                if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_rejected")
             )
             # Collect changed files from merged PRs for co-change index update
             merged_files_lists = [
@@ -134,11 +134,11 @@ async def _update_direction_research_outcomes(
             # Review quality signals: track how users respond to Blueprint's reviews
             entry["reviews_dismissed"] = sum(
                 1 for ct in child_tasks_rows
-                if (ct.context or {}).get("review_dismissed")
+                if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("review_dismissed")
             )
             entry["reviews_overridden"] = sum(
                 1 for ct in child_tasks_rows
-                if (ct.context or {}).get("user_overrode_review")
+                if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("user_overrode_review")
             )
             entry["user_issues_caught"] = sum(
                 1 for ct in child_tasks_rows

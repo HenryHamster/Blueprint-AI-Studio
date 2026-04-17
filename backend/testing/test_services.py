@@ -462,6 +462,9 @@ async def test_persist_zone_health_includes_streak_counters(deploy_db, mocker):
     mocker.patch("app.deploy_health._pause_failure_streak", 4)
     from collections import deque as _deque
     mocker.patch("app.deploy_health._health_recovery_history", _deque([True, False, True], maxlen=5))
+    from datetime import datetime as _dt
+    resume_at = _dt(2026, 4, 17, 12, 0, 0)
+    mocker.patch("app.deploy_health._last_auto_resume_at", resume_at)
 
     mock_state = MagicMock()
     mock_state.zone_health_state = None
@@ -472,6 +475,7 @@ async def test_persist_zone_health_includes_streak_counters(deploy_db, mocker):
     snapshot = mock_state.zone_health_state
     assert snapshot["_pause_failure_streak"] == 4
     assert snapshot["_health_recovery_history"] == [True, False, True]
+    assert snapshot["_last_auto_resume_at"] == resume_at.isoformat()
 
 
 @pytest.mark.asyncio

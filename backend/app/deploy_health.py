@@ -63,6 +63,31 @@ def _reset_health_recovery_history() -> None:
     _health_recovery_history.clear()
 
 
+def _restore_health_streaks(snapshot: dict) -> None:
+    """Restore module-level pause/recovery state from a persisted zone_health_state snapshot.
+
+    Called once at startup. Tolerates missing keys, legacy int history format, and
+    invalid ISO timestamps — corrupt values fall back to safe defaults (0 / empty / None).
+    """
+    global _pause_failure_streak, _last_auto_resume_at
+    _pause_failure_streak = int(snapshot.get("_pause_failure_streak") or 0)
+    history = snapshot.get("_health_recovery_history")
+    _health_recovery_history.clear()
+    if isinstance(history, list):
+        for v in history[-_HEALTH_HISTORY_SIZE:]:
+            _health_recovery_history.append(bool(v))
+    _last_auto_resume_at = None
+    raw = snapshot.get("_last_auto_resume_at")
+    if isinstance(raw, str):
+        try:
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            _last_auto_resume_at = parsed
+        except ValueError:
+            logger.warning(f"[DEPLOY] Invalid _last_auto_resume_at in persisted state: {raw!r}")
+
+
 def should_rollback() -> tuple:
     """Causation analysis: determine if failures are caused by the new deploy.
     Returns (should_rollback: bool, reason: str, response: str).

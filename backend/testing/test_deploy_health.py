@@ -781,6 +781,71 @@ async def test_forced_resume_sets_grace_timestamp(dh_db):
     assert _dh._last_auto_resume_at is not None
 
 
+# ── Tests: persisted-state restore on startup ────────────────────────────────
+
+
+def test_restore_health_streaks_roundtrip():
+    """_restore_health_streaks must rehydrate all three pieces of state from a snapshot."""
+    from datetime import datetime as _dt
+    resume_at = _dt(2026, 4, 17, 10, 30, 0)
+    snapshot = {
+        "_pause_failure_streak": 2,
+        "_health_recovery_history": [True, False, True],
+        "_last_auto_resume_at": resume_at.isoformat(),
+    }
+    _dh._restore_health_streaks(snapshot)
+    assert _dh._pause_failure_streak == 2
+    assert list(_dh._health_recovery_history) == [True, False, True]
+    assert _dh._last_auto_resume_at == resume_at
+
+
+def test_restore_health_streaks_tolerates_missing_keys():
+    """Empty snapshot must restore to safe defaults (0 / empty / None)."""
+    _dh._pause_failure_streak = 99
+    _dh._health_recovery_history.append(True)
+    _dh._last_auto_resume_at = _dh._utcnow()
+
+    _dh._restore_health_streaks({})
+    assert _dh._pause_failure_streak == 0
+    assert list(_dh._health_recovery_history) == []
+    assert _dh._last_auto_resume_at is None
+
+
+def test_restore_health_streaks_tolerates_invalid_timestamp():
+    """Corrupt ISO string for _last_auto_resume_at must fall back to None."""
+    _dh._restore_health_streaks({"_last_auto_resume_at": "not-a-date"})
+    assert _dh._last_auto_resume_at is None
+
+
+@pytest.mark.asyncio
+async def test_restored_grace_period_suppresses_repause_after_restart(dh_db, mocker):
+    """Simulated restart: after restoring _last_auto_resume_at, grace period still applies."""
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    _shared_state.runtime_config["max_concurrent_vms"] = 4
+    _shared_state.runtime_config["auto_resume_grace_period_seconds"] = 300
+    _set_critical_failures("db")
+
+    # Persist a recent resume, then simulate restart by clearing module state and restoring.
+    recent = _dh._utcnow()
+    snapshot = {
+        "_pause_failure_streak": 2,
+        "_health_recovery_history": [],
+        "_last_auto_resume_at": recent.isoformat(),
+    }
+    _dh._pause_failure_streak = 0
+    _dh._last_auto_resume_at = None
+    _dh._restore_health_streaks(snapshot)
+    assert _dh._last_auto_resume_at is not None
+
+    mocker.patch("app.deploy_health.manager.broadcast_to_all", new_callable=AsyncMock)
+    await _dh._check_pause_mode()
+
+    # Grace period honored — no pause triggered despite streak reaching 3.
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    assert state.status == DeploymentStatus.STABLE.value
+
+
 # ── Tests: nested pause preserves original pre-pause VM count ────────────────
 
 

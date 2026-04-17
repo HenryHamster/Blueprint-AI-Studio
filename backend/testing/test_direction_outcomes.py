@@ -268,7 +268,7 @@ async def test_pr_metrics_basic(db_session: AsyncSession):
                               status=TaskStatus.COMPLETED,
                               context={"pr_merged": True}, title="merged2")
     await _create_child_task(db_session, research_task.id, project.id,
-                              status=TaskStatus.FAILED,
+                              status=TaskStatus.COMPLETED,
                               context={"pr_rejected": True}, title="rejected1")
     await _create_child_task(db_session, research_task.id, project.id,
                               status=TaskStatus.COMPLETED,
@@ -318,6 +318,48 @@ async def test_conversion_rate_division_by_zero(db_session: AsyncSession):
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
     assert entry["conversion_rate"] is None
+
+
+@pytest.mark.asyncio
+async def test_rejected_and_review_counts_require_completed_status(db_session: AsyncSession):
+    """prs_rejected, reviews_dismissed, reviews_overridden exclude non-COMPLETED tasks."""
+    direction_id = "d-status-filter"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=6)]
+    await db_session.flush()
+
+    # COMPLETED — should count
+    await _create_child_task(db_session, research_task.id, project.id,
+                              status=TaskStatus.COMPLETED,
+                              context={"pr_rejected": True, "review_dismissed": True,
+                                       "user_overrode_review": True}, title="ok")
+    # FAILED with the same flags — should NOT count
+    await _create_child_task(db_session, research_task.id, project.id,
+                              status=TaskStatus.FAILED,
+                              context={"pr_rejected": True, "review_dismissed": True,
+                                       "user_overrode_review": True}, title="failed")
+    # CANCELLED with flags — should NOT count
+    await _create_child_task(db_session, research_task.id, project.id,
+                              status=TaskStatus.CANCELLED,
+                              context={"pr_rejected": True, "review_dismissed": True,
+                                       "user_overrode_review": True}, title="cancelled")
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_rejected"] == 1
+    assert entry["reviews_dismissed"] == 1
+    assert entry["reviews_overridden"] == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
