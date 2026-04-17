@@ -61,7 +61,7 @@ vi.mock('child_process', () => ({
 import fs from 'fs';
 import { execFileSync } from 'child_process';
 import * as indexMod from '../index.js';
-import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS, annotateResolvedIssues, detectMediumScopeSubsystemHint } from './review-fix.js';
+import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS, annotateResolvedIssues, detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying } from './review-fix.js';
 
 const statusRef = () => ({ value: '' });
 
@@ -831,5 +831,140 @@ describe('handleFix — post-rebase lint re-validation', () => {
     expect(lintCalls).toBe(2);
     const sendLogMessages = vi.mocked(indexMod.sendLog).mock.calls.map(c => String(c[1]));
     expect(sendLogMessages.some(m => /still failing/i.test(m))).toBe(false);
+  });
+});
+
+// ── pushForceWithLeaseRetrying: concurrent push retry paths ─────────────────
+describe('pushForceWithLeaseRetrying — concurrent push retry', () => {
+  it('returns after a successful first push without retrying', async () => {
+    vi.mocked(indexMod.gitAsync).mockResolvedValueOnce('');
+
+    await pushForceWithLeaseRetrying('feature/x', null);
+
+    expect(vi.mocked(indexMod.gitAsync)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(indexMod.gitAsync)).toHaveBeenCalledWith(['push', '--force-with-lease', 'origin', 'feature/x']);
+    // No fetch/rebase on the happy path.
+    const gitCalls = vi.mocked(indexMod.git).mock.calls.map(c => c[0]);
+    expect(gitCalls.some(args => Array.isArray(args) && args[0] === 'fetch')).toBe(false);
+    expect(gitCalls.some(args => Array.isArray(args) && args[0] === 'rebase')).toBe(false);
+  });
+
+  it('refetches, rebases, and retries push when first push fails with stale info', async () => {
+    vi.mocked(indexMod.gitAsync)
+      .mockRejectedValueOnce(new Error('error: failed to push some refs ... stale info'))
+      .mockResolvedValueOnce('');
+    // git() returns '' for fetch and rebase (both succeed).
+    vi.mocked(indexMod.git).mockReturnValue('');
+
+    await pushForceWithLeaseRetrying('feature/x', null);
+
+    expect(vi.mocked(indexMod.gitAsync)).toHaveBeenCalledTimes(2);
+    const gitCalls = vi.mocked(indexMod.git).mock.calls.map(c => c[0]);
+    expect(gitCalls).toContainEqual(['fetch', 'origin', '+refs/heads/feature/x:refs/remotes/origin/feature/x']);
+    expect(gitCalls).toContainEqual(['rebase', 'origin/feature/x']);
+    // rebase --abort must NOT be invoked when rebase succeeded.
+    expect(gitCalls.some(args => Array.isArray(args) && args[0] === 'rebase' && args[1] === '--abort')).toBe(false);
+  });
+
+  it('aborts the rebase and throws a descriptive error when rebase conflicts after stale-info retry', async () => {
+    vi.mocked(indexMod.gitAsync).mockRejectedValueOnce(new Error('stale info'));
+    const abortCalls: string[][] = [];
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (!args) return '';
+      if (args[0] === 'rebase' && args[1] !== '--abort') {
+        throw new Error('CONFLICT: cannot rebase');
+      }
+      if (args[0] === 'rebase' && args[1] === '--abort') {
+        abortCalls.push(args);
+        return '';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await expect(pushForceWithLeaseRetrying('feature/x', null))
+      .rejects.toThrow(/Rebase onto updated origin\/feature\/x conflicted after concurrent push/);
+
+    expect(abortCalls.length).toBe(1);
+    // Second push must NOT be attempted when rebase conflicted.
+    expect(vi.mocked(indexMod.gitAsync)).toHaveBeenCalledTimes(1);
+  });
+
+  it('propagates a non-stale push error immediately without retrying', async () => {
+    vi.mocked(indexMod.gitAsync).mockRejectedValueOnce(new Error('remote: Permission denied to branch'));
+
+    await expect(pushForceWithLeaseRetrying('feature/x', null))
+      .rejects.toThrow(/Permission denied/);
+
+    // Only the first push; no fetch, no rebase, no retry push.
+    expect(vi.mocked(indexMod.gitAsync)).toHaveBeenCalledTimes(1);
+    const gitCalls = vi.mocked(indexMod.git).mock.calls.map(c => c[0]);
+    expect(gitCalls.some(args => Array.isArray(args) && args[0] === 'fetch')).toBe(false);
+    expect(gitCalls.some(args => Array.isArray(args) && args[0] === 'rebase')).toBe(false);
+  });
+
+  it('silently ignores a rebase --abort failure and still throws the descriptive conflict error', async () => {
+    vi.mocked(indexMod.gitAsync).mockRejectedValueOnce(new Error('stale info'));
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (!args) return '';
+      if (args[0] === 'rebase' && args[1] !== '--abort') {
+        throw new Error('CONFLICT during rebase');
+      }
+      if (args[0] === 'rebase' && args[1] === '--abort') {
+        throw new Error('fatal: no rebase in progress');
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await expect(pushForceWithLeaseRetrying('feature/x', null))
+      .rejects.toThrow(/Rebase onto updated origin\/feature\/x conflicted after concurrent push/);
+  });
+
+  it('retries multiple times when successive pushes return stale info (default maxRetries=2)', async () => {
+    vi.useFakeTimers();
+    vi.mocked(indexMod.gitAsync)
+      .mockRejectedValueOnce(new Error('stale info'))  // initial push
+      .mockRejectedValueOnce(new Error('stale info'))  // retry 1
+      .mockResolvedValueOnce('');                       // retry 2 succeeds
+    vi.mocked(indexMod.git).mockReturnValue('');
+
+    const promise = pushForceWithLeaseRetrying('feature/x', null);
+    await vi.runAllTimersAsync();
+    await promise;
+    vi.useRealTimers();
+
+    // 1 initial + 2 retries = 3 total push attempts.
+    expect(vi.mocked(indexMod.gitAsync)).toHaveBeenCalledTimes(3);
+    // Logged attempt numbers for observability.
+    const logs = vi.mocked(indexMod.sendLog).mock.calls.map(c => String(c[1])).join('\n');
+    expect(logs).toContain('Retry attempt 1/2');
+    expect(logs).toContain('Retry attempt 2/2');
+  });
+
+  it('throws the last stale-info error when all retries are exhausted', async () => {
+    vi.useFakeTimers();
+    vi.mocked(indexMod.gitAsync).mockRejectedValue(new Error('stale info again'));
+    vi.mocked(indexMod.git).mockReturnValue('');
+
+    const promise = pushForceWithLeaseRetrying('feature/x', null);
+    const assertion = expect(promise).rejects.toThrow(/stale info/);
+    await vi.runAllTimersAsync();
+    await assertion;
+    vi.useRealTimers();
+
+    // 1 initial + 2 retries (default) = 3 total push attempts.
+    expect(vi.mocked(indexMod.gitAsync)).toHaveBeenCalledTimes(3);
+  });
+
+  it('respects a custom maxRetries value (0 means no retries)', async () => {
+    vi.mocked(indexMod.gitAsync).mockRejectedValueOnce(new Error('stale info'));
+    vi.mocked(indexMod.git).mockReturnValue('');
+
+    await expect(pushForceWithLeaseRetrying('feature/x', null, 0))
+      .rejects.toThrow(/stale info/);
+
+    // Only the initial push; no fetch/rebase/retry push.
+    expect(vi.mocked(indexMod.gitAsync)).toHaveBeenCalledTimes(1);
+    const gitCalls = vi.mocked(indexMod.git).mock.calls.map(c => c[0]);
+    expect(gitCalls.some(args => Array.isArray(args) && args[0] === 'fetch')).toBe(false);
   });
 });

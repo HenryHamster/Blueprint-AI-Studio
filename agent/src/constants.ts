@@ -19,6 +19,12 @@ export const CLONE_MAX_RETRIES = 3;
 export const CLONE_RETRY_BASE_DELAY = 5_000;
 export const DEFAULT_CLONE_DEPTH = 50;
 
+// Force-with-lease push retry (concurrent-push recovery).
+// maxRetries is "attempts AFTER the initial push" — default 2 gives 3 total
+// attempts, which covers 3+ sibling agents racing the same branch.
+export const PUSH_FORCE_WITH_LEASE_MAX_RETRIES = 2;
+export const PUSH_FORCE_WITH_LEASE_RETRY_DELAY = 1_000;
+
 // Conflict marker grep
 export const CONFLICT_CHECK_TIMEOUT = 10_000;
 

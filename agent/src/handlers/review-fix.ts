@@ -8,7 +8,7 @@ import {
   captureTestBaseline, sendHeartbeatSync,
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
-import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS } from '../constants.js';
+import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY } from '../constants.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
@@ -16,33 +16,59 @@ import {
 import { resolveBuildConfig } from '../build-config.js';
 
 /**
- * Push with --force-with-lease, retrying once if another agent raced us.
+ * Push with --force-with-lease, retrying if another agent raced us.
  *
  * "stale info" is the lease-check rejection emitted when the remote branch
  * advanced between our last fetch and this push — typically because another
  * agent on a sibling task of the same research parent pushed first. Retrying
  * unconditionally with plain --force would clobber their work; instead we
  * refetch, rebase our local commits onto the new remote tip, and then push
- * with a fresh lease. Any other push failure surfaces immediately.
+ * with a fresh lease. With 3+ sibling agents racing, a single retry may also
+ * be stale — allow up to `maxRetries` retries after the initial attempt, with
+ * a brief delay between successive retries to reduce contention. Any non-
+ * stale push failure and any rebase conflict surface immediately.
  */
-async function pushForceWithLeaseRetrying(branch: string, ws: WebSocket | null): Promise<void> {
+export async function pushForceWithLeaseRetrying(
+  branch: string,
+  ws: WebSocket | null,
+  maxRetries: number = PUSH_FORCE_WITH_LEASE_MAX_RETRIES,
+): Promise<void> {
+  let lastErr: unknown;
   try {
     await gitAsync(['push', '--force-with-lease', 'origin', branch]);
     return;
   } catch (e) {
     const errMsg = e instanceof Error ? e.message : String(e);
     if (!errMsg.includes('stale info')) throw e;
-    sendLog(ws, `Push rejected (stale info) — concurrent push detected, refetching ${branch} and retrying...\n`);
+    lastErr = e;
+    sendLog(ws, `Push rejected (stale info) — concurrent push detected, will retry up to ${maxRetries} time(s).\n`);
   }
-  git(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
-  try {
-    git(['rebase', `origin/${branch}`]);
-  } catch {
-    try { git(['rebase', '--abort']); } catch { /* ignore */ }
-    throw new Error(`Rebase onto updated origin/${branch} conflicted after concurrent push`);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    if (attempt > 1) {
+      await new Promise(resolve => setTimeout(resolve, PUSH_FORCE_WITH_LEASE_RETRY_DELAY));
+    }
+    sendLog(ws, `Retry attempt ${attempt}/${maxRetries} — refetching ${branch} and rebasing...\n`);
+    git(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+    try {
+      git(['rebase', `origin/${branch}`]);
+    } catch {
+      try { git(['rebase', '--abort']); } catch { /* ignore */ }
+      throw new Error(`Rebase onto updated origin/${branch} conflicted after concurrent push`);
+    }
+    try {
+      await gitAsync(['push', '--force-with-lease', 'origin', branch]);
+      sendLog(ws, `Retry push to ${branch} succeeded on attempt ${attempt}/${maxRetries}.\n`);
+      return;
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      if (!errMsg.includes('stale info')) throw e;
+      lastErr = e;
+      if (attempt < maxRetries) {
+        sendLog(ws, `Retry ${attempt}/${maxRetries} also rejected (stale info) — another concurrent push, will retry.\n`);
+      }
+    }
   }
-  await gitAsync(['push', '--force-with-lease', 'origin', branch]);
-  sendLog(ws, `Retry push to ${branch} succeeded after rebasing onto concurrent work.\n`);
+  throw lastErr;
 }
 
 function fmtIssueLoc(i: { file?: string; line?: number }): string {
