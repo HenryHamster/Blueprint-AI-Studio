@@ -286,6 +286,44 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('**Failure pattern:**');
   });
 
+  it('renders direction_prior_analysis as Prior analysis section when present', () => {
+    const task = {
+      direction_context: {
+        title: 'Refactor module',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        direction_prior_analysis: [
+          {
+            title: 'Prior failed task',
+            failure_category: 'CODE_ERROR',
+            analysis_plan: 'Update orchestrator.py to call new helper',
+            test_failure_summary: 'AssertionError in test_foo',
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('**Prior analysis from failed attempts:**');
+    expect(result).toContain('- Prior failed task [CODE_ERROR]');
+    expect(result).toContain('Analysis plan: Update orchestrator.py to call new helper');
+    expect(result).toContain('Test failure: AssertionError in test_foo');
+  });
+
+  it('does not render Prior analysis section when direction_prior_analysis is empty or absent', () => {
+    const task = {
+      direction_context: {
+        title: 'Improve caching',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        direction_prior_analysis: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('**Prior analysis from failed attempts:**');
+  });
+
   it('renders ## Task Scope section for create task with small scope', () => {
     const task = {
       payloads: [{ type: 'create' }],

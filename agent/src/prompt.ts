@@ -344,6 +344,22 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       const msg = strVal(failureStagePattern.message);
       if (msg) dcLines.push(`**Failure pattern:** ${msg}`);
     }
+    const priorAnalysis = Array.isArray(dirCtx.direction_prior_analysis)
+      ? dirCtx.direction_prior_analysis as Array<Record<string, unknown>>
+      : [];
+    if (priorAnalysis.length > 0) {
+      dcLines.push('**Prior analysis from failed attempts:**');
+      for (const entry of priorAnalysis) {
+        const t = strVal(entry.title);
+        const cat = strVal(entry.failure_category);
+        const header = cat ? `- ${t} [${cat}]` : `- ${t}`;
+        dcLines.push(header);
+        const plan = strVal(entry.analysis_plan);
+        if (plan) dcLines.push(`  - Analysis plan: ${plan}`);
+        const tfs = strVal(entry.test_failure_summary);
+        if (tfs) dcLines.push(`  - Test failure: ${tfs}`);
+      }
+    }
     dcLines.push('');
     prefix += dcLines.join('\n') + '\n';
   }

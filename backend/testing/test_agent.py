@@ -1600,6 +1600,83 @@ async def test_claim_injects_failure_stage_pattern_in_direction_context(client: 
     assert fsp["rate"] >= 0.6
 
 
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_session):
+    """Claim endpoint surfaces condensed prior analysis from recent failed/cancelled sibling tasks."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Prior Analysis Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Refactor module X",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    long_plan = "A" * 800  # will be truncated to 500
+    long_tfs = "B" * 600  # will be truncated to 300
+    prior = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "prior"}],
+        vm_instance_id="vm-prior-1",
+        context={
+            "direction_id": direction_id,
+            "_analysis_plan": long_plan,
+            "_test_failure_summary": long_tfs,
+        },
+        status=TaskStatus.FAILED,
+        title="Prior failed task",
+        latest_status_message="tests failed",
+    )
+    # Prior with no analysis artifacts — should be skipped
+    prior_no_artifacts = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "no artifacts"}],
+        vm_instance_id="vm-prior-2",
+        context={"direction_id": direction_id},
+        status=TaskStatus.FAILED,
+        title="No artifacts task",
+        latest_status_message="failed",
+    )
+    db_session.add_all([prior, prior_no_artifacts])
+    await db_session.commit()
+
+    current = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "current"}],
+        vm_instance_id="vm-current",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(current)
+    await db_session.commit()
+    await db_session.refresh(current)
+
+    token = create_agent_token(str(current.id), "vm-current")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dc = resp.json()["direction_context"]
+    assert "direction_prior_analysis" in dc
+    dpa = dc["direction_prior_analysis"]
+    assert len(dpa) == 1
+    entry = dpa[0]
+    assert entry["title"] == "Prior failed task"
+    assert "failure_category" in entry
+    assert len(entry["analysis_plan"]) == 500
+    assert len(entry["test_failure_summary"]) == 300
+    # Total payload stays under 2000-char cap
+    import json as _json
+    assert len(_json.dumps(dpa)) <= 2000
+
+
 @pytest.mark.asyncio
 async def test_claim_injects_cochange_files_for_create_task(client: AsyncClient, db_session):
     """Claim endpoint injects cochange_files in project_context for create tasks when related_files match index."""

@@ -993,12 +993,51 @@ async def claim_task(
                     if h.get("tasks_created", 0) > 0
                 ]
                 failure_stage_pattern = _compute_failure_stage_pattern(history)
+
+                # Pull recent failed/cancelled sibling tasks with analysis artifacts
+                prior_analysis_cutoff = _utcnow() - timedelta(days=14)
+                prior_stmt = (
+                    select(Task)
+                    .where(
+                        Task.project_id == task.project_id,
+                        Task.id != task.id,
+                        Task.context["direction_id"].as_string() == str(direction_id),
+                        Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+                        Task.created_at >= prior_analysis_cutoff,
+                    )
+                    .order_by(Task.created_at.desc())
+                    .limit(5)
+                )
+                prior_rows = (await session.execute(prior_stmt)).scalars().all()
+                direction_prior_analysis: list = []
+                total_chars = 0
+                for pt in prior_rows:
+                    pctx = pt.context or {}
+                    analysis_plan = pctx.get("_analysis_plan")
+                    test_failure_summary = pctx.get("_test_failure_summary")
+                    if not analysis_plan and not test_failure_summary:
+                        continue
+                    entry = {
+                        "title": pt.title,
+                        "failure_category": classify_failure(pt),
+                    }
+                    if analysis_plan:
+                        entry["analysis_plan"] = str(analysis_plan)[:500]
+                    if test_failure_summary:
+                        entry["test_failure_summary"] = str(test_failure_summary)[:300]
+                    entry_len = len(json.dumps(entry))
+                    if total_chars + entry_len > 2000:
+                        break
+                    total_chars += entry_len
+                    direction_prior_analysis.append(entry)
+
                 response["direction_context"] = {
                     "title": direction.get("title", ""),
                     "priority": direction.get("priority", ""),
                     "failed_approaches": structured_failed_approaches,
                     "recent_outcomes": recent_outcomes,
                     "failure_stage_pattern": failure_stage_pattern,
+                    "direction_prior_analysis": direction_prior_analysis,
                 }
 
             # Surface saturation / deadlock signals to research agents so they can
