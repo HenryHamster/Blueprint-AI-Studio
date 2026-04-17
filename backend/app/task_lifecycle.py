@@ -79,9 +79,10 @@ def _build_retry_prompt_suffix(
     """Build failure-class-specific retry guidance for the agent prompt_suffix.
 
     Returns (extra_guidance, scope_override). scope_override is set to a reduced
-    scope string when repeated AGENT_TIMEOUT on a large-scope task should trigger
-    a downgrade; otherwise None. Reads ``_previous_failing_tests`` and
-    ``_previous_error_files`` from ctx for CODE_ERROR hints.
+    scope string when repeated AGENT_TIMEOUT should trigger a downgrade
+    (large→medium or medium→small); otherwise None. Reads
+    ``_previous_failing_tests`` and ``_previous_error_files`` from ctx for
+    CODE_ERROR hints.
     """
     extra_guidance = ""
     scope_override: "str | None" = None
@@ -96,6 +97,8 @@ def _build_retry_prompt_suffix(
         )
         if attempt >= 2 and task_scope == "large":
             scope_override = "medium"
+        elif attempt >= 2 and task_scope == "medium":
+            scope_override = "small"
 
     elif failure_class == "CODE_ERROR":
         error_text = (original_status_message or "").lower()

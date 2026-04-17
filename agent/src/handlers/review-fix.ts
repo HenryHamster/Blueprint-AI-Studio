@@ -111,6 +111,31 @@ export function computeMaxFixIterations(task: Record<string, unknown>): number {
   return 16;
 }
 
+// Medium-scope priority hint based on which subsystem the PR touches. The
+// reviewer otherwise weights every checklist section equally, accumulating
+// off-target findings (e.g. SQL injection notes on agent-only TypeScript
+// changes) that drive extra fix iterations. Returns '' for mixed-subsystem
+// PRs so they keep full scrutiny.
+export function detectMediumScopeSubsystemHint(changedFiles: string): string {
+  const paths = changedFiles
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('('))
+    .map(l => l.split(/\s+/).pop() || '')
+    .filter(Boolean);
+  if (paths.length === 0) return '';
+  if (paths.every(p => p.startsWith('agent/'))) {
+    return 'This is a medium-scope change confined to agent/ (TypeScript agent code). The agent does not touch the database, so deprioritize SQL injection and database query checks. Focus on Correctness & Logic, Build & Type Safety, and TypeScript-specific concerns.\n\n';
+  }
+  if (paths.every(p => p.startsWith('admin-ui/'))) {
+    return 'This is a medium-scope change confined to admin-ui/ (frontend). Deprioritize backend-specific checks like SQL injection, server-side authorization, and database query review. Focus on Correctness & Logic, Build & Type Safety, XSS risks, and frontend-specific concerns.\n\n';
+  }
+  if (paths.every(p => p.startsWith('backend/'))) {
+    return 'This is a medium-scope change confined to backend/. Apply full security scrutiny — review SQL injection, authorization checks, input validation, and server-side concerns thoroughly.\n\n';
+  }
+  return '';
+}
+
 // ── Build instruction generator for review prompts ───────────────────────────
 function buildTypeCheckInstructions(buildConfig?: BuildConfig): string {
   if (!buildConfig || !buildConfig.directories || buildConfig.directories.length === 0) {
@@ -280,7 +305,7 @@ You have full access to the codebase. Read any files you need to understand the 
 
 Review the changes thoroughly using this checklist:
 
-${scopeOverflowWarning}${taskScope === 'small' ? 'This is a small-scope change. Focus your review on Correctness & Logic and Build & Type Safety. Security and performance sections are lower priority unless the change touches auth, user input handling, or database queries.\n\n' : taskScope === 'large' ? 'This is a large-scope change with higher risk. Review ALL checklist sections thoroughly. Pay special attention to backwards compatibility, data model safety, and security implications.\n\n' : ''}${origTaskType === 'qa' ? 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n' : origTaskType === 'migrate' ? 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n' : ''}**Correctness & Logic:**
+${scopeOverflowWarning}${taskScope === 'small' ? 'This is a small-scope change. Focus your review on Correctness & Logic and Build & Type Safety. Security and performance sections are lower priority unless the change touches auth, user input handling, or database queries.\n\n' : taskScope === 'large' ? 'This is a large-scope change with higher risk. Review ALL checklist sections thoroughly. Pay special attention to backwards compatibility, data model safety, and security implications.\n\n' : taskScope === 'medium' ? detectMediumScopeSubsystemHint(changedFiles) : ''}${origTaskType === 'qa' ? 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n' : origTaskType === 'migrate' ? 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n' : ''}**Correctness & Logic:**
 - Does the code correctly implement what the original task asked for?
 - Are there edge cases, null/undefined handling, or off-by-one errors?
 - Are async operations properly awaited? Are errors properly handled?

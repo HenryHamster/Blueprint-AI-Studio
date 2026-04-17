@@ -48,7 +48,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
 
 // ── strVal ───────────────────────────────────────────────────────────────────
@@ -616,5 +616,78 @@ describe('failure category classification', () => {
 
     expect(caughtError).toBeInstanceOf(Error);
     expect((caughtError as Error & { failureCategory?: string }).failureCategory).toBe('pr_creation_failed');
+  });
+});
+
+// ── condensedAnalysisSections ────────────────────────────────────────────────
+describe('condensedAnalysisSections', () => {
+  it('extracts canonical headings exactly as written by the prompt', () => {
+    const ctx = [
+      '**Files to change**',
+      '- a.ts',
+      '',
+      '**Interfaces to preserve**',
+      '- Foo',
+      '',
+      '**Key dependencies**',
+      '- bar.ts → a.ts',
+      '',
+      '**Callers to verify after implementation**',
+      '- caller.ts (uses: foo)',
+    ].join('\n');
+    const out = condensedAnalysisSections(ctx);
+    expect(out).toContain('**Files to change**');
+    expect(out).toContain('**Interfaces to preserve**');
+    expect(out).toContain('**Key dependencies**');
+    expect(out).toContain('**Callers to verify after implementation**');
+  });
+
+  it('matches case-insensitively', () => {
+    const ctx = '**FILES TO CHANGE**\n- a.ts\n\n**Implementation Approach**\n- step';
+    const out = condensedAnalysisSections(ctx);
+    expect(out).toContain('**FILES TO CHANGE**');
+    expect(out).not.toContain('Implementation Approach');
+  });
+
+  it('matches "Files to modify" as a synonym for "Files to change"', () => {
+    const ctx = '**Files to modify**\n- a.ts\n- b.ts';
+    const out = condensedAnalysisSections(ctx);
+    expect(out).toContain('**Files to modify**');
+    expect(out).toContain('- a.ts');
+  });
+
+  it('matches headings with parenthetical suffixes', () => {
+    const ctx = '**Files to change** (in recommended order)\n- a.ts\n\n**Interfaces to preserve** (signatures)\n- Foo';
+    const out = condensedAnalysisSections(ctx);
+    expect(out).toContain('**Files to change** (in recommended order)');
+    expect(out).toContain('**Interfaces to preserve** (signatures)');
+  });
+
+  it('matches "Key dependencies" or just "Dependencies"', () => {
+    const ctx = '**Dependencies**\n- a → b';
+    const out = condensedAnalysisSections(ctx);
+    expect(out).toContain('**Dependencies**');
+    expect(out).toContain('- a → b');
+  });
+
+  it('matches "Callers to verify" with trailing variation', () => {
+    const ctx = '**Callers to verify**\n- caller.ts';
+    const out = condensedAnalysisSections(ctx);
+    expect(out).toContain('**Callers to verify**');
+  });
+
+  it('falls back to truncation when no key headings match', () => {
+    const long = '**Risks**\n' + 'x'.repeat(1000);
+    const out = condensedAnalysisSections(long);
+    expect(out.length).toBeLessThanOrEqual(800);
+    expect(out).toContain('**Risks**');
+  });
+
+  it('does not match unrelated headings that contain a single key term', () => {
+    const ctx = '**Files used**\n- nope\n\n**Files to change**\n- a.ts\n\n**Implementation approach**\n- step';
+    const out = condensedAnalysisSections(ctx);
+    expect(out).toContain('**Files to change**');
+    expect(out).not.toContain('**Files used**');
+    expect(out).not.toContain('**Implementation approach**');
   });
 });

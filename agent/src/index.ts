@@ -993,17 +993,25 @@ export async function captureTestBaseline(
  */
 
 /** Extracts plan-alignment-relevant sections ('Files to change', 'Interfaces to preserve',
- * 'Key dependencies', 'Callers to verify after implementation') from analysis context. */
+ * 'Key dependencies', 'Callers to verify after implementation') from analysis context.
+ * Heading match is fuzzy (lowercased, key-term based) so minor wording variations from
+ * the analysis agent (e.g. 'Files to modify') still produce complete section data. */
 export function condensedAnalysisSections(analysisContext: string): string {
   // Split at section boundaries (lines starting a new **[A-Z] heading)
   const sectionBreak = /(?=\n\*\*[A-Z])/;
   const sections = analysisContext.split(sectionBreak);
-  const wanted = sections.filter(s =>
-    s.includes('**Files to change**')
-    || s.includes('**Interfaces to preserve**')
-    || s.includes('**Key dependencies**')
-    || s.includes('**Callers to verify after implementation**')
-  );
+  const isWantedHeading = (section: string): boolean => {
+    const headingMatch = section.match(/^\s*\*\*([^*\n]+)\*\*/);
+    if (!headingMatch) return false;
+    const h = headingMatch[1].toLowerCase();
+    return (
+      (h.includes('files') && (h.includes('change') || h.includes('modify')))
+      || (h.includes('interfaces') && h.includes('preserve'))
+      || h.includes('dependencies')
+      || (h.includes('callers') && h.includes('verify'))
+    );
+  };
+  const wanted = sections.filter(isWantedHeading);
   if (wanted.length === 0) return analysisContext.slice(0, 800).trim();
   return wanted.map(s => s.trim()).join('\n\n');
 }

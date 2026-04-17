@@ -2030,12 +2030,15 @@ Check for:
   const planAlignmentItem = hasAnalysisPlan
     ? `0. **Plan alignment** — Do the files you actually changed match the "Files to change" list from the analysis plan? Were any interfaces marked "preserve" altered? If yes to either, justify or revert.\n`
     : '';
+  const scopeViolationsItem = hasAnalysisPlan
+    ? `3. **Scope violations** — Are there changed files not listed in the analysis plan's "Files to change" section (excluding test files)? If a file is in the plan, it is in-scope.`
+    : `3. **Scope violations** — Are there changes unrelated to the task requirements?`;
   return `This is a multi-file change — verify that types, imports, and function signatures are consistent across all changed files.
 
 Check for:
 ${planAlignmentItem}1. **Missing test coverage** — Is there new behavior with no corresponding test?
 2. **Type safety violations** — TypeScript errors, incorrect type assertions, or missing type guards?
-3. **Scope violations** — Are there changes unrelated to the task requirements?
+${scopeViolationsItem}
 4. **Security issues** — Command injection, SQL injection, XSS, exposed secrets or tokens?
 5. **Pattern violations** — Does the code violate the patterns listed in Review Failure Patterns above?
 6. **Cross-file consistency** — Do interfaces, types, and exports stay consistent across all changed files?

@@ -60,7 +60,7 @@ vi.mock('child_process', () => ({
 import fs from 'fs';
 import { execFileSync } from 'child_process';
 import * as indexMod from '../index.js';
-import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS, annotateResolvedIssues } from './review-fix.js';
+import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS, annotateResolvedIssues, detectMediumScopeSubsystemHint } from './review-fix.js';
 
 const statusRef = () => ({ value: '' });
 
@@ -255,6 +255,98 @@ describe('review history feedback truncation — reviewer sees at least as much 
     const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
     expect(prompt).not.toMatch(/- Iteration 1: x+/);
+  });
+});
+
+// ── detectMediumScopeSubsystemHint: subsystem-aware priority guidance ───────
+describe('detectMediumScopeSubsystemHint — medium-scope subsystem hint', () => {
+  it('returns agent-focused hint when all changed files are under agent/', () => {
+    const hint = detectMediumScopeSubsystemHint('M\tagent/src/handlers/standard.ts\nM\tagent/src/prompt.ts');
+    expect(hint).toContain('agent/');
+    expect(hint).toContain('deprioritize SQL injection');
+  });
+
+  it('returns admin-ui-focused hint when all changed files are under admin-ui/', () => {
+    const hint = detectMediumScopeSubsystemHint('M\tadmin-ui/src/App.tsx\nA\tadmin-ui/src/components/Foo.tsx');
+    expect(hint).toContain('admin-ui/');
+    expect(hint).toContain('Deprioritize backend-specific checks');
+  });
+
+  it('keeps full security scrutiny for backend-only changes', () => {
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/app/orchestrator.py\nM\tbackend/app/main.py');
+    expect(hint).toContain('backend/');
+    expect(hint).toContain('full security scrutiny');
+  });
+
+  it('returns empty string for mixed-subsystem changes (no deprioritization)', () => {
+    const hint = detectMediumScopeSubsystemHint('M\tagent/src/index.ts\nM\tbackend/app/main.py');
+    expect(hint).toBe('');
+  });
+
+  it('returns empty string for changed files placeholder / no files', () => {
+    expect(detectMediumScopeSubsystemHint('')).toBe('');
+    expect(detectMediumScopeSubsystemHint('(could not generate file list)')).toBe('');
+  });
+});
+
+describe('handleReview — medium-scope subsystem hint integration', () => {
+  it('injects agent-focused hint into the review prompt for medium-scope agent-only PRs', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tagent/src/handlers/review-fix.ts';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-medium-agent',
+      { pr_number: 10, branch: 'feat/agent-thing', base_branch: 'main', original_prompt: 'do agent thing' },
+      { context: { scope: 'medium' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    expect(prompt).toContain('confined to agent/');
+    expect(prompt).toContain('deprioritize SQL injection');
+  });
+
+  it('omits subsystem hint for mixed-subsystem medium-scope PRs', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tagent/src/index.ts\nM\tbackend/app/main.py';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-medium-mixed',
+      { pr_number: 11, branch: 'feat/mixed', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'medium' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    expect(prompt).not.toContain('confined to agent/');
+    expect(prompt).not.toContain('confined to admin-ui/');
+    expect(prompt).not.toContain('confined to backend/');
+  });
+
+  it('does not emit medium-scope hint for small-scope PRs', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tagent/src/handlers/review-fix.ts';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-small-agent',
+      { pr_number: 12, branch: 'feat/small', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    expect(prompt).not.toContain('confined to agent/');
+    // small-scope still gets its own hint
+    expect(prompt).toContain('small-scope change');
   });
 });
 
