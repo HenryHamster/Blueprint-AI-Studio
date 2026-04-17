@@ -197,12 +197,18 @@ async def _persist(db_session, *tasks) -> None:
 @pytest.mark.asyncio
 async def test_global_cap_blocks_spawn(db_session, mocker):
     """When the global completed-task count for a PR reaches the cap,
-    _spawn_pipeline_task returns None without creating a new task, marks the
-    chain's root task requires_approval=True with a 'manual review required'
-    status message, and fires a failure alert so the user is notified."""
+    _spawn_pipeline_task returns None without creating a new task, transitions
+    the root task to FAILED with failure_detail=review_cap_exhausted, closes
+    the PR, keeps requires_approval=True, and fires a failure alert."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
     alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "o", "r"),
+    )
+    close_mock = mocker.patch("app.github.close_pull_request", new_callable=AsyncMock, return_value=True)
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
 
@@ -249,11 +255,25 @@ async def test_global_cap_blocks_spawn(db_session, mocker):
     assert result is None, "Global cap (10 iterations, small scope) should block spawn"
 
     await db_session.refresh(original_task)
+    assert original_task.status == TaskStatus.FAILED, (
+        f"Global cap must transition the root task to FAILED, got {original_task.status}"
+    )
+    assert (original_task.context or {}).get("failure_detail") == "review_cap_exhausted", (
+        "Global cap must tag failure_detail=review_cap_exhausted so the rollup respawn "
+        "loop can skip this child and the parent can finalize."
+    )
+    assert (original_task.context or {}).get("pr_rejected") is True, (
+        "Global cap must preempt the webhook by setting pr_rejected=True before closing the PR"
+    )
     assert original_task.requires_approval is True, (
-        "Global cap must set requires_approval=True on the root task"
+        "Global cap preserves requires_approval=True as the UI signal for manual intervention"
     )
     assert "manual review" in (original_task.latest_status_message or "").lower(), (
         f"Status message should mention manual review: {original_task.latest_status_message!r}"
+    )
+    close_mock.assert_awaited_once()
+    assert close_mock.call_args.args[3] == 101, (
+        f"close_pull_request must be called with pr_number=101, got {close_mock.call_args.args}"
     )
     alert_mock.assert_called_once()
     call_args = alert_mock.call_args[0]
@@ -265,12 +285,20 @@ async def test_global_cap_blocks_spawn(db_session, mocker):
 @pytest.mark.asyncio
 async def test_cap_paths_symmetric_terminal_state(db_session, mocker):
     """Both the global-cap and per-chain-cap paths must produce a symmetric
-    terminal state: requires_approval=True on the root task with a
-    'manual review required' status message. This prevents silent-block
-    conditions where one cap path marks the chain but the other does not."""
+    terminal state: FAILED status with failure_detail=review_cap_exhausted,
+    requires_approval=True, and a 'manual review required' status message.
+    Prevents silent-block conditions where one cap path fails the task but
+    the other leaves it COMPLETED (the bug that produced the PR #1947 respawn
+    loop, fixed 2026-04-17)."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "o", "r"),
+    )
+    mocker.patch("app.github.close_pull_request", new_callable=AsyncMock, return_value=True)
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
 
     async def _run_cap(pr_number: int, iteration: int, completed_count: int) -> Task:
         project = await _make_db_project(db_session)
@@ -319,7 +347,13 @@ async def test_cap_paths_symmetric_terminal_state(db_session, mocker):
     per_chain_root = await _run_cap(pr_number=902, iteration=10, completed_count=0)
 
     for root, label in ((global_root, "global"), (per_chain_root, "per-chain")):
-        assert root.requires_approval is True, f"{label} cap must set requires_approval"
+        assert root.status == TaskStatus.FAILED, (
+            f"{label} cap must transition to FAILED, got {root.status}"
+        )
+        assert (root.context or {}).get("failure_detail") == "review_cap_exhausted", (
+            f"{label} cap must tag failure_detail=review_cap_exhausted"
+        )
+        assert root.requires_approval is True, f"{label} cap must preserve requires_approval"
         msg = (root.latest_status_message or "").lower()
         assert "manual review" in msg, f"{label} cap message missing 'manual review': {msg!r}"
         assert "review-fix cycle reached limit" in msg, (
@@ -481,11 +515,17 @@ async def test_global_cap_under_limit_allows_spawn(db_session, mocker):
 @pytest.mark.asyncio
 async def test_per_chain_cap_blocks_spawn_and_marks_original(db_session, mocker):
     """When the per-chain iteration counter exceeds the cap, _spawn_pipeline_task
-    returns None, sets requires_approval=True on the original task, and fires
-    a failure alert so the user is notified."""
+    returns None, transitions the original task to FAILED with
+    failure_detail=review_cap_exhausted, closes the PR, and fires a failure alert."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
     alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "o", "r"),
+    )
+    close_mock = mocker.patch("app.github.close_pull_request", new_callable=AsyncMock, return_value=True)
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
 
@@ -531,17 +571,101 @@ async def test_per_chain_cap_blocks_spawn_and_marks_original(db_session, mocker)
     assert result is None, "Per-chain cap should block the fix spawn"
 
     await db_session.refresh(original_task)
+    assert original_task.status == TaskStatus.FAILED, (
+        f"Per-chain cap must transition the original task to FAILED, got {original_task.status}"
+    )
+    assert (original_task.context or {}).get("failure_detail") == "review_cap_exhausted", (
+        "Per-chain cap must tag failure_detail=review_cap_exhausted"
+    )
     assert original_task.requires_approval is True, (
-        "Per-chain cap must set requires_approval=True on the original task"
+        "Per-chain cap preserves requires_approval=True"
     )
     assert "manual review" in (original_task.latest_status_message or "").lower(), (
         f"Status message should mention manual review: {original_task.latest_status_message!r}"
+    )
+    close_mock.assert_awaited_once()
+    assert close_mock.call_args.args[3] == 103, (
+        f"close_pull_request must be called with pr_number=103, got {close_mock.call_args.args}"
     )
     alert_mock.assert_called_once()
     call_args = alert_mock.call_args[0]
     assert "cap" in call_args[2].lower() or "manual" in call_args[2].lower(), (
         f"Alert should mention cap or manual review, got: {call_args[2]!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_cap_exhaustion_idempotent(db_session, mocker):
+    """If rollup or another handler re-enters _spawn_pipeline_task for an
+    already-cap-exhausted PR, the side effects (PR close, alert) must fire
+    exactly once. Before the 2026-04-17 fix this path looped every 10min,
+    re-writing the same status message and never converging."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "o", "r"),
+    )
+    close_mock = mocker.patch("app.github.close_pull_request", new_callable=AsyncMock, return_value=True)
+    comment_mock = mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    async def _spawn_once():
+        source_task = make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "review", "pr_number": 555, "branch": "feat/idem", "base_branch": "main",
+                       "original_task_id": str(original_task.id)}],
+            context={"scope": "small",
+                     "review_loop": {"iteration": 0,
+                                     "original_task_id": str(original_task.id)}},
+        )
+        db_session.add(source_task)
+        await db_session.commit()
+        return await _spawn_pipeline_task(
+            source_task, "fix", db_session,
+            pr_number=555, branch="feat/idem", base_branch="main",
+            original_task_id=str(original_task.id),
+        )
+
+    for _ in range(10):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review", "pr_number": 555, "branch": "feat/idem", "base_branch": "main"}],
+        ))
+    await db_session.commit()
+
+    await _spawn_once()
+    assert close_mock.await_count == 1
+    assert alert_mock.call_count == 1
+    assert comment_mock.await_count == 1
+
+    await _spawn_once()
+    assert close_mock.await_count == 1, (
+        f"close_pull_request must only fire once; idempotent handler got {close_mock.await_count} calls"
+    )
+    assert alert_mock.call_count == 1, (
+        f"Alert must only fire once; got {alert_mock.call_count}"
+    )
+    assert comment_mock.await_count == 1, (
+        f"PR comment must only fire once; got {comment_mock.await_count}"
+    )
+
+    await _spawn_once()
+    assert close_mock.await_count == 1
 
 
 @pytest.mark.asyncio

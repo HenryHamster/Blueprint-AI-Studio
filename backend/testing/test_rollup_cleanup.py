@@ -906,6 +906,59 @@ async def test_zero_diff_rollup_pr_closed_without_spawning_review(cleanup_db, mo
 
 
 @pytest.mark.asyncio
+async def test_unverified_pr_size_defers_instead_of_spawning_review(cleanup_db, mocker):
+    """When get_pull_request fails transiently, defer the review-spawn decision
+    to the next rollup cycle rather than assuming large and burning VM time on
+    a PR whose size is unverified. Pre-2026-04-17 this path defaulted
+    lines_changed=999 → review spawned on potentially-empty PRs → ~15
+    VM-hours/day wasted per the audit."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.create_pull_request",
+        new_callable=AsyncMock,
+        return_value={"number": 7070, "html_url": "https://github.com/owner/repo/pull/7070", "empty_diff": False},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock, side_effect=Exception("GitHub 502"),
+    )
+    mock_close = mocker.patch("app.github.close_pull_request", new_callable=AsyncMock)
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock, return_value=(None, None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db, project.id, task_type="research", status=TaskStatus.EVALUATING,
+        context={"research_branch": "research/unverified", "parent_base": "main"},
+        plan_output="plan",
+    )
+    child = await _make_task(
+        cleanup_db, project.id, parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED, context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"Unverified PR should defer, not transition. Got {parent.status}: {parent.latest_status_message}"
+    )
+    mock_close.assert_not_awaited()
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_marker_commit_failure_rescues_pr_number(cleanup_db, mocker):
     """When PR creation succeeds but the marker commit fails, the exception
     handler must persist rollup_pr_number via a separate session so the

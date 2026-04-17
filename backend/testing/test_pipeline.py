@@ -1299,6 +1299,64 @@ async def test_rollup_blocked_by_fresh_review_task(rollup_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_rollup_skips_requeue_for_cap_exhausted_children(rollup_db, mocker):
+    """Cap-exhausted failed children (failure_detail=review_cap_exhausted) must
+    be excluded from _requeue_parent_task: their PR is auto-closed and a retry
+    would just re-hit the merge conflict that triggered the cap. Before the
+    2026-04-17 fix, rollup_management's respawn loop re-entered the cap every
+    10 min and the parent sat in EVALUATING indefinitely."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+
+    project = Project(name="Cap Exhausted Skip Requeue Test", user_id="user1")
+    rollup_db.add(project)
+    await rollup_db.commit()
+    await rollup_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "parent task"}],
+        status=TaskStatus.EVALUATING,
+        context={},  # Below requeue limit — would normally fire
+    )
+    rollup_db.add(parent)
+    await rollup_db.commit()
+    await rollup_db.refresh(parent)
+
+    succeeded = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature A"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    cap_exhausted = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature B"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        latest_status_message="Review-fix cycle reached limit (10 iterations) — PR #42 auto-closed",
+        context={"failure_detail": "review_cap_exhausted", "failure_category": "CODE_ERROR"},
+    )
+    rollup_db.add(succeeded)
+    rollup_db.add(cap_exhausted)
+    await rollup_db.commit()
+    await rollup_db.refresh(succeeded)
+    await rollup_db.refresh(cap_exhausted)
+
+    await _check_and_trigger_rollup(cap_exhausted, rollup_db)
+
+    mock_requeue.assert_not_called()
+    await rollup_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED, (
+        f"Parent with cap-exhausted + merged siblings must finalize via partial rollup, "
+        f"got {parent.status}: {parent.latest_status_message}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_rollup_partial_after_requeue_limit_exhausted(rollup_db, mocker):
     """When requeue limit is exhausted (_requeue_count == MAX_PARENT_REQUEUES),
     the rollup should skip retry and proceed with partial rollup of succeeded children."""
@@ -1964,6 +2022,131 @@ async def test_rollup_auto_merge_blocked_calls_enable_auto_merge(rollup_db, mock
     # Deferral counter path still ran in parallel
     assert (parent.context or {}).get("_merge_deferred_count") == 1
     assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_rollup_per_state_alert_does_not_refire_on_flap(rollup_db, mocker):
+    """A PR that flaps blocked↔unstable between sweeps resets the per-state
+    counter each flip, but per-state alerts must only fire once per state
+    (tracked by _merge_alerted_states). Without the latch, a flap that walks
+    the counter back through the threshold fires the alert every time.
+    """
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {
+            "rollup_merge_deferred_alert": 2,
+            "rollup_merge_deferred_alert_unknown": 2,
+            "rollup_merge_deferred_approval": 99,
+        },
+    )
+    state = {"state": "blocked"}
+    _patch_deferred_counter_mocks(mocker, state)
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock)
+    mocker.patch("app.github.enable_auto_merge", new_callable=AsyncMock, return_value={"enabled": False})
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    # Sweep 1 (blocked=1) — below threshold
+    await _check_and_trigger_rollup(child, rollup_db)
+    # Sweep 2 (blocked=2) — hits threshold, fires alert once for blocked
+    await _check_and_trigger_rollup(child, rollup_db)
+    blocked_alert_count = alert_mock.call_count
+    assert blocked_alert_count >= 1, "blocked state at threshold should fire alert"
+
+    # Flap to unstable — counter resets to 1
+    state["state"] = "unstable"
+    await _check_and_trigger_rollup(child, rollup_db)
+    # Unstable hits threshold — should fire alert once for unstable
+    await _check_and_trigger_rollup(child, rollup_db)
+    assert alert_mock.call_count >= blocked_alert_count + 1, (
+        "new state at threshold should fire its own per-state alert"
+    )
+    unstable_alert_count = alert_mock.call_count
+
+    # Flap back to blocked — counter resets to 1 again
+    state["state"] = "blocked"
+    await _check_and_trigger_rollup(child, rollup_db)
+    # Blocked hits threshold AGAIN — but it's already in alerted_states,
+    # so NO new alert should fire.
+    await _check_and_trigger_rollup(child, rollup_db)
+    assert alert_mock.call_count == unstable_alert_count, (
+        f"blocked re-crossing threshold must NOT re-fire alert (already latched). "
+        f"Got {alert_mock.call_count} alerts, expected {unstable_alert_count}"
+    )
+    # Latch is persisted
+    await rollup_db.refresh(parent)
+    assert "blocked" in (parent.context or {}).get("_merge_alerted_states", [])
+    assert "unstable" in (parent.context or {}).get("_merge_alerted_states", [])
+
+
+@pytest.mark.asyncio
+async def test_rollup_merge_success_clears_transient_counter_state(rollup_db, mocker):
+    """When a rollup PR eventually merges after prior deferrals, the merge
+    success path must scrub all transient deferral/retry state from parent
+    context so a future re-entry (e.g. reused parent via admin requeue)
+    starts from zero instead of inheriting stale counters."""
+    _patch_common_rollup_mocks(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "additions": 5, "deletions": 5,
+            "state": "open", "merged": False,
+            "mergeable_state": "clean",
+            "head": {"sha": "abc123"},
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "sha": "deadbeef"},
+    )
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock)
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+    # Seed parent context with stale deferral/retry counters — simulates a
+    # parent that was previously stuck and finally unstuck itself.
+    parent.context = {
+        **(parent.context or {}),
+        "_merge_deferred_count": 5,
+        "_merge_deferred_state": "blocked",
+        "_merge_total_deferrals": 8,
+        "_merge_first_deferred_at": "2026-04-17T10:00:00",
+        "_merge_total_alerted": True,
+        "_merge_time_alerted": True,
+        "_merge_alerted_states": ["blocked", "unstable"],
+        "_rollup_retries": 2,
+    }
+    rollup_db.add(parent)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert parent.status == TaskStatus.COMPLETED
+    assert (parent.context or {}).get("pr_merged") is True
+    # All transient keys must be gone.
+    for key in (
+        "_merge_deferred_count", "_merge_deferred_state",
+        "_merge_total_deferrals", "_merge_first_deferred_at",
+        "_merge_total_alerted", "_merge_time_alerted",
+        "_merge_alerted_states", "_rollup_retries",
+    ):
+        assert key not in (parent.context or {}), (
+            f"transient key {key!r} must be cleared on terminal success, "
+            f"but was present with value {(parent.context or {}).get(key)!r}"
+        )
 
 
 def _patch_refetch_failure_mocks(mocker, *, merge_msg="merge_msg-from-failed-attempt"):

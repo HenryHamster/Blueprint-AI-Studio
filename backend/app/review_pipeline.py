@@ -129,6 +129,118 @@ def _max_review_iterations(task: Task, direction_data: dict | None = None) -> in
     return min(limit, MAX_REVIEW_FIX_ITERATIONS)
 
 
+async def _handle_cap_exhaustion(
+    source_task: Task,
+    resolved_original_id: str,
+    pr_number: int,
+    iterations: int,
+    session: AsyncSession,
+    *,
+    scope: str,
+) -> None:
+    """Terminal handler when the review-fix iteration cap is hit.
+
+    Transitions the create task (``orig``) to FAILED with
+    failure_detail=review_cap_exhausted, closes the GitHub PR, and fires an
+    approval alert. Idempotent — safe to re-enter on the same orig without
+    duplicating side effects.
+
+    Why FAILED instead of COMPLETED+requires_approval:
+    The prior behaviour left the create task COMPLETED and relied on
+    requires_approval=True as a terminal signal, but rollup_management's
+    stale-unmerged respawn loop doesn't check that flag — it kept re-entering
+    the cap path every 10 min indefinitely. Marking FAILED routes the task
+    through the standard failure → partial-rollup path.
+
+    ``scope`` is either "global" (cross-chain) or "per-chain" — used only for
+    human-readable messages.
+    """
+    from app.failure_classification import CODE_ERROR, persist_failure_category  # noqa: PLC0415
+    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+    from app.github import close_pull_request, create_pr_comment  # noqa: PLC0415
+    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+    cap_label = "global" if scope == "global" else "per-chain"
+    source_task.latest_status_message = (
+        f"Review-fix cap reached for PR #{pr_number} ({iterations} iterations, {cap_label})"
+    )
+    session.add(source_task)
+
+    try:
+        orig = await session.get(Task, uuid.UUID(resolved_original_id))
+    except Exception as e:
+        logger.warning(f"[PIPELINE] Cap-exhaustion: failed to load orig {resolved_original_id[:8]}: {e}")
+        return
+    if orig is None:
+        logger.warning(f"[PIPELINE] Cap-exhaustion: orig {resolved_original_id[:8]} not found")
+        return
+
+    already_handled = (
+        orig.status == TaskStatus.FAILED
+        and (orig.context or {}).get("failure_detail") == "review_cap_exhausted"
+    )
+    if already_handled:
+        logger.info(
+            f"[PIPELINE] Cap re-triggered for PR #{pr_number} — orig {resolved_original_id[:8]} "
+            f"already FAILED with review_cap_exhausted, skipping side effects"
+        )
+        await session.commit()
+        return
+
+    orig.status = TaskStatus.FAILED
+    orig.requires_approval = True
+    orig.latest_status_message = (
+        f"Review-fix cycle reached limit ({iterations} iterations, {cap_label}) — "
+        f"PR #{pr_number} auto-closed, manual review required"
+    )
+    persist_failure_category(orig, CODE_ERROR)
+    ctx = dict(orig.context or {})
+    ctx["failure_detail"] = "review_cap_exhausted"
+    ctx["review_cap_iterations"] = iterations
+    ctx["pr_rejected"] = True
+    ctx["pr_rejection_note"] = (
+        f"Auto-closed by Blueprint: review-fix cap exhausted after {iterations} iterations"
+    )
+    orig.context = ctx
+    flag_modified(orig, "context")
+    session.add(orig)
+    try:
+        await session.commit()
+    except Exception as e:
+        logger.warning(f"[PIPELINE] Cap-exhaustion: failed to commit orig {resolved_original_id[:8]}: {e}", exc_info=True)
+        return
+
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
+        try:
+            await create_pr_comment(
+                gh_token, owner, repo, pr_number,
+                f"Auto-closed: review-fix cap reached ({iterations} iterations, {cap_label}). "
+                f"Manual review required. Reopen this PR to resume work."
+            )
+        except Exception as e:
+            logger.warning(f"[PIPELINE] Cap-exhaustion: failed to comment on PR #{pr_number}: {e}")
+        closed = await close_pull_request(
+            gh_token, owner, repo, pr_number, project_id=str(orig.project_id)
+        )
+        if closed:
+            logger.info(f"[PIPELINE] Closed PR #{pr_number} after cap exhaustion ({iterations} iterations)")
+        else:
+            logger.warning(f"[PIPELINE] close_pull_request returned False for PR #{pr_number}")
+    except Exception as e:
+        logger.warning(f"[PIPELINE] Cap-exhaustion: failed to close PR #{pr_number}: {e}", exc_info=True)
+
+    try:
+        await _maybe_create_failure_alert(
+            orig, session,
+            f"PR #{pr_number} hit review-fix cap ({iterations} iterations, {cap_label}) — "
+            f"auto-closed, manual review required"
+        )
+    except Exception as e:
+        logger.warning(f"[PIPELINE] Cap-exhaustion: failed to create alert for PR #{pr_number}: {e}")
+
+
 async def _spawn_pipeline_task(
     source_task: Task, task_type: str, session: AsyncSession,
     pr_number: int, branch: str, base_branch: str,
@@ -321,24 +433,10 @@ async def _spawn_pipeline_task(
         global_cap = MAX_REVIEW_FIX_ITERATIONS
     if pr_iterations >= global_cap:
         logger.warning(f"[PIPELINE] PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations across all chains)")
-        source_task.latest_status_message = f"Review-fix cap reached for PR #{pr_number} ({pr_iterations} total iterations)"
-        session.add(source_task)
-        # Mirror per-chain cap: mark the chain's root task requires_approval so the
-        # pipeline has a consistent terminal signal for cap exhaustion.
-        try:
-            orig = await session.get(Task, uuid.UUID(resolved_original_id))
-            if orig:
-                orig.requires_approval = True
-                orig.latest_status_message = f"Review-fix cycle reached limit ({pr_iterations} iterations across all chains) — manual review required"
-                session.add(orig)
-                await session.commit()
-        except Exception as e:
-            logger.warning(f"[PIPELINE] Failed to mark global cap on {resolved_original_id}: {e}", exc_info=True)
-        try:
-            from app.main import _maybe_create_failure_alert
-            await _maybe_create_failure_alert(source_task, session, f"PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations) — manual intervention required")
-        except Exception as _alert_err:
-            logger.warning(f"[PIPELINE] Failed to create failure alert for global cap on PR #{pr_number}: {_alert_err}")
+        await _handle_cap_exhaustion(
+            source_task, resolved_original_id, pr_number, pr_iterations, session,
+            scope="global",
+        )
         return (None, False)
 
     # Track review-fix iteration count to prevent infinite loops (per-chain)
@@ -347,22 +445,11 @@ async def _spawn_pipeline_task(
     per_chain_cap = _max_review_iterations(source_task)
 
     if iteration > per_chain_cap:
-        # Cap reached — require manual intervention on the chain's root task.
-        try:
-            orig = await session.get(Task, uuid.UUID(resolved_original_id))
-            if orig:
-                orig.requires_approval = True
-                orig.latest_status_message = f"Review-fix cycle reached limit ({per_chain_cap} iterations) — manual review required"
-                session.add(orig)
-                try:
-                    from app.main import _maybe_create_failure_alert
-                    await _maybe_create_failure_alert(orig, session, f"PR #{pr_number} review-fix per-chain cap reached ({per_chain_cap} iterations) — manual review required")
-                except Exception as _alert_err:
-                    logger.warning(f"[PIPELINE] Failed to create failure alert for per-chain cap on PR #{pr_number}: {_alert_err}")
-                await session.commit()
-        except Exception as e:
-            logger.warning(f"[PIPELINE] Failed to mark iteration cap on {resolved_original_id}: {e}", exc_info=True)
         logger.warning(f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} after {iteration - 1} iterations")
+        await _handle_cap_exhaustion(
+            source_task, resolved_original_id, pr_number, per_chain_cap, session,
+            scope="per-chain",
+        )
         return (None, False)
 
     vm_name = f"agent-vm-{uuid.uuid4().hex}"

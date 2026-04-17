@@ -299,6 +299,17 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         if child.status != TaskStatus.FAILED:
             continue
 
+        # Skip children that hit the review-fix cap: their PR is auto-closed and
+        # marked terminal by _handle_cap_exhaustion. Cloning would spawn a fresh
+        # create task + fresh PR, which typically re-hits the same merge conflict
+        # that triggered the cap. Operators can manually requeue if desired.
+        if (child.context or {}).get("failure_detail") == "review_cap_exhausted":
+            logger.info(
+                f"[REQUEUE] Skipping child {str(child.id)[:8]} — review_cap_exhausted, "
+                f"PR already closed. Manual requeue required."
+            )
+            continue
+
         # Capture before cancellation — cancellation overwrites both
         child_extra_logs = (child.context or {}).get("last_error", "")
         failure_class = classify_failure(child, logs=child_extra_logs or None)
