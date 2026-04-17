@@ -6,6 +6,9 @@ import { DirectionsPanel } from './DirectionsPanel';
 vi.mock('../api', () => ({
   authHeaders: vi.fn().mockResolvedValue({ Authorization: 'Bearer ***' }),
   API_BASE_URL: '',
+  // DirectionsPanel calls apiFetch, not fetch directly — route through
+  // the global fetch stub so the test's mockFetch() responses still apply.
+  apiFetch: (path: string, init?: RequestInit) => (globalThis.fetch as typeof fetch)(path, init),
 }));
 
 vi.mock('./DirectionCard', () => ({

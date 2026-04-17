@@ -701,6 +701,9 @@ export function useAppState() {
         headers: await authHeaders(),
       });
       fetchArchiveTasks();
+      // Also refresh the main task list so pipeline/kanban pick up the
+      // now-unarchived task (used by pipeline-view "Unarchive parent").
+      fetchTasks();
       addToast('Task unarchived', 'success');
     } catch (error) {
       console.error('Failed to unarchive task:', error);

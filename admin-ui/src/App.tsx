@@ -691,6 +691,7 @@ export default function App() {
                     onConfirm: () => s.handleBulkArchiveColumn(taskIds),
                   });
                 }}
+                onUnarchiveTask={s.handleUnarchiveTask}
               />
             </main>
             </ErrorBoundary>

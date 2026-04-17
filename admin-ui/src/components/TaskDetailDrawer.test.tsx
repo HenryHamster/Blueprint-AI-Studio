@@ -1,6 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+
+// Stub firebase before any module that transitively imports it — getAuth()
+// throws at load time when test env lacks VITE_FIREBASE_* vars.
+vi.mock('../firebase', () => ({
+  auth: { currentUser: null, onAuthStateChanged: () => () => {} },
+  signInWithGoogle: vi.fn(),
+  signOut: vi.fn(),
+}));
+
 import { TaskDetailDrawer } from './TaskDetailDrawer';
 import type { Task } from '../types/task';
 

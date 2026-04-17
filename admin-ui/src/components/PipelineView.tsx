@@ -50,6 +50,7 @@ interface PipelineViewProps {
   onNavigateToParent?: (parentTaskId: string) => void;
   onClearWaveDeps?: () => void;
   onArchiveGroup?: (taskIds: string[]) => void;
+  onUnarchiveTask?: (taskId: string) => void;
 }
 
 function buildForest(tasks: Task[]): TreeNode[] {
@@ -117,7 +118,7 @@ function buildForest(tasks: Task[]): TreeNode[] {
   return [...syntheticRoots, ...roots];
 }
 
-function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, activeFilter, blockingCount }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void; activeFilter: FilterType; blockingCount?: number }) {
+function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveParent, activeFilter, blockingCount }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void; onUnarchiveParent?: (parentTaskId: string) => void; activeFilter: FilterType; blockingCount?: number }) {
   const style = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
   const Icon = style?.icon;
   const statusColor = STATUS_COLORS[task.status] || 'bg-neutral-500';
@@ -148,15 +149,29 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, activeFilter
         <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${heartbeat.color}${heartbeat.color === 'bg-red-500' ? ' animate-pulse' : ''}`} title={heartbeat.text} />
       )}
 
-      {/* Orphan indicator */}
+      {/* Orphan indicator — the real parent is either archived or on another
+          page. Two actions: copy parent id (existing) + unarchive-parent
+          (new) so users can pull an archived parent back into view without
+          hunting for it in the Archive panel. */}
       {isOrphan && task.parent_task_id && (
-        <button
-          onClick={e => { e.stopPropagation(); onNavigateToParent?.(task.parent_task_id!); }}
-          className="text-[9px] text-amber-500/80 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
-          title={`Copy parent task ID: ${task.parent_task_id}`}
-        >
-          ↑ Parent on another page
-        </button>
+        <>
+          <button
+            onClick={e => { e.stopPropagation(); onNavigateToParent?.(task.parent_task_id!); }}
+            className="text-[9px] text-amber-500/80 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+            title={`Copy parent task ID: ${task.parent_task_id}`}
+          >
+            ↑ Parent on another page
+          </button>
+          {onUnarchiveParent && (
+            <button
+              onClick={e => { e.stopPropagation(); onUnarchiveParent(task.parent_task_id!); }}
+              className="text-[9px] text-emerald-500/80 border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 hover:text-emerald-400 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+              title="Unarchive parent task (idempotent if already unarchived)"
+            >
+              ↪ Unarchive parent
+            </button>
+          )}
+        </>
       )}
 
       {/* Type badge */}
@@ -234,6 +249,7 @@ function TreeBranch({
   prChainMap,
   onViewLogs,
   onNavigateToParent,
+  onUnarchiveParent,
   isLast,
   depth,
   activeFilter,
@@ -245,6 +261,7 @@ function TreeBranch({
   prChainMap: Map<number, Task>;
   onViewLogs: (task: Task) => void;
   onNavigateToParent?: (parentTaskId: string) => void;
+  onUnarchiveParent?: (parentTaskId: string) => void;
   isLast: boolean;
   depth: number;
   activeFilter: FilterType;
@@ -341,7 +358,7 @@ function TreeBranch({
             </button>
           )}
           <div className="flex-1 min-w-0">
-            <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} onNavigateToParent={onNavigateToParent} activeFilter={activeFilter} blockingCount={blockingMap[node.task.id]} />
+            <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} onNavigateToParent={onNavigateToParent} onUnarchiveParent={onUnarchiveParent} activeFilter={activeFilter} blockingCount={blockingMap[node.task.id]} />
           </div>
         </div>
 
@@ -357,6 +374,7 @@ function TreeBranch({
                 prChainMap={prChainMap}
                 onViewLogs={onViewLogs}
                 onNavigateToParent={onNavigateToParent}
+                onUnarchiveParent={onUnarchiveParent}
                 isLast={i === node.children.length - 1}
                 depth={depth + 1}
                 activeFilter={activeFilter}
@@ -399,6 +417,7 @@ function RootGroup({
   prChainMap,
   onViewLogs,
   onNavigateToParent,
+  onUnarchiveParent,
   expanded,
   onToggle,
   activeFilter,
@@ -411,6 +430,7 @@ function RootGroup({
   prChainMap: Map<number, Task>;
   onViewLogs: (task: Task) => void;
   onNavigateToParent?: (parentTaskId: string) => void;
+  onUnarchiveParent?: (parentTaskId: string) => void;
   expanded: boolean;
   onToggle: () => void;
   activeFilter: FilterType;
@@ -539,6 +559,7 @@ function RootGroup({
                 prChainMap={prChainMap}
                 onViewLogs={onViewLogs}
                 onNavigateToParent={onNavigateToParent}
+                onUnarchiveParent={onUnarchiveParent}
                 isLast={i === root.children.length - 1}
                 depth={0}
                 activeFilter={activeFilter}
@@ -553,6 +574,7 @@ function RootGroup({
               prChainMap={prChainMap}
               onViewLogs={onViewLogs}
               onNavigateToParent={onNavigateToParent}
+              onUnarchiveParent={onUnarchiveParent}
               isLast={true}
               depth={0}
               activeFilter={activeFilter}
@@ -565,7 +587,7 @@ function RootGroup({
   );
 }
 
-export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWaveDeps, onArchiveGroup }: PipelineViewProps) {
+export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWaveDeps, onArchiveGroup, onUnarchiveTask }: PipelineViewProps) {
   const forest = useMemo(() => buildForest(tasks), [tasks]);
   const allTaskIds = useMemo(() => new Set(tasks.map(t => t.id)), [tasks]);
   const taskMap = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
@@ -624,18 +646,21 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
     }, 0);
   };
 
-  // Pipelines where the root + all descendants are terminal (done)
+  // Pipelines where all visible (non-synthetic) nodes are terminal (done).
+  // Synthetic parents are orphan-groups whose real parent is archived or on
+  // another page — if every visible child in the group is terminal, the
+  // tree is done from the operator's view and should be archivable too.
   const TERMINAL = ['COMPLETED', 'FAILED', 'CANCELLED'];
   const donePipelineIds = useMemo(() => {
     const ids: string[] = [];
     for (const root of forest) {
-      if (root.isSyntheticParent) continue;
       const allIds = collectAllIds(root).filter(id => !id.startsWith('synthetic-'));
+      if (allIds.length === 0) continue;
       const allTerminal = allIds.every(id => {
         const t = taskMap.get(id);
         return t && TERMINAL.includes(t.status);
       });
-      if (allTerminal && allIds.length > 0) ids.push(...allIds);
+      if (allTerminal) ids.push(...allIds);
     }
     return ids;
   }, [forest, taskMap]);
@@ -699,6 +724,7 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
             prChainMap={prChainMap}
             onViewLogs={onViewLogs}
             onNavigateToParent={onNavigateToParent}
+            onUnarchiveParent={onUnarchiveTask}
             expanded={getExpanded(root.task.id)}
             onToggle={() => toggleGroup(root.task.id)}
             activeFilter={activeFilter}
