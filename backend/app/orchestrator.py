@@ -1873,13 +1873,34 @@ async def orchestrator_worker():
                                 session.add(ci_task)
                                 await session.commit()
                                 continue
-                            ci_task.status = TaskStatus.COMPLETED
-                            ci_task.latest_status_message = f"PR #{ci_pr_number} already merged/closed"
-                            session.add(ci_task)
-                            await session.commit()
-                            await broadcast_to_project(str(ci_task.project_id), "task_updated",
-                                                       {"task_id": str(ci_task.id), "status": ci_task.status})
-                            logger.info(f"[CI] PR #{ci_pr_number} already merged/closed, skipping")
+                            if pr_data.get("merged"):
+                                ci_task.status = TaskStatus.COMPLETED
+                                ci_task.latest_status_message = f"PR #{ci_pr_number} merged"
+                                ci_task.context = {**(ci_task.context or {}), "pr_merged": True}
+                                session.add(ci_task)
+                                await session.commit()
+                                await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                           {"task_id": str(ci_task.id), "status": ci_task.status})
+                                logger.info(f"[CI] PR #{ci_pr_number} merged, marking task COMPLETED")
+                            else:
+                                # Closed without merge (human/bot intervention, not a self-close
+                                # reset — pending_reopen case handled above). Do NOT mark
+                                # COMPLETED — the code never landed. Fail the task so rollup
+                                # parents don't silently report success.
+                                _closed_msg = f"PR #{ci_pr_number} was closed without being merged"
+                                ci_task.status = TaskStatus.FAILED
+                                ci_task.latest_status_message = _closed_msg
+                                from app.failure_classification import persist_failure_category as _pfc_closed
+                                _pfc_closed(ci_task, "EXTERNAL_API")
+                                record_task_result(success=False, failure_class="EXTERNAL_API",
+                                                   task_id=str(ci_task.id),
+                                                   task_type=(ci_task.first_payload).get("type", ""))
+                                session.add(ci_task)
+                                await _maybe_create_failure_alert(ci_task, session, _closed_msg)
+                                await session.commit()
+                                await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                           {"task_id": str(ci_task.id), "status": ci_task.status})
+                                logger.warning(f"[CI] {_closed_msg} — marking task {ci_task.id} FAILED")
                             continue
 
                         # Check for merge conflicts — CI won't trigger on conflicting PRs.

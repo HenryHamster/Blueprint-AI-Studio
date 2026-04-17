@@ -527,6 +527,119 @@ async def test_ci_polling_deleted_pr_creates_alert(orch_db, mocker):
     )
 
 
+@pytest.mark.asyncio
+async def test_ci_polling_closed_without_merge_fails_task(orch_db, mocker):
+    """When CI polling finds a PR that was closed without being merged (and
+    there's no pending_reopen from the mergeability close/reopen reset), the
+    task must transition to FAILED — not COMPLETED. Otherwise rollup parents
+    silently report success even though the code never landed.
+    """
+    session, _Session = orch_db
+
+    project = Project(name="CI Closed No-Merge Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "ci closed task", "branch": "feat/closed"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 77,
+                "branch": "feat/closed",
+                "base_branch": "main",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+            }
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+    task_id = ci_task.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    # Closed without being merged — human or bot intervention
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "closed", "merged": False,
+                               "head": {"sha": "abc123"}, "mergeable": None})
+
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify_session:
+        from sqlmodel import select as _select
+        result = await verify_session.execute(_select(Task).where(Task.id == task_id))
+        updated = result.scalars().first()
+
+    assert updated is not None
+    assert updated.status == TaskStatus.FAILED, (
+        f"Expected task to be FAILED when PR closed without merge, got {updated.status}. "
+        f"Status message: {updated.latest_status_message!r}"
+    )
+    assert "closed without being merged" in (updated.latest_status_message or "").lower()
+    assert not (updated.context or {}).get("pr_merged"), (
+        "pr_merged must not be set when PR was closed without merging"
+    )
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_merged_pr_marks_completed(orch_db, mocker):
+    """When CI polling finds a truly merged PR, the task must transition to
+    COMPLETED with pr_merged=True in context.
+    """
+    session, _Session = orch_db
+
+    project = Project(name="CI Merged PR Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "ci merged task", "branch": "feat/merged"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 88,
+                "branch": "feat/merged",
+                "base_branch": "main",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+            }
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+    task_id = ci_task.id
+
+    mocker.patch("app.routers.agent.get_github_token_for_task",
+                 return_value=("fake-token", "owner", "repo"))
+    mocker.patch("app.github.get_pull_request",
+                 return_value={"state": "closed", "merged": True,
+                               "head": {"sha": "def456"}, "mergeable": None})
+
+    await _run_one_cycle(mocker)
+
+    async with _Session() as verify_session:
+        from sqlmodel import select as _select
+        result = await verify_session.execute(_select(Task).where(Task.id == task_id))
+        updated = result.scalars().first()
+
+    assert updated is not None
+    assert updated.status == TaskStatus.COMPLETED, (
+        f"Expected task to be COMPLETED when PR merged, got {updated.status}"
+    )
+    assert (updated.context or {}).get("pr_merged") is True, (
+        "pr_merged=True must be set on merged PR context"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 5 — CI polling transient failure retries
 # ══════════════════════════════════════════════════════════════════════════════

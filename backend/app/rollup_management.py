@@ -878,14 +878,17 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} but update_branch failed: "
                                 f"{_upd.get('message')} — falling through to fix spawn"
                             )
-                        elif _ms in ("blocked", "unstable", "unknown") or not _ms:
-                            # Empty _ms means the PR refetch failed (empty dict) — transient
-                            # infrastructure failure, not a merge conflict. Treat the same as
-                            # 'unknown': defer to the next rollup sweep instead of spawning a fix.
-                            # Track consecutive deferrals so silent stalls surface with an alert
-                            # (and escalate to approval) instead of waiting out the 6h hard timeout.
+                        elif _ms != "dirty":
+                            # Non-conflict states: known stalls (blocked/unstable/unknown),
+                            # empty _ms (PR refetch failed — transient infrastructure issue,
+                            # not a merge conflict), or any unrecognized value GitHub may
+                            # introduce. All defer to the next rollup sweep instead of
+                            # spawning a fix. Track consecutive deferrals so silent stalls
+                            # surface with an alert (and escalate to approval) instead of
+                            # waiting out the 6h hard timeout.
                             _ms_key = _ms or "empty"
                             _ms_display = _ms or "missing (refetch failed)"
+                            _is_unrecognized = _ms_key not in ("blocked", "unstable", "unknown", "empty")
                             prev_state = parent_ctx.get("_merge_deferred_state")
                             deferred_count = (parent_ctx.get("_merge_deferred_count", 0) + 1) if prev_state == _ms_key else 1
                             # Total-deferral counter: increments on every deferral regardless
@@ -901,9 +904,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             except (TypeError, ValueError):
                                 elapsed_minutes = 0.0
                             # 'unknown' / empty = GitHub stuck computing mergeability or refetch
-                            # failing → escalate faster than 'blocked'/'unstable' which
-                            # legitimately wait for checks/reviews.
-                            _fast_escalate = _ms_key in ("unknown", "empty")
+                            # failing; unrecognized = GitHub returned a new state we don't know
+                            # how to interpret. All escalate faster than 'blocked'/'unstable'
+                            # which legitimately wait for checks/reviews.
+                            _fast_escalate = _ms_key not in ("blocked", "unstable")
                             alert_threshold = _runtime_config.get(
                                 "rollup_merge_deferred_alert_unknown" if _fast_escalate
                                 else "rollup_merge_deferred_alert", 5 if _fast_escalate else 10
@@ -979,25 +983,14 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                     )
                             session.add(parent)
                             await session.commit()
-                            logger.info(
-                                f"[ROLLUP] PR #{rollup_pr_number} merge skipped: mergeable_state={_ms_display} "
+                            _log = logger.warning if _is_unrecognized else logger.info
+                            _log(
+                                f"[ROLLUP] PR #{rollup_pr_number} merge skipped: "
+                                f"{'unrecognized ' if _is_unrecognized else ''}mergeable_state={_ms_display} "
                                 f"(deferral {deferred_count}/total {total_deferrals}/{elapsed_minutes:.0f}min; "
                                 f"alert@{alert_threshold}/{total_alert_threshold}/{time_alert_minutes}min, "
                                 f"approval@{approval_threshold}/{total_approval_threshold}/{time_approval_minutes}min) "
                                 f"— deferring to next rollup sweep, no fix spawn"
-                            )
-                            return
-                        elif _ms and _ms != "dirty":
-                            parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
-                            parent.latest_status_message = (
-                                f"Rollup PR #{rollup_pr_number} merge deferred — unrecognized "
-                                f"mergeable_state={_ms!r}, next sweep will re-attempt"
-                            )
-                            session.add(parent)
-                            await session.commit()
-                            logger.warning(
-                                f"[ROLLUP] PR #{rollup_pr_number} merge skipped: unrecognized "
-                                f"mergeable_state={_ms!r} — deferring to next rollup sweep, no fix spawn"
                             )
                             return
                         # Observability: check if concurrent rollups may explain this conflict

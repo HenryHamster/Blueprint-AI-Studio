@@ -1741,6 +1741,70 @@ async def test_rollup_merge_time_based_escalation(rollup_db, mocker):
     assert mock_approval_dispatch.await_args.kwargs.get("pr_number") == 777
 
 
+@pytest.mark.asyncio
+async def test_rollup_merge_unrecognized_state_escalates(rollup_db, mocker):
+    """Unrecognized mergeable_state values (e.g., a new GitHub state) must track
+    consecutive deferrals with the fast-escalate thresholds — same as unknown/empty —
+    and eventually fire an alert and flip requires_approval rather than silently
+    stalling until the 6h hard timeout."""
+    # Fast-escalate thresholds: alert at 3, approval at 5 keep the test compact.
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {
+            "rollup_merge_deferred_alert_unknown": 3,
+            "rollup_merge_deferred_approval": 5,
+        },
+    )
+    state = {"state": "has_hooks"}  # unrecognized — not in blocked/unstable/unknown/dirty
+    _patch_deferred_counter_mocks(mocker, state)
+    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_approval_dispatch = mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock,
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    # Sweep 1 — counter starts at 1, state recorded, no escalation yet
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 1
+    assert (parent.context or {}).get("_merge_deferred_state") == "has_hooks"
+    assert (parent.context or {}).get("_merge_total_deferrals") == 1
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.requires_approval is False
+    assert mock_alert.await_count == 0
+    assert mock_approval_dispatch.await_count == 0
+
+    # Sweep 2 — counter climbs, still below alert
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 2
+    assert mock_alert.await_count == 0
+
+    # Sweep 3 — hits fast-escalate alert threshold (3)
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 3
+    assert mock_alert.await_count == 1
+    assert parent.requires_approval is False
+
+    # Sweep 4 — counter past threshold, alert must not re-fire
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 4
+    assert mock_alert.await_count == 1, "alert must fire only once for unrecognized state"
+
+    # Sweep 5 — hits approval threshold, dispatch fires with PR number
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_count") == 5
+    assert parent.requires_approval is True
+    assert mock_approval_dispatch.await_count == 1
+    assert mock_approval_dispatch.await_args.kwargs.get("pr_number") == 777
+
+
 # ── Strategic Completion Handler ─────────────────────────────────────────────
 
 @pytest_asyncio.fixture()
