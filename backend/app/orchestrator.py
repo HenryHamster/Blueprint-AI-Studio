@@ -462,6 +462,7 @@ async def orchestrator_worker():
     from app.github import (
         get_check_runs,
         get_pull_request,
+        update_branch,
     )
     global _last_pool_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
     global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
@@ -1682,6 +1683,37 @@ async def orchestrator_worker():
                         if pr_data.get("mergeable") is None:
                             continue
                         if pr_data.get("mergeable") is False:
+                            # Distinguish "behind base" (trivially resolvable via
+                            # GitHub's update-branch API) from real conflicts. For
+                            # 'behind' PRs, update the branch in-place instead of
+                            # burning a VM fix cycle; the merge-commit triggers fresh
+                            # CI and the next poll re-evaluates mergeability.
+                            if pr_data.get("mergeable_state") == "behind":
+                                try:
+                                    _upd = await update_branch(
+                                        ci_gh_token, ci_owner, ci_repo, ci_pr_number,
+                                        expected_head_sha=pr_data.get("head", {}).get("sha") or None,
+                                        project_id=str(ci_task.project_id),
+                                    )
+                                except HTTPException as _upd_exc:
+                                    _upd = {"updated": False, "message": f"HTTP error: {_upd_exc.detail}"}
+                                except Exception as _upd_exc:
+                                    _upd = {"updated": False, "message": f"{type(_upd_exc).__name__}: {_upd_exc}"}
+                                if _upd.get("updated"):
+                                    ci_task.latest_status_message = (
+                                        f"PR #{ci_pr_number} was behind base — updated branch via GitHub API, awaiting fresh CI"
+                                    )
+                                    # Force a refetch next cycle so mergeable/head_sha refresh.
+                                    ci_loop["polls_since_pr_fetch"] = 999
+                                    ci_loop["head_sha"] = ""
+                                    ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    await broadcast_to_project(str(ci_task.project_id), "task_updated",
+                                                               {"task_id": str(ci_task.id), "status": ci_task.status})
+                                    logger.info(f"[CI] PR #{ci_pr_number} behind base — update_branch succeeded, skipped fix spawn")
+                                    continue
+                                logger.info(f"[CI] PR #{ci_pr_number} behind base but update_branch failed: {_upd.get('message')} — falling through to fix spawn")
                             ci_payload = ci_task.first_payload
                             ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
                             ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")

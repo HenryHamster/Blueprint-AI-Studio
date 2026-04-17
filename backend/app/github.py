@@ -1353,6 +1353,61 @@ async def enable_auto_merge(
     return {"enabled": False, "message": "GraphQL returned no enabledAt — auto-merge not confirmed"}
 
 
+async def update_branch(
+    token: str, owner: str, repo: str, pr_number: int,
+    expected_head_sha: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Update a PR branch with the latest base-branch commits via
+    PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch.
+
+    Use this when a PR's mergeable_state is 'behind' — GitHub will create a
+    merge commit from base into the PR branch, which triggers a fresh CI run
+    and clears the 'behind' state. Does not raise on expected failures (422
+    cannot-update, 403/404 auth/no-PR); returns {"updated": bool, "message": str}
+    mirroring merge_pull_request / enable_auto_merge.
+
+    Raises on unexpected 5xx so the caller can treat it as transient.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body: dict[str, str] = {}
+    if expected_head_sha:
+        body["expected_head_sha"] = expected_head_sha
+    response = await _github_request(
+        "PUT",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/update-branch",
+        headers, json=body, project_id=project_id,
+    )
+    if response.status_code == 202:
+        try:
+            data = response.json() or {}
+        except Exception:
+            data = {}
+        msg = data.get("message", "Update queued")
+        logger.info(f"[UPDATE-BRANCH] PR #{pr_number} update queued: {msg}")
+        return {"updated": True, "message": msg}
+    if response.status_code in (403, 404, 422):
+        try:
+            data = response.json() or {}
+        except Exception:
+            data = {}
+        msg = data.get("message", f"HTTP {response.status_code}")
+        logger.info(f"[UPDATE-BRANCH] PR #{pr_number} cannot update ({response.status_code}): {msg}")
+        return {"updated": False, "message": msg}
+    body_snippet = (response.text or "")[:500]
+    logger.error(
+        f"Failed to update PR #{pr_number} branch (status={response.status_code}): {body_snippet}"
+    )
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=f"Failed to update PR #{pr_number} branch (upstream status {response.status_code})",
+    )
+
+
 async def close_pull_request(
     token: str, owner: str, repo: str, pr_number: int,
     project_id: str | None = None,

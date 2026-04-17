@@ -27,6 +27,11 @@ from app.models import Task, TaskStatus, _utcnow
 
 logger = logging.getLogger(__name__)
 
+# Hard cap on merge retries — escalates at 10, but if we hit this many failures
+# the PR is clearly stuck (e.g. corrupted ci_wait_started bypassing the CI backstop
+# in services.py). Mark FAILED with requires_approval to force manual intervention.
+MERGE_FAILURE_HARD_CAP = 25
+
 
 def _review_approved(review_loop: dict) -> bool:
     """True if a review task signed off on this PR.
@@ -146,6 +151,24 @@ async def _attempt_merge_with_retry_and_escalation(
                 task.context = {**(task.context or {}), "review_loop": ci_loop}
                 await _maybe_create_failure_alert(task, session,
                     f"Rollup PR #{ci_pr_number} merge failed {_merge_failures} times — still retrying")
+            if _merge_failures >= MERGE_FAILURE_HARD_CAP:
+                task.status = TaskStatus.FAILED
+                task.requires_approval = True
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} merge failed {_merge_failures} times "
+                    f"(>= {MERGE_FAILURE_HARD_CAP}) — giving up, needs manual intervention"
+                )
+                if ci_orig_id:
+                    try:
+                        orig = await session.get(Task, uuid.UUID(ci_orig_id))
+                        if orig:
+                            orig.requires_approval = True
+                            session.add(orig)
+                    except Exception as e:
+                        logger.warning(f"[CI] Failed to set requires_approval on {ci_orig_id}: {e}", exc_info=True)
+                await _maybe_create_failure_alert(task, session,
+                    f"PR #{ci_pr_number} merge hard-capped after {_merge_failures} failures — manual action required")
+                logger.error(f"[CI] PR #{ci_pr_number} hit merge hard cap ({_merge_failures}) — marking FAILED ({source})")
     except Exception:
         ci_loop["ci_poll_interval"] = 30
         ci_loop["ci_last_polled"] = _utcnow().isoformat()

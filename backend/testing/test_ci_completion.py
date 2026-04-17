@@ -396,6 +396,57 @@ async def test_merge_failure_does_not_double_escalate(db_session, mocker):
     alert_mock.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_merge_failure_hard_cap_marks_failed(db_session, mocker):
+    """
+    When merge_failures crosses MERGE_FAILURE_HARD_CAP, the task is marked FAILED
+    with requires_approval and a failure alert is created — preventing indefinite
+    retry every 120 seconds.
+    """
+    from app.ci_completion import (
+        MERGE_FAILURE_HARD_CAP,
+        _attempt_merge_with_retry_and_escalation,
+    )
+
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "server error"},
+    )
+
+    project = Project(name="Hard cap test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # One below the cap so this call crosses it; merge_escalated already True
+    # so we test that the cap fires independently of the 10-failure escalation.
+    task = _make_task(db_session, project, ci_loop_extra={
+        "merge_failures": MERGE_FAILURE_HARD_CAP - 1,
+        "merge_escalated": True,
+    })
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    assert task.status == TaskStatus.FAILED
+    assert task.requires_approval is True
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_failures") == MERGE_FAILURE_HARD_CAP
+    alert_mock.assert_called_once()
+    assert "hard-capped" in alert_mock.call_args[0][2].lower()
+
+
 # ---------------------------------------------------------------------------
 # 5. Already-merged race condition
 # ---------------------------------------------------------------------------

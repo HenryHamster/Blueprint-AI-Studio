@@ -248,7 +248,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     from app.github import (
         create_pr_comment, delete_branch, create_pull_request,
         merge_pull_request, get_pull_request, get_pr_files, get_branch_sha,
-        close_pull_request,
+        close_pull_request, update_branch,
     )
 
     if not child_task.parent_task_id:
@@ -804,6 +804,44 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     else:
                         # Merge failed (conflicts) — spawn review/fix cycle instead of giving up
                         merge_msg = merge_result.get("message", "unknown")
+                        # Before spawning a fix task, check if the PR is merely
+                        # behind its base (common when concurrent rollups land on
+                        # the same target). If so, update-branch via GitHub API
+                        # and let the next rollup sweep re-attempt the merge.
+                        try:
+                            _pr_detail = await get_pull_request(
+                                gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id),
+                            )
+                        except Exception as _pr_exc:
+                            _pr_detail = {}
+                            logger.debug(f"[ROLLUP] Could not refetch PR #{rollup_pr_number} for behind-check: {_pr_exc}")
+                        if _pr_detail.get("mergeable_state") == "behind":
+                            try:
+                                _upd = await update_branch(
+                                    gh_token, owner, repo, rollup_pr_number,
+                                    expected_head_sha=_pr_detail.get("head", {}).get("sha") or None,
+                                    project_id=str(parent.project_id),
+                                )
+                            except HTTPException as _upd_exc:
+                                _upd = {"updated": False, "message": f"HTTP error: {_upd_exc.detail}"}
+                            except Exception as _upd_exc:
+                                _upd = {"updated": False, "message": f"{type(_upd_exc).__name__}: {_upd_exc}"}
+                            if _upd.get("updated"):
+                                parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{rollup_pr_number} was behind {target_branch} — updated branch, "
+                                    f"awaiting fresh CI; next rollup sweep will re-attempt merge"
+                                )
+                                session.add(parent)
+                                await session.commit()
+                                logger.info(
+                                    f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch succeeded, skipped fix spawn"
+                                )
+                                return
+                            logger.info(
+                                f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} but update_branch failed: "
+                                f"{_upd.get('message')} — falling through to fix spawn"
+                            )
                         # Observability: check if concurrent rollups may explain this conflict
                         try:
                             recent_rollups = (await session.execute(
