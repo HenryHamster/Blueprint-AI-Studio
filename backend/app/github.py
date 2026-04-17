@@ -75,6 +75,40 @@ def _record_call(method: str, url: str) -> None:
     _ss.github_call_counts[template] = _ss.github_call_counts.get(template, 0) + 1
 
 
+async def probe_rate_limit() -> bool:
+    """Ping GitHub's /rate_limit endpoint to keep github_quota fresh.
+
+    /rate_limit is a free call — doesn't count against the 5000/hr REST
+    budget (per GitHub docs).  We use it as a heartbeat so the dashboard
+    quota pill shows real numbers even when the pipeline is idle and no
+    task-driven GitHub calls have happened recently.  Returns True on
+    success.
+    """
+    if not GITHUB_APP_ID or not GITHUB_PRIVATE_KEY:
+        return False
+    try:
+        app_jwt = generate_github_app_jwt()
+    except Exception as e:
+        logger.debug(f"[GITHUB] probe_rate_limit: could not generate JWT: {e}")
+        return False
+    headers = {
+        "Authorization": f"Bearer {app_jwt}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        resp = await _github_request(
+            "GET", "https://api.github.com/rate_limit", headers,
+            max_retries=1,
+        )
+        # Even non-200 responses populate the quota headers (GitHub still
+        # attaches them on errors), so just return True if we got a response.
+        return resp is not None
+    except Exception as e:
+        logger.debug(f"[GITHUB] probe_rate_limit failed: {e}")
+        return False
+
+
 def _update_quota_state(remaining: int, limit: int | None, reset_ts: int | None) -> None:
     """Mirror X-RateLimit-* headers into shared_state.github_quota.
 

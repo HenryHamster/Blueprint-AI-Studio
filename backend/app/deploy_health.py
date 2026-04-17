@@ -278,6 +278,17 @@ async def _check_external_health():
 
     ext["failed_deps"] = failed
 
+    # Probe /rate_limit to keep github_quota warm for the dashboard pill.
+    # /rate_limit is free (doesn't count against the 5000/hr budget) and
+    # populates X-RateLimit-* headers which _github_request mirrors into
+    # shared_state.github_quota.  Without this the pill stays gray after a
+    # backend restart until the first task-driven GitHub call happens.
+    try:
+        from app.github import probe_rate_limit  # noqa: PLC0415
+        await probe_rate_limit()
+    except Exception:
+        logger.debug("[HEALTH] GitHub rate_limit probe failed", exc_info=True)
+
     # Track consecutive failure counts per dependency (used by dispatch gate)
     consec = ext.setdefault("consecutive_failures", {})
     for dep in ("github_api", "claude_api", "gcp", "db"):
