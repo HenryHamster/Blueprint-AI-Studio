@@ -73,6 +73,16 @@ def _reset_health_recovery_history() -> None:
     _health_recovery_history.clear()
 
 
+def get_recovery_history_snapshot() -> list:
+    """Return a copy of the current health-recovery ring buffer (True == healthy probe).
+
+    Other modules use this to substitute health-probe evidence for task-result
+    evidence while the pipeline is paused (no tasks run, so task_results stops
+    growing). Returns at most ``_HEALTH_HISTORY_SIZE`` entries.
+    """
+    return list(_health_recovery_history)
+
+
 def _prune_flap_window(now: datetime) -> None:
     """Drop _recent_auto_resumes entries older than the configured flap window."""
     window = _runtime_config.get("flap_window_seconds", 1800)
@@ -641,9 +651,14 @@ async def _check_pause_mode():
                     # intermediate (small) VM count while state.runtime_max_concurrent_vms
                     # holds the original pre-pause target. Preserve the larger so nested
                     # pause cycles don't ratchet capacity down.
+                    # Anomaly throttling may have already reduced both runtime config and
+                    # DB state below the true original capacity — consult the anomaly
+                    # pre-adjustment stash so restoration doesn't permanently shrink.
+                    anomaly_pre = _shared_state.anomaly_adjustments.get("pre_adjustment_max_vms") or 0
                     original_capacity = max(
                         _runtime_config["max_concurrent_vms"],
                         state.runtime_max_concurrent_vms or 0,
+                        anomaly_pre,
                     )
                     state.status = DeploymentStatus.PAUSED
                     state.pause_reason = f"External dependency down: {', '.join(critical_failures)}"

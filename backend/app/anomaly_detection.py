@@ -409,9 +409,23 @@ def _check_max_duration_safeguard() -> bool:
     if pre_max_vms is not None:
         current_max_vms = rc["max_concurrent_vms"]
         expected_adjusted_vms = max(2, pre_max_vms // 2)
+        if current_max_vms < expected_adjusted_vms:
+            # deploy_health has paused (=0) or is ramping up (1-2) — this is NOT
+            # an admin override. Defer forced restoration until deploy resumes so
+            # we don't lose the pre-adjustment capacity.
+            logger.info(
+                f"[ANOMALY_ACTION] Deferring max-duration safeguard: current_max_vms="
+                f"{current_max_vms} is below anomaly-adjusted floor ({expected_adjusted_vms}) — "
+                f"deploy_health appears paused/ramping; preserving anomaly stash"
+            )
+            return False
         if current_max_vms == expected_adjusted_vms:
             graduated = max(2, int(pre_max_vms * _FORCED_RESTORATION_VMS_FRACTION))
             rc["max_concurrent_vms"] = graduated
+        elif current_max_vms >= pre_max_vms:
+            # Already at or above pre-adjustment (e.g., deploy_health ramped back
+            # to the original capacity). Nothing to restore; just clear stash.
+            pass
         else:
             logger.info(
                 f"[ANOMALY_ACTION] max_concurrent_vms was manually changed "
@@ -472,11 +486,13 @@ def _check_anomaly_restoration() -> bool:
         if still_active:
             break
 
+    came_via_fast_recovery = False
     if still_active:
         # Fast-recovery path: restore proactively when recent outcomes are clean
         # even though the anomaly occurrence_count hasn't dropped yet.
         if not _check_fast_recovery():
             return False
+        came_via_fast_recovery = True
         logger.info(
             "[ANOMALY_ACTION] Fast recovery: no triggering failures in %dh window "
             "with sufficient sample — restoring pipeline settings early",
@@ -492,8 +508,36 @@ def _check_anomaly_restoration() -> bool:
         # changed it manually while adjustments were active, respect that.
         current_max_vms = rc["max_concurrent_vms"]
         expected_adjusted_vms = max(2, pre_max_vms // 2)
-        if current_max_vms == expected_adjusted_vms:
+        if current_max_vms < expected_adjusted_vms:
+            if not came_via_fast_recovery:
+                # deploy_health has paused (=0) or is ramping up (1-2) — this
+                # is NOT an admin override. Defer restoration until deploy_health
+                # finishes ramping so we don't clear the stash and lose the
+                # original capacity. deploy_health's pre_pause_max_vms already
+                # captured our pre_adjustment stash at pause time (see
+                # deploy_health.py:647-667), so on resume the full capacity is
+                # preserved.
+                logger.info(
+                    f"[ANOMALY_ACTION] Deferring restoration: current_max_vms="
+                    f"{current_max_vms} is below anomaly-adjusted floor ({expected_adjusted_vms}) — "
+                    f"deploy_health appears paused/ramping; preserving anomaly stash"
+                )
+                return False
+            # Fast-recovery affirmed the trigger cleared via health-history
+            # probes while deploy_health held rc below our floor. deploy_health
+            # now owns max_concurrent_vms — leave rc alone and clear the
+            # anomaly stash so the resume path can ramp cleanly.
+            logger.info(
+                "[ANOMALY_ACTION] Fast recovery via health history: leaving "
+                "max_concurrent_vms=%d for deploy_health resume",
+                current_max_vms,
+            )
+        elif current_max_vms == expected_adjusted_vms:
             rc["max_concurrent_vms"] = pre_max_vms
+        elif current_max_vms >= pre_max_vms:
+            # Already at or above pre-adjustment (deploy_health ramp completed
+            # or admin bumped past original). Nothing to restore; clear stash.
+            pass
         else:
             logger.info(
                 f"[ANOMALY_ACTION] max_concurrent_vms was manually changed "
@@ -547,9 +591,23 @@ def _check_fast_recovery() -> bool:
         if r[0] >= cutoff
     ]
 
-    # Need a meaningful sample to avoid restoring during an idle lull
+    # Need a meaningful sample to avoid restoring during an idle lull.
+    # Exception: when the pipeline is paused (max_concurrent_vms == 0), no tasks
+    # run and task_results stops growing, so the min-sample bar can never be met.
+    # Fall back to the deploy_health recovery ring buffer (probes continue during
+    # pause). If it shows a full window of healthy probes, treat that as
+    # equivalent evidence that the triggering condition has resolved.
     if len(recent_results) < _FAST_RECOVERY_MIN_SAMPLE:
-        return False
+        if _shared_state.runtime_config.get("max_concurrent_vms", 0) != 0:
+            return False
+        from app.deploy_health import (  # noqa: PLC0415
+            _HEALTH_HISTORY_SIZE,
+            get_recovery_history_snapshot,
+        )
+        history = get_recovery_history_snapshot()
+        if len(history) < _HEALTH_HISTORY_SIZE or not all(history):
+            return False
+        return True
 
     # Tolerate a small number of triggering-class failures when they represent
     # a tiny fraction of recent results (one intermittent failure shouldn't pin

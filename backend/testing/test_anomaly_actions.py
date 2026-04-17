@@ -315,6 +315,64 @@ def test_no_restoration_when_not_active():
     assert result is False
 
 
+def test_restoration_deferred_when_deploy_paused():
+    """If deploy_health paused (rc=0) or is ramping (rc=1/2), don't misread as admin override."""
+    proj_id = str(uuid.uuid4())
+    _shared_state.persistent_anomalies[proj_id] = {
+        "PROVISION_FAILURE": {
+            "severity": "high",
+            "occurrence_count": 3,
+            "first_seen": "2026-04-16T00:00:00",
+            "last_seen": "2026-04-16T01:00:00",
+            "latest_details": "test",
+        }
+    }
+    _shared_state.runtime_config["max_concurrent_vms"] = 8
+    _apply_anomaly_adjustments()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+
+    # Anomaly clears
+    _shared_state.persistent_anomalies.clear()
+    # deploy_health auto-paused: rc forced to 0
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+
+    result = _check_anomaly_restoration()
+    assert result is False
+    # Adjustments stay active; stash preserved so capacity isn't lost
+    assert _shared_state.anomaly_adjustments["active"] is True
+    assert _shared_state.anomaly_adjustments["pre_adjustment_max_vms"] == 8
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 0
+
+    # Simulate deploy_health ramp-up: rc=1, then 2 — still below adjusted floor (4)
+    for ramp_val in (1, 2):
+        _shared_state.runtime_config["max_concurrent_vms"] = ramp_val
+        assert _check_anomaly_restoration() is False
+        assert _shared_state.anomaly_adjustments["pre_adjustment_max_vms"] == 8
+
+    # Once deploy_health has fully restored (rc back to 8), stash clears cleanly
+    _shared_state.runtime_config["max_concurrent_vms"] = 8
+    result = _check_anomaly_restoration()
+    assert result is True
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 8
+    assert _shared_state.anomaly_adjustments["active"] is False
+    assert _shared_state.anomaly_adjustments["pre_adjustment_max_vms"] is None
+
+
+def test_max_duration_safeguard_deferred_when_paused():
+    """Max-duration safeguard defers when deploy_health has paused (rc below adjusted floor)."""
+    proj_id = str(uuid.uuid4())
+    _setup_active_adjustment(proj_id, "PROVISION_FAILURE", max_vms=8)
+    # deploy_health paused during the throttled period
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _backdate_adjusted_at(hours=_MAX_ADJUSTMENT_DURATION_HOURS + 0.5)
+
+    result = _check_max_duration_safeguard()
+    assert result is False
+    # Stash preserved so deploy_health resume path can restore correctly
+    assert _shared_state.anomaly_adjustments["active"] is True
+    assert _shared_state.anomaly_adjustments["pre_adjustment_max_vms"] == 8
+
+
 def test_manual_override_respected():
     """If an admin changes max_concurrent_vms during adjustment, don't overwrite it."""
     proj_id = str(uuid.uuid4())
@@ -670,6 +728,79 @@ def test_fast_recovery_blocked_when_sample_too_small():
         )
 
     result = _check_anomaly_restoration()
+    assert result is False
+    assert _shared_state.anomaly_adjustments["active"] is True
+
+
+def test_fast_recovery_uses_health_history_when_paused():
+    """When pipeline is paused (max_concurrent_vms == 0), task_results stops growing.
+    A full ring buffer of healthy probes substitutes for the task-result sample."""
+    from app import deploy_health
+
+    proj_id = str(uuid.uuid4())
+    _setup_active_adjustment(proj_id, "PROVISION_FAILURE", max_vms=8)
+    # Pipeline is paused — adjustment captured pre_max=8, but deploy_health
+    # subsequently dropped capacity to 0 to stop dispatch.
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+
+    deploy_health._reset_health_recovery_history()
+    for _ in range(deploy_health._HEALTH_HISTORY_SIZE):
+        deploy_health._health_recovery_history.append(True)
+
+    try:
+        result = _check_anomaly_restoration()
+    finally:
+        deploy_health._reset_health_recovery_history()
+
+    assert result is True
+    assert _shared_state.anomaly_adjustments["active"] is False
+    # max_concurrent_vms stays at 0 — that's deploy_health's value to manage on
+    # its own resume path; anomaly system treats it as a manual override.
+    assert _shared_state.anomaly_adjustments["failure_gate_threshold"] == 0.8
+
+
+def test_fast_recovery_health_history_path_requires_full_healthy_window():
+    """Paused-pipeline fallback only fires when the buffer is full AND all-healthy."""
+    from app import deploy_health
+
+    proj_id = str(uuid.uuid4())
+    _setup_active_adjustment(proj_id, "PROVISION_FAILURE", max_vms=8)
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+
+    # Mostly healthy but one flaky probe — should NOT fast-recover
+    deploy_health._reset_health_recovery_history()
+    for _ in range(deploy_health._HEALTH_HISTORY_SIZE - 1):
+        deploy_health._health_recovery_history.append(True)
+    deploy_health._health_recovery_history.append(False)
+
+    try:
+        result = _check_anomaly_restoration()
+    finally:
+        deploy_health._reset_health_recovery_history()
+
+    assert result is False
+    assert _shared_state.anomaly_adjustments["active"] is True
+
+
+def test_fast_recovery_health_history_ignored_when_not_paused():
+    """The health-history fallback only applies when max_concurrent_vms == 0."""
+    from app import deploy_health
+
+    proj_id = str(uuid.uuid4())
+    _setup_active_adjustment(proj_id, "PROVISION_FAILURE", max_vms=8)
+    # Not paused: pipeline is throttled but still dispatching (4 == 8 // 2).
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+
+    deploy_health._reset_health_recovery_history()
+    for _ in range(deploy_health._HEALTH_HISTORY_SIZE):
+        deploy_health._health_recovery_history.append(True)
+
+    try:
+        result = _check_anomaly_restoration()
+    finally:
+        deploy_health._reset_health_recovery_history()
+
+    # Empty task_results + not paused → original min-sample bar still blocks
     assert result is False
     assert _shared_state.anomaly_adjustments["active"] is True
 

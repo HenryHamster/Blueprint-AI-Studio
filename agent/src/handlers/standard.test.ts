@@ -806,8 +806,8 @@ describe('self-review phase', () => {
     vi.mocked(getMandatoryChecks).mockReturnValue(['test_coverage', 'type_safety']);
     const reviewJson = JSON.stringify({
       verdict: 'PASS',
-      check_results: { test_coverage: { passed: true }, type_safety: { passed: true } },
-      issues_found: 0,
+      check_results: { test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing type annotation' } },
+      issues_found: 1,
       files_reviewed: 2,
       truncated_files_read: [],
     });
@@ -829,7 +829,7 @@ describe('self-review phase', () => {
     expect(payload.failure_category).toBe('self_review_rejected');
     const outcome = payload.self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
-    expect(outcome.check_results).toEqual({ test_coverage: { passed: true }, type_safety: { passed: true } });
+    expect(outcome.check_results).toEqual({ test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing type annotation' } });
     expect(outcome.checks_performed).toEqual(['test_coverage', 'type_safety']);
     expect(outcome.verdict).toBe('FAIL');
     expect(outcome.parse_failed).toBeUndefined();

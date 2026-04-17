@@ -661,30 +661,23 @@ Output ONLY a JSON object in a \`\`\`json code fence:
           // Extract check_results if present
           if (parsed.check_results && typeof parsed.check_results === 'object' && !Array.isArray(parsed.check_results)) {
             parsedCheckResults = parsed.check_results as Record<string, { passed: boolean; issue?: string }>;
-            // Derive checks_performed from check_results keys if not already set
+            // When the agent provided an explicit checks_performed array alongside
+            // a verdict that contradicts check_results, that's a higher-signal
+            // inconsistency worth retrying so the agent self-corrects. When
+            // checks_performed was omitted, derive it silently and just flip the
+            // verdict to FAIL — no retry needed for a pure formatting miss.
+            const hadExplicitChecks = parsedChecks !== undefined;
             if (!parsedChecks) {
               parsedChecks = Object.keys(parsedCheckResults);
             }
-            // Enforce verdict consistency: any failed check forces FAIL regardless
-            // of what the agent reported in the verdict field.
-            const anyFailed = Object.values(parsedCheckResults).some(
-              (c) => c && typeof c === 'object' && c.passed === false,
-            );
-            if (anyFailed && parsedVerdict !== 'FAIL') {
-              parsedVerdict = 'FAIL';
-            }
-          }
-
-          // Enforce verdict/check_results consistency: if any check has passed:false,
-          // verdict MUST be FAIL. Agents sometimes mimic example formatting over
-          // instruction text, so programmatically override PASS→FAIL when inconsistent.
-          if (parsedCheckResults) {
             const failedCheckIds = Object.entries(parsedCheckResults)
               .filter(([, r]) => r && r.passed === false)
               .map(([id]) => id);
             if (failedCheckIds.length > 0 && parsedVerdict !== 'FAIL') {
-              reviewCategories.push('verdict_check_mismatch');
-              parseFailed = true;
+              if (hadExplicitChecks) {
+                reviewCategories.push('verdict_check_mismatch');
+                parseFailed = true;
+              }
               parsedVerdict = 'FAIL';
             }
           }
