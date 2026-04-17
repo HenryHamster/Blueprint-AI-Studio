@@ -748,8 +748,15 @@ def _make_check_run_payload(
     action: str = "completed",
     conclusion: str = "success",
     head_branch: str = "feature/test",
+    pr_numbers: list[int] | None = None,
 ) -> bytes:
-    """Build a minimal check_run webhook payload."""
+    """Build a minimal check_run webhook payload.
+
+    ``pr_numbers`` populates ``check_run.pull_requests`` so the webhook
+    handler's pr_number match path (for rollup parents with no head_sha)
+    can be exercised.
+    """
+    _prs = [{"number": n} for n in (pr_numbers or [])]
     return json.dumps({
         "action": action,
         "check_run": {
@@ -758,6 +765,7 @@ def _make_check_run_payload(
             "status": "completed",
             "conclusion": conclusion,
             "head_sha": head_sha,
+            "pull_requests": _prs,
             "check_suite": {
                 "head_branch": head_branch,
                 "pull_requests": [],
@@ -1143,6 +1151,82 @@ async def test_check_run_completed_calls_handle_ci_completion(client, db_session
     mock_handle_ci.assert_called_once()
     called_task = mock_handle_ci.call_args[0][0]
     assert called_task.id == task.id
+
+
+@pytest.mark.asyncio
+async def test_check_run_completed_matches_rollup_parent_by_pr_number(client, db_session, mocker):
+    """Rollup parents are set ci_waiting=True + pr_number but NOT head_sha
+    (rollup_management.py). A check_run webhook that doesn't match head_sha
+    must still route to handle_ci_completion via pr_number, otherwise the
+    webhook is a no-op and polling burns GitHub API quota."""
+    from app.models import Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    head_sha = "rolluphead123456789abcdef"
+    pr_number = 4242
+    gh_token = "gh-test-token"
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=(gh_token, "rollorg", "rollrepo"),
+    )
+    mocker.patch(
+        "app.github.get_check_runs",
+        new_callable=AsyncMock,
+        return_value={"status": "completed", "conclusion": "success", "failed_logs": ""},
+    )
+    mock_handle_ci = mocker.patch(
+        "app.ci_completion.handle_ci_completion",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Rollup Webhook", user_id="user1",
+        github_owner="rollorg", github_repo="rollrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Rollup parent: ci_waiting + pr_number, but head_sha intentionally absent.
+    rollup_parent = Task(
+        project_id=project.id,
+        title="Rollup parent",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": pr_number,
+                "branch": "research/abcd",
+                "base_branch": "main",
+                # NO head_sha — this is exactly the bug case
+            }
+        },
+        created_by="user1",
+    )
+    db_session.add(rollup_parent)
+    await db_session.commit()
+    await db_session.refresh(rollup_parent)
+
+    payload_bytes = _make_check_run_payload(
+        "rollorg", "rollrepo", head_sha, conclusion="success", pr_numbers=[pr_number]
+    )
+    resp = await _post_webhook(client, payload_bytes, "check_run")
+
+    assert resp.status_code == 200
+    # The critical assertion: webhook routed to handle_ci_completion despite
+    # the head_sha mismatch, because pr_number matched.
+    mock_handle_ci.assert_called_once()
+    called_task = mock_handle_ci.call_args[0][0]
+    assert called_task.id == rollup_parent.id
+    # Backfill: head_sha is set on the in-session object so future
+    # webhooks can use the fast-path match.  handle_ci_completion commits
+    # after we add it in-session; the mock here doesn't commit, but the
+    # attribute must be populated by the matching loop before it ran.
+    assert (called_task.context or {}).get("review_loop", {}).get("head_sha") == head_sha
 
 
 @pytest.mark.asyncio

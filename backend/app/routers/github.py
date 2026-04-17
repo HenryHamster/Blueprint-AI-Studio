@@ -460,9 +460,40 @@ async def github_webhook(
             select(Task).where(Task.status == TaskStatus.EVALUATING, Task.project_id == project.id)
         )).scalars().all()
 
-        matching = [t for t in ci_tasks
-                    if (t.context or {}).get('review_loop', {}).get('ci_waiting')
-                    and (t.context or {}).get('review_loop', {}).get('head_sha') == head_sha]
+        # Match strategies (in order of specificity):
+        #   1. head_sha equality — the original precise match, set by the review
+        #      APPROVE path (task_lifecycle.py) for non-rollup PRs.
+        #   2. pr_number match against any PR number surfaced in the webhook's
+        #      check_run.pull_requests[].  Rollup parents (rollup_management.py)
+        #      set ci_waiting=True + pr_number but NOT head_sha, so strategy (1)
+        #      would miss them and the orchestrator's 30s poll loop would be the
+        #      only fallback — a major GitHub API quota burn.  Matching on
+        #      pr_number lets the webhook handle rollup CI completions too.
+        # GitHub puts the PR list at check_run.pull_requests and historically
+        # also under check_run.check_suite.pull_requests — accept either.
+        _pr_candidates = (check_run.get('pull_requests') or []) + (
+            (check_run.get('check_suite') or {}).get('pull_requests') or []
+        )
+        webhook_pr_numbers = {
+            pr.get('number') for pr in _pr_candidates
+            if pr.get('number') is not None
+        }
+        matching = []
+        for t in ci_tasks:
+            rl = (t.context or {}).get('review_loop', {}) or {}
+            if not rl.get('ci_waiting'):
+                continue
+            if rl.get('head_sha') == head_sha:
+                matching.append(t)
+                continue
+            task_pr = rl.get('pr_number')
+            if task_pr is not None and task_pr in webhook_pr_numbers:
+                matching.append(t)
+                # Backfill head_sha so future webhooks hit strategy (1) directly
+                # and the orchestrator's poll-skip can use head_sha too.
+                rl['head_sha'] = head_sha
+                t.context = {**(t.context or {}), 'review_loop': rl}
+                session.add(t)
 
         if not matching:
             # No EVALUATING tasks match — check if this is a protected-branch CI failure
