@@ -794,6 +794,19 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('medium-scope tasks have struggled');
   });
 
+  it('renders upgrade note (decompose) when scope_calibrated_from is smaller than taskScope', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: { scope: 'large', scope_calibrated_from: 'medium' },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Task Scope');
+    expect(result).toContain('Scope: large');
+    expect(result).toContain('originally scoped as medium but calibrated up to large');
+    expect(result).toContain('Decompose the work');
+    expect(result).not.toContain('calibrated down');
+  });
+
   it('omits scope calibration note when scope_calibrated_from matches current scope', () => {
     const task = {
       payloads: [{ type: 'create' }],

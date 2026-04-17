@@ -1912,14 +1912,18 @@ class TestCalibrateScope:
         assert calibrated_from is None
 
     def test_below_threshold_downgrades_to_smaller_scope(self):
-        """Proposed scope below 40% → downgraded to next smaller scope with acceptable rate."""
+        """Proposed scope below 40% → downgraded to next smaller scope with acceptable rate.
+
+        Uses 'large' scope to exercise the downgrade path without triggering the
+        medium→large(decompose) upgrade.
+        """
         d = self._direction([
-            {"medium": {"created": 10, "merged": 3}},  # 30% < 40%
-            {"small": {"created": 5, "merged": 3}},    # 60% >= 40%
+            {"large": {"created": 10, "merged": 3}},   # 30% < 40%
+            {"medium": {"created": 5, "merged": 3}},   # 60% >= 40%
         ])
-        result_scope, calibrated_from = _calibrate_scope("medium", d)
-        assert result_scope == "small"
-        assert calibrated_from == "medium"
+        result_scope, calibrated_from = _calibrate_scope("large", d)
+        assert result_scope == "medium"
+        assert calibrated_from == "large"
 
     def test_smaller_scope_also_bad_returns_unchanged(self):
         """Proposed scope below 40% but no smaller scope has acceptable rate → no downgrade."""
@@ -1942,14 +1946,17 @@ class TestCalibrateScope:
         assert calibrated_from == "medium"
 
     def test_boundary_40_percent_smaller_scope_is_accepted(self):
-        """Smaller scope at exactly 40% merge rate should be accepted as downgrade target."""
+        """Smaller scope at exactly 40% merge rate should be accepted as downgrade target.
+
+        Uses 'large' scope to bypass the medium→large(decompose) upgrade path.
+        """
         d = self._direction([
-            {"medium": {"created": 10, "merged": 3}},  # 30% — triggers downgrade search
-            {"small": {"created": 5, "merged": 2}},    # 40% — should be accepted (>= 0.4)
+            {"large": {"created": 10, "merged": 3}},   # 30% — triggers downgrade search
+            {"medium": {"created": 5, "merged": 2}},   # 40% — should be accepted (>= 0.4)
         ])
-        result_scope, calibrated_from = _calibrate_scope("medium", d)
-        assert result_scope == "small"
-        assert calibrated_from == "medium"
+        result_scope, calibrated_from = _calibrate_scope("large", d)
+        assert result_scope == "medium"
+        assert calibrated_from == "large"
 
     def test_large_scope_downgrades_through_medium_to_small(self):
         """Large scope below threshold downgrades: picks first smaller scope with acceptable rate."""
@@ -1999,17 +2006,21 @@ class TestCalibrateScope:
         return p
 
     def test_project_fallback_downgrades_when_direction_data_insufficient(self):
-        """Direction has < 3 data points; project-wide rate < 30% → downgrade."""
+        """Direction has < 3 data points; project-wide rate < 30% → downgrade.
+
+        Uses 'large' scope so the project-fallback downgrade path is exercised
+        without triggering the medium→large(decompose) upgrade.
+        """
         d = self._direction([])  # no direction history
-        # Project-wide medium scope: 10 created / 1 merged = 10% < 30%
-        # Project-wide small scope: 5 created / 4 merged = 80% — acceptable target
+        # Project-wide large scope: 10 created / 1 merged = 10% < 30%
+        # Project-wide medium scope: 5 created / 4 merged = 80% — acceptable target
         project = self._project([
-            [{"medium": {"created": 5, "merged": 0}}, {"small": {"created": 3, "merged": 3}}],
-            [{"medium": {"created": 5, "merged": 1}}, {"small": {"created": 2, "merged": 1}}],
+            [{"large": {"created": 5, "merged": 0}}, {"medium": {"created": 3, "merged": 3}}],
+            [{"large": {"created": 5, "merged": 1}}, {"medium": {"created": 2, "merged": 1}}],
         ])
-        result_scope, calibrated_from = _calibrate_scope("medium", d, project)
-        assert result_scope == "small"
-        assert calibrated_from == "medium"
+        result_scope, calibrated_from = _calibrate_scope("large", d, project)
+        assert result_scope == "medium"
+        assert calibrated_from == "large"
 
     def test_project_fallback_softer_threshold_30_percent(self):
         """Project-wide rate at exactly 30% → not downgraded (threshold >= 0.3)."""
@@ -2051,6 +2062,62 @@ class TestCalibrateScope:
         """No project passed AND direction insufficient → unchanged (back-compat)."""
         d = self._direction([])
         assert _calibrate_scope("medium", d) == ("medium", None)
+
+    def test_medium_upgrades_to_large_when_small_is_healthy(self):
+        """Medium below threshold + small healthy → upgrade to large for plan-agent decomposition.
+
+        calibrated_from is the bare proposed scope ('medium') — the "(decompose)"
+        detail is logged, not persisted, so downstream consumers that treat
+        calibrated_from as a scope key (direction_outcomes bookkeeping,
+        prompt.ts calibration note, admin analytics) receive a valid scope.
+        """
+        d = self._direction([
+            {"medium": {"created": 10, "merged": 2}},  # 20% < 40%
+            {"small": {"created": 5, "merged": 4}},    # 80% >= 40% (healthy)
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "large"
+        assert calibrated_from == "medium"
+
+    def test_medium_no_upgrade_when_small_also_failing(self):
+        """Medium below threshold + small below threshold → systemic issue, no upgrade.
+
+        Falls through to downgrade loop; since small also fails, returns unchanged.
+        """
+        d = self._direction([
+            {"medium": {"created": 10, "merged": 2}},  # 20%
+            {"small": {"created": 5, "merged": 1}},    # 20% < 40%
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "medium"
+        assert calibrated_from is None
+
+    def test_medium_no_upgrade_when_small_lacks_data(self):
+        """Medium below threshold + small has insufficient data → no upgrade.
+
+        Without proven small-scope success, decomposition is not justified. Falls
+        through to existing downgrade behavior (which treats no-data as acceptable).
+        """
+        d = self._direction([
+            {"medium": {"created": 10, "merged": 2}},  # 20%
+            # no "small" data
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "small"
+        assert calibrated_from == "medium"
+
+    def test_large_does_not_upgrade(self):
+        """Upgrade path only fires for medium — large below threshold still downgrades normally."""
+        d = self._direction([
+            {"large": {"created": 10, "merged": 2}},   # 20%
+            {"medium": {"created": 5, "merged": 1}},   # 20% — bad, skipped
+            {"small": {"created": 5, "merged": 4}},    # 80% — healthy
+        ])
+        result_scope, calibrated_from = _calibrate_scope("large", d)
+        # Despite small being healthy (the trigger condition for upgrade), large
+        # only ever downgrades — calibrated_from is the bare scope, not a "→...(decompose)" marker.
+        assert result_scope == "small"
+        assert calibrated_from == "large"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

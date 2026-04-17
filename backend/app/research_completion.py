@@ -151,6 +151,26 @@ def _calibrate_scope(
     if rate is None or rate >= threshold:
         return proposed_scope, None
 
+    # Upgrade path: medium→large(decompose) when medium is failing but small is healthy.
+    # Why: downgrading medium→small forces medium-sized work into a small budget, triggering
+    # scope_overflow failures. Routing through large invokes the plan agent, which decomposes
+    # the work into multiple small subtasks — each succeeding at the healthy small-scope rate.
+    # calibrated_from is kept as the bare proposed scope so downstream consumers
+    # (direction_outcomes bookkeeping, prompt.ts, admin analytics) continue to receive
+    # a valid scope name — the "(decompose)" detail is captured in logs only.
+    if proposed_scope == "medium" and idx + 1 < len(_SCOPE_ORDER):
+        small_rate = _merge_rate("small")
+        if small_rate is not None and small_rate >= threshold:
+            larger = _SCOPE_ORDER[idx + 1]
+            logger.info(
+                "[RESEARCH] Upgrading scope %s→%s(decompose) for direction '%s' "
+                "(%s medium rate %.0f%% < %.0f%%, small rate %.0f%% healthy)",
+                proposed_scope, larger,
+                direction.get("title", direction.get("id", "?")),
+                source, rate * 100, threshold * 100, small_rate * 100,
+            )
+            return larger, proposed_scope
+
     # Downgrade to next smaller scope with acceptable rate
     for smaller_scope in reversed(_SCOPE_ORDER[:idx]):
         smaller_rate = _merge_rate(smaller_scope)

@@ -666,9 +666,19 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     scopeLines.push(scopeLine);
     if (effort) scopeLines.push(`Effort: ${effort}`);
     if (calibratedFrom && calibratedFrom !== taskScope) {
-      scopeLines.push(
-        `Note: This task was originally scoped as ${calibratedFrom} but calibrated down to ${taskScope} because ${calibratedFrom}-scope tasks have struggled for this direction. Stay tightly focused — the scope reduction is intentional to avoid the scope creep that caused prior ${calibratedFrom}-scope failures.`,
-      );
+      const order = ['small', 'medium', 'large'];
+      const fromIdx = order.indexOf(calibratedFrom);
+      const toIdx = order.indexOf(taskScope);
+      const isUpgrade = fromIdx >= 0 && toIdx > fromIdx;
+      if (isUpgrade) {
+        scopeLines.push(
+          `Note: This task was originally scoped as ${calibratedFrom} but calibrated up to ${taskScope} because ${calibratedFrom}-scope tasks have struggled for this direction while smaller scopes have succeeded. Decompose the work into independent smaller pieces — each piece should be small enough to succeed on its own.`,
+        );
+      } else {
+        scopeLines.push(
+          `Note: This task was originally scoped as ${calibratedFrom} but calibrated down to ${taskScope} because ${calibratedFrom}-scope tasks have struggled for this direction. Stay tightly focused — the scope reduction is intentional to avoid the scope creep that caused prior ${calibratedFrom}-scope failures.`,
+        );
+      }
     }
     scopeLines.push('');
     prefix += scopeLines.join('\n') + '\n';
