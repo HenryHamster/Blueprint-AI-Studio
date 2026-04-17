@@ -45,6 +45,12 @@ async function pushForceWithLeaseRetrying(branch: string, ws: WebSocket | null):
   sendLog(ws, `Retry push to ${branch} succeeded after rebasing onto concurrent work.\n`);
 }
 
+function fmtIssueLoc(i: { file?: string; line?: number }): string {
+  if (i.file && typeof i.line === 'number') return ` [${i.file}:${i.line}]`;
+  if (i.file) return ` [${i.file}]`;
+  return '';
+}
+
 // Mirrors backend _max_review_iterations (review_pipeline.py): ci_failure=8,
 // small=10, medium=12, else=16. Keep in sync — if this drifts, the agent will
 // claim "FINAL attempt" at the wrong iteration and collapse targeted fixes
@@ -100,7 +106,7 @@ export async function handleReview(
   const taskContext = task.context as Record<string, unknown> | undefined;
   const reviewLoop = taskContext?.review_loop as Record<string, unknown> | undefined;
   const iteration = (reviewLoop?.iteration as number | undefined) || 1;
-  const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string; issues?: Array<{severity: string; description: string}> }> | undefined) || [];
+  const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string; issues?: Array<{severity: string; description: string; file?: string; line?: number}> }> | undefined) || [];
   const taskScope = (taskContext?.scope as string | undefined) || 'medium';
   const origTaskType = strVal(payload.original_task_type || '');
 
@@ -161,9 +167,9 @@ export async function handleReview(
   const reviewHistorySection = reviewHistory.length > 0 && iteration > 1
     ? `Issues from previous iterations (verify each was addressed):\n${reviewHistory.map(e => {
         if (e.issues && e.issues.length > 0) {
-          const critical = e.issues.filter(i => i.severity === 'critical').map(i => '  [CRITICAL] ' + i.description);
-          const major = e.issues.filter(i => i.severity === 'major').map(i => '  [MAJOR] ' + i.description);
-          const minor = e.issues.filter(i => i.severity === 'minor').map(i => '  [MINOR] ' + i.description);
+          const critical = e.issues.filter(i => i.severity === 'critical').map(i => `  [CRITICAL]${fmtIssueLoc(i)} ${i.description}`);
+          const major = e.issues.filter(i => i.severity === 'major').map(i => `  [MAJOR]${fmtIssueLoc(i)} ${i.description}`);
+          const minor = e.issues.filter(i => i.severity === 'minor').map(i => `  [MINOR]${fmtIssueLoc(i)} ${i.description}`);
           return `- Iteration ${e.iteration}:\n` + [...critical, ...major, ...minor].join('\n');
         }
         return `- Iteration ${e.iteration}: ` + e.feedback.slice(0, 800);
@@ -370,7 +376,7 @@ export async function handleFix(
 
   // Prepend accumulated review history so the agent knows what was previously requested
   const reviewLoop = (task.context as Record<string, unknown> | undefined)?.review_loop as Record<string, unknown> | undefined;
-  const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string; issues?: Array<{severity: string; description: string}> }> | undefined) || [];
+  const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string; issues?: Array<{severity: string; description: string; file?: string; line?: number}> }> | undefined) || [];
   const iteration = (reviewLoop?.iteration as number | undefined) || 1;
   const maxIterations = computeMaxFixIterations(task);
   let iterationHeader = `You are on fix iteration ${iteration} of ${maxIterations}.\n`;
@@ -384,9 +390,9 @@ export async function handleFix(
       .map(e => {
         const issues = e.issues;
         if (issues && issues.length > 0) {
-          const critical = issues.filter(i => i.severity === 'critical').map(i => `  [CRITICAL] ${i.description}`);
-          const major = issues.filter(i => i.severity === 'major').map(i => `  [MAJOR] ${i.description}`);
-          const minor = issues.filter(i => i.severity === 'minor').map(i => `  [MINOR] ${i.description}`);
+          const critical = issues.filter(i => i.severity === 'critical').map(i => `  [CRITICAL]${fmtIssueLoc(i)} ${i.description}`);
+          const major = issues.filter(i => i.severity === 'major').map(i => `  [MAJOR]${fmtIssueLoc(i)} ${i.description}`);
+          const minor = issues.filter(i => i.severity === 'minor').map(i => `  [MINOR]${fmtIssueLoc(i)} ${i.description}`);
           return `- Iteration ${e.iteration}:\n${[...critical, ...major, ...minor].join('\n')}`;
         } else {
           return `- Iteration ${e.iteration}: ${e.feedback.slice(0, 1500)}`;

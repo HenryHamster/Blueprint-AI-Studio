@@ -1551,16 +1551,25 @@ async def _process_post_commit(
                     except Exception as e:
                         logger.error(f"[REVIEW PIPELINE] Could not fetch CI errors for fix context: {e}", exc_info=True)
                     if issues:
+                        def _fmt_issue(i):
+                            desc = i.get('description', '')
+                            file_ = i.get('file')
+                            line_ = i.get('line')
+                            if file_ and line_ is not None:
+                                return f"- [{file_}:{line_}] {desc}"
+                            if file_:
+                                return f"- [{file_}] {desc}"
+                            return f"- {desc}"
                         critical = [i for i in issues if i.get('severity') == 'critical']
                         major = [i for i in issues if i.get('severity') == 'major']
                         minor = [i for i in issues if i.get('severity') == 'minor']
                         structured = ""
                         if critical:
-                            structured += "\n\nCRITICAL issues (must fix):\n" + "\n".join(f"- {i['description']}" for i in critical)
+                            structured += "\n\nCRITICAL issues (must fix):\n" + "\n".join(_fmt_issue(i) for i in critical)
                         if major:
-                            structured += "\n\nMajor issues:\n" + "\n".join(f"- {i['description']}" for i in major)
+                            structured += "\n\nMajor issues:\n" + "\n".join(_fmt_issue(i) for i in major)
                         if minor:
-                            structured += "\n\nMinor issues:\n" + "\n".join(f"- {i['description']}" for i in minor)
+                            structured += "\n\nMinor issues:\n" + "\n".join(_fmt_issue(i) for i in minor)
                         fix_prompt_text = f"A code review requested changes. Address the following issues:{structured}{ci_errors_text}"
                     else:
                         fix_prompt_text = f"A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}"
