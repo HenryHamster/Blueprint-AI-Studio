@@ -110,6 +110,27 @@ def test_non_claude_rate_limit_messages_do_not_classify_as_rate_limit(msg, expec
     )
 
 
+def test_empty_status_and_logs_classify_as_agent_timeout():
+    """Whitespace-only combined log → AGENT_TIMEOUT (agent crash), not CODE_ERROR."""
+    t = MagicMock(spec=Task)
+    t.latest_status_message = ""
+    t.context = {}
+    assert classify_failure(t) == "AGENT_TIMEOUT"
+    assert classify_failure(t, logs="   \n\t") == "AGENT_TIMEOUT"
+
+
+def test_superseded_message_classifies_as_agent_timeout():
+    """'Superseded by fix on PR #N: ...' is system cancellation → AGENT_TIMEOUT."""
+    msg = "Superseded by fix on PR #1234: review was scoped to a pre-conflict snapshot"
+    assert classify_failure(_task(msg)) == "AGENT_TIMEOUT"
+
+
+def test_real_code_error_still_classifies_as_code_error():
+    """Regression: typical code-defect messages still classify as CODE_ERROR."""
+    assert classify_failure(_task("AssertionError: expected 3, got 4")) == "CODE_ERROR"
+    assert classify_failure(_task("TypeError: unsupported operand type(s)")) == "CODE_ERROR"
+
+
 def test_agent_reported_rate_limited_category_bypasses_text_match():
     """If the agent POSTs a structured failure_category=rate_limited, honor it
     regardless of the status message text — the agent has direct stderr access."""

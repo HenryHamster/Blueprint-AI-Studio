@@ -781,6 +781,90 @@ async def test_forced_resume_sets_grace_timestamp(dh_db):
     assert _dh._last_auto_resume_at is not None
 
 
+# ── Tests: nested pause preserves original pre-pause VM count ────────────────
+
+
+@pytest.mark.asyncio
+async def test_nested_pause_during_rampup_preserves_original_count(dh_db):
+    """After normal auto-resume, a second pause during ramp-up must capture the
+    ORIGINAL pre-pause capacity (from the DB ramp-up target), not the reduced
+    runtime value. Prevents the staircase ratcheting bug."""
+    # Simulate post-resume ramp-up state: DB holds target=10, runtime at 2.
+    from sqlalchemy import update
+    await _make_deploy_state(dh_db, status=DeploymentStatus.MONITORING)
+    await dh_db.execute(update(DeploymentState).where(DeploymentState.id == 1).values(runtime_max_concurrent_vms=10))
+    await dh_db.commit()
+    dh_db.expire_all()
+
+    _shared_state.runtime_config["max_concurrent_vms"] = 2  # mid ramp-up
+    _set_critical_failures("db")
+    _dh._pause_failure_streak = 2
+
+    await _dh._check_pause_mode()
+
+    dh_db.expire_all()
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    assert state.status == DeploymentStatus.PAUSED.value
+    # Must preserve the ORIGINAL target (10), NOT the intermediate runtime (2).
+    assert state.pre_pause_max_vms == 10
+    assert state.runtime_max_concurrent_vms == 10
+
+
+@pytest.mark.asyncio
+async def test_forced_resume_then_pause_preserves_original_count(dh_db):
+    """Forced resume leaves the DB ramp-up target intact at the original; a subsequent
+    pause must capture that original value, not the forced-resume's 1-VM runtime."""
+    from datetime import timedelta
+    long_ago = _dh._utcnow() - timedelta(seconds=10_000)
+    await _make_deploy_state(
+        dh_db,
+        status=DeploymentStatus.PAUSED,
+        pause_reason="External dependency down: claude_api",
+        pre_pause_max_vms=8,
+        paused_at=long_ago,
+    )
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+    _shared_state.runtime_config["max_auto_pause_duration_seconds"] = 7200
+    _shared_state.deploy_monitoring["window_start"] = None
+    _set_critical_failures("claude_api")
+
+    # Trigger forced resume.
+    await _dh._check_pause_mode()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 1
+
+    dh_db.expire_all()
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    # Forced resume must preserve the ORIGINAL target (8) as runtime_max_concurrent_vms,
+    # not the forced-resume's initial_vms (=1). Without this, a subsequent pause
+    # during ramp-up captures 1 instead of 8.
+    assert state.runtime_max_concurrent_vms == 8
+    assert state.pre_pause_max_vms is None  # cleared by resume
+
+
+@pytest.mark.asyncio
+async def test_full_recovery_pause_captures_target(dh_db):
+    """When ramp-up has fully reached the target, a fresh pause correctly captures
+    that target (no leftover ratcheting or phantom state)."""
+    from sqlalchemy import update
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    await dh_db.execute(update(DeploymentState).where(DeploymentState.id == 1).values(runtime_max_concurrent_vms=6))
+    await dh_db.commit()
+    dh_db.expire_all()
+
+    # Fully ramped up: runtime == target.
+    _shared_state.runtime_config["max_concurrent_vms"] = 6
+    _set_critical_failures("gcp")
+    _dh._pause_failure_streak = 2
+
+    await _dh._check_pause_mode()
+
+    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+    assert state.status == DeploymentStatus.PAUSED.value
+    assert state.pre_pause_max_vms == 6
+    assert state.runtime_max_concurrent_vms == 6
+
+
+
 # ── Tests: task_results staleness guard (auto-resume deadlock) ───────────────
 
 import os

@@ -493,11 +493,19 @@ async def _check_pause_mode():
                     logger.warning(f"[WS] health_degrading broadcast failed: {_be}")
             elif critical_failures and _pause_failure_streak >= 3 and _runtime_config["max_concurrent_vms"] > 0:
                 if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+                    # During ramp-up after a prior auto-resume, _runtime_config holds the
+                    # intermediate (small) VM count while state.runtime_max_concurrent_vms
+                    # holds the original pre-pause target. Preserve the larger so nested
+                    # pause cycles don't ratchet capacity down.
+                    original_capacity = max(
+                        _runtime_config["max_concurrent_vms"],
+                        state.runtime_max_concurrent_vms or 0,
+                    )
                     state.status = DeploymentStatus.PAUSED
                     state.pause_reason = f"External dependency down: {', '.join(critical_failures)}"
                     state.paused_at = _utcnow()
-                    state.pre_pause_max_vms = _runtime_config["max_concurrent_vms"]
-                    state.runtime_max_concurrent_vms = _runtime_config["max_concurrent_vms"]
+                    state.pre_pause_max_vms = original_capacity
+                    state.runtime_max_concurrent_vms = original_capacity
                     session.add(state)
                     await _create_auto_pause_alerts(session, critical_failures)
                     await session.commit()
@@ -560,7 +568,10 @@ async def _check_pause_mode():
         state.pause_reason = None
         state.paused_at = None
         state.pre_pause_max_vms = None
-        state.runtime_max_concurrent_vms = initial_vms if should_force_resume else restore
+        # Always persist the ORIGINAL target as the ramp-up target, even on forced
+        # resume. Previously forced resume stored initial_vms (=1), which caused
+        # nested pause cycles to ratchet capacity down permanently.
+        state.runtime_max_concurrent_vms = restore
         session.add(state)
         if should_force_resume:
             await _create_forced_resume_alerts(session, pause_duration, critical_failures)

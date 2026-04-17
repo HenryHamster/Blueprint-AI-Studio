@@ -142,6 +142,11 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     logs_lower = (logs or "").lower()
     combined = status_msg + " " + logs_lower
 
+    # Empty/whitespace-only combined log — agent crashed or never communicated.
+    # Classify as AGENT_TIMEOUT (infra) rather than falling through to CODE_ERROR.
+    if not combined.strip():
+        return AGENT_TIMEOUT
+
     # Database / internal service unavailable — checked before provision failures because
     # PostgreSQL errors like "could not connect to server: Connection refused" contain
     # "connection refused" which would otherwise be misclassified as PROVISION_FAILURE.
@@ -249,6 +254,11 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     # "Cancelled: parent dependency failed", "Cancelled: parent evaluation timeout", etc.
     if combined.startswith("cancelled:"):
         return "AGENT_TIMEOUT"
+
+    # System-initiated supersession — review pipeline cancels stale tasks with
+    # "Superseded by fix on PR #N: ...". Same family as "cancelled:" above.
+    if "superseded" in combined:
+        return AGENT_TIMEOUT
 
     # Default: code error
     return "CODE_ERROR"

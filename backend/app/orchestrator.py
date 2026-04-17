@@ -41,7 +41,7 @@ from app.orchestrator_filters import (
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
-from app.time_utils import _utcnow, set_retry_after
+from app.time_utils import _utcnow, rate_limit_retry_minutes, set_retry_after
 
 logger = logging.getLogger("blueprint")
 
@@ -1262,10 +1262,11 @@ async def orchestrator_worker():
                                 stall_msg = f'All accounts rate-limited — earliest recovery in {int(wait_min)}min'
                             else:
                                 stall_msg = 'All accounts rate-limited — waiting for cooldown'
-                            # Short retry delay so we don't hot-loop while all accounts are blocked.
-                            # Cap at 2 min to stay responsive when accounts recover sooner.
+                            # Retry delay based on earliest known recovery to avoid
+                            # hot-looping every 2 min when recovery is hours away.
+                            # set_retry_after clamps to RETRY_AFTER_MAX_MINUTES.
                             stall_ctx = dict(task.context or {})
-                            set_retry_after(stall_ctx, 2)
+                            set_retry_after(stall_ctx, rate_limit_retry_minutes(earliest_recovery))
                             task.context = stall_ctx
                             if not (task.latest_status_message or "").startswith("All accounts"):
                                 # Update directly on the locked task object (separate session would deadlock)
@@ -1515,6 +1516,22 @@ async def orchestrator_worker():
                 elif _stall_action == "fire":
                     _all_accounts_blocked_alerted = True
                     await _emit_all_accounts_blocked_stall(session, _cycle_earliest_recovery)
+
+                # Per-cycle broadcast so operators can see held-task counts in
+                # the admin UI without tailing logs. Distinct from the debounced
+                # pipeline_throttle alert: this fires every cycle any tasks are held.
+                if _cycle_accounts_blocked > 0:
+                    try:
+                        from app.broadcast import manager as _ws_manager  # noqa: PLC0415
+                        await _ws_manager.broadcast_to_all("tasks_held_by_rate_limit", {
+                            "count": _cycle_accounts_blocked,
+                            "earliest_recovery": (
+                                _cycle_earliest_recovery.isoformat()
+                                if _cycle_earliest_recovery else None
+                            ),
+                        })
+                    except Exception:
+                        logger.exception("[ORCHESTRATOR] Failed to broadcast tasks_held_by_rate_limit")
 
                 # Flush any status message updates from skipped tasks (e.g., "All accounts rate-limited")
                 if session.dirty:

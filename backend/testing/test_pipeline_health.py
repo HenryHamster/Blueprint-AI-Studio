@@ -2180,3 +2180,48 @@ async def test_all_accounts_blocked_emits_broadcast_and_alert(monkeypatch):
     stall_alerts = [a for a in added if isinstance(a, Alert) and a.severity == AlertSeverity.ERROR]
     assert len(stall_alerts) == 1
     assert "all Max plan accounts" in stall_alerts[0].message.lower() or "rate-limited" in stall_alerts[0].title.lower()
+
+
+# ── rate_limit_retry_minutes helper ──────────────────────────────────────────
+
+def test_rate_limit_retry_minutes_uses_earliest_recovery():
+    """When a recovery time is known, delay scales with time-to-recovery."""
+    from app.time_utils import rate_limit_retry_minutes
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    earliest = now + timedelta(minutes=45)
+    assert rate_limit_retry_minutes(earliest, now=now) == pytest.approx(45.0)
+
+
+def test_rate_limit_retry_minutes_falls_back_to_short_default():
+    """With no recovery time known, delay falls back to a short default (>0)."""
+    from app.time_utils import rate_limit_retry_minutes
+
+    delay = rate_limit_retry_minutes(None)
+    assert 0 < delay <= 5
+
+
+def test_rate_limit_retry_minutes_clamped_to_max_via_set_retry_after():
+    """A far-future recovery (e.g. 4h) is clamped by set_retry_after's ceiling."""
+    from app.time_utils import (
+        RETRY_AFTER_MAX_MINUTES,
+        _utcnow,
+        parse_retry_after,
+        rate_limit_retry_minutes,
+        set_retry_after,
+    )
+
+    earliest = _utcnow() + timedelta(hours=4)
+    raw_min = rate_limit_retry_minutes(earliest)
+    # Helper itself returns the raw (uncapped) minutes — caller (set_retry_after) clamps.
+    assert raw_min > RETRY_AFTER_MAX_MINUTES
+
+    ctx: dict = {}
+    set_retry_after(ctx, raw_min)
+    written = parse_retry_after(ctx["retry_after"])
+    assert written is not None
+    # Written retry_after must not exceed now + RETRY_AFTER_MAX_MINUTES (allow 1s slack).
+    max_allowed = _utcnow() + timedelta(minutes=RETRY_AFTER_MAX_MINUTES, seconds=1)
+    assert written <= max_allowed
+    # And must be significantly longer than the prior 2-minute fixed default.
+    assert written > _utcnow() + timedelta(minutes=10)
