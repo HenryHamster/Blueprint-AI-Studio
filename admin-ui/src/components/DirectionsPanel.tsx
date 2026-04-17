@@ -508,8 +508,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                 setConfigCooldownHours={config.setConfigCooldownHours}
                 configIntervalMinutes={config.configIntervalMinutes}
                 setConfigIntervalMinutes={config.setConfigIntervalMinutes}
-                configWaveSize={config.configWaveSize}
-                setConfigWaveSize={config.setConfigWaveSize}
+                configMaxParallel={config.configMaxParallel}
+                setConfigMaxParallel={config.setConfigMaxParallel}
                 configMaxTasksPerHour={config.configMaxTasksPerHour}
                 setConfigMaxTasksPerHour={config.setConfigMaxTasksPerHour}
                 autonomousConfigOpen={config.autonomousConfigOpen}

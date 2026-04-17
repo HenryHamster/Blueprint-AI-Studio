@@ -6,8 +6,8 @@ export interface AutonomousConfigSectionProps {
   setConfigCooldownHours: (v: number) => void;
   configIntervalMinutes: number;
   setConfigIntervalMinutes: (v: number) => void;
-  configWaveSize: number;
-  setConfigWaveSize: (v: number) => void;
+  configMaxParallel: number;
+  setConfigMaxParallel: (v: number) => void;
   configMaxTasksPerHour: number;
   setConfigMaxTasksPerHour: (v: number) => void;
   autonomousConfigOpen: boolean;
@@ -19,7 +19,7 @@ export interface AutonomousConfigSectionProps {
 export function AutonomousConfigSection({
   configCooldownHours, setConfigCooldownHours,
   configIntervalMinutes, setConfigIntervalMinutes,
-  configWaveSize, setConfigWaveSize,
+  configMaxParallel, setConfigMaxParallel,
   configMaxTasksPerHour, setConfigMaxTasksPerHour,
   autonomousConfigOpen, setAutonomousConfigOpen,
   savingConfigField, saveConfigField,
@@ -84,20 +84,20 @@ export function AutonomousConfigSection({
             </button>
           </div>
 
-          {/* Wave size */}
+          {/* Max parallel research tasks per project per cycle */}
           <div className="flex items-center gap-2">
-            <label className="text-[11px] text-neutral-400 w-32 shrink-0">Wave size</label>
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Max concurrent research/plan tasks spawned per project per autonomy cycle">Max parallel</label>
             <input
               type="number"
               min={1}
-              max={50}
-              value={configWaveSize}
-              onChange={e => setConfigWaveSize(Number(e.target.value))}
+              max={20}
+              value={configMaxParallel}
+              onChange={e => setConfigMaxParallel(Number(e.target.value))}
               className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
             <button
-              onClick={() => saveConfigField('autonomous_research_wave_size', configWaveSize)}
-              disabled={savingConfigField === 'autonomous_research_wave_size'}
+              onClick={() => saveConfigField('max_parallel_research_per_project', configMaxParallel)}
+              disabled={savingConfigField === 'max_parallel_research_per_project'}
               className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
               title="Save"
             >

@@ -316,7 +316,7 @@ async def get_settings(
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
         "autonomous_direction_cooldown_minutes": _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
-        "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 3),
+        "max_parallel_research_per_project": _runtime_config.get("max_parallel_research_per_project", 3),
         "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
         "github_account": github_account,
         "require_approval_gates": _runtime_config.get("require_approval_gates", True),
@@ -478,14 +478,6 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_hours must be a number")
         _runtime_config["autonomous_direction_cooldown_minutes"] = val * 60
-    if "autonomous_research_wave_size" in payload:
-        try:
-            val = int(payload["autonomous_research_wave_size"])
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="autonomous_research_wave_size must be a number")
-        if not (1 <= val <= 50):
-            raise HTTPException(status_code=400, detail="autonomous_research_wave_size must be between 1 and 50")
-        _runtime_config["autonomous_research_wave_size"] = val
     if "strategic_research_frequency" in payload:
         try:
             val = int(payload["strategic_research_frequency"])
@@ -627,7 +619,6 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
                     "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
                     "health_check_urls": _runtime_config.get("health_check_urls", []),
-                    "autonomous_research_wave_size": _runtime_config.get("autonomous_research_wave_size", 3),
                     "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
                     "require_approval_gates": _runtime_config.get("require_approval_gates", True),
                     "daily_cost_ceiling_usd": _runtime_config.get("daily_cost_ceiling_usd", 0),

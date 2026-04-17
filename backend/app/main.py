@@ -308,8 +308,6 @@ async def _init_deployment_state():
                              "notification_config"):
                     if key in config_json:
                         _runtime_config[key] = config_json[key]
-                if "autonomous_research_wave_size" in config_json:
-                    _runtime_config["autonomous_research_wave_size"] = int(config_json["autonomous_research_wave_size"])
                 if "strategic_research_frequency" in config_json:
                     _runtime_config["strategic_research_frequency"] = int(config_json["strategic_research_frequency"])
                 if "require_approval_gates" in config_json:

@@ -9,7 +9,7 @@ interface UseAutonomousConfigDeps {
 export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigDeps) {
   const [configCooldownHours, setConfigCooldownHours] = useState<number>(24);
   const [configIntervalMinutes, setConfigIntervalMinutes] = useState<number>(60);
-  const [configWaveSize, setConfigWaveSize] = useState<number>(3);
+  const [configMaxParallel, setConfigMaxParallel] = useState<number>(3);
   const [configMaxTasksPerHour, setConfigMaxTasksPerHour] = useState<number>(10);
   const [autonomousConfigOpen, setAutonomousConfigOpen] = useState(false);
   const [savingConfigField, setSavingConfigField] = useState<string | null>(null);
@@ -37,7 +37,7 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
       const data = await res.json();
       if (data.autonomous_direction_cooldown_minutes != null) setConfigCooldownHours(data.autonomous_direction_cooldown_minutes / 60);
       if (data.autonomous_research_interval_minutes != null) setConfigIntervalMinutes(data.autonomous_research_interval_minutes);
-      if (data.autonomous_research_wave_size != null) setConfigWaveSize(data.autonomous_research_wave_size);
+      if (data.max_parallel_research_per_project != null) setConfigMaxParallel(data.max_parallel_research_per_project);
       if (data.max_autonomous_tasks_per_hour != null) setConfigMaxTasksPerHour(data.max_autonomous_tasks_per_hour);
     } catch { /* ignore */ }
   }
@@ -62,7 +62,7 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
   return {
     configCooldownHours, setConfigCooldownHours,
     configIntervalMinutes, setConfigIntervalMinutes,
-    configWaveSize, setConfigWaveSize,
+    configMaxParallel, setConfigMaxParallel,
     configMaxTasksPerHour, setConfigMaxTasksPerHour,
     autonomousConfigOpen, setAutonomousConfigOpen,
     savingConfigField,

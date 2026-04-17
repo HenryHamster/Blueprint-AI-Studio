@@ -871,37 +871,37 @@ async def test_delete_nonexistent_direction_returns_404(client: AsyncClient, moc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. autonomous_research_wave_size settings
+# 7. max_parallel_research_per_project settings
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_get_settings_returns_wave_size_default(client: AsyncClient):
-    """GET /api/admin/settings returns autonomous_research_wave_size with default 3."""
+async def test_get_settings_returns_max_parallel_default(client: AsyncClient):
+    """GET /api/admin/settings returns max_parallel_research_per_project with default 3."""
     resp = await client.get("/api/admin/settings")
     assert resp.status_code == 200
     data = resp.json()
-    assert "autonomous_research_wave_size" in data
-    assert data["autonomous_research_wave_size"] == 3
+    assert "max_parallel_research_per_project" in data
+    assert data["max_parallel_research_per_project"] == 3
 
 
 @pytest.mark.asyncio
-async def test_patch_settings_wave_size_persists(client: AsyncClient):
-    """PATCH /api/admin/settings with autonomous_research_wave_size updates the value."""
-    resp = await client.patch("/api/admin/settings", json={"autonomous_research_wave_size": 10})
+async def test_patch_settings_max_parallel_persists(client: AsyncClient):
+    """PATCH /api/admin/settings with max_parallel_research_per_project updates the value."""
+    resp = await client.patch("/api/admin/settings", json={"max_parallel_research_per_project": 5})
     assert resp.status_code == 200
 
     resp2 = await client.get("/api/admin/settings")
     assert resp2.status_code == 200
-    assert resp2.json()["autonomous_research_wave_size"] == 10
+    assert resp2.json()["max_parallel_research_per_project"] == 5
 
 
 @pytest.mark.asyncio
-async def test_patch_settings_wave_size_invalid_returns_400(client: AsyncClient):
-    """PATCH /api/admin/settings with out-of-range wave_size returns 400."""
-    resp = await client.patch("/api/admin/settings", json={"autonomous_research_wave_size": 0})
+async def test_patch_settings_max_parallel_invalid_returns_400(client: AsyncClient):
+    """PATCH /api/admin/settings with out-of-range max_parallel_research_per_project returns 400."""
+    resp = await client.patch("/api/admin/settings", json={"max_parallel_research_per_project": 0})
     assert resp.status_code == 400
 
-    resp2 = await client.patch("/api/admin/settings", json={"autonomous_research_wave_size": 51})
+    resp2 = await client.patch("/api/admin/settings", json={"max_parallel_research_per_project": 21})
     assert resp2.status_code == 400
 
 
