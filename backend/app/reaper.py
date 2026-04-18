@@ -552,6 +552,7 @@ async def reaper_service():
                                 # (only for agent failures — provision failures ran no agent code)
                                 if not is_provision_failure:
                                     reaper_ctx["_attempt_number"] = task.attempt_count
+                                    reaper_ctx["_max_attempts"] = class_budget
                                     reaper_ctx["_previous_error"] = (task.latest_status_message or "")[:1500]
                                     reaper_ctx["_previous_failure_class"] = _reap_failure_class
                                     _prior_history = reaper_ctx.get("_failure_class_history") or []
@@ -565,6 +566,39 @@ async def reaper_service():
                                     _copy_analysis_artifacts_to_previous(reaper_ctx)
                             except Exception:
                                 logger.exception("[REAPER] Failed to enrich retry context for task %s", task.id)
+                            if not is_provision_failure:
+                                try:
+                                    from app.task_lifecycle import _build_retry_prompt_suffix  # noqa: PLC0415
+                                    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                    _task_scope = (
+                                        reaper_ctx.get("scope")
+                                        or (task.first_payload or {}).get("scope")
+                                        or "small"
+                                    )
+                                    _prior_error = (
+                                        (task.context or {}).get("last_error")
+                                        or reaper_ctx.get("_previous_error")
+                                        or ""
+                                    )
+                                    _extra_guidance, _scope_override = _build_retry_prompt_suffix(
+                                        reap_failure_class, _prior_error, task.attempt_count, _task_scope, reaper_ctx,
+                                    )
+                                    if _scope_override:
+                                        reaper_ctx["scope"] = _scope_override
+                                        reaper_ctx["_scope_reduced"] = True
+                                    if _extra_guidance and task.payloads:
+                                        _new_payloads = list(task.payloads)
+                                        if isinstance(_new_payloads[0], dict):
+                                            _p0 = dict(_new_payloads[0])
+                                            _existing_suffix = _p0.get("prompt_suffix", "") or ""
+                                            _p0["prompt_suffix"] = _extra_guidance + (
+                                                "\n" + _existing_suffix if _existing_suffix else ""
+                                            )
+                                            _new_payloads[0] = _p0
+                                            task.payloads = _new_payloads
+                                            flag_modified(task, "payloads")
+                                except Exception:
+                                    logger.exception("[REAPER] Failed to inject retry guidance for task %s", task.id)
                             if is_provision_failure and (task.context or {}).get("_infra_wait"):
                                 # Infra-wide failure: align with zone recovery
                                 recovery = soonest_zone_recovery()

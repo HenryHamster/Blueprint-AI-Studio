@@ -66,7 +66,10 @@ def _detect_issue_churn(history: list) -> tuple[bool, list[int]]:
     if any(c == 0 for c in counts):
         return (False, counts)
     non_decreasing = all(counts[i + 1] >= counts[i] for i in range(len(counts) - 1))
-    return (non_decreasing, counts)
+    # Oscillating patterns (e.g. [5, 3, 5], [4, 2, 4]) also represent zero net
+    # progress: the fix agent removes some issues but reintroduces others.
+    no_net_progress = counts[-1] >= counts[0]
+    return (non_decreasing or no_net_progress, counts)
 
 
 _CHURN_NARROW_FOCUS_PREFIX = (

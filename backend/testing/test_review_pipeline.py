@@ -2849,6 +2849,28 @@ class TestDetectIssueChurn:
         is_churn, _ = _detect_issue_churn(hist)
         assert is_churn is False
 
+    def test_oscillating_counts_is_churn(self):
+        # Counts 5, 3, 5 — dip then rebound to original → zero net progress.
+        hist = [
+            self._entry([_issue(f"a{i}") for i in range(5)]),
+            self._entry([_issue(f"b{i}") for i in range(3)]),
+            self._entry([_issue(f"c{i}") for i in range(5)]),
+        ]
+        is_churn, counts = _detect_issue_churn(hist)
+        assert is_churn is True
+        assert counts == [5, 3, 5]
+
+    def test_dip_then_partial_recover_not_churn(self):
+        # Counts 4, 2, 3 — final below first → net progress, not churn.
+        hist = [
+            self._entry([_issue(f"a{i}") for i in range(4)]),
+            self._entry([_issue(f"b{i}") for i in range(2)]),
+            self._entry([_issue(f"c{i}") for i in range(3)]),
+        ]
+        is_churn, counts = _detect_issue_churn(hist)
+        assert is_churn is False
+        assert counts == [4, 2, 3]
+
     def test_minor_issues_ignored(self):
         hist = [
             self._entry([_issue("a", "MINOR")]),
