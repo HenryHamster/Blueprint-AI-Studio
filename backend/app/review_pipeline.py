@@ -541,7 +541,7 @@ async def _spawn_pipeline_task(
     # Track review-fix iteration count to prevent infinite loops (per-chain)
     source_loop = (source_task.context or {}).get("review_loop", {})
     iteration = source_loop.get("iteration", 0) + 1
-    per_chain_cap = _max_review_iterations(source_task)
+    per_chain_cap = _max_review_iterations(source_task, direction_data)
 
     if iteration > per_chain_cap:
         logger.warning(f"[PIPELINE] Review-fix cycle limit reached for PR #{pr_number} after {iteration - 1} iterations")
@@ -719,12 +719,13 @@ async def _spawn_pipeline_task(
         # Issue-churn detection: complements stuck-cycle above. If total
         # CRITICAL+MAJOR count fails to decrease across the last
         # ISSUE_CHURN_WINDOW iterations (even though the specific issues are
-        # rotating and so evading Jaccard stuck detection), halve the
-        # remaining iteration cap and instruct the fix agent to narrow focus.
+        # rotating and so evading Jaccard stuck detection), reduce the
+        # remaining iteration cap by ~1/3 and instruct the fix agent to
+        # narrow focus. The stuck-cycle detector handles harsher intervention.
         is_churn, churn_counts = _detect_issue_churn(new_review_history)
         if is_churn and task_type == "fix":
             remaining = max(per_chain_cap - iteration, 0)
-            reduced_cap = iteration + (remaining // 2)
+            reduced_cap = iteration + (remaining * 2 // 3)
             if reduced_cap < per_chain_cap:
                 logger.warning(
                     f"[PIPELINE] Issue churn detected for PR #{pr_number}: "

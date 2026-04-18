@@ -360,7 +360,10 @@ export async function handleReview(
   const reviewBudgetHint = reviewMidBudget
     ? `\nBudget-awareness: you are at or past 50% of the ${reviewMaxIterations}-iteration budget. Do NOT flag MINOR-severity issues — every iteration now costs a meaningful fraction of remaining budget and cosmetic nits are not worth a round trip. Focus only on CRITICAL and MAJOR findings. If only MINOR issues remain, APPROVE and note them as non-blocking polish in \`feedback\`.`
     : '';
-  const iterationPreamble = `This is review iteration ${iteration} of ${reviewMaxIterations} in the automated review-fix cycle.${iteration > 1 ? '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.' : ''}${reviewBudgetHint}`;
+  const smallScopeEarlyHint = iteration === 1 && taskScope === 'small' && !isScopeOverflow
+    ? `\nSmall-scope early-iteration guidance: MINOR-severity issues (cosmetic nits, naming preferences, non-critical style) are NON-BLOCKING for small-scope changes. Do NOT include them in the \`issues\` array — mention them in \`feedback\` as optional polish. Only CRITICAL and MAJOR issues should drive a REQUEST_CHANGES verdict. A small-scope PR with only MINOR findings should APPROVE.`
+    : '';
+  const iterationPreamble = `This is review iteration ${iteration} of ${reviewMaxIterations} in the automated review-fix cycle.${iteration > 1 ? '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.' : ''}${reviewBudgetHint}${smallScopeEarlyHint}`;
 
   // Rollup PRs (head branch research/* or plan/*) contain N subtask squash-merge
   // commits whose titles end in "(#NNNN)". The `(#NNNN)` marker means a PR was
@@ -607,6 +610,12 @@ export async function handleFix(
     iterationHeader += 'This is your FINAL attempt. If this fix is not accepted, the task will require manual intervention. Address every feedback point thoroughly.\n';
   } else if (iteration * 2 >= maxIterations) {
     iterationHeader += 'Convergence mode: you are at or past 50% of the iteration budget. Make only the minimal changes needed to address the specific issues listed below. Do NOT touch files that are not mentioned in the review feedback, do NOT refactor or clean up adjacent code, and defer any non-blocking improvements to follow-up tasks. Scope creep at this stage commonly exhausts the remaining budget and forces the PR to close unmerged.\n';
+    const latestIssues = reviewHistory[reviewHistory.length - 1]?.issues || [];
+    const criticalCount = latestIssues.filter(i => i.severity === 'critical').length;
+    const majorCount = latestIssues.filter(i => i.severity === 'major').length;
+    if (criticalCount + majorCount > 0) {
+      iterationHeader += `Address exactly ${criticalCount} CRITICAL and ${majorCount} MAJOR issue(s) below. Do NOT introduce new changes beyond what these issues require.\n`;
+    }
   }
   const originalPromptSection = originalPrompt ? `## Original Task Goal\n${originalPrompt}\n\n` : '';
   let basePrompt = originalPromptSection + iterationHeader + prompt;

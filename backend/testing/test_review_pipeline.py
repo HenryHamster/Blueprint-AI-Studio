@@ -2861,7 +2861,7 @@ class TestDetectIssueChurn:
 
 
 @pytest.mark.asyncio
-async def test_issue_churn_injects_narrow_focus_and_halves_cap(db_session, mocker):
+async def test_issue_churn_injects_narrow_focus_and_reduces_cap(db_session, mocker):
     """When CRITICAL+MAJOR counts don't decrease across ISSUE_CHURN_WINDOW iterations
     (but the specific issues rotate, evading stuck-cycle detection), the spawned fix
     task should get a narrow-focus directive prefix and a reduced per-chain cap."""
@@ -2929,7 +2929,7 @@ async def test_issue_churn_injects_narrow_focus_and_halves_cap(db_session, mocke
     assert "ISSUE CHURN DETECTED" in (payload.get("prompt") or "")
     assert "Please fix." in payload["prompt"]
 
-    # Per-chain cap reduced (original cap minus half of remaining).
+    # Per-chain cap reduced (original cap minus one-third of remaining).
     ctx_cap = (result.context or {}).get("review_loop", {}).get("max_iterations")
     source_cap_ctx = (source_task.context or {}).get("review_loop", {}).get("max_iterations")
     # Source task didn't set max_iterations → per-chain cap came from

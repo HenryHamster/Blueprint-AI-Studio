@@ -1772,11 +1772,16 @@ async def _process_post_commit(
                                 buckets = _categorize_review_issues(rh_items)
                                 rejection_cats = {cat: len(items) for cat, items in buckets.items() if items}
                                 if rejection_cats:
+                                    minor_only = all(
+                                        (i.get("severity", "minor") or "minor").lower() == "minor"
+                                        for i in issues if i.get("description")
+                                    )
                                     orig_task = await session.get(Task, uuid.UUID(original_task_id))
                                     if orig_task:
                                         orig_task.context = {
                                             **(orig_task.context or {}),
                                             "_first_attempt_rejection_categories": rejection_cats,
+                                            "_first_attempt_minor_only": minor_only,
                                         }
                                         flag_modified(orig_task, "context")
                                         session.add(orig_task)
