@@ -8,7 +8,7 @@ import {
   captureTestBaseline, sendHeartbeatSync,
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
-import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY } from '../constants.js';
+import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT } from '../constants.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, formatProjectContext, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
@@ -201,6 +201,9 @@ export function detectMediumScopeSubsystemHint(changedFiles: string): string {
     return 'This is a medium-scope change confined to admin-ui/ (frontend). Deprioritize backend-specific checks like SQL injection, server-side authorization, and database query review. Focus on Correctness & Logic, Build & Type Safety, XSS risks, and frontend-specific concerns.\n\n';
   }
   if (paths.every(p => p.startsWith('backend/'))) {
+    if (paths.every(p => p.startsWith('backend/testing/') || /(^|\/)test_[^/]+\.py$|(^|\/)conftest\.py$/.test(p))) {
+      return 'This is a medium-scope change confined to backend test files (backend/testing/). Deprioritize SQL injection, authorization, and input-validation checks — these tests do not handle real user input or production database connections. Focus on test quality: correct assertions, test isolation, fixture cleanup, and coverage of the intended behavior.\n\n';
+    }
     return 'This is a medium-scope change confined to backend/. Apply full security scrutiny — review SQL injection, authorization checks, input validation, and server-side concerns thoroughly.\n\n';
   }
   return '';
@@ -622,7 +625,7 @@ export async function handleFix(
         }
       })
       .join('\n');
-    basePrompt = `${originalPromptSection}Previous review iterations (issues marked "(likely resolved ...)" were not re-flagged in the following iteration — treat as historical context, focus on the current feedback):\n${historyLines}\n\nCurrent review feedback to address:\n${prompt}`;
+    basePrompt = `${originalPromptSection}${iterationHeader}Previous review iterations (issues marked "(likely resolved ...)" were not re-flagged in the following iteration — treat as historical context, focus on the current feedback):\n${historyLines}\n\nCurrent review feedback to address:\n${prompt}`;
   }
 
   // Always check for conflict markers — even if rebase/merge appeared to succeed
@@ -639,7 +642,7 @@ export async function handleFix(
   // Also check for conflict markers in tracked files via grep
   if (!hasConflicts) {
     try {
-      const markerCheck = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
+      const markerCheck = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: CONFLICT_CHECK_TIMEOUT }).trim();
       if (markerCheck) {
         enrichedPrompt = `CONFLICT MARKERS FOUND in the following files:\n${markerCheck}${originalPrompt ? `\n\nThis PR's goal: ${originalPrompt.slice(0, 500)}` : ''}\n\nResolve ALL conflict markers (${'<'.repeat(7)} ${'='.repeat(7)} ${'>'.repeat(7)}) in each file. ${baseBranch} is the source of truth — keep its refactors and restructuring, and re-apply only this PR's specific changes (described above) on top.\n\n${basePrompt}`;
         sendLog(ws, `Files with conflict markers:\n${markerCheck}\n`);

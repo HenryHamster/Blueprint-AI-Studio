@@ -393,6 +393,18 @@ describe('detectMediumScopeSubsystemHint — medium-scope subsystem hint', () =>
     expect(hint).toContain('full security scrutiny');
   });
 
+  it('deprioritizes security for backend/testing-only changes', () => {
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/testing/test_foo.py\nA\tbackend/testing/test_bar.py');
+    expect(hint).toContain('test');
+    expect(hint).toContain('Deprioritize');
+    expect(hint).not.toContain('full security scrutiny');
+  });
+
+  it('keeps full security scrutiny when backend changes include a non-test file', () => {
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/testing/test_foo.py\nM\tbackend/app/main.py');
+    expect(hint).toContain('full security scrutiny');
+  });
+
   it('returns empty string for mixed-subsystem changes (no deprioritization)', () => {
     const hint = detectMediumScopeSubsystemHint('M\tagent/src/index.ts\nM\tbackend/app/main.py');
     expect(hint).toBe('');

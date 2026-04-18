@@ -10,7 +10,8 @@ Check for:
 2. **Missing test coverage** (MAJOR) — Is there new behavior with no corresponding test?
 3. **Error handling** (MAJOR) — Are async operations properly awaited, exceptions caught where needed, null checks present?
 4. **Security quick-check** (CRITICAL) — Are any user inputs passed unsanitized to queries, commands, or HTML output?
-5. **Import and type verification** (MAJOR) — Are new imports available, type annotations correct, and do modified exports match their callers?`;
+5. **Import and type verification** (MAJOR) — Are new imports available, type annotations correct, and do modified exports match their callers?
+6. **Scope violations** (MAJOR) — Small-scope tasks have a 6-file budget for non-test production files and fail a hard gate if exceeded. Count the non-test files you changed; if over budget or any file is not essential to the task, revert it now.`;
   }
   if (taskScope === 'large') {
     return `Check for:
