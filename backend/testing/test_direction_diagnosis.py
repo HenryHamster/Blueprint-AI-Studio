@@ -24,7 +24,7 @@ from app.direction_lifecycle import (
     _process_direction_lifecycle,
     _spawn_direction_diagnosis,
 )
-from app.models import ArtifactType, MessageType, Project, ProjectMessage, Task, TaskStatus
+from app.models import Alert, AlertSeverity, ArtifactType, MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.task_completion import _handle_investigation_completion, _record_remediation_outcome
 
 
@@ -434,6 +434,63 @@ async def test_stale_monitor_cleared_without_escalation(db_session, mocker):
     )
     assert d.get("needs_manual_intervention") is not True
     assert "remediation_monitor_started_at" not in d
+
+
+@pytest.mark.asyncio
+async def test_auto_retire_at_threshold_creates_alert(db_session, mocker):
+    """Auto-retire on reaching MAX_AUTO_PAUSE_CYCLES creates an INFO Alert and marks direction completed."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new_callable=AsyncMock,
+    )
+    # auto_pause_count=2 → increments to 3 (MAX_AUTO_PAUSE_CYCLES) on this pause.
+    # Rule 3 history trips a code-failure pause reason so the auto-pause path runs.
+    direction = {
+        "id": "d-retire-1",
+        "text": "Chronically failing direction requiring auto-retire",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "auto_pause_count": 2,
+        "research_history": [
+            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+        ],
+    }
+    project = Project(
+        name="Auto-retire Alert",
+        user_id="u-retire",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "completed"
+    assert d.get("auto_completed") is True
+    assert d.get("auto_completed_reason")
+    assert "auto-retired" in d["auto_completed_reason"].lower()
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.INFO
+    assert alert.title == "Direction auto-retired"
+    assert "auto-retired" in alert.message.lower()
 
 
 @pytest.mark.asyncio

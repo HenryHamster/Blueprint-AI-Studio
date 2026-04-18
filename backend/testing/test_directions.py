@@ -18,6 +18,7 @@ from sqlalchemy import select
 
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
+from app.direction_lifecycle import _process_direction_lifecycle
 from app.research_completion import _handle_research_completion, _calibrate_scope, predict_spawn_success, _poor_decomp_history
 from app.direction_metrics import _compute_acceptance_rate, _compute_momentum_factor, _compute_productivity_score
 from app.max_plan_pool import _max_plan_pools, _account_by_id
@@ -3079,3 +3080,57 @@ async def test_auto_escalate_suppressed_by_poor_decomp_history(db_session, mocke
     assert child.context["scope"] == "medium"
     assert child.context["low_confidence_spawn"] is True
     assert child.first_payload["type"] == "create"
+
+
+@pytest.mark.asyncio
+async def test_completion_suggestion_toggles_off_when_no_longer_complete(db_session):
+    """A previously possibly_complete direction clears both flags when
+    _check_direction_completion later returns None, and the cleared state
+    is committed."""
+    direction = {
+        "id": "d-toggle-off-1",
+        "text": "Direction that looked complete earlier",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        # Empty history → _check_direction_completion returns None (needs ≥4 entries)
+        # and _check_direction_health returns None (no rules trip).
+        "research_history": [],
+        "possibly_complete": True,
+        "completion_suggestion": (
+            "Direction appears complete: 3 PRs merged across 4 cycles, "
+            "last 2 cycles low-yield"
+        ),
+    }
+    project = Project(
+        name="Completion Toggle-Off",
+        user_id="u-toggle",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    active = await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=60.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+
+    # Direction stays active and eligible.
+    assert len(active) == 1
+    assert active[0]["id"] == "d-toggle-off-1"
+    assert active[0]["status"] == "active"
+
+    # Both flags removed from the direction dict.
+    d = project.directions[0]
+    assert "possibly_complete" not in d
+    assert "completion_suggestion" not in d
+
+    # directions_modified triggered a commit — the cleared state is persisted.
+    await db_session.refresh(project)
+    persisted = project.directions[0]
+    assert "possibly_complete" not in persisted
+    assert "completion_suggestion" not in persisted

@@ -1813,3 +1813,171 @@ async def test_parent_failure_after_pr_verification_stamps_deploy_monitoring(
     results = list(_ss.deploy_monitoring["task_results"])
     assert any(r[1] == "failure" and r[2] == "AGENT_TIMEOUT" for r in results), \
         f"Post-verification parent FAILED never reached deploy_monitoring: {results}"
+
+
+# ── High-risk approval gate (require_approval_gates) ──────────────────────────
+# Covers rollup_management.py:846 — the gate that flips parent.requires_approval
+# when a completed child has risk='high', the target is non-intermediate, and
+# the runtime config opt-in is enabled. Refactor-type children are excluded
+# from the high-risk set even when classified risk='high'.
+
+
+def _mock_high_risk_gate_deps(mocker, *, get_pull_request_responses):
+    """Common mocks for tests that exercise the high-risk approval gate.
+
+    Drives the resume path (rollup_pr_number set on parent context) so
+    create_pull_request is skipped and control reaches the gate at line 846.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=get_pull_request_responses,
+    )
+
+
+async def _make_rollup_parent_to_main(session, project_id):
+    """Rollup parent on the resume path with target_branch='main' (non-intermediate)
+    so the high-risk gate at line 846 is reachable."""
+    return await _make_task(
+        session, project_id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "research_branch": "research/risky-stg",
+            "parent_base": "main",
+            "rollup_pr_number": 9999,
+            "rollup_pr_url": "https://github.com/owner/repo/pull/9999",
+        },
+        plan_output="some plan",
+    )
+
+
+@pytest.mark.asyncio
+async def test_high_risk_child_with_gate_enabled_requires_approval(cleanup_db, mocker):
+    """Default require_approval_gates=True: a completed child with risk='high'
+    on a non-intermediate target marks the rollup parent requires_approval=True
+    and returns without merging."""
+    _mock_high_risk_gate_deps(
+        mocker,
+        # Only the resume-path validation call fires before the gate returns.
+        get_pull_request_responses=[{"merged": False, "state": "open"}],
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock, return_value=(None, None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_to_main(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db, project.id,
+        task_type="create",
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "risk": "high"},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert "awaiting approval" in (parent.latest_status_message or "")
+    # Gate returns before the review/fix spawn path
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_high_risk_child_with_gate_disabled_skips_approval(
+    cleanup_db, mocker, monkeypatch,
+):
+    """require_approval_gates=False: a completed high-risk child does NOT
+    flip requires_approval; control falls through to the rollup-to-main
+    review spawn."""
+    from app.shared_state import runtime_config
+    monkeypatch.setitem(runtime_config, "require_approval_gates", False)
+
+    _mock_high_risk_gate_deps(
+        mocker,
+        get_pull_request_responses=[
+            {"merged": False, "state": "open"},  # resume validation
+            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},  # diff size
+        ],
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="review-task-id"), None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_to_main(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db, project.id,
+        task_type="create",
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "risk": "high"},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is False
+    mock_spawn.assert_awaited_once()
+    assert mock_spawn.await_args.args[1] == "review"
+
+
+@pytest.mark.asyncio
+async def test_refactor_high_risk_child_excluded_from_approval_gate(cleanup_db, mocker):
+    """Refactor-type children are structural (no behavior change) and are
+    excluded from the high-risk set even when marked risk='high'. Even with
+    the default gate enabled, the parent is NOT flagged for approval and
+    control falls through to the review spawn."""
+    _mock_high_risk_gate_deps(
+        mocker,
+        get_pull_request_responses=[
+            {"merged": False, "state": "open"},
+            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},
+        ],
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="review-task-id"), None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_to_main(cleanup_db, project.id)
+    # Refactor type with risk=high — the type-filter must exclude it.
+    child = await _make_task(
+        cleanup_db, project.id,
+        task_type="refactor",
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "risk": "high"},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is False
+    mock_spawn.assert_awaited_once()
+    assert mock_spawn.await_args.args[1] == "review"

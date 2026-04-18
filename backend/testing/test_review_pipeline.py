@@ -2384,6 +2384,45 @@ async def test_pipeline_dedup_different_pr_numbers_pass_through(db_session, mock
     assert set(result) == {a.id, b.id}
 
 
+@pytest.mark.asyncio
+async def test_pipeline_dedup_different_projects_same_pr_pass_through(db_session, mocker):
+    """Two review tasks sharing a pr_number but in DIFFERENT projects are not
+    duplicates — the grouping key includes project_id. Guards against a regression
+    where removing project_id from the key would cause cross-project dedup."""
+    from app.orchestrator_filters import filter_pipeline_duplicates
+    broadcast_mock = mocker.AsyncMock()
+
+    project_a = await _make_db_project(db_session)
+    project_b = await _make_db_project(db_session)
+    assert project_a.id != project_b.id
+
+    a = make_task(
+        project_id=project_a.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "review", "pr_number": 700, "branch": "feat/a", "base_branch": "main"}],
+    )
+    b = make_task(
+        project_id=project_b.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "review", "pr_number": 700, "branch": "feat/b", "base_branch": "main"}],
+    )
+    db_session.add(a)
+    db_session.add(b)
+    await db_session.commit()
+    await db_session.refresh(a)
+    await db_session.refresh(b)
+
+    result = await filter_pipeline_duplicates(
+        [a.id, b.id], [a, b], db_session, broadcast_mock
+    )
+    await db_session.commit()
+    assert set(result) == {a.id, b.id}, "Same PR number in different projects must not dedup"
+    await db_session.refresh(a)
+    await db_session.refresh(b)
+    assert a.status == TaskStatus.QUEUED
+    assert b.status == TaskStatus.QUEUED
+
+
 # ── _spawn_pipeline_task: supersession paths persist AGENT_TIMEOUT ─────────────
 
 

@@ -981,6 +981,57 @@ async def test_force_lock_timeout_resets_skip_count(
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_refresh_between_step1_and_step2_not_reaped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Race: task is flagged orphaned in Step 1 (heartbeat 6 min old) but
+    receives a fresh heartbeat before Step 2's FOR UPDATE lock acquires. The
+    re-verification after expire_all()+lock must see the fresh heartbeat and
+    skip the reap — status stays IN_PROGRESS and retry budget is untouched."""
+    from sqlalchemy import update as _sa_update
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-race-refresh",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=6),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    task_id = t.id
+
+    # Patch AsyncSession.execute: when the Step-2 FOR UPDATE query fires, first
+    # update last_heartbeat to "now" and commit. expire_all() ran before the
+    # lock query, so the lock's fresh SELECT returns the refreshed row.
+    real_execute = AsyncSession.execute
+    refreshed = {"done": False}
+    fresh_ts = datetime.utcnow()
+
+    async def mock_execute(self, stmt, *args, **kwargs):
+        if not refreshed["done"] and getattr(stmt, "_for_update_arg", None) is not None:
+            refreshed["done"] = True
+            await real_execute(
+                self,
+                _sa_update(Task).where(Task.id == task_id).values(last_heartbeat=fresh_ts),
+            )
+            await self.commit()
+        return await real_execute(self, stmt, *args, **kwargs)
+
+    mocker.patch.object(AsyncSession, "execute", mock_execute)
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert refreshed["done"], "for_update lock query must have fired (race injection point)"
+    assert t.status == TaskStatus.IN_PROGRESS, "task with refreshed heartbeat must NOT be reaped"
+    assert t.attempt_count == 0, "retry budget must not be burned when Step 2 re-verify skips reap"
+    assert t.last_heartbeat == fresh_ts, "refreshed heartbeat must be persisted"
+
+
+@pytest.mark.asyncio
 async def test_skip_count_stale_entries_cleaned(
     reaper_db, stop_after_one_cycle, reaper_side_effects, clean_skip_counts
 ):
