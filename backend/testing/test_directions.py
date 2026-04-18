@@ -19,7 +19,7 @@ from sqlalchemy import select
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
 from app.research_completion import _handle_research_completion, _calibrate_scope, predict_spawn_success, _poor_decomp_history
-from app.direction_metrics import _compute_momentum_factor, _compute_productivity_score
+from app.direction_metrics import _compute_acceptance_rate, _compute_momentum_factor, _compute_productivity_score
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -1031,6 +1031,66 @@ class TestComputeMergeRate:
             d.get("last_researched_at") or "",
         ))
         assert directions[0]["id"] == "unsat"
+
+
+class TestComputeAcceptanceRate:
+    """Unit tests for _compute_acceptance_rate — pure function, no DB."""
+
+    def test_no_data_returns_none(self):
+        assert _compute_acceptance_rate({}) is None
+        assert _compute_acceptance_rate({"research_history": [], "history_aggregate": {}}) is None
+
+    def test_only_merges_returns_one(self):
+        d = {"research_history": [{"prs_merged": 2, "prs_rejected": 0}]}
+        assert _compute_acceptance_rate(d) == 1.0
+
+    def test_only_rejections_returns_zero(self):
+        d = {"research_history": [{"prs_merged": 0, "prs_rejected": 3}]}
+        assert _compute_acceptance_rate(d) == 0.0
+
+    def test_empty_recent_falls_back_to_lifetime(self):
+        """No live history but aggregate has data → recent is empty → lifetime rate."""
+        d = {
+            "research_history": [],
+            "history_aggregate": {"total_prs_merged": 3, "total_prs_rejected": 1},
+        }
+        assert _compute_acceptance_rate(d) == pytest.approx(0.75)
+
+    def test_aggregate_contributes_to_lifetime(self):
+        """history_aggregate merged/rejected totals roll into the lifetime computation."""
+        d = {
+            "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            "history_aggregate": {"total_prs_merged": 1, "total_prs_rejected": 2},
+        }
+        # lifetime: merged=2, rejected=2 → 0.5; recent (last 3 live)=1 cycle, recent_rate=1.0
+        # weighted: (1.0*3 + 0.5)/4 = 0.875
+        assert _compute_acceptance_rate(d) == pytest.approx(0.875)
+
+    def test_recent_dominates_lifetime(self):
+        """3:1 weighting: recent (1.0) over lifetime (≈0.23) yields ~0.808."""
+        d = {
+            "research_history": [
+                {"prs_merged": 1, "prs_rejected": 0},
+                {"prs_merged": 1, "prs_rejected": 0},
+                {"prs_merged": 1, "prs_rejected": 0},
+            ],
+            "history_aggregate": {"total_prs_merged": 0, "total_prs_rejected": 10},
+        }
+        lifetime = 3 / 13
+        expected = (1.0 * 3 + lifetime) / 4
+        assert _compute_acceptance_rate(d) == pytest.approx(expected)
+
+    def test_recent_zero_prs_falls_back_to_lifetime(self):
+        """When the recent window has cycles but no PRs, lifetime rate is returned."""
+        d = {
+            "research_history": [
+                {"prs_merged": 0, "prs_rejected": 0},
+                {"prs_merged": 0, "prs_rejected": 0},
+                {"prs_merged": 0, "prs_rejected": 0},
+            ],
+            "history_aggregate": {"total_prs_merged": 4, "total_prs_rejected": 1},
+        }
+        assert _compute_acceptance_rate(d) == pytest.approx(0.8)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

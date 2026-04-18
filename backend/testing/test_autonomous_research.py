@@ -4494,3 +4494,122 @@ def test_fold_evicted_handles_legacy_entries_without_scope_or_decomp():
     assert agg["scope_breakdown"] == {}
     assert agg["decomposition_quality"]["total_decompositions"] == 0
     assert agg["decomposition_quality"]["subtask_count_sum"] == 0
+
+
+def _dedup_entry(tasks_created=0, hash_dedup=0, word_overlap_dedup=0):
+    return {
+        "tasks_created": tasks_created,
+        "filter_breakdown": {
+            "hash_dedup": hash_dedup,
+            "word_overlap_dedup": word_overlap_dedup,
+        },
+    }
+
+
+def test_compute_saturation_fewer_than_three_entries():
+    from app.research_completion import _compute_saturation
+
+    assert _compute_saturation([]) is False
+    assert _compute_saturation([{"tasks_created": 0}]) is False
+    assert _compute_saturation([{"tasks_created": 0}, {"tasks_created": 1}]) is False
+
+
+def test_compute_saturation_at_threshold():
+    from app.research_completion import _compute_saturation
+
+    history = [{"tasks_created": 1}, {"tasks_created": 1}, {"tasks_created": 1}]
+    assert _compute_saturation(history) is True
+
+
+def test_compute_saturation_above_threshold_breaks_saturation():
+    from app.research_completion import _compute_saturation
+
+    history = [{"tasks_created": 1}, {"tasks_created": 2}, {"tasks_created": 1}]
+    assert _compute_saturation(history) is False
+
+
+def test_compute_saturation_uses_only_last_three_entries():
+    from app.research_completion import _compute_saturation
+
+    history = [
+        {"tasks_created": 5},
+        {"tasks_created": 5},
+        {"tasks_created": 0},
+        {"tasks_created": 1},
+        {"tasks_created": 0},
+    ]
+    assert _compute_saturation(history) is True
+
+
+def test_detect_dedup_deadlock_insufficient_window():
+    from app.research_completion import _detect_dedup_deadlock
+
+    deadlocked, consec = _detect_dedup_deadlock(
+        [_dedup_entry(0, hash_dedup=3), _dedup_entry(0, hash_dedup=3)]
+    )
+    assert deadlocked is False
+    assert consec == 0
+
+
+def test_detect_dedup_deadlock_all_zero_no_dedup_activity():
+    from app.research_completion import _detect_dedup_deadlock
+
+    history = [_dedup_entry(0), _dedup_entry(0), _dedup_entry(0)]
+    deadlocked, consec = _detect_dedup_deadlock(history)
+    assert deadlocked is False
+    assert consec == 0
+
+
+def test_detect_dedup_deadlock_dedup_activity_below_threshold():
+    from app.research_completion import _detect_dedup_deadlock
+
+    history = [
+        _dedup_entry(0),
+        _dedup_entry(0),
+        _dedup_entry(0, hash_dedup=5),
+    ]
+    deadlocked, consec = _detect_dedup_deadlock(history)
+    assert deadlocked is False
+    assert consec == 0
+
+
+def test_detect_dedup_deadlock_valid_detection():
+    from app.research_completion import _detect_dedup_deadlock
+
+    history = [
+        _dedup_entry(0, hash_dedup=2),
+        _dedup_entry(0, word_overlap_dedup=3),
+        _dedup_entry(0, hash_dedup=1),
+    ]
+    deadlocked, consec = _detect_dedup_deadlock(history)
+    assert deadlocked is True
+    assert consec == 3
+
+
+def test_detect_dedup_deadlock_consecutive_empty_count():
+    from app.research_completion import _detect_dedup_deadlock
+
+    history = [
+        _dedup_entry(2),
+        _dedup_entry(0, hash_dedup=1),
+        _dedup_entry(0, hash_dedup=1),
+        _dedup_entry(0, word_overlap_dedup=2),
+        _dedup_entry(0, hash_dedup=1),
+    ]
+    deadlocked, consec = _detect_dedup_deadlock(history)
+    assert deadlocked is True
+    assert consec == 4
+
+
+def test_detect_dedup_deadlock_productive_cycle_breaks_window():
+    from app.research_completion import _detect_dedup_deadlock
+
+    history = [
+        _dedup_entry(0, hash_dedup=1),
+        _dedup_entry(0, hash_dedup=1),
+        _dedup_entry(3),
+        _dedup_entry(0, hash_dedup=1),
+    ]
+    deadlocked, consec = _detect_dedup_deadlock(history)
+    assert deadlocked is False
+    assert consec == 0
