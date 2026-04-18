@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type React from 'react';
-import { Check, ChevronDown, ChevronRight, ChevronUp, Pencil, Trash2, X, Zap } from 'lucide-react';
+import { AlertTriangle, Check, ChevronDown, ChevronRight, ChevronUp, Loader2, Pencil, Trash2, X, Zap } from 'lucide-react';
 import { BarChart, Bar, Cell, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts';
 import type { Direction } from './DirectionsPanel';
 import type { DirectionCategory } from '../hooks/useDirectionForm';
@@ -380,6 +380,52 @@ export function DirectionCard({
             <p className="text-[10px] text-emerald-500/80 mt-0.5 leading-relaxed">
               {d.completion_suggestion}
             </p>
+          )}
+          {/* Diagnosis / remediation pipeline status */}
+          {(d.needs_manual_intervention || d.diagnosis_in_progress || d.diagnosis_summary || (d.remediation_attempts ?? 0) > 0) && (
+            <div className="mt-2 space-y-1">
+              {d.needs_manual_intervention ? (
+                <div className="flex items-start gap-1.5 p-1.5 bg-red-950/40 border border-red-900/50 rounded">
+                  <AlertTriangle className="w-3 h-3 text-red-400 shrink-0 mt-0.5" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[11px] text-red-300 font-medium leading-tight">Manual intervention needed</p>
+                    <p className="text-[10px] text-red-400/80 leading-relaxed mt-0.5">
+                      Auto-remediation escalated after {d.remediation_attempts ?? 0} failed attempt{(d.remediation_attempts ?? 0) !== 1 ? 's' : ''}.
+                      {d.diagnosis_summary && <span className="block mt-0.5 text-neutral-400 italic">{d.diagnosis_summary}</span>}
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {d.diagnosis_in_progress && (
+                    <div className="flex items-center gap-1.5 text-[10px] text-amber-400">
+                      <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                      <span>Diagnosing failure pattern…</span>
+                    </div>
+                  )}
+                  {d.diagnosis_summary && !d.diagnosis_in_progress && (
+                    <p className="text-[10px] text-neutral-400 leading-relaxed">
+                      <span className="text-neutral-500 font-medium">Diagnosis: </span>
+                      {d.diagnosis_summary}
+                      {d.diagnosis_completed_at && (
+                        <span className="text-neutral-600 ml-1">· {formatRelativeTime(d.diagnosis_completed_at)}</span>
+                      )}
+                    </p>
+                  )}
+                  {(d.remediation_attempts ?? 0) > 0 && (() => {
+                    const attempts = d.remediation_attempts ?? 0;
+                    const result = d.last_remediation_result;
+                    const color = result === 'merged' ? 'emerald' : result === 'failed' ? 'red' : 'amber';
+                    const label = result === 'merged' ? 'merged' : result === 'failed' ? 'failed' : 'pending';
+                    return (
+                      <span className={`inline-block text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
+                        Remediation {attempts}× · {label}
+                      </span>
+                    );
+                  })()}
+                </>
+              )}
+            </div>
           )}
           <div className="flex items-center gap-2 mt-2">
             <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>

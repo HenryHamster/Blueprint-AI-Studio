@@ -476,6 +476,32 @@ async def test_post_remediation_escalation_message_truncates(db_session):
 
 
 @pytest.mark.asyncio
+async def test_post_remediation_escalation_message_fires_webhook(db_session):
+    """Creating the escalation message also fires REMEDIATION_ESCALATED via the external webhook."""
+    project_id = uuid.uuid4()
+    dispatch_mock = AsyncMock()
+    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+        await post_remediation_escalation_message(
+            db_session, project_id,
+            direction_text="Improve CI reliability",
+            failure_pattern="AssertionError in test_foo",
+            attempts=3,
+            remediation_summary="Added retry wrapper; same fingerprint recurred",
+        )
+        # Allow the ensure_future-scheduled coroutine to run
+        import asyncio as _asyncio  # noqa: PLC0415
+        await _asyncio.sleep(0)
+    dispatch_mock.assert_called_once()
+    args, _ = dispatch_mock.call_args
+    assert args[0] == project_id
+    assert args[1] == "REMEDIATION_ESCALATED"
+    assert args[2]["direction_text"] == "Improve CI reliability"
+    assert args[2]["failure_pattern"] == "AssertionError in test_foo"
+    assert args[2]["attempts"] == 3
+    assert args[2]["remediation_summary"].startswith("Added retry wrapper")
+
+
+@pytest.mark.asyncio
 async def test_post_issue_implementation_spawned_message(db_session):
     project_id = uuid.uuid4()
     task_id = uuid.uuid4()

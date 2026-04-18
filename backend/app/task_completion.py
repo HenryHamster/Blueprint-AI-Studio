@@ -832,7 +832,7 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
     structural = _is_structural_diagnosis(root_cause, recommended_fix)
     spawn_remediation = (
         not structural
-        and confidence == "high"
+        and confidence in ("high", "medium")
         and bool(recommended_fix)
     )
 
@@ -845,6 +845,7 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
             root_cause=root_cause,
             recommended_fix=recommended_fix,
             severity=severity,
+            confidence=confidence,
             affected_paths=affected_paths,
             session=session,
         )
@@ -933,7 +934,7 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
         reason = (
             "structural" if structural else
             ("no_actionable_fix" if not recommended_fix else
-             ("low_confidence" if confidence != "high" else "no_direction"))
+             ("low_confidence" if confidence not in ("high", "medium") else "no_direction"))
         )
         logger.info(
             f"[INVESTIGATION] Task {task.id} completed without spawning remediation "
@@ -978,10 +979,11 @@ async def _spawn_investigation_remediation(
     root_cause: str,
     recommended_fix: str,
     severity: str,
+    confidence: str,
     affected_paths: List[str],
     session: AsyncSession,
 ) -> Optional[Task]:
-    """Build and persist a targeted `create` task from a high-confidence diagnosis."""
+    """Build and persist a targeted `create` task from a high/medium-confidence diagnosis."""
     prompt_parts = [recommended_fix.strip()]
     if root_cause:
         prompt_parts.append(f"\nRoot cause (from diagnosis):\n{root_cause[:1500]}")
@@ -1023,6 +1025,7 @@ async def _spawn_investigation_remediation(
             "diagnosed_direction_id": direction_id,
             "direction_id": direction_id,
             "severity": severity_tag,
+            "diagnosis_confidence": confidence if confidence in ("high", "medium") else "high",
             "related_files": affected_paths[:25],
             "diagnosis_trigger": "investigation_completion",
         },

@@ -550,6 +550,16 @@ async def post_remediation_escalation_message(
         context=ctx,
     )
     session.add(msg)
+    asyncio.ensure_future(dispatch_external_notification(
+        project_id,
+        "REMEDIATION_ESCALATED",
+        {
+            "direction_text": direction_text[:120],
+            "failure_pattern": failure_pattern[:200],
+            "attempts": attempts,
+            "remediation_summary": remediation_summary[:240],
+        },
+    ))
     return msg
 
 

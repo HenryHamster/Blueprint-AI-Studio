@@ -63,6 +63,14 @@ export interface Direction {
   paused_reason?: string;
   paused_at?: string;
   auto_paused?: boolean;
+  // Diagnosis / remediation pipeline state (surfaced from backend direction dict)
+  needs_manual_intervention?: boolean;
+  diagnosis_in_progress?: boolean;
+  diagnosis_summary?: string;
+  diagnosis_completed_at?: string;
+  remediation_attempts?: number;
+  last_remediation_result?: 'merged' | 'failed' | 'pending' | string;
+  remediation_monitor_started_at?: string;
   /**
    * Productivity score: (merged − 0.5 × rejected) / cycles.
    * Quality-weighted — can go negative when rejections outweigh merges.

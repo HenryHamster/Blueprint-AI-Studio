@@ -921,8 +921,38 @@ class TestHandleInvestigationCompletion:
         assert child.context["diagnosis_task_id"] == str(task.id)
         assert child.context["diagnosed_direction_id"] == "dir-invest-1"
         assert child.context["direction_id"] == "dir-invest-1"
+        assert child.context["diagnosis_confidence"] == "high"
         assert "backend/app/shared_state.py" in child.context["related_files"]
         assert child.status == TaskStatus.QUEUED
+        assert project.directions[0]["remediation_task_id"] == str(child.id)
+
+    @pytest.mark.asyncio
+    async def test_spawns_remediation_on_medium_confidence(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-invest-1"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(
+            task, self._payload(self._report(confidence="medium")), db_session
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        children = result.scalars().all()
+        assert len(children) == 1
+        child = children[0]
+        assert child.context["diagnosis_confidence"] == "medium"
+        assert child.context["direction_id"] == "dir-invest-1"
         assert project.directions[0]["remediation_task_id"] == str(child.id)
 
     @pytest.mark.asyncio
