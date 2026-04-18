@@ -35,7 +35,8 @@ interface DirectionProgress {
   cost_per_merged_pr?: number | null;
   scope_breakdown?: Record<string, { created: number; merged: number; failed: number; failed_infra?: number; failed_code_error?: number; failed_scope_overflow?: number; calibrated_in?: number; calibrated_out?: number }> | null;
   taxonomy_summary?: Record<string, number> | null;
-  recent_failed_titles?: string[] | null;
+  stage_dropout?: Record<string, number> | null;
+  recent_failure_titles?: string[] | null;
 }
 
 interface FailureGroupTask {
@@ -78,7 +79,7 @@ interface DigestData {
   failed_count: number;
   success_rate?: number | null;
   trend?: 'improving' | 'declining' | 'stable';
-  trend_history?: { period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_class?: Record<string, number>; period_cost_usd?: number | null }[];
+  trend_history?: { period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_class?: Record<string, number>; failed_by_taxonomy?: Record<string, number>; period_cost_usd?: number | null }[];
   total_estimated_cost_usd?: number | null;
   daily_cost_usd?: number | null;
   daily_cost_ceiling_usd?: number | null;
@@ -112,6 +113,12 @@ const TAXONOMY_COLORS: Record<string, string> = {
   review_quality: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
   infra_related: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
   code_defect: 'bg-red-500/20 text-red-400 border-red-500/30',
+};
+const TAXONOMY_STROKE: Record<string, string> = {
+  scope_related: '#22d3ee',
+  review_quality: '#a855f7',
+  infra_related: '#f59e0b',
+  code_defect: '#ef4444',
 };
 
 interface SparkPoint {
@@ -185,6 +192,7 @@ const FAILURE_CLASS_COLORS: Record<string, string> = {
   AGENT_TIMEOUT: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
   RATE_LIMIT: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
   EXTERNAL_API: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
+  SCOPE_OVERFLOW: 'bg-teal-500/20 text-teal-400 border-teal-500/30',
 };
 
 const FAILURE_CLASS_STROKE: Record<string, string> = {
@@ -193,6 +201,7 @@ const FAILURE_CLASS_STROKE: Record<string, string> = {
   AGENT_TIMEOUT: '#fbbf24',
   RATE_LIMIT: '#facc15',
   EXTERNAL_API: '#c084fc',
+  SCOPE_OVERFLOW: '#2dd4bf',
 };
 
 const TASK_TYPE_COLORS: Record<string, string> = {
@@ -479,11 +488,29 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   const isDominant = tax.dominant_category === k;
                   const base = TAXONOMY_COLORS[k] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
                   const cls = isDominant ? `${base} ring-1 ring-current` : base;
+                  const stroke = TAXONOMY_STROKE[k] ?? '#a3a3a3';
+                  const taxSpark = (digest.trend_history ?? []).map(p => ({ v: p.failed_by_taxonomy?.[k] ?? 0 }));
+                  const hasSpark = taxSpark.length >= 3;
                   return (
                     <span key={k} className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${cls}`} title={`${TAXONOMY_LABELS[k]}: ${cat.count} (${cat.percentage}%)${isDominant ? ' — dominant' : ''}`}>
                       {TAXONOMY_LABELS[k]}
                       <span className="font-bold">{cat.count}</span>
                       <span className="opacity-70">{cat.percentage}%</span>
+                      {hasSpark && (
+                        <span className="w-16 h-3 inline-block">
+                          <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
+                            <AreaChart data={taxSpark}>
+                              <defs>
+                                <linearGradient id={`tsp-${k}`} x1="0" y1="0" x2="0" y2="1">
+                                  <stop offset="0%" stopColor={stroke} stopOpacity={0.4} />
+                                  <stop offset="100%" stopColor={stroke} stopOpacity={0} />
+                                </linearGradient>
+                              </defs>
+                              <Area type="monotone" dataKey="v" stroke={stroke} fill={`url(#tsp-${k})`} strokeWidth={1} dot={false} isAnimationActive={false} />
+                            </AreaChart>
+                          </ResponsiveContainer>
+                        </span>
+                      )}
                     </span>
                   );
                 })}
@@ -542,6 +569,14 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                           )}
                         </div>
                         {d.taxonomy_summary && <div className="flex gap-1 mt-1 flex-wrap">{TAXONOMY_ORDER.map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return v ? <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span> : null; })}</div>}
+                        {d.stage_dropout && Object.values(d.stage_dropout).some(v => v) && <div className="flex gap-1 mt-1 flex-wrap">{Object.entries(d.stage_dropout).filter(([, v]) => v).sort((a, b) => b[1] - a[1]).map(([stage, v]) => <span key={stage} title={`Failed at ${stage}: ${v}`} className="text-[9px] leading-none px-1 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-300">{stage} {v}</span>)}</div>}
+                        {d.recent_failure_titles && d.recent_failure_titles.length > 0 && (
+                          <ul className="mt-1 space-y-0.5">
+                            {d.recent_failure_titles.slice(0, 3).map((t, i) => (
+                              <li key={i} className="text-[10px] text-red-300/80 truncate" title={t}>• {t}</li>
+                            ))}
+                          </ul>
+                        )}
                       </div>
                     );
                   })}
