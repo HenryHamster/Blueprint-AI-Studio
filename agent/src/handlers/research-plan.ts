@@ -65,6 +65,29 @@ export function aggregateDirectionStats(
     parts.push(`conversion: ${pct}% (${recentMerged}/${recentTasksCreated} findings merged last ${cycleLabel})`);
   }
 
+  // Dedup/filter losses across last 3 cycles — lets the agent see how many
+  // proposed findings were filtered and by which mechanism, so it can steer
+  // toward more novel titles, different files, or new approaches.
+  const filterKeys = ['hash_dedup', 'word_overlap_dedup', 'file_overlap_dedup', 'type_filtered', 'empty_prompt'] as const;
+  const filterAgg: Record<string, number> = {};
+  for (const h of recent) {
+    const fb = h.filter_breakdown as Record<string, number> | undefined;
+    if (!fb || typeof fb !== 'object') continue;
+    for (const k of filterKeys) {
+      const v = (fb[k] as number) || 0;
+      if (v > 0) filterAgg[k] = (filterAgg[k] || 0) + v;
+    }
+  }
+  const filterTotal = Object.values(filterAgg).reduce((s, v) => s + v, 0);
+  if (filterTotal > 0) {
+    const shortKey: Record<string, string> = {
+      hash_dedup: 'hash', word_overlap_dedup: 'word-overlap',
+      file_overlap_dedup: 'file-overlap', type_filtered: 'type', empty_prompt: 'empty',
+    };
+    const segs = filterKeys.filter(k => filterAgg[k]).map(k => `${shortKey[k]} ${filterAgg[k]}`);
+    parts.push(`filtered: ${filterTotal} (${segs.join(', ')})`);
+  }
+
   // Per-scope (finding-type) success rates across last 3 cycles — surfaces
   // whether certain scopes/types land more reliably than others.
   const typeAgg: Record<string, {created: number; merged: number}> = {};

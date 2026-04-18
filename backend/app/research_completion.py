@@ -567,22 +567,29 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         # Apply scope calibration from direction's historical merge rates (skip if already calibrated)
         scope_calibrated_from: str | None = finding.get("scope_calibrated_from")
+        _history_calibration_fired = False
         if not (scope_calibrated_from or (task.context or {}).get("scope_calibrated_from")):
             _dir_id = finding.get("direction_id") or _parent_direction_id
             _direction = _directions_by_id.get(str(_dir_id)) if _dir_id else None
             if _direction:
                 scope, scope_calibrated_from = _calibrate_scope(scope, _direction, _scope_cal_project)
+                _history_calibration_fired = scope_calibrated_from is not None
 
         # Pre-spawn scope-upgrade heuristics (file count, cross-module span,
         # expansion-ratio prediction, composite complexity). Extracted into
         # _calibrate_finding_scope so the heuristics are independently testable.
-        _heur_dir_id = finding.get("direction_id") or _parent_direction_id
-        _heur_direction = _directions_by_id.get(str(_heur_dir_id)) if _heur_dir_id else None
-        scope, _heur_calibrated_from = _calibrate_finding_scope(
-            finding, scope, _heur_direction, _cochange_index_for_decomp,
-        )
-        if _heur_calibrated_from is not None:
-            scope_calibrated_from = _heur_calibrated_from
+        # Skip when _calibrate_scope just fired: historical merge-rate data is
+        # a stronger signal than file-count heuristics, so a freshly-applied
+        # downgrade (e.g. medium→small) should not be reversed by the small→medium
+        # heuristic that fires on related_files >= 3.
+        if not _history_calibration_fired:
+            _heur_dir_id = finding.get("direction_id") or _parent_direction_id
+            _heur_direction = _directions_by_id.get(str(_heur_dir_id)) if _heur_dir_id else None
+            scope, _heur_calibrated_from = _calibrate_finding_scope(
+                finding, scope, _heur_direction, _cochange_index_for_decomp,
+            )
+            if _heur_calibrated_from is not None:
+                scope_calibrated_from = _heur_calibrated_from
 
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation

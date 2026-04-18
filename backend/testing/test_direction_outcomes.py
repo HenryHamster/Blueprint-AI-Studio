@@ -16,10 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.direction_outcomes import (
     _longest_chain_length,
+    _refresh_pipeline_scope_merge_rates,
     _update_cochange_index,
     _update_direction_research_outcomes,
 )
 from app.models import Project, Task, TaskStatus
+from app.shared_state import runtime_config
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1250,6 +1252,42 @@ async def test_decomposition_quality_ignores_infra_failures_in_merge_rate(db_ses
 
 
 @pytest.mark.asyncio
+async def test_decomposition_quality_records_failed_plan_with_zero_subtasks(db_session: AsyncSession):
+    """A terminal plan that produced no subtasks gets a sentinel entry with
+    subtask_merge_rate=0.0 so _poor_decomp_history can count the failure."""
+    direction_id = "d-decomp-zero"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    await db_session.flush()
+
+    plan = await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+        payloads=[{"type": "plan"}],
+        title="plan-zero-subtasks",
+        latest_status_message="plan handler crashed before spawning",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    dq = project.directions[0]["research_history"][0]["decomposition_quality"]
+    assert len(dq) == 1
+    entry = dq[0]
+    assert entry["plan_task_id"] == str(plan.id)
+    assert entry["subtask_count"] == 0
+    assert entry["subtask_merge_rate"] == 0.0
+
+
+@pytest.mark.asyncio
 async def test_decomposition_quality_skips_non_terminal_plans(db_session: AsyncSession):
     """Plan tasks still EVALUATING/running are not included."""
     direction_id = "d-decomp-skip"
@@ -1282,3 +1320,139 @@ async def test_decomposition_quality_skips_non_terminal_plans(db_session: AsyncS
     await db_session.refresh(project)
     dq = project.directions[0]["research_history"][0]["decomposition_quality"]
     assert dq == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Pipeline scope merge rate auto-population
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def _reset_pipeline_scope_rates():
+    """Snapshot/restore runtime_config['pipeline_scope_merge_rates'] per test."""
+    original = dict(runtime_config.get("pipeline_scope_merge_rates") or {})
+    runtime_config["pipeline_scope_merge_rates"] = {}
+    yield
+    runtime_config["pipeline_scope_merge_rates"] = original
+
+
+def _direction_with_scope_breakdown(direction_id: str, scope_breakdown: dict) -> dict:
+    """Build a direction with one research_history entry carrying scope_breakdown."""
+    return {
+        "id": direction_id,
+        "text": "t",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "research_history": [{"task_id": str(uuid.uuid4()), "scope_breakdown": scope_breakdown}],
+    }
+
+
+def test_refresh_pipeline_scope_merge_rates_aggregates_and_publishes(_reset_pipeline_scope_rates):
+    """Rates are aggregated across all directions and written to runtime_config."""
+    project = Project(
+        name="p", user_id="u",
+        directions=[
+            _direction_with_scope_breakdown("d1", {
+                "small": {"created": 4, "merged": 3, "failed": 1,
+                          "failed_infra": 0, "failed_scope_overflow": 0},
+            }),
+            _direction_with_scope_breakdown("d2", {
+                "small": {"created": 3, "merged": 2, "failed": 1,
+                          "failed_infra": 0, "failed_scope_overflow": 0},
+            }),
+        ],
+    )
+    _refresh_pipeline_scope_merge_rates(project)
+    # small effective = (3+2) merged + (1+1) failed - 0 infra = 7 >= 5
+    # rate = 5 / 7 = 0.714
+    assert runtime_config["pipeline_scope_merge_rates"] == {"small": round(5 / 7, 3)}
+
+
+def test_refresh_pipeline_scope_merge_rates_omits_sparse_scopes(_reset_pipeline_scope_rates):
+    """Scopes with < 5 effective data points are excluded from the published dict."""
+    project = Project(
+        name="p", user_id="u",
+        directions=[
+            _direction_with_scope_breakdown("d1", {
+                "small": {"created": 6, "merged": 4, "failed": 2,
+                          "failed_infra": 0, "failed_scope_overflow": 0},
+                "medium": {"created": 3, "merged": 1, "failed": 2,
+                           "failed_infra": 0, "failed_scope_overflow": 0},
+            }),
+        ],
+    )
+    _refresh_pipeline_scope_merge_rates(project)
+    rates = runtime_config["pipeline_scope_merge_rates"]
+    assert "small" in rates  # effective = 6, included
+    assert "medium" not in rates  # effective = 3, excluded
+
+
+def test_refresh_pipeline_scope_merge_rates_excludes_infra_from_denominator(_reset_pipeline_scope_rates):
+    """Non-overflow infra failures are excluded from the effective denominator."""
+    project = Project(
+        name="p", user_id="u",
+        directions=[
+            _direction_with_scope_breakdown("d1", {
+                "medium": {"created": 10, "merged": 3, "failed": 7,
+                           "failed_infra": 5, "failed_scope_overflow": 1},
+            }),
+        ],
+    )
+    _refresh_pipeline_scope_merge_rates(project)
+    # effective = 3 merged + 7 failed - (5 infra - 1 overflow) = 3 + 7 - 4 = 6
+    # rate = 3 / 6 = 0.5
+    assert runtime_config["pipeline_scope_merge_rates"] == {"medium": 0.5}
+
+
+def test_refresh_pipeline_scope_merge_rates_no_directions(_reset_pipeline_scope_rates):
+    """Empty directions produces an empty rates dict."""
+    project = Project(name="p", user_id="u", directions=[])
+    _refresh_pipeline_scope_merge_rates(project)
+    assert runtime_config["pipeline_scope_merge_rates"] == {}
+
+
+@pytest.mark.asyncio
+async def test_update_outcomes_publishes_pipeline_scope_rates(
+    db_session: AsyncSession, _reset_pipeline_scope_rates
+):
+    """_update_direction_research_outcomes writes rates after updating a direction."""
+    direction_id = "d-rates"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    # Seed another direction with history so the cross-direction aggregation reaches
+    # the 5-effective threshold after this cycle's 2 small tasks land.
+    seeded_direction = _direction_with_scope_breakdown("d-seed", {
+        "small": {"created": 3, "merged": 3, "failed": 0,
+                  "failed_infra": 0, "failed_scope_overflow": 0},
+    })
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2),
+        seeded_direction,
+    ]
+    await db_session.flush()
+
+    await _create_child_task(db_session, research_task.id, project.id,
+                             status=TaskStatus.COMPLETED,
+                             context={"pr_merged": True, "scope": "small"},
+                             payloads=[{"type": "create"}],
+                             title="s1")
+    await _create_child_task(db_session, research_task.id, project.id,
+                             status=TaskStatus.FAILED,
+                             context={"scope": "small", "failure_category": "CODE_ERROR"},
+                             payloads=[{"type": "create"}],
+                             title="s2")
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    # Combined small: 1 merged + 3 seeded merged = 4; 1 failed; infra 0.
+    # With seeded 3 merged + this cycle 1 merged + 1 failed = effective 5 → 4/5 = 0.8
+    rates = runtime_config["pipeline_scope_merge_rates"]
+    assert rates == {"small": 0.8}

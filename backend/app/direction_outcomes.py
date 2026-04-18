@@ -405,6 +405,21 @@ async def _update_direction_research_outcomes(
                         "dependency_depth": _longest_chain_length(deps_map),
                         "cross_module_count": cross_mod,
                     })
+                # Sentinel entries for plans that reached terminal state without producing
+                # any subtasks — otherwise these decomposition failures leave no data in
+                # decomposition_quality and _poor_decomp_history stays blind to them.
+                for plan_id in plan_child_ids:
+                    if plan_id in by_parent:
+                        continue
+                    decomposition_quality.append({
+                        "plan_task_id": str(plan_id),
+                        "subtask_count": 0,
+                        "subtask_merge_rate": 0.0,
+                        "avg_files_per_subtask": 0.0,
+                        "max_files_in_subtask": 0,
+                        "dependency_depth": 0,
+                        "cross_module_count": 0,
+                    })
             entry["decomposition_quality"] = decomposition_quality
 
             # Maintain research_context: promote proposed findings based on outcomes
@@ -485,3 +500,33 @@ async def _update_direction_research_outcomes(
         flag_modified(project, "directions")
         session.add(project)
         await session.commit()
+        _refresh_pipeline_scope_merge_rates(project)
+
+
+def _refresh_pipeline_scope_merge_rates(project: Project) -> None:
+    """Publish project-wide scope merge rates to runtime_config.
+
+    Aggregates scope_breakdown across every research_history entry in the
+    project's directions, then writes merged/effective rate for each scope
+    with >= 5 effective data points. Keeps the fallback signal in
+    predict_spawn_success current without operator intervention; scopes with
+    sparse data are omitted to avoid noisy early estimates.
+    """
+    from app.shared_state import runtime_config  # noqa: PLC0415
+    from app.spawn_calibration import (  # noqa: PLC0415
+        _aggregate_scope_breakdown,
+        _effective_scope_denominator,
+    )
+
+    proj_entries = [
+        entry
+        for d in (project.directions or [])
+        for entry in (d.get("research_history") or [])
+    ]
+    aggregated = _aggregate_scope_breakdown(proj_entries)
+    rates: dict[str, float] = {}
+    for scope, stats in aggregated.items():
+        effective = _effective_scope_denominator(stats)
+        if effective >= 5:
+            rates[scope] = round(stats["merged"] / effective, 3)
+    runtime_config["pipeline_scope_merge_rates"] = rates

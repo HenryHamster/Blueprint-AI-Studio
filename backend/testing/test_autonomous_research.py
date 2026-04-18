@@ -1551,6 +1551,47 @@ async def test_small_scope_with_many_related_files_upgrades_to_medium(db_session
 
 
 @pytest.mark.asyncio
+async def test_history_downgrade_suppresses_heuristic_upgrade(db_session, mocker, monkeypatch):
+    """Medium finding downgraded to small by _calibrate_scope (historical merge
+    rates) stays at small even when related_files >= 3. Historical data is a
+    stronger signal than the file-count heuristic, so the heuristic must not
+    revert the downgrade and route the task back into the failing medium pool.
+    """
+    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    direction = _active_direction("d-histdown01", "History downgrade direction")
+    # Medium has 6 terminal tasks at 17% merge rate (< 40% threshold) and no
+    # small data, so _calibrate_scope downgrades medium→small.
+    direction["research_history"] = [
+        {"scope_breakdown": {"medium": {"created": 6, "merged": 1, "failed": 5}}},
+    ]
+    project = Project(
+        name="History Downgrade Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    finding = _make_finding("Touch three modules", direction["id"], scope="medium")
+    finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(3)]
+
+    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    assert child_tasks[0].payloads[0]["type"] == "create"
+    assert child_tasks[0].context["scope"] == "small"
+    assert child_tasks[0].context["scope_calibrated_from"] == "medium"
+
+
+@pytest.mark.asyncio
 async def test_small_scope_with_few_related_files_stays_small(db_session, mocker, monkeypatch):
     """Small-scope finding with <3 related_files is not upgraded by the file-count heuristic."""
     monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})

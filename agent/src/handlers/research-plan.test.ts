@@ -211,6 +211,21 @@ describe('aggregateDirectionStats', () => {
     expect(result).toContain('by type: small 67% (2/3), medium 0% (0/2)');
   });
 
+  it('includes dedup filter breakdown when findings were filtered', () => {
+    const history = [
+      { tasks_created: 2, prs_merged: 1, filter_breakdown: { hash_dedup: 2, word_overlap_dedup: 1, file_overlap_dedup: 0, type_filtered: 0, empty_prompt: 0 } },
+      { tasks_created: 1, prs_merged: 0, filter_breakdown: { hash_dedup: 1, word_overlap_dedup: 0, file_overlap_dedup: 3, type_filtered: 0, empty_prompt: 0 } },
+    ];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).toContain('filtered: 7 (hash 3, word-overlap 1, file-overlap 3)');
+  });
+
+  it('omits filter breakdown when no findings were filtered', () => {
+    const history = [{ tasks_created: 2, prs_merged: 1, filter_breakdown: { hash_dedup: 0, word_overlap_dedup: 0 } }];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).not.toContain('filtered:');
+  });
+
   it('omits per-type breakdown when only one type present', () => {
     const history = [{ tasks_created: 3, prs_merged: 2, scope_breakdown: { small: { created: 3, merged: 2 } } }];
     const result = aggregateDirectionStats(history, {});

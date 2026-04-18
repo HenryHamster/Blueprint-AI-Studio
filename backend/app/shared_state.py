@@ -136,8 +136,10 @@ runtime_config: Dict = {
     "pipeline_scope_baseline_rates": {},
     # Pipeline-wide merge rate per scope (e.g. {"medium": 0.04}). Acts as a
     # weakest-signal fallback in predict_spawn_success when direction- and
-    # project-level scope_breakdown data are too sparse to fire. Operator-
-    # adjustable from admin_analytics observations.
+    # project-level scope_breakdown data are too sparse to fire. Auto-populated
+    # by direction_outcomes._refresh_pipeline_scope_merge_rates after each
+    # research_history update — only scopes with >= 5 effective data points are
+    # published so the fallback stays conservative during early project state.
     "pipeline_scope_merge_rates": {},
     # Per-failure-class retry budgets: max attempt_count before permanent failure.
     # Overrides max_retries for specific failure classes. Operator-adjustable.
