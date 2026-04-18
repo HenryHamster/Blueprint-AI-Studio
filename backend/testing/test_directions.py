@@ -1716,6 +1716,223 @@ async def test_auto_recovery_respects_custom_cooldown(db_session, monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Diagnosis research on auto-pause
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_unhealthy_active_direction(did: str, auto_pause_count: int = 0) -> dict:
+    """Build an ACTIVE direction whose history trips Rule 2 (zero merge rate).
+
+    5 cycles, all finished, all with 0 prs_merged → _check_direction_health
+    returns a pause reason, forcing an auto-pause transition.
+    """
+    history = [
+        {"tasks_created": 1, "tasks_completed": 0, "tasks_failed": 1, "prs_merged": 0}
+        for _ in range(5)
+    ]
+    return {
+        "id": did,
+        "text": "Direction failing repeatedly",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "auto_pause_count": auto_pause_count,
+        "research_history": history,
+    }
+
+
+@pytest.mark.asyncio
+async def test_auto_pause_spawns_diagnosis_research(db_session):
+    """Auto-pause transition spawns exactly one research task in diagnosis mode."""
+    direction = _make_unhealthy_active_direction("d-diag001")
+    project = Project(
+        name="Diagnosis Spawn Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-diag001")
+    assert d["status"] == "paused"
+    assert d.get("auto_paused") is True
+    assert d.get("diagnosis_spawned_at")
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.context["diagnosis_for_direction"].as_string() == "d-diag001",
+        )
+    )
+    diagnosis_tasks = result.scalars().all()
+    assert len(diagnosis_tasks) == 1
+    dtask = diagnosis_tasks[0]
+    payload = dtask.first_payload
+    assert payload["type"] == "research"
+    assert payload["research_mode"] == "diagnosis"
+    assert payload["current_direction_id"] == "d-diag001"
+    assert payload["pause_reason"]
+    assert dtask.context["direction_id"] == "d-diag001"
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_not_respawned_when_active(db_session):
+    """An existing active diagnosis task for the direction suppresses a duplicate spawn."""
+    from app.autonomous_research import _spawn_direction_diagnosis
+
+    did = "d-diag002"
+    direction = _make_unhealthy_active_direction(did)
+    project = Project(
+        name="Diagnosis Dedup Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    existing = Task(
+        project_id=project.id,
+        title="Diagnosis: existing",
+        payloads=[{
+            "type": "research",
+            "research_mode": "diagnosis",
+            "current_direction_id": did,
+            "base_branch": "main",
+        }],
+        context={"diagnosis_for_direction": did, "direction_id": did},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    spawned = await _spawn_direction_diagnosis(
+        project, direction, "Unproductive: 0 PRs merged", db_session
+    )
+    assert spawned is False, "spawner must skip when an active diagnosis exists"
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.context["diagnosis_for_direction"].as_string() == did,
+        )
+    )
+    diagnosis_tasks = result.scalars().all()
+    assert len(diagnosis_tasks) == 1, "duplicate diagnosis must not be spawned"
+
+
+@pytest.mark.asyncio
+async def test_auto_retire_skips_diagnosis_spawn(db_session):
+    """When the auto-pause count escalates to retirement, diagnosis is NOT spawned."""
+    did = "d-diag003"
+    # With auto_pause_count=2, the incremented value hits MAX_AUTO_PAUSE_CYCLES=3
+    # and the direction is auto-retired instead of paused.
+    direction = _make_unhealthy_active_direction(did, auto_pause_count=2)
+    project = Project(
+        name="Diagnosis Retire Skip Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == did)
+    assert d["status"] == "completed"
+    assert d.get("auto_completed") is True
+    assert "diagnosis_spawned_at" not in d
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.context["diagnosis_for_direction"].as_string() == did,
+        )
+    )
+    diagnosis_tasks = result.scalars().all()
+    assert len(diagnosis_tasks) == 0, "retired directions must not spawn diagnosis"
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_payload_includes_failure_context(db_session):
+    """Diagnosis payload carries pause_reason, failed-task signatures, and taxonomy counts."""
+    did = "d-diag004"
+    direction = _make_unhealthy_active_direction(did)
+    project = Project(
+        name="Diagnosis Context Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+        design_doc={
+            "playbook/test-gotcha": {
+                "content": "When tests fail, first diagnose if the bug is in CODE or TEST.",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed a couple of FAILED tasks attributed to this direction so the spawner
+    # has real signatures to include.
+    for i in range(2):
+        failed = Task(
+            project_id=project.id,
+            title=f"Failed task {i}",
+            payloads=[{"type": "create", "base_branch": "main"}],
+            context={
+                "direction_id": did,
+                "failure_category": "CODE_ERROR",
+                "failure_taxonomy": "review_quality",
+            },
+            status=TaskStatus.FAILED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            latest_status_message=f"pytest failed in module {i}",
+        )
+        db_session.add(failed)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.context["diagnosis_for_direction"].as_string() == did,
+        )
+    )
+    diagnosis_tasks = result.scalars().all()
+    assert len(diagnosis_tasks) == 1
+    payload = diagnosis_tasks[0].first_payload
+    assert payload["research_mode"] == "diagnosis"
+    assert payload["pause_reason"]
+    sigs = payload.get("failed_task_signatures") or []
+    assert len(sigs) == 2
+    # Signatures carry the failure context for the agent.
+    assert all(s["failure_category"] == "CODE_ERROR" for s in sigs)
+    assert all(s["failure_taxonomy"] == "review_quality" for s in sigs)
+    assert payload["failure_taxonomy_counts"].get("review_quality") == 2
+    # Playbook entry is forwarded through the design_doc summary.
+    assert "playbook/test-gotcha" in payload["design_doc"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Direction cap enforcement in autonomous creation paths
 # ─────────────────────────────────────────────────────────────────────────────
 

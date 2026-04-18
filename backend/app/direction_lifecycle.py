@@ -140,6 +140,19 @@ async def _process_direction_lifecycle(
                 except Exception as _e:
                     logger.warning(f"[NOTIFY] Failed to post auto-retired message: {_e}")
                 directions_modified = True
+            else:
+                # Spawn diagnosis research so the agent can investigate the failure
+                # pattern before the 48h cooldown elapses — skipped on auto-retire
+                # since a retired direction is terminal and has no future cycles.
+                try:
+                    from app.autonomous_research import _spawn_direction_diagnosis  # noqa: PLC0415
+                    if await _spawn_direction_diagnosis(project, d, pause_reason, session):
+                        d["diagnosis_spawned_at"] = _utcnow().isoformat()
+                        directions_modified = True
+                except Exception as _e:
+                    logger.warning(
+                        f"[DIAGNOSIS] Failed to spawn diagnosis research for {did}: {_e}"
+                    )
             continue
         # Positive completion detection — mark for user review but don't pause
         completion_suggestion = _check_direction_completion(d)
