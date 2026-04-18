@@ -44,6 +44,7 @@ const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string }> = {
   AGENT_TIMEOUT: { label: 'Timeout', color: 'bg-yellow-500/20 text-yellow-400' },
   EXTERNAL_API: { label: 'API Error', color: 'bg-blue-500/20 text-blue-400' },
   RATE_LIMIT: { label: 'Rate Limit', color: 'bg-purple-500/20 text-purple-400' },
+  SCOPE_OVERFLOW: { label: 'Scope Overflow', color: 'bg-teal-500/20 text-teal-400' },
 };
 
 const OUTCOME_STYLES: Record<string, { icon: typeof CheckCircle; color: string; label: string }> = {

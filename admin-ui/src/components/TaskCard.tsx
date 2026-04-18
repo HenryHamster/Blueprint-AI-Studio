@@ -105,6 +105,7 @@ const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string; hint:
   AGENT_TIMEOUT: { label: 'Timeout', color: 'bg-yellow-500/20 text-yellow-400', hint: 'Agent died or timed out — possible OOM or stuck execution', suggestion: 'Agent process died — check for OOM or stuck execution', retryLabel: 'Retry' },
   EXTERNAL_API: { label: 'API Error', color: 'bg-blue-500/20 text-blue-400', hint: 'External service failure — typically transient, auto-retries', suggestion: 'Transient service error — typically auto-retries', retryLabel: 'Retry' },
   RATE_LIMIT: { label: 'Rate Limit', color: 'bg-purple-500/20 text-purple-400', hint: 'API quota exhausted — auto-retries with different account', suggestion: 'API quota exhausted — auto-retries with different account', retryLabel: 'Retry' },
+  SCOPE_OVERFLOW: { label: 'Scope Overflow', color: 'bg-teal-500/20 text-teal-400', hint: 'Task exceeded its scope budget — consider decomposition or scope escalation', suggestion: 'Decompose into smaller tasks or escalate scope before retrying', retryLabel: 'Retry' },
 };
 
 export { FAILURE_CLASS_CONFIG };

@@ -1032,6 +1032,84 @@ async def test_narrative_taxonomy_insight_dominant_category(client: AsyncClient,
     assert "Infrastructure issues dominate" in data["narrative_summary"]
 
 
+@pytest.mark.asyncio
+async def test_narrative_taxonomy_insight_review_quality(client: AsyncClient, db_session):
+    """CODE_ERROR failures with test/lint keywords → review_quality narrative hint."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Lint Fail {i}",
+            status=TaskStatus.FAILED,
+            context={"failure_category": "test_failed"},
+            latest_status_message="pytest failed on test_foo",
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["failure_taxonomy_distribution"]["dominant_category"] == "review_quality"
+    assert "Review quality issues dominate" in data["narrative_summary"]
+
+
+@pytest.mark.asyncio
+async def test_narrative_taxonomy_insight_scope_related(client: AsyncClient, db_session):
+    """CODE_ERROR failures with expansion_ratio > 1.5 → scope_related narrative hint."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Scope Fail {i}",
+            status=TaskStatus.FAILED,
+            context={"failure_category": "test_failed", "expansion_ratio": 2.5},
+            latest_status_message="assertion error in handler",
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["failure_taxonomy_distribution"]["dominant_category"] == "scope_related"
+    assert "Scope mismatch is the top failure pattern" in data["narrative_summary"]
+
+
+@pytest.mark.asyncio
+async def test_narrative_taxonomy_insight_code_defect(client: AsyncClient, db_session):
+    """CODE_ERROR failures without review/scope signals → code_defect narrative hint."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Defect {i}",
+            status=TaskStatus.FAILED,
+            context={"failure_category": "test_failed"},
+            latest_status_message="null pointer exception in handler",
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["failure_taxonomy_distribution"]["dominant_category"] == "code_defect"
+    assert "Code defects dominate failures" in data["narrative_summary"]
+
+
 # ---------------------------------------------------------------------------
 # Trend boundary tests
 # ---------------------------------------------------------------------------
