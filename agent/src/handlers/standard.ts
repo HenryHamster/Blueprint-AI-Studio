@@ -945,7 +945,11 @@ Output ONLY a JSON object in a \`\`\`json code fence:
               retryNoteParts.push(`The verdict was inconsistent with check_results: ${failedCheckIds.join(', ')} had passed:false but verdict was not FAIL. When any check has passed:false, verdict MUST be FAIL and issues_found MUST be ≥1.`);
             }
             if (retryNoteParts.length === 0) {
-              retryNoteParts.push('The JSON output could not be parsed as valid JSON.');
+              const rawOutput = (lastReviewResult || lastReviewOutput || '').slice(0, 500);
+              const snippet = rawOutput
+                ? ` Your previous output began with:\n---\n${rawOutput}\n---`
+                : '';
+              retryNoteParts.push(`The JSON output could not be parsed as valid JSON.${snippet}`);
             }
             const retryNote = retryNoteParts.join(' ');
             sendLog(ws, `\nSelf-review: validation failed — retrying with explicit guidance...\n`);
