@@ -84,6 +84,62 @@ def count_matching_fingerprints(target_fingerprint: str, failed_tasks) -> int:
     return count
 
 
+# Window for considering a direction "recently paused" when checking cross-direction
+# fingerprint overlap. Matches the default auto-recovery cooldown — pauses older than
+# this are assumed stale or already recovered and no longer evidence of a systemic
+# issue.
+_SHARED_FINGERPRINT_PAUSED_WINDOW_HOURS = 48
+
+
+def find_directions_sharing_fingerprint(
+    project, target_fingerprint: str, exclude_direction_id: Optional[str] = None,
+) -> list[dict]:
+    """Return other recently auto-paused directions that share ``target_fingerprint``.
+
+    When multiple directions fail with the same normalized error fingerprint, a
+    shared root cause (broken dependency, infra issue, framework bug) is more
+    likely than direction-specific problems. The auto-pause path uses this to
+    annotate diagnosis context with the systemic signal so the investigating
+    agent scopes its fix correctly.
+
+    Scans ``project.directions`` for entries with ``status=='paused'``,
+    ``auto_paused`` truthy, and ``error_fingerprint == target_fingerprint``,
+    excluding the direction identified by ``exclude_direction_id``. Only pauses
+    within the last ``_SHARED_FINGERPRINT_PAUSED_WINDOW_HOURS`` count. Returns
+    compact dicts (``id``/``text``/``paused_at``/``auto_pause_count``) so callers
+    can cheaply embed the list in a prompt. Returns an empty list when
+    ``target_fingerprint`` is empty.
+    """
+    if not target_fingerprint:
+        return []
+    cutoff = _utcnow() - timedelta(hours=_SHARED_FINGERPRINT_PAUSED_WINDOW_HOURS)
+    matches: list[dict] = []
+    for d in (getattr(project, "directions", None) or []):
+        if exclude_direction_id and d.get("id") == exclude_direction_id:
+            continue
+        if d.get("status") != "paused" or not d.get("auto_paused"):
+            continue
+        if d.get("error_fingerprint") != target_fingerprint:
+            continue
+        paused_at_raw = d.get("paused_at")
+        if paused_at_raw:
+            try:
+                paused_at = datetime.fromisoformat(paused_at_raw)
+                if paused_at.tzinfo is not None:
+                    paused_at = paused_at.astimezone(timezone.utc).replace(tzinfo=None)
+                if paused_at < cutoff:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        matches.append({
+            "id": d.get("id"),
+            "text": (d.get("text") or "")[:100],
+            "paused_at": paused_at_raw,
+            "auto_pause_count": int(d.get("auto_pause_count", 0) or 0),
+        })
+    return matches
+
+
 def _is_recurring_failure_class(proj_anomalies: dict, failure_class: str) -> bool:
     """Return True if the given failure class has a persistent anomaly with occurrence_count >= 3."""
     entry = proj_anomalies.get(failure_class)

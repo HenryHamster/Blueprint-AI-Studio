@@ -27,11 +27,13 @@ from app.anomaly_detection import (
     anomaly_maintenance_sweep,
     check_anomaly_actions,
     count_matching_fingerprints,
+    find_directions_sharing_fingerprint,
     _ACTIONABLE_FAILURE_CLASSES,
     _ANOMALY_ACTION_THRESHOLD,
     _FAST_RECOVERY_MIN_SAMPLE,
     _FAST_RECOVERY_WINDOW_HOURS,
     _MAX_ADJUSTMENT_DURATION_HOURS,
+    _SHARED_FINGERPRINT_PAUSED_WINDOW_HOURS,
 )
 from app.time_utils import _utcnow
 from collections import deque
@@ -1031,6 +1033,78 @@ def test_count_matching_fingerprints_counts_recurrence_ignoring_task_specifics()
         _FakeTask(""),
     ]
     assert count_matching_fingerprints(target, tasks) == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# find_directions_sharing_fingerprint — cross-direction systemic-failure helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _FakeProject:
+    def __init__(self, directions):
+        self.directions = directions
+
+
+def _paused_direction(did, fp, *, status="paused", auto_paused=True, paused_at=None, pause_count=1, text="dir"):
+    return {
+        "id": did,
+        "text": text,
+        "status": status,
+        "auto_paused": auto_paused,
+        "error_fingerprint": fp,
+        "paused_at": (paused_at if paused_at is not None else _utcnow().isoformat()),
+        "auto_pause_count": pause_count,
+    }
+
+
+def test_find_directions_sharing_fingerprint_empty_fingerprint():
+    """No fingerprint to match → no work, empty list."""
+    project = _FakeProject([_paused_direction("d1", "abc")])
+    assert find_directions_sharing_fingerprint(project, "") == []
+    assert find_directions_sharing_fingerprint(project, None) == []
+
+
+def test_find_directions_sharing_fingerprint_matches_other_paused_directions():
+    """Other auto-paused directions sharing the fingerprint are returned; caller excluded."""
+    project = _FakeProject([
+        _paused_direction("d-self", "fp-shared"),
+        _paused_direction("d-other", "fp-shared", text="some other direction"),
+        _paused_direction("d-mismatch", "fp-different"),
+    ])
+    result = find_directions_sharing_fingerprint(project, "fp-shared", exclude_direction_id="d-self")
+    assert len(result) == 1
+    assert result[0]["id"] == "d-other"
+    assert result[0]["text"] == "some other direction"
+    assert result[0]["auto_pause_count"] == 1
+
+
+def test_find_directions_sharing_fingerprint_skips_non_paused_and_user_paused():
+    """Active directions and user-paused (not auto_paused) directions are ignored."""
+    project = _FakeProject([
+        _paused_direction("d-active", "fp-x", status="active"),
+        _paused_direction("d-user-paused", "fp-x", auto_paused=False),
+        _paused_direction("d-auto-paused", "fp-x"),
+    ])
+    result = find_directions_sharing_fingerprint(project, "fp-x")
+    assert [r["id"] for r in result] == ["d-auto-paused"]
+
+
+def test_find_directions_sharing_fingerprint_skips_stale_pauses():
+    """Pauses older than the window are considered stale and excluded."""
+    stale_ts = (_utcnow() - timedelta(hours=_SHARED_FINGERPRINT_PAUSED_WINDOW_HOURS + 1)).isoformat()
+    fresh_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    project = _FakeProject([
+        _paused_direction("d-stale", "fp-y", paused_at=stale_ts),
+        _paused_direction("d-fresh", "fp-y", paused_at=fresh_ts),
+    ])
+    result = find_directions_sharing_fingerprint(project, "fp-y")
+    assert [r["id"] for r in result] == ["d-fresh"]
+
+
+def test_find_directions_sharing_fingerprint_handles_missing_directions():
+    """Project with no directions (None or []) returns empty list without error."""
+    assert find_directions_sharing_fingerprint(_FakeProject(None), "fp") == []
+    assert find_directions_sharing_fingerprint(_FakeProject([]), "fp") == []
 
 
 @pytest.mark.asyncio

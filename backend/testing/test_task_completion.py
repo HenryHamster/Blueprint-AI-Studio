@@ -28,6 +28,7 @@ from app.task_completion import (
     _handle_investigation_completion,
     _is_structural_diagnosis,
     _clear_direction_diagnosis_flag,
+    _calculate_remediation_scope,
 )
 from app.strategic_constants import STRATEGIC_RATIONALE_MAX
 from app.models import TaskStatus
@@ -866,6 +867,68 @@ class TestRecordRemediationOutcome:
         assert d["remediation_attempts"] == 2
         assert d["last_remediation_fingerprint"] == "fp-prior"
 
+    @pytest.mark.asyncio
+    async def test_failed_outcome_stamps_failure_class_and_summary(self, db_session):
+        """A failed remediation records the failure class and truncated error summary."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        long_msg = "x" * 500
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message=long_msg,
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-1",
+                "failure_category": "CODE_ERROR",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_outcome(task, merged=False, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["last_remediation_result"] == "failed"
+        assert d["last_remediation_failure_class"] == "CODE_ERROR"
+        assert d["last_remediation_error_summary"] == long_msg[:200]
+        assert len(d["last_remediation_error_summary"]) == 200
+
+    @pytest.mark.asyncio
+    async def test_merge_clears_prior_failure_details(self, db_session):
+        """A merged remediation must clear stale failure class/summary from prior failures."""
+        project = make_project(directions=[{
+            "id": "dir-1",
+            "status": "active",
+            "remediation_attempts": 1,
+            "last_remediation_result": "failed",
+            "last_remediation_failure_class": "CODE_ERROR",
+            "last_remediation_error_summary": "previous error output",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={"diagnosis_task_id": "diag-1", "direction_id": "dir-1"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["last_remediation_result"] == "merged"
+        assert "last_remediation_failure_class" not in d
+        assert "last_remediation_error_summary" not in d
+
 
 # ── _record_remediation_if_terminal ─────────────────────────────────────────
 
@@ -1403,3 +1466,153 @@ class TestClearDirectionDiagnosisFlag:
         assert "diagnosis_summary" not in d
         assert "diagnosis_completed_at" in d
         assert "diagnosis_in_progress" not in d
+
+
+# ── _calculate_remediation_scope ────────────────────────────────────────────
+
+class TestCalculateRemediationScope:
+    def test_small_when_few_paths_and_low_severity(self):
+        assert _calculate_remediation_scope(["a.py", "b.py"], "low", 0) == "small"
+
+    def test_small_when_few_paths_and_medium_severity(self):
+        assert _calculate_remediation_scope(["a.py"], "medium", 0) == "small"
+
+    def test_medium_when_few_paths_but_high_severity(self):
+        """High severity on <=2 paths falls through to medium (rule 1 needs low/medium)."""
+        assert _calculate_remediation_scope(["a.py", "b.py"], "high", 0) == "medium"
+
+    def test_medium_when_moderate_path_count(self):
+        paths = ["a.py", "b.py", "c.py", "d.py", "e.py"]
+        assert _calculate_remediation_scope(paths, "medium", 0) == "medium"
+
+    def test_large_when_many_paths(self):
+        paths = [f"f{i}.py" for i in range(6)]
+        assert _calculate_remediation_scope(paths, "medium", 0) == "large"
+
+    def test_large_when_critical_severity_regardless_of_paths(self):
+        assert _calculate_remediation_scope(["a.py"], "critical", 0) == "large"
+
+    def test_empty_paths_low_severity_is_small(self):
+        assert _calculate_remediation_scope([], "low", 0) == "small"
+
+    def test_bumps_small_to_medium_after_two_attempts(self):
+        assert _calculate_remediation_scope(["a.py"], "low", 2) == "medium"
+
+    def test_bumps_medium_to_large_after_two_attempts(self):
+        paths = ["a.py", "b.py", "c.py"]
+        assert _calculate_remediation_scope(paths, "medium", 2) == "large"
+
+    def test_large_stays_large_after_bump(self):
+        paths = [f"f{i}.py" for i in range(6)]
+        assert _calculate_remediation_scope(paths, "medium", 5) == "large"
+
+    def test_single_attempt_does_not_bump(self):
+        assert _calculate_remediation_scope(["a.py"], "low", 1) == "small"
+
+
+class TestRemediationScopeInPayload:
+    """Integration: _handle_investigation_completion propagates scope into payload."""
+
+    def _payload(self, logs=""):
+        from types import SimpleNamespace
+        from app.models import ArtifactType
+        return SimpleNamespace(logs=logs, artifact_type=ArtifactType.INVESTIGATION_REPORT)
+
+    def _report(self, **overrides) -> str:
+        base = {
+            "summary": "Missing lock causing race condition",
+            "root_cause": "Concurrent writers race on a shared dict without a lock.",
+            "affected_files": [{"path": "backend/app/shared_state.py", "issue": "missing lock"}],
+            "recommended_fix": "Wrap the mutation in the existing asyncio.Lock.",
+            "severity": "medium",
+            "confidence": "high",
+        }
+        base.update(overrides)
+        return json.dumps(base)
+
+    async def _setup(self, db_session, mocker, direction_overrides=None):
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        direction = {
+            "id": "dir-scope-1",
+            "text": "Improve pipeline reliability",
+            "status": "paused",
+            "diagnosis_in_progress": True,
+        }
+        if direction_overrides:
+            direction.update(direction_overrides)
+        project = make_project(directions=[direction])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        return project
+
+    async def _spawned_child(self, db_session, parent_task_id):
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == parent_task_id)
+        )
+        return result.scalars().first()
+
+    @pytest.mark.asyncio
+    async def test_small_scope_for_simple_diagnosis(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(project_id=project.id, context={"direction_id": "dir-scope-1"})
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await db_session.commit()
+        child = await self._spawned_child(db_session, task.id)
+        assert child is not None
+        assert child.context["scope"] == "small"
+
+    @pytest.mark.asyncio
+    async def test_large_scope_for_critical_severity(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(project_id=project.id, context={"direction_id": "dir-scope-1"})
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(
+            task, self._payload(self._report(severity="critical")), db_session,
+        )
+        await db_session.commit()
+        child = await self._spawned_child(db_session, task.id)
+        assert child is not None
+        assert child.context["scope"] == "large"
+
+    @pytest.mark.asyncio
+    async def test_medium_scope_for_multi_file_diagnosis(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(project_id=project.id, context={"direction_id": "dir-scope-1"})
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        affected = [{"path": f"backend/app/mod_{i}.py"} for i in range(4)]
+        await _handle_investigation_completion(
+            task, self._payload(self._report(affected_files=affected)), db_session,
+        )
+        await db_session.commit()
+        child = await self._spawned_child(db_session, task.id)
+        assert child is not None
+        assert child.context["scope"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_attempts_bump_small_to_medium(self, db_session, mocker):
+        project = await self._setup(
+            db_session, mocker, direction_overrides={"remediation_attempts": 2},
+        )
+        task = make_task(project_id=project.id, context={"direction_id": "dir-scope-1"})
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await db_session.commit()
+        child = await self._spawned_child(db_session, task.id)
+        assert child is not None
+        assert child.context["scope"] == "medium"

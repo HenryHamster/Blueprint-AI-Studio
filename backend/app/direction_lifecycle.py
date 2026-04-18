@@ -81,8 +81,9 @@ async def _spawn_direction_diagnosis(
     """Spawn an investigate task for a code-failure auto-pause.
 
     Guards: pause-reason type (Rule 3/4 only), auto-retire threshold, circuit
-    breaker state, per-direction 24h dedup. On spawn, marks the direction
-    with diagnosis_in_progress=True and returns True.
+    breaker state, per-direction 24h dedup, cross-direction 24h fingerprint
+    dedup. On spawn, marks the direction with diagnosis_in_progress=True and
+    returns True.
     """
     if not _is_code_failure_pause_reason(pause_reason):
         return False
@@ -104,6 +105,47 @@ async def _spawn_direction_diagnosis(
     )
     if existing.first() is not None:
         return False
+    # Compute fingerprint up front so it can be (1) used to dedup against
+    # recent investigations on sibling directions sharing the same root cause
+    # and (2) stamped on the new task's context so future dedup queries match.
+    fingerprint = direction.get("error_fingerprint")
+    try:
+        if not fingerprint:
+            fingerprint = await _compute_direction_error_fingerprint(
+                project.id, str(direction_id), session,
+            )
+    except Exception as _fp_exc:
+        logger.warning(f"[DIAGNOSIS] Failed to compute error fingerprint for {direction_id}: {_fp_exc!r}")
+        fingerprint = None
+    if fingerprint:
+        shared = (await session.execute(
+            select(Task.id).where(
+                Task.project_id == project.id,
+                Task.created_at >= cutoff,
+                Task.payloads[0]["type"].as_string() == "investigate",
+                Task.context["diagnosis_fingerprint"].as_string() == str(fingerprint),
+            ).limit(1)
+        )).first()
+        if shared is not None:
+            existing_task_id = str(shared[0])
+            from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX  # noqa: PLC0415
+            note_text = (
+                f"Skipped duplicate investigation: shares error fingerprint "
+                f"{str(fingerprint)[:80]} with existing investigate task {existing_task_id}."
+            )[:STRATEGIC_RATIONALE_MAX]
+            notes = list(direction.get("notes") or [])
+            notes.append({
+                "text": note_text,
+                "added_at": _utcnow().isoformat(),
+                "source": "diagnosis_dedup",
+                "shared_investigation_task_id": existing_task_id,
+            })
+            direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+            logger.info(
+                f"[DIAGNOSIS] Skipping spawn for {direction_id}: shares fingerprint "
+                f"{str(fingerprint)[:40]} with investigation {existing_task_id}"
+            )
+            return False
     history = direction.get("research_history") or []
     recent_lines = "\n".join(
         f"- created={e.get('tasks_created', 0)} failed={e.get('tasks_failed', 0)} "
@@ -121,19 +163,35 @@ async def _spawn_direction_diagnosis(
         f"- {(t.latest_status_message or '(no message)').strip()[:200]}"
         for t in recent_failures
     ) or "- (no recent failed tasks)"
-    fingerprint = direction.get("error_fingerprint")
-    try:
-        if not fingerprint:
-            fingerprint = await _compute_direction_error_fingerprint(
-                project.id, str(direction_id), session,
-            )
-    except Exception as _fp_exc:
-        logger.warning(f"[DIAGNOSIS] Failed to compute error fingerprint for {direction_id}: {_fp_exc!r}")
-        fingerprint = None
     prior_diagnosis = (direction.get("diagnosis_summary") or "").strip()
+    # Cross-direction shared-fingerprint detection. If the same fingerprint
+    # already appears on other auto-paused directions, annotate the diagnosis
+    # so the agent investigates a systemic root cause rather than a
+    # direction-specific scope/code issue.
+    shared_directions: list[dict] = []
+    if fingerprint:
+        for other in (project.directions or []):
+            if other.get("id") == direction_id:
+                continue
+            if other.get("status") != "paused" or not other.get("auto_paused"):
+                continue
+            if other.get("error_fingerprint") == fingerprint:
+                shared_directions.append({
+                    "id": other.get("id"),
+                    "text": (other.get("text") or "")[:80],
+                })
     extras = ""
     if fingerprint:
         extras += f"Dominant error fingerprint: {fingerprint[:200]}\n"
+    if shared_directions:
+        other_ids = ", ".join(str(d["id"]) for d in shared_directions)
+        extras += (
+            f"Shared error pattern: same fingerprint also appears on "
+            f"{len(shared_directions)} other auto-paused direction(s) ({other_ids}). "
+            f"This suggests a SYSTEMIC root cause rather than a direction-specific "
+            f"issue — investigate cross-cutting infrastructure or framework code, "
+            f"not just files specific to this direction.\n"
+        )
     if prior_diagnosis:
         extras += f"Prior diagnosis summary: {prior_diagnosis[:400]}\n"
     rem_attempts = int(direction.get("remediation_attempts") or 0)
@@ -146,6 +204,17 @@ async def _spawn_direction_diagnosis(
             f"Prior remediation attempts: {rem_attempts} "
             f"(last result: {last_rem_result}, at: {last_rem_at}, "
             f"task: {last_rem_task}, fingerprint: {str(last_rem_fp)[:200]})\n"
+        )
+        if last_rem_result == "failed":
+            last_rem_class = direction.get("last_remediation_failure_class")
+            last_rem_error = direction.get("last_remediation_error_summary")
+            if last_rem_class or last_rem_error:
+                extras += (
+                    f"Last remediation failed with "
+                    f"{last_rem_class or '(unknown class)'}: "
+                    f"{(last_rem_error or '(no error summary)')[:200]}\n"
+                )
+        extras += (
             f"Avoid proposing a fix targeting the same fingerprint that already "
             f"failed; prior attempts did not resolve the recurring pattern.\n"
         )
@@ -165,16 +234,21 @@ async def _spawn_direction_diagnosis(
         {"type": "investigate", "prompt": prompt, "base_branch": "main"},
         "direction_lifecycle:auto_pause_diagnosis",
     )
+    task_context = {
+        "direction_id": str(direction_id),
+        "pause_reason": pause_reason,
+        "diagnosis_trigger": "direction_auto_pause",
+    }
+    if fingerprint:
+        task_context["diagnosis_fingerprint"] = str(fingerprint)
+    if shared_directions:
+        task_context["shared_fingerprint_directions"] = shared_directions
     new_task = Task(
         project_id=project.id,
         title=f"Investigate direction auto-pause: {(direction.get('text') or '')[:60]}",
         description=f"Auto-pause reason: {pause_reason}"[:500],
         payloads=[payload],
-        context={
-            "direction_id": str(direction_id),
-            "pause_reason": pause_reason,
-            "diagnosis_trigger": "direction_auto_pause",
-        },
+        context=task_context,
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",

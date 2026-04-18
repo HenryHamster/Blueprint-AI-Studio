@@ -86,6 +86,13 @@ async def _record_remediation_outcome(
     target["last_remediation_task_id"] = str(task.id)
     if fingerprint:
         target["last_remediation_fingerprint"] = str(fingerprint)
+    if merged:
+        target.pop("last_remediation_failure_class", None)
+        target.pop("last_remediation_error_summary", None)
+    else:
+        from app.failure_classification import classify_failure  # noqa: PLC0415
+        target["last_remediation_failure_class"] = classify_failure(task)
+        target["last_remediation_error_summary"] = (task.latest_status_message or "")[:200]
     project.directions = directions
     flag_modified(project, "directions")
     session.add(project)
@@ -852,6 +859,7 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
             severity=severity,
             confidence=confidence,
             affected_paths=affected_paths,
+            remediation_attempts=int(direction.get("remediation_attempts") or 0),
             session=session,
         )
 
@@ -976,6 +984,29 @@ async def _clear_direction_diagnosis_flag(
     session.add(project)
 
 
+def _calculate_remediation_scope(
+    affected_paths: List[str],
+    severity: str,
+    remediation_attempts: int,
+) -> str:
+    """Calibrate the remediation task's scope based on diagnosis complexity.
+
+    Returns one of "small", "medium", or "large". Routes complex diagnoses
+    (>5 files or critical severity) to large scope (plan decomposition); bumps
+    the scope up one level when prior small-scope fixes have already failed.
+    """
+    num_paths = len(affected_paths)
+    if num_paths > 5 or severity == "critical":
+        scope = "large"
+    elif num_paths <= 2 and severity in ("low", "medium"):
+        scope = "small"
+    else:
+        scope = "medium"
+    if remediation_attempts >= 2:
+        scope = {"small": "medium", "medium": "large", "large": "large"}[scope]
+    return scope
+
+
 async def _spawn_investigation_remediation(
     *,
     task: Task,
@@ -986,6 +1017,7 @@ async def _spawn_investigation_remediation(
     severity: str,
     confidence: str,
     affected_paths: List[str],
+    remediation_attempts: int,
     session: AsyncSession,
 ) -> Optional[Task]:
     """Build and persist a targeted `create` task from a high/medium-confidence diagnosis."""
@@ -1008,6 +1040,7 @@ async def _spawn_investigation_remediation(
     title_hint = (summary or recommended_fix or "diagnosed fix")[:80]
     title = f"fix (diagnosed): {title_hint}"
     severity_tag = severity if severity in ("critical", "high", "medium", "low") else "medium"
+    scope = _calculate_remediation_scope(affected_paths, severity_tag, remediation_attempts)
 
     payload_dict: Dict[str, Any] = {
         "type": "create",
@@ -1033,6 +1066,7 @@ async def _spawn_investigation_remediation(
             "diagnosis_confidence": confidence if confidence in ("high", "medium") else "high",
             "related_files": affected_paths[:25],
             "diagnosis_trigger": "investigation_completion",
+            "scope": scope,
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,

@@ -123,6 +123,52 @@ async def test_dedup_skips_when_recent_investigate_exists(db_session):
 
 
 @pytest.mark.asyncio
+async def test_cross_direction_dedup_by_shared_fingerprint(db_session):
+    """Two directions sharing a dominant error fingerprint should only produce one
+    investigate task. The second direction gets a note referencing the first."""
+    project = await _make_project(db_session)
+    reason = "High code failure rate: ..."
+    d1 = _direction(did="d-fp-share-1")
+    d1["error_fingerprint"] = "fp-shared-root"
+    assert await _spawn_direction_diagnosis(project, d1, reason, db_session) is True
+    await db_session.commit()
+
+    tasks = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().all()
+    assert len(tasks) == 1
+    existing_id = str(tasks[0].id)
+    assert tasks[0].context.get("diagnosis_fingerprint") == "fp-shared-root"
+
+    # Different direction, same fingerprint → skipped with note
+    d2 = _direction(did="d-fp-share-2")
+    d2["error_fingerprint"] = "fp-shared-root"
+    assert await _spawn_direction_diagnosis(project, d2, reason, db_session) is False
+    assert "diagnosis_in_progress" not in d2
+    notes = d2.get("notes") or []
+    assert len(notes) == 1
+    assert notes[-1]["source"] == "diagnosis_dedup"
+    assert notes[-1]["shared_investigation_task_id"] == existing_id
+    assert "fp-shared-root" in notes[-1]["text"]
+
+    # Still only one investigate task in the project
+    tasks_after = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().all()
+    assert len(tasks_after) == 1
+
+    # Distinct fingerprint on a third direction still spawns
+    d3 = _direction(did="d-fp-different")
+    d3["error_fingerprint"] = "fp-other-root"
+    assert await _spawn_direction_diagnosis(project, d3, reason, db_session) is True
+    await db_session.commit()
+    tasks_final = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().all()
+    assert len(tasks_final) == 2
+
+
+@pytest.mark.asyncio
 async def test_skips_when_direction_id_missing(db_session):
     project = await _make_project(db_session)
     direction = {"text": "no id", "research_history": []}
@@ -130,6 +176,57 @@ async def test_skips_when_direction_id_missing(db_session):
         project, direction, "High code failure rate: ...", db_session
     )
     assert spawned is False
+
+
+@pytest.mark.asyncio
+async def test_prompt_includes_last_remediation_failure_details(db_session):
+    """When prior remediation failed, investigate prompt surfaces failure class + summary."""
+    project = await _make_project(db_session)
+    direction = _direction(did="d-with-failure-details")
+    direction.update({
+        "remediation_attempts": 2,
+        "last_remediation_result": "failed",
+        "last_remediation_at": "2026-04-17T12:00:00+00:00",
+        "last_remediation_task_id": "task-prev-remediation",
+        "last_remediation_fingerprint": "fp-recurring",
+        "last_remediation_failure_class": "SCOPE_OVERFLOW",
+        "last_remediation_error_summary": "expanded beyond 5 files during fix attempt",
+    })
+    reason = "High code failure rate: >70% of spawned tasks failed..."
+    spawned = await _spawn_direction_diagnosis(project, direction, reason, db_session)
+    assert spawned is True
+    await db_session.commit()
+    tasks = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().all()
+    assert len(tasks) == 1
+    prompt = tasks[0].first_payload["prompt"]
+    assert "SCOPE_OVERFLOW" in prompt
+    assert "expanded beyond 5 files during fix attempt" in prompt
+    assert "Last remediation failed with" in prompt
+
+
+@pytest.mark.asyncio
+async def test_prompt_omits_failure_details_when_last_remediation_merged(db_session):
+    """A merged prior remediation must not produce a failure-details line."""
+    project = await _make_project(db_session)
+    direction = _direction(did="d-prior-merged")
+    direction.update({
+        "remediation_attempts": 1,
+        "last_remediation_result": "merged",
+        "last_remediation_at": "2026-04-17T12:00:00+00:00",
+        "last_remediation_task_id": "task-merged",
+        "last_remediation_fingerprint": "fp-fixed",
+    })
+    reason = "High code failure rate: ..."
+    spawned = await _spawn_direction_diagnosis(project, direction, reason, db_session)
+    assert spawned is True
+    await db_session.commit()
+    tasks = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().all()
+    prompt = tasks[0].first_payload["prompt"]
+    assert "Last remediation failed with" not in prompt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -714,6 +811,97 @@ async def test_expired_monitor_on_active_direction_clears_intervention(db_sessio
     assert d["status"] == "active"
     assert "needs_manual_intervention" not in d
     assert "remediation_monitor_started_at" not in d
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-direction shared-fingerprint detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _other_paused(did: str, fp: str | None, *, status: str = "paused", auto_paused: bool = True) -> dict:
+    """Sibling direction record used to test cross-direction fingerprint annotation."""
+    return {
+        "id": did,
+        "text": f"Sibling direction {did}",
+        "status": status,
+        "auto_paused": auto_paused,
+        "error_fingerprint": fp,
+    }
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_annotates_shared_fingerprint_directions(db_session):
+    """When other paused directions share the fingerprint, context + prompt flag the systemic pattern."""
+    project = await _make_project(db_session)
+    project.directions = [
+        _other_paused("d-other-1", "fp-shared"),
+        _other_paused("d-other-2", "fp-shared"),
+        _other_paused("d-other-3", "fp-different"),
+    ]
+    flag_modified(project, "directions")
+    await db_session.commit()
+    direction = _direction(did="d-target")
+    direction["error_fingerprint"] = "fp-shared"
+    spawned = await _spawn_direction_diagnosis(
+        project, direction, "High code failure rate: ...", db_session,
+    )
+    assert spawned is True
+    await db_session.commit()
+    task = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().first()
+    shared = task.context.get("shared_fingerprint_directions")
+    assert shared is not None
+    shared_ids = {entry["id"] for entry in shared}
+    assert shared_ids == {"d-other-1", "d-other-2"}
+    assert "SYSTEMIC" in task.first_payload["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_omits_shared_directions_when_fingerprints_unique(db_session):
+    """No other directions share the fingerprint → no annotation, no SYSTEMIC hint."""
+    project = await _make_project(db_session)
+    project.directions = [
+        _other_paused("d-other-1", "fp-different"),
+        _other_paused("d-other-2", None),
+    ]
+    flag_modified(project, "directions")
+    await db_session.commit()
+    direction = _direction(did="d-target-unique")
+    direction["error_fingerprint"] = "fp-unique"
+    assert await _spawn_direction_diagnosis(
+        project, direction, "High code failure rate: ...", db_session,
+    ) is True
+    await db_session.commit()
+    task = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().first()
+    assert "shared_fingerprint_directions" not in task.context
+    assert "SYSTEMIC" not in task.first_payload["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_ignores_active_siblings_with_matching_fingerprint(db_session):
+    """Only paused, auto_paused siblings count — active directions are excluded."""
+    project = await _make_project(db_session)
+    project.directions = [
+        # Same fingerprint but still active — must be ignored.
+        _other_paused("d-active", "fp-shared", status="active", auto_paused=False),
+        # Paused but not auto_paused (e.g. user-paused) — also ignored.
+        _other_paused("d-manual", "fp-shared", auto_paused=False),
+    ]
+    flag_modified(project, "directions")
+    await db_session.commit()
+    direction = _direction(did="d-target-active")
+    direction["error_fingerprint"] = "fp-shared"
+    assert await _spawn_direction_diagnosis(
+        project, direction, "High code failure rate: ...", db_session,
+    ) is True
+    await db_session.commit()
+    task = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().first()
+    assert "shared_fingerprint_directions" not in task.context
 
 
 @pytest.mark.asyncio

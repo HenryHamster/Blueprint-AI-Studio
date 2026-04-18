@@ -1170,6 +1170,8 @@ async def _spawn_direction_diagnosis(
         "last_remediation_at": direction.get("last_remediation_at"),
         "last_remediation_task_id": direction.get("last_remediation_task_id"),
         "last_remediation_fingerprint": direction.get("last_remediation_fingerprint"),
+        "last_remediation_failure_class": direction.get("last_remediation_failure_class"),
+        "last_remediation_error_summary": direction.get("last_remediation_error_summary"),
     }
 
     research_payload: dict = {
