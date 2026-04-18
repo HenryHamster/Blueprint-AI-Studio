@@ -28,6 +28,7 @@ from app.task_completion import (
     _maybe_spawn_followup_investigation,
     _handle_investigation_completion,
     _handle_investigation_terminal_failure,
+    _maybe_spawn_reinvestigation_after_failure,
     _is_structural_diagnosis,
     _clear_direction_diagnosis_flag,
     _calculate_remediation_scope,
@@ -2903,3 +2904,47 @@ class TestHandleInvestigationTerminalFailure:
         # Should swallow the exception and still return
         await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
         assert boom.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_reinvestigation_skipped_by_cross_direction_fingerprint(self, db_session):
+        """Sibling direction with a recent investigate sharing the fingerprint
+        blocks the reinvestigation spawn and records a dedup note."""
+        project = make_project(directions=[
+            {"id": "dir-1", "status": "paused", "text": "primary"},
+            {"id": "dir-2", "status": "paused", "text": "sibling"},
+        ])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sibling_inv = make_task(
+            project_id=project.id,
+            payloads=[{"type": "investigate", "prompt": "sibling", "base_branch": "main"}],
+            context={"direction_id": "dir-2", "diagnosis_fingerprint": "fp-A"},
+        )
+        db_session.add(sibling_inv)
+        await db_session.commit()
+
+        failed_inv = self._make_investigation_task(
+            project.id, direction_id="dir-1", fingerprint="fp-A",
+        )
+        db_session.add(failed_inv)
+        await db_session.commit()
+        await db_session.refresh(failed_inv)
+
+        target = next(d for d in project.directions if d["id"] == "dir-1")
+        spawned = await _maybe_spawn_reinvestigation_after_failure(
+            investigation_task=failed_inv,
+            project=project,
+            direction=target,
+            session=db_session,
+        )
+        assert spawned is None
+        assert "followup_investigation_attempts_by_fingerprint" not in target
+        assert target.get("diagnosis_in_progress") is not True
+        notes = target.get("notes") or []
+        assert any(n.get("source") == "followup_dedup" for n in notes)
+        assert any(
+            n.get("shared_investigation_task_id") == str(sibling_inv.id)
+            for n in notes
+        )
