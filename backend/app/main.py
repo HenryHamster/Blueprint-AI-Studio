@@ -44,6 +44,7 @@ from app.routers.deploy import router as deploy_router
 from app.routers.admin_users import router as admin_users_router
 from app.routers.admin_notifications import router as admin_notifications_router
 from app.routers.admin_analytics import router as admin_analytics_router
+from app.routers.admin_orchestrator_errors import router as admin_orchestrator_errors_router
 from app.routers.agent_status import router as agent_status_router
 from app.routers.admin_onboard import router as admin_onboard_router
 from app.security import scan_pr_for_injection
@@ -855,6 +856,7 @@ app.include_router(deploy_router)
 app.include_router(admin_users_router)
 app.include_router(admin_notifications_router)
 app.include_router(admin_analytics_router)
+app.include_router(admin_orchestrator_errors_router)
 app.include_router(agent_status_router)
 app.include_router(admin_onboard_router)
 

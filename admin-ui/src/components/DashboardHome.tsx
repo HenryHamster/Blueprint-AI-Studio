@@ -468,24 +468,19 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           )}
 
           {/* Section 1c: Failure Taxonomy Breakdown */}
-          {!loading && digest?.failure_taxonomy_distribution && digest.failure_taxonomy_distribution.total_failures > 0 && (() => {
-            const tax = digest.failure_taxonomy_distribution;
-            return (
+          {!loading && digest?.failure_taxonomy_distribution && digest.failure_taxonomy_distribution.total_failures > 0 && (
             <section>
               <div className="flex flex-wrap gap-1.5 items-center">
                 <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Taxonomy</span>
                 {TAXONOMY_ORDER.map(k => {
+                  const tax = digest.failure_taxonomy_distribution!;
                   const cat = tax.categories[k];
                   if (!cat) return null;
                   const isDominant = tax.dominant_category === k;
                   const base = TAXONOMY_COLORS[k] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
                   const cls = isDominant ? `${base} ring-1 ring-current` : base;
                   return (
-                    <span
-                      key={k}
-                      className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${cls}`}
-                      title={`${TAXONOMY_LABELS[k]}: ${cat.count} (${cat.percentage}%)${isDominant ? ' — dominant' : ''}`}
-                    >
+                    <span key={k} className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${cls}`} title={`${TAXONOMY_LABELS[k]}: ${cat.count} (${cat.percentage}%)${isDominant ? ' — dominant' : ''}`}>
                       {TAXONOMY_LABELS[k]}
                       <span className="font-bold">{cat.count}</span>
                       <span className="opacity-70">{cat.percentage}%</span>
@@ -494,8 +489,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                 })}
               </div>
             </section>
-            );
-          })()}
+          )}
 
           {/* Section 2: Direction Portfolio Health */}
           <section>
@@ -994,42 +988,15 @@ function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | n
                       <p className="text-[9px] text-neutral-600">{data.post_investment.merged}/{data.post_investment.created}</p>
                     </div>
                   )}
-                  {data.recent_24h && (
-                    <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 24h</p>
+                  {([['Recent 24h', data.recent_24h], ['Recent 3d', data.recent_3d], ['Recent 7d', data.recent_7d], ['Recent 30d', data.recent_30d]] as const).map(([label, s]) => s && (
+                    <div key={label} className="text-center">
+                      <p className="text-[10px] text-neutral-500 mb-0.5">{label}</p>
                       <p className="text-lg font-bold font-mono text-neutral-300">
-                        {data.recent_24h.merge_rate != null ? `${Math.round(data.recent_24h.merge_rate * 100)}%` : '--'}
+                        {s.merge_rate != null ? `${Math.round(s.merge_rate * 100)}%` : '--'}
                       </p>
-                      <p className="text-[9px] text-neutral-600">{data.recent_24h.merged}/{data.recent_24h.created}</p>
+                      <p className="text-[9px] text-neutral-600">{s.merged}/{s.created}</p>
                     </div>
-                  )}
-                  {data.recent_3d && (
-                    <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 3d</p>
-                      <p className="text-lg font-bold font-mono text-neutral-300">
-                        {data.recent_3d.merge_rate != null ? `${Math.round(data.recent_3d.merge_rate * 100)}%` : '--'}
-                      </p>
-                      <p className="text-[9px] text-neutral-600">{data.recent_3d.merged}/{data.recent_3d.created}</p>
-                    </div>
-                  )}
-                  {data.recent_7d && (
-                    <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 7d</p>
-                      <p className="text-lg font-bold font-mono text-neutral-300">
-                        {data.recent_7d.merge_rate != null ? `${Math.round(data.recent_7d.merge_rate * 100)}%` : '--'}
-                      </p>
-                      <p className="text-[9px] text-neutral-600">{data.recent_7d.merged}/{data.recent_7d.created}</p>
-                    </div>
-                  )}
-                  {data.recent_30d && (
-                    <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Recent 30d</p>
-                      <p className="text-lg font-bold font-mono text-neutral-300">
-                        {data.recent_30d.merge_rate != null ? `${Math.round(data.recent_30d.merge_rate * 100)}%` : '--'}
-                      </p>
-                      <p className="text-[9px] text-neutral-600">{data.recent_30d.merged}/{data.recent_30d.created}</p>
-                    </div>
-                  )}
+                  ))}
                   {deltaPp != null && (
                     <div className="text-center">
                       <p className="text-[10px] text-neutral-500 mb-0.5">Delta</p>
@@ -1054,10 +1021,6 @@ function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | n
             return <p className={`text-[11px] ${color}`}>{text}</p>;
           })()}
 
-          {/* Daily trend chart (swapped from weekly 2026-04-17) — weekly buckets
-              are too coarse for this pipeline's velocity; within-week movement
-              was invisible. Daily dots preserve the same line shape but show
-              the real cadence. */}
           {data.daily_series.length >= 2 && (
             <div className="h-32">
               <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
