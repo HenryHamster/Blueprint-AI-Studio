@@ -43,6 +43,12 @@ def make_task(project_id=None, **kwargs) -> Task:
         status_log=[],
     )
     defaults.update(kwargs)
+    # When tests backdate created_at, mirror it to updated_at unless the test
+    # explicitly sets updated_at. Without this, updated_at would default to
+    # _utcnow() and pollute terminal-updated-in-window filters that treat
+    # updated_at as "last touched" (e.g. admin_analytics._rolling_window_stats).
+    if "created_at" in kwargs and "updated_at" not in kwargs:
+        defaults["updated_at"] = kwargs["created_at"]
     return Task(**defaults)
 
 

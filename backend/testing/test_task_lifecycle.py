@@ -924,6 +924,20 @@ def test_derive_failure_stage_pr_creation():
     assert _derive_failure_stage("CODE_ERROR", "failed to create pr: branch not found") == "pr_creation"
 
 
+def test_derive_failure_stage_merge_keyword():
+    from app.task_lifecycle import _derive_failure_stage
+    assert _derive_failure_stage("CODE_ERROR", "merge conflict in app.py") == "merge"
+    assert _derive_failure_stage("CODE_ERROR", "PR not mergeable") == "merge"
+    assert _derive_failure_stage("CODE_ERROR", "branch is behind main") == "merge"
+
+
+def test_derive_failure_stage_review_keyword():
+    from app.task_lifecycle import _derive_failure_stage
+    assert _derive_failure_stage("CODE_ERROR", "reviewer rejected changes") == "review"
+    assert _derive_failure_stage("CODE_ERROR", "changes requested on PR") == "review"
+    assert _derive_failure_stage("CODE_ERROR", "review dismissed by author") == "review"
+
+
 def test_derive_failure_stage_unknown():
     from app.task_lifecycle import _derive_failure_stage
     assert _derive_failure_stage("AGENT_TIMEOUT", "No heartbeat for 300s") is None

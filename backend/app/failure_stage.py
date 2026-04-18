@@ -21,7 +21,8 @@ def _is_transient_scan_error(exc: Exception) -> bool:
 def _derive_failure_stage(failure_class: str, status_message: str) -> "str | None":
     """Derive the pipeline stage at which a task failure occurred.
 
-    Returns one of: 'provision', 'clone', 'test', 'lint', 'build', 'pr_creation', or None.
+    Returns one of: 'provision', 'clone', 'test', 'lint', 'build', 'pr_creation',
+    'merge', 'review', or None.
     """
     if failure_class == "PROVISION_FAILURE":
         return "provision"
@@ -36,4 +37,8 @@ def _derive_failure_stage(failure_class: str, status_message: str) -> "str | Non
         return "build"
     if any(kw in msg for kw in ("pull request", "create pr", "pr creation")):
         return "pr_creation"
+    if any(kw in msg for kw in ("merge conflict", "mergeable", "dirty", "behind", "blocked")):
+        return "merge"
+    if any(kw in msg for kw in ("review", "rejected", "dismissed", "changes requested")):
+        return "review"
     return None

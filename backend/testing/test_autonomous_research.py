@@ -1823,6 +1823,159 @@ def test_cluster_files_by_cochange_ignores_below_threshold_scores():
     assert len(clusters) == 2
 
 
+def test_cluster_files_by_toplevel_dir_requires_min_files_and_dirs():
+    """Path-based fallback requires 3+ files spanning 2+ top-level directories."""
+    from app.cochange_decomposition import cluster_files_by_toplevel_dir
+    assert cluster_files_by_toplevel_dir(["backend/a.py", "agent/b.ts"]) is None
+    assert cluster_files_by_toplevel_dir(
+        ["backend/a.py", "backend/b.py", "backend/c.py"]
+    ) is None
+    # Root-level files don't establish a directory span.
+    assert cluster_files_by_toplevel_dir(["a.py", "b.py", "c.py"]) is None
+    clusters = cluster_files_by_toplevel_dir(
+        ["backend/a.py", "backend/b.py", "agent/c.ts"]
+    )
+    assert clusters is not None
+    cluster_sets = {frozenset(c) for c in clusters}
+    assert cluster_sets == {
+        frozenset({"backend/a.py", "backend/b.py"}),
+        frozenset({"agent/c.ts"}),
+    }
+
+
+def test_auto_decompose_falls_back_to_path_when_cochange_empty():
+    """Medium finding with files across 2 top-level dirs splits when cochange is empty."""
+    from app.cochange_decomposition import auto_decompose_findings_by_cochange
+
+    def _hash(title: str, desc: str) -> str:
+        return f"{title}|{desc}"
+
+    finding = {
+        "title": "Cross-module cleanup",
+        "description": "desc",
+        "scope": "medium",
+        "related_files": [
+            "backend/app/x.py",
+            "backend/app/y.py",
+            "agent/src/z.ts",
+        ],
+    }
+    result = auto_decompose_findings_by_cochange(
+        [(0, finding, "h0")], {}, None, _hash,
+    )
+    assert len(result) == 2
+    assert all(sub["scope"] == "small" for _, sub, _ in result)
+    assert all(sub["auto_decomposed"] for _, sub, _ in result)
+    sub_file_sets = {frozenset(sub["related_files"]) for _, sub, _ in result}
+    assert sub_file_sets == {
+        frozenset({"backend/app/x.py", "backend/app/y.py"}),
+        frozenset({"agent/src/z.ts"}),
+    }
+
+
+def test_auto_decompose_path_fallback_skipped_for_single_directory():
+    """Path fallback does not trigger when all files share one top-level dir."""
+    from app.cochange_decomposition import auto_decompose_findings_by_cochange
+
+    def _hash(title: str, desc: str) -> str:
+        return f"{title}|{desc}"
+
+    finding = {
+        "title": "Backend-only cleanup",
+        "scope": "medium",
+        "related_files": [
+            "backend/app/a.py",
+            "backend/app/b.py",
+            "backend/app/c.py",
+        ],
+    }
+    result = auto_decompose_findings_by_cochange(
+        [(0, finding, "h0")], None, None, _hash,
+    )
+    assert len(result) == 1
+    assert result[0][1] is finding
+
+
+def _decomp_hash_fn(title: str, desc: str) -> str:
+    return f"{title}|{desc}"
+
+
+def _decomp_finding(files: list[str], title: str = "F1") -> dict:
+    return {
+        "title": title,
+        "description": "d",
+        "scope": "medium",
+        "related_files": files,
+    }
+
+
+def _decomp_cochange_index(clusters: list[list[str]]) -> dict:
+    """Build a cochange_index where files within each cluster co-change."""
+    idx: dict = {}
+    for cluster in clusters:
+        for fa in cluster:
+            for fb in cluster:
+                if fa != fb:
+                    idx.setdefault(fa, {})[fb] = 2.0
+    return idx
+
+
+def test_auto_decompose_normal_split_when_clusters_fit_small_budget():
+    """[5 files, 3 files] decomposes normally — both clusters fit small budget (6)."""
+    from app.cochange_decomposition import auto_decompose_findings_by_cochange
+    cluster_a = [f"a{i}.py" for i in range(5)]
+    cluster_b = [f"b{i}.py" for i in range(3)]
+    files = cluster_a + cluster_b
+    idx = _decomp_cochange_index([cluster_a, cluster_b])
+    finding = _decomp_finding(files)
+    out = auto_decompose_findings_by_cochange(
+        [(0, finding, "h")], idx, None, _decomp_hash_fn
+    )
+    assert len(out) == 2
+    for _, sub, _ in out:
+        assert sub["scope"] == "small"
+        assert sub.get("auto_decomposed") is True
+        assert sub.get("scope_calibrated_from") == "medium"
+
+
+def test_auto_decompose_oversized_cluster_keeps_medium_scope():
+    """[7 files, 3 files] — 7-file cluster stays medium, 3-file cluster goes small."""
+    from app.cochange_decomposition import auto_decompose_findings_by_cochange
+    cluster_a = [f"a{i}.py" for i in range(7)]
+    cluster_b = [f"b{i}.py" for i in range(3)]
+    files = cluster_a + cluster_b
+    idx = _decomp_cochange_index([cluster_a, cluster_b])
+    finding = _decomp_finding(files)
+    out = auto_decompose_findings_by_cochange(
+        [(0, finding, "h")], idx, None, _decomp_hash_fn
+    )
+    assert len(out) == 2
+    by_size = {len(sub["related_files"]): sub for _, sub, _ in out}
+    assert by_size[7]["scope"] == "medium"
+    assert "scope_calibrated_from" not in by_size[7]
+    assert by_size[3]["scope"] == "small"
+    assert by_size[3]["scope_calibrated_from"] == "medium"
+
+
+def test_auto_decompose_skipped_when_all_clusters_exceed_small_budget():
+    """When every cluster exceeds the small budget, leave the original medium finding intact."""
+    from app.cochange_decomposition import auto_decompose_findings_by_cochange
+    cluster_a = [f"a{i}.py" for i in range(7)]
+    cluster_b = [f"b{i}.py" for i in range(8)]
+    files = cluster_a + cluster_b
+    idx = _decomp_cochange_index([cluster_a, cluster_b])
+    finding = _decomp_finding(files)
+    out = auto_decompose_findings_by_cochange(
+        [(0, finding, "h")], idx, None, _decomp_hash_fn
+    )
+    assert len(out) == 1
+    _, sub, fhash = out[0]
+    assert sub is finding
+    assert sub["scope"] == "medium"
+    assert sub.get("auto_decomposed") is not True
+    assert fhash == "h"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. _handle_research_completion — JSONB research_history Updates
 # ─────────────────────────────────────────────────────────────────────────────

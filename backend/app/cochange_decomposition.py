@@ -58,6 +58,32 @@ def cluster_files_by_cochange(
     return list(groups.values())
 
 
+def cluster_files_by_toplevel_dir(files: list[str]) -> list[list[str]] | None:
+    """Group files by their top-level directory (e.g. backend/, agent/, admin-ui/).
+
+    Fallback clustering for sparse-cochange findings: returns one cluster per
+    top-level dir when 3+ directory-prefixed files span 2+ dirs, else None.
+    Root-level files (no ``/``) don't establish a directory span and are
+    ignored — if after filtering fewer than 3 files remain, returns None.
+    """
+    if len(files) < 3:
+        return None
+    groups: dict[str, list[str]] = {}
+    order: list[str] = []
+    kept = 0
+    for f in files:
+        if "/" not in f:
+            continue
+        top = f.split("/", 1)[0]
+        if top not in groups:
+            order.append(top)
+        groups.setdefault(top, []).append(f)
+        kept += 1
+    if kept < 3 or len(groups) < 2:
+        return None
+    return [groups[t] for t in order]
+
+
 def auto_decompose_findings_by_cochange(
     deduplicated: list[tuple[int, dict, str]],
     cochange_index: dict | None,
@@ -70,9 +96,21 @@ def auto_decompose_findings_by_cochange(
     clusters in the cochange_index (files that don't historically co-change
     together), split it into one small sub-finding per cluster so each piece
     spawns as a small task at the healthier small-scope merge rate.
+
+    Falls back to clustering by top-level directory when the cochange index
+    has no affinity data for the finding's files — sparse history would
+    otherwise bypass decomposition entirely.
+
+    Clusters that exceed the small-scope file budget keep medium scope rather
+    than being downgraded — a cluster too large for small wouldn't fit the
+    agent file budget at small scope. If every cluster exceeds the small
+    budget, skip decomposition entirely so the original medium finding stays
+    intact.
     """
-    if not cochange_index:
-        return deduplicated
+    from app.research_completion import SCOPE_FILE_BUDGETS  # noqa: PLC0415
+    small_budget = (
+        SCOPE_FILE_BUDGETS.get("small", {}).get("total_files_max") or 6
+    )
     expanded: list[tuple[int, dict, str]] = []
     for orig_i, finding, fhash in deduplicated:
         f_scope = finding.get("scope", DEFAULT_TASK_SCOPE)
@@ -86,19 +124,38 @@ def auto_decompose_findings_by_cochange(
             and len(f_files) >= 3
             and not f_already_calibrated
         ):
-            f_clusters = cluster_files_by_cochange(f_files, cochange_index)
+            f_clusters = (
+                cluster_files_by_cochange(f_files, cochange_index)
+                if cochange_index
+                else None
+            )
+            cluster_source = "co-change"
+            if f_clusters is None:
+                f_clusters = cluster_files_by_toplevel_dir(f_files)
+                cluster_source = "top-level-dir"
             if f_clusters and len(f_clusters) >= 2:
                 f_title = finding.get("title", f"Research finding #{orig_i+1}")
+                if all(len(c) > small_budget for c in f_clusters):
+                    logger.info(
+                        "[RESEARCH] Skipping co-change decomposition for '%s': "
+                        "all %d clusters exceed small-scope budget (%d files)",
+                        f_title, len(f_clusters), small_budget,
+                    )
+                    expanded.append((orig_i, finding, fhash))
+                    continue
                 logger.info(
                     "[RESEARCH] Auto-decomposing medium finding '%s' into %d "
-                    "small sub-findings via co-change clustering: %s",
-                    f_title, len(f_clusters), f_clusters,
+                    "sub-findings via %s clustering: %s",
+                    f_title, len(f_clusters), cluster_source, f_clusters,
                 )
                 for ci, cluster in enumerate(f_clusters):
                     sub = dict(finding)
-                    sub["scope"] = "small"
+                    if len(cluster) > small_budget:
+                        sub["scope"] = "medium"
+                    else:
+                        sub["scope"] = "small"
+                        sub["scope_calibrated_from"] = "medium"
                     sub["related_files"] = cluster
-                    sub["scope_calibrated_from"] = "medium"
                     sub["title"] = (
                         f"{f_title} (cluster {ci + 1}/{len(f_clusters)})"
                     )
