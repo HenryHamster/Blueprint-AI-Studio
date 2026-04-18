@@ -1650,12 +1650,69 @@ class TestBuildRetryPromptSuffix:
         guidance, _ = _build_retry_prompt_suffix(
             "CODE_ERROR", "test failure: assert", attempt=1, task_scope="small", ctx=ctx,
         )
-        assert "Failing tests:" in guidance
+        assert "Previously failing tests:" in guidance
         assert "tests/test_a.py::test_x" in guidance
         assert "tests/test_b.py::test_y" in guidance
         assert "Error file locations:" in guidance
         assert "backend/app/main.py" in guidance
         assert "agent/src/index.ts" in guidance
+
+    def test_agent_timeout_oom_subtype_guidance(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "AGENT_TIMEOUT", "exit code 137 out of memory",
+            attempt=1, task_scope="medium", ctx={},
+        )
+        assert "out-of-memory" in guidance
+        assert "memory" in guidance.lower()
+
+    def test_agent_timeout_heartbeat_subtype_guidance(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "AGENT_TIMEOUT", "No heartbeat received after 300s",
+            attempt=1, task_scope="medium", ctx={},
+        )
+        assert "heartbeat" in guidance.lower()
+        assert "smaller" in guidance.lower()
+
+    def test_agent_timeout_iteration_limit_subtype_guidance(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "AGENT_TIMEOUT", "review-fix cycle limit reached",
+            attempt=1, task_scope="medium", ctx={},
+        )
+        assert "iteration" in guidance.lower()
+        assert "narrow scope" in guidance.lower()
+
+    def test_agent_timeout_cascade_no_scope_downgrade(self):
+        _, override = _build_retry_prompt_suffix(
+            "AGENT_TIMEOUT", "Cancelled: parent evaluation timeout",
+            attempt=3, task_scope="medium", ctx={},
+        )
+        assert override is None
+
+    def test_code_error_same_tests_warning_on_overlap(self):
+        ctx = {"_previous_failing_tests": ["tests/test_a.py::test_x"]}
+        status = "pytest FAILED tests/test_a.py::test_x\nassert 1 == 2"
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", status, attempt=2, task_scope="small", ctx=ctx,
+        )
+        assert "same tests are failing" in guidance.lower()
+        assert "tests/test_a.py::test_x" in guidance
+        assert "Previously failing tests:" in guidance
+
+    def test_previous_is_recurring_surfaces_in_guidance(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "pytest failed", attempt=2, task_scope="small",
+            ctx={"_previous_is_recurring": True},
+        )
+        assert "CROSS-ATTEMPT CONTEXT" in guidance
+        assert "recurred" in guidance.lower()
+
+    def test_previous_self_review_outcome_surfaces(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "err", attempt=2, task_scope="small",
+            ctx={"_previous_self_review_outcome": "missed edge case in parser"},
+        )
+        assert "self-review" in guidance.lower()
+        assert "missed edge case" in guidance
 
     def test_external_api_github_with_status_code(self):
         guidance, override = _build_retry_prompt_suffix(

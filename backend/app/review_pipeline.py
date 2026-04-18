@@ -72,6 +72,48 @@ def _detect_issue_churn(history: list) -> tuple[bool, list[int]]:
     return (non_decreasing or no_net_progress, counts)
 
 
+def _repeating_issue_descriptions(
+    history: list, window: int = ISSUE_CHURN_WINDOW, min_occurrences: int = 2
+) -> list[str]:
+    """Descriptions appearing in >= min_occurrences of the last `window` entries."""
+    if len(history) < min_occurrences:
+        return []
+    recent = history[-window:]
+    desc_by_norm: dict[str, str] = {}
+    per_entry: list[set[str]] = []
+    for entry in recent:
+        seen: set[str] = set()
+        for issue in (entry.get("issues") or []):
+            if issue.get("severity", "").upper() not in ("CRITICAL", "MAJOR"):
+                continue
+            desc = (issue.get("description") or "").strip()
+            if not desc:
+                continue
+            norm = " ".join(_FEEDBACK_TOKEN_RE.findall(desc.lower()))
+            if not norm:
+                continue
+            seen.add(norm)
+            desc_by_norm.setdefault(norm, desc)
+        per_entry.append(seen)
+    counts: dict[str, int] = {}
+    for s in per_entry:
+        for n in s:
+            counts[n] = counts.get(n, 0) + 1
+    repeating = [desc_by_norm[n] for n, c in counts.items() if c >= min_occurrences]
+    return repeating[:5]
+
+
+def _format_repeating_issues_section(history: list) -> str:
+    repeating = _repeating_issue_descriptions(history)
+    if not repeating:
+        return ""
+    bullets = "\n".join(f"- {d}" for d in repeating)
+    return (
+        "Repeating issues from prior iterations (prioritize breaking the cycle "
+        "on these exact issues):\n" + bullets + "\n\n"
+    )
+
+
 _CHURN_NARROW_FOCUS_PREFIX = (
     "⚠️ ISSUE CHURN DETECTED: the prior {window} fix iterations resolved some "
     "issues but introduced new ones (CRITICAL+MAJOR counts: {counts}). "
@@ -745,6 +787,7 @@ async def _spawn_pipeline_task(
             narrow_prefix = _CHURN_NARROW_FOCUS_PREFIX.format(
                 window=ISSUE_CHURN_WINDOW, counts=churn_counts
             )
+            narrow_prefix += _format_repeating_issues_section(new_review_history)
             payload_data["prompt"] = narrow_prefix + (payload_data.get("prompt") or "")
             fix_prompt = narrow_prefix + (fix_prompt or "")
         elif task_type == "fix" and per_chain_cap > 0 and (
@@ -754,6 +797,7 @@ async def _spawn_pipeline_task(
             mid_prefix = _MID_BUDGET_NARROW_FOCUS_PREFIX.format(
                 iteration=iteration, cap=per_chain_cap
             )
+            mid_prefix += _format_repeating_issues_section(new_review_history)
             logger.info(
                 f"[PIPELINE] Mid-budget narrow-focus directive for PR #{pr_number} "
                 f"(iteration {iteration}/{per_chain_cap})."

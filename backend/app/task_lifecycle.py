@@ -32,7 +32,16 @@ import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
 from app.notification_dispatch import post_auto_fix_result_message
-from app.failure_classification import classify_failure
+from app.failure_classification import (
+    classify_failure,
+    _timeout_subtype_from_message,
+    TIMEOUT_OOM,
+    TIMEOUT_HEARTBEAT_LOST,
+    TIMEOUT_ITERATION_LIMIT,
+    TIMEOUT_CASCADE,
+    TIMEOUT_PROCESS_CRASH,
+    TIMEOUT_EXECUTION,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,17 +139,56 @@ def _build_retry_prompt_suffix(
     scope_override: "str | None" = None
 
     if failure_class == "AGENT_TIMEOUT":
-        extra_guidance = (
-            "IMPORTANT: The previous attempt TIMED OUT. You MUST reduce scope:\n"
-            "- Focus on the single most critical change only\n"
-            "- Skip non-essential improvements, refactors, or cleanup\n"
-            "- Commit working changes early and often\n"
-            "- If the task requires changes across many files, pick the 2-3 most important\n"
-        )
-        if attempt >= 2 and task_scope == "large":
-            scope_override = "medium"
-        elif attempt >= 2 and task_scope == "medium":
-            scope_override = "small"
+        subtype = _timeout_subtype_from_message(original_status_message or "")
+        if subtype == TIMEOUT_OOM:
+            extra_guidance = (
+                "IMPORTANT: The previous attempt TIMED OUT due to an out-of-memory condition. You MUST reduce memory usage:\n"
+                "- Simplify data structures and avoid loading large files fully into memory\n"
+                "- Stream or paginate reads instead of materializing entire result sets\n"
+                "- Drop unused intermediate variables and large caches\n"
+                "- Reduce scope so fewer files/transforms are held in memory at once\n"
+            )
+        elif subtype == TIMEOUT_HEARTBEAT_LOST:
+            extra_guidance = (
+                "IMPORTANT: The previous attempt TIMED OUT — the agent stopped sending heartbeats. Keep operations smaller:\n"
+                "- Break long-running steps into shorter units that emit progress frequently\n"
+                "- Avoid single commands that block for minutes; prefer batched/iterative work\n"
+                "- Commit partial progress early so a later heartbeat loss doesn't erase it\n"
+                "- Reduce scope to fit comfortably within the heartbeat window\n"
+            )
+        elif subtype == TIMEOUT_ITERATION_LIMIT:
+            extra_guidance = (
+                "IMPORTANT: The previous attempt TIMED OUT — the review-fix/iteration cap was exhausted. You MUST narrow scope:\n"
+                "- Focus on the single most critical change; defer everything else\n"
+                "- Produce changes that pass review on the first pass — avoid churn that triggers more fix cycles\n"
+                "- Skip optional refactors, style tweaks, and speculative edits\n"
+            )
+        elif subtype == TIMEOUT_CASCADE:
+            extra_guidance = (
+                "NOTE: The previous attempt was CANCELLED by the orchestrator (cascade/supersession), not by a code defect.\n"
+                "- Proceed with the originally planned approach; no need to reduce scope defensively\n"
+                "- Check whether parent/sibling state has shifted before duplicating already-merged work\n"
+            )
+        elif subtype == TIMEOUT_PROCESS_CRASH:
+            extra_guidance = (
+                "IMPORTANT: The previous attempt TIMED OUT — the agent process crashed. Reduce scope and avoid risky operations:\n"
+                "- Skip commands known to be flaky or resource-intensive on this VM\n"
+                "- Keep changes small so a crash doesn't lose too much progress\n"
+                "- Commit working changes early and often\n"
+            )
+        else:
+            extra_guidance = (
+                "IMPORTANT: The previous attempt TIMED OUT. You MUST reduce scope:\n"
+                "- Focus on the single most critical change only\n"
+                "- Skip non-essential improvements, refactors, or cleanup\n"
+                "- Commit working changes early and often\n"
+                "- If the task requires changes across many files, pick the 2-3 most important\n"
+            )
+        if subtype != TIMEOUT_CASCADE:
+            if attempt >= 2 and task_scope == "large":
+                scope_override = "medium"
+            elif attempt >= 2 and task_scope == "medium":
+                scope_override = "small"
 
     # Escalate medium→large when the previous attempt overflowed its scope budget.
     # Routing through "large" invokes the plan agent, which decomposes the work
@@ -168,8 +216,16 @@ def _build_retry_prompt_suffix(
             extra_guidance = "RETRY GUIDANCE: " + " ".join(hints) + "\n"
         failing_tests = ctx.get("_previous_failing_tests", [])
         error_files = ctx.get("_previous_error_files", [])
+        current_failing = _extract_failing_tests(original_status_message or "")
+        overlap = [t for t in current_failing if t in set(failing_tests)]
+        if overlap:
+            extra_guidance = (
+                "WARNING: The same tests are failing across attempts — try a fundamentally "
+                "different approach rather than iterating on the current one.\n"
+                "- Overlapping failures: " + ", ".join(overlap[:5]) + "\n"
+            ) + extra_guidance
         if failing_tests:
-            extra_guidance += "Failing tests:\n" + "".join(f"  {t}\n" for t in failing_tests)
+            extra_guidance += "Previously failing tests:\n" + "".join(f"  {t}\n" for t in failing_tests)
         if error_files:
             extra_guidance += "Error file locations:\n" + "".join(f"  {f}\n" for f in error_files)
 
@@ -198,6 +254,24 @@ def _build_retry_prompt_suffix(
             "- Use exponential backoff with jitter between retries\n"
             "- Batch or reduce request volume where possible\n"
         )
+
+    cross_attempt_lines: list[str] = []
+    if ctx.get("_previous_is_recurring"):
+        cross_attempt_lines.append(
+            "- This failure class has recurred 3+ times project-wide — it is a systemic "
+            "pattern, not a one-off. Consider a structurally different approach."
+        )
+    prev_stage = ctx.get("_previous_failure_stage")
+    if prev_stage:
+        cross_attempt_lines.append(f"- Previous attempt failed at pipeline stage: {prev_stage}")
+    prev_self_review = ctx.get("_previous_self_review_outcome")
+    if prev_self_review:
+        summary = str(prev_self_review)[:300]
+        cross_attempt_lines.append(
+            f"- Previous attempt's self-review flagged: {summary}"
+        )
+    if cross_attempt_lines:
+        extra_guidance += "CROSS-ATTEMPT CONTEXT:\n" + "\n".join(cross_attempt_lines) + "\n"
 
     return extra_guidance, scope_override
 

@@ -27,6 +27,8 @@ from app.review_pipeline import (
     STUCK_CYCLE_THRESHOLD_REFACTOR,
     _compute_scope_budget_utilization,
     _detect_issue_churn,
+    _repeating_issue_descriptions,
+    _format_repeating_issues_section,
     _feedback_jaccard,
     _feedback_token_set,
     _is_pipeline_task_stale,
@@ -2881,6 +2883,42 @@ class TestDetectIssueChurn:
         is_churn, counts = _detect_issue_churn(hist)
         assert is_churn is False
         assert counts == [0, 0, 0]
+
+
+class TestRepeatingIssues:
+    def _entry(self, descriptions, severity="CRITICAL"):
+        return {"issues": [_issue(d, severity) for d in descriptions]}
+
+    def test_returns_descriptions_appearing_in_multiple_iterations(self):
+        hist = [
+            self._entry(["null pointer in foo", "unused import"]),
+            self._entry(["null pointer in foo", "new bug"]),
+            self._entry(["null pointer in foo", "another"]),
+        ]
+        out = _repeating_issue_descriptions(hist)
+        assert "null pointer in foo" in out
+        assert "unused import" not in out
+        assert "another" not in out
+
+    def test_ignores_minor(self):
+        hist = [
+            self._entry(["x"], "MINOR"),
+            self._entry(["x"], "MINOR"),
+        ]
+        assert _repeating_issue_descriptions(hist) == []
+
+    def test_empty_for_no_repeats(self):
+        hist = [self._entry(["a"]), self._entry(["b"]), self._entry(["c"])]
+        assert _repeating_issue_descriptions(hist) == []
+
+    def test_format_section_empty_when_no_repeats(self):
+        assert _format_repeating_issues_section([self._entry(["a"])]) == ""
+
+    def test_format_section_includes_bullets(self):
+        hist = [self._entry(["issue X"]), self._entry(["issue X"])]
+        section = _format_repeating_issues_section(hist)
+        assert "Repeating issues" in section
+        assert "- issue X" in section
 
 
 @pytest.mark.asyncio

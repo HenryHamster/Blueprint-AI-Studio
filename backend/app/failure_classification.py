@@ -197,18 +197,17 @@ TIMEOUT_PROCESS_CRASH = "process_crash"
 TIMEOUT_UNKNOWN = "unknown"
 
 
-def classify_timeout_subtype(task: "Task", logs: Optional[str] = None) -> str:
-    """Return a sub-type label for an AGENT_TIMEOUT failure.
+def _timeout_subtype_from_message(combined: str) -> str:
+    """Route a combined status+logs string to an AGENT_TIMEOUT sub-type label.
 
     Order matters: cascade/supersession and iteration caps are checked before
     heartbeat/OOM keywords because a cascade-cancelled task may transit through
     any state and its status message is the authoritative signal.
     """
-    status_msg = (task.latest_status_message or "").lower()
-    logs_lower = (logs or "").lower()
-    combined = status_msg + " " + logs_lower
+    combined = (combined or "").lower()
+    stripped = combined.lstrip()
 
-    if status_msg.startswith("cancelled:") or "superseded" in combined:
+    if stripped.startswith("cancelled:") or "superseded" in combined:
         return TIMEOUT_CASCADE
     if any(kw in combined for kw in ("iteration cap", "review not spawned",
                                      "fix not spawned", "review-fix cap reached",
@@ -227,6 +226,12 @@ def classify_timeout_subtype(task: "Task", logs: Optional[str] = None) -> str:
     if any(kw in combined for kw in ("execution timed out", "sigterm")):
         return TIMEOUT_EXECUTION
     return TIMEOUT_UNKNOWN
+
+
+def classify_timeout_subtype(task: "Task", logs: Optional[str] = None) -> str:
+    """Return a sub-type label for an AGENT_TIMEOUT failure."""
+    status_msg = task.latest_status_message or ""
+    return _timeout_subtype_from_message(status_msg + " " + (logs or ""))
 
 
 def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
