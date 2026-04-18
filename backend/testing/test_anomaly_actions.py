@@ -16,11 +16,14 @@ import pytest
 import app.shared_state as _shared_state
 from app.anomaly_detection import (
     _apply_anomaly_adjustments,
+    _as_iso,
     _check_anomaly_restoration,
     _check_fast_recovery,
     _check_max_duration_safeguard,
     _error_fingerprint,
     _expire_stale_anomalies,
+    _is_recurring_failure_class,
+    _normalize_error_message,
     anomaly_maintenance_sweep,
     check_anomaly_actions,
     count_matching_fingerprints,
@@ -32,7 +35,7 @@ from app.anomaly_detection import (
 )
 from app.time_utils import _utcnow
 from collections import deque
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 
 _DEFAULT_ADJUSTMENTS = {
@@ -1042,3 +1045,81 @@ async def test_check_anomaly_actions_returns_forced_restored():
     assert result["max_concurrent_vms"] == 6
     assert result["failure_gate_threshold"] == 0.8
     assert result["forced_restoration_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Pure-function helpers: _normalize_error_message, _as_iso,
+# _is_recurring_failure_class
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_error_message_strips_uuid():
+    msg = "task abc12345-1234-5678-9abc-def012345678 failed"
+    assert _normalize_error_message(msg) == "task <uuid> failed"
+
+
+def test_normalize_error_message_strips_pr_numbers():
+    assert _normalize_error_message("PR #123 blocked") == "<pr> blocked"
+    assert _normalize_error_message("see #456") == "see <pr>"
+    assert _normalize_error_message("pr #789") == "<pr>"
+
+
+def test_normalize_error_message_strips_branch_name():
+    assert _normalize_error_message("push to feature/foo-bar failed") == "push to <branch> failed"
+    assert _normalize_error_message("blueprint/task-abc123 error") == "<branch> error"
+
+
+def test_normalize_error_message_strips_iso_timestamp():
+    assert _normalize_error_message("error at 2026-04-11T12:34:56Z") == "error at <ts>"
+    assert (
+        _normalize_error_message("heartbeat 2026-04-11T12:34:56.789+00:00 missed")
+        == "heartbeat <ts> missed"
+    )
+
+
+def test_normalize_error_message_strips_long_numbers():
+    assert _normalize_error_message("job 123456 crashed") == "job <id> crashed"
+    # Short numbers (exit codes) preserved
+    assert _normalize_error_message("exit code 2") == "exit code 2"
+
+
+def test_normalize_error_message_empty():
+    assert _normalize_error_message("") == ""
+    assert _normalize_error_message(None) == ""  # type: ignore[arg-type]
+
+
+def test_normalize_error_message_no_tokens():
+    assert _normalize_error_message("connection refused") == "connection refused"
+
+
+def test_as_iso_with_datetime():
+    dt = datetime(2026, 4, 11, 12, 34, 56, tzinfo=timezone.utc)
+    assert _as_iso(dt) == dt.isoformat()
+
+
+def test_as_iso_with_string():
+    assert _as_iso("2026-04-11T12:34:56") == "2026-04-11T12:34:56"
+
+
+def test_as_iso_with_none_and_empty():
+    assert _as_iso(None) == ""
+    assert _as_iso("") == ""
+
+
+def test_is_recurring_failure_class_missing_key():
+    assert _is_recurring_failure_class({}, "CODE_ERROR") is False
+
+
+def test_is_recurring_failure_class_below_threshold():
+    anomalies = {"CODE_ERROR": {"occurrence_count": 2}}
+    assert _is_recurring_failure_class(anomalies, "CODE_ERROR") is False
+
+
+def test_is_recurring_failure_class_at_threshold():
+    anomalies = {"CODE_ERROR": {"occurrence_count": 3}}
+    assert _is_recurring_failure_class(anomalies, "CODE_ERROR") is True
+
+
+def test_is_recurring_failure_class_above_threshold():
+    anomalies = {"CODE_ERROR": {"occurrence_count": 7}}
+    assert _is_recurring_failure_class(anomalies, "CODE_ERROR") is True

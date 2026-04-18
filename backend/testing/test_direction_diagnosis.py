@@ -468,3 +468,15 @@ async def test_fingerprint_picks_best_among_multiple_distinct(db_session):
     await _add_failed_task(db_session, project.id, "d-fp-best", "ConnectionRefusedError: db down")
     expected = _error_fingerprint("KeyError: 'direction_id'")
     assert await _compute_direction_error_fingerprint(project.id, "d-fp-best", db_session) == expected
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_filters_by_direction_id(db_session):
+    # Failures on a different direction must not contribute to the target's fingerprint.
+    project = await _make_project(db_session)
+    msg = "CODE_ERROR: shared error text"
+    await _add_failed_task(db_session, project.id, "d-other", msg)
+    await _add_failed_task(db_session, project.id, "d-other", msg)
+    assert await _compute_direction_error_fingerprint(
+        project.id, "d-target", db_session,
+    ) is None

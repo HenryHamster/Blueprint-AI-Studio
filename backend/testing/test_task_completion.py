@@ -27,7 +27,9 @@ from app.task_completion import (
     _record_remediation_if_terminal,
     _handle_investigation_completion,
     _is_structural_diagnosis,
+    _clear_direction_diagnosis_flag,
 )
+from app.strategic_constants import STRATEGIC_RATIONALE_MAX
 from app.models import TaskStatus
 from testing.factories import make_project, make_task
 
@@ -1200,3 +1202,117 @@ class TestHandleInvestigationCompletion:
         assert task.status == TaskStatus.COMPLETED
         assert task.plan_output == {}
         assert "diagnosis_in_progress" not in project.directions[0]
+
+
+# ── _clear_direction_diagnosis_flag ─────────────────────────────────────────
+
+class TestClearDirectionDiagnosisFlag:
+    def _direction(self, **overrides):
+        d = {
+            "id": "dir-1",
+            "diagnosis_in_progress": True,
+            "diagnosis_started_at": "2026-04-17T00:00:00",
+            "diagnosis_task_id": "task-xyz",
+        }
+        d.update(overrides)
+        return d
+
+    @pytest.mark.asyncio
+    async def test_clears_flags_and_stores_summary(self, db_session):
+        project = make_project(directions=[self._direction()])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context={"direction_id": "dir-1"})
+        db_session.add(task)
+        await db_session.commit()
+
+        await _clear_direction_diagnosis_flag(task, db_session, "partial summary")
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert "diagnosis_in_progress" not in d
+        assert "diagnosis_started_at" not in d
+        assert "diagnosis_task_id" not in d
+        assert "diagnosis_completed_at" in d
+        assert d["diagnosis_summary"] == "partial summary"
+
+    @pytest.mark.asyncio
+    async def test_no_direction_id_in_context_is_noop(self, db_session):
+        project = make_project(directions=[self._direction()])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context={})
+        db_session.add(task)
+        await db_session.commit()
+
+        await _clear_direction_diagnosis_flag(task, db_session, "summary")
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert project.directions[0]["diagnosis_in_progress"] is True
+        assert "diagnosis_completed_at" not in project.directions[0]
+
+    @pytest.mark.asyncio
+    async def test_project_not_found_is_noop(self, db_session):
+        import uuid
+        task = make_task(project_id=uuid.uuid4(), context={"direction_id": "dir-1"})
+        db_session.add(task)
+        await db_session.commit()
+
+        await _clear_direction_diagnosis_flag(task, db_session, "summary")
+
+    @pytest.mark.asyncio
+    async def test_direction_id_not_matching_is_noop(self, db_session):
+        project = make_project(directions=[self._direction()])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context={"direction_id": "dir-nope"})
+        db_session.add(task)
+        await db_session.commit()
+
+        await _clear_direction_diagnosis_flag(task, db_session, "summary")
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert project.directions[0]["diagnosis_in_progress"] is True
+        assert "diagnosis_completed_at" not in project.directions[0]
+
+    @pytest.mark.asyncio
+    async def test_summary_truncated_to_max(self, db_session):
+        project = make_project(directions=[self._direction()])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context={"direction_id": "dir-1"})
+        db_session.add(task)
+        await db_session.commit()
+
+        long_summary = "x" * (STRATEGIC_RATIONALE_MAX + 500)
+        await _clear_direction_diagnosis_flag(task, db_session, long_summary)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert len(project.directions[0]["diagnosis_summary"]) == STRATEGIC_RATIONALE_MAX
+
+    @pytest.mark.asyncio
+    async def test_none_summary_omits_key(self, db_session):
+        project = make_project(directions=[self._direction()])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context={"direction_id": "dir-1"})
+        db_session.add(task)
+        await db_session.commit()
+
+        await _clear_direction_diagnosis_flag(task, db_session, None)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert "diagnosis_summary" not in d
+        assert "diagnosis_completed_at" in d
+        assert "diagnosis_in_progress" not in d

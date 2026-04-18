@@ -24,9 +24,11 @@ from app.review_pipeline import (
     STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR,
     STUCK_CYCLE_THRESHOLD_DEFAULT,
     STUCK_CYCLE_THRESHOLD_REFACTOR,
+    _compute_scope_budget_utilization,
     _feedback_jaccard,
     _feedback_token_set,
     _is_pipeline_task_stale,
+    _is_test_file,
     _max_review_iterations,
     _spawn_pipeline_task,
 )
@@ -2654,3 +2656,109 @@ class TestFeedbackTokenSet:
             "snake_case_var",
             "other",
         }
+
+
+# ── _is_test_file ─────────────────────────────────────────────────────────────
+
+
+class TestIsTestFile:
+    def test_testing_directory_slash(self):
+        assert _is_test_file("backend/testing/test_foo.py") is True
+
+    def test_tests_directory_slash(self):
+        assert _is_test_file("pkg/tests/helpers.py") is True
+
+    def test_testing_prefix_no_leading_slash(self):
+        assert _is_test_file("testing/factories.py") is True
+
+    def test_tests_prefix_no_leading_slash(self):
+        assert _is_test_file("tests/unit.py") is True
+
+    def test_test_prefix_filename(self):
+        assert _is_test_file("backend/app/test_helpers.py") is True
+
+    def test_underscore_test_py_suffix(self):
+        assert _is_test_file("backend/app/module_test.py") is True
+
+    def test_dot_test_in_filename(self):
+        assert _is_test_file("admin-ui/src/foo.test.ts") is True
+
+    def test_dot_spec_in_filename(self):
+        assert _is_test_file("admin-ui/src/bar.spec.js") is True
+
+    def test_regular_source_file(self):
+        assert _is_test_file("backend/app/review_pipeline.py") is False
+
+    def test_regular_frontend_file(self):
+        assert _is_test_file("admin-ui/src/components/Foo.tsx") is False
+
+    def test_case_insensitive(self):
+        assert _is_test_file("Backend/TESTING/Foo.py") is True
+
+
+# ── _compute_scope_budget_utilization ─────────────────────────────────────────
+
+
+class TestComputeScopeBudgetUtilization:
+    def test_none_changed_files_returns_none(self):
+        assert _compute_scope_budget_utilization(None, "small") is None
+
+    def test_empty_changed_files_returns_none(self):
+        assert _compute_scope_budget_utilization([], "small") is None
+
+    def test_unknown_scope_returns_none(self):
+        assert (
+            _compute_scope_budget_utilization(["backend/app/foo.py"], "bogus")
+            is None
+        )
+
+    def test_small_scope_mixed_files(self):
+        # small budget = 6 (total_files_max); 3 non-test files → 50%
+        result = _compute_scope_budget_utilization(
+            [
+                "backend/app/a.py",
+                "backend/app/b.py",
+                "backend/app/c.py",
+                "backend/testing/test_a.py",
+                "backend/testing/test_b.py",
+            ],
+            "small",
+        )
+        assert result == {
+            "scope": "small",
+            "file_count": 5,
+            "non_test_file_count": 3,
+            "budget": 6,
+            "percentage": 50,
+        }
+
+    def test_medium_scope_uses_production_files_max(self):
+        # medium production_files_max = 7; 7 non-test → 100%
+        files = [f"backend/app/m{i}.py" for i in range(7)] + [
+            "backend/testing/test_m.py"
+        ]
+        result = _compute_scope_budget_utilization(files, "medium")
+        assert result["budget"] == 7
+        assert result["non_test_file_count"] == 7
+        assert result["file_count"] == 8
+        assert result["percentage"] == 100
+
+    def test_all_test_files_zero_non_test(self):
+        result = _compute_scope_budget_utilization(
+            [
+                "backend/testing/test_a.py",
+                "admin-ui/src/foo.test.ts",
+                "pkg/tests/b.py",
+            ],
+            "small",
+        )
+        assert result["non_test_file_count"] == 0
+        assert result["file_count"] == 3
+        assert result["percentage"] == 0
+
+    def test_large_scope_budget(self):
+        # large total_files_max = 20; 10 non-test → 50%
+        files = [f"backend/app/l{i}.py" for i in range(10)]
+        result = _compute_scope_budget_utilization(files, "large")
+        assert result["budget"] == 20
+        assert result["percentage"] == 50
