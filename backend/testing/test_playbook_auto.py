@@ -2176,3 +2176,408 @@ def test_mark_stale_review_entries_ignores_non_review_and_fresh():
 
     # Idempotent: a second call does not re-flag.
     assert _mark_stale_review_entries(doc) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute_recurring_first_review_descriptions
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _FakeRow:
+    def __init__(self, rid, review_history, created_at=None):
+        self.id = rid
+        self.created_at = created_at
+        self.context = {"review_loop": {"review_history": review_history}}
+
+
+def _entry(iteration, *descs, category="style"):
+    return {
+        "iteration": iteration,
+        "issues": [{"description": d, "category": category} for d in descs],
+    }
+
+
+def test_recurring_descriptions_empty_rows_returns_none():
+    from app.playbook_learning import compute_recurring_first_review_descriptions
+
+    cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert compute_recurring_first_review_descriptions([], cutoff) is None
+
+
+def test_recurring_descriptions_no_review_history_returns_none():
+    from app.playbook_learning import compute_recurring_first_review_descriptions
+
+    cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rows = [_FakeRow("t1", [], created_at=datetime(2026, 2, 1, tzinfo=timezone.utc))]
+    assert compute_recurring_first_review_descriptions(rows, cutoff) is None
+
+
+def test_recurring_descriptions_single_occurrence_returns_none():
+    from app.playbook_learning import compute_recurring_first_review_descriptions
+
+    cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    rows = [
+        _FakeRow("t1", [_entry(0, "Missing docstring")], created_at=now),
+        _FakeRow("t2", [_entry(0, "Bad import")], created_at=now),
+    ]
+    assert compute_recurring_first_review_descriptions(rows, cutoff) is None
+
+
+def test_recurring_descriptions_returns_sorted_capped_at_three():
+    from app.playbook_learning import compute_recurring_first_review_descriptions
+
+    cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    rows = [
+        _FakeRow("t1", [_entry(0, "a", "b", "c", "d")], created_at=now),
+        _FakeRow("t2", [_entry(0, "a", "b", "c", "d")], created_at=now),
+        _FakeRow("t3", [_entry(0, "a", "b", "c")], created_at=now),
+        _FakeRow("t4", [_entry(0, "a", "b")], created_at=now),
+        _FakeRow("t5", [_entry(0, "a")], created_at=now),
+    ]
+    out = compute_recurring_first_review_descriptions(rows, cutoff)
+    assert out is not None
+    assert len(out) == 3
+    counts = [e["count"] for e in out]
+    assert counts == sorted(counts, reverse=True)
+    assert out[0]["description"] == "a"
+    assert out[0]["count"] == 5
+    assert out[0]["category"] == "style"
+
+
+def test_recurring_descriptions_cutoff_filters_old_tasks():
+    from app.playbook_learning import compute_recurring_first_review_descriptions
+
+    cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    old = datetime(2025, 6, 1, tzinfo=timezone.utc)
+    new = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    rows = [
+        _FakeRow("t1", [_entry(0, "repeat")], created_at=old),
+        _FakeRow("t2", [_entry(0, "repeat")], created_at=old),
+        _FakeRow("t3", [_entry(0, "repeat")], created_at=new),
+    ]
+    assert compute_recurring_first_review_descriptions(rows, cutoff) is None
+
+
+def test_recurring_descriptions_task_filter_excludes():
+    from app.playbook_learning import compute_recurring_first_review_descriptions
+
+    cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    rows = [
+        _FakeRow("keep1", [_entry(0, "repeat")], created_at=now),
+        _FakeRow("keep2", [_entry(0, "repeat")], created_at=now),
+        _FakeRow("skip1", [_entry(0, "other")], created_at=now),
+        _FakeRow("skip2", [_entry(0, "other")], created_at=now),
+    ]
+    out = compute_recurring_first_review_descriptions(
+        rows, cutoff, task_filter=lambda r: r.id.startswith("keep")
+    )
+    assert out is not None
+    assert len(out) == 1
+    assert out[0]["description"] == "repeat"
+
+
+def test_recurring_descriptions_min_tasks_threshold():
+    from app.playbook_learning import compute_recurring_first_review_descriptions
+
+    cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    rows = [
+        _FakeRow("t1", [_entry(0, "repeat", "repeat")], created_at=now),
+    ]
+    assert (
+        compute_recurring_first_review_descriptions(rows, cutoff, min_tasks=5)
+        is None
+    )
+
+
+def test_recurring_descriptions_count_unique_tasks_mode():
+    from app.playbook_learning import compute_recurring_first_review_descriptions
+
+    cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    # "solo" appears 5 times but all in one task; "shared" appears twice across two tasks.
+    rows = [
+        _FakeRow("t1", [_entry(0, "solo", "solo", "solo", "solo", "solo", "shared")], created_at=now),
+        _FakeRow("t2", [_entry(0, "shared")], created_at=now),
+    ]
+    out = compute_recurring_first_review_descriptions(
+        rows, cutoff, count_unique_tasks=True
+    )
+    assert out is not None
+    descs = {e["description"]: e["count"] for e in out}
+    assert descs == {"shared": 2}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _decay_module_feedback_entry
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_decay_module_feedback_entry_missing_last_updated_returns_unchanged():
+    from app.playbook_learning import _decay_module_feedback_entry
+
+    entry = {"review_quality": 3, "total": 3}
+    now = datetime(2026, 4, 18)
+    assert _decay_module_feedback_entry(entry, now) is entry
+
+
+def test_decay_module_feedback_entry_unparseable_last_updated_returns_unchanged():
+    from app.playbook_learning import _decay_module_feedback_entry
+
+    entry = {"review_quality": 3, "total": 3, "last_updated": "not-a-date"}
+    now = datetime(2026, 4, 18)
+    assert _decay_module_feedback_entry(entry, now) is entry
+
+
+def test_decay_module_feedback_entry_within_grace_window_unchanged():
+    from app.playbook_learning import (
+        _MODULE_FEEDBACK_DECAY_AGE_DAYS,
+        _decay_module_feedback_entry,
+    )
+
+    now = datetime(2026, 4, 18)
+    last = now - timedelta(days=_MODULE_FEEDBACK_DECAY_AGE_DAYS - 1)
+    entry = {
+        "review_quality": 5,
+        "total": 5,
+        "last_updated": last.isoformat(),
+    }
+    assert _decay_module_feedback_entry(entry, now) is entry
+
+
+def test_decay_module_feedback_entry_past_grace_decays_counts():
+    from app.playbook_learning import (
+        _MODULE_FEEDBACK_DECAY_AGE_DAYS,
+        _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS,
+        _decay_module_feedback_entry,
+    )
+
+    now = datetime(2026, 4, 18)
+    overage_days = _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS  # exactly one half-life past grace
+    last = now - timedelta(days=_MODULE_FEEDBACK_DECAY_AGE_DAYS + overage_days)
+    entry = {
+        "review_quality": 10,
+        "correctness": 4,
+        "total": 14,
+        "last_updated": last.isoformat(),
+    }
+    factor = 0.5 ** (overage_days / _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS)
+    result = _decay_module_feedback_entry(entry, now)
+    assert result["review_quality"] == round(10 * factor)
+    assert result["correctness"] == round(4 * factor)
+    assert result["total"] == result["review_quality"] + result["correctness"]
+
+
+def test_decay_module_feedback_entry_drops_categories_rounding_to_zero():
+    from app.playbook_learning import (
+        _MODULE_FEEDBACK_DECAY_AGE_DAYS,
+        _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS,
+        _decay_module_feedback_entry,
+    )
+
+    now = datetime(2026, 4, 18)
+    # 5 half-lives: factor = 1/32. A count of 1 rounds to 0 and is dropped.
+    overage_days = 5 * _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS
+    last = now - timedelta(days=_MODULE_FEEDBACK_DECAY_AGE_DAYS + overage_days)
+    entry = {
+        "review_quality": 1,
+        "correctness": 100,
+        "total": 101,
+        "last_updated": last.isoformat(),
+    }
+    result = _decay_module_feedback_entry(entry, now)
+    assert "review_quality" not in result
+    assert result["correctness"] == round(100 / 32)
+    assert result["total"] == result["correctness"]
+
+
+def test_decay_module_feedback_entry_preserves_non_integer_values():
+    from app.playbook_learning import (
+        _MODULE_FEEDBACK_DECAY_AGE_DAYS,
+        _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS,
+        _decay_module_feedback_entry,
+    )
+
+    now = datetime(2026, 4, 18)
+    overage_days = _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS
+    last = now - timedelta(days=_MODULE_FEEDBACK_DECAY_AGE_DAYS + overage_days)
+    entry = {
+        "review_quality": 8,
+        "total": 8,
+        "last_updated": last.isoformat(),
+        "note": "some string",
+        "ratio": 0.75,
+    }
+    result = _decay_module_feedback_entry(entry, now)
+    assert result["note"] == "some string"
+    assert result["ratio"] == 0.75
+    assert result["review_quality"] == round(8 * 0.5)
+    assert result["total"] == result["review_quality"]
+
+
+def test_decay_module_feedback_entry_total_recomputed_from_surviving_counts():
+    from app.playbook_learning import (
+        _MODULE_FEEDBACK_DECAY_AGE_DAYS,
+        _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS,
+        _decay_module_feedback_entry,
+    )
+
+    now = datetime(2026, 4, 18)
+    overage_days = _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS
+    last = now - timedelta(days=_MODULE_FEEDBACK_DECAY_AGE_DAYS + overage_days)
+    # Stored total is wrong on purpose; decay should recompute from survivors.
+    entry = {
+        "review_quality": 10,
+        "correctness": 6,
+        "total": 9999,
+        "last_updated": last.isoformat(),
+    }
+    result = _decay_module_feedback_entry(entry, now)
+    assert result["total"] == result["review_quality"] + result["correctness"]
+    assert result["total"] != 9999
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# summarize_decomposition_outcomes
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_summarize_decomposition_outcomes_empty_history():
+    from app.playbook_learning import summarize_decomposition_outcomes
+
+    assert summarize_decomposition_outcomes({}) is None
+    assert summarize_decomposition_outcomes({"research_history": []}) is None
+
+
+def test_summarize_decomposition_outcomes_no_decomposition_quality():
+    from app.playbook_learning import summarize_decomposition_outcomes
+
+    direction = {
+        "research_history": [
+            {"tasks_created": 2},
+            {"tasks_created": 3, "decomposition_quality": []},
+            {"tasks_created": 1, "decomposition_quality": "not-a-list"},
+        ]
+    }
+    assert summarize_decomposition_outcomes(direction) is None
+
+
+def test_summarize_decomposition_outcomes_single_cycle_averages():
+    from app.playbook_learning import summarize_decomposition_outcomes
+
+    direction = {
+        "research_history": [
+            {
+                "tasks_created": 2,
+                "decomposition_quality": [
+                    {
+                        "subtask_merge_rate": 0.8,
+                        "avg_files_per_subtask": 2.0,
+                        "max_files_in_subtask": 3,
+                        "dependency_depth": 1,
+                        "cross_module_count": 0,
+                    },
+                    {
+                        "subtask_merge_rate": 0.6,
+                        "avg_files_per_subtask": 4.0,
+                        "max_files_in_subtask": 5,
+                        "dependency_depth": 2,
+                        "cross_module_count": 1,
+                    },
+                ],
+            }
+        ]
+    }
+    out = summarize_decomposition_outcomes(direction)
+    assert out is not None
+    assert out["prior_decomposition_count"] == 2
+    assert out["avg_subtask_merge_rate"] == 0.7
+    assert out["avg_files_per_subtask"] == 3.0
+    assert out["max_files_in_subtask"] == 5
+    assert out["avg_dependency_depth"] == 1.5
+    assert out["max_dependency_depth"] == 2
+    assert out["high_cross_module_correlates_with_low_merge"] is False
+
+
+def test_summarize_decomposition_outcomes_cross_module_correlation_flag():
+    from app.playbook_learning import summarize_decomposition_outcomes
+
+    direction = {
+        "research_history": [
+            {
+                "tasks_created": 1,
+                "decomposition_quality": [
+                    {"subtask_merge_rate": 0.9, "cross_module_count": 0},
+                    {"subtask_merge_rate": 0.85, "cross_module_count": 1},
+                    {"subtask_merge_rate": 0.4, "cross_module_count": 3},
+                    {"subtask_merge_rate": 0.3, "cross_module_count": 2},
+                ],
+            }
+        ]
+    }
+    out = summarize_decomposition_outcomes(direction)
+    assert out is not None
+    assert out["high_cross_module_correlates_with_low_merge"] is True
+
+
+def test_summarize_decomposition_outcomes_skips_non_numeric():
+    from app.playbook_learning import summarize_decomposition_outcomes
+
+    direction = {
+        "research_history": [
+            {
+                "tasks_created": 1,
+                "decomposition_quality": [
+                    {
+                        "subtask_merge_rate": "nope",
+                        "avg_files_per_subtask": None,
+                        "max_files_in_subtask": "x",
+                        "dependency_depth": None,
+                        "cross_module_count": "y",
+                    },
+                    {
+                        "subtask_merge_rate": 0.5,
+                        "avg_files_per_subtask": 2.0,
+                        "max_files_in_subtask": 2,
+                        "dependency_depth": 1,
+                        "cross_module_count": 0,
+                    },
+                ],
+            }
+        ]
+    }
+    out = summarize_decomposition_outcomes(direction)
+    assert out is not None
+    assert out["prior_decomposition_count"] == 2
+    assert out["avg_subtask_merge_rate"] == 0.5
+    assert out["avg_files_per_subtask"] == 2.0
+    assert out["max_files_in_subtask"] == 2
+
+
+def test_summarize_decomposition_outcomes_only_last_three_productive():
+    from app.playbook_learning import summarize_decomposition_outcomes
+
+    def _cycle(rate, created=1):
+        return {
+            "tasks_created": created,
+            "decomposition_quality": [
+                {"subtask_merge_rate": rate, "cross_module_count": 0}
+            ],
+        }
+
+    direction = {
+        "research_history": [
+            _cycle(0.1),  # productive but outside last-3 window
+            _cycle(0.0, created=0),  # unproductive — skipped entirely
+            _cycle(0.5),
+            _cycle(0.5),
+            _cycle(0.5),
+        ]
+    }
+    out = summarize_decomposition_outcomes(direction)
+    assert out is not None
+    assert out["prior_decomposition_count"] == 3
+    assert out["avg_subtask_merge_rate"] == 0.5
