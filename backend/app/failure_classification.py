@@ -185,6 +185,50 @@ def normalize_agent_failure_category(raw: Optional[str], task: "Task") -> str:
     return classify_failure(task)
 
 
+# AGENT_TIMEOUT sub-types — finer breakdown of the catch-all timeout class so
+# digest consumers can tell a heartbeat loss from an OOM from a cascade cancel.
+# Keywords mirror the same phrases classify_failure() uses to route to AGENT_TIMEOUT.
+TIMEOUT_HEARTBEAT_LOST = "heartbeat_lost"
+TIMEOUT_OOM = "oom"
+TIMEOUT_EXECUTION = "execution_timeout"
+TIMEOUT_CASCADE = "cascade_cancellation"
+TIMEOUT_ITERATION_LIMIT = "iteration_limit"
+TIMEOUT_PROCESS_CRASH = "process_crash"
+TIMEOUT_UNKNOWN = "unknown"
+
+
+def classify_timeout_subtype(task: "Task", logs: Optional[str] = None) -> str:
+    """Return a sub-type label for an AGENT_TIMEOUT failure.
+
+    Order matters: cascade/supersession and iteration caps are checked before
+    heartbeat/OOM keywords because a cascade-cancelled task may transit through
+    any state and its status message is the authoritative signal.
+    """
+    status_msg = (task.latest_status_message or "").lower()
+    logs_lower = (logs or "").lower()
+    combined = status_msg + " " + logs_lower
+
+    if status_msg.startswith("cancelled:") or "superseded" in combined:
+        return TIMEOUT_CASCADE
+    if any(kw in combined for kw in ("iteration cap", "review not spawned",
+                                     "fix not spawned", "review-fix cap reached",
+                                     "review-fix cycle limit",
+                                     "ci wait exceeded", "ci wait timed out")):
+        return TIMEOUT_ITERATION_LIMIT
+    if any(kw in combined for kw in ("out of memory", "oom-kill", "memory limit",
+                                     "cannot allocate", "cgroup",
+                                     "exit code 137", "oom killer")):
+        return TIMEOUT_OOM
+    if any(kw in combined for kw in ("no heartbeat", "reaped", "never started")):
+        return TIMEOUT_HEARTBEAT_LOST
+    if any(kw in combined for kw in ("[fatal:", "fatal error", "process crashed",
+                                     "node process killed")):
+        return TIMEOUT_PROCESS_CRASH
+    if any(kw in combined for kw in ("execution timed out", "sigterm")):
+        return TIMEOUT_EXECUTION
+    return TIMEOUT_UNKNOWN
+
+
 def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     """Classify a task failure for deployment monitoring.
     Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API"""

@@ -1002,6 +1002,25 @@ async def get_digest(
                     if "avg_expansion_ratio_merged" in _agg:
                         _agg["avg_expansion_ratio"] = _agg["avg_expansion_ratio_merged"]
 
+                _dir_rejections = []
+                for _t in tasks_for_dir:
+                    _ctx = _t.context or {}
+                    if not _ctx.get("pr_rejected"):
+                        continue
+                    _ts = _derive_completed_at(_t)
+                    if _ts < window_start:
+                        continue
+                    _dir_rejections.append((_ts, _t))
+                _dir_rejections.sort(key=lambda x: x[0], reverse=True)
+                rejection_reasons = [
+                    {
+                        "task_id": str(_t.id),
+                        "title": _t.title,
+                        "rejection_note": ((_t.context or {}).get("pr_rejection_note") or "")[:200],
+                    }
+                    for _ts, _t in _dir_rejections[:3]
+                ]
+
                 direction_progress_list.append({
                     "direction_id": did,
                     "direction_text": direction_text,
@@ -1051,6 +1070,7 @@ async def get_digest(
                         "reviews_overridden": dir_reviews_overridden,
                         "user_issues_caught": dir_user_issues_caught,
                     },
+                    "rejection_reasons": rejection_reasons or None,
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
@@ -1124,7 +1144,11 @@ async def get_digest(
     needs_attention.sort(key=lambda x: (0 if x["reason"] == "approval_required" else 1, -(x["waiting_hours"] or 0)))
 
     # --- recent_failures (up to 10, desc) ---
-    from app.failure_classification import classify_failure as _classify_failure_rf
+    from app.failure_classification import (
+        classify_failure as _classify_failure_rf,
+        classify_timeout_subtype as _classify_timeout_subtype,
+        AGENT_TIMEOUT as _AGENT_TIMEOUT,
+    )
     sorted_failures = sorted(failed_tasks, key=_derive_completed_at, reverse=True)
     recent_failures = []
     for t in sorted_failures[:10]:
@@ -1135,6 +1159,7 @@ async def get_digest(
         t_dir_id = (t.context or {}).get("direction_id")
         t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
         task_type = (t.first_payload).get("type", "create")
+        _rf_cls = _classify_failure_rf(t, error_log_map.get(tid))
         recent_failures.append({
             "task_id": tid,
             "title": t.title or "Failed task",
@@ -1145,7 +1170,8 @@ async def get_digest(
             "direction_id": t_dir_id,
             "direction_text": t_dir_text,
             "task_type": task_type,
-            "failure_class": _classify_failure_rf(t, error_log_map.get(tid)),
+            "failure_class": _rf_cls,
+            "timeout_subtype": _classify_timeout_subtype(t, error_log_map.get(tid)) if _rf_cls == _AGENT_TIMEOUT else None,
             "scope": (t.context or {}).get("scope"),
         })
 
@@ -1179,6 +1205,7 @@ async def get_digest(
             "attempt_count": t.attempt_count,
             "waiting_hours": waiting_hours,
             "taxonomy": _classify_taxonomy(t),
+            "timeout_subtype": _classify_timeout_subtype(t, error_log_map.get(tid)) if cls == _AGENT_TIMEOUT else None,
             "direction_id": t_dir_id,
             "direction_text": t_dir_text,
         })
@@ -1554,6 +1581,60 @@ async def get_digest(
         for _k, _v in ff.items():
             pipeline_filter_funnel[_k] = pipeline_filter_funnel.get(_k, 0) + (_v or 0)
 
+    # --- Scope mismatch diagnostics ---
+    # Aggregate calibration data across terminal tasks in the window to surface
+    # systematic scope-estimation drift and chronic-calibration directions.
+    _terminal_in_window = completed_tasks + failed_tasks
+    _calibrated_tasks = [
+        t for t in _terminal_in_window
+        if (t.context or {}).get("scope_calibrated_from")
+    ]
+    scope_mismatch_summary: Optional[Dict[str, Any]] = None
+    if _calibrated_tasks:
+        _cal_completed = sum(1 for t in _calibrated_tasks if t.status == TaskStatus.COMPLETED)
+        _cal_total = len(_calibrated_tasks)
+        _by_orig: Dict[str, Dict[str, int]] = {}
+        _by_dir_calibrated: Dict[str, int] = {}
+        for t in _calibrated_tasks:
+            _orig_raw = str((t.context or {}).get("scope_calibrated_from") or "")
+            _orig = _orig_raw.split(":", 1)[0] or "unknown"
+            _bucket = _by_orig.setdefault(_orig, {"total": 0, "completed": 0, "failed": 0})
+            _bucket["total"] += 1
+            if t.status == TaskStatus.COMPLETED:
+                _bucket["completed"] += 1
+            elif t.status == TaskStatus.FAILED:
+                _bucket["failed"] += 1
+            _did = (t.context or {}).get("direction_id")
+            if _did:
+                _by_dir_calibrated[str(_did)] = _by_dir_calibrated.get(str(_did), 0) + 1
+
+        _by_dir_total: Dict[str, int] = {}
+        for t in _terminal_in_window:
+            _did = (t.context or {}).get("direction_id")
+            if _did:
+                _by_dir_total[str(_did)] = _by_dir_total.get(str(_did), 0) + 1
+
+        _top_dirs = []
+        for _did, _cal_cnt in _by_dir_calibrated.items():
+            _tot = _by_dir_total.get(_did, 0)
+            if _tot <= 0:
+                continue
+            _top_dirs.append({
+                "direction_id": _did,
+                "direction_text": dir_id_to_text.get(_did, ""),
+                "calibrated_count": _cal_cnt,
+                "total_tasks": _tot,
+                "calibration_rate": round(_cal_cnt / _tot, 3),
+            })
+        _top_dirs.sort(key=lambda d: (d["calibration_rate"], d["calibrated_count"]), reverse=True)
+
+        scope_mismatch_summary = {
+            "total_calibrated": _cal_total,
+            "calibrated_success_rate": round(_cal_completed / _cal_total, 3) if _cal_total else None,
+            "by_original_scope": _by_orig,
+            "top_directions": _top_dirs[:3],
+        }
+
     # --- Latest strategic cycle ---
     latest_cycle = None
     if project_id:
@@ -1573,6 +1654,24 @@ async def get_digest(
                     "vision_updated": last.get("vision_updated", False),
                     "summary_text": last.get("summary_text"),
                 }
+
+    _rejected_in_window = [
+        t for t in all_tasks
+        if (t.context or {}).get("pr_rejected")
+        and _derive_completed_at(t) >= window_start
+    ]
+    _note_counts: Dict[str, int] = {}
+    for _t in _rejected_in_window:
+        _note = ((_t.context or {}).get("pr_rejection_note") or "").strip()
+        if not _note:
+            continue
+        _snip = " ".join(_note.lower().split())[:120]
+        _note_counts[_snip] = _note_counts.get(_snip, 0) + 1
+    _top_notes = sorted(_note_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+    rejection_pattern_summary = {
+        "total_rejected": len(_rejected_in_window),
+        "top_notes": [{"snippet": s, "count": c} for s, c in _top_notes],
+    }
 
     return {
         "window_hours": hours,
@@ -1615,4 +1714,6 @@ async def get_digest(
         "pipeline_acceptance_rate": pipeline_acceptance_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
         "pipeline_filter_funnel": pipeline_filter_funnel or None,
+        "scope_mismatch_summary": scope_mismatch_summary,
+        "rejection_pattern_summary": rejection_pattern_summary,
     }

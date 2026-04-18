@@ -618,6 +618,35 @@ async def test_activity_limit(client: AsyncClient, db_session):
     assert data["total"] >= 5
 
 
+@pytest.mark.asyncio
+async def test_activity_failed_includes_failure_class_and_taxonomy(client: AsyncClient, db_session):
+    """TASK_FAILED events expose failure_class and taxonomy from task context."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    failed = make_task(
+        project_id=project.id,
+        title="Failed Task",
+        status=TaskStatus.FAILED,
+        context={"failure_category": "RATE_LIMIT"},
+    )
+    db_session.add(failed)
+    await db_session.commit()
+
+    response = await client.get("/api/admin/activity")
+    assert response.status_code == 200
+    data = response.json()
+    failed_events = [e for e in data["events"] if e["type"] == "TASK_FAILED"]
+    assert len(failed_events) >= 1
+    ev = next(e for e in failed_events if e["task_id"] == str(failed.id))
+    assert ev["failure_class"] == "RATE_LIMIT"
+    assert ev["taxonomy"] == "infra_related"
+
+
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_activity_requires_auth(unauthenticated_client: AsyncClient):
@@ -1894,6 +1923,76 @@ async def test_failure_groups_sorted_by_count_descending(client: AsyncClient, db
     assert data["failure_groups"][0]["count"] == 2
 
 
+@pytest.mark.asyncio
+async def test_failure_group_agent_timeout_subtypes(client: AsyncClient, db_session):
+    """AGENT_TIMEOUT failures expose timeout_subtype in recent_failures and failure_groups."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    cases = [
+        ("Heartbeat Task", "No heartbeat received after 300s", "heartbeat_lost"),
+        ("OOM Task", "exit code 137 out of memory", "oom"),
+        ("Exec Task", "execution timed out after 1800s", "execution_timeout"),
+        ("Cascade Task", "Cancelled: parent evaluation timeout", "cascade_cancellation"),
+        ("Iter Task", "merge blocked, fix not spawned (iteration cap)", "iteration_limit"),
+        ("Crash Task", "[FATAL:uncaughtException] boom", "process_crash"),
+    ]
+    for title, msg, _ in cases:
+        db_session.add(make_task(
+            project_id=project.id,
+            title=title,
+            status=TaskStatus.FAILED,
+            latest_status_message=msg,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    timeout_group = next(g for g in data["failure_groups"] if g["failure_class"] == "AGENT_TIMEOUT")
+    title_to_subtype = {t["title"]: t["timeout_subtype"] for t in timeout_group["tasks"]}
+    for title, _, expected_subtype in cases:
+        assert title_to_subtype[title] == expected_subtype, (title, title_to_subtype[title])
+
+    rf_by_title = {f["title"]: f for f in data["recent_failures"]}
+    for title, _, expected_subtype in cases:
+        assert rf_by_title[title]["timeout_subtype"] == expected_subtype
+
+
+@pytest.mark.asyncio
+async def test_non_timeout_failures_have_null_timeout_subtype(client: AsyncClient, db_session):
+    """Non-AGENT_TIMEOUT failures expose timeout_subtype=None."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Code Error Task",
+        status=TaskStatus.FAILED,
+        latest_status_message="TypeError: something broke",
+        created_at=curr,
+        status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    code_group = next(g for g in data["failure_groups"] if g["failure_class"] == "CODE_ERROR")
+    assert code_group["tasks"][0]["timeout_subtype"] is None
+    assert data["recent_failures"][0]["timeout_subtype"] is None
+
+
 # ---------------------------------------------------------------------------
 # Narrative ordering tests
 # ---------------------------------------------------------------------------
@@ -2644,3 +2743,146 @@ async def test_digest_pipeline_filter_funnel_sums_across_directions(client: Asyn
     assert pff["type_filtered"] == 1
     assert pff["batch_cap"] == 3
     assert pff["tasks_created"] == 5
+
+
+@pytest.mark.asyncio
+async def test_digest_review_rejection_summary(client: AsyncClient, db_session):
+    """rejection_reasons per direction and aggregate rejection_pattern_summary surface."""
+    project = make_project(
+        directions=[
+            {"id": "dir-rej", "text": "Rejection dir", "status": "active"},
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Two rejected tasks with identical notes (after normalization) + one unique
+    for i, (title, note) in enumerate([
+        ("Task A", "Scope too broad; split into smaller PRs"),
+        ("Task B", "scope too broad;   split into smaller prs"),
+        ("Task C", "Missing tests for new logic"),
+    ]):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=title,
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={
+                "direction_id": "dir-rej",
+                "pr_rejected": True,
+                "pr_rejection_note": note,
+            },
+            created_at=now - timedelta(hours=2),
+            updated_at=now - timedelta(minutes=30 + i),
+        ))
+    # Non-rejected failure should not count
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Unrelated failure",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"direction_id": "dir-rej"},
+        created_at=now - timedelta(hours=2),
+        updated_at=now - timedelta(minutes=10),
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    rps = data["rejection_pattern_summary"]
+    assert rps["total_rejected"] == 3
+    top = {n["snippet"]: n["count"] for n in rps["top_notes"]}
+    assert top.get("scope too broad; split into smaller prs") == 2
+    assert top.get("missing tests for new logic") == 1
+
+    dp = next(d for d in data["direction_progress"] if d["direction_id"] == "dir-rej")
+    reasons = dp["rejection_reasons"]
+    assert reasons is not None
+    assert len(reasons) == 3
+    titles = {r["title"] for r in reasons}
+    assert titles == {"Task A", "Task B", "Task C"}
+    for r in reasons:
+        assert "task_id" in r
+        assert "rejection_note" in r
+
+
+@pytest.mark.asyncio
+async def test_digest_scope_mismatch_summary(client: AsyncClient, db_session):
+    """scope_mismatch_summary aggregates calibrated tasks by original scope and direction."""
+    project = make_project(
+        directions=[
+            {"id": "dir-sm1", "text": "Dir 1", "status": "active"},
+            {"id": "dir-sm2", "text": "Dir 2", "status": "active"},
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id, title="c1", status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"direction_id": "dir-sm1", "scope": "small", "scope_calibrated_from": "medium"},
+    ))
+    db_session.add(make_task(
+        project_id=project.id, title="c2", status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"direction_id": "dir-sm1", "scope": "small", "scope_calibrated_from": "medium:cross_module"},
+    ))
+    db_session.add(make_task(
+        project_id=project.id, title="c3", status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"direction_id": "dir-sm1", "scope": "small"},
+    ))
+    db_session.add(make_task(
+        project_id=project.id, title="c4", status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"direction_id": "dir-sm2", "scope": "medium", "scope_calibrated_from": "large"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    summary = data["scope_mismatch_summary"]
+    assert summary is not None
+    assert summary["total_calibrated"] == 3
+    assert summary["calibrated_success_rate"] == round(2 / 3, 3)
+
+    by_orig = summary["by_original_scope"]
+    assert by_orig["medium"]["total"] == 2
+    assert by_orig["medium"]["completed"] == 1
+    assert by_orig["medium"]["failed"] == 1
+    assert by_orig["large"]["total"] == 1
+    assert by_orig["large"]["completed"] == 1
+
+    top = summary["top_directions"]
+    assert top[0]["direction_id"] == "dir-sm2"
+    assert top[0]["calibration_rate"] == 1.0
+    assert top[1]["direction_id"] == "dir-sm1"
+    assert top[1]["calibrated_count"] == 2
+    assert top[1]["total_tasks"] == 3
+
+
+@pytest.mark.asyncio
+async def test_digest_scope_mismatch_summary_empty(client: AsyncClient, db_session):
+    """scope_mismatch_summary is None when no tasks have scope_calibrated_from."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id, title="nc", status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}], context={"scope": "small"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    assert response.json()["scope_mismatch_summary"] is None

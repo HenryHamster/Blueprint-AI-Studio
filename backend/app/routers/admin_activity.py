@@ -16,6 +16,7 @@ from app.models import (
 )
 from app.auth import get_current_user
 from app.admin import _user_project_ids
+from app.failure_classification import classify_failure, classify_failure_taxonomy
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,8 @@ async def get_activity(
     tasks_result = await session.execute(
         select(Task).where(*task_filters).options(
             load_only(Task.id, Task.status, Task.title, Task.project_id,
-                      Task.payloads, Task.status_log, Task.created_at, Task.started_at)
+                      Task.payloads, Task.status_log, Task.created_at, Task.started_at,
+                      Task.context, Task.latest_status_message)
         )
     )
     recent_tasks = tasks_result.scalars().all()
@@ -166,6 +168,8 @@ async def get_activity(
                 "repo_url": None,
                 "commit_hash": None,
                 "error_summary": error_log_map.get(tid),
+                "failure_class": classify_failure(t, error_log_map.get(tid)),
+                "taxonomy": classify_failure_taxonomy(t),
                 "finding_count": None,
                 "deploy_sha": None,
                 "deploy_status": None,
