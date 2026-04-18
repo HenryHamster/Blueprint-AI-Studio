@@ -2239,17 +2239,17 @@ describe('buildSelfReviewChecklist', () => {
     claudeMd: '',
   };
 
-  it('taskScope=small produces a 5-item checklist with severity guide', () => {
+  it('taskScope=small produces a 6-item checklist with severity guide', () => {
     const result = buildSelfReviewPrompt({ ...baseOpts, taskScope: 'small' });
     expect(result).toContain('Correctness');
     expect(result).toContain('Missing test coverage');
     expect(result).toContain('Error handling');
     expect(result).toContain('Security quick-check');
     expect(result).toContain('Import and type verification');
+    expect(result).toContain('Scope violations');
     expect(result).toContain('CRITICAL');
     expect(result).toContain('MAJOR');
     expect(result).not.toContain('Type safety violations');
-    expect(result).not.toContain('Scope violations');
     expect(result).not.toContain('Pattern violations');
   });
 

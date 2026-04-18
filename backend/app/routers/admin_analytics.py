@@ -187,7 +187,22 @@ async def get_task_duration_stats(
             sd = sorted(durs); n = len(sd); mid = n // 2
             p50 = sd[mid] if n % 2 else (sd[mid - 1] + sd[mid]) / 2
             scope_stats[sc] = {"p50_seconds": p50, "p90_seconds": sd[min(n - 1, int(0.9 * n))], "sample_size": n}
-    return {"stats": stats, "scope_duration_stats": scope_stats}
+    provisioning_durs: list = []
+    execution_durs: list = []
+    for t in completed:
+        if t.vm_provisioned_at and t.vm_started_at and t.vm_stopped_at:
+            prov = (t.vm_started_at - t.vm_provisioned_at).total_seconds()
+            execd = (t.vm_stopped_at - t.vm_started_at).total_seconds()
+            if prov >= 0 and execd >= 0:
+                provisioning_durs.append(prov)
+                execution_durs.append(execd)
+    phase_duration_stats: dict = {}
+    for name, durs in (("provisioning", provisioning_durs), ("execution", execution_durs)):
+        if len(durs) >= 3:
+            sd = sorted(durs); n = len(sd); mid = n // 2
+            p50 = sd[mid] if n % 2 else (sd[mid - 1] + sd[mid]) / 2
+            phase_duration_stats[name] = {"p50_seconds": p50, "sample_size": n}
+    return {"stats": stats, "scope_duration_stats": scope_stats, "phase_duration_stats": phase_duration_stats}
 
 
 @router.get("/failing-task-types")

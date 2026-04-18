@@ -899,20 +899,30 @@ async def get_digest(
                 dir_product_ratio = round(sum(window_product_ratios) / len(window_product_ratios), 3) if window_product_ratios else None
 
                 dir_cost = 0.0
+                dir_spot_cost = 0.0
+                dir_on_demand_cost = 0.0
                 cost_by_scope: Dict[str, float] = {}
                 cost_by_status: Dict[str, float] = {}
+                cost_by_type: Dict[str, float] = {}
                 for t in tasks_for_dir:
                     if not (t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start):
                         continue
                     rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
                     t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
                     dir_cost += t_cost
+                    if t.vm_spot:
+                        dir_spot_cost += t_cost
+                    else:
+                        dir_on_demand_cost += t_cost
                     scope_key = (t.context or {}).get("scope", "unknown")
                     cost_by_scope[scope_key] = cost_by_scope.get(scope_key, 0.0) + t_cost
                     status_key = t.status.value if hasattr(t.status, "value") else str(t.status)
                     cost_by_status[status_key] = cost_by_status.get(status_key, 0.0) + t_cost
+                    type_key = (t.first_payload or {}).get("type", "create")
+                    cost_by_type[type_key] = cost_by_type.get(type_key, 0.0) + t_cost
                 cost_by_scope = {k: round(v, 4) for k, v in cost_by_scope.items()}
                 cost_by_status = {k: round(v, 4) for k, v in cost_by_status.items()}
+                cost_by_type = {k: round(v, 4) for k, v in cost_by_type.items()}
 
                 dir_fa_measured = [
                     t for t in tasks_for_dir
@@ -1017,8 +1027,11 @@ async def get_digest(
                     "type_distribution": agg_type_distribution or None,
                     "type_breakdown": agg_type_breakdown or None,
                     "estimated_cost_usd": round(dir_cost, 2),
+                    "spot_cost_usd": round(dir_spot_cost, 2),
+                    "on_demand_cost_usd": round(dir_on_demand_cost, 2),
                     "cost_by_scope": cost_by_scope or None,
                     "cost_by_status": cost_by_status or None,
+                    "cost_by_type": cost_by_type or None,
                     "cost_per_merged_pr": round(dir_cost / prs_merged, 4) if prs_merged > 0 else None,
                     "scope_breakdown": dir_scope_agg or None,
                     "taxonomy_summary": dir_taxonomy_summary or None,
@@ -1491,6 +1504,19 @@ async def get_digest(
     directed_task_ids = {t.id for t in all_tasks if (t.context or {}).get("direction_id")}
     undirected_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start and t.id not in directed_task_ids)
     total_estimated_cost_usd = round(sum(d["estimated_cost_usd"] for d in direction_progress_list) + undirected_cost, 2)
+    total_spot_cost_usd = 0.0
+    total_on_demand_cost_usd = 0.0
+    for t in all_tasks:
+        if not (t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start):
+            continue
+        rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+        t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+        if t.vm_spot:
+            total_spot_cost_usd += t_cost
+        else:
+            total_on_demand_cost_usd += t_cost
+    total_spot_cost_usd = round(total_spot_cost_usd, 2)
+    total_on_demand_cost_usd = round(total_on_demand_cost_usd, 2)
 
     # Compute today's cost for cost ceiling warning
     today_start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1570,6 +1596,8 @@ async def get_digest(
         "overall_product_ratio": overall_product_ratio,
         "overall_type_distribution": overall_type_distribution or None,
         "total_estimated_cost_usd": total_estimated_cost_usd,
+        "spot_cost_usd": total_spot_cost_usd,
+        "on_demand_cost_usd": total_on_demand_cost_usd,
         "daily_cost_usd": daily_cost_usd,
         "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
         "narrative_summary": narrative_summary,

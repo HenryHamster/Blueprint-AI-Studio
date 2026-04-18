@@ -157,6 +157,34 @@ class TestTaskDurationStats:
         assert resp.status_code == 200
         assert resp.json()["scope_duration_stats"] == {}
 
+    @pytest.mark.asyncio
+    async def test_phase_duration_stats_p50(self, client: AsyncClient, db_session):
+        """Tasks with vm_provisioned_at/vm_started_at/vm_stopped_at get provisioning+execution p50."""
+        now = _utcnow()
+        started_at = now - timedelta(hours=2)
+        # provisioning durations 10/20/30s, execution durations 100/200/300s.
+        for prov_s, exec_s in [(10, 100), (20, 200), (30, 300)]:
+            vm_prov = started_at
+            vm_start = vm_prov + timedelta(seconds=prov_s)
+            vm_stop = vm_start + timedelta(seconds=exec_s)
+            db_session.add(make_task(
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x"}],
+                started_at=started_at,
+                status_log=[{"s": "COMPLETED", "t": vm_stop.isoformat()}],
+                created_at=started_at,
+                vm_provisioned_at=vm_prov,
+                vm_started_at=vm_start,
+                vm_stopped_at=vm_stop,
+            ))
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/task-duration-stats")
+        assert resp.status_code == 200
+        phase = resp.json()["phase_duration_stats"]
+        assert phase["provisioning"] == {"p50_seconds": 20.0, "sample_size": 3}
+        assert phase["execution"] == {"p50_seconds": 200.0, "sample_size": 3}
+
 
 class TestAdminRecordFailureResult:
     """Cover the _record_failure_result helper used on admin.py failure paths

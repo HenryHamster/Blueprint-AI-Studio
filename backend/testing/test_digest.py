@@ -2314,6 +2314,113 @@ async def test_digest_direction_progress_cost_by_scope_and_status(client: AsyncC
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_cost_by_type(client: AsyncClient, db_session):
+    """direction_progress entries include cost_by_type breakdown keyed by task type."""
+    now = _utcnow()
+    project = make_project(
+        directions=[{"id": "dir-1", "text": "D1", "status": "active"}]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="t1",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1", "scope": "small"},
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),
+        vm_spot=False,
+    ))
+    db_session.add(make_task(
+        project_id=project.id,
+        title="t2",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"direction_id": "dir-1", "scope": "small"},
+        vm_provisioned_at=now - timedelta(minutes=60),
+        vm_stopped_at=now - timedelta(minutes=30),
+        vm_spot=True,
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    assert dp["cost_by_type"] is not None
+    assert "research" in dp["cost_by_type"]
+    assert "create" in dp["cost_by_type"]
+    assert dp["cost_by_type"]["research"] > 0
+    assert dp["cost_by_type"]["create"] > 0
+    total = round(dp["cost_by_type"]["research"] + dp["cost_by_type"]["create"], 2)
+    assert total == dp["estimated_cost_usd"]
+
+
+@pytest.mark.asyncio
+async def test_digest_spot_vs_on_demand_cost_split(client: AsyncClient, db_session):
+    """direction_progress and digest response expose spot/on-demand cost split."""
+    now = _utcnow()
+    project = make_project(
+        directions=[{"id": "dir-1", "text": "D1", "status": "active"}]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Directed: one on-demand, one spot
+    db_session.add(make_task(
+        project_id=project.id,
+        title="t1",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1", "scope": "small"},
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),
+        vm_spot=False,
+    ))
+    db_session.add(make_task(
+        project_id=project.id,
+        title="t2",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1", "scope": "medium"},
+        vm_provisioned_at=now - timedelta(minutes=60),
+        vm_stopped_at=now - timedelta(minutes=30),
+        vm_spot=True,
+    ))
+    # Undirected spot task contributes to top-level split only
+    db_session.add(make_task(
+        project_id=project.id,
+        title="t3",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={},
+        vm_provisioned_at=now - timedelta(hours=3),
+        vm_stopped_at=now - timedelta(hours=1),
+        vm_spot=True,
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    body = response.json()
+    dp = body["direction_progress"][0]
+    assert "spot_cost_usd" in dp
+    assert "on_demand_cost_usd" in dp
+    assert dp["spot_cost_usd"] > 0
+    assert dp["on_demand_cost_usd"] > 0
+    assert round(dp["spot_cost_usd"] + dp["on_demand_cost_usd"], 2) == dp["estimated_cost_usd"]
+
+    assert "spot_cost_usd" in body
+    assert "on_demand_cost_usd" in body
+    # Top-level spot includes both directed spot task and undirected spot task
+    assert body["spot_cost_usd"] > dp["spot_cost_usd"]
+    assert body["on_demand_cost_usd"] == dp["on_demand_cost_usd"]
+
+
+@pytest.mark.asyncio
 async def test_digest_scope_conversion_rates_absent_without_project(client: AsyncClient, db_session):
     """scope_conversion_rates is null when no project_id is provided."""
     response = await client.get("/api/admin/digest")
