@@ -30,6 +30,7 @@ from app.anomaly_detection import (
     find_directions_sharing_fingerprint,
     _ACTIONABLE_FAILURE_CLASSES,
     _ANOMALY_ACTION_THRESHOLD,
+    _CODE_ERROR_ACTION_THRESHOLD,
     _FAST_RECOVERY_MIN_SAMPLE,
     _FAST_RECOVERY_WINDOW_HOURS,
     _MAX_ADJUSTMENT_DURATION_HOURS,
@@ -49,6 +50,7 @@ _DEFAULT_ADJUSTMENTS = {
     "failure_gate_threshold": 0.8,
     "forced_restoration_count": 0,
     "forced_restored_at": None,
+    "adjusted_max_vms": None,
 }
 
 
@@ -119,12 +121,12 @@ def test_no_adjustment_for_medium_severity():
 
 
 def test_no_adjustment_for_non_actionable_class():
-    """CODE_ERROR and other non-actionable classes don't trigger adjustments."""
+    """Non-actionable classes (e.g. AGENT_TIMEOUT) don't trigger adjustments."""
     proj_id = str(uuid.uuid4())
     _shared_state.persistent_anomalies[proj_id] = {
-        "CODE_ERROR": {
+        "AGENT_TIMEOUT": {
             "severity": "high",
-            "occurrence_count": 5,
+            "occurrence_count": 10,
             "first_seen": "2026-04-16T00:00:00",
             "last_seen": "2026-04-16T01:00:00",
             "latest_details": "test",
@@ -608,12 +610,177 @@ def test_actionable_failure_classes():
     """Verify the expected actionable failure classes."""
     assert "PROVISION_FAILURE" in _ACTIONABLE_FAILURE_CLASSES
     assert "EXTERNAL_API" in _ACTIONABLE_FAILURE_CLASSES
-    assert "CODE_ERROR" not in _ACTIONABLE_FAILURE_CLASSES
+    # CODE_ERROR is actionable, but with a higher threshold and gentler throttle
+    assert "CODE_ERROR" in _ACTIONABLE_FAILURE_CLASSES
+    assert "AGENT_TIMEOUT" not in _ACTIONABLE_FAILURE_CLASSES
 
 
 def test_anomaly_action_threshold():
     """Verify the threshold value."""
     assert _ANOMALY_ACTION_THRESHOLD == 3
+
+
+def test_code_error_action_threshold():
+    """CODE_ERROR requires a larger surge than infra classes before throttling."""
+    assert _CODE_ERROR_ACTION_THRESHOLD == 5
+    assert _CODE_ERROR_ACTION_THRESHOLD > _ANOMALY_ACTION_THRESHOLD
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CODE_ERROR — higher threshold, gentler throttle
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_code_error_no_adjustment_below_threshold():
+    """CODE_ERROR surge at occurrence_count=4 does NOT trigger (needs 5)."""
+    proj_id = str(uuid.uuid4())
+    _shared_state.persistent_anomalies[proj_id] = {
+        "CODE_ERROR": {
+            "severity": "high",
+            "occurrence_count": 4,
+            "first_seen": "2026-04-16T00:00:00",
+            "last_seen": "2026-04-16T01:00:00",
+            "latest_details": "merged PR broke an import",
+        }
+    }
+    _shared_state.runtime_config["max_concurrent_vms"] = 8
+
+    result = _apply_anomaly_adjustments()
+    assert result is False
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 8
+    assert _shared_state.anomaly_adjustments["active"] is False
+
+
+def test_code_error_no_adjustment_when_infra_threshold_met_but_not_code_threshold():
+    """CODE_ERROR at infra-threshold (3) is still insufficient; higher bar stays enforced."""
+    proj_id = str(uuid.uuid4())
+    _shared_state.persistent_anomalies[proj_id] = {
+        "CODE_ERROR": {
+            "severity": "high",
+            "occurrence_count": 3,
+            "first_seen": "2026-04-16T00:00:00",
+            "last_seen": "2026-04-16T01:00:00",
+            "latest_details": "test",
+        }
+    }
+    _shared_state.runtime_config["max_concurrent_vms"] = 8
+
+    assert _apply_anomaly_adjustments() is False
+    assert _shared_state.anomaly_adjustments["active"] is False
+
+
+def test_code_error_triggers_gentler_throttle_at_threshold():
+    """CODE_ERROR at occurrence_count=5 triggers 25% reduction (not 50%)."""
+    proj_id = str(uuid.uuid4())
+    _shared_state.persistent_anomalies[proj_id] = {
+        "CODE_ERROR": {
+            "severity": "high",
+            "occurrence_count": 5,
+            "first_seen": "2026-04-16T00:00:00",
+            "last_seen": "2026-04-16T01:00:00",
+            "latest_details": "framework upgrade broke a shared util",
+        }
+    }
+    _shared_state.runtime_config["max_concurrent_vms"] = 8
+
+    result = _apply_anomaly_adjustments()
+    assert result is True
+    assert _shared_state.anomaly_adjustments["active"] is True
+    # 25% reduction: int(8 * 0.75) = 6, not 4 (which would be 50%)
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 6
+    # Failure gate still tightened as for infra classes
+    assert _shared_state.anomaly_adjustments["failure_gate_threshold"] == 0.6
+    assert _shared_state.anomaly_adjustments["pre_adjustment_max_vms"] == 8
+    assert _shared_state.anomaly_adjustments["adjusted_max_vms"] == 6
+    assert "CODE_ERROR" in _shared_state.anomaly_adjustments["trigger_anomalies"]
+
+
+def test_code_error_fast_recovery_restores_after_clean_outcomes():
+    """Once CODE_ERROR stops recurring in the 2h window, capacity is restored."""
+    proj_id = str(uuid.uuid4())
+    _shared_state.persistent_anomalies[proj_id] = {
+        "CODE_ERROR": {
+            "severity": "high",
+            "occurrence_count": 5,
+            "first_seen": "2026-04-16T00:00:00",
+            "last_seen": "2026-04-16T01:00:00",
+            "latest_details": "test",
+        }
+    }
+    _shared_state.runtime_config["max_concurrent_vms"] = 8
+    _apply_anomaly_adjustments()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 6
+
+    # Anomaly is still persistent (occurrence_count still >= threshold) but recent
+    # outcomes are all clean — fast recovery should restore.
+    for _ in range(_FAST_RECOVERY_MIN_SAMPLE):
+        _shared_state.deploy_monitoring["task_results"].append(
+            _make_result(success=True, failure_class="", task_type="create")
+        )
+
+    result = _check_anomaly_restoration()
+    assert result is True
+    assert _shared_state.anomaly_adjustments["active"] is False
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 8
+    assert _shared_state.anomaly_adjustments["failure_gate_threshold"] == 0.8
+    assert _shared_state.anomaly_adjustments["adjusted_max_vms"] is None
+
+
+def test_code_error_fast_recovery_blocked_by_recurring_code_error():
+    """A fresh CODE_ERROR in the 2h window blocks fast recovery."""
+    proj_id = str(uuid.uuid4())
+    _shared_state.persistent_anomalies[proj_id] = {
+        "CODE_ERROR": {
+            "severity": "high",
+            "occurrence_count": 5,
+            "first_seen": "2026-04-16T00:00:00",
+            "last_seen": "2026-04-16T01:00:00",
+            "latest_details": "test",
+        }
+    }
+    _shared_state.runtime_config["max_concurrent_vms"] = 8
+    _apply_anomaly_adjustments()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 6
+
+    for _ in range(_FAST_RECOVERY_MIN_SAMPLE):
+        _shared_state.deploy_monitoring["task_results"].append(
+            _make_result(success=True, failure_class="", task_type="create")
+        )
+    # One fresh CODE_ERROR — exceeds the 10% tolerance (1/6 ≈ 17%)
+    _shared_state.deploy_monitoring["task_results"].append(
+        _make_result(success=False, failure_class="CODE_ERROR", task_type="create")
+    )
+
+    result = _check_anomaly_restoration()
+    assert result is False
+    assert _shared_state.anomaly_adjustments["active"] is True
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 6
+
+
+def test_mixed_trigger_uses_aggressive_infra_throttle():
+    """If an infra class is among the triggers, the 50% reduction applies."""
+    proj_id = str(uuid.uuid4())
+    _shared_state.persistent_anomalies[proj_id] = {
+        "CODE_ERROR": {
+            "severity": "high",
+            "occurrence_count": 5,
+            "first_seen": "2026-04-16T00:00:00",
+            "last_seen": "2026-04-16T01:00:00",
+            "latest_details": "test",
+        },
+        "PROVISION_FAILURE": {
+            "severity": "high",
+            "occurrence_count": 3,
+            "first_seen": "2026-04-16T00:00:00",
+            "last_seen": "2026-04-16T01:00:00",
+            "latest_details": "test",
+        },
+    }
+    _shared_state.runtime_config["max_concurrent_vms"] = 8
+    _apply_anomaly_adjustments()
+    # Infra trigger present → aggressive 50% reduction (8 // 2 = 4), not gentler
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+    assert _shared_state.anomaly_adjustments["adjusted_max_vms"] == 4
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -231,6 +231,48 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                 anomaly["top_patterns"] = top_patterns
             anomalies.append(anomaly)
 
+    # --- Cross-direction systemic pattern analysis ---
+    # When one normalized error fingerprint recurs across multiple directions in
+    # the 48h window, a shared root cause (infra, framework, shared dep) is more
+    # likely than direction-specific issues. Emit a distinct signal so operators
+    # scope investigations systemically rather than treating each paused
+    # direction as independent. Complements the per-class top_patterns view,
+    # which doesn't distinguish "all in one direction" from "spread across many".
+    fp_directions: dict[str, set[str]] = {}
+    fp_counts: dict[str, int] = {}
+    fp_example: dict[str, str] = {}
+    for t in recent_failures:
+        msg = t.latest_status_message or ""
+        if not msg:
+            continue
+        did = str((t.context or {}).get("direction_id") or "").strip()
+        if not did:
+            continue
+        fp = _error_fingerprint(msg)
+        fp_directions.setdefault(fp, set()).add(did)
+        fp_counts[fp] = fp_counts.get(fp, 0) + 1
+        fp_example.setdefault(fp, msg)
+    for fp, dirs in fp_directions.items():
+        if len(dirs) < 2 or fp_counts[fp] < 3:
+            continue
+        dir_list = sorted(dirs)
+        anomalies.append({
+            "signal": (
+                f"CrossDirectionFingerprint_{fp} spans {len(dirs)} directions "
+                f"with {fp_counts[fp]} recent failures"
+            ),
+            "severity": "high",
+            "details": (
+                f"Fingerprint {fp} ({fp_counts[fp]} recent failures) affects "
+                f"{len(dirs)} directions: {', '.join(dir_list)[:200]}. "
+                f"Example message: \"{fp_example[fp][:120]}\". "
+                "Suggests a systemic root cause (shared infra/framework/dep) "
+                "rather than direction-specific scope or code issues."
+            ),
+            "fingerprint": fp,
+            "affected_directions": dir_list,
+        })
+
     # --- Direction merge rate and failure rate analysis ---
     project = (await session.execute(
         select(Project).where(Project.id == project_id)
@@ -331,11 +373,39 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
 # Anomaly-driven pipeline adjustments
 # ---------------------------------------------------------------------------
 
-# Failure classes that trigger automatic pipeline adjustments when surging
-_ACTIONABLE_FAILURE_CLASSES = frozenset({"PROVISION_FAILURE", "EXTERNAL_API"})
+# Failure classes that trigger automatic pipeline adjustments when surging.
+# CODE_ERROR is included but uses a higher threshold and gentler reduction —
+# code regressions tend to be direction-specific rather than infra-wide, so
+# aggressive pipeline-level throttling is less appropriate than for infra
+# failures.
+_ACTIONABLE_FAILURE_CLASSES = frozenset({"PROVISION_FAILURE", "EXTERNAL_API", "CODE_ERROR"})
+_INFRA_FAILURE_CLASSES = frozenset({"PROVISION_FAILURE", "EXTERNAL_API"})
 
 # Minimum occurrence_count in persistent_anomalies to trigger adjustments
 _ANOMALY_ACTION_THRESHOLD = 3
+# CODE_ERROR requires a larger surge than infra classes before throttling.
+_CODE_ERROR_ACTION_THRESHOLD = 5
+# Fraction of max_concurrent_vms retained after a CODE_ERROR-only throttle
+# (25% reduction, vs the 50% reduction for infra-class triggers).
+_CODE_ERROR_REDUCTION_RETAINED_FRACTION = 0.75
+
+
+def _threshold_for_class(cls: str) -> int:
+    """Occurrence_count required for ``cls`` to trigger pipeline throttling."""
+    if cls == "CODE_ERROR":
+        return _CODE_ERROR_ACTION_THRESHOLD
+    return _ANOMALY_ACTION_THRESHOLD
+
+
+def _compute_adjusted_max_vms(pre_max_vms: int, triggers) -> int:
+    """Return the target max_concurrent_vms for the given trigger set.
+
+    Aggressive 50% reduction when any infra class is among the triggers;
+    gentler 25% reduction for CODE_ERROR-only triggers. Floor of 2 either way.
+    """
+    if set(triggers) & _INFRA_FAILURE_CLASSES:
+        return max(2, pre_max_vms // 2)
+    return max(2, int(pre_max_vms * _CODE_ERROR_REDUCTION_RETAINED_FRACTION))
 
 # Fast-recovery: rolling window (hours) and minimum completions required
 _FAST_RECOVERY_WINDOW_HOURS = 2
@@ -363,9 +433,11 @@ _FORCED_RESTORATION_REENTRY_WINDOW_MINUTES = 30
 def _apply_anomaly_adjustments() -> bool:
     """Check persistent anomalies across all projects and apply runtime adjustments.
 
-    When PROVISION_FAILURE or EXTERNAL_API anomalies reach high severity with
-    occurrence_count >= 3, automatically:
-    - Reduce max_concurrent_vms by 50% (floor of 2)
+    When an actionable failure class reaches high severity with occurrence_count
+    at or above its class-specific threshold (3 for PROVISION_FAILURE/EXTERNAL_API,
+    5 for CODE_ERROR), automatically:
+    - Reduce max_concurrent_vms (50% for infra triggers, 25% for CODE_ERROR-only),
+      floor of 2
     - Lower failure-rate dispatch gate from 0.8 to 0.6
 
     Returns True if adjustments were applied (or were already active).
@@ -380,7 +452,7 @@ def _apply_anomaly_adjustments() -> bool:
             if (
                 anomaly_key in _ACTIONABLE_FAILURE_CLASSES
                 and info.get("severity") == "high"
-                and info.get("occurrence_count", 0) >= _ANOMALY_ACTION_THRESHOLD
+                and info.get("occurrence_count", 0) >= _threshold_for_class(anomaly_key)
             ):
                 triggered_keys.append(anomaly_key)
 
@@ -405,14 +477,18 @@ def _apply_anomaly_adjustments() -> bool:
     adjustments["pre_adjustment_max_vms"] = rc["max_concurrent_vms"]
     adjustments["pre_adjustment_failure_gate"] = adjustments["failure_gate_threshold"]
 
-    # Apply adjustments: reduce VMs by 50% (floor 2), tighten failure gate
-    new_max_vms = max(2, rc["max_concurrent_vms"] // 2)
+    # Apply adjustments: reduce VMs (50% for infra triggers, 25% for CODE_ERROR-only),
+    # floor 2; tighten failure gate.
+    new_max_vms = _compute_adjusted_max_vms(rc["max_concurrent_vms"], triggered_keys)
     rc["max_concurrent_vms"] = new_max_vms
     adjustments["failure_gate_threshold"] = 0.6
 
     adjustments["active"] = True
     adjustments["adjusted_at"] = _utcnow().isoformat()
     adjustments["trigger_anomalies"] = sorted(set(triggered_keys))
+    # Remember the target we set so restoration/safeguard paths can compare against
+    # it even if trigger_anomalies drifts while the adjustment is active.
+    adjustments["adjusted_max_vms"] = new_max_vms
 
     if is_reentry:
         logger.info(
@@ -485,7 +561,9 @@ def _check_max_duration_safeguard() -> bool:
     # admin overrides made while adjustments were active).
     if pre_max_vms is not None:
         current_max_vms = rc["max_concurrent_vms"]
-        expected_adjusted_vms = max(2, pre_max_vms // 2)
+        expected_adjusted_vms = adjustments.get("adjusted_max_vms")
+        if expected_adjusted_vms is None:
+            expected_adjusted_vms = max(2, pre_max_vms // 2)
         if current_max_vms < expected_adjusted_vms:
             # deploy_health has paused (=0) or is ramping up (1-2) — this is NOT
             # an admin override. Defer forced restoration until deploy resumes so
@@ -519,6 +597,7 @@ def _check_max_duration_safeguard() -> bool:
     adjustments["trigger_anomalies"] = []
     adjustments["pre_adjustment_max_vms"] = None
     adjustments["pre_adjustment_failure_gate"] = None
+    adjustments["adjusted_max_vms"] = None
 
     logger.warning(
         f"[ANOMALY_ACTION] Forced restoration after "
@@ -556,7 +635,7 @@ def _check_anomaly_restoration() -> bool:
             if (
                 anomaly_key in _ACTIONABLE_FAILURE_CLASSES
                 and info.get("severity") == "high"
-                and info.get("occurrence_count", 0) >= _ANOMALY_ACTION_THRESHOLD
+                and info.get("occurrence_count", 0) >= _threshold_for_class(anomaly_key)
             ):
                 still_active = True
                 break
@@ -584,7 +663,9 @@ def _check_anomaly_restoration() -> bool:
         # Only restore if the current value matches what we set — if an admin
         # changed it manually while adjustments were active, respect that.
         current_max_vms = rc["max_concurrent_vms"]
-        expected_adjusted_vms = max(2, pre_max_vms // 2)
+        expected_adjusted_vms = adjustments.get("adjusted_max_vms")
+        if expected_adjusted_vms is None:
+            expected_adjusted_vms = max(2, pre_max_vms // 2)
         if current_max_vms < expected_adjusted_vms:
             if not came_via_fast_recovery:
                 # deploy_health has paused (=0) or is ramping up (1-2) — this
@@ -630,6 +711,7 @@ def _check_anomaly_restoration() -> bool:
     adjustments["trigger_anomalies"] = []
     adjustments["pre_adjustment_max_vms"] = None
     adjustments["pre_adjustment_failure_gate"] = None
+    adjustments["adjusted_max_vms"] = None
 
     logger.info(
         f"[ANOMALY_ACTION] Restored pipeline settings: "

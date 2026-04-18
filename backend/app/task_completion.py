@@ -102,18 +102,165 @@ async def _record_remediation_outcome(
 async def _record_remediation_if_terminal(
     task: Task, status: "TaskStatus", session: AsyncSession,
 ) -> None:
-    """Stamp remediation outcome on the linked direction when a diagnosis-spawned task terminates."""
+    """Stamp remediation outcome on the linked direction when a diagnosis-spawned task terminates.
+
+    On a failed/cancelled remediation, additionally attempt to spawn a
+    follow-up investigation so the pipeline does not have to wait for the
+    48h auto-recovery cycle to revisit the root cause.
+    """
     if status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
         return
     ctx = task.context or {}
     if not ctx.get("diagnosis_task_id") or not ctx.get("direction_id"):
         return
     try:
-        await _record_remediation_outcome(
+        recorded = await _record_remediation_outcome(
             task, merged=(status == TaskStatus.COMPLETED), session=session,
         )
+        if recorded and status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+            await _maybe_spawn_followup_investigation(task, session)
     except Exception as exc:
         logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome for task {task.id}: {exc!r}")
+
+
+# Maximum follow-up investigations the failure-driven trigger will spawn
+# per (direction, fingerprint) pair before falling back to the 48h
+# auto-recovery cycle. Prevents a never-ending reinvestigate loop when the
+# root cause genuinely can't be diagnosed from code signals alone.
+_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT = 2
+
+
+async def _maybe_spawn_followup_investigation(
+    task: Task, session: AsyncSession,
+) -> Optional[Task]:
+    """Spawn a follow-up investigate task after a diagnosis-spawned remediation fails.
+
+    Intended to be called only when ``_record_remediation_outcome`` has just
+    recorded a failed remediation for this task. Builds a new investigate
+    task whose prompt carries the prior diagnosis summary, the approach that
+    failed, the failure class, and the error summary — giving the agent a
+    materially different starting point than the original diagnosis.
+
+    Guards (all must pass to spawn):
+      * task has ``diagnosis_task_id`` and ``direction_id`` in context
+      * direction is not already flagged ``diagnosis_in_progress``
+      * no investigate task for this direction created in the last 24h
+      * fewer than ``_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT`` follow-ups
+        have been spawned for the current fingerprint on this direction
+    """
+    ctx = task.context or {}
+    direction_id = ctx.get("direction_id")
+    diagnosis_task_id = ctx.get("diagnosis_task_id")
+    if not direction_id or not diagnosis_task_id:
+        return None
+    project = await session.get(Project, task.project_id)
+    if project is None:
+        return None
+    directions = list(project.directions or [])
+    target = next((d for d in directions if d.get("id") == direction_id), None)
+    if target is None:
+        return None
+    if target.get(DIAGNOSIS_IN_PROGRESS_KEY):
+        logger.debug(
+            f"[DIAGNOSIS] Skip follow-up for direction {direction_id}: "
+            f"diagnosis_in_progress already set"
+        )
+        return None
+    cutoff = _utcnow() - timedelta(hours=24)
+    existing = await session.execute(
+        select(Task.id).where(
+            Task.project_id == project.id,
+            Task.created_at >= cutoff,
+            Task.payloads[0]["type"].as_string() == "investigate",
+            Task.context["direction_id"].as_string() == str(direction_id),
+        ).limit(1)
+    )
+    if existing.first() is not None:
+        logger.debug(
+            f"[DIAGNOSIS] Skip follow-up for direction {direction_id}: "
+            f"investigate task already created in last 24h"
+        )
+        return None
+    fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint") \
+        or target.get("last_remediation_fingerprint")
+    fp_key = str(fingerprint) if fingerprint else "no_fingerprint"
+    attempts_by_fp = dict(target.get("followup_investigation_attempts_by_fingerprint") or {})
+    if attempts_by_fp.get(fp_key, 0) >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT:
+        logger.info(
+            f"[DIAGNOSIS] Skip follow-up for direction {direction_id}: "
+            f"cap reached for fingerprint {fp_key[:40]} "
+            f"({attempts_by_fp.get(fp_key)}/"
+            f"{_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT})"
+        )
+        return None
+
+    prior_summary = (target.get("diagnosis_summary") or "").strip()
+    failure_class = target.get("last_remediation_failure_class") or "(unknown)"
+    error_summary = (target.get("last_remediation_error_summary") or "(no error message)")
+    failed_prompt = (task.first_payload or {}).get("prompt", "") or ""
+    prompt_parts = [
+        "A remediation task spawned from a prior diagnosis on this direction "
+        "has failed. Re-investigate the root cause — the earlier recommended "
+        "fix was insufficient or targeted the wrong layer.",
+        "",
+        f"Direction: {(target.get('text') or '')[:200]}",
+        f"Direction id: {direction_id}",
+        "",
+        f"Prior diagnosis summary:\n{prior_summary[:1500] or '(none recorded)'}",
+        "",
+        f"Remediation approach that failed (agent prompt, truncated):\n"
+        f"{failed_prompt[:1500] or '(no prompt recorded)'}",
+        "",
+        f"Failure class: {failure_class}",
+        f"Error summary: {str(error_summary)[:400]}",
+        "",
+        "Produce a recommended_fix that is materially different from the prior "
+        "attempt. Consider whether the direction scope is wrong, the prior fix "
+        "targeted a symptom rather than the cause, or a systemic/cross-cutting "
+        "issue (shared infrastructure, framework bug, test harness) is at play.",
+    ]
+    prompt = "\n".join(prompt_parts)[:20000]
+    payload = validate_internal_payload(
+        {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+        "task_completion:remediation_failure_followup",
+    )
+    task_context = {
+        "direction_id": str(direction_id),
+        "diagnosis_trigger": "remediation_failure_followup",
+        "failed_remediation_task_id": str(task.id),
+    }
+    if fingerprint:
+        task_context["diagnosis_fingerprint"] = str(fingerprint)
+    new_task = Task(
+        project_id=project.id,
+        title=f"Investigate remediation failure: {(target.get('text') or '')[:60]}",
+        description=(
+            f"Follow-up investigation after remediation task "
+            f"{str(task.id)[:8]} failed"
+        )[:500],
+        payloads=[payload],
+        context=task_context,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        priority=70,
+    )
+    session.add(new_task)
+    attempts_by_fp[fp_key] = attempts_by_fp.get(fp_key, 0) + 1
+    target["followup_investigation_attempts_by_fingerprint"] = attempts_by_fp
+    target[DIAGNOSIS_IN_PROGRESS_KEY] = True
+    target[DIAGNOSIS_STARTED_AT_KEY] = _utcnow().isoformat()
+    project.directions = directions
+    flag_modified(project, "directions")
+    session.add(project)
+    logger.info(
+        f"[DIAGNOSIS] Spawned follow-up investigation {new_task.id} after "
+        f"remediation task {task.id} failed (direction={direction_id}, "
+        f"fingerprint={fp_key[:40]}, "
+        f"attempt {attempts_by_fp[fp_key]}/"
+        f"{_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT})"
+    )
+    return new_task
 
 
 # Maps priority string labels to integer values stored on Task.priority.

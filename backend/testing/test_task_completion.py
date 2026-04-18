@@ -25,6 +25,7 @@ from app.task_completion import (
     _ensure_branch,
     _record_remediation_outcome,
     _record_remediation_if_terminal,
+    _maybe_spawn_followup_investigation,
     _handle_investigation_completion,
     _is_structural_diagnosis,
     _clear_direction_diagnosis_flag,
@@ -1052,6 +1053,235 @@ class TestRecordRemediationIfTerminal:
         )
         await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
         assert boom.await_count == 1
+
+
+# ── follow-up investigation on remediation failure ──────────────────────────
+
+class TestFollowupInvestigationOnFailure:
+    """_maybe_spawn_followup_investigation spawns a new investigate task when a
+    diagnosis-spawned remediation fails, subject to dedup + cap guards."""
+
+    @staticmethod
+    def _make_remediation_task(project_id, *, direction_id="dir-1",
+                               fingerprint="fp-A", prompt="apply the fix",
+                               status=TaskStatus.FAILED,
+                               latest_status_message="ImportError: boom"):
+        return make_task(
+            project_id=project_id,
+            status=status,
+            latest_status_message=latest_status_message,
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": direction_id,
+                "diagnosis_fingerprint": fingerprint,
+                "failure_category": "CODE_ERROR",
+            },
+            payloads=[{"type": "create", "prompt": prompt, "base_branch": "main"}],
+        )
+
+    @pytest.mark.asyncio
+    async def test_follow_up_spawned_on_first_failure(self, db_session):
+        """Failed remediation spawns an investigate task and updates direction state."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active", "text": "demo direction",
+            "diagnosis_summary": "race on record_direction_result",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": 1}
+        assert d["diagnosis_in_progress"] is True
+        assert "diagnosis_started_at" in d
+
+        from sqlmodel import select as _select
+        from app.models import Task as TaskModel
+        spawned = (await db_session.execute(
+            _select(TaskModel).where(
+                TaskModel.project_id == project.id,
+                TaskModel.id != task.id,
+            )
+        )).scalars().all()
+        assert len(spawned) == 1
+        spawned_task = spawned[0]
+        assert spawned_task.payloads[0]["type"] == "investigate"
+        assert spawned_task.context["diagnosis_trigger"] == "remediation_failure_followup"
+        assert spawned_task.context["direction_id"] == "dir-1"
+        assert spawned_task.context["diagnosis_fingerprint"] == "fp-A"
+        assert spawned_task.context["failed_remediation_task_id"] == str(task.id)
+
+    @pytest.mark.asyncio
+    async def test_follow_up_skipped_by_24h_dedup(self, db_session):
+        """An investigate task created in the last 24h blocks a new follow-up."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        # Pre-seed a recent investigate task for this direction
+        prior = make_task(
+            project_id=project.id,
+            payloads=[{"type": "investigate", "prompt": "old", "base_branch": "main"}],
+            context={"direction_id": "dir-1"},
+        )
+        db_session.add(prior)
+        await db_session.commit()
+        task = self._make_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert "followup_investigation_attempts_by_fingerprint" not in d
+        assert d.get("diagnosis_in_progress") is not True
+
+    @pytest.mark.asyncio
+    async def test_follow_up_skipped_when_cap_reached(self, db_session):
+        """Per-fingerprint cap blocks a third follow-up for the same fingerprint."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active",
+            "followup_investigation_attempts_by_fingerprint": {"fp-A": 2},
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": 2}
+        assert d.get("diagnosis_in_progress") is not True
+
+    @pytest.mark.asyncio
+    async def test_follow_up_skipped_when_diagnosis_in_progress(self, db_session):
+        """Do not spawn when an investigation is already open for the direction."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active", "diagnosis_in_progress": True,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert "followup_investigation_attempts_by_fingerprint" not in d
+
+    @pytest.mark.asyncio
+    async def test_follow_up_prompt_includes_enriched_context(self, db_session):
+        """Spawned investigate prompt carries summary, failed approach, class, error."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active",
+            "text": "fix rollup reliability",
+            "diagnosis_summary": "queue drains lock dict without ownership check",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(
+            project.id,
+            prompt="Wrap drain_rollups in per-project asyncio.Lock",
+            latest_status_message="TypeError in drain_rollups at line 88: NoneType",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as TaskModel
+        spawned = (await db_session.execute(
+            _select(TaskModel).where(
+                TaskModel.project_id == project.id,
+                TaskModel.id != task.id,
+            )
+        )).scalars().first()
+        assert spawned is not None
+        prompt_text = spawned.payloads[0]["prompt"]
+        assert "queue drains lock dict without ownership check" in prompt_text
+        assert "Wrap drain_rollups in per-project asyncio.Lock" in prompt_text
+        assert "CODE_ERROR" in prompt_text
+        assert "TypeError in drain_rollups" in prompt_text
+
+    @pytest.mark.asyncio
+    async def test_merged_remediation_does_not_spawn_followup(self, db_session):
+        """A completed (merged) remediation must not trigger a follow-up investigation."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["last_remediation_result"] == "merged"
+        assert "followup_investigation_attempts_by_fingerprint" not in d
+        assert d.get("diagnosis_in_progress") is not True
+
+        from sqlmodel import select as _select
+        from app.models import Task as TaskModel
+        all_tasks = (await db_session.execute(
+            _select(TaskModel).where(TaskModel.project_id == project.id)
+        )).scalars().all()
+        assert len(all_tasks) == 1
+
+    @pytest.mark.asyncio
+    async def test_follow_up_uses_no_fingerprint_key_when_absent(self, db_session):
+        """Missing fingerprint still caps follow-ups under a sentinel key."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        # Task without diagnosis_fingerprint in context
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message="boom",
+            context={"diagnosis_task_id": "diag-1", "direction_id": "dir-1"},
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["followup_investigation_attempts_by_fingerprint"] == {"no_fingerprint": 1}
 
 
 # ── _handle_investigation_completion ────────────────────────────────────────

@@ -207,6 +207,95 @@ async def test_prompt_includes_last_remediation_failure_details(db_session):
 
 
 @pytest.mark.asyncio
+async def test_prompt_enriches_with_prior_remediation_task(db_session):
+    """When the prior remediation task is loadable, prompt surfaces its title/description and failure guidance."""
+    project = await _make_project(db_session)
+    rem_task = Task(
+        project_id=project.id,
+        title="feat: add retry loop to flaky call",
+        description="Wraps the failing call in a 3-attempt retry to paper over transient errors.",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(rem_task)
+    await db_session.commit()
+    await db_session.refresh(rem_task)
+    direction = _direction(did="d-enrich-rem")
+    direction.update({
+        "remediation_attempts": 1,
+        "last_remediation_result": "failed",
+        "last_remediation_task_id": str(rem_task.id),
+    })
+    assert await _spawn_direction_diagnosis(
+        project, direction, "High code failure rate: ...", db_session,
+    ) is True
+    await db_session.commit()
+    investigate = (await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.context["direction_id"].as_string() == "d-enrich-rem",
+        )
+    )).scalars().first()
+    prompt = investigate.first_payload["prompt"]
+    assert "feat: add retry loop to flaky call" in prompt
+    assert "3-attempt retry to paper over transient errors" in prompt
+    assert "previous remediation attempt failed" in prompt.lower()
+    assert "prior diagnosis was incorrect" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_prompt_falls_back_when_remediation_task_missing(db_session):
+    """Invalid/unfindable last_remediation_task_id: prompt still includes metadata + guidance, no approach block."""
+    project = await _make_project(db_session)
+    direction = _direction(did="d-missing-rem")
+    direction.update({
+        "remediation_attempts": 1,
+        "last_remediation_result": "failed",
+        "last_remediation_task_id": "not-a-real-uuid",
+    })
+    assert await _spawn_direction_diagnosis(
+        project, direction, "High code failure rate: ...", db_session,
+    ) is True
+    await db_session.commit()
+    investigate = (await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.context["direction_id"].as_string() == "d-missing-rem",
+        )
+    )).scalars().first()
+    prompt = investigate.first_payload["prompt"]
+    assert "Prior remediation attempts: 1" in prompt
+    assert "previous remediation attempt failed" in prompt.lower()
+    assert "Prior remediation approach:" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_prompt_omits_failure_guidance_when_last_remediation_merged(db_session):
+    """A merged remediation must not trigger the 'previous remediation failed' guidance."""
+    project = await _make_project(db_session)
+    direction = _direction(did="d-guidance-merged")
+    direction.update({
+        "remediation_attempts": 1,
+        "last_remediation_result": "merged",
+        "last_remediation_task_id": "task-prev-merged",
+    })
+    assert await _spawn_direction_diagnosis(
+        project, direction, "High code failure rate: ...", db_session,
+    ) is True
+    await db_session.commit()
+    investigate = (await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.context["direction_id"].as_string() == "d-guidance-merged",
+        )
+    )).scalars().first()
+    prompt = investigate.first_payload["prompt"]
+    assert "previous remediation attempt failed" not in prompt.lower()
+    assert "Prior remediation approach:" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_prompt_omits_failure_details_when_last_remediation_merged(db_session):
     """A merged prior remediation must not produce a failure-details line."""
     project = await _make_project(db_session)
@@ -854,7 +943,21 @@ async def test_diagnosis_annotates_shared_fingerprint_directions(db_session):
     assert shared is not None
     shared_ids = {entry["id"] for entry in shared}
     assert shared_ids == {"d-other-1", "d-other-2"}
-    assert "SYSTEMIC" in task.first_payload["prompt"]
+    # Each entry must carry id + text so the diagnosis agent can reference sibling directions by name.
+    for entry in shared:
+        assert set(entry.keys()) == {"id", "text"}
+        assert entry["text"], "text field should be populated from sibling direction"
+    prompt = task.first_payload["prompt"]
+    assert "SYSTEMIC" in prompt
+    # Prompt should surface the sibling count and explicit direction IDs so the agent
+    # knows which directions co-fail on this root cause.
+    assert "2 other auto-paused direction(s)" in prompt
+    assert "d-other-1" in prompt and "d-other-2" in prompt
+    assert "d-other-3" not in prompt
+    # Sibling text (not just id) must appear so the agent can judge which
+    # subsystems are affected and scope the systemic investigation accordingly.
+    assert "Sibling direction d-other-1" in prompt
+    assert "Sibling direction d-other-2" in prompt
 
 
 @pytest.mark.asyncio
@@ -889,6 +992,10 @@ async def test_diagnosis_ignores_active_siblings_with_matching_fingerprint(db_se
         _other_paused("d-active", "fp-shared", status="active", auto_paused=False),
         # Paused but not auto_paused (e.g. user-paused) — also ignored.
         _other_paused("d-manual", "fp-shared", auto_paused=False),
+        # Auto-retired: status flipped to "completed" on MAX_AUTO_PAUSE_CYCLES, so the
+        # direction is terminal and should not be treated as a live sibling affected
+        # by the same systemic pattern.
+        _other_paused("d-retired", "fp-shared", status="completed"),
     ]
     flag_modified(project, "directions")
     await db_session.commit()
@@ -902,6 +1009,7 @@ async def test_diagnosis_ignores_active_siblings_with_matching_fingerprint(db_se
         select(Task).where(Task.project_id == project.id)
     )).scalars().first()
     assert "shared_fingerprint_directions" not in task.context
+    assert "SYSTEMIC" not in task.first_payload["prompt"]
 
 
 @pytest.mark.asyncio
@@ -928,3 +1036,188 @@ async def test_active_monitor_not_expired_keeps_intervention(db_session):
     d = project.directions[0]
     assert d.get("needs_manual_intervention") is True
     assert d.get("remediation_monitor_started_at") is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BLOCKER escalation notification retry
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _re_pause_direction(did: str = "d-retry-1") -> dict:
+    """Direction configured so _process_direction_lifecycle fires an escalation.
+
+    Unhealthy research_history trips Rule 3, remediation_monitor + 3 attempts +
+    matching fingerprints satisfy the escalation precondition.
+    """
+    return {
+        "id": did,
+        "text": "Direction needing escalation",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [
+            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+        ],
+        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+        "remediation_attempts": 3,
+        "last_remediation_result": "merged",
+        "error_fingerprint": "fp-retry",
+        "last_remediation_fingerprint": "fp-retry",
+    }
+
+
+@pytest.mark.asyncio
+async def test_escalation_failure_sets_pending_flag(db_session, mocker):
+    """When post_remediation_escalation_message raises, the direction is stamped pending."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value="fp-retry",
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_remediation_escalation_message",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("webhook down"),
+    )
+    project = Project(
+        name="Escalation retry — initial failure",
+        user_id="u-retry",
+        autonomous_enabled=True,
+        directions=[_re_pause_direction("d-pending-1")],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "paused"
+    assert d.get("needs_manual_intervention") is True
+    assert d.get("escalation_notification_pending") is True
+    assert d.get("escalation_notification_retries") == 0
+
+
+@pytest.mark.asyncio
+async def test_escalation_retry_succeeds_clears_flag(db_session, mocker):
+    """Retry loop clears pending flag and posts the BLOCKER message on success."""
+    post_mock = mocker.patch(
+        "app.notification_dispatch.post_remediation_escalation_message",
+        new_callable=AsyncMock,
+    )
+    # Direction already stamped from a prior failed escalation; paused and healthy-history
+    # so no new auto-pause fires this cycle.
+    direction = {
+        "id": "d-retry-ok",
+        "text": "Retry target",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "High code failure rate: ...",
+        "paused_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "escalation_notification_pending": True,
+        "escalation_notification_retries": 1,
+        "error_fingerprint": "fp-retry",
+        "remediation_attempts": 3,
+    }
+    project = await _make_intervention_project(db_session, direction)
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert post_mock.await_count == 1
+    kwargs = post_mock.await_args.kwargs
+    assert kwargs["attempts"] == 3
+    assert kwargs["failure_pattern"] == "fp-retry"
+    assert "escalation_notification_pending" not in d
+    assert "escalation_notification_retries" not in d
+
+
+@pytest.mark.asyncio
+async def test_escalation_retry_max_retries_stops(db_session, mocker, caplog):
+    """After _MAX_ESCALATION_NOTIFICATION_RETRIES, the retry loop logs ERROR and stops."""
+    import logging as _logging
+    post_mock = mocker.patch(
+        "app.notification_dispatch.post_remediation_escalation_message",
+        new_callable=AsyncMock,
+    )
+    direction = {
+        "id": "d-retry-exhausted",
+        "text": "Retry exhausted",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "High code failure rate: ...",
+        "paused_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "escalation_notification_pending": True,
+        "escalation_notification_retries": 3,  # already at max
+        "remediation_attempts": 3,
+    }
+    project = await _make_intervention_project(db_session, direction)
+    with caplog.at_level(_logging.ERROR, logger="app.direction_lifecycle"):
+        await _process_direction_lifecycle(
+            project, db_session, cooldown_minutes=240.0,
+            busy_direction_ids=set(), now=datetime.utcnow(),
+        )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert post_mock.await_count == 0, "must not retry after max retries"
+    assert "escalation_notification_pending" not in d
+    err_records = [
+        r for r in caplog.records
+        if r.levelno == _logging.ERROR and "retries exhausted" in r.message
+    ]
+    assert len(err_records) == 1
+    rec = err_records[0]
+    assert getattr(rec, "direction_id", None) == "d-retry-exhausted"
+    assert getattr(rec, "retries", None) == 3
+
+
+@pytest.mark.asyncio
+async def test_escalation_retry_failure_increments_count(db_session, mocker):
+    """When the retry itself fails, retry count increments and pending stays true."""
+    mocker.patch(
+        "app.notification_dispatch.post_remediation_escalation_message",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("still down"),
+    )
+    direction = {
+        "id": "d-retry-increment",
+        "text": "Retry increment",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "High code failure rate: ...",
+        "paused_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "escalation_notification_pending": True,
+        "escalation_notification_retries": 1,
+        "remediation_attempts": 3,
+    }
+    project = await _make_intervention_project(db_session, direction)
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d.get("escalation_notification_pending") is True
+    assert d.get("escalation_notification_retries") == 2

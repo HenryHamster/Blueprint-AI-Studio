@@ -36,6 +36,39 @@ _FINGERPRINT_SAMPLE_SIZE = 10
 # Min matching failures required for a fingerprint to count as "dominant" for the direction
 _FINGERPRINT_MIN_RECURRENCE = 2
 
+# Max retries for a BLOCKER escalation notification whose initial delivery failed.
+# After this many failed retries, the pending flag is cleared and an ERROR is logged
+# with structured fields so monitoring can catch a silently-stuck direction.
+_MAX_ESCALATION_NOTIFICATION_RETRIES = 3
+
+
+def _build_escalation_args(direction: dict) -> dict:
+    """Assemble kwargs for post_remediation_escalation_message from direction state.
+
+    Shared by the initial auto-pause escalation path and the retry loop so both
+    produce identical message bodies when re-derived from the direction.
+    """
+    from app.strategic_completion import _build_direction_failure_summary  # noqa: PLC0415
+    summary = _build_direction_failure_summary(direction)
+    rem_summary = (
+        f"cycles_analyzed={summary['cycles_analyzed']} "
+        f"tasks_created={summary['tasks_created']} "
+        f"code_failed={summary['tasks_failed_code']} "
+        f"merged={summary['prs_merged']} "
+        f"code_failure_rate={summary['code_failure_rate']}"
+    )
+    did = direction.get("id")
+    return {
+        "direction_text": direction.get("text") or (str(did) if did else ""),
+        "failure_pattern": (
+            direction.get("error_fingerprint")
+            or direction.get("paused_reason")
+            or "(unknown)"
+        ),
+        "attempts": int(direction.get("remediation_attempts", 0)),
+        "remediation_summary": rem_summary,
+    }
+
 
 async def _compute_direction_error_fingerprint(
     project_id: uuid.UUID, direction_id: str, session: AsyncSession,
@@ -184,13 +217,22 @@ async def _spawn_direction_diagnosis(
     if fingerprint:
         extras += f"Dominant error fingerprint: {fingerprint[:200]}\n"
     if shared_directions:
-        other_ids = ", ".join(str(d["id"]) for d in shared_directions)
+        sibling_lines = "\n".join(
+            f"  - {d['id']}: {d['text']}" if d.get("text") else f"  - {d['id']}"
+            for d in shared_directions
+        )
         extras += (
             f"Shared error pattern: same fingerprint also appears on "
-            f"{len(shared_directions)} other auto-paused direction(s) ({other_ids}). "
+            f"{len(shared_directions)} other auto-paused direction(s):\n"
+            f"{sibling_lines}\n"
             f"This suggests a SYSTEMIC root cause rather than a direction-specific "
             f"issue — investigate cross-cutting infrastructure or framework code, "
             f"not just files specific to this direction.\n"
+        )
+        logger.info(
+            f"[DIAGNOSIS] Cross-direction systemic pattern for {direction_id}: "
+            f"fingerprint {str(fingerprint)[:40]} shared with "
+            f"{len(shared_directions)} other direction(s)"
         )
     if prior_diagnosis:
         extras += f"Prior diagnosis summary: {prior_diagnosis[:400]}\n"
@@ -214,6 +256,29 @@ async def _spawn_direction_diagnosis(
                     f"{last_rem_class or '(unknown class)'}: "
                     f"{(last_rem_error or '(no error summary)')[:200]}\n"
                 )
+            # Load the prior remediation task so the investigation sees what
+            # approach was tried (title/description), not just what it errored on.
+            rem_task = None
+            if direction.get("last_remediation_task_id"):
+                try:
+                    rem_task = await session.get(
+                        Task, uuid.UUID(str(direction["last_remediation_task_id"])),
+                    )
+                except (ValueError, TypeError):
+                    rem_task = None
+            if rem_task:
+                extras += (
+                    f"Prior remediation approach:\n"
+                    f"  title: {(rem_task.title or '')[:200]}\n"
+                    f"  description: {(rem_task.description or '')[:500]}\n"
+                )
+            extras += (
+                "The previous remediation attempt failed. Your investigation "
+                "should determine whether the prior diagnosis was incorrect, "
+                "incomplete, or whether the fix approach was wrong. Do not "
+                "recommend the same approach unless you have evidence it was "
+                "implemented incorrectly.\n"
+            )
         extras += (
             f"Avoid proposing a fix targeting the same fingerprint that already "
             f"failed; prior attempts did not resolve the recurring pattern.\n"
@@ -288,6 +353,45 @@ async def _process_direction_lifecycle(
         project.directions = live_dirs
         flag_modified(project, "directions")
         directions_modified = True
+    # Retry BLOCKER escalation notifications whose initial delivery failed.
+    # Runs before auto-recovery so a direction that recovers this cycle does
+    # not silently lose its pending notification.
+    for d in (project.directions or []):
+        if not d.get("escalation_notification_pending"):
+            continue
+        retries = int(d.get("escalation_notification_retries", 0))
+        if retries >= _MAX_ESCALATION_NOTIFICATION_RETRIES:
+            logger.error(
+                "[NOTIFY] Escalation notification retries exhausted",
+                extra={
+                    "event": "escalation_retries_exhausted",
+                    "project_id": str(project.id),
+                    "direction_id": d.get("id"),
+                    "retries": retries,
+                    "remediation_attempts": int(d.get("remediation_attempts", 0)),
+                },
+            )
+            d.pop("escalation_notification_pending", None)
+            directions_modified = True
+            continue
+        try:
+            from app.notification_dispatch import post_remediation_escalation_message  # noqa: PLC0415
+            await post_remediation_escalation_message(
+                session, project.id, **_build_escalation_args(d),
+            )
+            d.pop("escalation_notification_pending", None)
+            d.pop("escalation_notification_retries", None)
+            directions_modified = True
+            logger.info(
+                f"[NOTIFY] Escalation retry succeeded for direction {d.get('id')} "
+                f"after {retries} prior retries"
+            )
+        except Exception as _retry_exc:
+            d["escalation_notification_retries"] = retries + 1
+            directions_modified = True
+            logger.warning(
+                f"[NOTIFY] Escalation retry {retries + 1} failed for {d.get('id')}: {_retry_exc}"
+            )
     # Auto-recovery: reactivate auto-paused directions past cooldown
     recovery_hours = _runtime_config.get("direction_auto_recovery_hours", 48)
     for d in (project.directions or []):
@@ -448,25 +552,21 @@ async def _process_direction_lifecycle(
                 )
                 try:
                     from app.notification_dispatch import post_remediation_escalation_message  # noqa: PLC0415
-                    from app.strategic_completion import _build_direction_failure_summary  # noqa: PLC0415
-                    summary = _build_direction_failure_summary(d)
-                    rem_summary = (
-                        f"cycles_analyzed={summary['cycles_analyzed']} "
-                        f"tasks_created={summary['tasks_created']} "
-                        f"code_failed={summary['tasks_failed_code']} "
-                        f"merged={summary['prs_merged']} "
-                        f"code_failure_rate={summary['code_failure_rate']}"
-                    )
                     await post_remediation_escalation_message(
-                        session,
-                        project.id,
-                        direction_text=d.get("text", did) or did,
-                        failure_pattern=d.get("error_fingerprint") or pause_reason,
-                        attempts=int(d.get("remediation_attempts", 0)),
-                        remediation_summary=rem_summary,
+                        session, project.id, **_build_escalation_args(d),
                     )
+                    # Clear any pending retry stamps from a prior failed escalation
+                    d.pop("escalation_notification_pending", None)
+                    d.pop("escalation_notification_retries", None)
                 except Exception as _esc_exc:
                     logger.warning(f"[NOTIFY] Failed to post remediation escalation message: {_esc_exc}")
+                    # Stamp for retry on the next lifecycle cycle. Retry count is
+                    # preserved if an earlier escalation on this direction was also
+                    # pending; the retry loop enforces _MAX_ESCALATION_NOTIFICATION_RETRIES.
+                    d["escalation_notification_pending"] = True
+                    d["escalation_notification_retries"] = int(
+                        d.get("escalation_notification_retries", 0)
+                    )
             logger.info(f"[AUTONOMOUS] Auto-paused direction {did}: {pause_reason}")
             auto_paused_any = True
             try:

@@ -174,6 +174,7 @@ anomaly_adjustments: Dict[str, Any] = {
     "failure_gate_threshold": 0.8,   # default; lowered to 0.6 during anomaly response
     "forced_restoration_count": 0,   # cumulative count of max-duration forced restorations
     "forced_restored_at": None,      # ISO timestamp of last forced restoration
+    "adjusted_max_vms": None,        # target max_concurrent_vms we set; used to detect deploy_health/admin overrides
 }
 
 # --- Circuit Breaker (Hystrix-inspired) ---

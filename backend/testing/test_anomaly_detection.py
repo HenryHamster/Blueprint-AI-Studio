@@ -516,3 +516,95 @@ async def test_multiple_anomalies_returned_when_multiple_signals_present():
     signals = [a["signal"] for a in result]
     assert any("PROVISION_FAILURE" in s for s in signals)
     assert any("d-multi01" in s for s in signals)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-direction systemic fingerprint pattern
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_cross_direction_fingerprint_emits_systemic_anomaly():
+    """Same normalized error across 2+ directions with 3+ total failures → systemic anomaly."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+
+    # Same message — all failures share one fingerprint — across three directions
+    shared_msg = "ImportError: cannot import name 'Foo' from 'app.bar'"
+    tasks = [
+        make_task(
+            project_id=project_id, status=TaskStatus.FAILED,
+            latest_status_message=shared_msg, context={"direction_id": "d-aaa"},
+            created_at=now - timedelta(hours=2),
+        ),
+        make_task(
+            project_id=project_id, status=TaskStatus.FAILED,
+            latest_status_message=shared_msg, context={"direction_id": "d-bbb"},
+            created_at=now - timedelta(hours=3),
+        ),
+        make_task(
+            project_id=project_id, status=TaskStatus.FAILED,
+            latest_status_message=shared_msg, context={"direction_id": "d-ccc"},
+            created_at=now - timedelta(hours=4),
+        ),
+    ]
+    session = _make_session(tasks=tasks, project=project)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    systemic = [a for a in result if a["signal"].startswith("CrossDirectionFingerprint_")]
+    assert len(systemic) == 1
+    anomaly = systemic[0]
+    assert anomaly["severity"] == "high"
+    assert sorted(anomaly["affected_directions"]) == ["d-aaa", "d-bbb", "d-ccc"]
+    assert anomaly["fingerprint"]  # non-empty fingerprint stored
+
+
+@pytest.mark.asyncio
+async def test_single_direction_fingerprint_no_systemic_anomaly():
+    """Fingerprint confined to one direction → no cross-direction anomaly (even if count is high)."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+
+    shared_msg = "AttributeError: 'NoneType' has no attribute 'x'"
+    tasks = [
+        make_task(
+            project_id=project_id, status=TaskStatus.FAILED,
+            latest_status_message=shared_msg, context={"direction_id": "d-only"},
+            created_at=now - timedelta(hours=i + 1),
+        )
+        for i in range(5)
+    ]
+    session = _make_session(tasks=tasks, project=project)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    assert not any(a["signal"].startswith("CrossDirectionFingerprint_") for a in result)
+
+
+@pytest.mark.asyncio
+async def test_cross_direction_below_count_threshold_no_anomaly():
+    """2 directions but only 2 total failures → below count threshold → no systemic anomaly."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+
+    shared_msg = "KeyError: 'missing_key'"
+    tasks = [
+        make_task(
+            project_id=project_id, status=TaskStatus.FAILED,
+            latest_status_message=shared_msg, context={"direction_id": "d-a"},
+            created_at=now - timedelta(hours=1),
+        ),
+        make_task(
+            project_id=project_id, status=TaskStatus.FAILED,
+            latest_status_message=shared_msg, context={"direction_id": "d-b"},
+            created_at=now - timedelta(hours=2),
+        ),
+    ]
+    session = _make_session(tasks=tasks, project=project)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    assert not any(a["signal"].startswith("CrossDirectionFingerprint_") for a in result)
