@@ -22,7 +22,33 @@ from sqlmodel import SQLModel
 from sqlmodel import select as _select
 
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
-from app.reaper import reaper_service, _copy_analysis_artifacts_to_previous, _reaper_skip_counts
+from app.reaper import reaper_service, _copy_analysis_artifacts_to_previous, _reaper_skip_counts, _heartbeat_stale_cutoff
+from app.shared_state import runtime_config as _runtime_config
+
+
+def test_heartbeat_stale_cutoff_respects_runtime_config_override():
+    """_heartbeat_stale_cutoff reads per-scope thresholds from runtime_config."""
+    original = _runtime_config.get("heartbeat_stale_seconds_by_scope")
+    try:
+        _runtime_config["heartbeat_stale_seconds_by_scope"] = {
+            "small": 60, "medium": 120, "large": 900,
+        }
+
+        class _T:
+            context = {"scope": "large"}
+            first_payload = None
+
+        now = datetime(2026, 1, 1, 12, 0, 0)
+        cutoff = _heartbeat_stale_cutoff(_T(), now)
+        assert cutoff == now - timedelta(seconds=900)
+
+        _T.context = {"scope": "small"}
+        assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=60)
+    finally:
+        if original is None:
+            _runtime_config.pop("heartbeat_stale_seconds_by_scope", None)
+        else:
+            _runtime_config["heartbeat_stale_seconds_by_scope"] = original
 
 
 class _StopLoop(Exception):
@@ -649,10 +675,47 @@ async def test_external_api_transient_5xx_skips_delay_when_healthy(
     await reaper_db.refresh(t)
 
     assert t.status == TaskStatus.QUEUED
+    # Fast-path: transient 5xx + recovered dependency + no committed work
+    # must not burn the retry budget.
+    assert t.attempt_count == 0
     ra = (t.context or {}).get("retry_after")
     assert ra
     delay_min = (datetime.fromisoformat(ra) - before).total_seconds() / 60
     assert delay_min < 1.0, f"expected near-zero delay, got {delay_min:.1f}min"
+
+
+@pytest.mark.asyncio
+async def test_external_api_transient_5xx_with_committed_work_burns_budget(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Transient 5xx but task has a PR — fast-path skipped, attempt_count increments."""
+    mocker.patch("app.reaper.random.uniform", return_value=1.0)
+    mocker.patch.dict(
+        "app.reaper._external_health",
+        {"consecutive_failures": {"github_api": 0}},
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-api-with-pr",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        context={
+            "last_error": "502 Bad Gateway from api.github.com",
+            "pr_number": 123,
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 1
 
 
 @pytest.mark.asyncio

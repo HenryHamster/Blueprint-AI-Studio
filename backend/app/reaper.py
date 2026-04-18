@@ -41,11 +41,7 @@ def _copy_analysis_artifacts_to_previous(ctx: dict) -> None:
             ctx[dst] = ctx[src]
 
 
-# Per-scope heartbeat-stale thresholds. Large-scope tasks legitimately run longer
-# stretches without a heartbeat (multi-file self-review, full test suites,
-# cross-module analysis), so reaping at the small-scope 5-minute bar flags them
-# as dead while they're still making progress.
-_HEARTBEAT_STALE_SECONDS_BY_SCOPE = {
+_HEARTBEAT_STALE_DEFAULTS = {
     "small": 300,
     "medium": 420,
     "large": 600,
@@ -56,7 +52,8 @@ def _heartbeat_stale_cutoff(task, now: datetime) -> datetime:
     scope = (task.context or {}).get("scope")
     if not scope:
         scope = (task.first_payload or {}).get("scope")
-    seconds = _HEARTBEAT_STALE_SECONDS_BY_SCOPE.get(scope, 300)
+    thresholds = _runtime_config.get("heartbeat_stale_seconds_by_scope", _HEARTBEAT_STALE_DEFAULTS)
+    seconds = thresholds.get(scope, thresholds.get("small", 300))
     return now - timedelta(seconds=seconds)
 
 
@@ -465,6 +462,25 @@ async def reaper_service():
                             reap_failure_class = "AGENT_TIMEOUT"
                         task_scope = (task.context or {}).get("scope")
                         class_budget = resolve_retry_budget(reap_failure_class, task_scope)
+                        # Detect EXTERNAL_API fast-path: transient 5xx on a task with no
+                        # committed work, where the dependency health check shows recovery.
+                        # These failures skip the attempt_count increment below (mirrors
+                        # the RATE_LIMIT fast-path) since the retry is near-instant and
+                        # not indicative of a code defect.
+                        _err_blob = (combined_logs + " " + (task.latest_status_message or "")).lower()
+                        _transient_5xx = any(p in _err_blob for p in (
+                            "http 502", "http 503", "http 504",
+                            "502 bad gateway", "503 service", "504 gateway",
+                            "server error",
+                        ))
+                        _has_work = bool((task.context or {}).get("pr_number"))
+                        _gh_consec = _external_health.get("consecutive_failures", {}).get("github_api", 0)
+                        ext_api_fast_path = (
+                            reap_failure_class == "EXTERNAL_API"
+                            and _transient_5xx
+                            and not _has_work
+                            and _gh_consec == 0
+                        )
                         can_retry = task.attempt_count < class_budget
 
                     if can_retry:
@@ -481,7 +497,7 @@ async def reaper_service():
                             logger.info(f"[REAPER] Re-evaluating parent task {task.id}")
                             await _requeue_parent_task(task, session)
                         else:
-                            if not is_provision_failure:
+                            if not is_provision_failure and not ext_api_fast_path:
                                 task.attempt_count += 1
                             if is_provision_failure:
                                 retry_label = f"provision {provision_failures}/{max_provision_retries}"

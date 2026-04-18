@@ -166,6 +166,14 @@ runtime_config: Dict = {
         "EXTERNAL_API": 4,
         "AGENT_TIMEOUT": 3,
     },
+    # Per-scope heartbeat-stale thresholds (seconds). Large-scope tasks
+    # legitimately run longer stretches without a heartbeat, so reaping at the
+    # small-scope bar flags them as dead while they're still making progress.
+    "heartbeat_stale_seconds_by_scope": {
+        "small": 300,
+        "medium": 420,
+        "large": 600,
+    },
 }
 
 # Scope-aware per-class retry budgets. When a task's context includes a scope
