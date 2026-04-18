@@ -528,7 +528,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                           )}
                         </div>
                         {d.taxonomy_summary && <div className="flex gap-1 mt-1 flex-wrap">{TAXONOMY_ORDER.map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return v ? <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span> : null; })}</div>}
-                        {d.stage_dropout && Object.values(d.stage_dropout).some(v => v) && <div className="flex gap-1 mt-1 flex-wrap">{Object.entries(d.stage_dropout).filter(([, v]) => v).sort((a, b) => b[1] - a[1]).map(([stage, v]) => <span key={stage} title={`Failed at ${stage}: ${v}`} className="text-[9px] leading-none px-1 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-300">{stage} {v}</span>)}</div>}
+                        {d.stage_dropout && Object.values(d.stage_dropout).some(v => v) && <div className="flex gap-1 mt-1 flex-wrap">{Object.entries(d.stage_dropout).filter(([, v]) => v).sort((a, b) => b[1] - a[1]).map(([stage, v]) => <span key={stage} title={`Failed at ${stage}: ${v}`} className="text-[9px] leading-none px-1 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-300">{STAGE_DROPOUT_LABELS[stage] ?? stage} {v}</span>)}</div>}
                         {d.recent_failure_titles && d.recent_failure_titles.length > 0 && (
                           <ul className="mt-1 space-y-0.5">
                             {d.recent_failure_titles.slice(0, 3).map((t, i) => (
@@ -790,6 +790,14 @@ const FAILURE_CLASS_SHORT: Record<string, string> = {
   AGENT_TIMEOUT: 'timeout',
   RATE_LIMIT: 'rate',
   EXTERNAL_API: 'ext api',
+  SCOPE_OVERFLOW: 'scope',
+};
+
+const STAGE_DROPOUT_LABELS: Record<string, string> = {
+  tasks_failed_code_error: 'code error',
+  tasks_failed_infra: 'infra',
+  tasks_required_approval: 'approval',
+  tasks_merged_staging_only: 'staging only',
 };
 
 function FailedCard({ value, groups, spark, loading }: {

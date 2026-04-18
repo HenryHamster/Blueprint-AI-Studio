@@ -1453,6 +1453,22 @@ async def get_digest(
                     failed_str += f" ({', '.join(failure_titles)})"
                 narrative_parts.append(failed_str + ".")
 
+            # Taxonomy insight: if one category dominates (>=50% of failures), add actionable hint
+            _dom_cat = failure_taxonomy_distribution.get("dominant_category")
+            _tax_tot = failure_taxonomy_distribution.get("total_failures") or 0
+            if _dom_cat and _tax_tot >= 2:
+                _dom_count = failure_taxonomy_distribution["categories"][_dom_cat]["count"]
+                if _dom_count / _tax_tot >= 0.5:
+                    _taxonomy_msgs = {
+                        "review_quality": "Review quality issues dominate failures — improving lint/test coverage may help.",
+                        "scope_related": "Scope mismatch is the top failure pattern — consider task decomposition.",
+                        "infra_related": "Infrastructure issues dominate — check provisioning and rate limits.",
+                        "code_defect": "Code defects dominate failures — strengthening self-review may help.",
+                    }
+                    _tax_msg = _taxonomy_msgs.get(_dom_cat)
+                    if _tax_msg:
+                        narrative_parts.append(_tax_msg)
+
         # THIRD: Completion stats with trend prefix embedded
         if completed_count > 0:
             trend_prefix = ""

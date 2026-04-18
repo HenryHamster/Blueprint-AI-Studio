@@ -1008,6 +1008,30 @@ async def test_narrative_all_quiet_fallback(client: AsyncClient, db_session):
     assert "All quiet" in data["narrative_summary"]
 
 
+@pytest.mark.asyncio
+async def test_narrative_taxonomy_insight_dominant_category(client: AsyncClient, db_session):
+    """When a taxonomy category dominates failures (>=50%), narrative appends an actionable hint."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Failed Task {i}",
+            status=TaskStatus.FAILED,
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["failure_taxonomy_distribution"]["dominant_category"] == "infra_related"
+    assert "Infrastructure issues dominate" in data["narrative_summary"]
+
+
 # ---------------------------------------------------------------------------
 # Trend boundary tests
 # ---------------------------------------------------------------------------
