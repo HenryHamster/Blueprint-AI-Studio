@@ -772,6 +772,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 finding_effort = _finding_explicit
             else:
                 finding_effort = _scope_effort
+            # Complexity-aware boost: complex tasks (low P(merge) complexity
+            # score) get elevated effort so the agent has deeper inference to
+            # navigate the complexity without requiring a scope upgrade.
+            _cscore = finding.get("_complexity_score")
+            if _cscore is not None and _cscore < 0.4 and _effort_rank.get(finding_effort, 0) < _effort_rank["high"]:
+                finding_effort = "high"
         finding_payload = validate_internal_payload({
             "type": task_type,
             "prompt": full_prompt,

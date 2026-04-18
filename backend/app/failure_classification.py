@@ -100,6 +100,7 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     'fatal': CODE_ERROR,
     'rate_limited': RATE_LIMIT,
     'scope_overflow': SCOPE_OVERFLOW,
+    'timeout': AGENT_TIMEOUT,
 }
 
 

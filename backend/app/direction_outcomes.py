@@ -230,11 +230,15 @@ async def _update_direction_research_outcomes(
                     category = (ct.context or {}).get("failure_category", "")
                     taxonomy = _classify_taxonomy(ct)
                     taxonomy_summary[taxonomy] = taxonomy_summary.get(taxonomy, 0) + 1
+                    effort_attempted = (ct.first_payload or {}).get("effort")
+                    scope_calibrated_from = (ct.context or {}).get("scope_calibrated_from")
                     failed_details.append({
                         "title": ct.title or "",
                         "reason": reason,
                         "category": category,
                         "taxonomy": taxonomy,
+                        "effort_attempted": effort_attempted,
+                        "scope_calibrated_from": scope_calibrated_from,
                     })
                     if category in INFRA_CLASSES:
                         infra_failures += 1
@@ -336,6 +340,17 @@ async def _update_direction_research_outcomes(
                 scope = ctx_.get("scope", "unknown")
                 _ensure_scope(scope)
                 scope_breakdown[scope]["created"] += 1
+                effort_level = (ct.first_payload or {}).get("effort")
+                if effort_level:
+                    effort_dist = scope_breakdown[scope].setdefault("effort_distribution", {})
+                    effort_bucket = effort_dist.setdefault(
+                        effort_level, {"created": 0, "merged": 0, "failed": 0}
+                    )
+                    effort_bucket["created"] += 1
+                    if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):
+                        effort_bucket["merged"] += 1
+                    if _counts_as_failure(ct):
+                        effort_bucket["failed"] += 1
                 if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):
                     scope_breakdown[scope]["merged"] += 1
                 if _counts_as_failure(ct):

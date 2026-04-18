@@ -14,11 +14,11 @@ import {
   AGENT_NPM_TIMEOUT, AGENT_TSC_TIMEOUT,
   RUFF_TIMEOUT,
   TEST_RUNNER_TIMEOUT, TEST_BASELINE_TIMEOUT, TEST_BASELINE_DOCKER_TIMEOUT,
-  CLAUDE_TIMEOUT_MS, MAX_OUTPUT_BYTES,
+  claudeTimeoutForEffort, MAX_OUTPUT_BYTES,
 } from './constants.js';
 
 // ── Failure categories ───────────────────────────────────────────────────────
-export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited';
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'timeout';
 
 // Exact substrings from Claude Code CLI / Anthropic API rate-limit messages.
 // Must stay in sync with backend/app/max_plan_pool.py:RATE_LIMIT_PATTERNS.
@@ -47,6 +47,17 @@ export class RateLimitError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'RateLimitError';
+  }
+}
+
+// Thrown when the 45-minute kill timer fires. Carries a distinct failure
+// category so the backend can map it to AGENT_TIMEOUT (scope-downgrade path)
+// instead of CODE_ERROR (fix-tests/lint path).
+export class ClaudeTimeoutError extends Error {
+  failureCategory: FailureCategory = 'timeout';
+  constructor(message: string) {
+    super(message);
+    this.name = 'ClaudeTimeoutError';
   }
 }
 
@@ -1188,6 +1199,7 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
   let allOutput = '';
   let lastResultText = '';
   let stderrBuffer = '';
+  let timedOut = false;
 
   sendLog(ws, `\n--- Claude Code starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\n\n`);
   log('Spawning Claude Code CLI...');
@@ -1292,15 +1304,19 @@ echo ""
     const claude = spawn('claude', args, { cwd: WORKSPACE, env: claudeEnv, detached: true, stdio: [promptFd, 'pipe', 'pipe'] });
     fs.closeSync(promptFd);
 
-    // Kill Claude if it exceeds 45 minutes — kill entire process group (negative PID)
-    // so child processes (npm, pytest, etc.) are also terminated
+    // Kill Claude if it exceeds its effort-scaled timeout — kill entire process
+    // group (negative PID) so child processes (npm, pytest, etc.) are also
+    // terminated.
+    const timeoutMs = claudeTimeoutForEffort(effort);
+    const timeoutMinutes = timeoutMs / 60000;
     const killTimer = setTimeout(() => {
-      log('Claude Code process timed out after 45 minutes — killing process group');
-      sendLog(ws, '\n[TIMEOUT] Claude Code exceeded 45-minute time limit\n');
+      log(`Claude Code process timed out after ${timeoutMinutes} minutes — killing process group`);
+      sendLog(ws, `\n[TIMEOUT] Claude Code exceeded ${timeoutMinutes}-minute time limit\n`);
+      timedOut = true;
       const pid = claude.pid;
       if (pid) { try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ } }
       setTimeout(() => { if (pid) { try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ } } }, 5000);
-    }, CLAUDE_TIMEOUT_MS);
+    }, timeoutMs);
 
     claude.stdout!.on('data', (data: Buffer) => {
       const text = data.toString();
@@ -1339,6 +1355,10 @@ echo ""
   });
 
   sendLog(ws, `\n--- Claude Code exited (code: ${exitCode}) ---\n`);
+
+  if (timedOut) {
+    throw new ClaudeTimeoutError(`Claude Code exceeded ${claudeTimeoutForEffort(effort) / 60000}-minute time limit`);
+  }
 
   // Detect Claude rate-limit / usage exhaustion from stderr using exact
   // substrings from RATE_LIMIT_PATTERNS.

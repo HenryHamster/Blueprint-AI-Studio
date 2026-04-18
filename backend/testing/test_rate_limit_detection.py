@@ -221,6 +221,14 @@ def test_normalize_agent_category_scope_overflow_maps_to_scope_overflow():
     assert normalize_agent_failure_category("scope_overflow", t) == "SCOPE_OVERFLOW"
 
 
+def test_normalize_agent_category_timeout_maps_to_agent_timeout():
+    """Agent posts lowercase 'timeout' when the 45-minute kill timer fires —
+    must persist as AGENT_TIMEOUT so scope-downgrade retry logic triggers
+    instead of CODE_ERROR's fix-tests/lint guidance."""
+    t = _task("")
+    assert normalize_agent_failure_category("timeout", t) == "AGENT_TIMEOUT"
+
+
 def test_classify_failure_respects_scope_overflow_agent_category():
     """A task with ctx['failure_category'] = 'SCOPE_OVERFLOW' must classify as SCOPE_OVERFLOW
     regardless of the status message text."""
