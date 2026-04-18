@@ -3,7 +3,7 @@ import type { RefObject } from 'react';
 import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw } from 'lucide-react';
 import { apiFetch } from '../api';
 import { timeAgo } from '../utils/time';
-import { isSafeUrl, TaskTypeBadge, TASK_TYPE_STYLES } from './TaskCard';
+import { isSafeUrl, TaskTypeBadge, TASK_TYPE_STYLES, FAILURE_CLASS_CONFIG } from './TaskCard';
 import type { TaskType } from './TaskCard';
 
 interface NeedsAttentionItem {
@@ -16,6 +16,8 @@ interface NeedsAttentionItem {
   waiting_hours?: number;
   approval_reason?: string;
   touched_critical?: string[];
+  failure_class?: string | null;
+  scope?: string | null;
 }
 
 interface RecentFailure {
@@ -130,10 +132,28 @@ interface DigestData {
       calibration_rate: number;
     }[];
   } | null;
+  failure_stage_distribution?: {
+    stages: Record<string, number>;
+    total_classified: number;
+    dominant_stage: string | null;
+  } | null;
   rejection_pattern_summary?: {
     total_rejected: number;
     top_notes: { snippet: string; count: number }[];
   } | null;
+  retry_pattern_summary?: {
+    total_multi_attempt_failures: number;
+    repeat_class_count: number;
+    top_patterns: { sequence: string; count: number }[];
+  } | null;
+  recurring_error_clusters?: {
+    fingerprint: string;
+    count: number;
+    error_snippet: string | null;
+    direction_ids: string[];
+    task_types: string[];
+    first_task_id?: string | null;
+  }[];
 }
 
 const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
@@ -148,6 +168,18 @@ const TAXONOMY_COLORS: Record<string, string> = {
   review_quality: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
   infra_related: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
   code_defect: 'bg-red-500/20 text-red-400 border-red-500/30',
+};
+
+const STAGE_ORDER = ['provision', 'clone', 'test', 'lint', 'build', 'pr_creation', 'merge', 'review'] as const;
+const STAGE_COLORS: Record<string, string> = {
+  provision: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  clone: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  test: 'bg-red-500/20 text-red-400 border-red-500/30',
+  lint: 'bg-red-500/20 text-red-400 border-red-500/30',
+  build: 'bg-red-500/20 text-red-400 border-red-500/30',
+  pr_creation: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
+  merge: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
+  review: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
 };
 
 export interface CatchUpPanelProps {
@@ -835,6 +867,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             }`}>
                               {item.reason === 'failed' ? 'Failed' : 'Approval required'}
                             </span>
+                            {item.reason === 'failed' && item.failure_class && FAILURE_CLASS_CONFIG[item.failure_class] && (
+                              <span
+                                className={`shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded ${FAILURE_CLASS_CONFIG[item.failure_class].color}`}
+                                title={FAILURE_CLASS_CONFIG[item.failure_class].hint}
+                              >
+                                {FAILURE_CLASS_CONFIG[item.failure_class].label}
+                              </span>
+                            )}
                             <WaitingBadge hours={item.waiting_hours} />
                             {item.reason === 'approval_required' && onApprove && (
                               <button
@@ -1024,6 +1064,27 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                 </div>
               )}
 
+              {/* Failure stage distribution pills */}
+              {digest!.failure_stage_distribution && digest!.failure_stage_distribution.total_classified > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Pipeline stage</span>
+                  {STAGE_ORDER.map(stage => {
+                    const count = digest!.failure_stage_distribution!.stages[stage];
+                    if (!count) return null;
+                    return (
+                      <span
+                        key={stage}
+                        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'}`}
+                        title={`${stage}: ${count}`}
+                      >
+                        {stage}
+                        <span className="font-bold">{count}</span>
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+
               {/* Scope mismatch diagnostics */}
               {digest!.scope_mismatch_summary && digest!.scope_mismatch_summary.total_calibrated > 0 && (
                 <div className="flex flex-col gap-1">
@@ -1075,6 +1136,61 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       ))}
                     </div>
                   )}
+                </div>
+              )}
+
+              {/* Retry pattern summary */}
+              {digest!.retry_pattern_summary && digest!.retry_pattern_summary.total_multi_attempt_failures > 0 && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Retry patterns</span>
+                    <span className="text-[10px] text-neutral-400">
+                      {digest!.retry_pattern_summary.total_multi_attempt_failures} multi-attempt
+                    </span>
+                    {digest!.retry_pattern_summary.total_multi_attempt_failures > 0 && (
+                      <span className="text-[10px] text-neutral-500">
+                        · {Math.round((digest!.retry_pattern_summary.repeat_class_count / digest!.retry_pattern_summary.total_multi_attempt_failures) * 100)}% same class
+                      </span>
+                    )}
+                  </div>
+                  {digest!.retry_pattern_summary.top_patterns.length > 0 && (
+                    <div className="flex flex-col gap-0.5 ml-1">
+                      {digest!.retry_pattern_summary.top_patterns.slice(0, 3).map((p, i) => (
+                        <span key={i} className="text-[10px] text-neutral-500 truncate font-mono">
+                          · {p.sequence}{' '}
+                          <span className="text-amber-400">×{p.count}</span>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Recurring error clusters */}
+              {(digest!.recurring_error_clusters ?? []).length > 0 && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Recurring errors</span>
+                    <span className="text-[10px] text-neutral-400">
+                      {digest!.recurring_error_clusters!.length} cluster{digest!.recurring_error_clusters!.length !== 1 ? 's' : ''}
+                    </span>
+                  </div>
+                  <div className="flex flex-col gap-0.5 ml-1">
+                    {digest!.recurring_error_clusters!.map(c => {
+                      const snippet = (c.error_snippet ?? c.fingerprint ?? '').replace(/\s+/g, ' ').trim();
+                      const truncated = snippet.length > 100 ? snippet.slice(0, 100) + '…' : snippet;
+                      const dirCount = c.direction_ids.length;
+                      return (
+                        <span key={c.fingerprint} className="text-[10px] text-neutral-500 truncate">
+                          · {truncated}{' '}
+                          <span className="text-red-400">×{c.count}</span>
+                          {dirCount > 0 && (
+                            <span className="text-neutral-600"> · {dirCount} dir{dirCount !== 1 ? 's' : ''}</span>
+                          )}
+                        </span>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
 

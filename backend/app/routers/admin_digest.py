@@ -1103,6 +1103,7 @@ async def get_digest(
                 error_log_map[tid] = a.logs[:500]
 
     # --- needs_attention: failed + pending approval ---
+    from app.failure_classification import classify_failure as _classify_failure
     _now = _utcnow()
     needs_attention = []
     for t in failed_tasks:
@@ -1121,6 +1122,8 @@ async def get_digest(
             "waiting_hours": waiting_hours,
             "direction_id": t_dir_id,
             "direction_text": t_dir_text,
+            "failure_class": _classify_failure(t, error_log_map.get(tid)),
+            "scope": (t.context or {}).get("scope"),
         })
     for t in approval_tasks:
         tid = str(t.id)
