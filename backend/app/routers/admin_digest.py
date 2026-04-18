@@ -1111,6 +1111,7 @@ async def get_digest(
     needs_attention.sort(key=lambda x: (0 if x["reason"] == "approval_required" else 1, -(x["waiting_hours"] or 0)))
 
     # --- recent_failures (up to 10, desc) ---
+    from app.failure_classification import classify_failure as _classify_failure_rf
     sorted_failures = sorted(failed_tasks, key=_derive_completed_at, reverse=True)
     recent_failures = []
     for t in sorted_failures[:10]:
@@ -1131,6 +1132,8 @@ async def get_digest(
             "direction_id": t_dir_id,
             "direction_text": t_dir_text,
             "task_type": task_type,
+            "failure_class": _classify_failure_rf(t, error_log_map.get(tid)),
+            "scope": (t.context or {}).get("scope"),
         })
 
     # --- failure_groups (classify failures by type) ---
@@ -1222,6 +1225,8 @@ async def get_digest(
             "direction_id": t_dir_id,
             "direction_text": t_dir_text,
             "duration_seconds": duration_seconds,
+            "scope": (t.context or {}).get("scope"),
+            "review_iterations": (t.context or {}).get("review_loop", {}).get("iteration", 0),
         })
 
     # --- active_tasks list (up to 5, oldest started first) ---
@@ -1244,6 +1249,7 @@ async def get_digest(
             "direction_id": at_dir_id,
             "direction_text": at_dir_text,
             "running_cost_usd": running_cost_usd,
+            "scope": (t.context or {}).get("scope"),
         })
 
     running_statuses = {TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING}

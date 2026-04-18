@@ -84,6 +84,36 @@ async def test_digest_with_completed_tasks(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_digest_recent_completions_include_scope_and_review_iterations(
+    client: AsyncClient, db_session
+):
+    """recent_completions entries expose scope and review_iterations from task.context."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Scoped Completed Task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"scope": "medium", "review_loop": {"iteration": 3}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    entries = [c for c in data["recent_completions"] if c["title"] == "Scoped Completed Task"]
+    assert len(entries) == 1
+    assert entries[0]["scope"] == "medium"
+    assert entries[0]["review_iterations"] == 3
+
+
+@pytest.mark.asyncio
 async def test_digest_with_failed_tasks(client: AsyncClient, db_session):
     """Failed tasks appear in both needs_attention (reason='failed') and recent_failures."""
     project = make_project()
@@ -159,6 +189,35 @@ async def test_digest_failed_task_direction_attribution(client: AsyncClient, db_
     group_task = data["failure_groups"][0]["tasks"][0]
     assert group_task["direction_id"] == "dir-f1"
     assert group_task["direction_text"] == "Harden reliability"
+
+
+@pytest.mark.asyncio
+async def test_digest_recent_failures_includes_failure_class_and_scope(client: AsyncClient, db_session):
+    """recent_failures entries include failure_class and scope fields."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Failed Task",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"scope": "small"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["recent_failures"]) == 1
+    failure = data["recent_failures"][0]
+    assert "failure_class" in failure
+    assert failure["failure_class"] is not None
+    assert failure["scope"] == "small"
 
 
 @pytest.mark.asyncio
@@ -376,6 +435,38 @@ async def test_digest_active_tasks_direction_and_cost(client: AsyncClient, db_se
     assert bare["direction_id"] is None
     assert bare["direction_text"] is None
     assert bare["running_cost_usd"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_active_tasks_includes_scope(client: AsyncClient, db_session):
+    """active_tasks entries expose the scope field from task context."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    scoped_task = make_task(
+        project_id=project.id,
+        title="Scoped Active",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "large"},
+    )
+    bare_task = make_task(
+        project_id=project.id,
+        title="Bare Active",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(scoped_task)
+    db_session.add(bare_task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    by_id = {t["task_id"]: t for t in data["active_tasks"]}
+    assert by_id[str(scoped_task.id)]["scope"] == "large"
+    assert by_id[str(bare_task.id)]["scope"] is None
 
 
 @pytest.mark.asyncio
