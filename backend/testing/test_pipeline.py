@@ -15,7 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 
-from app.research_completion import _parse_research_findings
+from app.research_completion import _parse_research_findings, _calibrate_finding_scope
 from app.task_completion import _validate_plan_dependencies
 from app.failure_classification import classify_failure
 from app.routers.agent_status import record_task_result
@@ -3744,3 +3744,72 @@ class TestReviewVerdictBinaryOnly:
         for bad in ("NEUTRAL", "ADVISORY", "COMMENT_ONLY", "comment", "approve"):
             with pytest.raises(ValidationError):
                 GitHubSubmitPRReviewRequest(**base, event=bad)
+
+
+class TestCalibrateFindingScope:
+    """Unit tests for _calibrate_finding_scope heuristic branches."""
+
+    def _single_module_files(self, n):
+        return [f"backend/app/mod{i}.py" for i in range(n)]
+
+    def test_passthrough_small_unchanged_when_few_files(self):
+        finding = {"title": "t", "related_files": ["backend/a.py"]}
+        scope, cal = _calibrate_finding_scope(finding, "small", None, None)
+        assert scope == "small"
+        assert cal is None
+
+    def test_passthrough_large_unchanged(self):
+        finding = {"title": "t", "related_files": self._single_module_files(20)}
+        scope, cal = _calibrate_finding_scope(finding, "large", None, None)
+        assert scope == "large"
+        assert cal is None
+
+    def test_file_count_heuristic_upgrades_medium_to_large(self):
+        finding = {"title": "t", "related_files": self._single_module_files(5)}
+        scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
+        assert scope == "large"
+        assert cal == "medium"
+
+    def test_cross_module_heuristic_upgrades_medium_to_large(self):
+        finding = {
+            "title": "t",
+            "related_files": ["backend/app/foo.py", "agent/src/bar.ts"],
+        }
+        scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
+        assert scope == "large"
+        assert cal == "medium:cross_module"
+
+    def test_expansion_ratio_prediction_upgrades_medium_to_large(self):
+        finding = {"title": "t", "related_files": self._single_module_files(4)}
+        direction = {
+            "research_history": [
+                {"scope_breakdown": {"medium": {"avg_expansion_ratio": 3.0}}},
+            ]
+        }
+        scope, cal = _calibrate_finding_scope(finding, "medium", direction, None)
+        # 4 * 3.0 = 12 > 10 threshold
+        assert scope == "large"
+        assert cal == "medium"
+
+    def test_composite_complexity_upgrades_medium_to_large(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.research_completion._composite_complexity_score",
+            lambda files, direction, cochange: (0.3, {"sig": "low"}),
+        )
+        finding = {"title": "t", "related_files": self._single_module_files(2)}
+        scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
+        assert scope == "large"
+        assert cal == "medium"
+        assert finding["_complexity_score"] == 0.3
+        assert finding["_complexity_signals"] == {"sig": "low"}
+
+    def test_medium_passthrough_when_no_heuristic_fires(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.research_completion._composite_complexity_score",
+            lambda files, direction, cochange: (0.9, {"sig": "healthy"}),
+        )
+        finding = {"title": "t", "related_files": self._single_module_files(2)}
+        scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
+        assert scope == "medium"
+        assert cal is None
+        assert finding["_complexity_score"] == 0.9
