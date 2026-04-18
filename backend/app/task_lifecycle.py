@@ -644,6 +644,7 @@ async def _process_post_commit(
         _handle_plan_completion, _handle_design_doc_completion,
         _handle_security_audit_completion, _handle_perf_completion,
         _handle_investigation_completion, _record_remediation_if_terminal,
+        _handle_investigation_terminal_failure,
     )
     from app.strategic_completion import _handle_strategic_completion, _record_strategic_task_failure
     from app.research_completion import _handle_research_completion
@@ -1994,6 +1995,7 @@ async def _process_post_commit(
                 )
 
         await _record_remediation_if_terminal(task, payload.status, session)
+        await _handle_investigation_terminal_failure(task, payload.status, session)
 
         # 7. Project State Aggregation
         # Only consider executable tasks (those with a VM) for aggregation.

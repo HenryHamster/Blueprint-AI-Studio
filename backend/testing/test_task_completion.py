@@ -27,6 +27,7 @@ from app.task_completion import (
     _record_remediation_if_terminal,
     _maybe_spawn_followup_investigation,
     _handle_investigation_completion,
+    _handle_investigation_terminal_failure,
     _is_structural_diagnosis,
     _clear_direction_diagnosis_flag,
     _calculate_remediation_scope,
@@ -1672,6 +1673,113 @@ class TestFollowupInvestigationOnFailure:
         assert isinstance(fp_entry, list) and len(fp_entry) == 1
         assert d["diagnosis_in_progress"] is True
 
+    @pytest.mark.asyncio
+    async def test_cap_exhausted_all_failed_escalates(self, db_session, mocker):
+        """Cap hit with all prior remediations failed flags needs_manual_intervention + posts."""
+        from app.time_utils import _utcnow
+        post_mock = mocker.patch(
+            "app.notification_dispatch.post_remediation_escalation_message",
+            new_callable=AsyncMock,
+        )
+        recent_ts = [_utcnow().isoformat(), _utcnow().isoformat()]
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active", "text": "rollup reliability",
+            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent_ts)},
+            "remediation_history": [
+                {"task_id": "old-1", "result": "failed", "fingerprint": "fp-A",
+                 "timestamp": "2026-04-10T00:00:00"},
+                {"task_id": "old-2", "result": "failed", "fingerprint": "fp-A",
+                 "timestamp": "2026-04-12T00:00:00"},
+            ],
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d.get("needs_manual_intervention") is True
+        assert post_mock.await_count == 1
+        call_kwargs = post_mock.await_args.kwargs
+        assert call_kwargs["direction_text"] == "rollup reliability"
+        # Cap state unchanged; no follow-up spawned
+        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": recent_ts}
+        assert d.get("diagnosis_in_progress") is not True
+
+    @pytest.mark.asyncio
+    async def test_cap_exhausted_with_prior_merged_does_not_escalate(self, db_session, mocker):
+        """A prior merged remediation on this fingerprint indicates partial success — no escalation."""
+        from app.time_utils import _utcnow
+        post_mock = mocker.patch(
+            "app.notification_dispatch.post_remediation_escalation_message",
+            new_callable=AsyncMock,
+        )
+        recent_ts = [_utcnow().isoformat(), _utcnow().isoformat()]
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active",
+            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent_ts)},
+            "remediation_history": [
+                {"task_id": "old-1", "result": "merged", "fingerprint": "fp-A",
+                 "timestamp": "2026-04-10T00:00:00"},
+                {"task_id": "old-2", "result": "failed", "fingerprint": "fp-A",
+                 "timestamp": "2026-04-12T00:00:00"},
+            ],
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d.get("needs_manual_intervention") is not True
+        assert post_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_cap_exhausted_idempotent_when_already_flagged(self, db_session, mocker):
+        """When needs_manual_intervention is already set, do not re-post the escalation."""
+        from app.time_utils import _utcnow
+        post_mock = mocker.patch(
+            "app.notification_dispatch.post_remediation_escalation_message",
+            new_callable=AsyncMock,
+        )
+        recent_ts = [_utcnow().isoformat(), _utcnow().isoformat()]
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active",
+            "needs_manual_intervention": True,
+            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent_ts)},
+            "remediation_history": [
+                {"task_id": "old-1", "result": "failed", "fingerprint": "fp-A",
+                 "timestamp": "2026-04-10T00:00:00"},
+            ],
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert post_mock.await_count == 0
+
 
 # ── _handle_investigation_completion ────────────────────────────────────────
 
@@ -2299,3 +2407,337 @@ class TestRemediationScopeInPayload:
         child = await self._spawned_child(db_session, task.id)
         assert child is not None
         assert child.context["scope"] == "medium"
+
+
+# ── _handle_investigation_terminal_failure ──────────────────────────────────
+
+class TestHandleInvestigationTerminalFailure:
+    """Clears diagnosis_in_progress on investigate-task FAILED/CANCELLED and
+    optionally re-spawns investigation when the failure was infra-related."""
+
+    @staticmethod
+    def _make_investigation_task(project_id, *, direction_id="dir-1",
+                                 fingerprint="fp-A", status=TaskStatus.FAILED,
+                                 latest_status_message="VM failed to start: quota exceeded",
+                                 extra_context=None):
+        ctx = {
+            "direction_id": direction_id,
+            "diagnosis_trigger": "auto_pause_diagnosis",
+        }
+        if fingerprint:
+            ctx["diagnosis_fingerprint"] = fingerprint
+        if extra_context:
+            ctx.update(extra_context)
+        return make_task(
+            project_id=project_id,
+            status=status,
+            latest_status_message=latest_status_message,
+            context=ctx,
+            payloads=[{"type": "investigate", "prompt": "diagnose", "base_branch": "main"}],
+        )
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_clears_flag_and_spawns_reinvestigation(self, db_session):
+        """VM crash on an investigation clears diagnosis flag AND spawns a re-investigation."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused", "text": "fix rollup reliability",
+            "diagnosis_in_progress": True,
+            "diagnosis_started_at": "2026-04-17T00:00:00",
+            "diagnosis_task_id": "some-prior-id",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_investigation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        # Re-investigation spawned — flag is re-set for the new task
+        assert d.get("diagnosis_in_progress") is True
+        assert "diagnosis_started_at" in d
+        # Prior task id cleared (not restored by re-spawn — re-spawn stamps new started_at only)
+        assert d.get("diagnosis_task_id") != "some-prior-id"
+        # diagnosis_completed_at stamped for this terminal event
+        assert "diagnosis_completed_at" in d
+        # Re-investigation recorded against the fingerprint cap
+        fp_entry = d["followup_investigation_attempts_by_fingerprint"]["fp-A"]
+        assert isinstance(fp_entry, list) and len(fp_entry) == 1
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        siblings = (await db_session.execute(
+            _select(_Task).where(
+                _Task.project_id == project.id,
+                _Task.id != task.id,
+            )
+        )).scalars().all()
+        assert len(siblings) == 1
+        followup = siblings[0]
+        assert followup.payloads[0]["type"] == "investigate"
+        assert followup.context["diagnosis_trigger"] == "investigation_failure_followup"
+        assert followup.context["previous_investigation_task_id"] == str(task.id)
+        assert followup.context["direction_id"] == "dir-1"
+        assert followup.context["diagnosis_fingerprint"] == "fp-A"
+
+    @pytest.mark.asyncio
+    async def test_cancelled_clears_flag_no_respawn(self, db_session):
+        """CANCELLED status clears the flag but never spawns a re-investigation."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused",
+            "diagnosis_in_progress": True,
+            "diagnosis_started_at": "2026-04-17T00:00:00",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_investigation_task(
+            project.id,
+            status=TaskStatus.CANCELLED,
+            latest_status_message="Cancelled: parent dependency failed",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.CANCELLED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert "diagnosis_in_progress" not in d
+        assert "diagnosis_started_at" not in d
+        assert "diagnosis_completed_at" in d
+        # No follow-up recorded
+        assert "followup_investigation_attempts_by_fingerprint" not in d
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        siblings = (await db_session.execute(
+            _select(_Task).where(
+                _Task.project_id == project.id,
+                _Task.id != task.id,
+            )
+        )).scalars().all()
+        assert siblings == []
+
+    @pytest.mark.asyncio
+    async def test_code_error_clears_flag_no_respawn(self, db_session):
+        """CODE_ERROR investigation failure clears the flag but does not re-spawn."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused",
+            "diagnosis_in_progress": True,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        # A status message that classifies as CODE_ERROR (not infra)
+        task = self._make_investigation_task(
+            project.id,
+            latest_status_message="Investigate agent returned malformed JSON — parse error",
+            extra_context={"failure_category": "CODE_ERROR"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert "diagnosis_in_progress" not in d
+        assert "diagnosis_completed_at" in d
+        assert "followup_investigation_attempts_by_fingerprint" not in d
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        siblings = (await db_session.execute(
+            _select(_Task).where(
+                _Task.project_id == project.id,
+                _Task.id != task.id,
+            )
+        )).scalars().all()
+        assert siblings == []
+
+    @pytest.mark.asyncio
+    async def test_non_investigate_task_is_noop(self, db_session):
+        """A failing create/plan/etc task does not clear a direction diagnosis flag."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused",
+            "diagnosis_in_progress": True,
+            "diagnosis_started_at": "2026-04-17T00:00:00",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            context={"direction_id": "dir-1"},
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        # Flag untouched for non-investigate types
+        assert d.get("diagnosis_in_progress") is True
+        assert "diagnosis_completed_at" not in d
+
+    @pytest.mark.asyncio
+    async def test_completed_status_is_noop(self, db_session):
+        """COMPLETED is handled by _handle_investigation_completion, not this path."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused",
+            "diagnosis_in_progress": True,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_investigation_task(project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.COMPLETED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        # Flag untouched — caller relies on _handle_investigation_completion
+        assert d.get("diagnosis_in_progress") is True
+
+    @pytest.mark.asyncio
+    async def test_respawn_skipped_when_cap_reached(self, db_session):
+        """Per-fingerprint cap blocks re-investigation but still clears the flag."""
+        from app.time_utils import _utcnow
+        recent = [_utcnow().isoformat(), _utcnow().isoformat()]
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused",
+            "diagnosis_in_progress": True,
+            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent)},
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_investigation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        # Flag cleared (no re-spawn re-set it)
+        assert "diagnosis_in_progress" not in d
+        assert "diagnosis_completed_at" in d
+        # Cap unchanged
+        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": recent}
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        siblings = (await db_session.execute(
+            _select(_Task).where(
+                _Task.project_id == project.id,
+                _Task.id != task.id,
+            )
+        )).scalars().all()
+        assert siblings == []
+
+    @pytest.mark.asyncio
+    async def test_respawn_skipped_when_recent_investigate_exists(self, db_session):
+        """24h dedup: flag still cleared, but no re-investigation spawned."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused",
+            "diagnosis_in_progress": True,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        # Another investigate task for this direction already exists in the last 24h
+        sibling = make_task(
+            project_id=project.id,
+            payloads=[{"type": "investigate", "prompt": "p", "base_branch": "main"}],
+            context={"direction_id": "dir-1"},
+        )
+        db_session.add(sibling)
+        await db_session.commit()
+        task = self._make_investigation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert "diagnosis_in_progress" not in d
+        assert "diagnosis_completed_at" in d
+        assert "followup_investigation_attempts_by_fingerprint" not in d
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        all_investigate = (await db_session.execute(
+            _select(_Task).where(
+                _Task.project_id == project.id,
+                _Task.id != task.id,
+            )
+        )).scalars().all()
+        # Only the pre-existing sibling remains — no new task spawned
+        assert len(all_investigate) == 1
+        assert all_investigate[0].id == sibling.id
+
+    @pytest.mark.asyncio
+    async def test_missing_direction_id_is_noop(self, db_session):
+        """Investigate task without direction_id in context is a safe no-op."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            context={},
+            payloads=[{"type": "investigate", "prompt": "x", "base_branch": "main"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        # Must not raise
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+
+    @pytest.mark.asyncio
+    async def test_swallows_inner_exception(self, db_session, mocker):
+        """Errors from helpers must not propagate (mirrors _record_remediation_if_terminal)."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused", "diagnosis_in_progress": True,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_investigation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+
+        boom = mocker.patch(
+            "app.task_completion._maybe_spawn_reinvestigation_after_failure",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("db blew up"),
+        )
+        # Should swallow the exception and still return
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        assert boom.await_count == 1

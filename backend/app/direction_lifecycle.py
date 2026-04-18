@@ -35,6 +35,10 @@ _DIAGNOSIS_STALE_HOURS = 4
 _FINGERPRINT_SAMPLE_SIZE = 10
 # Min matching failures required for a fingerprint to count as "dominant" for the direction
 _FINGERPRINT_MIN_RECURRENCE = 2
+# Only consider failures from within this window so stale patterns don't dominate
+# after the current failure mode has shifted. Falls back to the unfiltered query
+# when fewer than _FINGERPRINT_MIN_RECURRENCE recent failures exist.
+_FINGERPRINT_RECENCY_DAYS = 7
 
 # Max retries for a BLOCKER escalation notification whose initial delivery failed.
 # After this many failed retries, the pending flag is cleared and an ERROR is logged
@@ -125,21 +129,28 @@ async def _compute_direction_error_fingerprint(
     """Return the dominant error fingerprint across this direction's recent failed tasks.
 
     Pulls the most recent ``_FINGERPRINT_SAMPLE_SIZE`` failures for ``direction_id``
-    and uses ``count_matching_fingerprints`` to find the fingerprint that recurs
-    most, returning it only if it matches at least ``_FINGERPRINT_MIN_RECURRENCE``
-    failures. The result is stored on the direction so operators see the specific
-    error pattern and the escalation path can compare it against the last
+    within the last ``_FINGERPRINT_RECENCY_DAYS`` days and uses
+    ``count_matching_fingerprints`` to find the fingerprint that recurs most,
+    returning it only if it matches at least ``_FINGERPRINT_MIN_RECURRENCE``
+    failures. Falls back to the unfiltered query when too few failures exist
+    inside the window so low-volume directions still get a fingerprint. The
+    result is stored on the direction so operators see the specific error
+    pattern and the escalation path can compare it against the last
     remediation's fingerprint.
     """
     from app.anomaly_detection import _error_fingerprint, count_matching_fingerprints  # noqa: PLC0415
 
+    base_query = select(Task).where(
+        Task.project_id == project_id,
+        Task.status == TaskStatus.FAILED,
+        Task.context["direction_id"].as_string() == direction_id,
+    ).order_by(Task.created_at.desc()).limit(_FINGERPRINT_SAMPLE_SIZE)
+    window_start = _utcnow() - timedelta(days=_FINGERPRINT_RECENCY_DAYS)
     failed_tasks = (await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.FAILED,
-            Task.context["direction_id"].as_string() == direction_id,
-        ).order_by(Task.created_at.desc()).limit(_FINGERPRINT_SAMPLE_SIZE)
+        base_query.where(Task.created_at >= window_start)
     )).scalars().all()
+    if len(failed_tasks) < _FINGERPRINT_MIN_RECURRENCE:
+        failed_tasks = (await session.execute(base_query)).scalars().all()
     best_fp: str | None = None
     best_count = 0
     seen: set[str] = set()
@@ -169,7 +180,7 @@ async def _spawn_direction_diagnosis(
     """
     if not _is_code_failure_pause_reason(pause_reason):
         return False
-    if direction.get("auto_pause_count", 0) >= _MAX_AUTO_PAUSE_CYCLES:
+    if direction.get("code_failure_pause_count", 0) >= _MAX_AUTO_PAUSE_CYCLES:
         return False
     if get_circuit_breaker(str(project.id)).get("state") == "OPEN":
         return False
@@ -547,6 +558,11 @@ async def _process_direction_lifecycle(
             d["paused_at"] = _utcnow().isoformat()
             d["auto_paused"] = True
             d["auto_pause_count"] = d.get("auto_pause_count", 0) + 1
+            # Only code-failure pauses (Rules 3/4) count toward auto-retirement.
+            # Infrastructure-driven pauses (saturation, unproductive) shouldn't
+            # permanently retire an otherwise healthy direction.
+            if _is_code_failure_pause_reason(pause_reason):
+                d["code_failure_pause_count"] = d.get("code_failure_pause_count", 0) + 1
             # Stamp the dominant error fingerprint from the direction's recent failures
             # so the diagnostics API can surface it and escalation can verify that the
             # same root cause keeps recurring after remediation.
@@ -635,17 +651,18 @@ async def _process_direction_lifecycle(
             except Exception as _e:
                 logger.warning(f"[DIAGNOSIS] Failed to spawn investigate task for {did}: {_e}")
             MAX_AUTO_PAUSE_CYCLES = _MAX_AUTO_PAUSE_CYCLES
-            if d.get("auto_pause_count", 0) >= MAX_AUTO_PAUSE_CYCLES:
+            code_pause_count = d.get("code_failure_pause_count", 0)
+            if code_pause_count >= MAX_AUTO_PAUSE_CYCLES:
                 d["status"] = "completed"
                 d["auto_completed"] = True
                 d["auto_completed_reason"] = (
-                    f"Auto-retired: direction was auto-paused {d['auto_pause_count']} times "
-                    f"without producing results. Slot freed for new directions."
+                    f"Auto-retired: direction hit {code_pause_count} code-failure "
+                    f"auto-pauses without producing results. Slot freed for new directions."
                 )
                 d["completed_at"] = _utcnow().isoformat()
                 logger.info(
                     f"[AUTONOMOUS] Auto-retired direction {did} after "
-                    f"{d['auto_pause_count']} auto-pause cycles: {d.get('text', '')[:60]}"
+                    f"{code_pause_count} code-failure auto-pause cycles: {d.get('text', '')[:60]}"
                 )
                 from app.models import Alert, AlertSeverity  # noqa: PLC0415
                 alert = Alert(
@@ -654,7 +671,7 @@ async def _process_direction_lifecycle(
                     title="Direction auto-retired",
                     message=(
                         f"Direction '{d.get('text', '')[:80]}' was auto-retired after "
-                        f"{d['auto_pause_count']} consecutive auto-pause cycles. "
+                        f"{code_pause_count} consecutive code-failure auto-pause cycles. "
                         f"Slot freed for strategic agent to create a replacement."
                     ),
                 )
@@ -662,7 +679,7 @@ async def _process_direction_lifecycle(
                 try:
                     from app.notification_dispatch import post_direction_milestone_message as _post_milestone  # noqa: PLC0415
                     _retire_reason = (
-                        f"Auto-retired after {d['auto_pause_count']} consecutive auto-pause cycles. "
+                        f"Auto-retired after {code_pause_count} consecutive code-failure auto-pause cycles. "
                         f"Slot freed for strategic agent to create a replacement."
                     )
                     await _post_milestone(

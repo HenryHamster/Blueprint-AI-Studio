@@ -26,6 +26,7 @@ from app.direction_lifecycle import (
 )
 from app.models import Alert, AlertSeverity, ArtifactType, MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.task_completion import _handle_investigation_completion, _record_remediation_outcome
+from app.time_utils import _utcnow
 
 
 def _direction(did: str = "d-diag-1", pause_count: int = 1) -> dict:
@@ -33,6 +34,10 @@ def _direction(did: str = "d-diag-1", pause_count: int = 1) -> dict:
         "id": did,
         "text": "Improve pipeline reliability via targeted tests",
         "auto_pause_count": pause_count,
+        # Keep code_failure_pause_count mirrored with auto_pause_count so the
+        # retirement-guard tests continue to exercise the guard. Diagnosis spawn
+        # only happens on code-failure pause reasons, so this mirrors real state.
+        "code_failure_pause_count": pause_count,
         "research_history": [
             {"tasks_created": 3, "tasks_failed": 3, "tasks_failed_infra": 0, "prs_merged": 0},
             {"tasks_created": 2, "tasks_failed": 2, "tasks_failed_infra": 0, "prs_merged": 0},
@@ -748,8 +753,8 @@ async def test_auto_retire_at_threshold_creates_alert(db_session, mocker):
         "app.notification_dispatch.post_direction_milestone_message",
         new_callable=AsyncMock,
     )
-    # auto_pause_count=2 → increments to 3 (MAX_AUTO_PAUSE_CYCLES) on this pause.
-    # Rule 3 history trips a code-failure pause reason so the auto-pause path runs.
+    # code_failure_pause_count=2 → increments to 3 (MAX_AUTO_PAUSE_CYCLES) on this pause.
+    # Rule 3 history trips a code-failure pause reason so the counter increments.
     direction = {
         "id": "d-retire-1",
         "text": "Chronically failing direction requiring auto-retire",
@@ -758,6 +763,7 @@ async def test_auto_retire_at_threshold_creates_alert(db_session, mocker):
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
         "auto_pause_count": 2,
+        "code_failure_pause_count": 2,
         "research_history": [
             {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
             {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
@@ -796,6 +802,151 @@ async def test_auto_retire_at_threshold_creates_alert(db_session, mocker):
     assert alert.severity == AlertSeverity.INFO
     assert alert.title == "Direction auto-retired"
     assert "auto-retired" in alert.message.lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# code_failure_pause_count — only code-failure auto-pauses count toward retirement.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_saturation_pauses_do_not_drive_auto_retire(db_session):
+    """Three saturation auto-pauses must not retire a direction — code quality is fine."""
+    # Rule 1 fires: possibly_saturated=True + 5 cycles each with tasks_created<=1.
+    # "Saturated: ..." is NOT a code-failure reason, so code_failure_pause_count stays 0.
+    direction = {
+        "id": "d-saturated-retire",
+        "text": "Saturated direction with no code issues",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "auto_pause_count": 2,
+        "code_failure_pause_count": 0,
+        "possibly_saturated": True,
+        "research_history": [
+            {"tasks_created": 0, "tasks_failed": 0, "tasks_failed_infra": 0, "prs_merged": 0}
+            for _ in range(5)
+        ],
+    }
+    project = Project(
+        name="Saturation no retire",
+        user_id="u-sat",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", "saturation still pauses the direction"
+    assert d.get("auto_completed") is not True, (
+        "saturation pauses must not drive retirement even at the count threshold"
+    )
+    assert d.get("auto_pause_count") == 3
+    assert d.get("code_failure_pause_count", 0) == 0, (
+        "saturation must not increment the code-failure counter"
+    )
+
+
+@pytest.mark.asyncio
+async def test_three_code_failure_pauses_trigger_auto_retire(db_session, mocker):
+    """Three code-failure auto-pauses (code_failure_pause_count → 3) must retire the direction."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new_callable=AsyncMock,
+    )
+    direction = {
+        "id": "d-code-retire",
+        "text": "Code-failure direction hitting retire threshold",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "auto_pause_count": 2,
+        "code_failure_pause_count": 2,
+        "research_history": [
+            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0}
+            for _ in range(3)
+        ],
+    }
+    project = Project(
+        name="Code retire",
+        user_id="u-code",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "completed"
+    assert d.get("auto_completed") is True
+    assert d.get("code_failure_pause_count") == 3
+
+
+@pytest.mark.asyncio
+async def test_mixed_pause_reasons_only_code_failures_count(db_session):
+    """A direction with prior infra pauses paired with a fresh code-failure pause
+    must only increment code_failure_pause_count from the code-failure event."""
+    # Seed the infra-driven counter already high; the new pause is a code failure
+    # so only code_failure_pause_count should advance (from 1 → 2, below threshold).
+    direction = {
+        "id": "d-mixed-pauses",
+        "text": "Mixed pause history direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "auto_pause_count": 2,  # already seen 2 infra-driven pauses
+        "code_failure_pause_count": 1,  # only one of those was code-driven
+        "research_history": [
+            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0}
+            for _ in range(3)
+        ],
+    }
+    project = Project(
+        name="Mixed pauses",
+        user_id="u-mixed",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    # New code-failure pause: both counters advance by 1.
+    assert d["status"] == "paused", "below retirement threshold → still paused"
+    assert d.get("auto_pause_count") == 3
+    assert d.get("code_failure_pause_count") == 2
+    assert d.get("auto_completed") is not True
 
 
 @pytest.mark.asyncio
@@ -842,7 +993,10 @@ async def test_structural_diagnosis_appends_note_no_remediation(db_session, mock
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-async def _add_failed_task(db_session, project_id, direction_id: str, msg: str | None) -> None:
+async def _add_failed_task(
+    db_session, project_id, direction_id: str, msg: str | None,
+    created_at: datetime | None = None,
+) -> None:
     task = Task(
         project_id=project_id,
         title="failed",
@@ -853,6 +1007,8 @@ async def _add_failed_task(db_session, project_id, direction_id: str, msg: str |
         created_by="ORCHESTRATOR",
         latest_status_message=msg,
     )
+    if created_at is not None:
+        task.created_at = created_at
     db_session.add(task)
     await db_session.commit()
 
@@ -910,6 +1066,74 @@ async def test_fingerprint_filters_by_direction_id(db_session):
     assert await _compute_direction_error_fingerprint(
         project.id, "d-target", db_session,
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_uses_recent_failures_within_window(db_session):
+    # Two fresh failures inside the 7-day window should dominate — stale failures
+    # with a different error pattern must not drown them out.
+    project = await _make_project(db_session)
+    now = _utcnow()
+    stale_msg = "RateLimitError: slow down"
+    recent_msg = "TypeError: object has no attribute 'x'"
+    for _ in range(3):
+        await _add_failed_task(
+            db_session, project.id, "d-fp-recency", stale_msg,
+            created_at=now - timedelta(days=21),
+        )
+    for _ in range(2):
+        await _add_failed_task(
+            db_session, project.id, "d-fp-recency", recent_msg,
+            created_at=now - timedelta(hours=1),
+        )
+    expected = _error_fingerprint(recent_msg)
+    assert await _compute_direction_error_fingerprint(
+        project.id, "d-fp-recency", db_session,
+    ) == expected
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_excludes_stale_failures_outside_window(db_session):
+    # A single recent failure plus many old ones must yield None — the old
+    # failures are filtered out and the one recent failure is below the
+    # recurrence threshold, triggering the unfiltered fallback whose dominant
+    # fingerprint is the recent one only if it still meets the threshold.
+    project = await _make_project(db_session)
+    now = _utcnow()
+    stale_msg = "RateLimitError: slow down"
+    recent_msg = "TypeError: only recent"
+    for _ in range(4):
+        await _add_failed_task(
+            db_session, project.id, "d-fp-stale", stale_msg,
+            created_at=now - timedelta(days=30),
+        )
+    await _add_failed_task(
+        db_session, project.id, "d-fp-stale", recent_msg,
+        created_at=now - timedelta(hours=2),
+    )
+    # Recent window has 1 failure (below threshold), fallback scans all 5 where
+    # the stale pattern is dominant.
+    assert await _compute_direction_error_fingerprint(
+        project.id, "d-fp-stale", db_session,
+    ) == _error_fingerprint(stale_msg)
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_falls_back_to_unfiltered_when_window_sparse(db_session):
+    # Low-volume direction: only old failures exist. Fallback to the unfiltered
+    # query must still return the dominant fingerprint so diagnosis has context.
+    project = await _make_project(db_session)
+    now = _utcnow()
+    msg = "AssertionError: legacy regression"
+    for _ in range(2):
+        await _add_failed_task(
+            db_session, project.id, "d-fp-sparse", msg,
+            created_at=now - timedelta(days=30),
+        )
+    expected = _error_fingerprint(msg)
+    assert await _compute_direction_error_fingerprint(
+        project.id, "d-fp-sparse", db_session,
+    ) == expected
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -304,6 +304,10 @@ async def _maybe_spawn_followup_investigation(
             f"{_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT}, "
             f"decay={_FOLLOWUP_INVESTIGATION_DECAY_DAYS}d)"
         )
+        await _maybe_escalate_exhausted_followups(
+            project=project, direction=target, directions=directions,
+            fp_key=fp_key, session=session,
+        )
         return None
 
     prior_summary = (target.get("diagnosis_summary") or "").strip()
@@ -401,6 +405,66 @@ async def _maybe_spawn_followup_investigation(
     return new_task
 
 
+def _followup_history_all_failed(
+    direction: Dict[str, Any], fp_key: str,
+) -> bool:
+    """True when remediation_history for this fingerprint exists and every entry failed.
+
+    Any merged entry — even an older one — indicates partial success on this
+    fingerprint, so the direction is not a candidate for cap-exhaustion escalation.
+    """
+    history = list(direction.get("remediation_history") or [])
+    relevant = [
+        h for h in history
+        if (str(h.get("fingerprint") or "") or "no_fingerprint") == fp_key
+    ]
+    if not relevant:
+        return False
+    return all(h.get("result") != "merged" for h in relevant)
+
+
+async def _maybe_escalate_exhausted_followups(
+    *,
+    project: Project,
+    direction: Dict[str, Any],
+    directions: List[Dict[str, Any]],
+    fp_key: str,
+    session: AsyncSession,
+) -> None:
+    """Escalate to operator when the follow-up cap is hit with no merged remediation.
+
+    Without this, the direction sits in a dead end: automated remediation is
+    exhausted, the 48h auto-recovery cycle re-triggers the same failure pattern,
+    and nobody is told. Mirror the auto-pause escalation path in direction_lifecycle
+    so operators get a BLOCKER notification the moment the full diagnosis→remediation
+    →follow-up chain has been exhausted.
+    """
+    if direction.get("needs_manual_intervention"):
+        return
+    if not _followup_history_all_failed(direction, fp_key):
+        return
+    direction["needs_manual_intervention"] = True
+    project.directions = directions
+    flag_modified(project, "directions")
+    session.add(project)
+    logger.warning(
+        f"[DIAGNOSIS] Direction {direction.get('id')} flagged needs_manual_intervention: "
+        f"follow-up cap exhausted for fingerprint {fp_key[:40]} with all prior "
+        f"remediations failed"
+    )
+    try:
+        from app.notification_dispatch import post_remediation_escalation_message  # noqa: PLC0415
+        from app.direction_lifecycle import _build_escalation_args  # noqa: PLC0415
+        await post_remediation_escalation_message(
+            session, project.id, **_build_escalation_args(direction),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"[NOTIFY] Failed to post follow-up cap escalation for direction "
+            f"{direction.get('id')}: {exc!r}"
+        )
+
+
 async def _maybe_spawn_low_confidence_followup(
     *,
     investigation_task: Task,
@@ -495,6 +559,175 @@ async def _maybe_spawn_low_confidence_followup(
         f"attempt {len(active_ts)}/{_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT})"
     )
     return new_task
+
+
+async def _maybe_spawn_reinvestigation_after_failure(
+    *,
+    investigation_task: Task,
+    project: Project,
+    direction: Dict[str, Any],
+    session: AsyncSession,
+) -> Optional[Task]:
+    """Spawn a re-investigation after an investigate task terminates FAILED on infra.
+
+    Mirrors the 24h-dedup / per-fingerprint-cap / diagnosis_in_progress guards
+    used by remediation-failure and low-confidence follow-ups. Caller must have
+    already cleared ``diagnosis_in_progress`` on ``direction`` — an infra crash
+    leaves the flag pinned unless something clears it.
+    """
+    direction_id = direction.get("id")
+    if not direction_id or direction.get(DIAGNOSIS_IN_PROGRESS_KEY):
+        return None
+    cutoff = _utcnow() - timedelta(hours=24)
+    existing = await session.execute(
+        select(Task.id).where(
+            Task.project_id == project.id,
+            Task.created_at >= cutoff,
+            Task.id != investigation_task.id,
+            Task.payloads[0]["type"].as_string() == "investigate",
+            Task.context["direction_id"].as_string() == str(direction_id),
+        ).limit(1)
+    )
+    if existing.first() is not None:
+        return None
+    fingerprint = (
+        (investigation_task.context or {}).get("diagnosis_fingerprint")
+        or direction.get("error_fingerprint")
+    )
+    fp_key = str(fingerprint) if fingerprint else "no_fingerprint"
+    attempts_by_fp = dict(direction.get("followup_investigation_attempts_by_fingerprint") or {})
+    now = _utcnow()
+    active_ts = _active_followup_timestamps(attempts_by_fp.get(fp_key), now=now)
+    if len(active_ts) >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT:
+        return None
+    prior_summary = (direction.get("diagnosis_summary") or "").strip()
+    failure_summary = (investigation_task.latest_status_message or "(no error message)")
+    from app.failure_classification import classify_failure  # noqa: PLC0415
+    failure_class = classify_failure(investigation_task)
+    prompt = "\n".join([
+        "A prior investigation on this direction did not complete — the "
+        "investigate task terminated due to an infrastructure failure before "
+        "producing a diagnosis. Re-run the investigation from scratch.",
+        "",
+        f"Direction: {(direction.get('text') or '')[:200]}",
+        f"Direction id: {direction_id}",
+        "",
+        f"Prior diagnosis summary (if any):\n{prior_summary[:1500] or '(none recorded)'}",
+        "",
+        f"Previous investigation failure class: {failure_class}",
+        f"Previous investigation error summary: {str(failure_summary)[:400]}",
+        "",
+        "Produce a diagnosis (root cause, affected files, recommended fix) with "
+        "HIGH or MEDIUM confidence, or explicitly declare that code signals "
+        "alone are insufficient and manual intervention is required.",
+    ])[:20000]
+    task_ctx: Dict[str, Any] = {
+        "direction_id": str(direction_id),
+        "diagnosis_trigger": "investigation_failure_followup",
+        "previous_investigation_task_id": str(investigation_task.id),
+    }
+    if fingerprint:
+        task_ctx["diagnosis_fingerprint"] = str(fingerprint)
+    new_task = Task(
+        project_id=project.id,
+        title=f"Re-investigate after failure: {(direction.get('text') or '')[:50]}",
+        description=(
+            f"Follow-up after investigation task "
+            f"{str(investigation_task.id)[:8]} failed ({failure_class})"
+        )[:500],
+        payloads=[validate_internal_payload(
+            {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+            "task_completion:investigation_failure_followup",
+        )],
+        context=task_ctx,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        priority=70,
+    )
+    session.add(new_task)
+    active_ts.append(now.isoformat())
+    attempts_by_fp[fp_key] = active_ts
+    direction["followup_investigation_attempts_by_fingerprint"] = attempts_by_fp
+    direction[DIAGNOSIS_IN_PROGRESS_KEY] = True
+    direction[DIAGNOSIS_STARTED_AT_KEY] = now.isoformat()
+    logger.info(
+        f"[DIAGNOSIS] Spawned investigation-failure follow-up {new_task.id} for "
+        f"direction {direction_id} (fingerprint={fp_key[:40]}, "
+        f"class={failure_class}, "
+        f"attempt {len(active_ts)}/{_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT})"
+    )
+    return new_task
+
+
+async def _handle_investigation_terminal_failure(
+    task: Task, status: "TaskStatus", session: AsyncSession,
+) -> None:
+    """Clear diagnosis state + optionally re-spawn when an investigate task terminates FAILED/CANCELLED.
+
+    ``_handle_investigation_completion`` only runs on COMPLETED status, so a
+    crashed or cancelled investigate task leaves the linked direction pinned
+    with ``diagnosis_in_progress=True`` until the 4h stale-diagnosis timer in
+    ``direction_lifecycle`` runs. This handler short-circuits that wait:
+
+      1. Clear ``diagnosis_in_progress`` / ``diagnosis_started_at`` /
+         ``diagnosis_task_id`` on the linked direction and stamp
+         ``diagnosis_completed_at`` so future auto-pause diagnoses can fire.
+      2. On FAILED status only, when the failure class is an infra class
+         (VM crash, timeout, rate limit, etc.) — not a CODE_ERROR from a
+         broken investigate agent — spawn a re-investigation subject to the
+         same cap + dedup guards as the other follow-up helpers.
+    """
+    if status not in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+        return
+    payload = task.first_payload or {}
+    if payload.get("type") != "investigate":
+        return
+    ctx = task.context or {}
+    direction_id = ctx.get("direction_id")
+    if not direction_id:
+        return
+    try:
+        project = await session.get(Project, task.project_id)
+        if project is None:
+            return
+        directions_list = list(project.directions or [])
+        target = next((d for d in directions_list if d.get("id") == direction_id), None)
+        if target is None:
+            return
+        had_flag = bool(target.get(DIAGNOSIS_IN_PROGRESS_KEY))
+        target.pop(DIAGNOSIS_IN_PROGRESS_KEY, None)
+        target.pop(DIAGNOSIS_STARTED_AT_KEY, None)
+        target.pop(DIAGNOSIS_TASK_ID_KEY, None)
+        target["diagnosis_completed_at"] = _utcnow().isoformat()
+        project.directions = directions_list
+        flag_modified(project, "directions")
+        session.add(project)
+        if had_flag:
+            logger.info(
+                f"[DIAGNOSIS] Cleared diagnosis_in_progress on direction "
+                f"{direction_id} after investigate task {task.id} terminated "
+                f"{status}"
+            )
+        if status != TaskStatus.FAILED:
+            return
+        from app.failure_classification import classify_failure, INFRA_CLASSES  # noqa: PLC0415
+        if classify_failure(task) not in INFRA_CLASSES:
+            return
+        spawned = await _maybe_spawn_reinvestigation_after_failure(
+            investigation_task=task,
+            project=project,
+            direction=target,
+            session=session,
+        )
+        if spawned is not None:
+            flag_modified(project, "directions")
+            session.add(project)
+    except Exception as exc:
+        logger.warning(
+            f"[DIAGNOSIS] Failed to handle investigation terminal failure for "
+            f"task {task.id}: {exc!r}"
+        )
 
 
 # Maps priority string labels to integer values stored on Task.priority.

@@ -1931,11 +1931,19 @@ async def test_diagnosis_not_respawned_when_active(db_session):
 
 @pytest.mark.asyncio
 async def test_auto_retire_skips_diagnosis_spawn(db_session):
-    """When the auto-pause count escalates to retirement, diagnosis is NOT spawned."""
+    """When the code-failure pause count escalates to retirement, diagnosis is NOT spawned."""
     did = "d-diag003"
-    # With auto_pause_count=2, the incremented value hits MAX_AUTO_PAUSE_CYCLES=3
-    # and the direction is auto-retired instead of paused.
+    # With code_failure_pause_count=2 and a Rule-3 (code-failure) history, the
+    # incremented counter hits MAX_AUTO_PAUSE_CYCLES=3 and the direction is
+    # auto-retired instead of paused.
     direction = _make_unhealthy_active_direction(did, auto_pause_count=2)
+    direction["code_failure_pause_count"] = 2
+    # Replace Rule-2 "Unproductive" history with Rule-3 "High code failure rate"
+    # so the new pause counts toward retirement.
+    direction["research_history"] = [
+        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0}
+        for _ in range(3)
+    ]
     project = Project(
         name="Diagnosis Retire Skip Test",
         user_id="test-user-123",
