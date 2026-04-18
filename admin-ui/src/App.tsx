@@ -666,6 +666,7 @@ export default function App() {
               onTrack={s.trackTask}
               trackedTaskIds={s.trackedTaskIds}
               searchQuery={s.searchQuery}
+              onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
             />
             </ErrorBoundary>
           ) : (

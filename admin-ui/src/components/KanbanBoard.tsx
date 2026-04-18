@@ -101,6 +101,7 @@ interface KanbanBoardProps {
   trackedTaskIds?: Set<string>;
   hasActiveFilters?: boolean;
   searchQuery?: string;
+  onDirectionClick?: (directionId: string) => void;
 }
 
 function loadColumnOrder(): Record<string, string[]> {
@@ -146,6 +147,7 @@ export function KanbanBoard({
   onTrack,
   trackedTaskIds,
   searchQuery,
+  onDirectionClick,
 }: KanbanBoardProps) {
   const groupBy = 'status' as 'status' | 'type' | 'project';
   const projects: Project[] = [];
@@ -352,7 +354,7 @@ export function KanbanBoard({
     return map;
   }, [tasks]);
 
-  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery };
+  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick };
 
   return (
     <DndContext
@@ -527,6 +529,7 @@ export function KanbanBoard({
                       onTrack={onTrack}
                       isTracked={trackedTaskIds?.has(task.id)}
                       searchQuery={searchQuery}
+                      onDirectionClick={onDirectionClick}
                     />
                   ))}
                 </SortableContext>
@@ -628,6 +631,7 @@ export function KanbanBoard({
                 columnRefs.current[colIdx][cardIdx] = el;
               }}
               handleNavigate={handleNavigate}
+              onDirectionClick={onDirectionClick}
             />
           );
         })}
@@ -657,6 +661,7 @@ export function KanbanBoard({
             onTrack={onTrack}
             isTracked={trackedTaskIds?.has(activeTask.id)}
             searchQuery={searchQuery}
+            onDirectionClick={onDirectionClick}
             isOverlay
           />
         )}

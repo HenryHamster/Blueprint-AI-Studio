@@ -30,11 +30,18 @@ interface DirectionProgress {
   tasks_created: number;
   prs_merged: number;
   possibly_saturated: boolean;
+  auto_paused?: boolean;
+  paused_reason?: string | null;
+  needs_manual_intervention?: boolean;
   conversion_rate?: number | null;
   acceptance_rate?: number | null;
   product_ratio?: number | null;
   estimated_cost_usd?: number | null;
   cost_per_merged_pr?: number | null;
+  cost_by_scope?: Record<string, number> | null;
+  cost_by_type?: Record<string, number> | null;
+  spot_cost_usd?: number | null;
+  on_demand_cost_usd?: number | null;
   scope_breakdown?: Record<string, { created: number; merged: number; failed: number; failed_infra?: number; failed_code_error?: number; failed_scope_overflow?: number; calibrated_in?: number; calibrated_out?: number }> | null;
   taxonomy_summary?: Record<string, number> | null;
   stage_dropout?: Record<string, number> | null;
@@ -255,6 +262,75 @@ function FailureClassPill({ group, sparkData }: { group: FailureGroup; sparkData
               </div>
             ))}
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- cost breakdown pill ----------
+
+function CostBreakdownPill({ direction: d }: { direction: DirectionProgress }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const total = d.estimated_cost_usd ?? 0;
+
+  useEffect(() => {
+    if (!open) return;
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [open]);
+
+  const byScope = d.cost_by_scope ?? null;
+  const byType = d.cost_by_type ?? null;
+  const spot = d.spot_cost_usd;
+  const onDemand = d.on_demand_cost_usd;
+  const hasBreakdown =
+    (byScope && Object.keys(byScope).length > 0) ||
+    (byType && Object.keys(byType).length > 0) ||
+    (spot != null && onDemand != null && (spot > 0 || onDemand > 0));
+
+  return (
+    <div ref={ref} className="relative inline-block">
+      <button
+        type="button"
+        className="text-neutral-400 hover:text-neutral-200 cursor-pointer"
+        title="Cost breakdown"
+        onClick={e => { e.stopPropagation(); setOpen(v => !v); }}
+      >
+        ${total.toFixed(2)}
+      </button>
+      {open && hasBreakdown && (
+        <div
+          className="absolute z-20 top-full mt-1 left-0 w-56 bg-neutral-900 border border-neutral-700 rounded-lg p-2 shadow-lg text-[10px] text-neutral-300 space-y-1.5"
+          onClick={e => e.stopPropagation()}
+        >
+          {byScope && Object.keys(byScope).length > 0 && (
+            <div>
+              <p className="text-neutral-500 uppercase tracking-wide text-[9px] mb-0.5">By scope</p>
+              {(['small', 'medium', 'large'] as const).map(s => byScope[s] != null ? (
+                <div key={s} className="flex justify-between"><span>{s}</span><span className="font-mono">${byScope[s].toFixed(2)}</span></div>
+              ) : null)}
+            </div>
+          )}
+          {byType && Object.keys(byType).length > 0 && (
+            <div>
+              <p className="text-neutral-500 uppercase tracking-wide text-[9px] mb-0.5">By type</p>
+              {Object.entries(byType).sort((a, b) => b[1] - a[1]).map(([t, v]) => (
+                <div key={t} className="flex justify-between"><span>{t}</span><span className="font-mono">${v.toFixed(2)}</span></div>
+              ))}
+            </div>
+          )}
+          {spot != null && onDemand != null && (spot > 0 || onDemand > 0) && (
+            <div>
+              <p className="text-neutral-500 uppercase tracking-wide text-[9px] mb-0.5">VM type</p>
+              <div className="flex justify-between"><span>spot</span><span className="font-mono">${spot.toFixed(2)}</span></div>
+              <div className="flex justify-between"><span>on-demand</span><span className="font-mono">${onDemand.toFixed(2)}</span></div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -544,6 +620,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                         <div className="flex items-center gap-1.5 mb-1.5">
                           <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${priorityBadge(d.priority)}`}>{d.priority}</span>
                           {d.possibly_saturated && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30">Saturated</span>}
+                          {d.needs_manual_intervention && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-red-500/20 text-red-400 border border-red-500/30">Needs Intervention</span>}
+                          {d.auto_paused && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30" title={d.paused_reason ?? undefined}>Paused</span>}
                         </div>
                         <p className="text-xs text-neutral-200 line-clamp-2 mb-2">{d.direction_text}</p>
                         <div className="flex items-center gap-2 text-[10px] text-neutral-500">
@@ -554,7 +632,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                             <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
                           )}
                           {d.estimated_cost_usd != null && (
-                            <span className="text-neutral-400" title="Estimated cost in window">${d.estimated_cost_usd.toFixed(2)}</span>
+                            <CostBreakdownPill direction={d} />
                           )}
                           {d.cost_per_merged_pr != null && (
                             <span className="text-neutral-400" title="Cost per merged PR">${d.cost_per_merged_pr.toFixed(2)}/PR</span>

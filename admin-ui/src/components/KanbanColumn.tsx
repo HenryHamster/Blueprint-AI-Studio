@@ -21,7 +21,7 @@ const SORT_LABELS: Record<SortBy, string> = {
   attempts: 'Most retried',
 };
 
-export function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, onShiftClick, onCtrlClick, maxRetries, actionLoadingMap, compact, blockingCount, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, colIdx, cardIdx, cardRef, onNavigate, searchQuery }: {
+export function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, onShiftClick, onCtrlClick, maxRetries, actionLoadingMap, compact, blockingCount, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, colIdx, cardIdx, cardRef, onNavigate, searchQuery, onDirectionClick }: {
   task: Task;
   selectionMode: boolean;
   selectedTaskIds: Set<string>;
@@ -47,6 +47,7 @@ export function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSel
   cardRef?: (el: HTMLDivElement | null) => void;
   onNavigate?: (colIdx: number, cardIdx: number, direction: 'up' | 'down' | 'left' | 'right') => void;
   searchQuery?: string;
+  onDirectionClick?: (directionId: string) => void;
 }) {
   return (
     <div className="relative">
@@ -92,6 +93,7 @@ export function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSel
           onTrack={onTrack}
           isTracked={isTracked}
           searchQuery={searchQuery}
+          onDirectionClick={onDirectionClick}
         />
       </div>
     </div>
@@ -125,6 +127,7 @@ export interface SortableCardProps {
   cardRef: (el: HTMLDivElement | null) => void;
   onNavigate: (colIdx: number, cardIdx: number, direction: 'up' | 'down' | 'left' | 'right') => void;
   searchQuery?: string;
+  onDirectionClick?: (directionId: string) => void;
 }
 
 export function SortableCard({
@@ -154,6 +157,7 @@ export function SortableCard({
   cardRef,
   onNavigate,
   searchQuery,
+  onDirectionClick,
 }: SortableCardProps) {
   const {
     attributes,
@@ -225,6 +229,7 @@ export function SortableCard({
           onTrack={onTrack}
           isTracked={isTracked}
           searchQuery={searchQuery}
+          onDirectionClick={onDirectionClick}
         />
       </div>
     </div>
@@ -298,6 +303,7 @@ export interface KanbanColumnProps {
   prevColId?: string;
   getCardRef: (cardIdx: number) => (el: HTMLDivElement | null) => void;
   handleNavigate: (colIdx: number, cardIdx: number, direction: 'up' | 'down' | 'left' | 'right') => void;
+  onDirectionClick?: (directionId: string) => void;
 }
 
 export function KanbanColumn({
@@ -338,6 +344,7 @@ export function KanbanColumn({
   prevColId,
   getCardRef,
   handleNavigate,
+  onDirectionClick,
 }: KanbanColumnProps) {
   const isArchivable = ARCHIVABLE_COLUMNS.includes(col.id);
   const taskIds = columnTasks.map(t => t.id);
@@ -345,7 +352,7 @@ export function KanbanColumn({
     ? (taskId: string) => onShiftSelect(taskId, taskIds)
     : undefined;
 
-  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery };
+  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick };
 
   let content: React.ReactNode;
 
@@ -480,6 +487,7 @@ export function KanbanColumn({
               onTrack={onTrack}
               isTracked={trackedTaskIds?.has(task.id)}
               searchQuery={searchQuery}
+              onDirectionClick={onDirectionClick}
             />
           ))}
         </SortableContext>

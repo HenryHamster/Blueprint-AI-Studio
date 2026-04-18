@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { RefObject } from 'react';
-import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw } from 'lucide-react';
+import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw, DollarSign, Compass } from 'lucide-react';
 import { apiFetch } from '../api';
 import { timeAgo } from '../utils/time';
 import { isSafeUrl, TaskTypeBadge, TASK_TYPE_STYLES, FAILURE_CLASS_CONFIG } from './TaskCard';
@@ -86,6 +86,9 @@ interface ActiveTask {
   status: string;
   task_type: string;
   started_at: string | null;
+  running_cost_usd?: number | null;
+  direction_text?: string | null;
+  scope?: string | null;
 }
 
 interface DigestData {
@@ -1025,6 +1028,21 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: t.task_id }); } }}
                         >
                           <span className="flex-1 truncate text-neutral-400">{t.title}</span>
+                          {t.direction_text && (
+                            <span
+                              className="shrink-0 inline-flex items-center gap-0.5 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 max-w-[180px] truncate"
+                              title={t.direction_text}
+                            >
+                              <Compass className="w-2.5 h-2.5 shrink-0" />
+                              <span className="truncate">{t.direction_text.slice(0, 30)}{t.direction_text.length > 30 ? '…' : ''}</span>
+                            </span>
+                          )}
+                          {t.running_cost_usd != null && t.running_cost_usd > 0 && (
+                            <span className="shrink-0 inline-flex items-center gap-0.5 text-[9px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                              <DollarSign className="w-2.5 h-2.5" />
+                              {t.running_cost_usd.toFixed(2)}
+                            </span>
+                          )}
                           <span className="shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-500">
                             {t.status}
                           </span>

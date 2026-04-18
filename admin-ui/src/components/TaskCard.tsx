@@ -146,6 +146,7 @@ interface TaskCardProps {
   isTracked?: boolean;
   blockingCount?: number;
   searchQuery?: string;
+  onDirectionClick?: (directionId: string) => void;
 }
 
 export function useElapsedTime(startIso: string, endIso?: string): string {
@@ -289,7 +290,7 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, onCtrlClick, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, searchQuery }, ref) {
+export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, onCtrlClick, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, searchQuery, onDirectionClick }, ref) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
@@ -537,13 +538,25 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           </span>
         )}
         {directionId && (
-          <span
-            className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 font-mono"
-            title={`Direction: ${directionId}`}
-          >
-            <Compass className="w-3 h-3" />
-            {directionId.length > 10 ? `${directionId.slice(0, 10)}…` : directionId}
-          </span>
+          onDirectionClick ? (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onDirectionClick(directionId); }}
+              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 font-mono hover:text-neutral-200 hover:bg-neutral-800 rounded px-1 -mx-1 transition-colors cursor-pointer"
+              title={`Filter by direction: ${directionId}`}
+            >
+              <Compass className="w-3 h-3" />
+              {directionId.length > 10 ? `${directionId.slice(0, 10)}…` : directionId}
+            </button>
+          ) : (
+            <span
+              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 font-mono"
+              title={`Direction: ${directionId}`}
+            >
+              <Compass className="w-3 h-3" />
+              {directionId.length > 10 ? `${directionId.slice(0, 10)}…` : directionId}
+            </span>
+          )
         )}
       </div>
 
@@ -688,8 +701,11 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
               · {etaLabel}
             </span>
           )}
-          {task.status === 'COMPLETED' && task.estimated_cost_usd != null && (
-            <span className="text-neutral-500 font-mono" title="Estimated VM cost">
+          {(task.status === 'COMPLETED' || task.status === 'FAILED') && task.estimated_cost_usd != null && (
+            <span
+              className={`font-mono ${task.status === 'FAILED' ? 'text-red-600' : 'text-neutral-500'}`}
+              title={task.status === 'FAILED' ? 'Estimated VM cost (wasted spend)' : 'Estimated VM cost'}
+            >
               · ${task.estimated_cost_usd.toFixed(2)}
             </span>
           )}
