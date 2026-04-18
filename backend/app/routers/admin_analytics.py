@@ -1508,15 +1508,32 @@ async def get_digest(
 
         # FOURTH: Direction progress
         if project_id and direction_progress_list:
+            _dir_tax_hints = {
+                "review_quality": "mostly review-quality failures",
+                "scope_related": "mostly scope-related failures",
+                "infra_related": "mostly infra-related failures",
+                "code_defect": "mostly code-defect failures",
+            }
             dir_summaries = []
             for dp in direction_progress_list:
                 dt = (dp["direction_text"] or "")[:40]
                 if dp["prs_merged"] > 0:
-                    dir_summaries.append(f"{dt}: {dp['prs_merged']} PR{'s' if dp['prs_merged'] != 1 else ''} merged")
+                    entry = f"{dt}: {dp['prs_merged']} PR{'s' if dp['prs_merged'] != 1 else ''} merged"
                 elif dp.get("possibly_saturated"):
-                    dir_summaries.append(f"{dt}: may be saturated")
+                    entry = f"{dt}: may be saturated"
                 elif dp["tasks_created"] > 0:
-                    dir_summaries.append(f"{dt}: {dp['tasks_created']} task{'s' if dp['tasks_created'] != 1 else ''} in progress")
+                    entry = f"{dt}: {dp['tasks_created']} task{'s' if dp['tasks_created'] != 1 else ''} in progress"
+                else:
+                    continue
+                _tax = dp.get("taxonomy_summary") or {}
+                _tax_total = sum(_tax.values())
+                if _tax_total >= 2:
+                    _dom = max(_tax, key=_tax.get)
+                    if _tax[_dom] / _tax_total >= 0.5:
+                        _hint = _dir_tax_hints.get(_dom)
+                        if _hint:
+                            entry += f" ({_hint})"
+                dir_summaries.append(entry)
             if dir_summaries:
                 narrative_parts.append("Research: " + "; ".join(dir_summaries) + ".")
 

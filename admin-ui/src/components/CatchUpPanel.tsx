@@ -100,7 +100,26 @@ interface DigestData {
   success_rate_delta?: number | null;
   trend?: 'improving' | 'declining' | 'stable';
   trend_history?: {period_end: string; success_rate: number | null; completed: number; failed: number}[];
+  failure_taxonomy_distribution?: {
+    categories: Record<string, { count: number; percentage: number }>;
+    total_failures: number;
+    dominant_category: string | null;
+  } | null;
 }
+
+const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
+const TAXONOMY_LABELS: Record<string, string> = {
+  scope_related: 'scope',
+  review_quality: 'review',
+  infra_related: 'infra',
+  code_defect: 'code',
+};
+const TAXONOMY_COLORS: Record<string, string> = {
+  scope_related: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
+  review_quality: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
+  infra_related: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  code_defect: 'bg-red-500/20 text-red-400 border-red-500/30',
+};
 
 export interface CatchUpPanelProps {
   selectedProjectId: string | null;
@@ -952,6 +971,27 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       )}
                     </div>
                   )}
+                </div>
+              )}
+
+              {/* Failure taxonomy root-cause pills */}
+              {digest!.failure_taxonomy_distribution && digest!.failure_taxonomy_distribution.total_failures > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Root cause</span>
+                  {TAXONOMY_ORDER.map(cat => {
+                    const entry = digest!.failure_taxonomy_distribution!.categories[cat];
+                    if (!entry || entry.count === 0) return null;
+                    return (
+                      <span
+                        key={cat}
+                        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border ${TAXONOMY_COLORS[cat]}`}
+                        title={`${TAXONOMY_LABELS[cat]}: ${entry.count} (${Math.round(entry.percentage)}%)`}
+                      >
+                        {TAXONOMY_LABELS[cat]}
+                        <span className="font-bold">{entry.count}</span>
+                      </span>
+                    );
+                  })}
                 </div>
               )}
 
