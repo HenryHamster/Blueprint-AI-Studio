@@ -322,6 +322,63 @@ async def _make_project_with_member(db_session):
 
 
 @pytest.mark.asyncio
+async def test_admin_tasks_include_estimated_cost_usd(client: AsyncClient, db_session):
+    """Both the list and detail admin task endpoints should expose estimated_cost_usd
+    computed from VM provisioning timestamps and the spot/on-demand rate. Tasks with
+    missing timing data must report None (never an implicit zero)."""
+    from datetime import datetime, timedelta
+    from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+
+    project = await _make_project_with_member(db_session)
+
+    started = datetime.utcnow().replace(microsecond=0) - timedelta(hours=1)
+    stopped = started + timedelta(seconds=3600)
+    spot_task = Task(
+        project_id=project.id,
+        title="Completed spot task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        vm_provisioned_at=started,
+        vm_stopped_at=stopped,
+        vm_spot=True,
+    )
+    ondemand_task = Task(
+        project_id=project.id,
+        title="Completed on-demand task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "y"}],
+        vm_provisioned_at=started,
+        vm_stopped_at=stopped,
+        vm_spot=False,
+    )
+    no_timing_task = Task(
+        project_id=project.id,
+        title="Task without VM timing",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "z"}],
+    )
+    db_session.add_all([spot_task, ondemand_task, no_timing_task])
+    await db_session.commit()
+    for t in (spot_task, ondemand_task, no_timing_task):
+        await db_session.refresh(t)
+
+    list_resp = await client.get("/api/admin/tasks", params={"limit": 100})
+    assert list_resp.status_code == 200
+    by_id = {t["id"]: t for t in list_resp.json()["tasks"]}
+    assert by_id[str(spot_task.id)]["estimated_cost_usd"] == pytest.approx(3600 * SPOT_RATE)
+    assert by_id[str(ondemand_task.id)]["estimated_cost_usd"] == pytest.approx(3600 * ON_DEMAND_RATE)
+    assert by_id[str(no_timing_task.id)]["estimated_cost_usd"] is None
+
+    detail_resp = await client.get(f"/api/admin/tasks/{spot_task.id}")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["estimated_cost_usd"] == pytest.approx(3600 * SPOT_RATE)
+
+    detail_none = await client.get(f"/api/admin/tasks/{no_timing_task.id}")
+    assert detail_none.status_code == 200
+    assert detail_none.json()["estimated_cost_usd"] is None
+
+
+@pytest.mark.asyncio
 async def test_bulk_action_invalid_action(client: AsyncClient):
     """POST /api/admin/tasks/bulk-action with unknown action returns 400."""
     response = await client.post(

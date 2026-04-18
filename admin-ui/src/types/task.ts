@@ -43,6 +43,7 @@ export interface Task {
   context?: Record<string, unknown>;
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
   child_task_ids?: string[];
+  estimated_cost_usd?: number | null;
 }
 
 export type TrackLogType = 'log' | 'status' | 'artifact' | 'error' | 'system';

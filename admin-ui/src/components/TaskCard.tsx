@@ -688,6 +688,11 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
               · {etaLabel}
             </span>
           )}
+          {task.status === 'COMPLETED' && task.estimated_cost_usd != null && (
+            <span className="text-neutral-500 font-mono" title="Estimated VM cost">
+              · ${task.estimated_cost_usd.toFixed(2)}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-2">

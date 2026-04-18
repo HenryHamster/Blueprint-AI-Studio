@@ -23,6 +23,15 @@ from app.auth import get_current_user, require_admin
 from app.github import generate_installation_access_token
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import TaskType, validate_internal_payload, validate_task_payload
+from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+
+
+def _estimated_cost_usd(task: Task) -> Optional[float]:
+    """Return the VM cost for a task, or None when timing data is incomplete."""
+    if not task.vm_provisioned_at or not task.vm_stopped_at:
+        return None
+    rate = SPOT_RATE if task.vm_spot else ON_DEMAND_RATE
+    return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +298,7 @@ async def get_all_tasks(
             "history": history_map.get(str(t.id), []),
             "child_task_ids": children_map.get(str(t.id), []),
             "failure_class": classify_failure(t) if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED) and t.latest_status_message else None,
+            "estimated_cost_usd": _estimated_cost_usd(t),
         }
         result_list.append(task_dict)
 
@@ -746,6 +756,7 @@ async def get_task(
         "research_findings": research_findings,
         "history": history,
         "child_task_ids": child_task_ids,
+        "estimated_cost_usd": _estimated_cost_usd(task),
     }
 
 class CreateTaskPayload(BaseModel):
