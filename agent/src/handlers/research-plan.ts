@@ -622,35 +622,35 @@ ${hotspotsSection}
     }
   }
 
-  // Pipeline-wide scope merge rates — rendered from pipeline_health.scope_merge_rates
+  // Pipeline-wide scope conversion rates — rendered from pipeline_health.scope_conversion_rates
   // so measurement directions can read the number straight from the prompt instead
   // of hitting an admin endpoint they aren't authenticated for.
   let pipelineScopeRatesSection = '';
   const pipelineHealthForScope = projectCtx?.pipeline_health as Record<string, unknown> | null | undefined;
-  const scopeMergeRates = pipelineHealthForScope?.scope_merge_rates as
+  const scopeConversionRates = pipelineHealthForScope?.scope_conversion_rates as
     | Record<string, { current_rate: number | null; prev_rate: number | null; delta: number | null; trend: string | null }>
     | null
     | undefined;
-  if (scopeMergeRates && Object.keys(scopeMergeRates).length > 0) {
+  if (scopeConversionRates && Object.keys(scopeConversionRates).length > 0) {
     const fmtRate = (r: number | null | undefined) => (typeof r === 'number' ? `${Math.round(r * 100)}%` : '—');
     const scopeOrder = ['small', 'medium', 'large'];
     const orderedKeys = [
-      ...scopeOrder.filter(k => k in scopeMergeRates),
-      ...Object.keys(scopeMergeRates).filter(k => !scopeOrder.includes(k)),
+      ...scopeOrder.filter(k => k in scopeConversionRates),
+      ...Object.keys(scopeConversionRates).filter(k => !scopeOrder.includes(k)),
     ];
     const parts = orderedKeys.map(k => {
-      const r = scopeMergeRates[k];
+      const r = scopeConversionRates[k];
       const trend = r?.trend ? ` (${r.trend})` : '';
       return `${k} ${fmtRate(r?.current_rate)}/${fmtRate(r?.prev_rate)}${trend}`;
     });
-    pipelineScopeRatesSection = `\nPipeline-wide scope merge rates (current / prev 24h window): ${parts.join(', ')}\n`;
+    pipelineScopeRatesSection = `\nPipeline-wide scope conversion rates (current / prev 24h window): ${parts.join(', ')}\n`;
   }
 
   // Medium-scope pre/post investment measurement — rendered so measurement directions
   // can read the headline before/after numbers straight from the prompt.
   const mediumScopeMeasurement = pipelineHealthForScope?.medium_scope_measurement as
     | {
-        medium_scope_merge_rate: number | null;
+        medium_scope_conversion_rate: number | null;
         total_created: number | null;
         total_merged: number | null;
         pre_investment: { merge_rate: number | null; created: number | null; merged: number | null } | null;
@@ -669,7 +669,7 @@ ${hotspotsSection}
     if (pre || post) {
       const preStr = pre ? `pre-investment ${fmtPct(pre.merge_rate)} (${pre.created ?? 0} tasks)` : 'pre-investment —';
       const postStr = post ? `post-investment ${fmtPct(post.merge_rate)} (${post.created ?? 0} tasks)` : 'post-investment —';
-      const headline = `${fmtPct(mediumScopeMeasurement.medium_scope_merge_rate)} overall (${mediumScopeMeasurement.total_merged ?? 0}/${mediumScopeMeasurement.total_created ?? 0})`;
+      const headline = `${fmtPct(mediumScopeMeasurement.medium_scope_conversion_rate)} overall (${mediumScopeMeasurement.total_merged ?? 0}/${mediumScopeMeasurement.total_created ?? 0})`;
       const recentParts: string[] = [];
       if (recent30) recentParts.push(`recent-30d ${fmtPct(recent30.merge_rate)} (${recent30.created ?? 0} tasks)`);
       if (recent7) recentParts.push(`recent-7d ${fmtPct(recent7.merge_rate)} (${recent7.created ?? 0} tasks)`);

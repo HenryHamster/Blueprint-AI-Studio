@@ -2979,8 +2979,8 @@ async def test_agent_claim_non_research_includes_pipeline_health(client: AsyncCl
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_pipeline_health_includes_scope_merge_rates(client: AsyncClient, db_session, mocker):
-    """Claim response includes scope_merge_rates and medium_scope_review_iterations in pipeline_health."""
+async def test_agent_claim_pipeline_health_includes_scope_conversion_rates(client: AsyncClient, db_session, mocker):
+    """Claim response includes scope_conversion_rates and medium_scope_review_iterations in pipeline_health."""
     project = Project(name="Scope Merge Rate Test", user_id="test-user-smr")
     db_session.add(project)
     await db_session.commit()
@@ -3009,7 +3009,7 @@ async def test_agent_claim_pipeline_health_includes_scope_merge_rates(client: As
         "pipeline_conversion_rate": None,
         "review_accuracy": None,
         "persistent_review_issues": None,
-        "scope_merge_rates": {
+        "scope_conversion_rates": {
             "medium": {"current_rate": 0.75, "prev_rate": 0.5, "delta": 0.25, "trend": "improving"},
             "small": {"current_rate": 0.9, "prev_rate": 0.85, "delta": 0.05, "trend": "stable"},
         },
@@ -3027,10 +3027,10 @@ async def test_agent_claim_pipeline_health_includes_scope_merge_rates(client: As
     assert "project_context" in data
     ph = data["project_context"]["pipeline_health"]
     assert ph is not None
-    assert "scope_merge_rates" in ph
-    assert isinstance(ph["scope_merge_rates"], dict)
-    assert ph["scope_merge_rates"]["medium"]["current_rate"] == 0.75
-    assert ph["scope_merge_rates"]["medium"]["trend"] == "improving"
+    assert "scope_conversion_rates" in ph
+    assert isinstance(ph["scope_conversion_rates"], dict)
+    assert ph["scope_conversion_rates"]["medium"]["current_rate"] == 0.75
+    assert ph["scope_conversion_rates"]["medium"]["trend"] == "improving"
     assert ph["medium_scope_review_iterations"] == 2.5
 
 

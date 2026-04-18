@@ -365,7 +365,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
     - success_rate: float or None
     - trend: 'improving' | 'stable' | 'declining' | None
     - failure_distribution: {failure_class: count} top 3
-    - direction_stats: [{direction_id, merge_rate, cycles, possibly_saturated}]
+    - direction_stats: [{direction_id, conversion_rate, cycles, possibly_saturated}]
     """
     from app.failure_classification import classify_failure as _classify_failure
 
@@ -459,7 +459,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "dominant_category": max(_taxonomy_keys, key=lambda k: taxonomy_counts[k]) if _tax_total else None,
     }
 
-    # Direction stats: merge_rate and cycle count per active direction
+    # Direction stats: conversion_rate and cycle count per active direction
     direction_stats: List[Dict[str, Any]] = []
     project = await session.get(Project, project_id)
     if project:
@@ -509,7 +509,6 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
             )
             direction_stats.append({
                 "direction_id": did,
-                "merge_rate": round(prs_merged / cycles, 2),
                 "cycles": cycles,
                 "possibly_saturated": bool(d.get("possibly_saturated", False)),
                 "conversion_rate": dir_conversion_rate,
@@ -651,7 +650,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 target[scope]["calibrated_out"] += counts.get("calibrated_out") or 0
 
     all_scopes = set(_scope_cur) | set(_scope_prev)
-    scope_merge_rates: Dict[str, Any] = {}
+    scope_conversion_rates: Dict[str, Any] = {}
     for scope in all_scopes:
         cur = _scope_cur.get(scope, {})
         prev = _scope_prev.get(scope, {})
@@ -668,7 +667,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 scope_trend = "declining"
             else:
                 scope_trend = "stable"
-        scope_merge_rates[scope] = {
+        scope_conversion_rates[scope] = {
             "current_rate": cur_rate,
             "prev_rate": prev_rate,
             "delta": delta,
@@ -951,7 +950,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         if ms_medium:
             full = _compute_medium_scope_measurement(ms_medium, project, None, 365)
             medium_scope_measurement = {
-                "medium_scope_merge_rate": full.get("medium_scope_merge_rate"),
+                "medium_scope_conversion_rate": full.get("medium_scope_conversion_rate"),
                 "total_created": full.get("total_created"),
                 "total_merged": full.get("total_merged"),
                 "pre_investment": full.get("pre_investment"),
@@ -980,7 +979,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "persistent_review_issues": persistent_review_issues,
         "review_effectiveness_trends": review_effectiveness_trends,
         "review_recurrence_by_category": review_recurrence_by_category,
-        "scope_merge_rates": scope_merge_rates,
+        "scope_conversion_rates": scope_conversion_rates,
         "scope_file_budgets": SCOPE_FILE_BUDGETS,
         "medium_scope_review_iterations": medium_scope_review_iterations,
         "direction_first_attempt_feedback": direction_first_attempt_feedback,
@@ -1068,8 +1067,8 @@ async def get_digest(
     # --- Direction progress (only when project_id provided) ---
     direction_progress_list: List[Dict[str, Any]] = []
     dir_id_to_text: Dict[str, str] = {}
-    scope_merge_rates: Dict[str, Dict[str, int]] = {}
-    prev_scope_merge_rates: Dict[str, Dict[str, int]] = {}
+    scope_conversion_rates: Dict[str, Dict[str, int]] = {}
+    prev_scope_conversion_rates: Dict[str, Dict[str, int]] = {}
 
     if project_id:
         project = await session.get(Project, project_id)
@@ -1171,19 +1170,19 @@ async def get_digest(
                 conversion_rate = round(prs_merged / findings_tasks_created, 3) if findings_tasks_created > 0 else None
                 # Accumulate into project-level scope rate aggregates
                 for _s, _st in dir_scope_agg.items():
-                    if _s not in scope_merge_rates:
-                        scope_merge_rates[_s] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
-                    scope_merge_rates[_s]["created"] += _st["created"]
-                    scope_merge_rates[_s]["merged"] += _st["merged"]
-                    scope_merge_rates[_s]["calibrated_in"] += _st.get("calibrated_in", 0)
-                    scope_merge_rates[_s]["calibrated_out"] += _st.get("calibrated_out", 0)
+                    if _s not in scope_conversion_rates:
+                        scope_conversion_rates[_s] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
+                    scope_conversion_rates[_s]["created"] += _st["created"]
+                    scope_conversion_rates[_s]["merged"] += _st["merged"]
+                    scope_conversion_rates[_s]["calibrated_in"] += _st.get("calibrated_in", 0)
+                    scope_conversion_rates[_s]["calibrated_out"] += _st.get("calibrated_out", 0)
                 for _s, _st in prev_dir_scope_agg.items():
-                    if _s not in prev_scope_merge_rates:
-                        prev_scope_merge_rates[_s] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
-                    prev_scope_merge_rates[_s]["created"] += _st["created"]
-                    prev_scope_merge_rates[_s]["merged"] += _st["merged"]
-                    prev_scope_merge_rates[_s]["calibrated_in"] += _st.get("calibrated_in", 0)
-                    prev_scope_merge_rates[_s]["calibrated_out"] += _st.get("calibrated_out", 0)
+                    if _s not in prev_scope_conversion_rates:
+                        prev_scope_conversion_rates[_s] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
+                    prev_scope_conversion_rates[_s]["created"] += _st["created"]
+                    prev_scope_conversion_rates[_s]["merged"] += _st["merged"]
+                    prev_scope_conversion_rates[_s]["calibrated_in"] += _st.get("calibrated_in", 0)
+                    prev_scope_conversion_rates[_s]["calibrated_out"] += _st.get("calibrated_out", 0)
 
                 direction_progress_list.append({
                     "direction_id": did,
@@ -1648,8 +1647,8 @@ async def get_digest(
         "trend": trend,
         "trend_history": trend_history,
         "latest_cycle": latest_cycle,
-        "scope_merge_rates": scope_merge_rates or None,
-        "prev_scope_merge_rates": prev_scope_merge_rates or None,
+        "scope_conversion_rates": scope_conversion_rates or None,
+        "prev_scope_conversion_rates": prev_scope_conversion_rates or None,
     }
 
 
@@ -2231,7 +2230,7 @@ def _compute_medium_scope_measurement(
         1 for t in medium_tasks
         if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
     )
-    medium_scope_merge_rate = round(total_merged / total_created, 3) if total_created > 0 else None
+    medium_scope_conversion_rate = round(total_merged / total_created, 3) if total_created > 0 else None
 
     # --- Find target direction ---
     resolved_direction_id: Optional[str] = direction_id
@@ -2474,7 +2473,7 @@ def _compute_medium_scope_measurement(
             })
 
     return {
-        "medium_scope_merge_rate": medium_scope_merge_rate,
+        "medium_scope_conversion_rate": medium_scope_conversion_rate,
         "total_created": total_created,
         "total_merged": total_merged,
         "investment_start": investment_start.isoformat() if investment_start else None,

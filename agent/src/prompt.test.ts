@@ -1209,6 +1209,23 @@ describe('formatProjectContext', () => {
     expect(result).toContain('90%');
   });
 
+  it('renders direction_stats with cvr label using conversion_rate (not merge rate)', () => {
+    const ctx = {
+      pipeline_health: {
+        success_rate: 0.85,
+        trend: 'stable',
+        failure_distribution: {},
+        direction_stats: [
+          { direction_id: 'd-abcdef12345678', cycles: 5, possibly_saturated: false, conversion_rate: 0.42 },
+        ],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('cvr 0.42');
+    expect(result).toContain('5 cycles');
+    expect(result).not.toContain('merge rate');
+  });
+
   it('includes scope-specific pipeline health stat when by_scope is provided', () => {
     const ctx = {
       pipeline_health: {

@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
-from app.research_completion import _handle_research_completion, _compute_momentum_factor, _compute_merge_rate, _calibrate_scope, predict_spawn_success, _poor_decomp_history
+from app.research_completion import _handle_research_completion, _compute_momentum_factor, _compute_productivity_score, _calibrate_scope, predict_spawn_success, _poor_decomp_history
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -906,21 +906,21 @@ async def test_patch_settings_max_parallel_invalid_returns_400(client: AsyncClie
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Standalone tests for _compute_merge_rate (no DB required)
+# Standalone tests for _compute_productivity_score (no DB required)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestComputeMergeRate:
-    """Unit tests for _compute_merge_rate — pure function, no DB."""
+    """Unit tests for _compute_productivity_score — pure function, no DB."""
 
     def test_never_researched_returns_neutral(self):
         """A direction with no history returns 0.5 (neutral/unknown)."""
         d = {"id": "d1", "priority": "medium"}
-        assert _compute_merge_rate(d) == 0.5
+        assert _compute_productivity_score(d) == 0.5
 
     def test_empty_history_returns_neutral(self):
         """Explicit empty lists also return 0.5."""
         d = {"id": "d1", "research_history": [], "history_aggregate": {}}
-        assert _compute_merge_rate(d) == 0.5
+        assert _compute_productivity_score(d) == 0.5
 
     def test_history_with_no_merges(self):
         """Cycles present but zero merges → rate = 0.0."""
@@ -930,7 +930,7 @@ class TestComputeMergeRate:
                 {"prs_merged": 0},
             ]
         }
-        assert _compute_merge_rate(d) == 0.0
+        assert _compute_productivity_score(d) == 0.0
 
     def test_history_with_merges(self):
         """3 cycles, 6 total merges → rate = 2.0."""
@@ -941,7 +941,7 @@ class TestComputeMergeRate:
                 {"prs_merged": 2},
             ]
         }
-        assert _compute_merge_rate(d) == pytest.approx(6 / 3)
+        assert _compute_productivity_score(d) == pytest.approx(6 / 3)
 
     def test_aggregate_counted(self):
         """history_aggregate cycles and merges are included in the total."""
@@ -952,7 +952,7 @@ class TestComputeMergeRate:
         # lifetime: 1 live + 4 agg = 5 cycles, 1+8=9 merged → 1.8
         # recent (last 3 live): [{"prs_merged":1}] → rate=1.0
         # weighted: (1.0*3 + 1.8) / 4 = 1.2
-        assert _compute_merge_rate(d) == pytest.approx(1.2)
+        assert _compute_productivity_score(d) == pytest.approx(1.2)
 
     def test_higher_merge_rate_sorted_first(self):
         """Within the same priority tier, higher merge_rate direction is selected first."""
@@ -979,7 +979,7 @@ class TestComputeMergeRate:
         directions.sort(key=lambda d: (
             priority_rank.get(d.get("priority", "medium"), 1),
             1 if d.get("possibly_saturated") else 0,
-            -_compute_merge_rate(d),
+            -_compute_productivity_score(d),
             d.get("last_researched_at") or "",
         ))
         assert directions[0]["id"] == "high"
@@ -1026,7 +1026,7 @@ class TestComputeMergeRate:
         directions.sort(key=lambda d: (
             priority_rank.get(d.get("priority", "medium"), 1),
             1 if d.get("possibly_saturated") else 0,
-            -_compute_merge_rate(d),
+            -_compute_productivity_score(d),
             d.get("last_researched_at") or "",
         ))
         assert directions[0]["id"] == "unsat"

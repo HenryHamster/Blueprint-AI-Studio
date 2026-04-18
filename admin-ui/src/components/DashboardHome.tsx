@@ -91,8 +91,8 @@ interface DigestData {
   latest_cycle?: LatestCycle | null;
   completed_count?: number;
   pipeline_conversion_rate?: number | null;
-  scope_merge_rates?: Record<string, { created: number; merged: number }> | null;
-  prev_scope_merge_rates?: Record<string, { created: number; merged: number }> | null;
+  scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
+  prev_scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
   failure_taxonomy_distribution?: {
     categories: Record<string, { count: number; percentage: number }>;
     total_failures: number;
@@ -153,7 +153,7 @@ interface CorrelatedChange {
 }
 
 interface MediumScopeMeasurement {
-  medium_scope_merge_rate: number | null;
+  medium_scope_conversion_rate: number | null;
   total_created: number;
   total_merged: number;
   investment_start: string | null;
@@ -535,7 +535,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                         </div>
                         <p className="text-xs text-neutral-200 line-clamp-2 mb-2">{d.direction_text}</p>
                         <div className="flex items-center gap-2 text-[10px] text-neutral-500">
-                          {cvr != null && <span className={cvrColor}>{cvr}% merge</span>}
+                          {cvr != null && <span className={cvrColor}>{cvr}% conversion</span>}
                           <span>{d.prs_merged} PR{d.prs_merged !== 1 ? 's' : ''}</span>
                           {d.product_ratio != null && (
                             <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
@@ -550,11 +550,11 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             )}
           </section>
 
-          {/* Section 2b: Scope Merge Rates */}
+          {/* Section 2b: Scope Conversion Rates */}
           {!!selectedProjectId && (
-            <ScopeMergeRatesSection
-              scopeRates={digest?.scope_merge_rates}
-              prevScopeRates={digest?.prev_scope_merge_rates}
+            <ScopeConversionRatesSection
+              scopeRates={digest?.scope_conversion_rates}
+              prevScopeRates={digest?.prev_scope_conversion_rates}
               loading={loading}
             />
           )}
@@ -656,11 +656,11 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   );
 }
 
-// ---------- scope merge rates ----------
+// ---------- scope conversion rates ----------
 
 const SCOPE_ORDER = ['small', 'medium', 'large'];
 
-function ScopeMergeRatesSection({
+function ScopeConversionRatesSection({
   scopeRates,
   prevScopeRates,
   loading,
@@ -676,7 +676,7 @@ function ScopeMergeRatesSection({
 
   return (
     <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Scope Merge Rates</h2>
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Scope Conversion Rates</h2>
       <div className="flex gap-2 flex-wrap">
         {scopes.map(scope => {
           const { created, merged } = scopeRates[scope];
@@ -932,7 +932,7 @@ const TOOLTIP_STYLE = {
 };
 
 function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | null; loading: boolean }) {
-  const rate = data?.medium_scope_merge_rate;
+  const rate = data?.medium_scope_conversion_rate;
   const rateColor = rate == null ? 'text-neutral-500' : rate >= 0.6 ? 'text-emerald-400' : rate >= 0.3 ? 'text-amber-400' : 'text-red-400';
 
   return (

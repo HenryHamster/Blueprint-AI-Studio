@@ -55,7 +55,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     """Inner implementation — always called under the per-project spawn lock."""
     from app.main import _maybe_create_circuit_breaker_alert  # noqa: PLC0415
     from app.task_lifecycle import _increment_research_spawn_count  # noqa: PLC0415
-    from app.research_completion import _compute_momentum_factor, _compute_merge_rate, _compute_acceptance_rate  # noqa: PLC0415
+    from app.research_completion import _compute_momentum_factor, _compute_productivity_score, _compute_acceptance_rate  # noqa: PLC0415
     from app.anomaly_detection import _compute_research_anomalies, check_anomaly_actions  # noqa: PLC0415
     from app.direction_lifecycle import _process_direction_lifecycle  # noqa: PLC0415
     # Guard: autonomous must be enabled
@@ -189,7 +189,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         priority_rank = {"high": 0, "medium": 1, "low": 2}
 
         def _direction_score(d: dict) -> tuple:
-            merge_rate = _compute_merge_rate(d)
+            productivity_score = _compute_productivity_score(d)
             momentum = _compute_momentum_factor(d)
             acceptance_rate = _compute_acceptance_rate(d)
             is_new = 0 if d.get("last_researched_at") else -1  # small novelty bonus
@@ -204,7 +204,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 category_bonus,                                  # product category within same priority
                 is_new,                                          # novelty bonus within same priority
                 v_rank,                                          # vision priority drives selection
-                -(merge_rate * momentum),                        # productivity within same vision rank
+                -(productivity_score * momentum),                # productivity within same vision rank
                 acceptance_rate if acceptance_rate is not None else 0.5,  # low acceptance = deprioritized
                 1 if d.get("possibly_saturated") else 0,         # saturated last
                 d.get("last_researched_at") or "",               # staleness
@@ -276,10 +276,10 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         if chosen_directions:
             for d in chosen_directions:
                 did = d.get("id", "?")
-                merge_rate = _compute_merge_rate(d)
+                productivity_score = _compute_productivity_score(d)
                 momentum = _compute_momentum_factor(d)
                 category = d.get("category", "unset")
-                logger.debug(f"[RESEARCH] Selected direction {did} category={category} merge_rate={merge_rate:.2f} momentum={momentum:.1f} vision_rank={_vision_rank(d)}")
+                logger.debug(f"[RESEARCH] Selected direction {did} category={category} productivity_score={productivity_score:.2f} momentum={momentum:.1f} vision_rank={_vision_rank(d)}")
     elif not force_strategic:
         return  # No directions and not a strategic cycle — nothing to do
 

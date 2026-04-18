@@ -1484,8 +1484,8 @@ async def test_trend_history_includes_failed_by_taxonomy(client: AsyncClient, db
 
 
 @pytest.mark.asyncio
-async def test_digest_scope_merge_rates_aggregated(client: AsyncClient, db_session):
-    """scope_merge_rates aggregates scope_breakdown from research_history within the window."""
+async def test_digest_scope_conversion_rates_aggregated(client: AsyncClient, db_session):
+    """scope_conversion_rates aggregates scope_breakdown from research_history within the window."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
     old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
 
@@ -1534,8 +1534,8 @@ async def test_digest_scope_merge_rates_aggregated(client: AsyncClient, db_sessi
     assert response.status_code == 200
     data = response.json()
 
-    # scope_merge_rates should aggregate only the recent entry (not the old one outside window)
-    rates = data["scope_merge_rates"]
+    # scope_conversion_rates should aggregate only the recent entry (not the old one outside window)
+    rates = data["scope_conversion_rates"]
     assert rates is not None
     assert rates["small"]["created"] == 4
     assert rates["small"]["merged"] == 3
@@ -1602,18 +1602,18 @@ async def test_digest_scope_breakdown_preserves_failure_sub_counts(client: Async
 
 
 @pytest.mark.asyncio
-async def test_digest_scope_merge_rates_absent_without_project(client: AsyncClient, db_session):
-    """scope_merge_rates is null when no project_id is provided."""
+async def test_digest_scope_conversion_rates_absent_without_project(client: AsyncClient, db_session):
+    """scope_conversion_rates is null when no project_id is provided."""
     response = await client.get("/api/admin/digest")
     assert response.status_code == 200
     data = response.json()
-    assert data["scope_merge_rates"] is None
-    assert data["prev_scope_merge_rates"] is None
+    assert data["scope_conversion_rates"] is None
+    assert data["prev_scope_conversion_rates"] is None
 
 
 @pytest.mark.asyncio
-async def test_digest_prev_scope_merge_rates(client: AsyncClient, db_session):
-    """prev_scope_merge_rates aggregates scope_breakdown from the previous window."""
+async def test_digest_prev_scope_conversion_rates(client: AsyncClient, db_session):
+    """prev_scope_conversion_rates aggregates scope_breakdown from the previous window."""
     curr_ts = (_utcnow() - timedelta(hours=1)).isoformat()
     prev_ts = (_utcnow() - timedelta(hours=36)).isoformat()  # in prev 24h window (24–48h ago)
 
@@ -1662,11 +1662,11 @@ async def test_digest_prev_scope_merge_rates(client: AsyncClient, db_session):
     data = response.json()
 
     # Current window rates
-    assert data["scope_merge_rates"]["medium"]["created"] == 4
-    assert data["scope_merge_rates"]["medium"]["merged"] == 2
+    assert data["scope_conversion_rates"]["medium"]["created"] == 4
+    assert data["scope_conversion_rates"]["medium"]["merged"] == 2
 
     # Previous window rates (for trend comparison)
-    prev_rates = data["prev_scope_merge_rates"]
+    prev_rates = data["prev_scope_conversion_rates"]
     assert prev_rates is not None
     assert prev_rates["medium"]["created"] == 4
     assert prev_rates["medium"]["merged"] == 1

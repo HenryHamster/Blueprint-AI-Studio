@@ -256,7 +256,8 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
         .map((d) => {
           const did = strVal(d.direction_id).slice(-8);
           const sat = d.possibly_saturated ? ', saturated' : '';
-          return `d-${did} merge rate ${String(d.merge_rate)} (${String(d.cycles)} cycles${sat})`;
+          const cvr = d.conversion_rate != null ? String(d.conversion_rate) : 'n/a';
+          return `d-${did} cvr ${cvr} (${String(d.cycles)} cycles${sat})`;
         })
         .join(', ');
       parts.push(`Direction ROI: ${dirStr}.`);

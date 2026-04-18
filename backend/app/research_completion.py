@@ -132,7 +132,7 @@ def _compute_acceptance_rate(d: dict) -> float | None:
     """Return operator acceptance rate (merged / (merged + rejected)) with recency weighting.
 
     Weights the last 3 cycles 3x relative to the lifetime average, matching
-    _compute_merge_rate's recency scheme. Returns None when no PRs exist (merged
+    _compute_productivity_score's recency scheme. Returns None when no PRs exist (merged
     or rejected) so callers can distinguish "unknown" from a low rate.
     """
     history = d.get("research_history", [])
@@ -156,7 +156,7 @@ def _compute_acceptance_rate(d: dict) -> float | None:
     return (recent_rate * 3 + lifetime_rate) / 4
 
 
-def _compute_merge_rate(d: dict) -> float:
+def _compute_productivity_score(d: dict) -> float:
     """Return net productivity score for a direction, with recency weighting.
 
     Accounts for both merged PRs (positive signal) and rejected PRs (negative

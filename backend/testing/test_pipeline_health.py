@@ -265,8 +265,8 @@ async def test_trend_none_when_no_previous_window_data():
 # ── Direction stats ───────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_direction_stats_merge_rate():
-    """Direction with 2 research cycles and 1 PR merged → merge_rate = 0.5."""
+async def test_direction_stats_conversion_rate():
+    """Direction with 2 research cycles and 1 PR merged from 4 tasks created → conversion_rate = 0.25, no merge_rate key."""
     now = _utcnow()
     project_id = uuid.uuid4()
     direction_id = str(uuid.uuid4())
@@ -277,7 +277,7 @@ async def test_direction_stats_merge_rate():
         "text": "Improve test coverage",
         "possibly_saturated": False,
         "research_history": [
-            {"timestamp": (now - timedelta(hours=5)).isoformat(), "prs_merged": 1},
+            {"timestamp": (now - timedelta(hours=5)).isoformat(), "prs_merged": 1, "tasks_created": 4},
         ],
     }])
 
@@ -299,7 +299,8 @@ async def test_direction_stats_merge_rate():
     assert len(stats) == 1
     assert stats[0]["direction_id"] == direction_id
     assert stats[0]["cycles"] == 2
-    assert stats[0]["merge_rate"] == 0.5
+    assert "merge_rate" not in stats[0]
+    assert stats[0]["conversion_rate"] == 0.25
     assert stats[0]["possibly_saturated"] is False
 
 
@@ -532,7 +533,7 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "failure_taxonomy", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_merge_rates", "scope_file_budgets", "medium_scope_review_iterations", "direction_first_attempt_feedback", "medium_scope_measurement"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "failure_taxonomy", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_conversion_rates", "scope_file_budgets", "medium_scope_review_iterations", "direction_first_attempt_feedback", "medium_scope_measurement"}
     fa = result["first_attempt_success_rate"]
     assert "first_attempt_by_review_category" in fa
     assert "with_arch_context" in fa
@@ -861,11 +862,11 @@ async def test_direction_first_attempt_feedback_returned_when_present():
     assert feedback["dir-xyz"]["tests"] == 2
 
 
-# ── Scope merge rates ────────────────────────────────────────────────────────
+# ── Scope conversion rates ───────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_scope_merge_rates_computed_from_research_history():
-    """scope_merge_rates aggregates scope_breakdown across directions for the 24h window."""
+async def test_scope_conversion_rates_computed_from_research_history():
+    """scope_conversion_rates aggregates scope_breakdown across directions for the 24h window."""
     now = _utcnow()
     project_id = uuid.uuid4()
     direction_id = str(uuid.uuid4())
@@ -898,7 +899,7 @@ async def test_scope_merge_rates_computed_from_research_history():
 
     result = await compute_pipeline_health_summary(session, project_id)
 
-    smr = result["scope_merge_rates"]
+    smr = result["scope_conversion_rates"]
     assert isinstance(smr, dict)
     assert "medium" in smr
     assert smr["medium"]["current_rate"] == 0.5
@@ -907,8 +908,8 @@ async def test_scope_merge_rates_computed_from_research_history():
 
 
 @pytest.mark.asyncio
-async def test_scope_merge_rates_trend_improving():
-    """scope_merge_rates trend is 'improving' when current_rate exceeds prev_rate by > 0.05."""
+async def test_scope_conversion_rates_trend_improving():
+    """scope_conversion_rates trend is 'improving' when current_rate exceeds prev_rate by > 0.05."""
     now = _utcnow()
     project_id = uuid.uuid4()
     direction_id = str(uuid.uuid4())
@@ -950,7 +951,7 @@ async def test_scope_merge_rates_trend_improving():
 
     result = await compute_pipeline_health_summary(session, project_id)
 
-    smr = result["scope_merge_rates"]
+    smr = result["scope_conversion_rates"]
     assert "medium" in smr
     medium = smr["medium"]
     assert medium["current_rate"] == 0.75
@@ -959,8 +960,8 @@ async def test_scope_merge_rates_trend_improving():
 
 
 @pytest.mark.asyncio
-async def test_scope_merge_rates_no_data_returns_empty_dict():
-    """scope_merge_rates is an empty dict when no research_history entries have scope_breakdown."""
+async def test_scope_conversion_rates_no_data_returns_empty_dict():
+    """scope_conversion_rates is an empty dict when no research_history entries have scope_breakdown."""
     project_id = uuid.uuid4()
     now = _utcnow()
     direction_id = str(uuid.uuid4())
@@ -990,7 +991,7 @@ async def test_scope_merge_rates_no_data_returns_empty_dict():
 
     result = await compute_pipeline_health_summary(session, project_id)
 
-    assert result["scope_merge_rates"] == {}
+    assert result["scope_conversion_rates"] == {}
 
 
 @pytest.mark.asyncio
@@ -1538,7 +1539,7 @@ def test_scope_baselines_week_key_is_monday():
 def test_medium_scope_no_tasks_returns_null_rates():
     """No medium-scope tasks → null merge rate, zero counts, empty series."""
     result = _compute_medium_scope_measurement([], None, None, 365)
-    assert result["medium_scope_merge_rate"] is None
+    assert result["medium_scope_conversion_rate"] is None
     assert result["total_created"] == 0
     assert result["total_merged"] == 0
     assert result["investment_start"] is None
@@ -1646,7 +1647,7 @@ def test_medium_scope_headline_rate_computed_correctly():
     result = _compute_medium_scope_measurement(tasks, None, None, 365)
     assert result["total_created"] == 4
     assert result["total_merged"] == 2
-    assert result["medium_scope_merge_rate"] == round(2 / 4, 3)
+    assert result["medium_scope_conversion_rate"] == round(2 / 4, 3)
 
 
 def test_medium_scope_pre_post_split_from_research_history():
