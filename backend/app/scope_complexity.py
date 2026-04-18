@@ -4,22 +4,10 @@ Extracted from app.research_completion to keep that module under its
 line-count guardrail. Contains composite-merge-probability scoring that
 combines file count, historical expansion ratio, cochange cluster density,
 and cross-module span into a single P(merge) estimate in [0, 1].
-
-Also home to SCOPE_FILE_BUDGETS — the per-scope file-count budgets surfaced
-to research agents and consulted by decomposition heuristics.
 """
 from app.cochange_decomposition import (
     cluster_files_by_cochange as _cluster_files_by_cochange,
 )
-
-# Hard file-count budgets enforced by implementing agents per scope.
-# Values mirror SCOPE_OVERFLOW_THRESHOLDS and MEDIUM_ANALYSIS_PLAN_FILE_LIMIT
-# in agent/src/constants.ts — keep in sync.
-SCOPE_FILE_BUDGETS: dict[str, dict[str, int]] = {
-    "small": {"total_files_max": 6},
-    "medium": {"production_files_max": 7, "total_files_max": 10},
-    "large": {"total_files_max": 20},
-}
 
 
 def _composite_complexity_score(

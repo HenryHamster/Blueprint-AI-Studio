@@ -611,6 +611,10 @@ export async function handleFix(
   } else if (iteration * 2 >= maxIterations) {
     iterationHeader += 'Convergence mode: you are at or past 50% of the iteration budget. Make only the minimal changes needed to address the specific issues listed below. Do NOT touch files that are not mentioned in the review feedback, do NOT refactor or clean up adjacent code, and defer any non-blocking improvements to follow-up tasks. Scope creep at this stage commonly exhausts the remaining budget and forces the PR to close unmerged.\n';
     const latestIssues = reviewHistory[reviewHistory.length - 1]?.issues || [];
+    const allowedFiles = Array.from(new Set(latestIssues.map(i => i.file).filter((f): f is string => typeof f === 'string' && f.length > 0)));
+    if (allowedFiles.length > 0) {
+      iterationHeader += `Files you may modify: ${allowedFiles.join(', ')}\n`;
+    }
     const criticalCount = latestIssues.filter(i => i.severity === 'critical').length;
     const majorCount = latestIssues.filter(i => i.severity === 'major').length;
     if (criticalCount + majorCount > 0) {
@@ -865,10 +869,18 @@ export async function handleFix(
         git(['merge', `origin/${baseBranch}`, '--no-edit']);
         sendLog(ws, `Merge onto ${baseBranch} successful\n`);
       } catch {
-        // Merge also conflicted — abort and push as-is.
-        // The PR will show conflicts and the review pipeline will handle it.
+        // Both rebase and merge failed — the working tree is fundamentally
+        // conflicted. Fail fast so the backend retry mechanism can spawn a
+        // fresh attempt with a clean clone, rather than burning a Claude call
+        // on post-push in-place repair of complex conflicts.
         try { git(['merge', '--abort']); } catch { /* ignore */ }
-        sendLog(ws, `Merge also conflicted (${conflictList || 'unknown files'}) — pushing as-is, review pipeline will handle\n`);
+        sendLog(ws, `Rebase and merge both failed (${conflictList || 'unknown files'}) — failing task for fresh retry\n`);
+        await persistAndPostStatus(taskId, {
+          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+          logs: `Rebase onto ${baseBranch} failed and merge fallback also failed. Conflicting files: ${conflictList || 'unknown'}. Failing task so retry spawns a fresh clone.`,
+          failure_category: 'rebase_failed',
+        });
+        return;
       }
     }
   }

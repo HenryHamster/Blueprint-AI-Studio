@@ -356,6 +356,23 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         failure_class = classify_failure(child, logs=child_extra_logs or None)
         original_status_message = child.latest_status_message
 
+        # Skip retry if the current failure fingerprint matches the prior retry's
+        # fingerprint — same code produced the same error, so retry is unlikely
+        # to help. The recurring-failure-class check fires only after 3+ hits
+        # project-wide, which is too late for individual task abort.
+        try:
+            from app.anomaly_detection import _error_fingerprint as _fp_fn
+            prior_fp = (child.context or {}).get("_previous_error_fingerprint")
+            current_fp = _fp_fn(original_status_message or "")
+            if prior_fp and current_fp and prior_fp == current_fp:
+                logger.info(
+                    f"[REQUEUE] Skipping child {str(child.id)[:8]} — "
+                    f"identical error fingerprint across retries"
+                )
+                continue
+        except Exception:
+            logger.exception("[REQUEUE] Fingerprint comparison failed for task %s", child.id)
+
         # Auto-generate playbook entry if this failure pattern is recurring
         try:
             from app.playbook_learning import _maybe_auto_playbook

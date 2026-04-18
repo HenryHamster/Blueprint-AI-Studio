@@ -2060,6 +2060,22 @@ def test_resolve_retry_budget_external_api_scope_aware():
     assert resolve_retry_budget("EXTERNAL_API", "unknown_scope") == uniform
 
 
+def test_resolve_retry_budget_agent_timeout_scope_aware():
+    """AGENT_TIMEOUT has scope-specific budgets; missing scope falls back to uniform."""
+    from app.shared_state import resolve_retry_budget, runtime_config
+
+    assert resolve_retry_budget("AGENT_TIMEOUT", "small") == 2
+    assert resolve_retry_budget("AGENT_TIMEOUT", "medium") == 3
+    assert resolve_retry_budget("AGENT_TIMEOUT", "large") == 4
+
+    uniform = runtime_config.get("retry_budgets_by_class", {}).get(
+        "AGENT_TIMEOUT", runtime_config["max_retries"]
+    )
+    assert uniform == 3
+    assert resolve_retry_budget("AGENT_TIMEOUT", None) == uniform
+    assert resolve_retry_budget("AGENT_TIMEOUT", "unknown_scope") == uniform
+
+
 def test_transient_5xx_patterns_constant():
     from app.reaper import _TRANSIENT_5XX_PATTERNS
 
