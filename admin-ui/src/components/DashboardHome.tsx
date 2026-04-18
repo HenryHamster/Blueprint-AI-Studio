@@ -1047,5 +1047,26 @@ function buildIssues(
     });
   }
 
+  // Taxonomy dominance insight
+  const tax = digest?.failure_taxonomy_distribution;
+  if (tax && tax.total_failures >= 3 && tax.dominant_category) {
+    const cat = tax.categories[tax.dominant_category];
+    if (cat && cat.percentage > 50) {
+      const remediation: Record<string, string> = {
+        scope_related: 'Review task decomposition and scope budgets to keep work within size limits.',
+        review_quality: 'Strengthen self-review and lint configuration to catch defects earlier.',
+        infra_related: 'Check infrastructure health (zones, provisioning, external APIs).',
+        code_defect: 'Review agent code-quality patterns and prompt guidance.',
+      };
+      const label = TAXONOMY_LABELS[tax.dominant_category] ?? tax.dominant_category;
+      items.push({
+        severity: 'info',
+        icon: AlertTriangle,
+        title: `${label} failures dominate (${Math.round(cat.percentage)}% of ${tax.total_failures})`,
+        detail: remediation[tax.dominant_category],
+      });
+    }
+  }
+
   return items;
 }

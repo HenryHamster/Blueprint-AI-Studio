@@ -1443,6 +1443,23 @@ async def get_digest(
                     "CODE_ERROR": f"Most failures ({cnt}/{failed_count}) are code errors in agent-written code.",
                     "SCOPE_OVERFLOW": f"Most failures ({cnt}/{failed_count}) exceeded scope budget (touched more files than scope allows) — consider task decomposition or scope escalation.",
                 }
+                if cls == "CODE_ERROR":
+                    _ce_tax: Dict[str, int] = {}
+                    for _t in failed_tasks:
+                        if _classify_failure(_t, error_log_map.get(str(_t.id))) == "CODE_ERROR":
+                            _sub = _classify_taxonomy(_t)
+                            _ce_tax[_sub] = _ce_tax.get(_sub, 0) + 1
+                    if _ce_tax:
+                        _sub_dom, _sub_cnt = max(_ce_tax.items(), key=lambda kv: kv[1])
+                        if _sub_cnt / cnt >= 0.6:
+                            _sub_msgs = {
+                                TAXONOMY_SCOPE_RELATED: f"Most failures ({cnt}/{failed_count}) are code errors driven by scope budget overruns — consider task decomposition or scope escalation.",
+                                TAXONOMY_REVIEW_QUALITY: f"Most failures ({cnt}/{failed_count}) are code errors from test/lint failures — strengthen self-review before PR creation.",
+                                TAXONOMY_CODE_DEFECT: f"Most failures ({cnt}/{failed_count}) are logical code defects in agent-written code.",
+                            }
+                            _refined = _sub_msgs.get(_sub_dom)
+                            if _refined:
+                                _root_cause_msgs["CODE_ERROR"] = _refined
                 dominant_msg = _root_cause_msgs.get(cls)
             if dominant_msg:
                 narrative_parts.append(dominant_msg)
