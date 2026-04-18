@@ -605,3 +605,138 @@ async def test_fingerprint_filters_by_direction_id(db_session):
     assert await _compute_direction_error_fingerprint(
         project.id, "d-target", db_session,
     ) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# needs_manual_intervention clearing on recovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _make_intervention_project(db_session, direction: dict) -> Project:
+    project = Project(
+        name="Manual Intervention Clearing",
+        user_id="u-intervene",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_auto_recovery_clears_intervention_when_fingerprint_differs(db_session):
+    """Auto-recovery drops needs_manual_intervention when the last pause's fingerprint
+    differs from the last remediation fingerprint — original problem is gone."""
+    direction = {
+        "id": "d-clear-fp-diff",
+        "text": "Recovering direction",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "High code failure rate: ...",
+        "paused_at": (datetime.utcnow() - timedelta(hours=50)).isoformat(),
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],  # healthy on recovery check
+        "needs_manual_intervention": True,
+        "error_fingerprint": "fp-new",
+        "last_remediation_fingerprint": "fp-old",
+        "last_remediation_result": "merged",
+    }
+    project = await _make_intervention_project(db_session, direction)
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "active"
+    assert "needs_manual_intervention" not in d
+
+
+@pytest.mark.asyncio
+async def test_auto_recovery_keeps_intervention_when_fingerprints_match(db_session):
+    """Same fingerprint on recovery means the original problem may recur — keep the flag."""
+    direction = {
+        "id": "d-keep-fp-match",
+        "text": "Recovering same-problem direction",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "High code failure rate: ...",
+        "paused_at": (datetime.utcnow() - timedelta(hours=50)).isoformat(),
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "needs_manual_intervention": True,
+        "error_fingerprint": "fp-same",
+        "last_remediation_fingerprint": "fp-same",
+        "last_remediation_result": "merged",
+    }
+    project = await _make_intervention_project(db_session, direction)
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "active"
+    assert d.get("needs_manual_intervention") is True
+
+
+@pytest.mark.asyncio
+async def test_expired_monitor_on_active_direction_clears_intervention(db_session):
+    """Monitor expiring on a still-active direction means the fix held — clear the flag."""
+    direction = {
+        "id": "d-monitor-expired",
+        "text": "Direction whose fix held",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "needs_manual_intervention": True,
+        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(days=8)).isoformat(),
+        "last_remediation_result": "merged",
+        "last_remediation_fingerprint": "fp-old",
+    }
+    project = await _make_intervention_project(db_session, direction)
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "active"
+    assert "needs_manual_intervention" not in d
+    assert "remediation_monitor_started_at" not in d
+
+
+@pytest.mark.asyncio
+async def test_active_monitor_not_expired_keeps_intervention(db_session):
+    """Active monitor within the expiry window must not clear the flag prematurely."""
+    direction = {
+        "id": "d-monitor-active",
+        "text": "Direction still under monitoring",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "needs_manual_intervention": True,
+        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=6)).isoformat(),
+        "last_remediation_result": "merged",
+    }
+    project = await _make_intervention_project(db_session, direction)
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d.get("needs_manual_intervention") is True
+    assert d.get("remediation_monitor_started_at") is not None

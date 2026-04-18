@@ -136,6 +136,19 @@ async def _spawn_direction_diagnosis(
         extras += f"Dominant error fingerprint: {fingerprint[:200]}\n"
     if prior_diagnosis:
         extras += f"Prior diagnosis summary: {prior_diagnosis[:400]}\n"
+    rem_attempts = int(direction.get("remediation_attempts") or 0)
+    if rem_attempts:
+        last_rem_result = direction.get("last_remediation_result") or "(unknown)"
+        last_rem_at = direction.get("last_remediation_at") or "(unknown)"
+        last_rem_task = direction.get("last_remediation_task_id") or "(unknown)"
+        last_rem_fp = direction.get("last_remediation_fingerprint") or "(unknown)"
+        extras += (
+            f"Prior remediation attempts: {rem_attempts} "
+            f"(last result: {last_rem_result}, at: {last_rem_at}, "
+            f"task: {last_rem_task}, fingerprint: {str(last_rem_fp)[:200]})\n"
+            f"Avoid proposing a fix targeting the same fingerprint that already "
+            f"failed; prior attempts did not resolve the recurring pattern.\n"
+        )
     prompt = (
         f"A research direction was auto-paused for repeated code failures.\n\n"
         f"Direction: {direction.get('text', '')[:200]}\n"
@@ -213,6 +226,22 @@ async def _process_direction_lifecycle(
             d["status"] = "active"
             for k in ("auto_paused", "paused_reason", "paused_at"):
                 d.pop(k, None)
+            # Clear stale manual-intervention alert if the last pause's dominant error
+            # fingerprint differs from what we last remediated. A different fingerprint
+            # means the original root cause is gone; the UI alert should reflect that
+            # rather than persisting indefinitely.
+            current_fp = d.get("error_fingerprint")
+            last_rem_fp = d.get("last_remediation_fingerprint")
+            if (
+                d.get("needs_manual_intervention")
+                and current_fp and last_rem_fp
+                and str(current_fp) != str(last_rem_fp)
+            ):
+                d.pop("needs_manual_intervention", None)
+                logger.info(
+                    f"[AUTONOMOUS] Cleared needs_manual_intervention on {d.get('id')}: "
+                    f"fingerprint changed since remediation"
+                )
             # Start remediation-effectiveness monitoring when recovering a direction whose
             # remediation task merged. Subsequent failures with the same error fingerprint
             # during this window signal the fix did not hold; escalation is triggered below
@@ -257,6 +286,24 @@ async def _process_direction_lifecycle(
                 d.pop("diagnosis_in_progress", None)
                 d.pop("diagnosis_started_at", None)
                 directions_modified = True
+        # If a remediation monitor has expired while the direction stayed active,
+        # the fix held — drop the monitor and clear any lingering manual-intervention
+        # alert so the UI stops showing a permanent red banner after recovery.
+        monitor_started_at = d.get("remediation_monitor_started_at")
+        if monitor_started_at:
+            try:
+                age_days = (_utcnow() - datetime.fromisoformat(monitor_started_at)).total_seconds() / 86400
+                if age_days > _REMEDIATION_MONITOR_EXPIRY_DAYS:
+                    d.pop("remediation_monitor_started_at", None)
+                    cleared = d.pop("needs_manual_intervention", None)
+                    logger.info(
+                        f"[AUTONOMOUS] Remediation monitor expired for {did} "
+                        f"(age {age_days:.1f}d); "
+                        f"{'cleared needs_manual_intervention' if cleared else 'no intervention flag to clear'}"
+                    )
+                    directions_modified = True
+            except (TypeError, ValueError):
+                pass
         last_researched = d.get("last_researched_at")
         if last_researched:
             minutes_ago = (now - datetime.fromisoformat(last_researched)).total_seconds() / 60

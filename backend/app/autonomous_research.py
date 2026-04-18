@@ -1164,6 +1164,14 @@ async def _spawn_direction_diagnosis(
     research_effort = _runtime_config.get("task_type_efforts", {}).get("research") or None
     research_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("research")
 
+    remediation_history = {
+        "remediation_attempts": int(direction.get("remediation_attempts") or 0),
+        "last_remediation_result": direction.get("last_remediation_result"),
+        "last_remediation_at": direction.get("last_remediation_at"),
+        "last_remediation_task_id": direction.get("last_remediation_task_id"),
+        "last_remediation_fingerprint": direction.get("last_remediation_fingerprint"),
+    }
+
     research_payload: dict = {
         "type": "research",
         "research_mode": "diagnosis",
@@ -1174,6 +1182,7 @@ async def _spawn_direction_diagnosis(
         "pause_reason": pause_reason,
         "failed_task_signatures": failed_signatures,
         "failure_taxonomy_counts": taxonomy_counts,
+        "remediation_history": remediation_history,
         **({"model": research_model} if research_model else {}),
         **({"effort": research_effort} if research_effort else {}),
         **({"prompt_suffix": research_suffix} if research_suffix else {}),
