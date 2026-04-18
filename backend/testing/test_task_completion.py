@@ -7,9 +7,13 @@ Covers:
 - _inject_file_overlap_deps: file-overlap dependency injection and cycle fallback
 - _log_file_overlaps: overlapping file detection
 - _compute_first_attempt_succeeded: attempt_count threshold and status check
+- _ensure_branch: retry/backoff, token refresh, exists-verification, terminal failure
 """
 import json
 import pytest
+from unittest.mock import AsyncMock
+
+from fastapi import HTTPException
 
 from app.task_completion import (
     _parse_plan_output,
@@ -18,8 +22,10 @@ from app.task_completion import (
     _log_file_overlaps,
     _compute_first_attempt_succeeded,
     _validate_plan_dependencies,
+    _ensure_branch,
 )
 from app.models import TaskStatus
+from testing.factories import make_project, make_task
 
 
 # ── _compute_first_attempt_succeeded ────────────────────────────────────────
@@ -430,3 +436,242 @@ class TestLogFileOverlaps:
         assert len(overlaps) == 1
         assert overlaps[0][0] == 0
         assert overlaps[0][1] == 1
+
+
+# ── _ensure_branch ───────────────────────────────────────────────────────────
+
+@pytest.fixture
+def _patch_ensure_branch_deps(mocker):
+    """Patch asyncio.sleep and failure-alert plumbing for _ensure_branch tests."""
+    mocker.patch("app.task_completion.asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.record_task_result")
+
+
+class TestEnsureBranch:
+    @pytest.mark.asyncio
+    async def test_success_first_attempt(self, db_session, mocker, _patch_ensure_branch_deps):
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, payloads=[{"type": "plan"}])
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        get_token = mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        get_sha = mocker.patch(
+            "app.task_completion.get_branch_sha",
+            new_callable=AsyncMock,
+            return_value="abc123",
+        )
+        create = mocker.patch(
+            "app.task_completion.create_branch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+
+        ok = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+
+        assert ok is True
+        # Only source-branch SHA lookup + create, no verify path
+        assert get_sha.await_count == 1
+        assert create.await_count == 1
+        # First attempt: force_refresh must be False
+        assert get_token.await_args.kwargs.get("force_refresh") is False
+        assert task.status != TaskStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_transient_verify_error_does_not_short_circuit(
+        self, db_session, mocker, _patch_ensure_branch_deps
+    ):
+        """A 502 during verification is transient — keep retrying, eventually succeed."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, payloads=[{"type": "plan"}])
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        # First call (source SHA) OK, second call (verify) raises 502,
+        # third call (source SHA on retry) OK.
+        get_sha = mocker.patch(
+            "app.task_completion.get_branch_sha",
+            new_callable=AsyncMock,
+            side_effect=[
+                "abc123",
+                HTTPException(status_code=502, detail="bad gateway"),
+                "abc123",
+            ],
+        )
+        # Create fails once (triggering verify), succeeds second time
+        mocker.patch(
+            "app.task_completion.create_branch",
+            new_callable=AsyncMock,
+            side_effect=[RuntimeError("boom"), None],
+        )
+
+        ok = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+
+        assert ok is True
+        assert get_sha.await_count == 3
+        assert task.status != TaskStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_force_refresh_on_retry(self, db_session, mocker, _patch_ensure_branch_deps):
+        """On retry attempts (attempt > 0), token fetch uses force_refresh=True."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, payloads=[{"type": "plan"}])
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        get_token = mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        # First attempt fails outright at create; verify also 404s so we move on.
+        mocker.patch(
+            "app.task_completion.get_branch_sha",
+            new_callable=AsyncMock,
+            side_effect=[
+                "sha1",  # source SHA attempt 1
+                HTTPException(status_code=404, detail="not found"),  # verify
+                "sha1",  # source SHA attempt 2
+            ],
+        )
+        mocker.patch(
+            "app.task_completion.create_branch",
+            new_callable=AsyncMock,
+            side_effect=[RuntimeError("down"), None],
+        )
+
+        ok = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+
+        assert ok is True
+        # Attempt 0: force_refresh=False; attempt 1: force_refresh=True
+        refresh_flags = [
+            c.kwargs.get("force_refresh") for c in get_token.await_args_list
+        ]
+        assert refresh_flags == [False, True]
+
+    @pytest.mark.asyncio
+    async def test_branch_already_exists_short_circuits(
+        self, db_session, mocker, _patch_ensure_branch_deps
+    ):
+        """If create_branch fails but verify succeeds, we reuse the existing branch."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, payloads=[{"type": "plan"}])
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        get_sha = mocker.patch(
+            "app.task_completion.get_branch_sha",
+            new_callable=AsyncMock,
+            side_effect=["sha1", "sha2"],  # source SHA, then verify returns OK
+        )
+        create = mocker.patch(
+            "app.task_completion.create_branch",
+            new_callable=AsyncMock,
+            side_effect=HTTPException(status_code=422, detail="reference exists"),
+        )
+
+        ok = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+
+        assert ok is True
+        assert create.await_count == 1
+        assert get_sha.await_count == 2
+        assert task.status != TaskStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_failure_after_all_retries_marks_task_failed(
+        self, db_session, mocker, _patch_ensure_branch_deps
+    ):
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, payloads=[{"type": "plan"}])
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.task_completion.get_branch_sha",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("persistent failure"),
+        )
+        mocker.patch(
+            "app.task_completion.create_branch",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("should not reach"),
+        )
+        alert = mocker.patch(
+            "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        )
+
+        ok = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+
+        assert ok is False
+        assert task.status == TaskStatus.FAILED
+        assert "Failed to create plan branch" in (task.latest_status_message or "")
+        assert alert.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_github_token_marks_task_failed(
+        self, db_session, mocker, _patch_ensure_branch_deps
+    ):
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, payloads=[{"type": "plan"}])
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("no installation token"),
+        )
+        get_sha = mocker.patch(
+            "app.task_completion.get_branch_sha", new_callable=AsyncMock
+        )
+
+        ok = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+
+        assert ok is False
+        assert task.status == TaskStatus.FAILED
+        # Token fetch failed before any GitHub call — verify was never reached.
+        assert get_sha.await_count == 0

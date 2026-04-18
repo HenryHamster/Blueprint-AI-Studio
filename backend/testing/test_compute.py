@@ -390,3 +390,115 @@ class TestZoneHealthRestoreDeque:
         zone = "us-central1-f"
         self._restore_zone_health({zone: {"last_failure_reason": None}})
         assert compute._zone_health[zone]["last_failure_reason"] is None
+
+
+class TestZoneCooldownSeconds:
+    """Cover _zone_cooldown_seconds exponential backoff with 1800s cap."""
+
+    def test_zero_failures_baseline(self):
+        assert compute._zone_cooldown_seconds(0) == compute.ZONE_COOLDOWN_SECONDS
+
+    def test_doubling_on_each_failure(self):
+        base = compute.ZONE_COOLDOWN_SECONDS
+        assert compute._zone_cooldown_seconds(1) == min(base * 2, 1800)
+        assert compute._zone_cooldown_seconds(2) == min(base * 4, 1800)
+        assert compute._zone_cooldown_seconds(3) == min(base * 8, 1800)
+
+    def test_cap_at_1800_seconds(self):
+        assert compute._zone_cooldown_seconds(10) == 1800
+        assert compute._zone_cooldown_seconds(100) == 1800
+
+    def test_monotonically_non_decreasing(self):
+        prev = 0
+        for n in range(0, 15):
+            current = compute._zone_cooldown_seconds(n)
+            assert current >= prev
+            prev = current
+
+
+class TestValidatePayloadUri:
+    """Cover validate_payload_uri GCS URI format validation."""
+
+    def test_valid_simple_uri(self):
+        compute.validate_payload_uri("gs://bucket/object")
+
+    def test_valid_nested_path(self):
+        compute.validate_payload_uri("gs://my-bucket/path/to/file.json")
+
+    def test_valid_with_allowed_special_chars(self):
+        compute.validate_payload_uri("gs://bucket.name_1-2/a_b.c-d/e.json")
+
+    @pytest.mark.parametrize("uri", [
+        "",
+        "   ",
+        "http://bucket/object",
+        "s3://bucket/object",
+        "gs://bucket",
+        "gs://bucket/",
+        "gs:///object",
+        "gs://bucket/object with spaces",
+        "gs://bucket/obj#frag",
+        "gs://bucket/obj?query",
+        "gs://bucket/obj*",
+        "/local/path",
+    ])
+    def test_invalid_uris_raise_value_error(self, uri):
+        with pytest.raises(ValueError, match="Invalid payload_uri"):
+            compute.validate_payload_uri(uri)
+
+
+def _cooldown_all_zones(expires_at: datetime) -> None:
+    """Mark every fallback zone as in cooldown with the given expiry."""
+    for zone, _subnet in compute.FALLBACK_ZONES:
+        compute._zone_health[zone] = {"cooldown_expires_at": expires_at}
+
+
+class TestAnyZoneAvailable:
+    """Tests for any_zone_available()."""
+
+    def test_empty_health_dict_returns_true(self, clean_zone_health):
+        assert compute.any_zone_available() is True
+
+    def test_one_available_others_in_cooldown(self, clean_zone_health):
+        future = datetime.now(timezone.utc) + timedelta(minutes=5)
+        _cooldown_all_zones(future)
+        # Clear cooldown on one zone
+        compute._zone_health[compute.FALLBACK_ZONES[0][0]] = {"cooldown_expires_at": None}
+        assert compute.any_zone_available() is True
+
+    def test_all_zones_in_cooldown_returns_false(self, clean_zone_health):
+        future = datetime.now(timezone.utc) + timedelta(minutes=5)
+        _cooldown_all_zones(future)
+        assert compute.any_zone_available() is False
+
+    def test_cooldown_expired_returns_true(self, clean_zone_health):
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        _cooldown_all_zones(past)
+        assert compute.any_zone_available() is True
+
+
+class TestSoonestZoneRecovery:
+    """Tests for soonest_zone_recovery()."""
+
+    def test_no_zones_in_health_returns_none(self, clean_zone_health):
+        assert compute.soonest_zone_recovery() is None
+
+    def test_one_zone_available_returns_none(self, clean_zone_health):
+        future = datetime.now(timezone.utc) + timedelta(minutes=5)
+        _cooldown_all_zones(future)
+        compute._zone_health[compute.FALLBACK_ZONES[0][0]] = {"cooldown_expires_at": None}
+        assert compute.soonest_zone_recovery() is None
+
+    def test_all_in_cooldown_returns_earliest(self, clean_zone_health):
+        now = datetime.now(timezone.utc)
+        for idx, (zone, _subnet) in enumerate(compute.FALLBACK_ZONES):
+            compute._zone_health[zone] = {
+                "cooldown_expires_at": now + timedelta(minutes=10 + idx),
+            }
+        expected = now + timedelta(minutes=10)
+        assert compute.soonest_zone_recovery() == expected
+
+    def test_expired_cooldown_returns_none(self, clean_zone_health):
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        _cooldown_all_zones(past)
+        assert compute.soonest_zone_recovery() is None

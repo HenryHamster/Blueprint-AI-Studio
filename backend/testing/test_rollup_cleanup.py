@@ -1578,3 +1578,120 @@ async def test_merge_conflict_deferral_counter_escalates_to_approval(cleanup_db,
     assert parent.requires_approval is True
     mock_dispatch.assert_awaited_once()
     mock_spawn.assert_not_called()
+
+
+# ── Tests for requeue limit and partial-rollup paths ──────────────────────────
+
+@pytest.mark.asyncio
+async def test_requeue_called_when_below_limit_with_mixed_children(cleanup_db, mocker):
+    """When some children failed and _requeue_count < MAX_PARENT_REQUEUES (3),
+    _requeue_parent_task is invoked instead of proceeding to partial rollup."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mock_requeue = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "_requeue_count": 1,  # below MAX_PARENT_REQUEUES (3)
+            "plan_branch": "blueprint/plan-mixed",
+            "parent_base": "main",
+        },
+        plan_output="some plan",
+    )
+    merged_child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    failed_child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+    )
+
+    await _check_and_trigger_rollup(failed_child, cleanup_db)
+
+    mock_requeue.assert_awaited_once()
+    # Parent should not be FAILED — requeue path defers the decision
+    await cleanup_db.refresh(parent)
+    assert parent.status != TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_partial_rollup_proceeds_when_requeue_limit_exhausted(cleanup_db, mocker):
+    """When _requeue_count == MAX_PARENT_REQUEUES (3) and some children merged
+    while others failed, the rollup proceeds with the merged subset only —
+    create_pull_request is invoked and _requeue_parent_task is NOT called."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    # empty_diff short-circuits the rollup to COMPLETED — keeps the test scope
+    # to verifying that the PR-creation path was entered (i.e. partial rollup).
+    mock_create_pr = mocker.patch(
+        "app.github.create_pull_request",
+        new_callable=AsyncMock,
+        return_value={"empty_diff": True},
+    )
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mock_requeue = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "_requeue_count": 3,  # at MAX_PARENT_REQUEUES
+            "plan_branch": "blueprint/plan-partial",
+            "parent_base": "main",
+        },
+        plan_output="some plan",
+    )
+    merged_child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    failed_child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+    )
+
+    await _check_and_trigger_rollup(failed_child, cleanup_db)
+
+    mock_requeue.assert_not_awaited()
+    mock_create_pr.assert_awaited_once()
+    # Verify rollup PR head is the staging branch (only merged child's work)
+    call_kwargs = mock_create_pr.call_args.kwargs
+    assert call_kwargs.get("head") == "blueprint/plan-partial"
+    await cleanup_db.refresh(parent)
+    # empty_diff path completes the parent
+    assert parent.status == TaskStatus.COMPLETED

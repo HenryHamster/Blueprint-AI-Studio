@@ -20,6 +20,7 @@ from app.strategic_completion import (
     _check_direction_completion,
     _is_direction_duplicate,
     _record_strategic_task_failure,
+    _check_direction_starvation,
 )
 from app.models import Project, Task, TaskStatus
 
@@ -558,3 +559,184 @@ class TestRecordStrategicTaskFailure:
         await strat_fail_db.commit()
         # Should not raise
         await _record_strategic_task_failure(task, strat_fail_db)
+
+
+# ── _check_direction_starvation ──────────────────────────────────────────────
+
+
+def _active_dir(**kwargs):
+    base = {"id": f"d-{kwargs.get('id', 'x')}", "status": "active"}
+    base.update(kwargs)
+    return base
+
+
+class TestCheckDirectionStarvation:
+
+    @pytest.mark.asyncio
+    async def test_no_gaps_resets_counter(self, strat_fail_db, mocker):
+        mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        # 3 active product directions, not saturated → no gaps
+        project = Project(
+            name="P", user_id="u1",
+            vision={"_direction_starvation_count": 3, "_strategic_frequency_override": 2},
+            directions=[
+                _active_dir(id="1", category="product"),
+                _active_dir(id="2", category="product"),
+                _active_dir(id="3", category="product"),
+            ],
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+
+        assert project.vision.get("_direction_starvation_count") == 0
+        assert "_strategic_frequency_override" not in project.vision
+
+    @pytest.mark.asyncio
+    async def test_dirs_created_resets_counter(self, strat_fail_db, mocker):
+        mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        project = Project(
+            name="P", user_id="u1",
+            vision={"_direction_starvation_count": 4, "_strategic_frequency_override": 2},
+            directions=[_active_dir(id="1", category="product")],
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        # dirs_created > 0 → reset even though has_gaps is True
+        await _check_direction_starvation(project, dirs_created=1, session=strat_fail_db)
+
+        assert project.vision.get("_direction_starvation_count") == 0
+        assert "_strategic_frequency_override" not in project.vision
+
+    @pytest.mark.asyncio
+    async def test_below_minimum_increments_counter(self, strat_fail_db, mocker):
+        alert_mock = mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        project = Project(
+            name="P", user_id="u1", vision={},
+            directions=[_active_dir(id="1", category="product")],
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+
+        assert project.vision.get("_direction_starvation_count") == 1
+        # Level 1 — no alert, no override
+        assert "_strategic_frequency_override" not in project.vision
+        alert_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_level_2_creates_alert_and_frequency_override(self, strat_fail_db, mocker):
+        alert_mock = mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        project = Project(
+            name="P", user_id="u1",
+            vision={"_direction_starvation_count": 1},
+            directions=[_active_dir(id="1", category="product")],
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+
+        assert project.vision.get("_direction_starvation_count") == 2
+        assert project.vision.get("_strategic_frequency_override") == 2
+        alert_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_level_5_auto_creates_no_product_fallback(self, strat_fail_db, mocker):
+        alert_mock = mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        # Active directions but NONE are product → gap_type=NO_PRODUCT_DIRECTIONS
+        project = Project(
+            name="P", user_id="u1",
+            vision={"_direction_starvation_count": 4, "_strategic_frequency_override": 2},
+            directions=[
+                _active_dir(id="1", category="structural"),
+                _active_dir(id="2", category="structural"),
+                _active_dir(id="3", category="structural"),
+            ],
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+
+        # Fallback direction appended with product category
+        assert len(project.directions) == 4
+        new_dir = project.directions[-1]
+        assert new_dir["category"] == "product"
+        assert new_dir["status"] == "active"
+        assert new_dir["priority"] == "medium"
+        assert new_dir["id"].startswith("d-")
+        # Counter and override cleared
+        assert project.vision.get("_direction_starvation_count") == 0
+        assert "_strategic_frequency_override" not in project.vision
+        alert_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_level_5_below_minimum_fallback_no_category(self, strat_fail_db, mocker):
+        mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        # 1 active product direction; product_count > 0 but active_count < 3
+        project = Project(
+            name="P", user_id="u1",
+            vision={"_direction_starvation_count": 4},
+            directions=[_active_dir(id="1", category="product")],
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+
+        assert len(project.directions) == 2
+        new_dir = project.directions[-1]
+        # BELOW_MINIMUM → no category set
+        assert "category" not in new_dir
+
+    @pytest.mark.asyncio
+    async def test_level_5_all_saturated_fallback(self, strat_fail_db, mocker):
+        mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        # 3 active product directions, all saturated → gap_type=ALL_SATURATED
+        project = Project(
+            name="P", user_id="u1",
+            vision={"_direction_starvation_count": 4},
+            directions=[
+                _active_dir(id="1", category="product", possibly_saturated=True),
+                _active_dir(id="2", category="product", possibly_saturated=True),
+                _active_dir(id="3", category="product", possibly_saturated=True),
+            ],
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+
+        assert len(project.directions) == 4
+        new_dir = project.directions[-1]
+        assert "category" not in new_dir
+
+    @pytest.mark.asyncio
+    async def test_level_5_cap_reached_skips_creation(self, strat_fail_db, mocker):
+        alert_mock = mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"max_active_directions": 2},
+            clear=False,
+        )
+        project = Project(
+            name="P", user_id="u1",
+            vision={"_direction_starvation_count": 4},
+            directions=[
+                _active_dir(id="1", category="structural"),
+                _active_dir(id="2", category="structural"),
+            ],
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        await _check_direction_starvation(project, dirs_created=0, session=strat_fail_db)
+
+        # No fallback added, counter NOT reset (kept incrementing)
+        assert len(project.directions) == 2
+        assert project.vision.get("_direction_starvation_count") == 5
+        alert_mock.assert_not_called()
