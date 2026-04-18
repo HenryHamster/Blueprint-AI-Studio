@@ -522,19 +522,27 @@ async def _process_direction_lifecycle(
         # alert so the UI stops showing a permanent red banner after recovery.
         monitor_started_at = d.get("remediation_monitor_started_at")
         if monitor_started_at:
+            expired = False
+            age_desc = ""
             try:
                 age_days = (_utcnow() - datetime.fromisoformat(monitor_started_at)).total_seconds() / 86400
                 if age_days > _REMEDIATION_MONITOR_EXPIRY_DAYS:
-                    d.pop("remediation_monitor_started_at", None)
-                    cleared = d.pop("needs_manual_intervention", None)
-                    logger.info(
-                        f"[AUTONOMOUS] Remediation monitor expired for {did} "
-                        f"(age {age_days:.1f}d); "
-                        f"{'cleared needs_manual_intervention' if cleared else 'no intervention flag to clear'}"
-                    )
-                    directions_modified = True
+                    expired = True
+                    age_desc = f"age {age_days:.1f}d"
             except (TypeError, ValueError):
-                pass
+                # Unparseable timestamp — safer to treat the monitor as expired
+                # than to keep it active indefinitely and risk a false escalation.
+                expired = True
+                age_desc = f"unparseable timestamp {monitor_started_at!r}"
+            if expired:
+                d.pop("remediation_monitor_started_at", None)
+                cleared = d.pop("needs_manual_intervention", None)
+                logger.info(
+                    f"[AUTONOMOUS] Remediation monitor expired for {did} "
+                    f"({age_desc}); "
+                    f"{'cleared needs_manual_intervention' if cleared else 'no intervention flag to clear'}"
+                )
+                directions_modified = True
         last_researched = d.get("last_researched_at")
         if last_researched:
             minutes_ago = (now - datetime.fromisoformat(last_researched)).total_seconds() / 60
@@ -589,7 +597,14 @@ async def _process_direction_lifecycle(
                             f"(age {age_days:.1f}d > {_REMEDIATION_MONITOR_EXPIRY_DAYS}d)"
                         )
                 except (TypeError, ValueError):
-                    pass
+                    # Unparseable timestamp — safe default is to treat the monitor
+                    # as expired so escalation logic does not fire off a bad value.
+                    monitor_expired = True
+                    d.pop("remediation_monitor_started_at", None)
+                    logger.warning(
+                        f"[AUTONOMOUS] Cleared unparseable remediation monitor on {did}: "
+                        f"{monitor_started_at!r}"
+                    )
             # Only escalate when the monitor is active AND the recurring failure matches
             # the fingerprint we already remediated (or fingerprint data is unavailable —
             # conservative fallback so we don't silently drop escalations).

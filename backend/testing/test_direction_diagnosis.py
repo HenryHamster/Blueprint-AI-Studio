@@ -1245,6 +1245,35 @@ async def test_expired_monitor_on_active_direction_clears_intervention(db_sessio
     assert "remediation_monitor_started_at" not in d
 
 
+@pytest.mark.asyncio
+async def test_unparseable_monitor_timestamp_clears_monitor(db_session):
+    """A non-ISO remediation_monitor_started_at must default to expired and clear,
+    not silently keep monitoring active and risk false escalation."""
+    direction = {
+        "id": "d-monitor-bad-ts",
+        "text": "Direction with corrupted monitor timestamp",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "needs_manual_intervention": True,
+        "remediation_monitor_started_at": "not-a-real-iso-timestamp",
+        "last_remediation_result": "merged",
+        "last_remediation_fingerprint": "fp-old",
+    }
+    project = await _make_intervention_project(db_session, direction)
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "active"
+    assert "remediation_monitor_started_at" not in d
+    assert "needs_manual_intervention" not in d
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Cross-direction shared-fingerprint detection
 # ─────────────────────────────────────────────────────────────────────────────
