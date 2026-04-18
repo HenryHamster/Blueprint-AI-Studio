@@ -205,6 +205,30 @@ def _calibrate_scope(
         return stats["merged"] / effective
 
     rate = _merge_rate(proposed_scope)
+
+    # Overflow-rate escalation: even when the merge rate is acceptable,
+    # proactively upgrade a scope that predictably overflows. Without this,
+    # compute is spent on a first attempt that gets rescoped on retry anyway.
+    proposed_stats = agg.get(proposed_scope)
+    if (
+        proposed_stats
+        and proposed_stats.get("created", 0) >= 3
+        and idx + 1 < len(_SCOPE_ORDER)
+    ):
+        overflow = proposed_stats.get("failed_scope_overflow", 0)
+        overflow_rate = overflow / proposed_stats["created"]
+        if overflow_rate >= 0.3:
+            larger = _SCOPE_ORDER[idx + 1]
+            logger.info(
+                "[RESEARCH] Upgrading scope %s→%s for direction '%s' "
+                "(%s overflow rate %.0f%% >= 30%%, %d/%d tasks overflowed)",
+                proposed_scope, larger,
+                direction.get("title", direction.get("id", "?")),
+                source, overflow_rate * 100,
+                overflow, proposed_stats["created"],
+            )
+            return larger, proposed_scope
+
     if rate is None or rate >= threshold:
         return proposed_scope, None
 

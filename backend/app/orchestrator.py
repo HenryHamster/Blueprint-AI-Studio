@@ -1143,15 +1143,62 @@ async def orchestrator_worker():
                     if _degradation_signals:
                         _task_by_id = {t.id: t for t in candidate_tasks}
                         _original_order = list(eligible_ids)
+
+                        # Load projects for candidate tasks (once per cycle) so we can
+                        # compute real P(success) via predict_spawn_success instead of
+                        # relying on the static small/low-risk bonus alone. Cache the
+                        # score per (project_id, direction_id, scope) since many tasks
+                        # may share the same direction within a dispatch cycle.
+                        from app.spawn_calibration import predict_spawn_success
+                        _project_ids = {
+                            _task_by_id[tid].project_id
+                            for tid in eligible_ids
+                            if tid in _task_by_id and _task_by_id[tid].project_id is not None
+                        }
+                        _projects_by_id: dict = {}
+                        if _project_ids:
+                            _proj_rows = (await session.execute(
+                                select(Project).where(Project.id.in_(_project_ids))
+                            )).scalars().all()
+                            _projects_by_id = {p.id: p for p in _proj_rows}
+                        _confidence_cache: dict = {}
+
+                        def _confidence_score(tid: str) -> float:
+                            t = _task_by_id.get(tid)
+                            if t is None:
+                                return 0.5
+                            ctx = t.context or {}
+                            scope = ctx.get("scope") or "medium"
+                            dir_id = str(ctx.get("direction_id") or "")
+                            cache_key = (t.project_id, dir_id, scope)
+                            if cache_key in _confidence_cache:
+                                return _confidence_cache[cache_key]
+                            proj = _projects_by_id.get(t.project_id)
+                            direction: dict = {}
+                            if proj and dir_id:
+                                for d in (proj.directions or []):
+                                    if str(d.get("id") or "") == dir_id:
+                                        direction = d
+                                        break
+                            try:
+                                score = predict_spawn_success(scope, direction, proj)
+                            except Exception:
+                                score = 0.5
+                            _confidence_cache[cache_key] = score
+                            return score
+
                         eligible_ids = sorted(
                             eligible_ids,
-                            key=lambda tid: _health_score_task(_task_by_id[tid]) if tid in _task_by_id else 0,
+                            key=lambda tid: (
+                                _confidence_score(tid),
+                                _health_score_task(_task_by_id[tid]) if tid in _task_by_id else 0,
+                            ),
                             reverse=True,
                         )
                         if eligible_ids != _original_order:
                             logger.info(
                                 "[ORCHESTRATOR] Health-aware reordering applied (%s): "
-                                "%d eligible tasks reordered to prioritize small/low-risk scope",
+                                "%d eligible tasks reordered by P(success) confidence",
                                 ", ".join(_degradation_signals),
                                 len(eligible_ids),
                             )

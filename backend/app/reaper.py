@@ -536,12 +536,34 @@ async def reaper_service():
                             elif is_provision_failure:
                                 delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75-6.25 minutes
                             elif reap_failure_class == "EXTERNAL_API":
-                                # Longer delays for transient API outages (GitHub 502, DNS flakes)
-                                # that typically resolve in 15-60 minutes.
-                                # Delays: 5, 15, 30, 60 min (one per attempt index)
-                                _ext_api_delays = [5, 15, 30, 60]
-                                _attempt_idx = min(task.attempt_count - 1, len(_ext_api_delays) - 1)
-                                delay_minutes = _ext_api_delays[_attempt_idx] * random.uniform(0.75, 1.25)
+                                # Adaptive delay: transient HTTP 5xx on a task with no successful
+                                # work typically resolves in 1-3 minutes, so don't wait 5+ minutes
+                                # on first retry. Sustained outages fall through to [5,15,30,60].
+                                _err_blob = (combined_logs + " " + (task.latest_status_message or "")).lower()
+                                _transient_5xx = any(p in _err_blob for p in (
+                                    "http 502", "http 503", "http 504",
+                                    "502 bad gateway", "503 service", "504 gateway",
+                                    "server error",
+                                ))
+                                _has_work = bool((task.context or {}).get("pr_number"))
+                                _gh_consec = _external_health.get("consecutive_failures", {}).get("github_api", 0)
+                                if _transient_5xx and not _has_work and _gh_consec == 0:
+                                    # Dependency already recovered — requeue immediately.
+                                    delay_minutes = 0
+                                elif _transient_5xx and not _has_work and task.attempt_count == 1:
+                                    # First-attempt short delay for transient 5xx.
+                                    delay_minutes = 1.5 * random.uniform(0.75, 1.25)
+                                elif _transient_5xx and not _has_work:
+                                    # Subsequent retries for transient 5xx: [5, 15, 30].
+                                    _t5xx_delays = [5, 15, 30]
+                                    _idx = min(task.attempt_count - 2, len(_t5xx_delays) - 1)
+                                    delay_minutes = _t5xx_delays[_idx] * random.uniform(0.75, 1.25)
+                                else:
+                                    # Non-transient (DNS, TLS, context_length_exceeded) or task
+                                    # already has committed work — use the longer sequence.
+                                    _ext_api_delays = [5, 15, 30, 60]
+                                    _attempt_idx = min(task.attempt_count - 1, len(_ext_api_delays) - 1)
+                                    delay_minutes = _ext_api_delays[_attempt_idx] * random.uniform(0.75, 1.25)
                             else:
                                 # Exponential backoff for agent failures: 1, 2, 4, 8 min capped at 15
                                 delay_minutes = min(2 ** (task.attempt_count - 1), 15) * random.uniform(0.75, 1.25)

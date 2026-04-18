@@ -2416,6 +2416,55 @@ class TestCalibrateScope:
         # Only last 3 (recent_good x3) used → medium rate 80%, no downgrade
         assert _calibrate_scope("medium", d) == ("medium", None)
 
+    def test_high_overflow_rate_escalates_even_with_acceptable_merge_rate(self):
+        """High failed_scope_overflow rate escalates to larger scope despite acceptable merge rate."""
+        # medium: 10 created, 6 merged (60%), 4 failed incl. 4 overflow → 40% overflow
+        # Merge rate alone would not trigger downgrade/upgrade, but overflow rate does.
+        d = self._direction([
+            {"medium": {
+                "created": 10, "merged": 6, "failed": 4,
+                "failed_infra": 4, "failed_scope_overflow": 4,
+            }},
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "large"
+        assert calibrated_from == "medium"
+
+    def test_low_overflow_rate_does_not_escalate(self):
+        """Overflow rate below 30% does not trigger escalation."""
+        d = self._direction([
+            {"medium": {
+                "created": 10, "merged": 7, "failed": 3,
+                "failed_infra": 1, "failed_scope_overflow": 1,
+            }},
+        ])
+        assert _calibrate_scope("medium", d) == ("medium", None)
+
+    def test_overflow_escalation_requires_3_data_points(self):
+        """Fewer than 3 created at scope → overflow escalation does not fire."""
+        # Only 2 medium tasks; project fallback also insufficient → cold-start path
+        d = self._direction([
+            {"medium": {
+                "created": 2, "merged": 0, "failed": 2,
+                "failed_infra": 2, "failed_scope_overflow": 2,
+            },
+             "small": {"created": 3, "merged": 2, "failed": 1}},
+        ])
+        # 2 medium created < 3 → overflow escalation skipped; medium effective
+        # denominator also < 3 so merge rate is None → returns unchanged.
+        assert _calibrate_scope("medium", d) == ("medium", None)
+
+    def test_overflow_escalation_skipped_for_large_scope(self):
+        """Large scope has no larger scope to escalate to → no-op."""
+        d = self._direction([
+            {"large": {
+                "created": 10, "merged": 6, "failed": 4,
+                "failed_infra": 4, "failed_scope_overflow": 4,
+            }},
+        ])
+        # 60% merge rate, 40% overflow, but no scope larger than "large"
+        assert _calibrate_scope("large", d) == ("large", None)
+
     def test_unknown_scope_returns_unchanged(self):
         """Unrecognized scope string → no downgrade (not in SCOPE_ORDER)."""
         d = self._direction([

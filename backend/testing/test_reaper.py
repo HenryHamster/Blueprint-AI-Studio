@@ -560,7 +560,9 @@ async def test_external_api_retry_delay_escalates_with_attempt_count(
         status=TaskStatus.IN_PROGRESS,
         attempt_count=2,
         last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
-        context={"last_error": "api.github.com: 502 bad gateway"},
+        # pr_number indicates successful work — routes through the non-transient
+        # [5,15,30,60] sequence rather than the adaptive-5xx fast path.
+        context={"last_error": "api.github.com: 502 bad gateway", "pr_number": 42},
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -577,6 +579,80 @@ async def test_external_api_retry_delay_escalates_with_attempt_count(
     # 30 min * 0.9 = 27 min. Without escalation (e.g. general backoff at attempt 3)
     # we'd see min(2^2, 15) * 0.9 = 3.6 min, so the 20-min floor confirms escalation.
     assert 20 <= delay_min <= 29, f"expected ~27min (30min * 0.9 jitter), got {delay_min:.1f}min"
+
+
+@pytest.mark.asyncio
+async def test_external_api_transient_5xx_uses_short_first_delay(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Transient 5xx with no committed work + unhealthy github_api uses 1.5min first-attempt delay."""
+    mocker.patch("app.reaper.random.uniform", return_value=1.0)
+    # Mark github_api as currently failing so the fast-path "skip delay" branch
+    # isn't taken — we want to verify the 1.5-minute first-attempt delay here.
+    mocker.patch.dict(
+        "app.reaper._external_health",
+        {"consecutive_failures": {"github_api": 2}},
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-api-transient",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        context={"last_error": "HTTP 503 Service Unavailable from api.github.com"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    before = datetime.utcnow()
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 1
+    ra = (t.context or {}).get("retry_after")
+    assert ra
+    delay_min = (datetime.fromisoformat(ra) - before).total_seconds() / 60
+    # 1.5 min * 1.0 jitter, allowing margin for test latency.
+    assert 0.5 <= delay_min <= 3.0, f"expected ~1.5min, got {delay_min:.1f}min"
+
+
+@pytest.mark.asyncio
+async def test_external_api_transient_5xx_skips_delay_when_healthy(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Transient 5xx + github_api recovered (consecutive_failures==0) → immediate requeue."""
+    mocker.patch("app.reaper.random.uniform", return_value=1.0)
+    mocker.patch.dict(
+        "app.reaper._external_health",
+        {"consecutive_failures": {"github_api": 0}},
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-api-healthy",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        context={"last_error": "502 Bad Gateway from api.github.com"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    before = datetime.utcnow()
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    ra = (t.context or {}).get("retry_after")
+    assert ra
+    delay_min = (datetime.fromisoformat(ra) - before).total_seconds() / 60
+    assert delay_min < 1.0, f"expected near-zero delay, got {delay_min:.1f}min"
 
 
 @pytest.mark.asyncio
