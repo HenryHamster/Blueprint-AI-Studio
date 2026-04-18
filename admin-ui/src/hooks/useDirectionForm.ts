@@ -10,6 +10,7 @@ export function useDirectionForm() {
   const [newCategory, setNewCategory] = useState<DirectionCategory>(null);
   const [newPathTags, setNewPathTags] = useState<string[]>([]);
   const [newPathInput, setNewPathInput] = useState('');
+  const [newCompletionCriteria, setNewCompletionCriteria] = useState('');
 
   // Edit form state
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -19,6 +20,7 @@ export function useDirectionForm() {
   const [editCategory, setEditCategory] = useState<DirectionCategory>(null);
   const [editPathTags, setEditPathTags] = useState<string[]>([]);
   const [editPathInput, setEditPathInput] = useState('');
+  const [editCompletionCriteria, setEditCompletionCriteria] = useState('');
 
   function startEdit(d: Direction) {
     setEditingId(d.id);
@@ -28,6 +30,7 @@ export function useDirectionForm() {
     setEditCategory(d.category ?? null);
     setEditPathTags(d.paths ?? []);
     setEditPathInput('');
+    setEditCompletionCriteria(d.completion_criteria ?? '');
   }
 
   function resetAddForm() {
@@ -36,6 +39,7 @@ export function useDirectionForm() {
     setNewCategory(null);
     setNewPathTags([]);
     setNewPathInput('');
+    setNewCompletionCriteria('');
   }
 
   return {
@@ -44,6 +48,7 @@ export function useDirectionForm() {
     newCategory, setNewCategory,
     newPathTags, setNewPathTags,
     newPathInput, setNewPathInput,
+    newCompletionCriteria, setNewCompletionCriteria,
     editingId, setEditingId,
     editText, setEditText,
     editPriority, setEditPriority,
@@ -51,6 +56,7 @@ export function useDirectionForm() {
     editCategory, setEditCategory,
     editPathTags, setEditPathTags,
     editPathInput, setEditPathInput,
+    editCompletionCriteria, setEditCompletionCriteria,
     startEdit,
     resetAddForm,
   };

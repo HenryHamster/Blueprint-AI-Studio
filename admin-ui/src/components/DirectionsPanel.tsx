@@ -193,6 +193,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
     try {
       const body: Record<string, unknown> = { text: form.newText.trim(), priority: form.newPriority, paths: form.newPathTags };
       if (form.newCategory) body.category = form.newCategory;
+      body.completion_criteria = form.newCompletionCriteria.trim() || null;
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions`, {
         method: 'POST',
         body: JSON.stringify(body),
@@ -210,7 +211,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
     try {
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
         method: 'PATCH',
-        body: JSON.stringify({ text: form.editText, priority: form.editPriority, status: form.editStatus, paths: form.editPathTags, category: form.editCategory ?? null }),
+        body: JSON.stringify({ text: form.editText, priority: form.editPriority, status: form.editStatus, paths: form.editPathTags, category: form.editCategory ?? null, completion_criteria: form.editCompletionCriteria.trim() || null }),
       });
       if (!res.ok) throw new Error('Failed to update direction');
       form.setEditingId(null);
@@ -606,6 +607,13 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                 className="flex-1 min-w-[120px] bg-transparent text-neutral-100 text-xs focus:outline-none placeholder-neutral-600"
               />
             </div>
+            <textarea
+              value={form.newCompletionCriteria}
+              onChange={e => form.setNewCompletionCriteria(e.target.value)}
+              placeholder="Done when..."
+              rows={2}
+              className="mt-1.5 w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
+            />
           </div>
         )}
 
@@ -777,6 +785,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                             editCategory={form.editCategory}
                             editPathTags={form.editPathTags}
                             editPathInput={form.editPathInput}
+                            editCompletionCriteria={form.editCompletionCriteria}
                             setEditingId={form.setEditingId}
                             setEditText={form.setEditText}
                             setEditPriority={form.setEditPriority}
@@ -784,6 +793,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                             setEditCategory={form.setEditCategory}
                             setEditPathTags={form.setEditPathTags}
                             setEditPathInput={form.setEditPathInput}
+                            setEditCompletionCriteria={form.setEditCompletionCriteria}
                             startEdit={form.startEdit}
                             updateDirection={updateDirection}
                             approveProposal={approveProposal}

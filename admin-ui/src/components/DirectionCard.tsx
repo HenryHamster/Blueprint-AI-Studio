@@ -33,6 +33,7 @@ export interface DirectionCardProps {
   editCategory: DirectionCategory;
   editPathTags: string[];
   editPathInput: string;
+  editCompletionCriteria: string;
   setEditingId: React.Dispatch<React.SetStateAction<string | null>>;
   setEditText: React.Dispatch<React.SetStateAction<string>>;
   setEditPriority: React.Dispatch<React.SetStateAction<'high' | 'medium' | 'low'>>;
@@ -40,6 +41,7 @@ export interface DirectionCardProps {
   setEditCategory: React.Dispatch<React.SetStateAction<DirectionCategory>>;
   setEditPathTags: React.Dispatch<React.SetStateAction<string[]>>;
   setEditPathInput: React.Dispatch<React.SetStateAction<string>>;
+  setEditCompletionCriteria: React.Dispatch<React.SetStateAction<string>>;
   startEdit: (d: Direction) => void;
   // Action handlers
   updateDirection: (id: string) => Promise<void>;
@@ -75,8 +77,8 @@ export function DirectionCard({
   direction: d,
   statusKey: key,
   activeItems,
-  editingId, editText, editPriority, editStatus, editCategory, editPathTags, editPathInput,
-  setEditingId, setEditText, setEditPriority, setEditStatus, setEditCategory, setEditPathTags, setEditPathInput,
+  editingId, editText, editPriority, editStatus, editCategory, editPathTags, editPathInput, editCompletionCriteria,
+  setEditingId, setEditText, setEditPriority, setEditStatus, setEditCategory, setEditPathTags, setEditPathInput, setEditCompletionCriteria,
   startEdit,
   updateDirection, approveProposal, rejectProposal, reviveProposal,
   reactivateDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
@@ -204,6 +206,13 @@ export function DirectionCard({
             value={editText}
             onChange={e => setEditText(e.target.value)}
             className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+          />
+          <textarea
+            value={editCompletionCriteria}
+            onChange={e => setEditCompletionCriteria(e.target.value)}
+            placeholder="Done when..."
+            rows={2}
+            className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
           />
           <div className="bg-neutral-950 border border-neutral-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center focus-within:ring-1 focus-within:ring-neutral-600">
             {editPathTags.map(tag => (

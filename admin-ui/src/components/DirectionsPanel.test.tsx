@@ -39,6 +39,8 @@ vi.mock('../hooks/useDirectionForm', () => ({
     setNewPathTags: vi.fn(),
     newPathInput: '',
     setNewPathInput: vi.fn(),
+    newCompletionCriteria: 'Done when merged',
+    setNewCompletionCriteria: vi.fn(),
     editingId: null,
     setEditingId: vi.fn(),
     editText: '',
@@ -51,6 +53,8 @@ vi.mock('../hooks/useDirectionForm', () => ({
     setEditStatus: vi.fn(),
     setEditPathTags: vi.fn(),
     setEditPathInput: vi.fn(),
+    editCompletionCriteria: '',
+    setEditCompletionCriteria: vi.fn(),
     startEdit: vi.fn(),
     resetAddForm: vi.fn(),
   }),
@@ -199,6 +203,12 @@ describe('DirectionsPanel', () => {
         expect.objectContaining({ method: 'POST' })
       );
     });
+    const postCall = fetchSpy.mock.calls.find(
+      (c) => (c[1] as RequestInit | undefined)?.method === 'POST',
+    );
+    expect(postCall).toBeDefined();
+    const body = JSON.parse((postCall![1] as RequestInit).body as string);
+    expect(body.completion_criteria).toBe('Done when merged');
   });
 
   it('clicking the close backdrop fires onClose', async () => {

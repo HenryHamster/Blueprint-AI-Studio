@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import { DirectionCard } from './DirectionCard';
 import type { Direction } from './DirectionsPanel';
 
@@ -26,6 +26,7 @@ function makeProps(direction: Direction, statusKey = 'active') {
     editCategory: null,
     editPathTags: [],
     editPathInput: '',
+    editCompletionCriteria: '',
     setEditingId: vi.fn(),
     setEditText: vi.fn(),
     setEditPriority: vi.fn(),
@@ -33,6 +34,7 @@ function makeProps(direction: Direction, statusKey = 'active') {
     setEditCategory: vi.fn(),
     setEditPathTags: vi.fn(),
     setEditPathInput: vi.fn(),
+    setEditCompletionCriteria: vi.fn(),
     startEdit: vi.fn(),
     updateDirection: vi.fn(),
     approveProposal: vi.fn(),
@@ -117,6 +119,24 @@ describe('DirectionCard diagnosis/remediation section', () => {
     const badge = screen.getByText(/Remediation 2× · failed/);
     expect(badge).toBeInTheDocument();
     expect(badge.className).toMatch(/red/);
+  });
+
+  it('renders completion_criteria textarea in edit mode and propagates changes', () => {
+    const d = makeDirection();
+    const setEditCompletionCriteria = vi.fn();
+    const props = {
+      ...makeProps(d),
+      editingId: d.id,
+      editText: d.text,
+      editCompletionCriteria: 'Merged across backend/',
+      setEditCompletionCriteria,
+    };
+    render(<DirectionCard {...props} />);
+    const textarea = screen.getByPlaceholderText('Done when...') as HTMLTextAreaElement;
+    expect(textarea).toBeInTheDocument();
+    expect(textarea.value).toBe('Merged across backend/');
+    fireEvent.change(textarea, { target: { value: 'All tests passing' } });
+    expect(setEditCompletionCriteria).toHaveBeenCalledWith('All tests passing');
   });
 
   it('renders no diagnosis section when all diagnosis fields are absent', () => {

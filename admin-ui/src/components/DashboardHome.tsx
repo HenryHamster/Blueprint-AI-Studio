@@ -534,6 +534,12 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                           {d.product_ratio != null && (
                             <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
                           )}
+                          {d.estimated_cost_usd != null && (
+                            <span className="text-neutral-400" title="Estimated cost in window">${d.estimated_cost_usd.toFixed(2)}</span>
+                          )}
+                          {d.cost_per_merged_pr != null && (
+                            <span className="text-neutral-400" title="Cost per merged PR">${d.cost_per_merged_pr.toFixed(2)}/PR</span>
+                          )}
                         </div>
                         {d.taxonomy_summary && <div className="flex gap-1 mt-1 flex-wrap">{TAXONOMY_ORDER.map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return v ? <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span> : null; })}</div>}
                         {d.scope_breakdown && Object.keys(d.scope_breakdown).length > 0 && <div className="flex gap-1 mt-1 flex-wrap">{(['small', 'medium', 'large'] as const).map(sz => { const s = d.scope_breakdown?.[sz]; if (!s || (!s.merged && !s.failed)) return null; const total = s.merged + s.failed; const rate = total > 0 ? s.merged / total : 0; const color = rate >= 0.7 ? 'border-emerald-700 bg-emerald-900/40 text-emerald-300' : rate >= 0.4 ? 'border-amber-700 bg-amber-900/40 text-amber-300' : 'border-red-700 bg-red-900/40 text-red-300'; return <span key={sz} title={`${sz}: ${s.merged} merged / ${s.failed} failed (${Math.round(rate * 100)}%)`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${color}`}>{sz[0].toUpperCase()} {s.merged}/{s.failed}</span>; })}</div>}
