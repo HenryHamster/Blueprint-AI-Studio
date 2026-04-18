@@ -17,7 +17,7 @@ from app.auth import get_current_user, require_admin
 from app.shared_state import external_health, circuit_breakers, get_circuit_breaker
 from app.compute import get_zone_health_summary
 from app.routers.admin_digest import compute_pipeline_health_summary
-from app.routers.admin_settings import _build_stuck_tasks
+from app.routers.admin_debug import _build_stuck_tasks
 
 logger = logging.getLogger(__name__)
 

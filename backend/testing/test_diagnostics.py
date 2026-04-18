@@ -10,7 +10,7 @@ import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
-from app.routers.admin_settings import _classify_stuck_failure, _build_stuck_tasks
+from app.routers.admin_debug import _classify_stuck_failure, _build_stuck_tasks
 from app.models import Project, Task, TaskStatus
 
 

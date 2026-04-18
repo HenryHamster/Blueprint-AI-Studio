@@ -144,6 +144,103 @@ def _parse_research_insights(task_id: str) -> List[Dict[str, Any]]:
     return []
 
 
+def _calibrate_finding_scope(
+    finding: Dict[str, Any],
+    scope: str,
+    direction: Optional[Dict[str, Any]],
+    cochange_index: Optional[Dict[str, Any]],
+) -> tuple[str, Optional[str]]:
+    """Apply pre-spawn scope-upgrade heuristics (file count, cross-module span,
+    expansion-ratio prediction, composite complexity).
+
+    Returns (new_scope, scope_calibrated_from). scope_calibrated_from is None
+    when no heuristic fired, so callers can preserve any prior calibration tag.
+    Mutates ``finding`` to record ``_complexity_score`` / ``_complexity_signals``
+    when the composite-complexity check runs.
+    """
+    title = finding.get("title", "")
+    scope_calibrated_from: Optional[str] = None
+
+    if scope == "medium":
+        _heuristic_files = finding.get("related_files") or []
+        if len(_heuristic_files) >= 5:
+            logger.info(
+                "[RESEARCH] Upgrading scope medium→large for '%s' "
+                "(file-count heuristic: %d related_files >= 5)",
+                title, len(_heuristic_files),
+            )
+            scope = "large"
+            scope_calibrated_from = "medium"
+        elif len({f.split("/", 1)[0] for f in _heuristic_files if "/" in f}) >= 2:
+            # Cross-module heuristic: related_files span 2+ top-level directories
+            # (e.g. backend + agent + admin-ui). These face language boundaries,
+            # separate build/test systems, and independent CI — upgrade to large
+            # for plan decomposition into per-module subtasks.
+            _modules = sorted({f.split("/", 1)[0] for f in _heuristic_files if "/" in f})
+            logger.info(
+                "[RESEARCH] Upgrading scope medium→large for '%s' "
+                "(cross-module heuristic: related_files span %d modules: %s)",
+                title, len(_modules), ",".join(_modules),
+            )
+            scope = "large"
+            scope_calibrated_from = "medium:cross_module"
+        elif _heuristic_files:
+            # Predictive expansion-ratio check: direction's historical avg_expansion_ratio
+            # (actual files touched / expected related_files) multiplied by this finding's
+            # related_files predicts how many files the task will actually touch. If that
+            # exceeds the medium overflow threshold (10 in SCOPE_OVERFLOW_THRESHOLDS), route
+            # to large for plan decomposition before burning 5-10 minutes on a task that
+            # will almost certainly scope-overflow during implementation.
+            if direction:
+                _ratios = [
+                    (entry.get("scope_breakdown") or {}).get("medium", {}).get("avg_expansion_ratio")
+                    for entry in (direction.get("research_history") or [])[-3:]
+                ]
+                _ratios = [float(r) for r in _ratios if isinstance(r, (int, float))]
+                if _ratios:
+                    _avg_ratio = sum(_ratios) / len(_ratios)
+                    _predicted_files = len(_heuristic_files) * _avg_ratio
+                    if _predicted_files > 10:
+                        logger.info(
+                            "[RESEARCH] Upgrading scope medium→large for '%s' "
+                            "(expansion-ratio prediction: %d related_files × %.2f avg_ratio "
+                            "= %.1f predicted files > 10 threshold)",
+                            title, len(_heuristic_files), _avg_ratio, _predicted_files,
+                        )
+                        scope = "large"
+                        scope_calibrated_from = "medium"
+        # Composite complexity score: combines file count, historical expansion,
+        # cochange cluster density, and cross-module span into a single merge-
+        # probability estimate. Upgrades when score indicates low P(merge) even if
+        # individual binary checks above let the task through.
+        if scope == "medium":
+            _cc_score, _cc_signals = _composite_complexity_score(
+                finding.get("related_files") or [], direction, cochange_index,
+            )
+            finding["_complexity_score"] = round(_cc_score, 3)
+            finding["_complexity_signals"] = _cc_signals
+            if _cc_score < 0.5:
+                logger.info(
+                    "[RESEARCH] Upgrading scope medium→large for '%s' "
+                    "(composite complexity %.2f < 0.50, signals=%s)",
+                    title, _cc_score, _cc_signals,
+                )
+                scope = "large"
+                scope_calibrated_from = "medium"
+    elif scope == "small":
+        _heuristic_files = finding.get("related_files") or []
+        if len(_heuristic_files) >= 3:
+            logger.info(
+                "[RESEARCH] Upgrading scope small→medium for '%s' "
+                "(file-count heuristic: %d related_files >= 3)",
+                title, len(_heuristic_files),
+            )
+            scope = "medium"
+            scope_calibrated_from = "small"
+
+    return scope, scope_calibrated_from
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them."""
     # Depth guard: prevent infinite research recursion
@@ -477,89 +574,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if _direction:
                 scope, scope_calibrated_from = _calibrate_scope(scope, _direction, _scope_cal_project)
 
-        # Pre-spawn file-count heuristic: medium-scope findings with 5+ related_files
-        # will almost certainly overflow the 10-file threshold in standard.ts once
-        # tests and discovered imports are added. Upgrade to large to route through
-        # the plan agent for decomposition into smaller subtasks.
-        if scope == "medium":
-            _heuristic_files = finding.get("related_files") or []
-            if len(_heuristic_files) >= 5:
-                logger.info(
-                    "[RESEARCH] Upgrading scope medium→large for '%s' "
-                    "(file-count heuristic: %d related_files >= 5)",
-                    title, len(_heuristic_files),
-                )
-                scope = "large"
-                scope_calibrated_from = "medium"
-            elif len({f.split("/", 1)[0] for f in _heuristic_files if "/" in f}) >= 2:
-                # Cross-module heuristic: related_files span 2+ top-level directories
-                # (e.g. backend + agent + admin-ui). These face language boundaries,
-                # separate build/test systems, and independent CI — upgrade to large
-                # for plan decomposition into per-module subtasks.
-                _modules = sorted({f.split("/", 1)[0] for f in _heuristic_files if "/" in f})
-                logger.info(
-                    "[RESEARCH] Upgrading scope medium→large for '%s' "
-                    "(cross-module heuristic: related_files span %d modules: %s)",
-                    title, len(_modules), ",".join(_modules),
-                )
-                scope = "large"
-                scope_calibrated_from = "medium:cross_module"
-            elif _heuristic_files:
-                # Predictive expansion-ratio check: direction's historical avg_expansion_ratio
-                # (actual files touched / expected related_files) multiplied by this finding's
-                # related_files predicts how many files the task will actually touch. If that
-                # exceeds the medium overflow threshold (10 in SCOPE_OVERFLOW_THRESHOLDS), route
-                # to large for plan decomposition before burning 5-10 minutes on a task that
-                # will almost certainly scope-overflow during implementation.
-                _exp_dir_id = finding.get("direction_id") or _parent_direction_id
-                _exp_direction = _directions_by_id.get(str(_exp_dir_id)) if _exp_dir_id else None
-                if _exp_direction:
-                    _ratios = [
-                        (entry.get("scope_breakdown") or {}).get("medium", {}).get("avg_expansion_ratio")
-                        for entry in (_exp_direction.get("research_history") or [])[-3:]
-                    ]
-                    _ratios = [float(r) for r in _ratios if isinstance(r, (int, float))]
-                    if _ratios:
-                        _avg_ratio = sum(_ratios) / len(_ratios)
-                        _predicted_files = len(_heuristic_files) * _avg_ratio
-                        if _predicted_files > 10:
-                            logger.info(
-                                "[RESEARCH] Upgrading scope medium→large for '%s' "
-                                "(expansion-ratio prediction: %d related_files × %.2f avg_ratio "
-                                "= %.1f predicted files > 10 threshold)",
-                                title, len(_heuristic_files), _avg_ratio, _predicted_files,
-                            )
-                            scope = "large"
-                            scope_calibrated_from = "medium"
-            # Composite complexity score: combines file count, historical expansion,
-            # cochange cluster density, and cross-module span into a single merge-
-            # probability estimate. Upgrades when score indicates low P(merge) even if
-            # individual binary checks above let the task through.
-            if scope == "medium":
-                _cc_dir = _directions_by_id.get(str(finding.get("direction_id") or _parent_direction_id)) if (finding.get("direction_id") or _parent_direction_id) else None
-                _cc_score, _cc_signals = _composite_complexity_score(
-                    finding.get("related_files") or [], _cc_dir, _cochange_index_for_decomp,
-                )
-                finding["_complexity_score"] = round(_cc_score, 3)
-                finding["_complexity_signals"] = _cc_signals
-                if _cc_score < 0.5:
-                    logger.info(
-                        "[RESEARCH] Upgrading scope medium→large for '%s' "
-                        "(composite complexity %.2f < 0.50, signals=%s)",
-                        title, _cc_score, _cc_signals,
-                    )
-                    scope = "large"
-                    scope_calibrated_from = "medium"
-        elif scope == "small":
-            _heuristic_files = finding.get("related_files") or []
-            if len(_heuristic_files) >= 3:
-                logger.info(
-                    "[RESEARCH] Upgrading scope small→medium for '%s' "
-                    "(file-count heuristic: %d related_files >= 3)",
-                    title, len(_heuristic_files),
-                )
-                scope = "medium"
-                scope_calibrated_from = "small"
+        # Pre-spawn scope-upgrade heuristics (file count, cross-module span,
+        # expansion-ratio prediction, composite complexity). Extracted into
+        # _calibrate_finding_scope so the heuristics are independently testable.
+        _heur_dir_id = finding.get("direction_id") or _parent_direction_id
+        _heur_direction = _directions_by_id.get(str(_heur_dir_id)) if _heur_dir_id else None
+        scope, _heur_calibrated_from = _calibrate_finding_scope(
+            finding, scope, _heur_direction, _cochange_index_for_decomp,
+        )
+        if _heur_calibrated_from is not None:
+            scope_calibrated_from = _heur_calibrated_from
 
         if finding_type == "research":
             task_type = "research"  # deeper investigation before implementation
