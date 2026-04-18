@@ -1166,11 +1166,15 @@ export async function handleCreate(
   const mediumScopePlanningNote = isMediumOrLargeScope
     ? '\n\n## Pre-Execution Planning\n\nBefore writing any code: (1) Identify which files need to change and why. (2) Consider dependency order — make foundational changes first (e.g., models before services, shared types before consumers). (3) Run the relevant test suite to establish a baseline. (4) Execute changes methodically, verifying each step builds/compiles before moving on.\n'
     : '';
+  const createBudget = createScope ? SCOPE_OVERFLOW_THRESHOLDS[createScope] : undefined;
+  const createScopeBudgetNote = createBudget
+    ? `\n\n## Scope File Budget\n\nYour scope budget allows at most ${createBudget} non-test production files. If your changes would exceed this, focus on the single most critical subset and note what was deferred.\n`
+    : '';
 
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'task',
-    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfaceContext}${affectedConsumersContext}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${prompt}${siblingNote}`,
+    buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfaceContext}${affectedConsumersContext}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${createScopeBudgetNote}${prompt}${siblingNote}`,
     commitPrefix: 'blueprint',
     prTitlePrefix: '[Blueprint]',
     noChangesMessage: 'No file changes.',
@@ -1217,13 +1221,17 @@ export async function handleRefactor(
   const refactorAffectedConsumersContext = (refactorScope === 'medium' || refactorScope === 'large')
     ? discoverAffectedConsumers(ws, refactorRelatedFiles)
     : '';
+  const refactorBudget = refactorScope ? SCOPE_OVERFLOW_THRESHOLDS[refactorScope] : undefined;
+  const refactorScopeBudgetNote = refactorBudget
+    ? `\n\n## Scope File Budget\n\nYour scope budget allows at most ${refactorBudget} non-test production files. If your changes would exceed this, focus on the single most critical subset and note what was deferred.\n`
+    : '';
 
   const refactorTitle = strVal(task.title, 'Refactor');
   await runStandardHandler({
     taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort,
     branchPrefix: 'refactor',
     buildPrompt: ({ contextPrefix, rawPrompt: rp }) =>
-      `${contextPrefix}${refactorModuleInterfaceContext}${refactorAffectedConsumersContext}${refactorRelatedTestContext}${refactorOverlapWarningText}REFACTOR TASK — STRICT CONSTRAINTS:
+      `${contextPrefix}${refactorModuleInterfaceContext}${refactorAffectedConsumersContext}${refactorRelatedTestContext}${refactorOverlapWarningText}${refactorScopeBudgetNote}REFACTOR TASK — STRICT CONSTRAINTS:
 - Do NOT add new features or new behavior.
 - Do NOT change any observable behavior, API contracts, or public interfaces.
 - Focus on ONE refactor concern per task (e.g. extract functions, reduce duplication, improve naming, simplify logic, or remove dead code — pick the most impactful single concern).

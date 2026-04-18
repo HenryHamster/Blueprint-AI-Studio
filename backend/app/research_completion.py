@@ -676,6 +676,28 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # data. Without this, medium rates stay low because no medium tasks ever run,
             # which keeps P(success) below threshold in a self-reinforcing loop.
             _explore_frac = _runtime_config.get("medium_exploration_fraction", 0.2)
+            # Adapt the exploration fraction from this direction's observed
+            # medium-scope exploration outcomes. Directions where exploration
+            # consistently merges get a boosted fraction so they accumulate
+            # medium data faster; directions where exploration consistently
+            # fails get a reduced fraction so they waste fewer attempts.
+            _exp_created = 0
+            _exp_merged = 0
+            for _entry in ((_pred_direction or {}).get("research_history") or [])[-5:]:
+                _med = (_entry.get("scope_breakdown") or {}).get("medium") or {}
+                _exp_created += int(_med.get("exploration_created") or 0)
+                _exp_merged += int(_med.get("exploration_merged") or 0)
+            if _exp_created > 0 and isinstance(_explore_frac, (int, float)):
+                _exp_rate = _exp_merged / _exp_created
+                _base = float(_explore_frac)
+                if _exp_rate >= 0.5:
+                    _explore_frac = min(1.0, _base * 2.0)
+                else:
+                    _explore_frac = _base * (_exp_rate / 0.5)
+                logger.info(
+                    "[RESEARCH] Adaptive exploration fraction for direction %s: rate=%.2f (%d/%d), frac=%.3f",
+                    _pred_dir_id, _exp_rate, _exp_merged, _exp_created, float(_explore_frac),
+                )
             if isinstance(_explore_frac, (int, float)) and _explore_frac > 0 and random.random() < float(_explore_frac):
                 _medium_exploration = True
                 logger.info("[RESEARCH] Exploration bypass keeping medium scope for '%s' (P=%.2f, explore_frac=%.2f)",

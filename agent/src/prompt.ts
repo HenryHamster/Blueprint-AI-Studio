@@ -735,6 +735,9 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   const previousFailureStage = strVal(ctx._previous_failure_stage as unknown);
   const previousErrorSummary = strVal(ctx._previous_error_summary as unknown);
   const previousIsRecurring = ctx._previous_is_recurring === true;
+  const failureClassHistory = Array.isArray(ctx._failure_class_history)
+    ? (ctx._failure_class_history as unknown[]).map(f => strVal(f)).filter(Boolean)
+    : [];
   const previousDiffSummary = Array.isArray(ctx._previous_diff_summary)
     ? (ctx._previous_diff_summary as unknown[]).filter(
         (e): e is Record<string, unknown> => typeof e === 'object' && e !== null,
@@ -774,6 +777,12 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   if (previousIsRecurring) {
     lines.push(
       '**This is a recurring failure pattern** — this same failure type has been seen multiple times. Consider a fundamentally different approach.',
+    );
+  }
+
+  if (failureClassHistory.length > 1) {
+    lines.push(
+      `Failure trajectory across retries: ${failureClassHistory.join(' → ')}. Consider whether the sequence reveals a root cause (e.g., CODE_ERROR → AGENT_TIMEOUT may indicate an infinite loop; repeated EXTERNAL_API suggests environment instability).`,
     );
   }
 

@@ -520,6 +520,12 @@ async def reaper_service():
                                     reaper_ctx["_attempt_number"] = task.attempt_count
                                     reaper_ctx["_previous_error"] = (task.latest_status_message or "")[:1500]
                                     reaper_ctx["_previous_failure_class"] = _reap_failure_class
+                                    _prior_history = reaper_ctx.get("_failure_class_history") or []
+                                    if not isinstance(_prior_history, list):
+                                        _prior_history = []
+                                    _prior_history = [str(h) for h in _prior_history if h]
+                                    _prior_history.append(_reap_failure_class)
+                                    reaper_ctx["_failure_class_history"] = _prior_history[-5:]
                                     if _reap_failure_class == "CODE_ERROR":
                                         reaper_ctx["_previous_error_summary"] = (task.latest_status_message or "")[:500]
                                     _copy_analysis_artifacts_to_previous(reaper_ctx)
@@ -903,6 +909,43 @@ async def reaper_service():
 
                 except Exception as e:
                     logger.error(f"[REAPER] Infra recovery sweep error: {e}", exc_info=True)
+
+                # Step 5a: Clear infra holds on directions whose root-cause signal has recovered.
+                # Mirrors the signal checks in Step 5 but applies to direction-level holds
+                # in direction_failure_streaks rather than individual task resurrection.
+                try:
+                    from app.max_plan_pool import _all_accounts, _account_available_for_model  # noqa: PLC0415
+                    from app.shared_state import direction_failure_streaks, clear_direction_hold  # noqa: PLC0415
+
+                    _cleared_holds = 0
+                    for _did, _streak in list(direction_failure_streaks.items()):
+                        if not _streak.get("held") or _streak.get("held_reason") != "infra":
+                            continue
+                        _fc = _streak.get("held_failure_class") or _streak.get("last_failure_class") or ""
+                        _ready = False
+                        if _fc == "PROVISION_FAILURE" or _fc == "AGENT_TIMEOUT" or _fc == "SCOPE_OVERFLOW":
+                            _ready = any_zone_available()
+                        elif _fc == "RATE_LIMIT":
+                            _ready = any(
+                                _account_available_for_model(acct, None)
+                                for acct in _all_accounts()
+                            )
+                        elif _fc == "EXTERNAL_API":
+                            _ready = (
+                                _external_health.get("github_api", False)
+                                and _external_health.get("claude_api", False)
+                            )
+                        if _ready:
+                            clear_direction_hold(_did)
+                            _cleared_holds += 1
+                            logger.info(
+                                f"[REAPER] Cleared infra hold on direction {_did} "
+                                f"(signal {_fc} recovered)"
+                            )
+                    if _cleared_holds:
+                        logger.info(f"[REAPER] Cleared {_cleared_holds} infra direction hold(s)")
+                except Exception as e:
+                    logger.error(f"[REAPER] Infra direction hold recovery error: {e}", exc_info=True)
 
                 # Step 5b: Clear stale or malformed retry_after on QUEUED tasks.
                 # A far-future or unparseable value permanently blocks dispatch
