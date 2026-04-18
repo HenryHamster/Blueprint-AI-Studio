@@ -1,0 +1,266 @@
+"""Activity feed endpoint: recent system events in reverse chronological order."""
+import uuid
+import json
+import logging
+from typing import Dict, Any, List
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
+from sqlmodel import select
+
+from app.database import get_session
+from app.models import (
+    Task, TaskStatus, Artifact, ArtifactType, DeploymentState, _utcnow,
+)
+from app.auth import get_current_user
+from app.admin import _user_project_ids
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/api/admin",
+    tags=["admin-activity"],
+    dependencies=[Depends(get_current_user)]
+)
+
+
+def _count_research_findings(logs: str | None) -> int:
+    """Parse research findings artifact logs and return finding count."""
+    if not logs:
+        return 0
+    try:
+        parsed = json.loads(logs[:100000])
+        if isinstance(parsed, list):
+            return len(parsed)
+        if isinstance(parsed, dict):
+            inner = parsed.get("logs", [])
+            if isinstance(inner, list):
+                return len(inner)
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return 0
+
+
+@router.get("/activity")
+async def get_activity(
+    project_id: uuid.UUID | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    event_types: List[str] | None = Query(None),
+    since: datetime | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Return a reverse-chronological list of recent system events."""
+    seven_days_ago = _utcnow() - timedelta(days=7)
+    cutoff = since if since is not None else seven_days_ago
+    events: List[Dict[str, Any]] = []
+
+    # --- 1 & 2: Completed and Failed tasks in last 7 days (or since cutoff) ---
+    user_project_ids = _user_project_ids(current_user["user_id"])
+    task_filters = [
+        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        Task.created_at >= cutoff,
+        Task.project_id.in_(user_project_ids),
+    ]
+    if project_id:
+        task_filters.append(Task.project_id == project_id)
+
+    tasks_result = await session.execute(
+        select(Task).where(*task_filters).options(
+            load_only(Task.id, Task.status, Task.title, Task.project_id,
+                      Task.payloads, Task.status_log, Task.created_at, Task.started_at)
+        )
+    )
+    recent_tasks = tasks_result.scalars().all()
+
+    task_ids = [t.id for t in recent_tasks] if recent_tasks else []
+
+    # Fetch relevant artifacts in one query
+    artifact_map: Dict[str, Dict[str, Any]] = {}  # task_id -> artifact info
+    research_artifact_map: Dict[str, Dict[str, Any]] = {}  # task_id -> research artifact
+    error_log_map: Dict[str, str] = {}  # task_id -> truncated error logs
+    investigation_report_map: Dict[str, str] = {}  # task_id -> summary text
+
+    if task_ids:
+        artifacts_result = await session.execute(
+            select(Artifact)
+            .where(
+                Artifact.task_id.in_(task_ids),
+                Artifact.artifact_type.in_([
+                    ArtifactType.PULL_REQUEST,
+                    ArtifactType.ERROR_LOG,
+                    ArtifactType.RESEARCH_FINDINGS,
+                    ArtifactType.INVESTIGATION_REPORT,
+                ])
+            )
+            .order_by(Artifact.created_at.asc())
+        )
+        for a in artifacts_result.scalars().all():
+            tid = str(a.task_id)
+            if a.artifact_type == ArtifactType.PULL_REQUEST:
+                artifact_map[tid] = {
+                    "pr_url": a.pr_url,
+                    "repo_url": a.repo_url,
+                    "commit_hash": a.commit_hash[:7] if a.commit_hash else None,
+                }
+            elif a.artifact_type == ArtifactType.ERROR_LOG and a.logs and tid not in error_log_map:
+                error_log_map[tid] = a.logs[:300]
+            elif a.artifact_type == ArtifactType.RESEARCH_FINDINGS:
+                research_artifact_map[tid] = {
+                    "artifact_created_at": a.created_at,
+                    "finding_count": _count_research_findings(a.logs),
+                }
+            elif a.artifact_type == ArtifactType.INVESTIGATION_REPORT and a.logs:
+                investigation_report_map[tid] = a.logs[:2000]
+
+    for t in recent_tasks:
+        tid = str(t.id)
+        task_type = (t.first_payload).get("type", "create")
+        pr_info = artifact_map.get(tid, {})
+
+        # Determine timestamp: last status_log entry or updated_at fallback
+        completed_at = None
+        if t.status_log:
+            last_entry = t.status_log[-1]
+            try:
+                completed_at = datetime.fromisoformat(last_entry["t"])
+            except (KeyError, ValueError):
+                pass
+        if completed_at is None:
+            # fall back to created_at since Task has no updated_at column
+            completed_at = t.created_at
+
+        duration_seconds = None
+        if completed_at is not None and t.started_at is not None:
+            duration_seconds = (completed_at - t.started_at).total_seconds()
+
+        if t.status == TaskStatus.COMPLETED:
+            events.append({
+                "id": f"task-{tid}",
+                "type": "TASK_COMPLETED",
+                "timestamp": completed_at.isoformat() if completed_at else None,
+                "title": t.title or "Completed task",
+                "task_id": tid,
+                "task_type": task_type,
+                "pr_url": pr_info.get("pr_url"),
+                "repo_url": pr_info.get("repo_url"),
+                "commit_hash": pr_info.get("commit_hash"),
+                "error_summary": None,
+                "finding_count": None,
+                "deploy_sha": None,
+                "deploy_status": None,
+                "rollback_count": None,
+                "duration_seconds": duration_seconds,
+            })
+        elif t.status == TaskStatus.FAILED:
+            events.append({
+                "id": f"task-{tid}",
+                "type": "TASK_FAILED",
+                "timestamp": completed_at.isoformat() if completed_at else None,
+                "title": t.title or "Failed task",
+                "task_id": tid,
+                "task_type": task_type,
+                "pr_url": None,
+                "repo_url": None,
+                "commit_hash": None,
+                "error_summary": error_log_map.get(tid),
+                "finding_count": None,
+                "deploy_sha": None,
+                "deploy_status": None,
+                "rollback_count": None,
+                "duration_seconds": duration_seconds,
+            })
+
+        # --- 3: Research findings events (one per task) ---
+        if tid in research_artifact_map:
+            ra = research_artifact_map[tid]
+            ra_ts = ra["artifact_created_at"]
+            events.append({
+                "id": f"research-{tid}",
+                "type": "RESEARCH_FINDINGS",
+                "timestamp": ra_ts.isoformat() if ra_ts else None,
+                "title": f"Research findings: {t.title or tid}",
+                "task_id": tid,
+                "task_type": task_type,
+                "pr_url": None,
+                "repo_url": None,
+                "commit_hash": None,
+                "error_summary": None,
+                "finding_count": ra["finding_count"],
+                "investigation_summary": investigation_report_map.get(tid),
+                "deploy_sha": None,
+                "deploy_status": None,
+                "rollback_count": None,
+            })
+
+    # --- 3b: In-progress tasks (QUEUED / PROVISIONING / IN_PROGRESS) ---
+    inprogress_filters = [
+        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        Task.project_id.in_(user_project_ids),
+    ]
+    if project_id:
+        inprogress_filters.append(Task.project_id == project_id)
+    if since is not None:
+        inprogress_filters.append(Task.created_at >= since)
+
+    inprogress_result = await session.execute(
+        select(Task).where(*inprogress_filters)
+    )
+    inprogress_tasks = inprogress_result.scalars().all()
+
+    for t in inprogress_tasks:
+        tid = str(t.id)
+        task_type = (t.first_payload).get("type", "create")
+        events.append({
+            "id": f"inprogress-{tid}",
+            "type": "TASK_IN_PROGRESS",
+            "timestamp": t.started_at.isoformat() if t.started_at else t.created_at.isoformat(),
+            "title": t.title or "In-progress task",
+            "task_id": tid,
+            "task_type": task_type,
+            "started_at": t.started_at.isoformat() if t.started_at else None,
+            "latest_status_message": t.latest_status_message,
+            "pr_url": None,
+            "repo_url": None,
+            "commit_hash": None,
+            "error_summary": None,
+            "finding_count": None,
+            "deploy_sha": None,
+            "deploy_status": None,
+            "rollback_count": None,
+        })
+
+    # --- 4: Deploy event from DeploymentState singleton ---
+    state = await session.get(DeploymentState, 1)
+    if state and state.deployed_at:
+        short_sha = state.current_sha[:7] if state.current_sha else None
+        deploy_event: Dict[str, Any] = {
+            "id": f"deploy-{short_sha or 'unknown'}",
+            "type": "DEPLOY_EVENT",
+            "timestamp": state.deployed_at.isoformat(),
+            "title": f"Deploy {short_sha or 'unknown'} — {state.status}",
+            "task_id": None,
+            "task_type": None,
+            "pr_url": None,
+            "repo_url": None,
+            "commit_hash": short_sha,
+            "error_summary": None,
+            "finding_count": None,
+            "deploy_sha": short_sha,
+            "deploy_status": str(state.status) if state.status else None,
+            "rollback_count": state.rollback_count if (state.rollback_count or 0) > 0 else None,
+        }
+        if (state.rollback_count or 0) > 0 and state.rolled_back_from_sha:
+            deploy_event["rolled_back_from_sha"] = state.rolled_back_from_sha[:7]
+        events.append(deploy_event)
+
+    # Sort descending by timestamp, nulls last
+    events.sort(key=lambda e: e["timestamp"] or "", reverse=True)
+
+    if event_types:
+        events = [e for e in events if e["type"] in event_types]
+
+    total = len(events)
+    return {"events": events[:limit], "total": total}

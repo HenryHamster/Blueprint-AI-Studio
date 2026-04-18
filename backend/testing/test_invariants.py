@@ -351,12 +351,28 @@ class TestDirectionLifecycleInvariants:
         )
 
     def test_auto_completion_pattern_exists(self):
-        """auto_completed flag must exist in research_completion.py — lost in PR #832."""
-        rc_path = os.path.join(os.path.dirname(__file__), "..", "app", "research_completion.py")
-        with open(rc_path) as f:
-            content = f.read()
-        assert 'auto_completed' in content, (
-            "The 'auto_completed' string literal is missing from research_completion.py. "
+        """auto_completed flag must exist in the research pipeline — lost in PR #832.
+
+        The logic lives in research_direction_state.apply_post_spawn_state (extracted from
+        research_completion._handle_research_completion); check both paths so the invariant
+        survives future re-organizations.
+        """
+        app_dir = os.path.join(os.path.dirname(__file__), "..", "app")
+        candidate_paths = [
+            os.path.join(app_dir, "research_direction_state.py"),
+            os.path.join(app_dir, "research_completion.py"),
+        ]
+        found = False
+        for path in candidate_paths:
+            if not os.path.exists(path):
+                continue
+            with open(path) as f:
+                if 'auto_completed' in f.read():
+                    found = True
+                    break
+        assert found, (
+            "The 'auto_completed' string literal is missing from the research pipeline modules "
+            f"({', '.join(os.path.basename(p) for p in candidate_paths)}). "
             "Auto-completion logic was silently removed in PR #832 and must not be removed again."
         )
 

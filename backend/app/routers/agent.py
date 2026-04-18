@@ -773,7 +773,7 @@ async def claim_task(
         # Pipeline health summary (for gated task types; else-branch covers the rest)
         pipeline_health = None
         try:
-            from app.routers.admin_analytics import compute_pipeline_health_summary
+            from app.routers.admin_digest import compute_pipeline_health_summary
             pipeline_health = await compute_pipeline_health_summary(session, task.project_id)
         except Exception:
             logger.exception("[AGENT] Failed to compute pipeline health summary (non-critical)")
@@ -885,7 +885,7 @@ async def claim_task(
     else:
         # Lightweight pipeline health for all other task types
         try:
-            from app.routers.admin_analytics import compute_pipeline_health_summary
+            from app.routers.admin_digest import compute_pipeline_health_summary
             pipeline_health = await compute_pipeline_health_summary(session, task.project_id)
             if pipeline_health:
                 response["project_context"] = {"pipeline_health": pipeline_health}

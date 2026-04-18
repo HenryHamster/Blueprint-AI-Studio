@@ -3108,7 +3108,7 @@ async def metrics_db(mocker):
 @pytest.mark.asyncio
 async def test_compute_pipeline_health_includes_first_attempt_rate(metrics_db):
     """compute_pipeline_health_summary returns first_attempt_success_rate field."""
-    from app.routers.admin_analytics import compute_pipeline_health_summary
+    from app.routers.admin_digest import compute_pipeline_health_summary
     from datetime import timezone
 
     project = Project(name="Test", user_id="u1")
@@ -3155,7 +3155,7 @@ async def test_compute_pipeline_health_includes_first_attempt_rate(metrics_db):
 @pytest.mark.asyncio
 async def test_compute_pipeline_health_no_metrics_returns_none(metrics_db):
     """When no tasks have _first_attempt_succeeded recorded, overall is None."""
-    from app.routers.admin_analytics import compute_pipeline_health_summary
+    from app.routers.admin_digest import compute_pipeline_health_summary
 
     project = Project(name="Test2", user_id="u2")
     metrics_db.add(project)
@@ -3181,7 +3181,7 @@ async def test_compute_pipeline_health_no_metrics_returns_none(metrics_db):
 @pytest.mark.asyncio
 async def test_first_attempt_by_review_category_populated(metrics_db):
     """first_attempt_by_review_category counts categories from first-rejection tasks."""
-    from app.routers.admin_analytics import compute_pipeline_health_summary
+    from app.routers.admin_digest import compute_pipeline_health_summary
 
     project = Project(name="Test3", user_id="u3")
     metrics_db.add(project)

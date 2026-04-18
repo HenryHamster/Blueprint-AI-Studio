@@ -2965,7 +2965,7 @@ async def test_agent_claim_non_research_includes_pipeline_health(client: AsyncCl
         "direction_stats": [],
     }
     mocker.patch(
-        "app.routers.admin_analytics.compute_pipeline_health_summary",
+        "app.routers.admin_digest.compute_pipeline_health_summary",
         return_value=fake_health,
     )
 
@@ -3016,7 +3016,7 @@ async def test_agent_claim_pipeline_health_includes_scope_conversion_rates(clien
         "medium_scope_review_iterations": 2.5,
     }
     mocker.patch(
-        "app.routers.admin_analytics.compute_pipeline_health_summary",
+        "app.routers.admin_digest.compute_pipeline_health_summary",
         return_value=fake_health,
     )
 

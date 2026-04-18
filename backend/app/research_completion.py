@@ -4,12 +4,11 @@ Extracted from app.task_completion to keep that module focused on plan/security/
 completion handlers. Contains the research findings parser, context builder,
 and the large _handle_research_completion handler.
 """
-import hashlib
 import json
 import logging
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,21 +16,23 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
-    Alert,
-    AlertSeverity,
     Artifact,
     ArtifactType,
-    MessageType,
     Project,
-    ProjectMessage,
     Task,
     TaskHistory,
     TaskStatus,
 )
-from app.broadcast import broadcast_to_project
 from app.cochange_decomposition import (
     auto_decompose_findings_by_cochange,
     cluster_files_by_cochange as _cluster_files_by_cochange,  # noqa: F401 — re-exported for tests
+)
+from app.failure_classification import classify_failure
+from app.finding_deduplication import (
+    build_dedup_state,
+    deduplicate_findings,
+    finding_hash as _finding_hash,  # noqa: F401 — re-exported for callers/tests
+    is_duplicate as _is_duplicate,  # noqa: F401 — re-exported for callers/tests
 )
 from app.payload_schemas import validate_internal_payload
 from app.scope_complexity import _composite_complexity_score
@@ -68,53 +69,17 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
 )
 
 
-def _compute_saturation(history: list) -> bool:
-    """Return True if last 3 cycles all produced 0 or 1 tasks."""
-    if len(history) < 3:
-        return False
-    recent = history[-3:]
-    return all(entry.get("tasks_created", 0) <= 1 for entry in recent)
-
-
-def _detect_dedup_deadlock(history: list, window: int = 3) -> tuple[bool, int]:
-    """Detect dedup deadlock: last `window` entries all have tasks_created==0 with dedup blocks.
-
-    A direction is considered deadlocked when research cycles keep producing findings that are
-    immediately rejected by hash or word-overlap deduplication, wasting VM compute. Detection
-    requires that the last `window` entries all have tasks_created==0 AND at least 2 of those
-    entries show non-zero hash_dedup or word_overlap_dedup counts.
-
-    Returns (is_deadlocked, consecutive_empty_count).
-    """
-    if len(history) < window:
-        return False, 0
-    recent = history[-window:]
-    if not all(e.get("tasks_created", 0) == 0 for e in recent):
-        return False, 0
-    # At least 2 of the last `window` entries must show dedup activity
-    dedup_active_count = sum(
-        1 for e in recent
-        if (e.get("filter_breakdown", {}).get("hash_dedup", 0) or 0)
-        + (e.get("filter_breakdown", {}).get("word_overlap_dedup", 0) or 0) > 0
-    )
-    if dedup_active_count < 2:
-        return False, 0
-    # Count consecutive empty cycles from the end
-    consecutive = 0
-    for e in reversed(history):
-        if e.get("tasks_created", 0) == 0:
-            consecutive += 1
-        else:
-            break
-    return True, consecutive
-
-
 from app.research_context import (  # noqa: F401 — re-exported for callers/tests
     _parse_research_context,
     _parse_eviction_counts,
     _format_evicted_failed,
     _format_eviction_body,
     _build_research_context,
+)
+from app.research_direction_state import (  # noqa: F401 — re-exported for callers/tests
+    _compute_saturation,
+    _detect_dedup_deadlock,
+    apply_post_spawn_state,
 )
 
 
@@ -323,65 +288,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if p.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
         }
 
-    from app.failure_classification import INFRA_CLASSES, classify_failure  # noqa: PLC0415
-    _code_error_cooldown = timedelta(hours=48)
-    _dedup_now = _utcnow()
-
-    recent_finding_hashes = {
-        t.context["finding_hash"] for t in recent_tasks_for_dedup
-        if t.context and t.context.get("finding_hash")
-        # Exclude COMPLETED without pr_merged (code was never shipped)
-        and not (t.status == TaskStatus.COMPLETED and not (t.context or {}).get("pr_merged"))
-        # Exclude ghost merges: pr_merged=True but rollup parent failed (code never reached main)
-        and not (
-            t.status == TaskStatus.COMPLETED
-            and (t.context or {}).get("pr_merged")
-            and t.parent_task_id in failed_parent_ids
-        )
-        # Exclude transient infra failures (task never ran, should be retried)
-        and not (
-            t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
-            and classify_failure(t) in INFRA_CLASSES
-        )
-        # Exclude CODE_ERROR failures older than cooldown — codebase may have changed,
-        # or improved context may allow a different implementation approach.
-        # Tasks within the cooldown window still block to prevent rapid re-spin loops.
-        and not (
-            t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
-            and classify_failure(t) == "CODE_ERROR"
-            and t.created_at < _dedup_now - _code_error_cooldown
-        )
-    }
-    # Build a map of finding_hash -> outcome for failed/cancelled tasks for better logging
-    failed_hashes = {
-        t.context["finding_hash"]: t.status
-        for t in recent_tasks_for_dedup
-        if t.context and t.context.get("finding_hash")
-        and t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
-    }
-    # Build a map of finding_hash -> most-recent failed task for prior-attempt context injection.
-    # When a re-spawned finding passes dedup (e.g. CODE_ERROR cooldown elapsed), inject the
-    # prior failure's retry context so the new agent avoids repeating the same approach.
-    prior_failure_by_hash: dict[str, Task] = {}
-    for _pt in recent_tasks_for_dedup:
-        if not _pt.context:
-            continue
-        _pfh = _pt.context.get("finding_hash")
-        if not _pfh:
-            continue
-        if _pt.status not in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-            continue
-        _existing = prior_failure_by_hash.get(_pfh)
-        if _existing is None or (_pt.created_at or _dedup_now) > (_existing.created_at or _dedup_now):
-            prior_failure_by_hash[_pfh] = _pt
-    # Also suppress tasks that have an active suppress_until field (set on user-cancelled low-priority tasks)
-    now_iso = _utcnow().isoformat()
-    for t in recent_tasks_for_dedup:
-        if t.context and t.context.get("suppress_until") and t.context["suppress_until"] > now_iso:
-            fhash = t.context.get("finding_hash")
-            if fhash:
-                recent_finding_hashes.add(fhash)
-                failed_hashes.setdefault(fhash, "suppressed")
+    recent_finding_hashes, failed_hashes, prior_failure_by_hash = build_dedup_state(
+        recent_tasks_for_dedup, failed_parent_ids,
+    )
 
     # Query open PR artifacts to detect file-scope conflicts with in-flight work
     open_pr_stmt = (
@@ -404,64 +313,24 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             for f in (task_ctx.get('related_files') or []):
                 open_pr_files.add(f)
 
-    def _finding_hash(title: str, description: str) -> str:
-        return hashlib.sha256((title + description).encode()).hexdigest()[:16]
-
-    def _is_duplicate(finding_title: str, finding_dir_id: str | None, existing: list[tuple]) -> bool:
-        STOPWORDS = {'the', 'a', 'an', 'to', 'for', 'and', 'or', 'in', 'of', 'is', 'it',
-                     'this', 'that', 'with', 'by', 'we', 'should', 'be', 'are', 'on', 'as',
-                     'feat', 'fix', 'refactor', 'add', 'update', 'improve'}
-        words = set(finding_title.lower().split()) - STOPWORDS
-        for task_dir_id, title in existing:
-            overlap = words & (set(title.lower().split()) - STOPWORDS)
-            # Cross-direction: require 6+ word overlap. Independent strategic tracks rarely
-            # produce true duplicates, so a higher threshold avoids false positives.
-            # If either direction is unknown (None), treat as same-direction (safer default).
-            same_direction = (
-                not finding_dir_id
-                or not task_dir_id
-                or finding_dir_id == task_dir_id
-            )
-            threshold = 4 if same_direction else 6
-            if len(overlap) >= threshold:
-                return True
-        return False
-
-    # Sort findings by priority: high → medium → low (preserve original order within each tier).
-    # The orchestrator dispatches by (status, priority, created_at), so higher-priority
-    # tasks naturally run first without needing artificial wave dependencies.
-    priority_order = {"high": 0, "medium": 1, "low": 2}
-    indexed_findings = list(enumerate(findings))
-    indexed_findings.sort(key=lambda x: priority_order.get(x[1].get("priority", "medium"), 1))
-
-    # Deduplicate findings against recent tasks
-    hash_dedup_count = 0
-    word_overlap_count = 0
-    file_overlap_count = 0
+    # Sort findings by priority (high → medium → low) and apply the hash,
+    # word-overlap, and file-overlap dedup stages. The orchestrator dispatches
+    # by (status, priority, created_at), so higher-priority tasks naturally
+    # run first without needing artificial wave dependencies.
+    _dedup_outcome = deduplicate_findings(
+        findings,
+        task.context,
+        recent_finding_hashes,
+        failed_hashes,
+        existing_tasks_with_dirs,
+        open_pr_files,
+    )
+    deduplicated = _dedup_outcome.deduplicated
+    hash_dedup_count = _dedup_outcome.hash_dedup_count
+    word_overlap_count = _dedup_outcome.word_overlap_count
+    file_overlap_count = _dedup_outcome.file_overlap_count
     type_filtered_count = 0
     empty_prompt_count = 0
-    deduplicated: list[tuple[int, dict, str]] = []  # (orig_i, finding, fhash)
-    for orig_i, finding in indexed_findings:
-        title = finding.get("title", f"Research finding #{orig_i+1}")
-        description = finding.get("description", finding.get("prompt", ""))
-        fhash = _finding_hash(title, description)
-        if fhash in recent_finding_hashes:
-            outcome = failed_hashes.get(fhash, "prior")
-            logger.info(f"[RESEARCH] Skipping finding '{title}' — hash {fhash} matched {outcome} task")
-            hash_dedup_count += 1
-            continue
-        finding_dir_id = finding.get("direction_id") or (task.context or {}).get("direction_id")
-        if _is_duplicate(title, finding_dir_id, existing_tasks_with_dirs):
-            logger.warning(f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task")
-            word_overlap_count += 1
-            continue
-        # Skip if all related_files for this finding are already covered by open PRs
-        finding_files = set(finding.get('related_files', []))
-        if finding_files and finding_files.issubset(open_pr_files):
-            logger.info(f"[RESEARCH] Skipping finding '{title}' — all related files already have open PRs")
-            file_overlap_count += 1
-            continue
-        deduplicated.append((orig_i, finding, fhash))
 
     # Assess pipeline health once before spawning implementation tasks.
     # Metadata findings (design_doc_observation, direction_update) are processed
@@ -895,419 +764,25 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     await session.commit()
 
-    # Update last_researched_at for directions that produced findings.
-    # Also update the current direction if all findings were deduped — prevents
-    # the system from immediately re-researching and hitting the same duplicates.
-    direction_ids_with_findings = set()
-    for ct in child_tasks:
-        did = (ct.context or {}).get("direction_id")
-        if did:
-            direction_ids_with_findings.add(did)
-    # If all findings were deduped OR no findings at all, still put the current
-    # direction on cooldown and record a cycle entry. This closes a blind spot
-    # where research tasks that completed with zero actionable findings (agent
-    # subtask failure, malformed output, etc.) left no trace in research_history
-    # and _check_direction_health could not see the stalled cycle.
-    current_direction_id = (task.context or {}).get("direction_id") or (task.first_payload).get("current_direction_id")
-    skipped_duplicates = hash_dedup_count + word_overlap_count + file_overlap_count
-    all_deduped = len(child_tasks) == 0 and skipped_duplicates > 0
-    # Build filter breakdown string (computed here so it's available for summary artifact below)
-    _filter_parts = []
-    if hash_dedup_count:
-        _filter_parts.append(f"{hash_dedup_count} hash-dedup")
-    if word_overlap_count:
-        _filter_parts.append(f"{word_overlap_count} word-overlap")
-    if file_overlap_count:
-        _filter_parts.append(f"{file_overlap_count} file-overlap")
-    if type_filtered_count:
-        _filter_parts.append(f"{type_filtered_count} type-filtered")
-    if empty_prompt_count:
-        _filter_parts.append(f"{empty_prompt_count} empty-prompt")
-    _filter_str = f" ({', '.join(_filter_parts)} skipped)" if _filter_parts else ""
-    no_findings_cycle = len(child_tasks) == 0 and skipped_duplicates == 0
-    if (all_deduped or no_findings_cycle) and current_direction_id:
-        direction_ids_with_findings.add(current_direction_id)
-    if direction_ids_with_findings:
-        project = await session.get(Project, task.project_id)
-        if project:
-            directions = list(project.directions or [])
-            now_iso = _utcnow().isoformat()
-            for d in directions:
-                if d.get("id") in direction_ids_with_findings:
-                    d["last_researched_at"] = now_iso
-            # Append to research_history for each direction that produced findings
-            finding_titles_by_dir: dict = {}
-            finding_descriptions_by_dir: dict = {}
-            finding_scopes_by_dir: dict = {}
-            for orig_i, finding, fhash in deduplicated:
-                did = finding.get("direction_id")
-                if did:
-                    finding_titles_by_dir.setdefault(did, []).append(
-                        finding.get("title", f"Research finding #{orig_i+1}")
-                    )
-                    finding_descriptions_by_dir.setdefault(did, []).append(
-                        (finding.get("description", finding.get("prompt", "")))[:200]
-                    )
-                    finding_scopes_by_dir.setdefault(did, []).append(
-                        finding.get("scope", DEFAULT_TASK_SCOPE)
-                    )
-            for d in directions:
-                did = d.get("id")
-                if did in direction_ids_with_findings:
-                    history = d.get("research_history", [])
-                    dir_child_tasks = [ct for ct in child_tasks if (ct.context or {}).get("direction_id") == did]
-                    # Compact history entry — just counters and a short summary.
-                    # Full details available via task API using task_id.
-                    titles = finding_titles_by_dir.get(did, [])[:3]
-                    descriptions = finding_descriptions_by_dir.get(did, [])[:3]
-                    entry = {
-                        "timestamp": now_iso,
-                        "task_id": str(task.id),
-                        "tasks_created": len(dir_child_tasks),
-                        "summary": "; ".join(t[:60] for t in titles) if titles else "no findings",
-                        "finding_titles": titles,
-                        "key_finding_descriptions": descriptions,
-                        "filter_breakdown": {
-                            "hash_dedup": hash_dedup_count,
-                            "word_overlap_dedup": word_overlap_count,
-                            "file_overlap_dedup": file_overlap_count,
-                            "type_filtered": type_filtered_count,
-                            "empty_prompt": empty_prompt_count,
-                        },
-                    }
-                    if no_findings_cycle and not titles:
-                        entry["no_findings"] = True
-                    # Keep last 10 history entries; aggregate evicted entries to preserve lifetime stats
-                    new_history = history + [entry]
-                    if len(new_history) > 10:
-                        d["history_aggregate"] = _fold_evicted_into_aggregate(
-                            d.get("history_aggregate"), new_history[:-10]
-                        )
-                    d["research_history"] = new_history[-10:]
-                    d["possibly_saturated"] = _compute_saturation(d["research_history"])
-
-                    # Deadlock detection: 3+ consecutive 0-task cycles driven by dedup
-                    _deadlocked, _consec = _detect_dedup_deadlock(d["research_history"])
-                    if _deadlocked and d.get("status") == "active":
-                        _blocked_titles = [
-                            f.get("title", "")[:60]
-                            for f in (task.plan_output or [])
-                            if f.get("type") not in (
-                                "direction_proposal", "direction_note",
-                                "design_doc_observation", "direction_update",
-                            )
-                            and f.get("title")
-                        ][:3]
-                        # Guard: only create alert if no undismissed alert exists for this direction
-                        _existing_deadlock_alert = (await session.execute(
-                            select(Alert).where(
-                                Alert.project_id == task.project_id,
-                                Alert.title == "Dedup deadlock detected",
-                                Alert.dismissed_at.is_(None),
-                                Alert.message.contains(did),
-                            )
-                        )).scalars().first()
-                        if not _existing_deadlock_alert:
-                            _deadlock_alert = Alert(
-                                project_id=task.project_id,
-                                severity=AlertSeverity.WARNING,
-                                title="Dedup deadlock detected",
-                                message=(
-                                    f"Direction '{d.get('text', did)[:80]}' (id: {did}) has "
-                                    f"{_consec} consecutive research cycles with 0 tasks created "
-                                    f"due to deduplication. "
-                                    + (
-                                        f"Top blocked findings: {'; '.join(_blocked_titles)}."
-                                        if _blocked_titles else ""
-                                    )
-                                ),
-                                task_id=task.id,
-                            )
-                            session.add(_deadlock_alert)
-                            _deadlock_msg = ProjectMessage(
-                                project_id=task.project_id,
-                                message_type=MessageType.BUG_REPORT,
-                                from_type="agent",
-                                from_task_id=task.id,
-                                content=(
-                                    f"Dedup deadlock detected for direction "
-                                    f"'{d.get('text', did)[:80]}' (id: {did}): "
-                                    f"{_consec} consecutive research cycles produced 0 tasks "
-                                    f"because findings keep matching existing hashes or "
-                                    f"word-overlapping active tasks. "
-                                    + (
-                                        f"Blocked: {'; '.join(_blocked_titles)}. "
-                                        if _blocked_titles else ""
-                                    )
-                                    + "Consider resetting the direction or waiting for "
-                                    "blocked tasks to complete."
-                                ),
-                                context={
-                                    "source": "dedup_deadlock",
-                                    "direction_id": did,
-                                    "consecutive_empty_cycles": _consec,
-                                },
-                            )
-                            session.add(_deadlock_msg)
-                            logger.warning(
-                                f"[RESEARCH] Dedup deadlock: direction {did}, "
-                                f"{_consec} consecutive empty cycles (task {task.id})"
-                            )
-
-                    d["research_context"] = _build_research_context(
-                        prior_context=d.get("research_context"),
-                        finding_titles=finding_titles_by_dir.get(did, [])[:5],
-                        key_finding_descriptions=finding_descriptions_by_dir.get(did, [])[:5],
-                        finding_scopes=finding_scopes_by_dir.get(did, [])[:5],
-                        cycle_insights=[i["summary"][:200] for i in insights[:3]],
-                        history_entry=entry,
-                    )
-
-                    # Auto-complete direction if saturated with sufficient merged PRs
-                    if (
-                        d.get("status") == "active"
-                        and d.get("possibly_saturated")
-                        and entry.get("tasks_created", 0) > 0
-                    ):
-                        history = d.get("research_history", [])
-                        agg = d.get("history_aggregate", {})
-                        total_merged = (
-                            sum(e.get("prs_merged", 0) for e in history)
-                            + (agg.get("total_prs_merged") or 0)
-                        )
-                        if total_merged >= 3:
-                            total_cycles = len(history) + (agg.get("total_cycles") or 0)
-                            d["status"] = "completed"
-                            d["completed_at"] = _utcnow().isoformat()
-                            d["auto_completed"] = True
-                            d["auto_completed_reason"] = (
-                                f"Auto-completed: direction saturated with {total_merged} "
-                                f"total PRs merged across {total_cycles} cycles"
-                            )
-                            alert = Alert(
-                                project_id=task.project_id,
-                                severity=AlertSeverity.INFO,
-                                title="Direction auto-completed",
-                                message=(
-                                    f"Direction '{d.get('text', did)[:80]}' was auto-completed: "
-                                    f"saturated with {total_merged} PRs merged across {total_cycles} cycles."
-                                ),
-                            )
-                            session.add(alert)
-                            try:
-                                from app.notification_dispatch import post_direction_milestone_message  # noqa: PLC0415
-                                _ac_reason = (
-                                    f"Saturated with {total_merged} PRs merged across {total_cycles} cycles"
-                                )
-                                await post_direction_milestone_message(
-                                    session, task.project_id, d.get("text", did),
-                                    "auto-completed", _ac_reason, task.id,
-                                )
-                            except Exception as _e:
-                                logger.warning(f"[NOTIFY] Failed to post auto-completed message: {_e}")
-
-            project.directions = directions
-            flag_modified(project, "directions")
-            session.add(project)
-
-            # If this is a sub-research task (depth > 0), also annotate the parent direction's
-            # most recent research_history entry with a note about sub-research findings.
-            if research_depth > 0 and parent_research_task_id and direction_ids_with_findings:
-                parent_project = await session.get(Project, task.project_id)
-                if parent_project and parent_project.directions:
-                    parent_dirs = list(parent_project.directions)
-                    for d in parent_dirs:
-                        did = d.get("id")
-                        if did not in direction_ids_with_findings:
-                            continue
-                        history = d.get("research_history", [])
-                        if history:
-                            last_entry = history[-1]
-                            sub_notes = last_entry.get("sub_research_notes", [])
-                            sub_notes.append({
-                                "sub_task_id": str(task.id),
-                                "depth": research_depth,
-                                "tasks_created": len(child_tasks),
-                                "finding_titles": [f.get("title", "") for _, f, _ in deduplicated[:3]],
-                                "insights": [i["summary"][:150] for i in insights[:2]],  # up to 2 insights, capped
-                            })
-                            last_entry["sub_research_notes"] = sub_notes[-5:]  # keep last 5
-                            history[-1] = last_entry
-                            d["research_history"] = history
-                    parent_project.directions = parent_dirs
-                    flag_modified(parent_project, "directions")
-                    session.add(parent_project)
-
-    # Process direction notes — append to the target direction's notes list
-    if direction_notes:
-        # Deferred import of strategic caps — shared with main.py
-        from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX  # noqa: PLC0415
-        note_project = await session.get(Project, task.project_id)
-        if note_project:
-            note_directions = list(note_project.directions or [])
-            changed = False
-            for note_finding in direction_notes:
-                target_id = note_finding.get("direction_id")
-                raw_note = note_finding.get("description") or note_finding.get("prompt") or ""
-                if len(raw_note) > STRATEGIC_RATIONALE_MAX:
-                    logger.warning(f"[RESEARCH] Task {task.id}: truncating direction note {len(raw_note)}→{STRATEGIC_RATIONALE_MAX} chars for direction {target_id}")
-                note_text = raw_note[:STRATEGIC_RATIONALE_MAX]
-                if not note_text or not target_id:
-                    continue
-                for d in note_directions:
-                    if d.get("id") == target_id:
-                        notes = d.get("notes", [])
-                        notes.append({
-                            "text": note_text,
-                            "added_at": _utcnow().isoformat(),
-                            "added_by_task": str(task.id),
-                        })
-                        if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
-                            logger.warning(f"[RESEARCH] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {target_id}")
-                        d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
-                        changed = True
-                        break
-            if changed:
-                note_project.directions = note_directions
-                flag_modified(note_project, "directions")
-                session.add(note_project)
-
-    # Process direction proposals — add to Project.directions with status='proposed'
-    proposals_created = 0
-    if direction_proposals:
-        # Deferred import to avoid circular dependency
-        from app.strategic_completion import _is_direction_duplicate  # noqa: PLC0415
-        proposal_project = await session.get(Project, task.project_id)
-        if proposal_project:
-            proj_directions = list(proposal_project.directions or [])
-            rejected_proposals = [d for d in proj_directions if d.get("status") == "rejected"]
-            pending_count = sum(1 for d in proj_directions if d.get("status") == "proposed")
-            max_proposals = 10
-            now_iso = _utcnow().isoformat()
-            for proposal in direction_proposals[:5]:  # max 5 per research call
-                if pending_count >= max_proposals:
-                    logger.info(f"[RESEARCH] Skipping direction proposal — max {max_proposals} pending proposals reached")
-                    break
-                proposal_text = (proposal.get("prompt") or proposal.get("description") or "")[:500]
-                if not proposal_text.strip():
-                    continue
-                if _is_direction_duplicate(proposal_text, proj_directions, rejected_proposals):
-                    logger.info(f"[RESEARCH] Skipping direction proposal — overlaps with existing direction")
-                    continue
-                new_direction = {
-                    "id": f"d-{uuid.uuid4().hex[:8]}",
-                    "text": proposal_text,
-                    "priority": proposal.get("priority", "medium") if proposal.get("priority") in ("high", "medium", "low") else "medium",
-                    "paths": [],
-                    "added_at": now_iso,
-                    "status": "proposed",
-                    "proposed_by": str(task.id),
-                    "proposal_rationale": (proposal.get("description") or "")[:500],
-                    "proposed_at": now_iso,
-                }
-                proj_directions.append(new_direction)
-                pending_count += 1
-                proposals_created += 1
-            if proposals_created:
-                proposal_project.directions = proj_directions
-                flag_modified(proposal_project, "directions")
-                session.add(proposal_project)
-                logger.info(f"[RESEARCH] Created {proposals_created} direction proposals from task {task.id}")
-
-    # Store a human-readable research summary artifact
-    if child_tasks:
-        direction_texts = []
-        payload0 = task.first_payload
-        if payload0.get('directions'):
-            direction_texts = [payload0['directions'][0].get('text', 'general improvement')]
-        summary_lines = [
-            f'# Research Summary',
-            f'**Direction**: {direction_texts[0][:200] if direction_texts else "general"}',
-            f'**Tasks Created**: {len(child_tasks)}{_filter_str}',
-            f'',
-            f'## Findings:',
-        ]
-        for ct in child_tasks[:10]:
-            p = ct.first_payload
-            summary_lines.append(f'- [{p.get("type", "?")}] {ct.title}: {(ct.description or "")[:150]}')
-        summary = '\n'.join(summary_lines)
-
-        summary_artifact = Artifact(
-            task_id=task.id,
-            artifact_type=ArtifactType.INVESTIGATION_REPORT,
-            logs=summary,
-        )
-        session.add(summary_artifact)
-
-    direction_id = (task.context or {}).get("direction_id", "?")
-    status_msg = (
-        f"Research created {len(child_tasks)} tasks from {len(findings)} findings"
-        + _filter_str
-        + (f", {proposals_created} direction proposals pending review" if proposals_created else "")
+    await apply_post_spawn_state(
+        session=session,
+        task=task,
+        findings=findings,
+        child_tasks=child_tasks,
+        deduplicated=deduplicated,
+        insights=insights,
+        direction_notes=direction_notes,
+        direction_proposals=direction_proposals,
+        hash_dedup_count=hash_dedup_count,
+        word_overlap_count=word_overlap_count,
+        file_overlap_count=file_overlap_count,
+        type_filtered_count=type_filtered_count,
+        empty_prompt_count=empty_prompt_count,
+        research_branch=research_branch,
+        original_base=original_base,
+        research_depth=research_depth,
+        parent_research_task_id=parent_research_task_id,
     )
-
-    if not child_tasks:
-        task.status = TaskStatus.COMPLETED
-        task.latest_status_message = status_msg + " — auto-completed (no actionable tasks)"
-        task.context = {**(task.context or {}), "research_branch": research_branch, "original_base": original_base}
-        session.add(task)
-
-        _note_parts = []
-        if skipped_duplicates:
-            _note_parts.append(f"{skipped_duplicates} duplicate(s) skipped"
-                               + (f" ({hash_dedup_count} hash-match, {word_overlap_count} word-overlap,"
-                                  f" {file_overlap_count} file-overlap)"
-                                  if hash_dedup_count or word_overlap_count or file_overlap_count else ""))
-        if type_filtered_count:
-            _note_parts.append(f"{type_filtered_count} type-filtered (design_doc_observation/direction_update)")
-        if empty_prompt_count:
-            _note_parts.append(f"{empty_prompt_count} had no prompt")
-        _note_filter = ("; ".join(_note_parts) + ".") if _note_parts else "not actionable."
-        note = (
-            f"Research cycle {task.id} found {len(findings)} findings but created 0 tasks: "
-            + _note_filter
-        )
-        project = await session.get(Project, task.project_id)
-        if project and str(direction_id) != "?" and direction_id != "crosscutting":
-            directions = list(project.directions or [])
-            for d in directions:
-                if d.get("id") == direction_id:
-                    d.setdefault("notes", [])
-                    d["notes"] = (d["notes"] or [])[-4:] + [{
-                        "t": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
-                        "msg": note,
-                    }]
-                    break
-            project.directions = directions
-            flag_modified(project, "directions")
-            session.add(project)
-        elif project:
-            msg = ProjectMessage(
-                project_id=task.project_id,
-                message_type=MessageType.NOTE,
-                from_type="agent",
-                from_task_id=task.id,
-                content=note,
-                context={"source": "research_zero_children", "direction_id": str(direction_id)},
-            )
-            session.add(msg)
-
-        await session.commit()
-        logger.info(f"[RESEARCH] Task {task.id}: 0 children created, auto-completed (direction: {str(direction_id)[:8]})")
-    else:
-        task.status = TaskStatus.EVALUATING
-        task.latest_status_message = status_msg
-        task.context = {**(task.context or {}), "research_branch": research_branch, "original_base": original_base}
-        session.add(task)
-        await session.commit()
-
-    logger.info(
-        f"[RESEARCH] Task {task.id}: {len(findings)} raw findings, "
-        f"{skipped_duplicates} deduped, {len(child_tasks)} tasks created "
-        f"(direction: {str(direction_id)[:8]})"
-    )
-    await broadcast_to_project(str(task.project_id), "autonomous_activity",
-                               {"research_task_id": str(task.id), "tasks_created": len(child_tasks)})
 
 
 async def _record_research_task_failure(task: Task, session: AsyncSession) -> None:
