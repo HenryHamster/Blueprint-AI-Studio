@@ -981,7 +981,12 @@ async def get_digest(
         })
 
     # --- failure_groups (classify failures by type) ---
-    from app.failure_classification import classify_failure as _classify_failure
+    from app.failure_classification import (
+        classify_failure as _classify_failure,
+        classify_failure_taxonomy as _classify_taxonomy,
+        TAXONOMY_REVIEW_QUALITY, TAXONOMY_SCOPE_RELATED,
+        TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED,
+    )
     _failure_class_labels = {
         "CODE_ERROR": "Code Error",
         "PROVISION_FAILURE": "Provision Failure",
@@ -1002,6 +1007,7 @@ async def get_digest(
             "error_snippet": error_log_map.get(tid),
             "attempt_count": t.attempt_count,
             "waiting_hours": waiting_hours,
+            "taxonomy": _classify_taxonomy(t),
         })
     failure_groups = sorted(
         [
@@ -1018,11 +1024,6 @@ async def get_digest(
     )
 
     # Taxonomy distribution (4-category: scope/review/infra/code_defect)
-    from app.failure_classification import (
-        classify_failure_taxonomy as _classify_taxonomy,
-        TAXONOMY_REVIEW_QUALITY, TAXONOMY_SCOPE_RELATED,
-        TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED,
-    )
     _tax_keys = (
         TAXONOMY_SCOPE_RELATED, TAXONOMY_REVIEW_QUALITY,
         TAXONOMY_INFRA_RELATED, TAXONOMY_CODE_DEFECT,

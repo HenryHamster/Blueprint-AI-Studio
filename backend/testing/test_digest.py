@@ -1366,6 +1366,9 @@ async def test_failure_group_code_error_default(client: AsyncClient, db_session)
 
     code_error_group = next(g for g in data["failure_groups"] if g["failure_class"] == "CODE_ERROR")
     assert code_error_group["count"] == 1
+    task_entry = code_error_group["tasks"][0]
+    assert "taxonomy" in task_entry
+    assert task_entry["taxonomy"] in {"scope_related", "review_quality", "code_defect", "infra_related"}
 
 
 @pytest.mark.asyncio

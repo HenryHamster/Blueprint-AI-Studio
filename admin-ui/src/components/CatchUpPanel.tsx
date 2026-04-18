@@ -33,6 +33,7 @@ interface FailureGroupTask {
   error_snippet: string | null;
   attempt_count: number;
   waiting_hours?: number;
+  taxonomy?: string;
 }
 
 interface FailureGroup {
@@ -1045,6 +1046,11 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                       onClick={() => onSelectTask({ id: t.task_id })}
                                       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: t.task_id }); } }}
                                     >
+                                      {t.taxonomy && TAXONOMY_LABELS[t.taxonomy] && (
+                                        <span className={`shrink-0 text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[t.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`} title={TAXONOMY_LABELS[t.taxonomy]}>
+                                          {TAXONOMY_LABELS[t.taxonomy]}
+                                        </span>
+                                      )}
                                       <span className="flex-1 truncate text-neutral-400">{t.title}</span>
                                       {t.attempt_count > 1 && (
                                         <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-500 border border-neutral-700/40">

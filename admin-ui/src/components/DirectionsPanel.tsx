@@ -28,6 +28,7 @@ export interface ResearchHistoryEntry {
   type_distribution?: Record<string, number> | null;
   prs_merged?: number | null;
   prs_rejected?: number | null;
+  taxonomy_summary?: Record<string, number> | null;
 }
 
 export interface Direction {

@@ -46,6 +46,7 @@ interface FailureGroupTask {
   title: string;
   error_snippet?: string;
   attempt_count?: number;
+  taxonomy?: string;
 }
 
 interface FailureGroup {
@@ -225,7 +226,14 @@ function FailureClassPill({ group, sparkData }: { group: FailureGroup; sparkData
         <div className="absolute z-10 top-full mt-1 left-0 w-64 bg-neutral-900 border border-neutral-700 rounded-lg p-2 shadow-lg">
           <div className="space-y-1">
             {topTasks.map(t => (
-              <div key={t.task_id} className="text-[10px] text-neutral-300 truncate">{t.title}</div>
+              <div key={t.task_id} className="text-[10px] text-neutral-300 flex items-center gap-1 min-w-0">
+                {t.taxonomy && TAXONOMY_LABELS[t.taxonomy] && (
+                  <span className={`shrink-0 text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[t.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`} title={TAXONOMY_LABELS[t.taxonomy]}>
+                    {TAXONOMY_LABELS[t.taxonomy]}
+                  </span>
+                )}
+                <span className="truncate">{t.title}</span>
+              </div>
             ))}
           </div>
         </div>

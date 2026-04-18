@@ -7,6 +7,20 @@ import type { DirectionCategory } from '../hooks/useDirectionForm';
 import { formatRelativeTime, formatTimeRemaining, getCooldownStatus, priorityColors, statusColors } from '../utils/directionHelpers';
 import { parseTimestamp } from '../utils/time';
 
+const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
+const TAXONOMY_LABELS: Record<string, string> = {
+  scope_related: 'scope',
+  review_quality: 'review',
+  infra_related: 'infra',
+  code_defect: 'code',
+};
+const TAXONOMY_COLORS: Record<string, string> = {
+  scope_related: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
+  review_quality: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
+  infra_related: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  code_defect: 'bg-red-500/20 text-red-400 border-red-500/30',
+};
+
 export interface DirectionCardProps {
   direction: Direction;
   statusKey: string;
@@ -784,7 +798,7 @@ export function DirectionCard({
                           ))}
                         </div>
                       )}
-                      {(entry.product_ratio != null || entry.type_distribution) && (
+                      {(entry.product_ratio != null || entry.type_distribution || entry.taxonomy_summary) && (
                         <div className="mt-1 flex flex-wrap items-center gap-1.5 border-t border-neutral-800/60 pt-1">
                           {entry.product_ratio != null && (() => {
                             const pct = Math.round((entry.product_ratio as number) * 100);
@@ -800,6 +814,19 @@ export function DirectionCard({
                               {Object.entries(entry.type_distribution).map(([k, v]) => `${k}:${v}`).join(' ')}
                             </span>
                           )}
+                          {entry.taxonomy_summary && TAXONOMY_ORDER.map(cat => {
+                            const count = entry.taxonomy_summary?.[cat] ?? 0;
+                            if (count <= 0) return null;
+                            return (
+                              <span
+                                key={cat}
+                                title={`${TAXONOMY_LABELS[cat]}: ${count} failure${count !== 1 ? 's' : ''}`}
+                                className={`text-[10px] px-1 py-0.5 rounded border ${TAXONOMY_COLORS[cat]}`}
+                              >
+                                {TAXONOMY_LABELS[cat]} {count}
+                              </span>
+                            );
+                          })}
                         </div>
                       )}
                       {entry.cycle_insights && entry.cycle_insights.length > 0 && (
