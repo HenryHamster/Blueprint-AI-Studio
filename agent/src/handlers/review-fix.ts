@@ -801,6 +801,33 @@ export async function handleFix(
     const { testFailuresDetected: fixTestFailures, failureSummary: fixTestFailureSummary } = await testFixLoop(ws, statusRef, model, effort, buildConfig, fixBaselineFailures);
 
     git(['add', '-A']);
+
+    // Parse restricted paths from CLAUDE.md and unstage any violations before commit.
+    {
+      const claudeMdContent = readClaudeMd();
+      if (claudeMdContent) {
+        const restrictedPaths: string[] = [];
+        for (const line of claudeMdContent.split('\n')) {
+          const match = line.match(/Do NOT modify.*?`([^`]+)`/i);
+          if (match) restrictedPaths.push(match[1]);
+        }
+        if (restrictedPaths.length > 0) {
+          let stagedFiles: string[];
+          try {
+            stagedFiles = execFileSync('git', ['-C', WORKSPACE, 'diff', '--name-only', '--cached'], { encoding: 'utf-8' })
+              .trim().split('\n').filter(Boolean);
+          } catch { stagedFiles = []; }
+          const violations = stagedFiles.filter(f => restrictedPaths.some(p => f.startsWith(p)));
+          if (violations.length > 0) {
+            sendLog(ws, `WARNING: Unstaging ${violations.length} restricted file(s) that must not be modified:\n${violations.join('\n')}\n`);
+            for (const v of violations) {
+              try { execFileSync('git', ['-C', WORKSPACE, 'restore', '--staged', v], { encoding: 'utf-8' }); } catch { /* ignore */ }
+            }
+          }
+        }
+      }
+    }
+
     const shortId = taskId.replace(/-/g, '').slice(0, 8);
     const testNote = fixTestFailures
       ? `\n\nNote: test failures detected, manual review recommended${fixTestFailureSummary ? `:\n${fixTestFailureSummary.slice(0, 500)}` : ''}`
