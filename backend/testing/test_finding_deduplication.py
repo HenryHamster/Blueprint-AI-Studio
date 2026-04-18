@@ -320,3 +320,76 @@ def test_dedup_outcome_default_empty():
     assert outcome.hash_dedup_count == 0
     assert outcome.word_overlap_count == 0
     assert outcome.file_overlap_count == 0
+    assert outcome.filtered == []
+
+
+def test_deduplicate_findings_records_hash_dedup_reason():
+    finding = {
+        "title": "previously attempted refactor",
+        "description": "body",
+        "priority": "medium",
+        "direction_id": "dir-1",
+    }
+    fhash = finding_hash(finding["title"], finding["description"])
+    outcome = deduplicate_findings(
+        [finding],
+        task_context={"direction_id": "dir-1"},
+        recent_finding_hashes={fhash},
+        failed_hashes={fhash: "prior"},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+    )
+    assert len(outcome.filtered) == 1
+    rec = outcome.filtered[0]
+    assert rec["title"] == "previously attempted refactor"
+    assert rec["direction_id"] == "dir-1"
+    assert rec["reason"] == "hash match with prior task"
+
+
+def test_deduplicate_findings_records_word_overlap_matched_title():
+    finding = {
+        "title": "alpha beta gamma delta novel",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-1",
+    }
+    existing_title = "alpha beta gamma delta something-else"
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[("dir-1", existing_title)],
+        open_pr_files=set(),
+    )
+    assert len(outcome.filtered) == 1
+    rec = outcome.filtered[0]
+    assert rec["title"] == "alpha beta gamma delta novel"
+    assert rec["direction_id"] == "dir-1"
+    assert rec["reason"].startswith("word overlap with: ")
+    assert "alpha beta gamma delta" in rec["reason"]
+    # The persisted reason must stay compact so it does not bloat the prompt.
+    assert len(rec["reason"]) <= 80
+
+
+def test_deduplicate_findings_records_file_overlap_reason():
+    finding = {
+        "title": "cover already-shipped files",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-2",
+        "related_files": ["app/foo.py", "app/bar.py"],
+    }
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files={"app/foo.py", "app/bar.py"},
+    )
+    assert len(outcome.filtered) == 1
+    rec = outcome.filtered[0]
+    assert rec["title"] == "cover already-shipped files"
+    assert rec["direction_id"] == "dir-2"
+    assert rec["reason"] == "all files covered by open PR"

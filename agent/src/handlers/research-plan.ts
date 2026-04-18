@@ -203,38 +203,127 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
     }
   }
 
-  // Scope success from last 3 cycles: aggregate scope_breakdown to show merged/created per scope
+  // Scope success from last 3 cycles: aggregate scope_breakdown to show merged/created per scope,
+  // and surface distinguishing characteristics (complexity, expansion ratio) + calibration flow
   const recent = history.slice(-3);
-  const aggScope: Record<string, {created: number; merged: number}> = {};
+  type ScopeAgg = {
+    created: number; merged: number;
+    cplxMSum: number; cplxMN: number;
+    cplxFSum: number; cplxFN: number;
+    expSum: number; expN: number;
+    calIn: number; calOut: number;
+  };
+  const aggScope: Record<string, ScopeAgg> = {};
   for (const h of recent) {
-    const sb = h.scope_breakdown as Record<string, {created: number; merged: number; failed: number}> | undefined;
+    const sb = h.scope_breakdown as Record<string, Record<string, number>> | undefined;
     if (!sb || typeof sb !== 'object') continue;
     for (const [scope, counts] of Object.entries(sb)) {
-      if (!aggScope[scope]) aggScope[scope] = { created: 0, merged: 0 };
-      aggScope[scope].created += (counts.created as number) || 0;
-      aggScope[scope].merged += (counts.merged as number) || 0;
+      if (!aggScope[scope]) aggScope[scope] = {
+        created: 0, merged: 0, cplxMSum: 0, cplxMN: 0, cplxFSum: 0, cplxFN: 0, expSum: 0, expN: 0, calIn: 0, calOut: 0,
+      };
+      const a = aggScope[scope];
+      a.created += (counts.created as number) || 0;
+      a.merged += (counts.merged as number) || 0;
+      if (typeof counts.avg_complexity_merged === 'number') { a.cplxMSum += counts.avg_complexity_merged; a.cplxMN += 1; }
+      if (typeof counts.avg_complexity_failed === 'number') { a.cplxFSum += counts.avg_complexity_failed; a.cplxFN += 1; }
+      if (typeof counts.avg_expansion_ratio === 'number') { a.expSum += counts.avg_expansion_ratio; a.expN += 1; }
+      a.calIn += counts.calibrated_in || 0;
+      a.calOut += counts.calibrated_out || 0;
     }
   }
   const scopeOrder = ['small', 'medium', 'large'];
+  const orderedScopes = [...scopeOrder, ...Object.keys(aggScope).filter(s => !scopeOrder.includes(s))];
   const scopeParts: string[] = [];
-  for (const scope of scopeOrder) {
-    if (aggScope[scope] && aggScope[scope].created > 0) {
-      scopeParts.push(`${scope} ${aggScope[scope].merged}/${aggScope[scope].created}`);
-    }
-  }
-  // Include any non-standard scopes
-  for (const scope of Object.keys(aggScope)) {
-    if (!scopeOrder.includes(scope) && aggScope[scope].created > 0) {
-      scopeParts.push(`${scope} ${aggScope[scope].merged}/${aggScope[scope].created}`);
+  const profileParts: string[] = [];
+  const calParts: string[] = [];
+  for (const scope of orderedScopes) {
+    const a = aggScope[scope];
+    if (!a) continue;
+    if (a.created > 0) scopeParts.push(`${scope} ${a.merged}/${a.created}`);
+    const mBits: string[] = [];
+    if (a.cplxMN > 0) mBits.push(`cplx ${(a.cplxMSum / a.cplxMN).toFixed(2)}`);
+    if (a.expN > 0) mBits.push(`expand ${(a.expSum / a.expN).toFixed(1)}x`);
+    const fBits = a.cplxFN > 0 ? [`cplx ${(a.cplxFSum / a.cplxFN).toFixed(2)}`] : [];
+    const sides: string[] = [];
+    if (mBits.length) sides.push(`merged ${mBits.join('/')}`);
+    if (fBits.length) sides.push(`failed ${fBits.join('/')}`);
+    if (sides.length) profileParts.push(`${scope}(${sides.join(' vs ')})`);
+    if (a.calIn > 0 || a.calOut > 0) {
+      const c: string[] = [];
+      if (a.calIn > 0) c.push(`in=${a.calIn}`);
+      if (a.calOut > 0) c.push(`out=${a.calOut}`);
+      calParts.push(`${scope} ${c.join(' ')}`);
     }
   }
   const cycleLabel = recent.length === 1 ? '1 cycle' : `${recent.length} cycles`;
   const line3 = scopeParts.length > 0
     ? `\n  Scope success (last ${cycleLabel}): ${scopeParts.join(', ')}`
     : '';
+  const line4 = profileParts.length > 0
+    ? `\n  Per-scope profile: ${profileParts.join('; ')}`
+    : '';
+  const line5 = calParts.length > 0
+    ? `\n  Calibration (in=narrowed from larger, out=auto-escalated up): ${calParts.join(', ')}`
+    : '';
 
-  if (!line1 && !line2 && !line3 && !priorFailuresLine) return '';
-  return line1 + line2 + line3 + priorFailuresLine;
+  // Scope accuracy: per-scope avg_expansion_ratio (actual files / declared related_files).
+  // Flag overflow (>2.0x) per scope and emit a summary warning so research agents
+  // learn when their file-count estimates chronically underestimate reality.
+  const expansionParts: string[] = [];
+  let maxRatio = 0;
+  for (const scope of orderedScopes) {
+    const a = aggScope[scope];
+    if (!a || a.expN === 0) continue;
+    const avg = a.expSum / a.expN;
+    if (avg > maxRatio) maxRatio = avg;
+    const flag = avg > 2.0 ? ' ⚠ scope overflow' : '';
+    expansionParts.push(`${scope} ${avg.toFixed(1)}x${flag}`);
+  }
+  const line6 = expansionParts.length > 0
+    ? `\n  Scope accuracy (actual files / declared, last ${cycleLabel}): ${expansionParts.join(', ')}`
+    : '';
+  const line7 = maxRatio > 2.0
+    ? `\n  ⚠ Expansion ratio exceeds 2.0x — halve your file count estimates or prefer smaller scope`
+    : '';
+
+  if (!line1 && !line2 && !line3 && !line4 && !line5 && !line6 && !line7 && !priorFailuresLine) return '';
+  return line1 + line2 + line3 + line4 + line5 + line6 + line7 + priorFailuresLine;
+}
+
+/**
+ * Renders a compact "Recently filtered (avoid)" section from the last few
+ * research_history entries. Flattens entries' filtered_findings lists
+ * (most recent cycle last), dedups by title, and caps at 5 items so the
+ * prompt does not bloat. Returns an empty string when no entries carry
+ * filtered_findings so existing prompts are unchanged.
+ */
+export function buildFilteredFindingsSection(history: Array<Record<string, unknown>>): string {
+  if (history.length === 0) return '';
+  const recent = history.slice(-3);
+  const seen = new Set<string>();
+  const items: Array<{title: string; reason: string}> = [];
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const entry = recent[i];
+    const raw = Array.isArray(entry.filtered_findings)
+      ? entry.filtered_findings as Array<Record<string, unknown>>
+      : [];
+    for (const rec of raw) {
+      const title = typeof rec.title === 'string' ? rec.title : '';
+      const reason = typeof rec.reason === 'string' ? rec.reason : '';
+      if (!title) continue;
+      const key = title.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({ title, reason });
+      if (items.length >= 5) break;
+    }
+    if (items.length >= 5) break;
+  }
+  if (items.length === 0) return '';
+  const lines = items.map(it => it.reason
+    ? `  * "${it.title}" — ${it.reason}`
+    : `  * "${it.title}"`);
+  return `\n  Recently filtered (avoid — propose different approaches):\n${lines.join('\n')}`;
 }
 
 export function formatCochangeHints(directionCtx: Record<string, unknown> | undefined): string {
@@ -643,6 +732,11 @@ ${hotspotsSection}
           }
         }
 
+        // Filter decisions from the dedup pipeline: specific titles + reasons
+        // for findings rejected in recent cycles. Lets the agent propose a
+        // different angle instead of repeating work the backend will reject.
+        const filteredSection = buildFilteredFindingsSection(history);
+
         // Notes: show all notes in full (user-written guidance, highest signal)
         const notes = Array.isArray(d.notes) ? d.notes as Array<{text: string; added_at: string}> : [];
         let notesSection = '';
@@ -664,7 +758,7 @@ ${hotspotsSection}
           }
         }
 
-        return `${i + 1}. [${strVal(d.priority, 'medium')}] ${strVal(d.text)}${pathScope} (id: ${strVal(d.id)})${statsLine}${calibrationSignal}${researchCtx}${historySection}${notesSection}${saturationNote}${activeForDirNote}`;
+        return `${i + 1}. [${strVal(d.priority, 'medium')}] ${strVal(d.text)}${pathScope} (id: ${strVal(d.id)})${statsLine}${calibrationSignal}${researchCtx}${historySection}${filteredSection}${notesSection}${saturationNote}${activeForDirNote}`;
       }).join('\n\n')
     : 'No specific directions provided. Identify general improvements.';
 

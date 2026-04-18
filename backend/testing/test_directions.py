@@ -3043,6 +3043,8 @@ async def test_low_confidence_medium_auto_escalates_to_large(db_session, mocker)
     _, task, _ = await _setup_escalation_project(db_session, direction_id, None)
     _mock_escalation_externals(mocker, direction_id)
     mocker.patch("app.research_completion.predict_spawn_success", return_value=0.0)
+    # Disable exploration-bypass randomness so the escalation path is deterministic.
+    mocker.patch.dict("app.shared_state.runtime_config", {"medium_exploration_fraction": 0})
 
     await _handle_research_completion(task, "", db_session)
 

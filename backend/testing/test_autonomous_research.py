@@ -1074,6 +1074,100 @@ async def test_unique_findings_are_not_deduplicated(db_session, mocker):
     assert len(child_tasks) == 2, "Both unique findings should produce child tasks"
 
 
+@pytest.mark.asyncio
+async def test_filtered_findings_recorded_in_direction_history(db_session, mocker):
+    """After dedup skips, the cycle's history entry must record title+reason so the
+    research agent can be told exactly what was rejected on its next cycle."""
+    direction_id = "d-filtrec01"
+    direction = _active_direction(direction_id, "Direction with filtered findings")
+    project = Project(
+        name="Filtered Findings Recording",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed a hash-match collision for one finding and a word-overlap existing
+    # task for another so both skip paths are exercised in a single cycle.
+    dup_title = "Consolidate auth token refresh across handlers"
+    dup_desc = "Unify token refresh logic used by all agent handlers"
+    dup_hash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+    hash_blocker = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        context={"finding_hash": dup_hash, "direction_id": direction_id},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    word_blocker = Task(
+        project_id=project.id,
+        title="instrument pipeline throughput histogram latency metrics",
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add_all([hash_blocker, word_blocker])
+    await db_session.commit()
+
+    task = await _make_research_task(project, direction, db_session)
+    # Scope the research task to the direction so current_direction_id resolves
+    # and the history entry is written even when every finding is deduped.
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "consolidate token refresh",
+                "priority": "high",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            },
+            {
+                "title": "instrument pipeline throughput histogram latency counters",
+                "description": "Add histogram metrics for pipeline stages",
+                "prompt": "add metrics",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            },
+        ],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    updated_dir = next(d for d in project.directions if d.get("id") == direction_id)
+    history = updated_dir.get("research_history", [])
+    assert history, "Dedup-only cycle still writes a history entry"
+    entry = history[-1]
+    filtered = entry.get("filtered_findings")
+    assert isinstance(filtered, list) and len(filtered) == 2, filtered
+    reasons_by_title = {rec["title"]: rec["reason"] for rec in filtered}
+    assert reasons_by_title[dup_title] == "hash match with prior task"
+    word_title = "instrument pipeline throughput histogram latency counters"
+    assert reasons_by_title[word_title].startswith("word overlap with: ")
+    # filter_breakdown is unchanged (additive persistence, counters still match).
+    assert entry["filter_breakdown"]["hash_dedup"] == 1
+    assert entry["filter_breakdown"]["word_overlap_dedup"] == 1
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. _handle_research_completion — Child Task Properties
 # ─────────────────────────────────────────────────────────────────────────────

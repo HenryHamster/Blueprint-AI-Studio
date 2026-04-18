@@ -95,8 +95,8 @@ async def apply_post_spawn_state(
     original_base: str,
     research_depth: int,
     parent_research_task_id: Optional[str],
-    findings_produced_count: int = 0,
     batch_cap_applied_count: int = 0,
+    filtered_findings: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Apply all direction-state updates after research child tasks have been spawned.
 
@@ -167,6 +167,42 @@ async def apply_post_spawn_state(
                     finding_scopes_by_dir.setdefault(did, []).append(
                         finding.get("scope", DEFAULT_TASK_SCOPE)
                     )
+            # Group filter-skip records by direction so each direction's
+            # research_history entry can record the exact titles + reasons
+            # that were rejected on this cycle. Bucket entries without a
+            # direction_id under the task's current direction so they are
+            # still surfaced next cycle. Also tally per-reason counts so the
+            # filter_breakdown block can reflect only this direction's skips
+            # instead of the global totals.
+            filtered_findings_by_dir: dict = {}
+            hash_dedup_by_dir: dict = {}
+            word_overlap_by_dir: dict = {}
+            file_overlap_by_dir: dict = {}
+            for rec in (filtered_findings or []):
+                did = rec.get("direction_id") or current_direction_id
+                if not did:
+                    continue
+                reason = rec.get("reason", "")
+                filtered_findings_by_dir.setdefault(did, []).append({
+                    "title": rec.get("title", "")[:120],
+                    "reason": reason[:80],
+                })
+                if reason.startswith("hash match"):
+                    hash_dedup_by_dir[did] = hash_dedup_by_dir.get(did, 0) + 1
+                elif reason.startswith("word overlap"):
+                    word_overlap_by_dir[did] = word_overlap_by_dir.get(did, 0) + 1
+                elif reason.startswith("all files covered"):
+                    file_overlap_by_dir[did] = file_overlap_by_dir.get(did, 0) + 1
+
+            # Count raw actionable findings per direction so each direction's
+            # history entry records only its own findings_produced instead of
+            # the global total. Applies the same parent-direction fallback used
+            # for filtered_findings bucketing.
+            findings_produced_by_dir: dict = {}
+            for _f in findings:
+                _did = _f.get("direction_id") or current_direction_id
+                if _did:
+                    findings_produced_by_dir[_did] = findings_produced_by_dir.get(_did, 0) + 1
             for d in directions:
                 did = d.get("id")
                 if did in direction_ids_with_findings:
@@ -180,19 +216,27 @@ async def apply_post_spawn_state(
                         "timestamp": now_iso,
                         "task_id": str(task.id),
                         "tasks_created": len(dir_child_tasks),
-                        "findings_produced": findings_produced_count,
+                        "findings_produced": findings_produced_by_dir.get(did, 0),
                         "batch_cap_applied": batch_cap_applied_count,
                         "summary": "; ".join(t[:60] for t in titles) if titles else "no findings",
                         "finding_titles": titles,
                         "key_finding_descriptions": descriptions,
                         "filter_breakdown": {
-                            "hash_dedup": hash_dedup_count,
-                            "word_overlap_dedup": word_overlap_count,
-                            "file_overlap_dedup": file_overlap_count,
+                            "hash_dedup": hash_dedup_by_dir.get(did, 0),
+                            "word_overlap_dedup": word_overlap_by_dir.get(did, 0),
+                            "file_overlap_dedup": file_overlap_by_dir.get(did, 0),
                             "type_filtered": type_filtered_count,
                             "empty_prompt": empty_prompt_count,
                         },
                     }
+                    # Record exact titles+reasons so the research agent can be
+                    # shown what was filtered and steer to different approaches
+                    # on its next cycle. Cap at 5 per cycle to bound prompt
+                    # growth; priority ordering (high→medium→low) is already
+                    # applied upstream in deduplicate_findings.
+                    _dir_filtered = filtered_findings_by_dir.get(did) or []
+                    if _dir_filtered:
+                        entry["filtered_findings"] = _dir_filtered[:5]
                     if no_findings_cycle and not titles:
                         entry["no_findings"] = True
                     # Keep last 10 history entries; aggregate evicted entries to preserve lifetime stats

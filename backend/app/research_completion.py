@@ -7,6 +7,7 @@ and the large _handle_research_completion handler.
 import json
 import logging
 import os
+import random
 import uuid
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
@@ -274,9 +275,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     direction_proposals = [f for f in findings if f.get("type") == "direction_proposal"]
     direction_notes = [f for f in findings if f.get("type") == "direction_note"]
     findings = [f for f in findings if f.get("type") not in ("direction_proposal", "direction_note")]
-    # Raw actionable findings count this cycle's agent produced, before batch cap or any dedup.
-    findings_produced_count = len(findings)
-
     # Recover findings that were deferred in the previous cycle due to pipeline degradation.
     # These were already researched but couldn't be spawned; prepend them so they go through
     # the full dedup + health gate pipeline alongside this cycle's new findings.
@@ -456,6 +454,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     hash_dedup_count = _dedup_outcome.hash_dedup_count
     word_overlap_count = _dedup_outcome.word_overlap_count
     file_overlap_count = _dedup_outcome.file_overlap_count
+    filtered_findings = _dedup_outcome.filtered
     type_filtered_count = 0
     empty_prompt_count = 0
 
@@ -647,10 +646,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "[RESEARCH] Low-confidence spawn '%s' (scope=%s, type=%s): P(success)=%.2f < threshold=%.2f",
                 title, scope, task_type, _pred_p, _confidence_threshold,
             )
+        _medium_exploration = False
         if _low_confidence and scope == "medium" and not _poor_decomp_history(_pred_direction or {}):
-            logger.info("[RESEARCH] Auto-escalating scope medium→large for '%s' (low-confidence spawn: P=%.2f < %.2f)",
-                        title, _pred_p, _confidence_threshold)
-            scope, scope_calibrated_from, task_type = "large", "medium", "plan"
+            # Exploration fraction: let a configurable share of medium findings bypass the
+            # confidence gate so the pipeline can accumulate real medium-scope conversion
+            # data. Without this, medium rates stay low because no medium tasks ever run,
+            # which keeps P(success) below threshold in a self-reinforcing loop.
+            _explore_frac = _runtime_config.get("medium_exploration_fraction", 0.2)
+            if isinstance(_explore_frac, (int, float)) and _explore_frac > 0 and random.random() < float(_explore_frac):
+                _medium_exploration = True
+                logger.info("[RESEARCH] Exploration bypass keeping medium scope for '%s' (P=%.2f, explore_frac=%.2f)",
+                            title, _pred_p, float(_explore_frac))
+            else:
+                logger.info("[RESEARCH] Auto-escalating scope medium→large for '%s' (low-confidence spawn: P=%.2f < %.2f)",
+                            title, _pred_p, _confidence_threshold)
+                scope, scope_calibrated_from, task_type = "large", "medium", "plan"
 
         finding_priority = TASK_PRIORITY_MAP.get(finding.get("priority", "medium"), 50)
         # Inherit parent direction_id if the finding doesn't specify one
@@ -757,6 +767,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **({"scope_calibrated_from": scope_calibrated_from} if scope_calibrated_from else {}),
                 **({"complexity_score": finding["_complexity_score"], "complexity_signals": finding.get("_complexity_signals", {})} if "_complexity_score" in finding else {}),
                 **({"low_confidence_spawn": True, "low_confidence_spawn_rate": round(_pred_p, 3)} if _low_confidence else {}),
+                **({"medium_exploration": True} if _medium_exploration else {}),
                 **prior_retry_ctx,
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -771,7 +782,23 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         finding_indices.append(orig_i)
         _impl_spawned += 1
 
-    _all_deferred = _deferred_findings + _batch_cap_deferred
+    _now_iso = _utcnow().isoformat()
+
+    def _stamp_deferral(f: dict, reason: str) -> dict:
+        stamped = dict(f)
+        stamped["deferred_count"] = int(stamped.get("deferred_count", 0)) + 1
+        stamped["deferred_reason"] = reason
+        stamped.setdefault("originally_researched_at", _now_iso)
+        if not stamped.get("finding_hash"):
+            stamped["finding_hash"] = _finding_hash(
+                stamped.get("title", ""), stamped.get("description", "")
+            )
+        return stamped
+
+    _all_deferred = (
+        [_stamp_deferral(f, "degradation_gate") for f in _deferred_findings]
+        + [_stamp_deferral(f, "batch_cap") for f in _batch_cap_deferred]
+    )
     if _all_deferred:
         ctx = dict(task.context or {})
         ctx["deferred_findings"] = _all_deferred
@@ -839,12 +866,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         file_overlap_count=file_overlap_count,
         type_filtered_count=type_filtered_count,
         empty_prompt_count=empty_prompt_count,
-        findings_produced_count=findings_produced_count,
         batch_cap_applied_count=batch_cap_applied_count,
         research_branch=research_branch,
         original_base=original_base,
         research_depth=research_depth,
         parent_research_task_id=parent_research_task_id,
+        filtered_findings=filtered_findings,
     )
 
 

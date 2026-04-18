@@ -162,6 +162,10 @@ class DedupOutcome:
     hash_dedup_count: int = 0
     word_overlap_count: int = 0
     file_overlap_count: int = 0
+    # Per-skip reason records: {title, direction_id, reason} for each filtered
+    # finding, so the research agent can be told exactly what was rejected and
+    # why on its next cycle. Reasons are short literals (≤80 chars).
+    filtered: list[dict] = field(default_factory=list)
 
 
 def deduplicate_findings(
@@ -192,6 +196,7 @@ def deduplicate_findings(
         title = finding.get("title", f"Research finding #{orig_i + 1}")
         description = finding.get("description", finding.get("prompt", ""))
         fhash = finding_hash(title, description)
+        finding_dir_id = finding.get("direction_id") or parent_dir_id
 
         if fhash in recent_finding_hashes:
             out = failed_hashes.get(fhash, "prior")
@@ -199,14 +204,25 @@ def deduplicate_findings(
                 f"[RESEARCH] Skipping finding '{title}' — hash {fhash} matched {out} task"
             )
             outcome.hash_dedup_count += 1
+            outcome.filtered.append({
+                "title": title[:120],
+                "direction_id": finding_dir_id,
+                "reason": "hash match with prior task"[:80],
+            })
             continue
 
-        finding_dir_id = finding.get("direction_id") or parent_dir_id
-        if is_duplicate(title, finding_dir_id, existing_tasks_with_dirs):
+        matched_title = _find_overlap_match(title, finding_dir_id, existing_tasks_with_dirs)
+        if matched_title is not None:
             logger.warning(
                 f"[RESEARCH] Skipping duplicate finding '{title}' — matches existing task"
             )
             outcome.word_overlap_count += 1
+            reason = f"word overlap with: {matched_title[:60]}"
+            outcome.filtered.append({
+                "title": title[:120],
+                "direction_id": finding_dir_id,
+                "reason": reason[:80],
+            })
             continue
 
         finding_files = set(finding.get('related_files', []))
@@ -215,8 +231,39 @@ def deduplicate_findings(
                 f"[RESEARCH] Skipping finding '{title}' — all related files already have open PRs"
             )
             outcome.file_overlap_count += 1
+            outcome.filtered.append({
+                "title": title[:120],
+                "direction_id": finding_dir_id,
+                "reason": "all files covered by open PR"[:80],
+            })
             continue
 
         outcome.deduplicated.append((orig_i, finding, fhash))
 
     return outcome
+
+
+def _find_overlap_match(
+    finding_title: str,
+    finding_dir_id: Optional[str],
+    existing: Iterable[tuple],
+) -> Optional[str]:
+    """Return the first existing title that word-overlaps ``finding_title``.
+
+    Uses the same threshold rules as :func:`is_duplicate` (4 words same or
+    unknown direction, 6 words cross-direction). Returns ``None`` when no
+    match is found, so callers can build a reason string with the matched
+    title.
+    """
+    words = set(finding_title.lower().split()) - _STOPWORDS
+    for task_dir_id, title in existing:
+        overlap = words & (set(title.lower().split()) - _STOPWORDS)
+        same_direction = (
+            not finding_dir_id
+            or not task_dir_id
+            or finding_dir_id == task_dir_id
+        )
+        threshold = 4 if same_direction else 6
+        if len(overlap) >= threshold:
+            return title
+    return None

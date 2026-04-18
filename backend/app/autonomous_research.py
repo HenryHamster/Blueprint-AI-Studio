@@ -635,26 +635,50 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             ).order_by(Task.created_at.desc()).limit(20)
         )).scalars().all()
         prev_research_rows = [r for r in prev_research_rows if (r.context or {}).get("deferred_findings")]
+        from app.finding_deduplication import finding_hash as _finding_hash  # noqa: PLC0415
+        _deferred_ttl_days = int(_runtime_config.get("deferred_finding_ttl_days", 7))
+        _ttl_cutoff = _utcnow() - timedelta(days=_deferred_ttl_days)
         dir_deferred: list[dict] = []
-        seen_titles: set[str] = set()
+        seen_hashes: set[str] = set()
+        _expired_count = 0
         for prev_row in prev_research_rows:
             for f in (prev_row.context or {}).get("deferred_findings", []):
                 if not isinstance(f, dict):
                     continue
                 f_dir_id = f.get("direction_id")
                 if current_dir_id:
-                    # Directed cycle: include findings for this direction or unscoped
                     if f_dir_id and f_dir_id != current_dir_id:
                         continue
                 else:
-                    # Undirected cycle: only unscoped findings (avoid stealing
-                    # directed leftovers from their owning direction)
                     if f_dir_id:
                         continue
-                title = f.get("title", "")
-                if title not in seen_titles:
+                # Expire stale findings (originally researched too long ago)
+                _orig_at = f.get("originally_researched_at")
+                if _orig_at:
+                    try:
+                        _orig_dt = datetime.fromisoformat(_orig_at)
+                        if _orig_dt.tzinfo is None:
+                            _orig_dt = _orig_dt.replace(tzinfo=timezone.utc)
+                        if _orig_dt < _ttl_cutoff:
+                            _expired_count += 1
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                # Prefer finding_hash for dedup; fall back to computed hash
+                fhash = f.get("finding_hash") or _finding_hash(
+                    f.get("title", ""), f.get("description", "")
+                )
+                if fhash not in seen_hashes:
                     dir_deferred.append(f)
-                    seen_titles.add(title)
+                    seen_hashes.add(fhash)
+        # Prioritize findings that have been deferred the most times — they keep
+        # getting bumped and should execute first when capacity returns.
+        dir_deferred.sort(key=lambda f: int(f.get("deferred_count", 0)), reverse=True)
+        if _expired_count:
+            logger.info(
+                f"[AUTONOMOUS] Expired {_expired_count} stale deferred finding(s) "
+                f"(older than {_deferred_ttl_days}d)"
+            )
         if dir_deferred:
             task_context["prior_deferred_findings"] = dir_deferred
             logger.info(

@@ -116,6 +116,16 @@ runtime_config: Dict = {
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
     "spawn_confidence_threshold": 0.25,  # P(success) below this injects low_confidence_spawn=True into task context
+    # Fraction of low-confidence medium-scope findings that bypass the escalation
+    # gate and run as medium tasks, breaking the self-reinforcing feedback loop
+    # where no medium tasks run → medium pipeline rate stays low → all medium
+    # findings escalate. Set to 0 to disable exploration.
+    "medium_exploration_fraction": 0.2,
+    # TTL (days) for deferred findings carried forward by autonomous_research.
+    # Findings older than this window are dropped rather than reprocessed, so
+    # stale context doesn't keep surfacing work the system already declined to
+    # spawn. Mirrors the hardcoded default in autonomous_research.py.
+    "deferred_finding_ttl_days": 7,
     # Pipeline-wide scope merge-rate baselines used for cold-start scope calibration
     # when a direction/project has insufficient research_history. Default is empty
     # (feature disabled) — the prior defaults {"medium": 0.04, ...} were snapshotted

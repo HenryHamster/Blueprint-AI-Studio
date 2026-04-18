@@ -17,6 +17,7 @@ import {
   mapSubtaskToSpawnPayload,
   classifyFailureCategory,
   buildScopeCalibrationSignal,
+  buildFilteredFindingsSection,
   formatCochangeHints,
   formatDecompositionOutcomes,
   readProgressArtifact,
@@ -445,6 +446,164 @@ describe('buildScopeCalibrationSignal', () => {
     ];
     const result = buildScopeCalibrationSignal(history);
     expect(result).not.toContain('Prior CODE_ERRORs');
+  });
+
+  it('surfaces per-scope expansion ratio when scope_breakdown carries avg_expansion_ratio', () => {
+    const history = [
+      {
+        failed_task_details: [],
+        scope_breakdown: {
+          small: { created: 3, merged: 2, failed: 0, avg_expansion_ratio: 1.2 },
+        },
+      },
+    ];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('Scope accuracy');
+    expect(result).toContain('small 1.2x');
+    expect(result).not.toContain('scope overflow');
+  });
+
+  it('warns when expansion ratio exceeds 2.0x', () => {
+    const history = [
+      {
+        failed_task_details: [],
+        scope_breakdown: {
+          medium: { created: 2, merged: 1, failed: 1, avg_expansion_ratio: 3.0 },
+        },
+      },
+    ];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('medium 3.0x');
+    expect(result).toContain('scope overflow');
+    expect(result).toContain('Expansion ratio exceeds 2.0x');
+  });
+
+  it('surfaces per-scope profile with merged complexity/expansion and failed complexity', () => {
+    const history = [{
+      scope_breakdown: {
+        small: { created: 3, merged: 2, failed: 1, avg_complexity_merged: 0.72, avg_complexity_failed: 0.41, avg_expansion_ratio: 1.3 },
+        medium: { created: 2, merged: 0, failed: 2, avg_complexity_failed: 0.30 },
+      },
+    }];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('Per-scope profile');
+    expect(result).toContain('small(merged cplx 0.72/expand 1.3x vs failed cplx 0.41)');
+    expect(result).toContain('medium(failed cplx 0.30)');
+  });
+
+  it('surfaces calibration counts for calibrated_in and calibrated_out', () => {
+    const history = [{
+      scope_breakdown: {
+        small: { created: 2, merged: 2, failed: 0, calibrated_in: 2 },
+        medium: { created: 0, merged: 0, failed: 0, calibrated_out: 2 },
+      },
+    }];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('Calibration');
+    expect(result).toContain('small in=2');
+    expect(result).toContain('medium out=2');
+  });
+
+  it('omits profile and calibration lines when those fields are absent', () => {
+    const history = [{
+      scope_breakdown: { small: { created: 2, merged: 1, failed: 1 } },
+    }];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('Scope success');
+    expect(result).not.toContain('Per-scope profile');
+    expect(result).not.toContain('Calibration');
+  });
+
+  it('averages per-scope avg_complexity_merged across multiple cycles', () => {
+    const history = [
+      { scope_breakdown: { small: { created: 1, merged: 1, avg_complexity_merged: 0.60 } } },
+      { scope_breakdown: { small: { created: 1, merged: 1, avg_complexity_merged: 0.80 } } },
+    ];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('small(merged cplx 0.70)');
+  });
+});
+
+describe('buildFilteredFindingsSection', () => {
+  it('returns empty string for empty history', () => {
+    expect(buildFilteredFindingsSection([])).toBe('');
+  });
+
+  it('returns empty string when no entries carry filtered_findings', () => {
+    const history = [
+      { finding_titles: ['a', 'b'], tasks_created: 2 },
+      { finding_titles: ['c'], tasks_created: 1 },
+    ];
+    expect(buildFilteredFindingsSection(history)).toBe('');
+  });
+
+  it('renders title and reason lines from the most recent cycle', () => {
+    const history = [
+      {
+        filtered_findings: [
+          { title: 'Consolidate token refresh', reason: 'hash match with prior task' },
+          { title: 'Add pipeline metrics', reason: 'word overlap with: instrument pipeline metrics' },
+        ],
+      },
+    ];
+    const section = buildFilteredFindingsSection(history);
+    expect(section).toContain('Recently filtered (avoid');
+    expect(section).toContain('"Consolidate token refresh"');
+    expect(section).toContain('hash match with prior task');
+    expect(section).toContain('"Add pipeline metrics"');
+    expect(section).toContain('word overlap with: instrument pipeline metrics');
+  });
+
+  it('dedups titles across cycles and keeps the most recent reason', () => {
+    const history = [
+      { filtered_findings: [{ title: 'Shared title', reason: 'older reason' }] },
+      { filtered_findings: [{ title: 'Shared title', reason: 'newer reason' }] },
+    ];
+    const section = buildFilteredFindingsSection(history);
+    // Only one occurrence of the title, with the newer reason attached.
+    const titleMatches = section.match(/Shared title/g) || [];
+    expect(titleMatches.length).toBe(1);
+    expect(section).toContain('newer reason');
+    expect(section).not.toContain('older reason');
+  });
+
+  it('caps rendered entries at 5', () => {
+    const history = [
+      {
+        filtered_findings: Array.from({ length: 10 }, (_, i) => ({
+          title: `finding ${i}`,
+          reason: 'hash match with prior task',
+        })),
+      },
+    ];
+    const section = buildFilteredFindingsSection(history);
+    const bullets = section.split('\n').filter(l => l.trim().startsWith('*'));
+    expect(bullets.length).toBe(5);
+  });
+
+  it('only considers the last 3 history entries', () => {
+    const history = [
+      { filtered_findings: [{ title: 'ancient', reason: 'ancient reason' }] },
+      { filtered_findings: [{ title: 'older', reason: 'older reason' }] },
+      { filtered_findings: [{ title: 'cycle -2', reason: 'r1' }] },
+      { filtered_findings: [{ title: 'cycle -1', reason: 'r2' }] },
+      { filtered_findings: [{ title: 'cycle 0', reason: 'r3' }] },
+    ];
+    const section = buildFilteredFindingsSection(history);
+    expect(section).toContain('cycle 0');
+    expect(section).toContain('cycle -1');
+    expect(section).toContain('cycle -2');
+    expect(section).not.toContain('ancient');
+    expect(section).not.toContain('older');
+  });
+
+  it('renders title without trailing separator when reason is empty', () => {
+    const history = [
+      { filtered_findings: [{ title: 'just a title', reason: '' }] },
+    ];
+    const section = buildFilteredFindingsSection(history);
+    expect(section).toContain('"just a title"');
+    expect(section).not.toContain('just a title" —');
   });
 });
 
