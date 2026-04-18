@@ -9,13 +9,14 @@ import {
   GitMerge,
   Minus,
 } from 'lucide-react';
-import { ResponsiveContainer, AreaChart, Area, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts';
+import { ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { apiFetch } from '../api';
 import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
 import { DirectionAutoPauseWidget } from './DirectionAutoPauseWidget';
 import { PRMonitorSection, type OpenPR } from './PRMonitorSection';
+import { MediumScopeWidget, type MediumScopeMeasurement } from './MediumScopeWidget';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
@@ -30,6 +31,7 @@ interface DirectionProgress {
   prs_merged: number;
   possibly_saturated: boolean;
   conversion_rate?: number | null;
+  acceptance_rate?: number | null;
   product_ratio?: number | null;
   estimated_cost_usd?: number | null;
   cost_per_merged_pr?: number | null;
@@ -92,6 +94,7 @@ interface DigestData {
   latest_cycle?: LatestCycle | null;
   completed_count?: number;
   pipeline_conversion_rate?: number | null;
+  pipeline_acceptance_rate?: number | null;
   scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
   prev_scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
   failure_taxonomy_distribution?: {
@@ -125,54 +128,6 @@ interface SparkPoint {
   active: number;
   queued: number;
   failed: number;
-}
-
-interface WindowStats {
-  merge_rate: number | null;
-  created: number;
-  merged: number;
-  window_start: string | null;
-  window_end: string | null;
-}
-
-interface WeeklySeries {
-  week: string;
-  created: number;
-  merged: number;
-  merge_rate: number | null;
-  direction_merges: number;
-  merge_rate_delta: number | null;
-}
-
-interface DailySeries {
-  day: string;
-  created: number;
-  merged: number;
-  merge_rate: number | null;
-  direction_merges: number;
-  merge_rate_delta: number | null;
-}
-
-interface CorrelatedChange {
-  title: string;
-  week: string;
-  merge_rate_delta: number | null;
-}
-
-interface MediumScopeMeasurement {
-  medium_scope_conversion_rate: number | null;
-  total_created: number;
-  total_merged: number;
-  investment_start: string | null;
-  pre_investment: WindowStats | null;
-  post_investment: WindowStats | null;
-  recent_30d: WindowStats | null;
-  recent_7d: WindowStats | null;
-  recent_3d: WindowStats | null;
-  recent_24h: WindowStats | null;
-  weekly_series: WeeklySeries[];
-  daily_series: DailySeries[];
-  correlated_changes: CorrelatedChange[];
 }
 
 // ---------- props ----------
@@ -460,6 +415,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               <FailedCard value={failedCount} groups={digest?.failure_groups} spark={sparkData} loading={loading} />
               <SuccessRateCard rate={successRate} trend={digest?.trend} trendHistory={digest?.trend_history} loading={loading} />
               <ConversionRateCard rate={digest?.pipeline_conversion_rate} loading={loading} />
+              <AcceptanceRateCard rate={digest?.pipeline_acceptance_rate} loading={loading} />
               <CostCard totalCost={digest?.total_estimated_cost_usd} trendHistory={digest?.trend_history} loading={loading} />
             </div>
           </section>
@@ -550,6 +506,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   {directions.map(d => {
                     const cvr = d.conversion_rate != null ? Math.round(d.conversion_rate * 100) : null;
                     const cvrColor = cvr == null ? 'text-neutral-500' : cvr >= 60 ? 'text-emerald-400' : cvr >= 30 ? 'text-amber-400' : 'text-red-400';
+                    const acc = d.acceptance_rate != null ? Math.round(d.acceptance_rate * 100) : null;
+                    const accColor = acc == null ? 'text-neutral-500' : acc >= 60 ? 'text-emerald-400' : acc >= 30 ? 'text-amber-400' : 'text-red-400';
                     return (
                       <div
                         key={d.direction_id}
@@ -563,6 +521,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                         <p className="text-xs text-neutral-200 line-clamp-2 mb-2">{d.direction_text}</p>
                         <div className="flex items-center gap-2 text-[10px] text-neutral-500">
                           {cvr != null && <span className={cvrColor}>{cvr}% conversion</span>}
+                          {acc != null && <span className={accColor} title="PRs merged / (merged + rejected)">{acc}% acc</span>}
                           <span>{d.prs_merged} PR{d.prs_merged !== 1 ? 's' : ''}</span>
                           {d.product_ratio != null && (
                             <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
@@ -926,6 +885,22 @@ function ConversionRateCard({ rate, loading }: {
   );
 }
 
+function AcceptanceRateCard({ rate, loading }: {
+  rate?: number | null;
+  loading: boolean;
+}) {
+  if (loading) return <Skeleton className="h-20" />;
+  const pct = rate != null ? Math.round(rate * 100) : null;
+  const color = pct == null ? 'text-neutral-500' : pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
+  return (
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Acceptance Rate</p>
+      <p className={`text-2xl font-bold font-mono ${color}`}>{pct != null ? `${pct}%` : '--'}</p>
+      <p className="text-[10px] text-neutral-600 mt-1">PRs merged / (merged + rejected)</p>
+    </div>
+  );
+}
+
 function CostCard({ totalCost, trendHistory, loading }: {
   totalCost?: number | null;
   trendHistory?: { period_cost_usd?: number | null }[];
@@ -955,167 +930,6 @@ function CostCard({ totalCost, trendHistory, loading }: {
         </div>
       )}
     </div>
-  );
-}
-
-// ---------- medium scope widget ----------
-
-const TOOLTIP_STYLE = {
-  contentStyle: { background: '#171717', border: '1px solid #404040', borderRadius: 4 },
-  itemStyle: { color: '#f5f5f5' },
-  labelStyle: { color: '#a3a3a3' },
-};
-
-function MediumScopeWidget({ data, loading }: { data: MediumScopeMeasurement | null; loading: boolean }) {
-  const rate = data?.medium_scope_conversion_rate;
-  const rateColor = rate == null ? 'text-neutral-500' : rate >= 0.6 ? 'text-emerald-400' : rate >= 0.3 ? 'text-amber-400' : 'text-red-400';
-
-  return (
-    <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Medium Scope Merge Rate</h2>
-      {loading ? (
-        <Skeleton className="h-40 w-full" />
-      ) : data == null || rate == null ? (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">
-          No medium-scope task data yet
-        </div>
-      ) : (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 space-y-4">
-          {/* Headline rate */}
-          <div className="flex items-center gap-4">
-            <div>
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-0.5">Overall Rate</p>
-              <p className={`text-3xl font-bold font-mono ${rateColor}`}>{Math.round(rate * 100)}%</p>
-              <p className="text-[10px] text-neutral-500 mt-0.5">{data.total_merged} merged / {data.total_created} created</p>
-            </div>
-            {/* Pre/Post comparison */}
-            {(data.pre_investment || data.post_investment) && (() => {
-              const preRate = data.pre_investment?.merge_rate;
-              const postRate = data.post_investment?.merge_rate;
-              const deltaPp = preRate != null && postRate != null ? Math.round((postRate - preRate) * 100) : null;
-              const deltaColor = deltaPp == null
-                ? 'text-neutral-400'
-                : Math.abs(deltaPp) <= 3 ? 'text-neutral-400' : deltaPp > 0 ? 'text-emerald-400' : 'text-red-400';
-              return (
-                <div className="flex gap-4 ml-4 items-center">
-                  {data.pre_investment && (
-                    <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Pre-investment</p>
-                      <p className="text-lg font-bold font-mono text-neutral-300">
-                        {preRate != null ? `${Math.round(preRate * 100)}%` : '--'}
-                      </p>
-                      <p className="text-[9px] text-neutral-600">{data.pre_investment.merged}/{data.pre_investment.created}</p>
-                    </div>
-                  )}
-                  {data.pre_investment && data.post_investment && (
-                    <div className="flex items-center text-neutral-600 text-xs">→</div>
-                  )}
-                  {data.post_investment && (
-                    <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Post-investment</p>
-                      <p className={`text-lg font-bold font-mono ${
-                        postRate != null && preRate != null
-                          ? postRate > preRate ? 'text-emerald-400' : 'text-red-400'
-                          : 'text-neutral-300'
-                      }`}>
-                        {postRate != null ? `${Math.round(postRate * 100)}%` : '--'}
-                      </p>
-                      <p className="text-[9px] text-neutral-600">{data.post_investment.merged}/{data.post_investment.created}</p>
-                    </div>
-                  )}
-                  {([['Recent 24h', data.recent_24h], ['Recent 3d', data.recent_3d], ['Recent 7d', data.recent_7d], ['Recent 30d', data.recent_30d]] as const).map(([label, s]) => s && (
-                    <div key={label} className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">{label}</p>
-                      <p className="text-lg font-bold font-mono text-neutral-300">
-                        {s.merge_rate != null ? `${Math.round(s.merge_rate * 100)}%` : '--'}
-                      </p>
-                      <p className="text-[9px] text-neutral-600">{s.merged}/{s.created}</p>
-                    </div>
-                  ))}
-                  {deltaPp != null && (
-                    <div className="text-center">
-                      <p className="text-[10px] text-neutral-500 mb-0.5">Delta</p>
-                      <p className={`text-lg font-bold font-mono ${deltaColor}`}>
-                        {deltaPp > 0 ? '+' : ''}{deltaPp}pp
-                      </p>
-                    </div>
-                  )}
-                </div>
-              );
-            })()}
-          </div>
-          {data.pre_investment?.merge_rate != null && data.post_investment?.merge_rate != null && (() => {
-            const deltaPp = Math.round((data.post_investment.merge_rate - data.pre_investment.merge_rate) * 100);
-            const within = Math.abs(deltaPp) <= 3;
-            const color = within ? 'text-neutral-400' : deltaPp > 0 ? 'text-emerald-400' : 'text-red-400';
-            const text = within
-              ? `No significant change detected (within 3pp, ${deltaPp > 0 ? '+' : ''}${deltaPp}pp)`
-              : deltaPp > 0
-                ? `Medium-scope merge rate improved by ${deltaPp} percentage points since investment began`
-                : `Medium-scope merge rate declined by ${Math.abs(deltaPp)} percentage points since investment began`;
-            return <p className={`text-[11px] ${color}`}>{text}</p>;
-          })()}
-
-          {data.daily_series.length >= 2 && (
-            <div className="h-32">
-              <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
-                <LineChart data={data.daily_series} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
-                  <XAxis
-                    dataKey="day"
-                    tick={{ fill: '#737373', fontSize: 9 }}
-                    tickFormatter={(v: string) => v.slice(5)}
-                  />
-                  <YAxis
-                    tick={{ fill: '#737373', fontSize: 9 }}
-                    tickFormatter={(v: number) => `${Math.round(v * 100)}%`}
-                    domain={[0, 1]}
-                  />
-                  <Tooltip
-                    {...TOOLTIP_STYLE}
-                    formatter={(v: unknown) => [typeof v === 'number' ? `${Math.round(v * 100)}%` : '--', 'Merge rate']}
-                    labelFormatter={(label: unknown) => `Day ${label}`}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="merge_rate"
-                    stroke="#34d399"
-                    strokeWidth={1.5}
-                    dot={false}
-                    isAnimationActive={false}
-                    connectNulls
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-          )}
-
-          {/* Correlated changes */}
-          {data.correlated_changes.length > 0 && (
-            <div>
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">Correlated Changes</p>
-              <div className="space-y-1">
-                {data.correlated_changes.slice(0, 5).map((c, i) => {
-                  const delta = c.merge_rate_delta;
-                  const deltaColor = delta == null ? 'text-neutral-500' : delta > 0 ? 'text-emerald-400' : 'text-red-400';
-                  return (
-                    <div key={i} className="flex items-center gap-2 text-[10px]">
-                      <span className="text-neutral-500 font-mono shrink-0">{c.week.slice(5)}</span>
-                      <span className="text-neutral-300 truncate flex-1">{c.title}</span>
-                      {delta != null && (
-                        <span className={`font-mono shrink-0 ${deltaColor}`}>
-                          {delta > 0 ? '+' : ''}{Math.round(delta * 100)}pp
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-    </section>
   );
 }
 

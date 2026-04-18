@@ -413,15 +413,42 @@ export function DirectionCard({
                 </span>
               );
             })()}
-            {/* Merge rate badge */}
+            {/* Productivity score badge — (merged - 0.5*rejected) / cycles; quality-weighted, can go negative */}
             {(() => {
               const hasHistory = d.research_history && d.research_history.length >= 3;
               if (!hasHistory || d.merge_rate == null) return null;
-              const rate = d.merge_rate as number;
-              const color = rate >= 0.5 ? 'emerald' : rate >= 0.2 ? 'amber' : 'red';
+              const score = d.merge_rate as number;
+              const color = score >= 0.5 ? 'emerald' : score >= 0.2 ? 'amber' : score >= 0 ? 'red' : 'red';
               return (
-                <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
-                  {rate.toFixed(2)} PRs/cycle
+                <span
+                  title="Productivity score: (merged − 0.5 × rejected) / cycles. Negative values indicate rejections outweighed merges."
+                  className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
+                >
+                  {score.toFixed(2)} productivity
+                </span>
+              );
+            })()}
+            {/* Acceptance rate badge — merged / (merged + rejected) */}
+            {(() => {
+              const history = d.research_history;
+              if (!history || history.length === 0) return null;
+              const historyMerged = history.reduce((sum, e) => sum + (e.prs_merged ?? 0), 0);
+              const historyRejected = history.reduce((sum, e) => sum + (e.prs_rejected ?? 0), 0);
+              const aggMerged = (d.history_aggregate?.total_prs_merged as number | null) ?? 0;
+              const aggRejected = (d.history_aggregate?.total_prs_rejected as number | null) ?? 0;
+              const totalMerged = historyMerged + aggMerged;
+              const totalRejected = historyRejected + aggRejected;
+              const totalDecided = totalMerged + totalRejected;
+              if (totalRejected === 0 || totalDecided === 0) return null;
+              const rate = totalMerged / totalDecided;
+              const pct = Math.round(rate * 100);
+              const color = rate >= 0.6 ? 'emerald' : rate >= 0.3 ? 'amber' : 'red';
+              return (
+                <span
+                  title={`${totalMerged} merged / ${totalDecided} decided (${totalRejected} rejected)`}
+                  className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
+                >
+                  {pct}% acceptance
                 </span>
               );
             })()}

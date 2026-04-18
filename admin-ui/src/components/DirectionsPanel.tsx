@@ -27,6 +27,7 @@ export interface ResearchHistoryEntry {
   product_ratio?: number | null;
   type_distribution?: Record<string, number> | null;
   prs_merged?: number | null;
+  prs_rejected?: number | null;
 }
 
 export interface Direction {
@@ -61,9 +62,15 @@ export interface Direction {
   paused_reason?: string;
   paused_at?: string;
   auto_paused?: boolean;
+  /**
+   * Productivity score: (merged − 0.5 × rejected) / cycles.
+   * Quality-weighted — can go negative when rejections outweigh merges.
+   * Backend key is `merge_rate` for historical reasons; treat as productivity score.
+   */
   merge_rate?: number | null;
   history_aggregate?: {
     total_prs_merged?: number | null;
+    total_prs_rejected?: number | null;
     total_tasks_failed?: number | null;
     [key: string]: unknown;
   } | null;

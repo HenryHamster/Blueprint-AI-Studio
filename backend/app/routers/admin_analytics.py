@@ -1517,6 +1517,20 @@ async def get_digest(
     # Compute overall product_ratio and type_distribution across all directions
     all_product_ratios = [d["product_ratio"] for d in direction_progress_list if d.get("product_ratio") is not None]
     overall_product_ratio = round(sum(all_product_ratios) / len(all_product_ratios), 3) if all_product_ratios else None
+
+    # Pipeline-level acceptance rate: total merged / (total merged + total rejected) across directions in window
+    _pipeline_total_merged_d = sum(d.get("prs_merged") or 0 for d in direction_progress_list)
+    _pipeline_total_rejected_d = sum(d.get("prs_rejected") or 0 for d in direction_progress_list)
+    _pipeline_total_decided = _pipeline_total_merged_d + _pipeline_total_rejected_d
+    pipeline_acceptance_rate = (
+        round(_pipeline_total_merged_d / _pipeline_total_decided, 3)
+        if _pipeline_total_decided > 0 else None
+    )
+    _pipeline_total_created_d = sum(d.get("tasks_created") or 0 for d in direction_progress_list)
+    pipeline_conversion_rate = (
+        round(_pipeline_total_merged_d / _pipeline_total_created_d, 3)
+        if _pipeline_total_created_d > 0 else None
+    )
     overall_type_distribution: Dict[str, int] = {}
     for d in direction_progress_list:
         for ttype, cnt in (d.get("type_distribution") or {}).items():
@@ -1578,6 +1592,8 @@ async def get_digest(
         "latest_cycle": latest_cycle,
         "scope_conversion_rates": scope_conversion_rates or None,
         "prev_scope_conversion_rates": prev_scope_conversion_rates or None,
+        "pipeline_acceptance_rate": pipeline_acceptance_rate,
+        "pipeline_conversion_rate": pipeline_conversion_rate,
     }
 
 
