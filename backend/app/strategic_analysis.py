@@ -40,6 +40,12 @@ def _build_outcome_evaluation(project) -> dict:
         merged = sum(h.get("prs_merged", 0) for h in window_history)
         rejected = sum(h.get("prs_rejected", 0) for h in window_history)
         failed = sum(h.get("tasks_failed", 0) for h in window_history)
+        failed_infra = sum(h.get("tasks_failed_infra", 0) for h in window_history)
+        taxonomy_summary: dict[str, int] = {}
+        for h in window_history:
+            for tkey, tval in (h.get("taxonomy_summary") or {}).items():
+                if tval:
+                    taxonomy_summary[tkey] = taxonomy_summary.get(tkey, 0) + tval
 
         # Extract confirmed vs proposed findings from research_context
         confirmed = []
@@ -77,6 +83,10 @@ def _build_outcome_evaluation(project) -> dict:
             "failed": failed,
             "prs_rejected": rejected,
         }
+        if failed_infra > 0:
+            outcome["tasks_failed_infra"] = failed_infra
+        if taxonomy_summary:
+            outcome["taxonomy_summary"] = taxonomy_summary
         if acceptance_rate is not None:
             outcome["acceptance_rate"] = acceptance_rate
         if avg_time_to_merge_hours is not None:

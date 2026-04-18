@@ -129,6 +129,33 @@ async def _record_remediation_if_terminal(
 # root cause genuinely can't be diagnosed from code signals alone.
 _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT = 2
 
+# Attempts older than this window are treated as expired and do not count
+# against the cap, letting directions that hit the cap recover naturally
+# as the codebase evolves.
+_FOLLOWUP_INVESTIGATION_DECAY_DAYS = 14
+
+
+def _active_followup_timestamps(
+    entry: Any, *, now: Optional[datetime] = None,
+) -> List[str]:
+    """Return non-expired ISO timestamps from a fingerprint entry.
+
+    Accepts the current list-of-timestamps format and the legacy integer
+    count format (treated as fully expired so old directions can recover
+    once this decay logic rolls out).
+    """
+    if not isinstance(entry, list):
+        return []
+    cutoff = (now or _utcnow()) - timedelta(days=_FOLLOWUP_INVESTIGATION_DECAY_DAYS)
+    active: List[str] = []
+    for ts in entry:
+        try:
+            if datetime.fromisoformat(str(ts)) >= cutoff:
+                active.append(str(ts))
+        except (TypeError, ValueError):
+            continue
+    return active
+
 
 async def _maybe_spawn_followup_investigation(
     task: Task, session: AsyncSession,
@@ -185,12 +212,15 @@ async def _maybe_spawn_followup_investigation(
         or target.get("last_remediation_fingerprint")
     fp_key = str(fingerprint) if fingerprint else "no_fingerprint"
     attempts_by_fp = dict(target.get("followup_investigation_attempts_by_fingerprint") or {})
-    if attempts_by_fp.get(fp_key, 0) >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT:
+    now = _utcnow()
+    active_ts = _active_followup_timestamps(attempts_by_fp.get(fp_key), now=now)
+    if len(active_ts) >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT:
         logger.info(
             f"[DIAGNOSIS] Skip follow-up for direction {direction_id}: "
             f"cap reached for fingerprint {fp_key[:40]} "
-            f"({attempts_by_fp.get(fp_key)}/"
-            f"{_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT})"
+            f"({len(active_ts)}/"
+            f"{_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT}, "
+            f"decay={_FOLLOWUP_INVESTIGATION_DECAY_DAYS}d)"
         )
         return None
 
@@ -246,10 +276,11 @@ async def _maybe_spawn_followup_investigation(
         priority=70,
     )
     session.add(new_task)
-    attempts_by_fp[fp_key] = attempts_by_fp.get(fp_key, 0) + 1
+    active_ts.append(now.isoformat())
+    attempts_by_fp[fp_key] = active_ts
     target["followup_investigation_attempts_by_fingerprint"] = attempts_by_fp
     target[DIAGNOSIS_IN_PROGRESS_KEY] = True
-    target[DIAGNOSIS_STARTED_AT_KEY] = _utcnow().isoformat()
+    target[DIAGNOSIS_STARTED_AT_KEY] = now.isoformat()
     project.directions = directions
     flag_modified(project, "directions")
     session.add(project)
@@ -257,7 +288,7 @@ async def _maybe_spawn_followup_investigation(
         f"[DIAGNOSIS] Spawned follow-up investigation {new_task.id} after "
         f"remediation task {task.id} failed (direction={direction_id}, "
         f"fingerprint={fp_key[:40]}, "
-        f"attempt {attempts_by_fp[fp_key]}/"
+        f"attempt {len(active_ts)}/"
         f"{_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT})"
     )
     return new_task

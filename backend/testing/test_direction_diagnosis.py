@@ -169,6 +169,125 @@ async def test_cross_direction_dedup_by_shared_fingerprint(db_session):
 
 
 @pytest.mark.asyncio
+async def test_dedup_across_auto_pause_and_hold_paths(db_session):
+    """_spawn_direction_diagnosis (auto-pause path) and _spawn_direction_hold_investigation
+    (hold path) must dedup against EACH OTHER, not just within their own path. Both
+    spawn investigate-type tasks targeting the same direction_id, so a duplicate from
+    one path must block a second spawn from the other.
+    """
+    import uuid as _uuid
+    from app.autonomous_research import _spawn_direction_hold_investigation
+    from app.shared_state import (
+        DIRECTION_HOLD_THRESHOLD,
+        direction_failure_streaks,
+        record_direction_result,
+    )
+
+    direction_failure_streaks.clear()
+    try:
+        # ───────── direction A: hold-path task already exists, auto-pause must skip
+        direction_a_id = "d-cross-dedup-a"
+        project_a = Project(
+            name="Cross Dedup A",
+            user_id="u-cross-a",
+            autonomous_enabled=True,
+            directions=[{
+                "id": direction_a_id,
+                "text": "Cross-path direction A",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "auto_pause_count": 1,
+                "research_history": [
+                    {"tasks_created": 3, "tasks_failed": 3, "tasks_failed_infra": 0, "prs_merged": 0},
+                ],
+            }],
+            vision={"purpose": "t"},
+        )
+        db_session.add(project_a)
+        await db_session.commit()
+        await db_session.refresh(project_a)
+        _ss.circuit_breakers.pop(str(project_a.id), None)
+
+        hold_task = Task(
+            project_id=project_a.id,
+            title="Hold-path investigation",
+            payloads=[{"type": "investigate", "prompt": "hold"}],
+            context={"direction_id": direction_a_id, "spawned_by": "direction_hold_investigation"},
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{_uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(hold_task)
+        await db_session.commit()
+
+        reason = "High code failure rate: >70% of spawned tasks failed..."
+        spawned = await _spawn_direction_diagnosis(
+            project_a, project_a.directions[0], reason, db_session,
+        )
+        assert spawned is False, "auto-pause path must skip when a hold-path investigation is in-flight"
+        assert "diagnosis_in_progress" not in project_a.directions[0]
+        count = (await db_session.execute(
+            select(Task).where(Task.project_id == project_a.id)
+        )).scalars().all()
+        investigates_a = [t for t in count if t.first_payload.get("type") == "investigate"]
+        assert len(investigates_a) == 1
+
+        # ───────── direction B: auto-pause task already exists, hold-path must skip
+        direction_b_id = "d-cross-dedup-b"
+        project_b = Project(
+            name="Cross Dedup B",
+            user_id="u-cross-b",
+            autonomous_enabled=True,
+            directions=[{
+                "id": direction_b_id,
+                "text": "Cross-path direction B",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+            }],
+            vision={"purpose": "t"},
+        )
+        db_session.add(project_b)
+        await db_session.commit()
+        await db_session.refresh(project_b)
+
+        diag_task = Task(
+            project_id=project_b.id,
+            title="Auto-pause diagnosis",
+            payloads=[{"type": "investigate", "prompt": "diag"}],
+            context={
+                "direction_id": direction_b_id,
+                "diagnosis_trigger": "direction_auto_pause",
+            },
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{_uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(diag_task)
+        await db_session.commit()
+
+        # Place direction B on hold
+        for _ in range(DIRECTION_HOLD_THRESHOLD):
+            record_direction_result(
+                direction_b_id, success=False, failure_class="CODE_ERROR",
+                project_id=str(project_b.id),
+            )
+
+        spawned_b = await _spawn_direction_hold_investigation(project_b, db_session)
+        assert spawned_b == 0, "hold path must skip when auto-pause investigation exists for same direction"
+        tasks_b = (await db_session.execute(
+            select(Task).where(Task.project_id == project_b.id)
+        )).scalars().all()
+        investigates_b = [t for t in tasks_b if t.first_payload.get("type") == "investigate"]
+        assert len(investigates_b) == 1
+    finally:
+        direction_failure_streaks.clear()
+
+
+@pytest.mark.asyncio
 async def test_skips_when_direction_id_missing(db_session):
     project = await _make_project(db_session)
     direction = {"text": "no id", "research_history": []}
@@ -1221,3 +1340,125 @@ async def test_escalation_retry_failure_increments_count(db_session, mocker):
     d = project.directions[0]
     assert d.get("escalation_notification_pending") is True
     assert d.get("escalation_notification_retries") == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Partial-success detection: a remediation that materially reduces code-failure
+# rate (but leaves the same dominant fingerprint) skips manual-intervention
+# escalation and is annotated last_remediation_result="partial_success".
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+from app.direction_lifecycle import _detect_partial_remediation_success  # noqa: E402
+
+
+def _partial_success_direction(
+    *,
+    pre_rate: float,
+    post_rate: float,
+    remediation_hours_ago: float = 2.0,
+) -> dict:
+    """Build a direction whose research_history straddles last_remediation_at
+    with configurable pre/post code-failure rates."""
+    last_rem = datetime.utcnow() - timedelta(hours=remediation_hours_ago)
+    pre_ts = (last_rem - timedelta(hours=1)).isoformat()
+    post_ts = (last_rem + timedelta(minutes=15)).isoformat()
+
+    def _entry(ts: str, rate: float) -> dict:
+        # 10 tasks per cycle; `rate` fraction are code-failures, infra=0.
+        failed = round(10 * rate)
+        return {
+            "timestamp": ts,
+            "tasks_created": 10,
+            "tasks_failed": failed,
+            "tasks_failed_infra": 0,
+            "prs_merged": 10 - failed,
+        }
+
+    return {
+        "id": "d-partial",
+        "text": "Partial success direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [
+            _entry(pre_ts, pre_rate),
+            _entry(post_ts, post_rate),
+        ],
+        "remediation_monitor_started_at": (last_rem + timedelta(minutes=1)).isoformat(),
+        "remediation_attempts": 3,
+        "last_remediation_result": "merged",
+        "last_remediation_at": last_rem.isoformat(),
+        "error_fingerprint": "fp-partial",
+        "last_remediation_fingerprint": "fp-partial",
+    }
+
+
+def test_detect_partial_success_true_when_rate_drops_significantly():
+    d = _partial_success_direction(pre_rate=0.8, post_rate=0.2)
+    assert _detect_partial_remediation_success(d) is True
+
+
+def test_detect_partial_success_false_when_rate_unchanged():
+    d = _partial_success_direction(pre_rate=0.8, post_rate=0.8)
+    assert _detect_partial_remediation_success(d) is False
+
+
+def test_detect_partial_success_false_without_post_entries():
+    d = _partial_success_direction(pre_rate=0.8, post_rate=0.2)
+    # Drop the post-remediation entry — only pre remains.
+    d["research_history"] = [d["research_history"][0]]
+    assert _detect_partial_remediation_success(d) is False
+
+
+def test_detect_partial_success_false_without_last_remediation_at():
+    d = _partial_success_direction(pre_rate=0.8, post_rate=0.2)
+    d.pop("last_remediation_at", None)
+    assert _detect_partial_remediation_success(d) is False
+
+
+@pytest.mark.asyncio
+async def test_partial_success_skips_escalation(db_session, mocker):
+    """Re-pause with matching fingerprint + significant rate drop => partial_success, no escalation."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value="fp-partial",
+    )
+    post_mock = mocker.patch(
+        "app.notification_dispatch.post_remediation_escalation_message",
+        new_callable=AsyncMock,
+    )
+    direction = _partial_success_direction(pre_rate=0.9, post_rate=0.1)
+    # Rules 3/4 run against the last 3 cycles — pack recent history with code failures
+    # so _check_direction_health returns a code-failure pause reason.
+    recent = [
+        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+    ]
+    direction["research_history"] = direction["research_history"] + recent
+    project = Project(
+        name="Partial success skips escalation",
+        user_id="u-partial",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused"
+    assert d.get("needs_manual_intervention") is not True
+    assert d.get("last_remediation_result") == "partial_success"
+    assert post_mock.await_count == 0, "escalation notification must not fire on partial success"

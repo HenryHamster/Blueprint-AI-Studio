@@ -41,6 +41,55 @@ _FINGERPRINT_MIN_RECURRENCE = 2
 # with structured fields so monitoring can catch a silently-stuck direction.
 _MAX_ESCALATION_NOTIFICATION_RETRIES = 3
 
+# Minimum fractional drop in CODE_ERROR failure rate (pre- vs post-remediation)
+# that counts as partial success rather than a failed fix. 0.5 == 50% reduction.
+_PARTIAL_SUCCESS_RATE_DROP = 0.5
+
+
+def _detect_partial_remediation_success(direction: dict) -> bool:
+    """Return True if post-remediation code-failure rate is materially lower than pre-remediation.
+
+    A remediation that reduces failures from 80% to 20% still leaves the same
+    dominant error fingerprint visible, so fingerprint-based escalation treats
+    it as total failure. Compares code-failure rate across research_history
+    entries straddling ``last_remediation_at`` and returns True when the
+    post-remediation rate dropped by at least ``_PARTIAL_SUCCESS_RATE_DROP``.
+    """
+    last_rem_at = direction.get("last_remediation_at")
+    if not last_rem_at:
+        return False
+    try:
+        boundary = datetime.fromisoformat(last_rem_at)
+    except (ValueError, TypeError):
+        return False
+    pre: list[dict] = []
+    post: list[dict] = []
+    for entry in (direction.get("research_history") or []):
+        ts = entry.get("timestamp")
+        if not ts:
+            continue
+        try:
+            entry_at = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            continue
+        (post if entry_at >= boundary else pre).append(entry)
+    if not pre or not post:
+        return False
+
+    def _code_failure_rate(entries: list[dict]) -> float:
+        created = sum(e.get("tasks_created", 0) for e in entries)
+        if created <= 0:
+            return 0.0
+        failed = sum(e.get("tasks_failed", 0) for e in entries)
+        infra = sum(e.get("tasks_failed_infra", 0) for e in entries)
+        return max(0, failed - infra) / created
+
+    pre_rate = _code_failure_rate(pre[-3:])
+    post_rate = _code_failure_rate(post)
+    if pre_rate <= 0:
+        return False
+    return post_rate <= pre_rate * (1.0 - _PARTIAL_SUCCESS_RATE_DROP)
+
 
 def _build_escalation_args(direction: dict) -> dict:
     """Assemble kwargs for post_remediation_escalation_message from direction state.
@@ -127,17 +176,10 @@ async def _spawn_direction_diagnosis(
     direction_id = direction.get("id")
     if not direction_id:
         return False
-    cutoff = _utcnow() - timedelta(hours=24)
-    existing = await session.execute(
-        select(Task.id).where(
-            Task.project_id == project.id,
-            Task.created_at >= cutoff,
-            Task.payloads[0]["type"].as_string() == "investigate",
-            Task.context["direction_id"].as_string() == str(direction_id),
-        ).limit(1)
-    )
-    if existing.first() is not None:
+    from app.autonomous_research import _recent_investigation_exists  # noqa: PLC0415
+    if await _recent_investigation_exists(project.id, str(direction_id), session):
         return False
+    cutoff = _utcnow() - timedelta(hours=24)
     # Compute fingerprint up front so it can be (1) used to dedup against
     # recent investigations on sibling directions sharing the same root cause
     # and (2) stamped on the new task's context so future dedup queries match.
@@ -424,7 +466,7 @@ async def _process_direction_lifecycle(
             # remediation task merged. Subsequent failures with the same error fingerprint
             # during this window signal the fix did not hold; escalation is triggered below
             # when the direction is re-paused while monitoring is active.
-            if d.get("last_remediation_result") == "merged":
+            if d.get("last_remediation_result") in ("merged", "partial_success"):
                 d["remediation_monitor_started_at"] = _utcnow().isoformat()
             logger.info(f"[AUTONOMOUS] Auto-recovered direction {d.get('id')} after {hours:.0f}h cooldown")
             directions_modified = True
@@ -545,28 +587,40 @@ async def _process_direction_lifecycle(
                 and d.get("remediation_attempts", 0) >= 3
                 and fingerprints_match
             ):
-                d["needs_manual_intervention"] = True
-                logger.warning(
-                    f"[AUTONOMOUS] Direction {did} flagged needs_manual_intervention "
-                    f"after {d.get('remediation_attempts', 0)} remediation attempts"
-                )
-                try:
-                    from app.notification_dispatch import post_remediation_escalation_message  # noqa: PLC0415
-                    await post_remediation_escalation_message(
-                        session, project.id, **_build_escalation_args(d),
+                if _detect_partial_remediation_success(d):
+                    # Fix materially reduced failure rate even though the
+                    # dominant fingerprint is still present — treat as partial
+                    # progress so the direction is not escalated to manual
+                    # intervention on the next remediation cycle.
+                    d["last_remediation_result"] = "partial_success"
+                    logger.info(
+                        f"[AUTONOMOUS] Direction {did} showed partial remediation success "
+                        f"(code-failure rate dropped >= {int(_PARTIAL_SUCCESS_RATE_DROP * 100)}%); "
+                        f"skipping manual-intervention escalation"
                     )
-                    # Clear any pending retry stamps from a prior failed escalation
-                    d.pop("escalation_notification_pending", None)
-                    d.pop("escalation_notification_retries", None)
-                except Exception as _esc_exc:
-                    logger.warning(f"[NOTIFY] Failed to post remediation escalation message: {_esc_exc}")
-                    # Stamp for retry on the next lifecycle cycle. Retry count is
-                    # preserved if an earlier escalation on this direction was also
-                    # pending; the retry loop enforces _MAX_ESCALATION_NOTIFICATION_RETRIES.
-                    d["escalation_notification_pending"] = True
-                    d["escalation_notification_retries"] = int(
-                        d.get("escalation_notification_retries", 0)
+                else:
+                    d["needs_manual_intervention"] = True
+                    logger.warning(
+                        f"[AUTONOMOUS] Direction {did} flagged needs_manual_intervention "
+                        f"after {d.get('remediation_attempts', 0)} remediation attempts"
                     )
+                    try:
+                        from app.notification_dispatch import post_remediation_escalation_message  # noqa: PLC0415
+                        await post_remediation_escalation_message(
+                            session, project.id, **_build_escalation_args(d),
+                        )
+                        # Clear any pending retry stamps from a prior failed escalation
+                        d.pop("escalation_notification_pending", None)
+                        d.pop("escalation_notification_retries", None)
+                    except Exception as _esc_exc:
+                        logger.warning(f"[NOTIFY] Failed to post remediation escalation message: {_esc_exc}")
+                        # Stamp for retry on the next lifecycle cycle. Retry count is
+                        # preserved if an earlier escalation on this direction was also
+                        # pending; the retry loop enforces _MAX_ESCALATION_NOTIFICATION_RETRIES.
+                        d["escalation_notification_pending"] = True
+                        d["escalation_notification_retries"] = int(
+                            d.get("escalation_notification_retries", 0)
+                        )
             logger.info(f"[AUTONOMOUS] Auto-paused direction {did}: {pause_reason}")
             auto_paused_any = True
             try:

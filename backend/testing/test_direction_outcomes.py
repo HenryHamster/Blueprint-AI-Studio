@@ -15,6 +15,8 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.direction_outcomes import (
+    _counts_as_failure,
+    _is_cascade_cancelled,
     _longest_chain_length,
     _refresh_pipeline_scope_merge_rates,
     _update_cochange_index,
@@ -1456,3 +1458,149 @@ async def test_update_outcomes_publishes_pipeline_scope_rates(
     # With seeded 3 merged + this cycle 1 merged + 1 failed = effective 5 → 4/5 = 0.8
     rates = runtime_config["pipeline_scope_merge_rates"]
     assert rates == {"small": 0.8}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Cascade-cancellation exclusion from failure metrics
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_is_cascade_cancelled_detects_signals():
+    """All four cascade signals are detected; genuine CANCELLED is not."""
+    # Requeue replacement via _replaced_by_task_id in context
+    t = Task(project_id=uuid.uuid4(), title="t", payloads=[{"type": "create"}],
+             status=TaskStatus.CANCELLED, context={"_replaced_by_task_id": "x"},
+             created_by="ORCHESTRATOR")
+    assert _is_cascade_cancelled(t)
+    # Requeue message
+    t.context = {}
+    t.latest_status_message = "Parent requeued — replaced by retry"
+    assert _is_cascade_cancelled(t)
+    # Parent cascade
+    t.latest_status_message = "Cancelled: parent evaluation timeout after 6h"
+    assert _is_cascade_cancelled(t)
+    # Dependency cascade
+    t.latest_status_message = "Cancelled: dependency task failed"
+    assert _is_cascade_cancelled(t)
+    # Genuine cancellation (operator action with no cascade marker)
+    t.latest_status_message = "Cancelled by admin"
+    assert not _is_cascade_cancelled(t)
+    # FAILED is never a cascade cancellation
+    t.status = TaskStatus.FAILED
+    t.latest_status_message = "Parent requeued — replaced by retry"
+    assert not _is_cascade_cancelled(t)
+
+
+def test_counts_as_failure_excludes_cascade_cancelled():
+    t = Task(project_id=uuid.uuid4(), title="t", payloads=[{"type": "create"}],
+             status=TaskStatus.CANCELLED, context={"_replaced_by_task_id": "x"},
+             created_by="ORCHESTRATOR")
+    assert not _counts_as_failure(t)
+    t.context = {}
+    t.latest_status_message = "Cancelled by admin"
+    assert _counts_as_failure(t)
+    t.status = TaskStatus.FAILED
+    assert _counts_as_failure(t)
+
+
+@pytest.mark.asyncio
+async def test_cascade_cancelled_excluded_from_failure_buckets(db_session: AsyncSession):
+    """A cascade-cancelled task stays in tasks_cancelled but is excluded from
+    taxonomy_summary, scope_breakdown.failed, type_breakdown.failed,
+    stage_dropout, and failed_task_details."""
+    direction_id = "d-cascade"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    await db_session.flush()
+
+    # Genuine FAILED — should count everywhere
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "small", "failure_category": "CODE_ERROR"},
+        payloads=[{"type": "create"}],
+        title="real-failure", latest_status_message="pytest failed",
+    )
+    # Cascade-cancelled via requeue clone — should NOT count as failure
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.CANCELLED,
+        context={"scope": "small", "_replaced_by_task_id": str(uuid.uuid4())},
+        payloads=[{"type": "create"}],
+        title="requeued", latest_status_message="Parent requeued — replaced by retry",
+    )
+    # Cascade-cancelled via parent dependency failure — should NOT count
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.CANCELLED,
+        context={"scope": "small"},
+        payloads=[{"type": "create"}],
+        title="dep-cascade", latest_status_message="Cancelled: parent dependency failed",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # tasks_cancelled still reflects BOTH cancelled tasks — raw status count is unchanged
+    assert entry["tasks_cancelled"] == 2
+    assert entry["tasks_failed"] == 1
+
+    # Only the genuine CODE_ERROR should appear in taxonomy / failed_task_details
+    assert len(entry["failed_task_details"]) == 1
+    assert entry["failed_task_details"][0]["title"] == "real-failure"
+    ts = entry["taxonomy_summary"]
+    assert sum(ts.values()) == 1  # cascade entries not counted
+
+    # scope_breakdown.small.failed should only include the real failure
+    sb = entry["scope_breakdown"]
+    assert sb["small"]["failed"] == 1
+    assert sb["small"]["failed_code_error"] == 1
+
+    # type_breakdown.create.failed excludes cascade cancellations
+    assert entry["type_breakdown"]["create"]["failed"] == 1
+
+    # stage_dropout.code_error only counts the real failure
+    assert entry["stage_dropout"]["tasks_failed_code_error"] == 1
+
+
+@pytest.mark.asyncio
+async def test_genuine_cancelled_still_counts_as_failure(db_session: AsyncSession):
+    """A CANCELLED task without cascade markers still counts toward failure metrics."""
+    direction_id = "d-genuine-cancel"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.CANCELLED,
+        context={"scope": "small", "failure_category": "AGENT_TIMEOUT"},
+        payloads=[{"type": "create"}],
+        title="genuine-cancel", latest_status_message="Task timed out on VM",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["scope_breakdown"]["small"]["failed"] == 1
+    assert len(entry["failed_task_details"]) == 1

@@ -25,6 +25,34 @@ from app.failure_classification import (
 from app.models import Project, Task, TaskStatus
 
 
+def _is_cascade_cancelled(task: Task) -> bool:
+    """True when a CANCELLED task was cascade-killed by external factors.
+
+    Signals: context._replaced_by_task_id (requeue clone took over) or a
+    latest_status_message prefix that identifies an orchestrator cascade path
+    ("Parent requeued", "Cancelled: parent …", "Cancelled: dependency …").
+    These tasks did not fail under their own code; excluding them from failure
+    metrics prevents false auto-pause and diagnosis triggers.
+    """
+    if task.status != TaskStatus.CANCELLED:
+        return False
+    if (task.context or {}).get("_replaced_by_task_id"):
+        return True
+    msg = task.latest_status_message or ""
+    return (
+        msg.startswith("Parent requeued")
+        or msg.startswith("Cancelled: parent ")
+        or msg.startswith("Cancelled: dependency ")
+    )
+
+
+def _counts_as_failure(task: Task) -> bool:
+    """Terminal status that represents a genuine failure for direction metrics."""
+    if task.status == TaskStatus.FAILED:
+        return True
+    return task.status == TaskStatus.CANCELLED and not _is_cascade_cancelled(task)
+
+
 def _longest_chain_length(deps_map: dict[str, list[str]]) -> int:
     """Longest path length in a subtask dependency DAG.
 
@@ -197,7 +225,7 @@ async def _update_direction_research_outcomes(
                 TAXONOMY_CODE_DEFECT: 0,
             }
             for ct in child_tasks_rows:
-                if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                if _counts_as_failure(ct):
                     reason = (ct.latest_status_message or "")[:120]
                     category = (ct.context or {}).get("failure_category", "")
                     taxonomy = _classify_taxonomy(ct)
@@ -219,7 +247,7 @@ async def _update_direction_research_outcomes(
             sd_infra = 0
             sd_code_error_ids: set = set()
             for ct in child_tasks_rows:
-                if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                if _counts_as_failure(ct):
                     fc = _classify_failure(ct)
                     if fc == "CODE_ERROR":
                         sd_code_error += 1
@@ -267,7 +295,7 @@ async def _update_direction_research_outcomes(
                 ctx_t = ct.context or {}
                 if ct.status == TaskStatus.COMPLETED and ctx_t.get("pr_merged"):
                     type_breakdown[task_type]["merged"] += 1
-                if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                if _counts_as_failure(ct):
                     type_breakdown[task_type]["failed"] += 1
                 if task_type in PRODUCT_TYPES:
                     product_count += 1
@@ -306,7 +334,7 @@ async def _update_direction_research_outcomes(
                 scope_breakdown[scope]["created"] += 1
                 if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):
                     scope_breakdown[scope]["merged"] += 1
-                if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                if _counts_as_failure(ct):
                     scope_breakdown[scope]["failed"] += 1
                     fcat = ctx_.get("failure_category") or _classify_failure(ct)
                     if fcat in INFRA_CLASSES:
@@ -344,7 +372,7 @@ async def _update_direction_research_outcomes(
                 if ct.status == TaskStatus.COMPLETED and ctx2.get("pr_merged"):
                     cplx_merged_sum[scope2] = cplx_merged_sum.get(scope2, 0.0) + float(cs)
                     cplx_merged_n[scope2] = cplx_merged_n.get(scope2, 0) + 1
-                elif ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                elif _counts_as_failure(ct):
                     cplx_failed_sum[scope2] = cplx_failed_sum.get(scope2, 0.0) + float(cs)
                     cplx_failed_n[scope2] = cplx_failed_n.get(scope2, 0) + 1
             for sk, n in cplx_merged_n.items():
@@ -378,7 +406,7 @@ async def _update_direction_research_outcomes(
                     )
                     failed_nc = sum(
                         1 for st in sts
-                        if st.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+                        if _counts_as_failure(st)
                         and _classify_failure(st) not in INFRA_CLASSES
                     )
                     file_counts = [
@@ -430,7 +458,7 @@ async def _update_direction_research_outcomes(
                     title = ct.title or ""
                     if not title:
                         continue
-                    if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                    if _counts_as_failure(ct):
                         # Move matching proposed finding to Failed Approaches
                         from app.task_lifecycle import _derive_failure_stage  # noqa: PLC0415
 

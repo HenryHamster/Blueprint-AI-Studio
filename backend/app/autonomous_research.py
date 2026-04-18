@@ -884,6 +884,37 @@ async def _check_autonomous_research(owner: str, repo: str):
         logger.error(f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}", exc_info=True)
 
 
+async def _recent_investigation_exists(
+    project_id: uuid.UUID, direction_id: str, session: AsyncSession,
+) -> bool:
+    """Return True if an investigate-type task already targets this direction.
+
+    Unified dedup gate shared by ``_spawn_direction_diagnosis`` (auto-pause path)
+    and ``_spawn_direction_hold_investigation`` (direction-hold path). Matches
+    any investigate task for ``direction_id`` that is either in-flight
+    (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING) or was created in the last 24h,
+    regardless of which spawn path produced it. This prevents duplicate
+    investigations when both paths fire for the same direction.
+    """
+    from sqlalchemy import or_  # noqa: PLC0415
+    cutoff = _utcnow() - timedelta(hours=24)
+    result = await session.execute(
+        select(Task.id).where(
+            Task.project_id == project_id,
+            Task.payloads[0]["type"].as_string() == "investigate",
+            Task.context["direction_id"].as_string() == str(direction_id),
+            or_(
+                Task.status.in_([
+                    TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+                ]),
+                Task.created_at >= cutoff,
+            ),
+        ).limit(1)
+    )
+    return result.first() is not None
+
+
 async def _spawn_direction_hold_investigation(project: Project, session: AsyncSession) -> int:
     """Auto-spawn an investigate-type task for each held direction in the project.
 
@@ -902,28 +933,13 @@ async def _spawn_direction_hold_investigation(project: Project, session: AsyncSe
     direction_map = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
     spawned = 0
 
-    in_flight = (await session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.status.in_([
-                TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
-            ]),
-        )
-    )).scalars().all()
-    in_flight_dir_ids = {
-        (t.context or {}).get("direction_id")
-        for t in in_flight
-        if (t.context or {}).get("spawned_by") == "direction_hold_investigation"
-    }
-
     for direction_id, hold_info in held.items():
         if hold_info.get("project_id") != project_id_str:
             continue
         direction = direction_map.get(direction_id)
         if not direction:
             continue
-        if direction_id in in_flight_dir_ids:
+        if await _recent_investigation_exists(project.id, direction_id, session):
             continue
 
         recent_failed = (await session.execute(

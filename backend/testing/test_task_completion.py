@@ -1099,7 +1099,12 @@ class TestFollowupInvestigationOnFailure:
         await db_session.refresh(project)
 
         d = project.directions[0]
-        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": 1}
+        fp_entry = d["followup_investigation_attempts_by_fingerprint"]["fp-A"]
+        assert isinstance(fp_entry, list)
+        assert len(fp_entry) == 1
+        # Entry is a parseable ISO timestamp
+        from datetime import datetime as _dt
+        _dt.fromisoformat(fp_entry[0])
         assert d["diagnosis_in_progress"] is True
         assert "diagnosis_started_at" in d
 
@@ -1150,9 +1155,11 @@ class TestFollowupInvestigationOnFailure:
     @pytest.mark.asyncio
     async def test_follow_up_skipped_when_cap_reached(self, db_session):
         """Per-fingerprint cap blocks a third follow-up for the same fingerprint."""
+        from app.time_utils import _utcnow
+        recent_ts = [_utcnow().isoformat(), _utcnow().isoformat()]
         project = make_project(directions=[{
             "id": "dir-1", "status": "active",
-            "followup_investigation_attempts_by_fingerprint": {"fp-A": 2},
+            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent_ts)},
         }])
         db_session.add(project)
         await db_session.commit()
@@ -1167,7 +1174,7 @@ class TestFollowupInvestigationOnFailure:
         await db_session.refresh(project)
 
         d = project.directions[0]
-        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": 2}
+        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": recent_ts}
         assert d.get("diagnosis_in_progress") is not True
 
     @pytest.mark.asyncio
@@ -1281,7 +1288,89 @@ class TestFollowupInvestigationOnFailure:
         await db_session.refresh(project)
 
         d = project.directions[0]
-        assert d["followup_investigation_attempts_by_fingerprint"] == {"no_fingerprint": 1}
+        fp_entry = d["followup_investigation_attempts_by_fingerprint"]["no_fingerprint"]
+        assert isinstance(fp_entry, list) and len(fp_entry) == 1
+
+    @pytest.mark.asyncio
+    async def test_follow_up_allowed_when_prior_attempts_expired(self, db_session):
+        """Attempts older than the decay window do not count toward the cap."""
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+        from app.task_completion import _FOLLOWUP_INVESTIGATION_DECAY_DAYS
+        stale = (_utcnow() - timedelta(days=_FOLLOWUP_INVESTIGATION_DECAY_DAYS + 1)).isoformat()
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active",
+            "followup_investigation_attempts_by_fingerprint": {"fp-A": [stale, stale]},
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        fp_entry = d["followup_investigation_attempts_by_fingerprint"]["fp-A"]
+        # Expired timestamps pruned; new attempt appended — single fresh entry remains
+        assert len(fp_entry) == 1
+        assert fp_entry[0] != stale
+        assert d["diagnosis_in_progress"] is True
+
+    @pytest.mark.asyncio
+    async def test_follow_up_skipped_when_recent_attempts_still_cap(self, db_session):
+        """Recent attempts (within the decay window) continue to block the cap."""
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+        from app.task_completion import _FOLLOWUP_INVESTIGATION_DECAY_DAYS
+        recent = (_utcnow() - timedelta(days=_FOLLOWUP_INVESTIGATION_DECAY_DAYS - 1)).isoformat()
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active",
+            "followup_investigation_attempts_by_fingerprint": {"fp-A": [recent, recent]},
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": [recent, recent]}
+        assert d.get("diagnosis_in_progress") is not True
+
+    @pytest.mark.asyncio
+    async def test_follow_up_legacy_int_entry_treated_as_expired(self, db_session):
+        """Pre-decay int entries (e.g. 2) no longer permanently block recovery."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active",
+            "followup_investigation_attempts_by_fingerprint": {"fp-A": 2},
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        fp_entry = d["followup_investigation_attempts_by_fingerprint"]["fp-A"]
+        assert isinstance(fp_entry, list) and len(fp_entry) == 1
+        assert d["diagnosis_in_progress"] is True
 
 
 # ── _handle_investigation_completion ────────────────────────────────────────

@@ -333,6 +333,68 @@ def test_inactive_directions_skipped():
 # 11. confirmed / proposed findings from research_context
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 12. Failure taxonomy — tasks_failed_infra and taxonomy_summary
+# ---------------------------------------------------------------------------
+
+def test_taxonomy_summary_aggregated_across_history():
+    directions = [
+        {
+            "id": "dir-1", "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "tasks_failed": 3,
+                 "tasks_failed_infra": 2,
+                 "taxonomy_summary": {"infra_related": 2, "code_defect": 1}},
+                {"timestamp": "2026-01-02T00:00:00", "tasks_failed": 2,
+                 "tasks_failed_infra": 0,
+                 "taxonomy_summary": {"review_quality": 1, "code_defect": 1}},
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+    assert d["tasks_failed_infra"] == 2
+    assert d["taxonomy_summary"] == {
+        "infra_related": 2, "code_defect": 2, "review_quality": 1,
+    }
+
+
+def test_taxonomy_summary_absent_when_all_zero():
+    directions = [
+        {"id": "dir-1", "status": "active", "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "tasks_failed": 0,
+             "tasks_failed_infra": 0,
+             "taxonomy_summary": {"code_defect": 0, "infra_related": 0}},
+        ]}
+    ]
+    project = _make_project(directions=directions)
+    d = _build_outcome_evaluation(project)["directions"][0]
+    assert "tasks_failed_infra" not in d
+    assert "taxonomy_summary" not in d
+
+
+def test_taxonomy_summary_respects_window_filter():
+    directions = [
+        {
+            "id": "dir-1", "status": "active",
+            "research_history": [
+                {"timestamp": "2025-01-01T00:00:00", "tasks_failed_infra": 10,
+                 "taxonomy_summary": {"infra_related": 10}},  # outside window
+                {"timestamp": "2026-03-01T00:00:00", "tasks_failed_infra": 1,
+                 "taxonomy_summary": {"review_quality": 2}},  # inside window
+            ],
+        }
+    ]
+    project = _make_project(
+        directions=directions,
+        vision={"last_updated": "2026-01-01T00:00:00", "revision": 1},
+    )
+    d = _build_outcome_evaluation(project)["directions"][0]
+    assert d["tasks_failed_infra"] == 1
+    assert d["taxonomy_summary"] == {"review_quality": 2}
+
+
 def test_confirmed_and_proposed_findings():
     research_ctx = (
         "## Established Findings\n"
