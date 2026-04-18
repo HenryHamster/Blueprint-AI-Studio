@@ -26,11 +26,14 @@ from app.task_lifecycle import (
     _increment_research_spawn_count,
     _requeue_parent_task,
     _merge_with_retry,
+    _comment_with_retry,
     _process_post_commit,
+    _record_parent_failure,
     _is_transient_scan_error,
     _extract_failing_tests,
     _extract_error_files,
     _build_scope_overflow_details,
+    _build_retry_prompt_suffix,
 )
 
 # SQLite JSONB compatibility — defensive, conftest.py also sets this
@@ -1117,6 +1120,78 @@ async def test_merge_with_retry_respects_max_attempts_parameter(mocker):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# _comment_with_retry
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_comment_with_retry_succeeds_on_first_attempt():
+    """Returns immediately after a successful first call, passing args through."""
+    mock_comment = AsyncMock(return_value=None)
+    result = await _comment_with_retry(
+        mock_comment, "gh_token", "owner", "repo", 42, "hello body"
+    )
+    assert result is None
+    assert mock_comment.await_count == 1
+    mock_comment.assert_awaited_once_with("gh_token", "owner", "repo", 42, "hello body")
+
+
+@pytest.mark.asyncio
+async def test_comment_with_retry_retries_on_exception_then_succeeds(mocker):
+    """Retries after a transient exception and returns on the subsequent success."""
+    mocker.patch("asyncio.sleep", new=AsyncMock())
+    call_count = 0
+
+    async def _flaky_comment(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            raise ConnectionError("transient network error")
+        return None
+
+    result = await _comment_with_retry(
+        _flaky_comment, "token", "owner", "repo", 10, "body"
+    )
+    assert result is None
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_comment_with_retry_swallows_error_after_max_attempts(mocker):
+    """After exhausting retries, the final exception is swallowed (returns None)."""
+    mocker.patch("asyncio.sleep", new=AsyncMock())
+    call_count = 0
+
+    async def _always_fails(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("persistent error")
+
+    result = await _comment_with_retry(
+        _always_fails, "token", "owner", "repo", 99, "body", max_attempts=3
+    )
+    assert result is None
+    assert call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_comment_with_retry_respects_max_attempts_parameter(mocker):
+    """Custom max_attempts controls how many times the comment is attempted."""
+    mocker.patch("asyncio.sleep", new=AsyncMock())
+    call_count = 0
+
+    async def _always_fails(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise ValueError("fail each time")
+
+    result = await _comment_with_retry(
+        _always_fails, "token", "owner", "repo", 1, "body", max_attempts=2
+    )
+    assert result is None
+    assert call_count == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # _process_post_commit
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1301,6 +1376,102 @@ async def test_scan_transient_retry_exhausted(tl_db, mocker):
     assert "infrastructure error" in (task.latest_status_message or "")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# _record_parent_failure
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_record_parent_failure_with_direction_id_calls_both(mocker):
+    """direction_id in context → both record_task_result and record_direction_result."""
+    mock_task_result = mocker.patch("app.routers.agent_status.record_task_result")
+    mock_dir_result = mocker.patch("app.shared_state.record_direction_result")
+
+    project_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    parent = Task(
+        id=task_id,
+        project_id=project_id,
+        payloads=[{"type": "create", "prompt": "do it"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        context={"direction_id": "d-abc-123"},
+    )
+
+    _record_parent_failure(parent, "CODE_ERROR")
+
+    mock_task_result.assert_called_once_with(
+        success=False,
+        failure_class="CODE_ERROR",
+        task_id=str(task_id),
+        task_type="create",
+    )
+    mock_dir_result.assert_called_once_with(
+        "d-abc-123",
+        success=False,
+        failure_class="CODE_ERROR",
+        project_id=str(project_id),
+    )
+
+
+def test_record_parent_failure_without_direction_id_skips_direction_result(mocker):
+    """No direction_id → only record_task_result is called."""
+    mock_task_result = mocker.patch("app.routers.agent_status.record_task_result")
+    mock_dir_result = mocker.patch("app.shared_state.record_direction_result")
+
+    parent = Task(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "research"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        context={},
+    )
+
+    _record_parent_failure(parent, "AGENT_TIMEOUT")
+
+    mock_task_result.assert_called_once()
+    mock_dir_result.assert_not_called()
+
+
+def test_record_parent_failure_empty_direction_id_skips_direction_result(mocker):
+    """Empty-string direction_id is falsy → record_direction_result is skipped."""
+    mock_task_result = mocker.patch("app.routers.agent_status.record_task_result")
+    mock_dir_result = mocker.patch("app.shared_state.record_direction_result")
+
+    parent = Task(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "plan"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        context={"direction_id": ""},
+    )
+
+    _record_parent_failure(parent, "CODE_ERROR")
+
+    mock_task_result.assert_called_once()
+    mock_dir_result.assert_not_called()
+
+
+def test_record_parent_failure_defaults_task_type_when_payload_missing(mocker):
+    """Empty payloads → task_type forwarded as empty string (not raised)."""
+    mock_task_result = mocker.patch("app.routers.agent_status.record_task_result")
+    mocker.patch("app.shared_state.record_direction_result")
+
+    parent = Task(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        payloads=[],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        context={},
+    )
+
+    _record_parent_failure(parent, "CODE_ERROR")
+
+    _, kwargs = mock_task_result.call_args
+    assert kwargs["task_type"] == ""
+
+
 # ── _extract_failing_tests / _extract_error_files ──────────────────────────────
 
 class TestExtractFailingTests:
@@ -1375,3 +1546,159 @@ class TestExtractErrorFiles:
         result = _extract_error_files(text)
         assert "backend/app/main.py" in result
         assert "src/index.ts" in result
+
+
+# ── _build_retry_prompt_suffix ────────────────────────────────────────────────
+
+class TestBuildRetryPromptSuffix:
+    """Pure-function tests for the retry prompt-suffix builder.
+
+    Covers each failure_class branch, the scope override conditions for
+    AGENT_TIMEOUT/SCOPE_OVERFLOW, keyword-based hints and context extraction
+    for CODE_ERROR, service/status detection for EXTERNAL_API, and the
+    fallback path for None/unknown failure classes.
+    """
+
+    def test_agent_timeout_attempt_one_no_scope_override(self):
+        guidance, override = _build_retry_prompt_suffix(
+            "AGENT_TIMEOUT", "boom", attempt=1, task_scope="large", ctx={}
+        )
+        assert "TIMED OUT" in guidance
+        assert "reduce scope" in guidance
+        assert override is None
+
+    def test_agent_timeout_large_downgrades_to_medium_on_attempt_two(self):
+        _, override = _build_retry_prompt_suffix(
+            "AGENT_TIMEOUT", None, attempt=2, task_scope="large", ctx={}
+        )
+        assert override == "medium"
+
+    def test_agent_timeout_medium_downgrades_to_small_on_attempt_two(self):
+        _, override = _build_retry_prompt_suffix(
+            "AGENT_TIMEOUT", None, attempt=3, task_scope="medium", ctx={}
+        )
+        assert override == "small"
+
+    def test_agent_timeout_small_no_downgrade(self):
+        _, override = _build_retry_prompt_suffix(
+            "AGENT_TIMEOUT", None, attempt=2, task_scope="small", ctx={}
+        )
+        assert override is None
+
+    def test_scope_overflow_medium_escalates_to_large(self):
+        guidance, override = _build_retry_prompt_suffix(
+            "SCOPE_OVERFLOW", None, attempt=1, task_scope="medium", ctx={}
+        )
+        assert "scope's file-count budget" in guidance
+        assert override == "large"
+
+    def test_scope_overflow_small_does_not_escalate(self):
+        _, override = _build_retry_prompt_suffix(
+            "SCOPE_OVERFLOW", None, attempt=1, task_scope="small", ctx={}
+        )
+        assert override is None
+
+    def test_scope_overflow_includes_overflow_details_when_changed_files_present(self):
+        ctx = {
+            "_previous_changed_files": [
+                "backend/app/a.py", "backend/app/b.py", "agent/src/c.ts",
+            ],
+        }
+        guidance, _ = _build_retry_prompt_suffix(
+            "SCOPE_OVERFLOW", None, attempt=1, task_scope="medium", ctx=ctx
+        )
+        assert "OVERFLOW DETAILS FROM PREVIOUS ATTEMPT" in guidance
+        assert "backend/app=2" in guidance
+        assert "agent/src=1" in guidance
+
+    def test_scope_overflow_raw_lowercase_label_via_failure_category(self):
+        """Path matches when failure_class is missing but ctx has lowercase label."""
+        _, override = _build_retry_prompt_suffix(
+            None, None, attempt=1, task_scope="medium",
+            ctx={"failure_category": "scope_overflow"},
+        )
+        assert override == "large"
+
+    def test_code_error_test_keyword_hint(self):
+        guidance, override = _build_retry_prompt_suffix(
+            "CODE_ERROR", "pytest assertion failed in test_foo",
+            attempt=1, task_scope="small", ctx={},
+        )
+        assert "failing tests" in guidance.lower()
+        assert override is None
+
+    def test_code_error_lint_keyword_hint(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "ruff E501 line too long; eslint warning",
+            attempt=1, task_scope="small", ctx={},
+        )
+        assert "lint/type errors" in guidance
+
+    def test_code_error_no_hint_when_no_keywords(self):
+        """No test/lint keywords → no RETRY GUIDANCE prefix from hints."""
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "something unexpected happened",
+            attempt=1, task_scope="small", ctx={},
+        )
+        assert "RETRY GUIDANCE" not in guidance
+
+    def test_code_error_extracts_previous_failing_tests_and_error_files(self):
+        ctx = {
+            "_previous_failing_tests": ["tests/test_a.py::test_x", "tests/test_b.py::test_y"],
+            "_previous_error_files": ["backend/app/main.py", "agent/src/index.ts"],
+        }
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "test failure: assert", attempt=1, task_scope="small", ctx=ctx,
+        )
+        assert "Failing tests:" in guidance
+        assert "tests/test_a.py::test_x" in guidance
+        assert "tests/test_b.py::test_y" in guidance
+        assert "Error file locations:" in guidance
+        assert "backend/app/main.py" in guidance
+        assert "agent/src/index.ts" in guidance
+
+    def test_external_api_github_with_status_code(self):
+        guidance, override = _build_retry_prompt_suffix(
+            "EXTERNAL_API", "GitHub API returned 503 Service Unavailable",
+            attempt=1, task_scope="small", ctx={},
+        )
+        assert "GitHub API error" in guidance
+        assert "(status 503)" in guidance
+        assert "exponential backoff" in guidance
+        assert override is None
+
+    def test_external_api_anthropic_detected_from_claude_keyword(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "EXTERNAL_API", "Claude returned 429", attempt=1, task_scope="small", ctx={},
+        )
+        assert "Claude API error" in guidance
+        assert "(status 429)" in guidance
+
+    def test_external_api_generic_without_status_code(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "EXTERNAL_API", "network unreachable", attempt=1, task_scope="small", ctx={},
+        )
+        assert "external API error" in guidance
+        assert "(status" not in guidance
+
+    def test_rate_limit_static_guidance(self):
+        guidance, override = _build_retry_prompt_suffix(
+            "RATE_LIMIT", None, attempt=1, task_scope="small", ctx={},
+        )
+        assert "rate limit" in guidance.lower()
+        assert "Retry-After" in guidance
+        assert override is None
+
+    def test_unknown_failure_class_returns_empty_guidance(self):
+        guidance, override = _build_retry_prompt_suffix(
+            "MYSTERY_FAILURE", "anything", attempt=1, task_scope="small", ctx={},
+        )
+        assert guidance == ""
+        assert override is None
+
+    def test_none_failure_class_returns_empty_guidance(self):
+        guidance, override = _build_retry_prompt_suffix(
+            None, None, attempt=1, task_scope="small", ctx={},
+        )
+        assert guidance == ""
+        assert override is None

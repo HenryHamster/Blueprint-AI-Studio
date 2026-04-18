@@ -18,7 +18,12 @@ from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
 
 import app.shared_state as _ss
-from app.direction_lifecycle import _process_direction_lifecycle, _spawn_direction_diagnosis
+from app.anomaly_detection import _error_fingerprint
+from app.direction_lifecycle import (
+    _compute_direction_error_fingerprint,
+    _process_direction_lifecycle,
+    _spawn_direction_diagnosis,
+)
 from app.models import ArtifactType, MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.task_completion import _handle_investigation_completion, _record_remediation_outcome
 
@@ -400,3 +405,66 @@ async def test_structural_diagnosis_appends_note_no_remediation(db_session, mock
     # The in-progress flag is cleared either way so future auto-pauses can re-diagnose.
     assert "diagnosis_in_progress" not in d
     assert "diagnosis_completed_at" in d
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _compute_direction_error_fingerprint
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _add_failed_task(db_session, project_id, direction_id: str, msg: str | None) -> None:
+    task = Task(
+        project_id=project_id,
+        title="failed",
+        description="",
+        payloads=[{"type": "create"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message=msg,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_returns_none_when_no_failed_tasks(db_session):
+    project = await _make_project(db_session)
+    assert await _compute_direction_error_fingerprint(project.id, "d-fp-empty", db_session) is None
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_returns_none_below_recurrence_threshold(db_session):
+    project = await _make_project(db_session)
+    # Only one failure with this fingerprint — below _FINGERPRINT_MIN_RECURRENCE=2.
+    await _add_failed_task(db_session, project.id, "d-fp-once", "TypeError: x is None")
+    assert await _compute_direction_error_fingerprint(project.id, "d-fp-once", db_session) is None
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_returns_dominant_when_threshold_met(db_session):
+    project = await _make_project(db_session)
+    for _ in range(2):
+        await _add_failed_task(db_session, project.id, "d-fp-dom", "AssertionError: values differ")
+    expected = _error_fingerprint("AssertionError: values differ")
+    assert await _compute_direction_error_fingerprint(project.id, "d-fp-dom", db_session) == expected
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_skips_empty_status_messages(db_session):
+    project = await _make_project(db_session)
+    # Two empty-message failures must NOT be coerced into a shared fingerprint.
+    await _add_failed_task(db_session, project.id, "d-fp-empty-msg", "")
+    await _add_failed_task(db_session, project.id, "d-fp-empty-msg", None)
+    assert await _compute_direction_error_fingerprint(project.id, "d-fp-empty-msg", db_session) is None
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_picks_best_among_multiple_distinct(db_session):
+    project = await _make_project(db_session)
+    # Dominant pattern: 3 matches. Other pattern: 1 match (below threshold on its own).
+    for _ in range(3):
+        await _add_failed_task(db_session, project.id, "d-fp-best", "KeyError: 'direction_id'")
+    await _add_failed_task(db_session, project.id, "d-fp-best", "ConnectionRefusedError: db down")
+    expected = _error_fingerprint("KeyError: 'direction_id'")
+    assert await _compute_direction_error_fingerprint(project.id, "d-fp-best", db_session) == expected

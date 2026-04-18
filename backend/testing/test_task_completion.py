@@ -24,6 +24,7 @@ from app.task_completion import (
     _validate_plan_dependencies,
     _ensure_branch,
     _record_remediation_outcome,
+    _record_remediation_if_terminal,
     _handle_investigation_completion,
     _is_structural_diagnosis,
 )
@@ -775,6 +776,130 @@ class TestRecordRemediationOutcome:
         updated = await _record_remediation_outcome(task, merged=True, session=db_session)
         assert updated is False
         assert "remediation_attempts" not in project.directions[0]
+
+
+# ── _record_remediation_if_terminal ─────────────────────────────────────────
+
+class TestRecordRemediationIfTerminal:
+    """Wrapper that filters by terminal status + diagnosis context, then delegates."""
+
+    def _diag_ctx(self, **overrides):
+        ctx = {"diagnosis_task_id": "diag-1", "direction_id": "dir-1"}
+        ctx.update(overrides)
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_non_terminal_status_is_noop(self, db_session):
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context=self._diag_ctx())
+        db_session.add(task)
+        await db_session.commit()
+
+        for status in (TaskStatus.IN_PROGRESS, TaskStatus.QUEUED, TaskStatus.EVALUATING, TaskStatus.PROVISIONING):
+            await _record_remediation_if_terminal(task, status, db_session)
+        await db_session.refresh(project)
+        assert "remediation_attempts" not in project.directions[0]
+
+    @pytest.mark.asyncio
+    async def test_skips_when_diagnosis_task_id_missing(self, db_session):
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context={"direction_id": "dir-1"})
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
+        await db_session.refresh(project)
+        assert "remediation_attempts" not in project.directions[0]
+
+    @pytest.mark.asyncio
+    async def test_skips_when_direction_id_missing(self, db_session):
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context={"diagnosis_task_id": "diag-1"})
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
+        await db_session.refresh(project)
+        assert "remediation_attempts" not in project.directions[0]
+
+    @pytest.mark.asyncio
+    async def test_completed_records_merged_true(self, db_session):
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context=self._diag_ctx())
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["remediation_attempts"] == 1
+        assert d["last_remediation_result"] == "merged"
+
+    @pytest.mark.asyncio
+    async def test_failed_records_merged_false(self, db_session):
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context=self._diag_ctx())
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["remediation_attempts"] == 1
+        assert d["last_remediation_result"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_cancelled_records_merged_false(self, db_session):
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context=self._diag_ctx())
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_if_terminal(task, TaskStatus.CANCELLED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["remediation_attempts"] == 1
+        assert d["last_remediation_result"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_swallows_inner_exception(self, db_session, mocker):
+        """Errors from _record_remediation_outcome must not propagate."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context=self._diag_ctx())
+        db_session.add(task)
+        await db_session.commit()
+
+        boom = mocker.patch(
+            "app.task_completion._record_remediation_outcome",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("db blew up"),
+        )
+        await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
+        assert boom.await_count == 1
 
 
 # ── _handle_investigation_completion ────────────────────────────────────────
