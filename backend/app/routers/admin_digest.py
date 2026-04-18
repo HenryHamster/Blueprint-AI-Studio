@@ -1193,9 +1193,13 @@ async def get_digest(
     }
     _failure_class_groups: Dict[str, List[Dict[str, Any]]] = {}
     _failure_stage_counts: Dict[str, int] = {}
+    _cost_by_failure_class: Dict[str, float] = {}
     for t in failed_tasks:
         tid = str(t.id)
         cls = _classify_failure(t, error_log_map.get(tid))
+        if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start:
+            _rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+            _cost_by_failure_class[cls] = _cost_by_failure_class.get(cls, 0.0) + _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
         waiting_since = _derive_completed_at(t)
         waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
         t_dir_id = (t.context or {}).get("direction_id")
@@ -1229,6 +1233,8 @@ async def get_digest(
         key=lambda x: x["count"],
         reverse=True,
     )
+    cost_by_failure_class = {k: round(v, 4) for k, v in _cost_by_failure_class.items()}
+    total_failed_cost_usd = round(sum(_cost_by_failure_class.values()), 4)
 
     # Taxonomy distribution (4-category: scope/review/infra/code_defect)
     _tax_keys = (
@@ -1716,6 +1722,74 @@ async def get_digest(
         "top_patterns": [{"sequence": s, "count": c} for s, c in _top_patterns],
     }
 
+    # --- Review cap exhaustion summary ---
+    # Tasks that FAILED because the review-fix cycle could not converge
+    # (failure_detail=review_cap_exhausted) — distinct from tasks that failed
+    # because the code itself was wrong.
+    _cap_tasks = [
+        t for t in failed_tasks
+        if (t.context or {}).get("failure_detail") == "review_cap_exhausted"
+    ]
+    _cap_iters: List[int] = []
+    _cap_dir_counts: Dict[str, int] = {}
+    for _t in _cap_tasks:
+        _ctx = _t.context or {}
+        _it = _ctx.get("review_cap_iterations")
+        if isinstance(_it, (int, float)):
+            _cap_iters.append(int(_it))
+        _did = _ctx.get("direction_id")
+        if _did:
+            _did_s = str(_did)
+            _cap_dir_counts[_did_s] = _cap_dir_counts.get(_did_s, 0) + 1
+    _top_cap_dirs = sorted(_cap_dir_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+    review_cap_exhaustion_summary = {
+        "count": len(_cap_tasks),
+        "avg_iterations": (sum(_cap_iters) / len(_cap_iters)) if _cap_iters else None,
+        "top_directions": [{"direction_id": d, "count": c} for d, c in _top_cap_dirs],
+    }
+
+    # --- Recurring error fingerprint clusters ---
+    # Group failed tasks by normalized error fingerprint to surface systemic
+    # failures manifesting across multiple tasks.
+    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+    _clusters: Dict[str, Dict[str, Any]] = {}
+    for _t in failed_tasks:
+        _tid = str(_t.id)
+        _msg = error_log_map.get(_tid) or (_t.latest_status_message or "")
+        if not _msg:
+            continue
+        _fp = _error_fingerprint(_msg)
+        _entry = _clusters.get(_fp)
+        if _entry is None:
+            _entry = {
+                "fingerprint": _fp,
+                "count": 0,
+                "error_snippet": _msg[:200],
+                "direction_ids": set(),
+                "task_types": set(),
+                "first_task_id": _tid,
+            }
+            _clusters[_fp] = _entry
+        _entry["count"] += 1
+        _dir_id = (_t.context or {}).get("direction_id")
+        if _dir_id:
+            _entry["direction_ids"].add(str(_dir_id))
+        _ttype = (_t.first_payload or {}).get("type")
+        if _ttype:
+            _entry["task_types"].add(str(_ttype))
+    recurring_error_clusters = [
+        {
+            "fingerprint": c["fingerprint"],
+            "count": c["count"],
+            "error_snippet": c["error_snippet"],
+            "direction_ids": sorted(c["direction_ids"]),
+            "task_types": sorted(c["task_types"]),
+            "first_task_id": c["first_task_id"],
+        }
+        for c in sorted(_clusters.values(), key=lambda x: x["count"], reverse=True)
+        if c["count"] >= 2
+    ][:5]
+
     return {
         "window_hours": hours,
         "generated_at": _utcnow().isoformat(),
@@ -1741,6 +1815,8 @@ async def get_digest(
         "total_estimated_cost_usd": total_estimated_cost_usd,
         "spot_cost_usd": total_spot_cost_usd,
         "on_demand_cost_usd": total_on_demand_cost_usd,
+        "cost_by_failure_class": cost_by_failure_class,
+        "total_failed_cost_usd": total_failed_cost_usd,
         "daily_cost_usd": daily_cost_usd,
         "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
         "narrative_summary": narrative_summary,
@@ -1761,4 +1837,6 @@ async def get_digest(
         "scope_mismatch_summary": scope_mismatch_summary,
         "rejection_pattern_summary": rejection_pattern_summary,
         "retry_pattern_summary": retry_pattern_summary,
+        "review_cap_exhaustion_summary": review_cap_exhaustion_summary,
+        "recurring_error_clusters": recurring_error_clusters,
     }

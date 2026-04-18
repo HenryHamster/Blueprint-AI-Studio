@@ -221,6 +221,87 @@ async def test_digest_recent_failures_includes_failure_class_and_scope(client: A
 
 
 @pytest.mark.asyncio
+async def test_digest_recurring_error_clusters(client: AsyncClient, db_session):
+    """Failed tasks sharing a normalized error are grouped into a recurring cluster (count >= 2)."""
+    project = make_project(
+        directions=[
+            {"id": "dir-rc", "text": "Reliability", "status": "active"}
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two failures with the same root cause but differing PR numbers — should
+    # normalize to the same fingerprint.
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Fail A",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"direction_id": "dir-rc"},
+        latest_status_message="Merge conflict on PR #1234",
+    ))
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Fail B",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix"}],
+        context={"direction_id": "dir-rc"},
+        latest_status_message="Merge conflict on PR #5678",
+    ))
+    # Singleton — should be excluded from clusters.
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Fail C",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        latest_status_message="Unique failure: disk full",
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    clusters = data["recurring_error_clusters"]
+    assert len(clusters) == 1
+    cluster = clusters[0]
+    assert cluster["count"] == 2
+    assert len(cluster["fingerprint"]) == 12
+    assert "Merge conflict" in cluster["error_snippet"]
+    assert cluster["direction_ids"] == ["dir-rc"]
+    assert sorted(cluster["task_types"]) == ["create", "fix"]
+
+
+@pytest.mark.asyncio
+async def test_digest_recurring_error_clusters_empty_when_all_unique(client: AsyncClient, db_session):
+    """If every failed task has a distinct fingerprint, recurring_error_clusters is empty."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i, msg in enumerate([
+        "TypeError: foo is undefined",
+        "Rate limit exceeded for region us-west",
+        "SyntaxError: unexpected token in parser",
+    ]):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Unique {i}",
+            status=TaskStatus.FAILED,
+            latest_status_message=msg,
+        ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["recurring_error_clusters"] == []
+
+
+@pytest.mark.asyncio
 async def test_digest_approval_task_direction_attribution(client: AsyncClient, db_session):
     """Approval-pending tasks with direction_id context expose direction attribution in needs_attention."""
     project = make_project(
@@ -2520,6 +2601,49 @@ async def test_digest_spot_vs_on_demand_cost_split(client: AsyncClient, db_sessi
 
 
 @pytest.mark.asyncio
+async def test_digest_cost_by_failure_class(client: AsyncClient, db_session):
+    """Digest response exposes per-failure-class cost breakdown and total failed cost."""
+    now = _utcnow()
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="timeout task",
+        status=TaskStatus.FAILED,
+        latest_status_message="",
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),
+        vm_spot=False,
+    ))
+    db_session.add(make_task(
+        project_id=project.id,
+        title="external api task",
+        status=TaskStatus.FAILED,
+        latest_status_message="could not connect to server",
+        vm_provisioned_at=now - timedelta(minutes=60),
+        vm_stopped_at=now - timedelta(minutes=30),
+        vm_spot=True,
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert "cost_by_failure_class" in body
+    assert "total_failed_cost_usd" in body
+    cbfc = body["cost_by_failure_class"]
+    assert "AGENT_TIMEOUT" in cbfc
+    assert "EXTERNAL_API" in cbfc
+    assert cbfc["AGENT_TIMEOUT"] > 0
+    assert cbfc["EXTERNAL_API"] > 0
+    assert round(sum(cbfc.values()), 4) == body["total_failed_cost_usd"]
+
+
+@pytest.mark.asyncio
 async def test_digest_scope_conversion_rates_absent_without_project(client: AsyncClient, db_session):
     """scope_conversion_rates is null when no project_id is provided."""
     response = await client.get("/api/admin/digest")
@@ -2937,6 +3061,71 @@ async def test_digest_retry_pattern_summary(client: AsyncClient, db_session):
     assert top[0]["count"] == 2
     sequences = {p["sequence"] for p in top}
     assert "PROVISION_FAILURE -> CODE_ERROR" in sequences
+
+
+@pytest.mark.asyncio
+async def test_digest_review_cap_exhaustion_summary(client: AsyncClient, db_session):
+    """review_cap_exhaustion_summary counts FAILED tasks with failure_detail=review_cap_exhausted."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id, title="c1", status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"failure_detail": "review_cap_exhausted", "review_cap_iterations": 16, "direction_id": "d-aaa"},
+    ))
+    db_session.add(make_task(
+        project_id=project.id, title="c2", status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"failure_detail": "review_cap_exhausted", "review_cap_iterations": 12, "direction_id": "d-aaa"},
+    ))
+    db_session.add(make_task(
+        project_id=project.id, title="c3", status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"failure_detail": "review_cap_exhausted", "review_cap_iterations": 8, "direction_id": "d-bbb"},
+    ))
+    # Unrelated FAILED task — should NOT be counted
+    db_session.add(make_task(
+        project_id=project.id, title="other", status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"failure_detail": "something_else", "direction_id": "d-ccc"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    summary = response.json()["review_cap_exhaustion_summary"]
+    assert summary["count"] == 3
+    assert summary["avg_iterations"] == pytest.approx((16 + 12 + 8) / 3)
+    top = summary["top_directions"]
+    assert top[0] == {"direction_id": "d-aaa", "count": 2}
+    dirs = {d["direction_id"] for d in top}
+    assert "d-bbb" in dirs
+    assert "d-ccc" not in dirs
+
+
+@pytest.mark.asyncio
+async def test_digest_review_cap_exhaustion_summary_empty(client: AsyncClient, db_session):
+    """review_cap_exhaustion_summary returns zero count and None avg when no cap exhaustion."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id, title="ok", status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    summary = response.json()["review_cap_exhaustion_summary"]
+    assert summary["count"] == 0
+    assert summary["avg_iterations"] is None
+    assert summary["top_directions"] == []
 
 
 @pytest.mark.asyncio

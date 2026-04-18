@@ -47,7 +47,18 @@ interface FailureGroupTask {
   error_snippet?: string;
   attempt_count?: number;
   taxonomy?: string;
+  timeout_subtype?: string | null;
 }
+
+const TIMEOUT_SUBTYPE_LABELS: Record<string, string> = {
+  heartbeat_lost: 'heartbeat lost',
+  oom: 'OOM',
+  execution_timeout: 'exec timeout',
+  cascade_cancellation: 'cascade',
+  iteration_limit: 'iter limit',
+  process_crash: 'crash',
+  unknown: 'unknown',
+};
 
 interface FailureGroup {
   failure_class: string;
@@ -233,6 +244,14 @@ function FailureClassPill({ group, sparkData }: { group: FailureGroup; sparkData
                   </span>
                 )}
                 <span className="truncate">{t.title}</span>
+                {group.failure_class === 'AGENT_TIMEOUT' && t.timeout_subtype && (
+                  <span
+                    className="shrink-0 text-[9px] font-mono px-1 py-0.5 rounded bg-amber-500/10 text-amber-400/80 border border-amber-500/20"
+                    title={`Timeout subtype: ${t.timeout_subtype}`}
+                  >
+                    {TIMEOUT_SUBTYPE_LABELS[t.timeout_subtype] ?? t.timeout_subtype}
+                  </span>
+                )}
               </div>
             ))}
           </div>
