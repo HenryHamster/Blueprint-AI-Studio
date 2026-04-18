@@ -472,6 +472,24 @@ Output ONLY a JSON object in a \`\`\`json code fence:
       }
     }
 
+    // ── Scope overflow gate (small-scope tasks only) ─────────────────────────────
+    // Small tasks that touch too many files waste review cycles — fail fast so the
+    // retry can focus on fewer files. Run before lint/test loops to avoid wasting
+    // cycles on tasks that are guaranteed to be rejected. Medium tasks legitimately
+    // touch more files, so keep the existing warning-only behaviour for them.
+    if (taskScope === 'small' && scopeOverflowWarning) {
+      sendLog(ws, `\nScope overflow: failing small-scope task — ${nonTestChangedPaths.length} non-test files changed exceeds the ${overflowThreshold}-file threshold. Retry should focus on the single most critical change and limit to 1-3 files.\n`);
+      await persistAndPostStatus(taskId, {
+        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+        logs: `Scope overflow: ${nonTestChangedPaths.length} non-test files changed for a small-scope task (threshold: ${overflowThreshold}, ${changedPaths.length} total including tests). Retry guidance: focus on the single most critical change and limit to 1-3 files.\n\nChanged files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`,
+        failure_category: 'scope_overflow',
+        scope_gate_triggered: 'small_overflow',
+        changed_files: changedPaths.slice(0, 50),
+        ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+      });
+      return;
+    }
+
     if (runLintFix) {
       const lintPassed = await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
       if (!lintPassed && failOnTestFailure) {
@@ -511,23 +529,6 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
         ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
         ...(analysisContext ? { analysis_plan: analysisContext.slice(0, 5000) } : {}),
-      });
-      return;
-    }
-
-    // ── Scope overflow gate (small-scope tasks only) ─────────────────────────────
-    // Small tasks that touch too many files waste review cycles — fail fast so the
-    // retry can focus on fewer files. Medium tasks legitimately touch more files, so
-    // keep the existing warning-only behaviour for them.
-    if (taskScope === 'small' && scopeOverflowWarning) {
-      sendLog(ws, `\nScope overflow: failing small-scope task — ${nonTestChangedPaths.length} non-test files changed exceeds the ${overflowThreshold}-file threshold. Retry should focus on the single most critical change and limit to 1-3 files.\n`);
-      await persistAndPostStatus(taskId, {
-        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-        logs: `Scope overflow: ${nonTestChangedPaths.length} non-test files changed for a small-scope task (threshold: ${overflowThreshold}, ${changedPaths.length} total including tests). Retry guidance: focus on the single most critical change and limit to 1-3 files.\n\nChanged files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`,
-        failure_category: 'scope_overflow',
-        scope_gate_triggered: 'small_overflow',
-        changed_files: changedPaths.slice(0, 50),
-        ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
       });
       return;
     }
@@ -1060,6 +1061,19 @@ Output ONLY a JSON object in a \`\`\`json code fence:
             ws, statusRef, model, effort
           );
           git(['add', '-A']);
+          // Re-verify: fail the task if markers still present rather than push known-broken code.
+          try {
+            const stillConflicting = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--cached', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
+            if (stillConflicting) {
+              sendLog(ws, `Conflict markers persist after resolution attempt in:\n${stillConflicting}\nFailing task — will not push known-broken code.\n`);
+              await persistAndPostStatus(taskId, {
+                task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+                logs: `Conflict markers still present after retry, refusing to push:\n${stillConflicting}`,
+                failure_category: 'unresolved_conflicts',
+              });
+              return;
+            }
+          } catch { /* no markers — resolved successfully */ }
         }
       } catch { /* grep exit 1 means no matches — good */ }
     }
