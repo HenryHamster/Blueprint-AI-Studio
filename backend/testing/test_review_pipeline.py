@@ -2192,8 +2192,8 @@ async def test_scope_budget_utilization_absent_when_no_changed_files(db_session,
 
 
 @pytest.mark.asyncio
-async def test_scope_budget_utilization_not_attached_to_review_spawn(db_session, mocker):
-    """Utilization is a fix-task signal only — review spawns must not carry it."""
+async def test_scope_budget_utilization_attached_to_review_spawn(db_session, mocker):
+    """Review spawns also carry utilization so reviewers can weigh budget pressure."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
@@ -2217,7 +2217,10 @@ async def test_scope_budget_utilization_not_attached_to_review_spawn(db_session,
         pr_number=604, branch="feat/rv", base_branch="main",
     )
     assert created is True and result is not None
-    assert "scope_budget_utilization" not in (result.context or {})
+    util = (result.context or {}).get("scope_budget_utilization")
+    assert util is not None
+    assert util["non_test_file_count"] == 2
+    assert util["scope"] == "small"
 
 
 # ── filter_pipeline_duplicates: pre-dispatch dedup safety net ─────────────────
@@ -2935,4 +2938,73 @@ async def test_issue_churn_injects_narrow_focus_and_halves_cap(db_session, mocke
     baseline = _max_review_iterations(source_task)
     assert ctx_cap is not None and ctx_cap < baseline, (
         f"Churn should reduce cap below baseline {baseline}, got {ctx_cap}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mid_budget_injects_narrow_focus_without_cap_reduction(db_session, mocker):
+    """When a fix iteration has consumed >= 50% of the per-chain cap but no
+    churn has been detected, a softer narrow-focus directive should be
+    prepended to the fix prompt without reducing the cap."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Only one prior entry → below ISSUE_CHURN_WINDOW, so churn cannot trigger.
+    prior_history = [
+        {"iteration": 0, "feedback": "f0", "issues": [_issue("alpha broken")]},
+    ]
+    # scope=medium → baseline cap 12; iteration 6 is exactly 50% → mid-budget.
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 801, "branch": "b2", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 6,
+                "original_task_id": str(original_task.id),
+                "pr_number": 801,
+                "branch": "b2",
+                "base_branch": "main",
+                "review_history": prior_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, spawned = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=801, branch="b2", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Please fix.",
+        current_feedback="new feedback",
+        current_issues=[_issue("single issue")],
+    )
+
+    assert result is not None and spawned is True
+    payload = result.first_payload or {}
+    prompt = payload.get("prompt") or ""
+    assert "over half of the fix iteration budget" in prompt
+    assert "ISSUE CHURN DETECTED" not in prompt
+    assert "Please fix." in prompt
+
+    # Cap is NOT reduced by the mid-budget directive.
+    from app.review_pipeline import _max_review_iterations
+    baseline = _max_review_iterations(source_task)
+    ctx_cap = (result.context or {}).get("review_loop", {}).get("max_iterations")
+    assert ctx_cap == baseline, (
+        f"Mid-budget directive must not reduce cap: baseline={baseline}, got={ctx_cap}"
     )

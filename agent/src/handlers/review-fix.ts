@@ -351,8 +351,13 @@ export async function handleReview(
       }).join('\n')}\n\n`
     : '';
 
-  // Build iteration preamble
-  const iterationPreamble = `This is review iteration ${iteration} of the automated review-fix cycle.${iteration > 1 ? '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.' : ''}`;
+  // Build iteration preamble with graduated budget guidance
+  const reviewMaxIterations = computeMaxFixIterations(task);
+  const reviewMidBudget = iteration * 2 >= reviewMaxIterations && iteration < reviewMaxIterations;
+  const reviewBudgetHint = reviewMidBudget
+    ? `\nBudget-awareness: you are at or past 50% of the ${reviewMaxIterations}-iteration budget. Do NOT flag MINOR-severity issues — every iteration now costs a meaningful fraction of remaining budget and cosmetic nits are not worth a round trip. Focus only on CRITICAL and MAJOR findings. If only MINOR issues remain, APPROVE and note them as non-blocking polish in \`feedback\`.`
+    : '';
+  const iterationPreamble = `This is review iteration ${iteration} of ${reviewMaxIterations} in the automated review-fix cycle.${iteration > 1 ? '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.' : ''}${reviewBudgetHint}`;
 
   // Rollup PRs (head branch research/* or plan/*) contain N subtask squash-merge
   // commits whose titles end in "(#NNNN)". The `(#NNNN)` marker means a PR was
@@ -388,6 +393,37 @@ actual changes.
   const selfReviewOutcome = taskContext?._self_review_outcome as Record<string, unknown> | undefined;
   const selfReviewBlindSpotsSection = formatSelfReviewBlindSpots(selfReviewOutcome, changedFilePathList);
 
+  // Propagated from the original create task's plan: files the task was scoped
+  // to modify. Changed files not in this list may indicate scope creep.
+  const plannedFiles = (taskContext?._planned_files as string[] | undefined) || [];
+  let plannedFilesSection = '';
+  if (plannedFiles.length > 0) {
+    const isTestPath = (p: string) => /(^|\/)testing\//.test(p) || /\.test\.[tj]sx?$/.test(p) || /(^|\/)tests?\//.test(p) || /_test\.py$/.test(p);
+    const plannedSet = new Set(plannedFiles);
+    const unplannedNonTest = changedFilePathList.filter(f => !plannedSet.has(f) && !isTestPath(f));
+    plannedFilesSection = `Planned files from the original analysis plan:\n${plannedFiles.map(f => `  - ${f}`).join('\n')}\n` +
+      (unplannedNonTest.length > 0
+        ? `\nFiles changed but NOT in the original plan:\n${unplannedNonTest.map(f => `  - ${f}`).join('\n')}\n\nUnplanned non-test file changes may indicate scope creep — flag them as MAJOR unless they are directly necessary to fix a listed review issue.\n\n`
+        : `\nAll non-test changed files are in the original plan.\n\n`);
+  }
+
+  // Scope-budget awareness for reviewers: when the PR is already ≥50% of its
+  // file budget, warn the reviewer so feedback that would require touching
+  // additional files is weighed against pushing the PR over scope.
+  const reviewScopeUtilization = taskContext?.scope_budget_utilization as
+    { scope?: string; file_count?: number; non_test_file_count?: number; budget?: number; percentage?: number } | undefined;
+  let reviewScopeBudgetSection = '';
+  if (reviewScopeUtilization && typeof reviewScopeUtilization.percentage === 'number' && reviewScopeUtilization.percentage >= 50) {
+    const rsNonTest = reviewScopeUtilization.non_test_file_count ?? 0;
+    const rsBudget = reviewScopeUtilization.budget ?? 0;
+    const rsPct = reviewScopeUtilization.percentage;
+    reviewScopeBudgetSection =
+      `## Scope Budget\n` +
+      `This PR touches ${rsNonTest} of ${rsBudget} allowed production files (${rsPct}% utilized). ` +
+      `When requesting changes, consider whether the fix would require touching additional files that could push the PR over its scope budget. ` +
+      `Prefer feedback that can be addressed within existing files.\n\n`;
+  }
+
   // Build review prompt — Claude has full repo access, not just a diff blob
   const reviewPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const reviewPrompt = `${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
@@ -398,12 +434,13 @@ ${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle
 ${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}
 
 ${selfReviewBlindSpotsSection}
+${plannedFilesSection}
 
 You have full access to the codebase. Read any files you need to understand the changes in context. Use \`git diff origin/${baseBranch}...HEAD\` to see the full diff, or \`git diff origin/${baseBranch}...HEAD -- <file>\` for specific files.
 
 Review the changes thoroughly using this checklist:
 
-${scopePreamble}${origTaskType === 'qa' ? 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n' : origTaskType === 'migrate' ? 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n' : ''}**Correctness & Logic:**
+${reviewScopeBudgetSection}${scopePreamble}${origTaskType === 'qa' ? 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n' : origTaskType === 'migrate' ? 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n' : ''}**Correctness & Logic:**
 - Does the code correctly implement what the original task asked for?
 - Are there edge cases, null/undefined handling, or off-by-one errors?
 - Are async operations properly awaited? Are errors properly handled?
@@ -565,6 +602,8 @@ export async function handleFix(
   let iterationHeader = `You are on fix iteration ${iteration} of ${maxIterations}.\n`;
   if (iteration >= maxIterations) {
     iterationHeader += 'This is your FINAL attempt. If this fix is not accepted, the task will require manual intervention. Address every feedback point thoroughly.\n';
+  } else if (iteration * 2 >= maxIterations) {
+    iterationHeader += 'Convergence mode: you are at or past 50% of the iteration budget. Make only the minimal changes needed to address the specific issues listed below. Do NOT touch files that are not mentioned in the review feedback, do NOT refactor or clean up adjacent code, and defer any non-blocking improvements to follow-up tasks. Scope creep at this stage commonly exhausts the remaining budget and forces the PR to close unmerged.\n';
   }
   const originalPromptSection = originalPrompt ? `## Original Task Goal\n${originalPrompt}\n\n` : '';
   let basePrompt = originalPromptSection + iterationHeader + prompt;

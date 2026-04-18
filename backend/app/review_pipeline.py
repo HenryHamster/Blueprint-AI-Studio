@@ -77,6 +77,18 @@ _CHURN_NARROW_FOCUS_PREFIX = (
     "reformat, or clean up unrelated code in this iteration.\n\n"
 )
 
+# Softer proactive directive injected when a fix iteration has consumed at
+# least half the per-chain iteration cap but churn has not (yet) been
+# detected. Unlike the churn prefix, this does NOT reduce the cap — it is
+# guidance only, aimed at preventing churn before it begins.
+MID_BUDGET_NARROW_FOCUS_THRESHOLD = 0.5
+_MID_BUDGET_NARROW_FOCUS_PREFIX = (
+    "⚠️ You have used over half of the fix iteration budget "
+    "({iteration}/{cap}). Focus on the specific issues listed in the review "
+    "feedback. Avoid modifying files not referenced by the issues. Defer "
+    "cleanups and refactors to follow-up tasks.\n\n"
+)
+
 # Utilization at/above this fraction of the scope file budget signals the fix
 # agent to prefer minimal fixes over expansive refactoring — gives headroom
 # before a fix iteration would tip the PR into scope-overflow territory.
@@ -731,6 +743,19 @@ async def _spawn_pipeline_task(
             )
             payload_data["prompt"] = narrow_prefix + (payload_data.get("prompt") or "")
             fix_prompt = narrow_prefix + (fix_prompt or "")
+        elif task_type == "fix" and per_chain_cap > 0 and (
+            iteration >= MID_BUDGET_NARROW_FOCUS_THRESHOLD * per_chain_cap
+        ):
+            # Proactive mid-budget directive: softer wording, no cap reduction.
+            mid_prefix = _MID_BUDGET_NARROW_FOCUS_PREFIX.format(
+                iteration=iteration, cap=per_chain_cap
+            )
+            logger.info(
+                f"[PIPELINE] Mid-budget narrow-focus directive for PR #{pr_number} "
+                f"(iteration {iteration}/{per_chain_cap})."
+            )
+            payload_data["prompt"] = mid_prefix + (payload_data.get("prompt") or "")
+            fix_prompt = mid_prefix + (fix_prompt or "")
 
     payload_data = validate_internal_payload(payload_data, f"review_pipeline:{task_type}:pr#{pr_number}")
     source_ctx = source_task.context or {}
@@ -750,18 +775,24 @@ async def _spawn_pipeline_task(
     prev_self_review_outcome = source_ctx.get('_self_review_outcome')
     if prev_self_review_outcome:
         propagated_ctx['_self_review_outcome'] = prev_self_review_outcome
-    # Scope-pressure awareness for fix tasks: if the PR already fills most of
-    # its file budget, expose utilization so the fix agent can prefer minimal
-    # fixes and defer peripheral edits rather than tipping into overflow.
-    if task_type == "fix":
-        changed_files = (
-            source_ctx.get("_pr_changed_files")
-            or ((orig.context or {}).get("_pr_changed_files") if orig else None)
-            or []
-        )
-        utilization = _compute_scope_budget_utilization(changed_files, propagated_scope)
-        if utilization:
-            propagated_ctx['scope_budget_utilization'] = utilization
+    # Scope-pressure awareness: expose file-budget utilization to both fix and
+    # review agents. Fix agents use it to prefer minimal edits; reviewers use it
+    # to weigh whether requesting changes would push the PR over its budget.
+    changed_files = (
+        source_ctx.get("_pr_changed_files")
+        or ((orig.context or {}).get("_pr_changed_files") if orig else None)
+        or []
+    )
+    utilization = _compute_scope_budget_utilization(changed_files, propagated_scope)
+    if utilization:
+        propagated_ctx['scope_budget_utilization'] = utilization
+    # Propagate the original create task's planned file list so the reviewer can
+    # objectively detect scope creep (files changed but not in the original plan).
+    planned_files = (orig.context or {}).get("related_files") if orig else None
+    if not planned_files:
+        planned_files = source_ctx.get("related_files")
+    if planned_files:
+        propagated_ctx['_planned_files'] = list(planned_files)
     propagated_ctx['review_loop'] = {
         "pr_number": pr_number, "branch": branch,
         "base_branch": base_branch,
