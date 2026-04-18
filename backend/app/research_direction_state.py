@@ -95,6 +95,8 @@ async def apply_post_spawn_state(
     original_base: str,
     research_depth: int,
     parent_research_task_id: Optional[str],
+    findings_produced_count: int = 0,
+    batch_cap_applied_count: int = 0,
 ) -> None:
     """Apply all direction-state updates after research child tasks have been spawned.
 
@@ -178,6 +180,8 @@ async def apply_post_spawn_state(
                         "timestamp": now_iso,
                         "task_id": str(task.id),
                         "tasks_created": len(dir_child_tasks),
+                        "findings_produced": findings_produced_count,
+                        "batch_cap_applied": batch_cap_applied_count,
                         "summary": "; ".join(t[:60] for t in titles) if titles else "no findings",
                         "finding_titles": titles,
                         "key_finding_descriptions": descriptions,

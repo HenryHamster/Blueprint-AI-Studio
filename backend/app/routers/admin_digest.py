@@ -788,6 +788,9 @@ async def get_digest(
                 dir_taxonomy_summary: Dict[str, int] = {}
                 dir_stage_dropout: Dict[str, int] = {}
                 recent_failed_titles: List[str] = []
+                dir_findings_produced = 0
+                dir_batch_cap_applied = 0
+                dir_filter_breakdown_agg: Dict[str, int] = {}
                 for entry in d.get("research_history") or []:
                     try:
                         entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
@@ -797,6 +800,10 @@ async def get_digest(
                         prs_merged += entry.get("prs_merged") or 0
                         prs_rejected += entry.get("prs_rejected") or 0
                         findings_tasks_created += entry.get("tasks_created") or 0
+                        dir_findings_produced += entry.get("findings_produced") or 0
+                        dir_batch_cap_applied += entry.get("batch_cap_applied") or 0
+                        for _fk, _fv in (entry.get("filter_breakdown") or {}).items():
+                            dir_filter_breakdown_agg[_fk] = dir_filter_breakdown_agg.get(_fk, 0) + (_fv or 0)
                         atm = entry.get("avg_time_to_merge_hours")
                         if atm is not None:
                             merge_time_values.append(float(atm))
@@ -855,6 +862,19 @@ async def get_digest(
                     prev_scope_conversion_rates[_s]["calibrated_in"] += _st.get("calibrated_in", 0)
                     prev_scope_conversion_rates[_s]["calibrated_out"] += _st.get("calibrated_out", 0)
 
+                filter_funnel = None
+                if dir_findings_produced or dir_batch_cap_applied or dir_filter_breakdown_agg or findings_tasks_created:
+                    filter_funnel = {
+                        "findings_produced": dir_findings_produced,
+                        "hash_dedup": dir_filter_breakdown_agg.get("hash_dedup", 0),
+                        "word_overlap": dir_filter_breakdown_agg.get("word_overlap_dedup", 0),
+                        "file_overlap": dir_filter_breakdown_agg.get("file_overlap_dedup", 0),
+                        "type_filtered": dir_filter_breakdown_agg.get("type_filtered", 0),
+                        "empty_prompt": dir_filter_breakdown_agg.get("empty_prompt", 0),
+                        "batch_cap": dir_batch_cap_applied,
+                        "tasks_created": findings_tasks_created,
+                    }
+
                 direction_progress_list.append({
                     "direction_id": did,
                     "direction_text": direction_text,
@@ -878,6 +898,7 @@ async def get_digest(
                     "taxonomy_summary": dir_taxonomy_summary or None,
                     "stage_dropout": dir_stage_dropout or None,
                     "recent_failure_titles": recent_failed_titles[-3:] or None,
+                    "filter_funnel": filter_funnel,
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
@@ -1327,6 +1348,12 @@ async def get_digest(
         for ttype, cnt in (d.get("type_distribution") or {}).items():
             overall_type_distribution[ttype] = overall_type_distribution.get(ttype, 0) + cnt
 
+    pipeline_filter_funnel: Dict[str, int] = {}
+    for d in direction_progress_list:
+        ff = d.get("filter_funnel") or {}
+        for _k, _v in ff.items():
+            pipeline_filter_funnel[_k] = pipeline_filter_funnel.get(_k, 0) + (_v or 0)
+
     # --- Latest strategic cycle ---
     latest_cycle = None
     if project_id:
@@ -1385,4 +1412,5 @@ async def get_digest(
         "prev_scope_conversion_rates": prev_scope_conversion_rates or None,
         "pipeline_acceptance_rate": pipeline_acceptance_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
+        "pipeline_filter_funnel": pipeline_filter_funnel or None,
     }

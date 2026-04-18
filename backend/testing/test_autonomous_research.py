@@ -89,12 +89,13 @@ def _make_finding(
     direction_id: str = "d-test0001",
     scope: str = "small",
     finding_type: str = "improvement",
+    priority: str = "medium",
 ) -> dict:
     return {
         "title": title,
         "description": f"Description: {title}",
         "prompt": f"Implement: {title}",
-        "priority": "medium",
+        "priority": priority,
         "scope": scope,
         "risk": "low",
         "type": finding_type,
@@ -2015,6 +2016,8 @@ async def test_research_history_entry_has_correct_fields(db_session, mocker):
     entry = history[0]
     assert entry["task_id"] == str(task.id)
     assert entry["tasks_created"] == 1
+    assert entry["findings_produced"] == 1
+    assert entry["batch_cap_applied"] == 0
     assert finding_title[:60] in entry.get("summary", "")
     assert datetime.fromisoformat(entry["timestamp"]) >= before
 
@@ -3928,6 +3931,256 @@ async def test_prior_deferred_findings_still_capped_if_pipeline_degraded(db_sess
     still_deferred = (task.context or {}).get("deferred_findings", [])
     assert len(still_deferred) == 5 - _DEGRADED_SPAWN_CAP, (
         f"Excess findings re-deferred: expected {5 - _DEGRADED_SPAWN_CAP}, got {len(still_deferred)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, mocker):
+    """Undirected research cycles must recover deferred findings without a direction_id.
+
+    Previously, the recovery block was gated on current_dir_id being truthy, so undirected
+    cycles silently dropped findings deferred during pipeline degradation."""
+    direction = _active_direction("d-undir-rec01", "Active direction")
+    project = Project(
+        name="Undirected Deferred Recovery",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        # Force is_undirected=True (12 % 12 == 0) without is_strategic (12 % 5 != 0)
+        vision={"purpose": "test", "_research_spawn_count": 12, "_strategic_frequency_override": 5},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    unscoped_finding = _make_finding("Unscoped deferred finding", direction_id=None)
+    unscoped_finding.pop("direction_id")  # truly unscoped — no direction_id key
+    directed_finding = _make_finding("Directed deferred finding", direction_id=direction["id"])
+    prev_completed = Task(
+        project_id=project.id,
+        title="Research: prior undirected cycle",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main",
+                   "current_direction_id": None}],
+        context={"deferred_findings": [unscoped_finding, directed_finding]},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(prev_completed)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != prev_completed.id,
+            Task.created_by == "ORCHESTRATOR",
+        )
+    )
+    new_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    assert len(new_tasks) == 1, f"Expected one new research task, got {len(new_tasks)}"
+    new_task = new_tasks[0]
+    assert new_task.first_payload.get("current_direction_id") is None, "Expected undirected cycle"
+    prior = (new_task.context or {}).get("prior_deferred_findings", [])
+    titles = [f.get("title") for f in prior]
+    assert "Unscoped deferred finding" in titles, (
+        f"Undirected cycle must recover unscoped deferred findings, got: {titles}"
+    )
+    assert "Directed deferred finding" not in titles, (
+        f"Undirected cycle must NOT steal directed-cycle leftovers, got: {titles}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 17. _handle_research_completion — Batch Cap Deferral & Priority Sort
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_batch_cap_excess_findings_are_deferred_not_discarded(db_session, mocker):
+    """Findings beyond the capacity batch cap are stored for the next cycle, not lost."""
+    direction_id = "d-batchcap01"
+    direction = _active_direction(direction_id, "Batch cap deferral")
+    project = Project(
+        name="Batch Cap Deferral", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    # Force batch cap to 3 by saturating queue (cap_by_queue = max(3, 15-12) = 3)
+    mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
+    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+
+    findings = [_make_finding(f"Finding {i}", direction_id) for i in range(5)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 3, "Cap of 3 should spawn 3 tasks"
+
+    await db_session.refresh(task)
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert len(deferred) == 2, f"Excess 2 findings should be deferred, got {len(deferred)}"
+    deferred_titles = {f["title"] for f in deferred}
+    assert all(t.startswith("Finding") for t in deferred_titles)
+
+
+@pytest.mark.asyncio
+async def test_priority_sort_before_batch_cap_keeps_high_priority(db_session, mocker):
+    """High-priority findings survive the batch cap regardless of agent output order."""
+    direction_id = "d-batchcap02"
+    direction = _active_direction(direction_id, "Priority sort before cap")
+    project = Project(
+        name="Priority Sort Before Cap", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    # Force batch cap to 3
+    mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
+    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+
+    # Agent returns 5 findings in low-first order — without priority sort,
+    # the batch cap would discard the trailing high-priority findings.
+    findings = [
+        _make_finding("Low A", direction_id, priority="low"),
+        _make_finding("Low B", direction_id, priority="low"),
+        _make_finding("Medium C", direction_id, priority="medium"),
+        _make_finding("High D", direction_id, priority="high"),
+        _make_finding("High E", direction_id, priority="high"),
+    ]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_titles = {ct.title for ct in result.scalars().all()}
+    assert {"High D", "High E", "Medium C"} == child_titles, (
+        f"High+medium should spawn, got {child_titles}"
+    )
+
+    await db_session.refresh(task)
+    deferred_titles = {f["title"] for f in (task.context or {}).get("deferred_findings", [])}
+    assert {"Low A", "Low B"} == deferred_titles, (
+        f"Low-priority findings should be deferred, got {deferred_titles}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_cap_preserves_depends_on_indices_across_priority_selection(db_session, mocker):
+    """A high-priority dependent keeps its link to a low-priority prerequisite that also survives the cap.
+
+    Regression: earlier priority-sort+cap code mutated findings in place so
+    depends_on_indices referenced the wrong finding (or triggered a spurious
+    self-cycle in _validate_plan_dependencies, stripping deps entirely).
+    """
+    direction_id = "d-batchcap04"
+    direction = _active_direction(direction_id, "Deps across priority cap")
+    project = Project(
+        name="Deps Across Priority Cap", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    # Force batch cap to 3
+    mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
+    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+
+    # Agent output: a low-priority prerequisite at index 0, a pure-low filler
+    # at index 1, a high-priority dependent at index 2 (points to 0), and a
+    # high-priority finding at index 3. Cap=3 keeps indices {0, 2, 3}; the
+    # dependent at new position 1 must still point to the prerequisite at
+    # new position 0.
+    prereq = _make_finding("Low Prereq A", direction_id, priority="low")
+    filler = _make_finding("Low Filler B", direction_id, priority="low")
+    dependent = _make_finding("High Dependent C", direction_id, priority="high")
+    dependent["depends_on_indices"] = [0]
+    high_d = _make_finding("High D", direction_id, priority="high")
+    findings = [prereq, filler, dependent, high_d]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = {ct.title: ct for ct in result.scalars().all()}
+    assert set(child_tasks) == {"Low Prereq A", "High Dependent C", "High D"}, (
+        f"Cap should keep prereq + both highs, got {set(child_tasks)}"
+    )
+    dependent_task = child_tasks["High Dependent C"]
+    prereq_task = child_tasks["Low Prereq A"]
+    assert dependent_task.depends_on == [str(prereq_task.id)], (
+        f"Dependent should link to prereq UUID, got depends_on={dependent_task.depends_on}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_cap_and_health_gate_deferrals_combine(db_session, mocker):
+    """When both batch cap and health gate trigger, all deferred findings are stored together."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-batchcap03"
+    direction = _active_direction(direction_id, "Combined deferral")
+    project = Project(
+        name="Combined Deferral", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    # Batch cap = 4 (queue gauge = 11 → max(3, 15-11) = 4)
+    mocker.patch.object(_shared_state, "tasks_queued_gauge", 11)
+    # And pipeline degraded so health gate further limits to _DEGRADED_SPAWN_CAP
+    mocker.patch(
+        "app.research_completion._assess_spawn_health",
+        return_value=(True, "all zones in cooldown"),
+    )
+
+    # 6 findings: batch cap leaves 4, health gate spawns _DEGRADED_SPAWN_CAP,
+    # remaining (4 - _DEGRADED_SPAWN_CAP) deferred by health gate, plus 2 deferred by batch cap.
+    findings = [_make_finding(f"Finding {i}", direction_id) for i in range(6)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == _DEGRADED_SPAWN_CAP
+
+    await db_session.refresh(task)
+    deferred = (task.context or {}).get("deferred_findings", [])
+    expected_deferred = 6 - _DEGRADED_SPAWN_CAP
+    assert len(deferred) == expected_deferred, (
+        f"Health gate + batch cap together should defer {expected_deferred}, got {len(deferred)}"
     )
 
 

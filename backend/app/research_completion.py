@@ -177,6 +177,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     direction_proposals = [f for f in findings if f.get("type") == "direction_proposal"]
     direction_notes = [f for f in findings if f.get("type") == "direction_note"]
     findings = [f for f in findings if f.get("type") not in ("direction_proposal", "direction_note")]
+    # Raw actionable findings count this cycle's agent produced, before batch cap or any dedup.
+    findings_produced_count = len(findings)
 
     # Recover findings that were deferred in the previous cycle due to pipeline degradation.
     # These were already researched but couldn't be spawned; prepend them so they go through
@@ -231,9 +233,37 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _healthy_accounts if _healthy_accounts >= 0 else "n/a",
         _queued_count,
     )
-    # Cap findings to prevent runaway task creation and backlog build-up
+    # Select the top _effective_cap findings by priority so high-priority
+    # findings survive capacity-limited cycles regardless of the agent's
+    # output ordering. We preserve agent order among survivors and remap
+    # each surviving finding's depends_on_indices to the compacted positions
+    # so _validate_plan_dependencies doesn't see spurious self-cycles and
+    # UUID resolution wires deps to the correct child tasks.
+    _BATCH_PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+    # Cap findings to prevent runaway task creation and backlog build-up.
+    # Excess findings are deferred to the next cycle (via task.context['deferred_findings'])
+    # rather than discarded, so capacity-constrained cycles don't permanently lose work.
+    batch_cap_applied_count = max(0, len(findings) - _effective_cap)
+    _batch_cap_deferred: list[dict] = []
     if len(findings) > _effective_cap:
-        findings = findings[:_effective_cap]
+        _ranked = sorted(
+            enumerate(findings),
+            key=lambda pair: _BATCH_PRIORITY_ORDER.get(pair[1].get("priority", "medium"), 1),
+        )
+        _kept_orig_indices = sorted(i for i, _ in _ranked[:_effective_cap])
+        _kept_set = set(_kept_orig_indices)
+        _batch_cap_deferred = [f for i, f in enumerate(findings) if i not in _kept_set]
+        _old_to_new = {old: new for new, old in enumerate(_kept_orig_indices)}
+        findings = [findings[i] for i in _kept_orig_indices]
+        for _f in findings:
+            _deps = _f.get("depends_on_indices")
+            if _deps:
+                _f["depends_on_indices"] = [_old_to_new[d] for d in _deps if d in _old_to_new]
+        logger.info(
+            "[RESEARCH] Batch cap (%d) exceeded — deferring %d lower-priority finding(s) to next cycle",
+            _effective_cap, len(_batch_cap_deferred),
+        )
 
     original_base = (task.first_payload).get("base_branch", "main")
     short_id = str(task.id).replace("-", "")[:8]
@@ -717,16 +747,23 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         finding_indices.append(orig_i)
         _impl_spawned += 1
 
-    if _deferred_findings:
+    _all_deferred = _deferred_findings + _batch_cap_deferred
+    if _all_deferred:
         ctx = dict(task.context or {})
-        ctx["deferred_findings"] = _deferred_findings
+        ctx["deferred_findings"] = _all_deferred
         task.context = ctx
         flag_modified(task, "context")
         session.add(task)
+        if _deferred_findings and _batch_cap_deferred:
+            _reason = f"degradation gate ({_health_reason}) + batch cap"
+        elif _deferred_findings:
+            _reason = f"degradation gate ({_health_reason})"
+        else:
+            _reason = "batch cap"
         logger.warning(
-            f"[RESEARCH] Pipeline degraded ({_health_reason}) — deferred {len(_deferred_findings)} "
-            f"of {len(deduplicated)} findings; spawning {_impl_spawned} tasks. "
-            f"Deferred findings stored in task.context['deferred_findings'] for next cycle."
+            f"[RESEARCH] Deferred {len(_all_deferred)} findings ({_reason}); "
+            f"spawning {_impl_spawned} tasks. "
+            f"Stored in task.context['deferred_findings'] for next cycle."
         )
 
     await session.commit()
@@ -778,6 +815,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         file_overlap_count=file_overlap_count,
         type_filtered_count=type_filtered_count,
         empty_prompt_count=empty_prompt_count,
+        findings_produced_count=findings_produced_count,
+        batch_cap_applied_count=batch_cap_applied_count,
         research_branch=research_branch,
         original_base=original_base,
         research_depth=research_depth,

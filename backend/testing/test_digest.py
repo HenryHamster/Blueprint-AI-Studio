@@ -1772,3 +1772,158 @@ async def test_digest_prev_scope_conversion_rates(client: AsyncClient, db_sessio
     assert prev_rates is not None
     assert prev_rates["medium"]["created"] == 4
     assert prev_rates["medium"]["merged"] == 1
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_filter_funnel(client: AsyncClient, db_session):
+    """filter_funnel aggregates findings_produced, filter_breakdown, and batch_cap from research_history."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-1",
+                "text": "Direction 1",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "tasks_created": 3,
+                        "findings_produced": 10,
+                        "batch_cap_applied": 2,
+                        "filter_breakdown": {
+                            "hash_dedup": 1,
+                            "word_overlap_dedup": 2,
+                            "file_overlap_dedup": 1,
+                            "type_filtered": 0,
+                            "empty_prompt": 1,
+                        },
+                    },
+                    {
+                        "timestamp": recent_ts,
+                        "tasks_created": 2,
+                        "findings_produced": 4,
+                        "batch_cap_applied": 0,
+                        "filter_breakdown": {
+                            "hash_dedup": 1,
+                            "word_overlap_dedup": 0,
+                            "file_overlap_dedup": 0,
+                            "type_filtered": 1,
+                            "empty_prompt": 0,
+                        },
+                    },
+                    {
+                        # Outside window — must not contribute
+                        "timestamp": old_ts,
+                        "tasks_created": 99,
+                        "findings_produced": 99,
+                        "batch_cap_applied": 99,
+                        "filter_breakdown": {
+                            "hash_dedup": 99,
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    ff = data["direction_progress"][0]["filter_funnel"]
+    assert ff is not None
+    assert ff["findings_produced"] == 14
+    assert ff["hash_dedup"] == 2
+    assert ff["word_overlap"] == 2
+    assert ff["file_overlap"] == 1
+    assert ff["type_filtered"] == 1
+    assert ff["empty_prompt"] == 1
+    assert ff["batch_cap"] == 2
+    assert ff["tasks_created"] == 5
+
+    # Pipeline-level aggregate mirrors per-direction totals when only one direction has activity
+    pff = data["pipeline_filter_funnel"]
+    assert pff is not None
+    assert pff["findings_produced"] == 14
+    assert pff["hash_dedup"] == 2
+    assert pff["batch_cap"] == 2
+    assert pff["tasks_created"] == 5
+
+
+@pytest.mark.asyncio
+async def test_digest_pipeline_filter_funnel_sums_across_directions(client: AsyncClient, db_session):
+    """pipeline_filter_funnel sums filter_funnel counters across all directions."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-a",
+                "text": "Direction A",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "tasks_created": 2,
+                        "findings_produced": 5,
+                        "batch_cap_applied": 1,
+                        "filter_breakdown": {"hash_dedup": 1, "word_overlap_dedup": 1},
+                    },
+                ],
+            },
+            {
+                "id": "dir-b",
+                "text": "Direction B",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "tasks_created": 3,
+                        "findings_produced": 7,
+                        "batch_cap_applied": 2,
+                        "filter_breakdown": {"hash_dedup": 2, "type_filtered": 1},
+                    },
+                ],
+            },
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for did in ("dir-a", "dir-b"):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Research {did}",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": did},
+        ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    pff = data["pipeline_filter_funnel"]
+    assert pff is not None
+    assert pff["findings_produced"] == 12
+    assert pff["hash_dedup"] == 3
+    assert pff["word_overlap"] == 1
+    assert pff["type_filtered"] == 1
+    assert pff["batch_cap"] == 3
+    assert pff["tasks_created"] == 5
