@@ -200,6 +200,21 @@ describe('aggregateDirectionStats', () => {
   it('returns empty string when totalCycles is 0 from aggregate', () => {
     expect(aggregateDirectionStats([], { total_cycles: 0 })).toBe('');
   });
+
+  it('includes per-type success rates when scope_breakdown spans multiple types', () => {
+    const history = [
+      { tasks_created: 3, prs_merged: 2, scope_breakdown: { small: { created: 3, merged: 2 } } },
+      { tasks_created: 2, prs_merged: 0, scope_breakdown: { medium: { created: 2, merged: 0 } } },
+    ];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).toContain('by type: small 67% (2/3), medium 0% (0/2)');
+  });
+
+  it('omits per-type breakdown when only one type present', () => {
+    const history = [{ tasks_created: 3, prs_merged: 2, scope_breakdown: { small: { created: 3, merged: 2 } } }];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).not.toContain('by type:');
+  });
 });
 
 describe('mapSubtaskToSpawnPayload', () => {
@@ -410,6 +425,26 @@ describe('buildScopeCalibrationSignal', () => {
     const result = buildScopeCalibrationSignal(history);
     expect(result).toContain('CODE_ERROR');
     expect(result).not.toContain('Scope success');
+  });
+
+  it('surfaces prior-cycle CODE_ERRORs with titles and reasons when history has earlier failures', () => {
+    const history = [
+      { failed_task_details: [{ title: 'feat: refactor module A boundary cleanup', reason: 'review iterations exhausted', category: 'claude_code_failed' }] },
+      { failed_task_details: [{ title: 'fix: recent', reason: 'build failed', category: 'build_failed' }] },
+    ];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).toContain('Prior CODE_ERRORs to avoid repeating');
+    expect(result).toContain('refactor module A boundary cleanup');
+    expect(result).toContain('review iterations exhausted');
+    expect(result).toContain('1 cycle ago');
+  });
+
+  it('does not emit prior-failures line when only one cycle exists', () => {
+    const history = [
+      { failed_task_details: [{ title: 'fix: only', reason: 'build failed', category: 'build_failed' }] },
+    ];
+    const result = buildScopeCalibrationSignal(history);
+    expect(result).not.toContain('Prior CODE_ERRORs');
   });
 });
 

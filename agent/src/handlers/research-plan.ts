@@ -65,6 +65,36 @@ export function aggregateDirectionStats(
     parts.push(`conversion: ${pct}% (${recentMerged}/${recentTasksCreated} findings merged last ${cycleLabel})`);
   }
 
+  // Per-scope (finding-type) success rates across last 3 cycles — surfaces
+  // whether certain scopes/types land more reliably than others.
+  const typeAgg: Record<string, {created: number; merged: number}> = {};
+  for (const h of recent) {
+    const sb = h.scope_breakdown as Record<string, {created?: number; merged?: number}> | undefined;
+    if (!sb || typeof sb !== 'object') continue;
+    for (const [k, v] of Object.entries(sb)) {
+      if (!v || typeof v !== 'object') continue;
+      if (!typeAgg[k]) typeAgg[k] = { created: 0, merged: 0 };
+      typeAgg[k].created += (v.created as number) || 0;
+      typeAgg[k].merged += (v.merged as number) || 0;
+    }
+  }
+  const typeKeys = Object.keys(typeAgg).filter(k => typeAgg[k].created > 0);
+  if (typeKeys.length > 1) {
+    const order = ['small', 'medium', 'large'];
+    typeKeys.sort((a, b) => {
+      const ai = order.indexOf(a); const bi = order.indexOf(b);
+      if (ai !== -1 && bi !== -1) return ai - bi;
+      if (ai !== -1) return -1;
+      if (bi !== -1) return 1;
+      return a.localeCompare(b);
+    });
+    const segs = typeKeys.map(k => {
+      const { merged, created } = typeAgg[k];
+      return `${k} ${Math.round((merged / created) * 100)}% (${merged}/${created})`;
+    });
+    parts.push(`by type: ${segs.join(', ')}`);
+  }
+
   return `Stats: ${parts.join(', ')}`;
 }
 
@@ -130,6 +160,33 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
 
   const line1 = parts.length > 0 ? `\n  Last cycle failures: ${parts.join('; ')}` : '';
 
+  // Prior-cycles failure recap: surface 2-3 code-error titles from cycles before
+  // the last one so agents can avoid re-proposing the same failed findings.
+  let priorFailuresLine = '';
+  if (history.length >= 2) {
+    const priorEntries = history.slice(-3, -1);
+    const priorItems: Array<{title: string; reason: string; cls: string; cycle: number}> = [];
+    priorEntries.forEach((h, idx) => {
+      const details = Array.isArray(h.failed_task_details)
+        ? h.failed_task_details as Array<{title: string; reason: string; category: string}>
+        : [];
+      for (const fd of details) {
+        const cls = classifyFailureCategory(fd.category);
+        if (cls === 'CODE_ERROR') {
+          priorItems.push({ title: fd.title || '?', reason: fd.reason || '', cls, cycle: priorEntries.length - idx });
+        }
+      }
+    });
+    if (priorItems.length > 0) {
+      const snippets = priorItems.slice(0, 3).map(it => {
+        const t = it.title.slice(0, 60);
+        const r = it.reason ? `: ${it.reason.slice(0, 50)}` : '';
+        return `"${t}"${r} (${it.cycle} cycle${it.cycle === 1 ? '' : 's'} ago)`;
+      });
+      priorFailuresLine = `\n  Prior CODE_ERRORs to avoid repeating: ${snippets.join('; ')}`;
+    }
+  }
+
   // Scope trend: CODE_ERRORs recurring in prior cycles too → strongly urge smaller scope
   let line2 = '';
   if (codeErrors.length > 0 && history.length >= 2) {
@@ -176,8 +233,8 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
     ? `\n  Scope success (last ${cycleLabel}): ${scopeParts.join(', ')}`
     : '';
 
-  if (!line1 && !line2 && !line3) return '';
-  return line1 + line2 + line3;
+  if (!line1 && !line2 && !line3 && !priorFailuresLine) return '';
+  return line1 + line2 + line3 + priorFailuresLine;
 }
 
 export function formatCochangeHints(directionCtx: Record<string, unknown> | undefined): string {
@@ -549,7 +606,16 @@ ${hotspotsSection}
           const sections = parseResearchContext(d.research_context as string);
           const ctxParts: string[] = [];
           if (sections.established.length > 0) {
-            ctxParts.push(`  ${sections.established.length} findings already completed for this direction (do not re-propose similar scope work).`);
+            const merged = sections.established.filter(s => /\(merged\)/i.test(s));
+            const failed = sections.established.filter(s => /\(failed[:)]/i.test(s));
+            const breakdown: string[] = [];
+            if (merged.length > 0) breakdown.push(`${merged.length} merged`);
+            if (failed.length > 0) breakdown.push(`${failed.length} failed`);
+            const breakdownStr = breakdown.length > 0 ? ` (${breakdown.join(', ')})` : '';
+            ctxParts.push(`  ${sections.established.length} findings already completed for this direction${breakdownStr} (do not re-propose similar scope work; prefer approaches that shipped over ones that failed).`);
+            if (failed.length > 0) {
+              ctxParts.push(`  Failed findings (do not repeat):\n${failed.slice(0, 5).join('\n')}`);
+            }
           }
           if (sections.failed.length > 0) {
             ctxParts.push(`  Failed approaches (avoid these):\n${sections.failed.join('\n')}`);

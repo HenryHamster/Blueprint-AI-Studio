@@ -279,6 +279,7 @@ async def apply_post_spawn_state(
                         finding_scopes=finding_scopes_by_dir.get(did, [])[:5],
                         cycle_insights=[i["summary"][:200] for i in insights[:3]],
                         history_entry=entry,
+                        prior_history=d.get("research_history", [])[:-1],
                     )
 
                     # Auto-complete direction if saturated with sufficient merged PRs

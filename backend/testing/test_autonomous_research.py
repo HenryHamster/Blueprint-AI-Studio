@@ -2889,6 +2889,13 @@ async def test_type_distribution_and_product_ratio(db_session):
     product_ratio = entry.get("product_ratio")
     assert product_ratio == 0.5, f"Expected product_ratio=0.5, got {product_ratio}"
 
+    # type_breakdown: per-type created/merged/failed counts so research agents
+    # can see which finding types ship vs fail.
+    type_breakdown = entry.get("type_breakdown", {})
+    assert type_breakdown.get("create") == {"created": 2, "merged": 1, "failed": 0}
+    assert type_breakdown.get("fix") == {"created": 1, "merged": 1, "failed": 0}
+    assert type_breakdown.get("refactor") == {"created": 1, "merged": 0, "failed": 1}
+
 
 @pytest.mark.asyncio
 async def test_stage_dropout_breakdown(db_session):

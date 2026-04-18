@@ -255,16 +255,26 @@ async def _update_direction_research_outcomes(
             # Classify child tasks as product vs structural
             PRODUCT_TYPES = {"create", "feature", "improvement"}
             type_counts: dict = {}
+            type_breakdown: dict = {}
             product_count = 0
             structural_count = 0
             for ct in child_tasks_rows:
                 task_type = (ct.first_payload or {}).get("type", "unknown")
                 type_counts[task_type] = type_counts.get(task_type, 0) + 1
+                if task_type not in type_breakdown:
+                    type_breakdown[task_type] = {"created": 0, "merged": 0, "failed": 0}
+                type_breakdown[task_type]["created"] += 1
+                ctx_t = ct.context or {}
+                if ct.status == TaskStatus.COMPLETED and ctx_t.get("pr_merged"):
+                    type_breakdown[task_type]["merged"] += 1
+                if ct.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+                    type_breakdown[task_type]["failed"] += 1
                 if task_type in PRODUCT_TYPES:
                     product_count += 1
                 else:
                     structural_count += 1
             entry["type_distribution"] = type_counts
+            entry["type_breakdown"] = type_breakdown
             total_typed = product_count + structural_count
             entry["product_ratio"] = round(product_count / total_typed, 2) if total_typed > 0 else 0.0
             entry["structural_count"] = structural_count

@@ -104,6 +104,48 @@ def _format_eviction_body(established: int, failed: int, open_questions: int, fa
     return "\n".join(lines)
 
 
+def _apply_prior_outcomes(established: list, prior_history: list) -> list:
+    """Retag '(proposed)' entries as '(merged)' or '(failed: CATEGORY)' from prior outcomes.
+
+    Matches the title prefix of each established entry against prior cycles'
+    finding_titles and failed_task_details so agents can see which findings
+    actually shipped vs failed.
+    """
+    if not prior_history:
+        return established
+    outcomes: dict = {}
+    for entry in prior_history:
+        failed = entry.get("failed_task_details") or []
+        failed_map = {(f.get("title") or "").strip(): (f.get("category") or "") for f in failed if f.get("title")}
+        prs_merged = entry.get("prs_merged", 0) or 0
+        tasks_created = entry.get("tasks_created", 0) or 0
+        settled = tasks_created > 0 and (prs_merged + len(failed)) >= tasks_created
+        for t in entry.get("finding_titles") or []:
+            tn = (t or "").strip()
+            if not tn or tn in outcomes:
+                continue
+            if tn in failed_map:
+                cat = failed_map[tn] or "unknown"
+                outcomes[tn] = f"failed: {cat}"
+            elif settled and prs_merged > 0:
+                outcomes[tn] = "merged"
+    if not outcomes:
+        return established
+    updated = []
+    for entry_text in established:
+        if "(proposed)" not in entry_text:
+            updated.append(entry_text)
+            continue
+        head = entry_text.split(" (proposed)", 1)[0]
+        title_key = head.split(" [", 1)[0].strip()
+        new_tag = outcomes.get(title_key)
+        if new_tag:
+            updated.append(entry_text.replace("(proposed)", f"({new_tag})", 1))
+        else:
+            updated.append(entry_text)
+    return updated
+
+
 def _build_research_context(
     prior_context: Optional[str],
     finding_titles: list,
@@ -111,9 +153,12 @@ def _build_research_context(
     cycle_insights: list,
     history_entry: dict,
     finding_scopes: Optional[list] = None,
+    prior_history: Optional[list] = None,
 ) -> str:
     """Build a compounding research_context document deterministically (no LLM)."""
     parsed = _parse_research_context(prior_context or "")
+    if prior_history:
+        parsed["established"] = _apply_prior_outcomes(parsed["established"], prior_history)
 
     # Parse prior eviction summary for accumulation
     prior_eviction = _parse_eviction_counts(parsed["eviction_summary"])

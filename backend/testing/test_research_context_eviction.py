@@ -300,3 +300,71 @@ class TestEvictionSummaryAccumulation:
 
         # Old evicted title should still be present
         assert "Old evicted approach title here" in eviction_text
+
+
+# ── _build_research_context: prior outcome tagging ──────────────────────────
+
+class TestPriorOutcomeTagging:
+    def _prior_with_proposed(self, titles):
+        parts = ["## Established Findings"]
+        for t in titles:
+            parts.append(f"- {t} [small] (proposed). Short desc")
+        parts.append("")
+        parts.append("## Failed Approaches")
+        parts.append("")
+        parts.append("## Open Questions")
+        parts.append("")
+        return "\n".join(parts).strip() + "\n"
+
+    def test_failed_titles_retagged_with_category(self):
+        prior = self._prior_with_proposed(["Refactor X", "Add feature Y"])
+        history = [{
+            "finding_titles": ["Refactor X", "Add feature Y"],
+            "tasks_created": 2,
+            "prs_merged": 0,
+            "failed_task_details": [
+                {"title": "Refactor X", "category": "CODE_ERROR"},
+            ],
+        }]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        assert "Refactor X" in result and "(failed: CODE_ERROR)" in result
+        # Unmatched finding stays (proposed) since not all settled AND none merged
+        assert "Add feature Y [small] (proposed)" in result
+
+    def test_merged_titles_retagged_when_settled(self):
+        prior = self._prior_with_proposed(["Clean up Z"])
+        history = [{
+            "finding_titles": ["Clean up Z"],
+            "tasks_created": 1,
+            "prs_merged": 1,
+            "failed_task_details": [],
+        }]
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=history,
+        )
+        assert "Clean up Z [small] (merged)" in result
+        assert "(proposed)" not in result
+
+    def test_no_history_is_noop(self):
+        prior = self._prior_with_proposed(["Thing A"])
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=[],
+            key_finding_descriptions=[],
+            cycle_insights=[],
+            history_entry={},
+            prior_history=None,
+        )
+        assert "Thing A [small] (proposed)" in result
