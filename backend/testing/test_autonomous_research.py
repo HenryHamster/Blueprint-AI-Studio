@@ -4120,7 +4120,7 @@ async def test_respawn_after_cooldown_injects_failure_class_prompt_suffix(db_ses
 
 def test_evicted_failed_preserves_category_with_long_title():
     """Eviction summary retains failure category even when title is long."""
-    from app.research_completion import _format_evicted_failed
+    from app.research_context import _format_evicted_failed
 
     entry = (
         "fix: implement comprehensive retry logic with backoff and circuit breaker "
@@ -4146,7 +4146,7 @@ def test_fold_evicted_preserves_scope_and_decomposition():
     Without this, directions older than 10 cycles silently lose data that
     _calibrate_scope and predict_spawn_success depend on.
     """
-    from app.research_completion import _fold_evicted_into_aggregate
+    from app.direction_metrics import _fold_evicted_into_aggregate
 
     evicted = [
         {
@@ -4197,7 +4197,7 @@ def test_fold_evicted_preserves_scope_and_decomposition():
 
 def test_fold_evicted_accumulates_into_existing_aggregate():
     """Subsequent rolloffs accumulate on top of prior aggregate without losing data."""
-    from app.research_completion import _fold_evicted_into_aggregate
+    from app.direction_metrics import _fold_evicted_into_aggregate
 
     prior = {
         "total_cycles": 3,
@@ -4329,7 +4329,7 @@ def test_assess_spawn_health_empty_ring_buffer_cold_start(mocker, monkeypatch):
 
 def test_fold_evicted_handles_legacy_entries_without_scope_or_decomp():
     """Old history entries predating scope_breakdown/decomposition_quality still roll off cleanly."""
-    from app.research_completion import _fold_evicted_into_aggregate
+    from app.direction_metrics import _fold_evicted_into_aggregate
 
     evicted = [
         {"timestamp": "2025-01-01T00:00:00", "tasks_created": 1, "prs_merged": 0},

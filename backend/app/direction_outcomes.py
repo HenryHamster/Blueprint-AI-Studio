@@ -117,7 +117,7 @@ async def _update_direction_research_outcomes(
     Called whenever a child task of a research cycle reaches a terminal status so
     that research_history entries accumulate live outcome statistics.
     """
-    from app.research_completion import _parse_research_context  # noqa: PLC0415
+    from app.research_context import _parse_research_context  # noqa: PLC0415
 
     project = await session.get(Project, project_id)
     if not project:

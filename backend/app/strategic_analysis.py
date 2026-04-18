@@ -12,7 +12,7 @@ def _build_outcome_evaluation(project) -> dict:
     Compares what the vision predicted against what directions actually produced.
     All data lives on project.directions and project.vision — no DB queries needed.
     """
-    from app.research_completion import _parse_research_context  # noqa: PLC0415
+    from app.research_context import _parse_research_context  # noqa: PLC0415
     vision = project.vision or {}
     directions = project.directions or []
     now_iso = _utcnow().isoformat()

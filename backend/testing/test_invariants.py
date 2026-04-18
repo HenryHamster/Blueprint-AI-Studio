@@ -334,7 +334,7 @@ class TestDirectionLifecycleInvariants:
 
     def test_momentum_factor_contract(self):
         """_compute_momentum_factor must return canonical values for known inputs."""
-        from app.research_completion import _compute_momentum_factor
+        from app.direction_metrics import _compute_momentum_factor
         # Hot streak: last 2 cycles productive → 2.0
         hot = {"research_history": [{"tasks_created": 3}, {"tasks_created": 2}]}
         assert _compute_momentum_factor(hot) == 2.0, (

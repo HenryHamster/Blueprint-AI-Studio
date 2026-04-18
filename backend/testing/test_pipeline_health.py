@@ -11,7 +11,8 @@ import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.routers.admin_analytics import compute_pipeline_health_summary, _compute_scope_baselines, _compute_medium_scope_measurement, _compute_first_attempt_measurement
+from app.routers.admin_analytics import compute_pipeline_health_summary
+from app.routers.admin_scope_measurement import _compute_scope_baselines, _compute_medium_scope_measurement, _compute_first_attempt_measurement
 from app.models import Task, TaskStatus, Project
 from testing.factories import make_task, make_project, _utcnow
 

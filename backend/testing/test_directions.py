@@ -18,7 +18,8 @@ from sqlalchemy import select
 
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
-from app.research_completion import _handle_research_completion, _compute_momentum_factor, _compute_productivity_score, _calibrate_scope, predict_spawn_success, _poor_decomp_history
+from app.research_completion import _handle_research_completion, _calibrate_scope, predict_spawn_success, _poor_decomp_history
+from app.direction_metrics import _compute_momentum_factor, _compute_productivity_score
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
