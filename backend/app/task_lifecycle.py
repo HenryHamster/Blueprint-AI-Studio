@@ -1631,6 +1631,22 @@ async def _process_post_commit(
                     # any non-standard verdict (e.g., legacy COMMENT) has already been
                     # rewritten to REQUEST_CHANGES and lands here.
 
+                    # Unparseable verdict short-circuit: the fix agent would receive no
+                    # structured issues and a placeholder feedback string, consuming a VM
+                    # cycle without useful guidance. The original task is already flagged
+                    # requires_approval above, so human intervention is expected.
+                    if verdict_unparseable:
+                        logger.warning(
+                            f"[REVIEW PIPELINE] PR #{pr_number}: verdict unparseable — skipping fix spawn, original task flagged requires_approval"
+                        )
+                        task.status = TaskStatus.COMPLETED
+                        task.latest_status_message = (
+                            f"Review verdict unparseable for PR #{pr_number} — fix skipped, manual review required"
+                        )
+                        session.add(task)
+                        await session.commit()
+                        return {"status": "accepted"}
+
                     # Empty-PR short-circuit: if the PR has no file changes (because a
                     # prior fix cycle rebased the branch flat so all its commits are in
                     # the base), spawning another fix is futile — there's nothing to

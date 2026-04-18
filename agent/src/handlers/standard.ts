@@ -706,6 +706,25 @@ Output ONLY a JSON object in a \`\`\`json code fence:
 
       if (selfReviewFailed) {
         selfReviewOutcome = { issues_found: false, categories: ['self_review_failed'], fixes_applied: false, passes, total_fixes: totalFixes, ...(feedbackCategoriesInjected !== undefined ? { feedback_categories_injected: feedbackCategoriesInjected } : {}) };
+        // Fallback safety net: when self-review crashes, still run lint/build
+        // checks on changed files so we don't push unvalidated code.
+        try {
+          runProjectLintChecks(changedPaths, ws, buildConfig);
+        } catch (lintErr: unknown) {
+          const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
+          if (failOnTestFailure) {
+            sendLog(ws, `\nFallback lint check after self-review failure failed — marking task as FAILED.\n${msg.slice(0, 2000)}\n`);
+            await persistAndPostStatus(taskId, {
+              task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+              logs: `Self-review crashed and fallback lint/build checks also failed. See logs above for details.`,
+              failure_category: 'lint_failed_after_self_review',
+              changed_files: changedPaths.slice(0, 50),
+              ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+            });
+            return;
+          }
+          sendLog(ws, `\nWARNING: Fallback lint check after self-review failure failed — proceeding anyway:\n${msg.slice(0, 2000)}\n`);
+        }
       } else {
         const fixesApplied = totalFixes > 0;
 
