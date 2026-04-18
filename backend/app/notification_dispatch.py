@@ -516,6 +516,43 @@ async def post_auto_fix_escalation_message(
     return msg
 
 
+async def post_remediation_escalation_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_text: str,
+    failure_pattern: str,
+    attempts: int,
+    remediation_summary: str,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a BLOCKER-severity message when remediation has repeatedly failed for a direction.
+
+    Fired after attempts >= 3 with the same error fingerprint still recurring. Callers should
+    also set needs_manual_intervention on the direction so the diagnostics API surfaces it.
+    """
+    summary = (
+        f"Remediation escalation: direction '{direction_text[:80]}' still failing after "
+        f"{attempts} remediation attempts. Manual intervention required."
+    )
+    ctx: dict[str, Any] = {
+        "event_type": "remediation_escalated",
+        "direction_text": direction_text[:120],
+        "failure_pattern": failure_pattern[:200],
+        "attempts": attempts,
+        "remediation_summary": remediation_summary[:240],
+    }
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType.BLOCKER,
+        from_type="system",
+        from_task_id=task_id,
+        content=summary,
+        context=ctx,
+    )
+    session.add(msg)
+    return msg
+
+
 async def post_issue_implementation_spawned_message(
     session: AsyncSession,
     project_id: uuid.UUID,

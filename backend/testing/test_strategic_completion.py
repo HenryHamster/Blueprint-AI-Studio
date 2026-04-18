@@ -21,6 +21,8 @@ from app.strategic_completion import (
     _is_direction_duplicate,
     _record_strategic_task_failure,
     _check_direction_starvation,
+    _is_code_failure_pause_reason,
+    _build_direction_failure_summary,
 )
 from app.models import Project, Task, TaskStatus
 
@@ -226,6 +228,116 @@ class TestCheckDirectionHealth:
     def test_missing_research_history_key_returns_none(self):
         result = _check_direction_health({"possibly_saturated": False})
         assert result is None
+
+
+# ── _is_code_failure_pause_reason ────────────────────────────────────────────
+
+class TestIsCodeFailurePauseReason:
+
+    def test_rule3_high_failure_rate_prefix_classified_as_code_failure(self):
+        # Use the actual message _check_direction_health produces for Rule 3
+        d = _direction(
+            research_history=_history(3, tasks_created=3, tasks_failed=3,
+                                      tasks_failed_infra=0, prs_merged=0),
+        )
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert _is_code_failure_pause_reason(reason) is True
+
+    def test_rule4_recent_stall_prefix_classified_as_code_failure(self):
+        # Rule 4 fires when 3 cycles all have >=1 code failure and 0 merges
+        d = _direction(
+            research_history=_history(3, tasks_created=2, tasks_completed=1,
+                                      tasks_failed=1, tasks_failed_infra=0,
+                                      prs_merged=0),
+        )
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert _is_code_failure_pause_reason(reason) is True
+
+    def test_rule1_saturation_not_classified_as_code_failure(self):
+        d = _direction(
+            possibly_saturated=True,
+            research_history=_history(5, tasks_created=1),
+        )
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert _is_code_failure_pause_reason(reason) is False
+
+    def test_rule2_unproductive_not_classified_as_code_failure(self):
+        d = _direction(
+            research_history=_history(5, prs_merged=0, tasks_created=2,
+                                      tasks_completed=2, tasks_failed=0),
+        )
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert _is_code_failure_pause_reason(reason) is False
+
+    def test_none_reason_returns_false(self):
+        assert _is_code_failure_pause_reason(None) is False
+
+    def test_empty_string_returns_false(self):
+        assert _is_code_failure_pause_reason("") is False
+
+
+# ── _build_direction_failure_summary ─────────────────────────────────────────
+
+class TestBuildDirectionFailureSummary:
+
+    def test_summarizes_last_3_cycles(self):
+        # 5 cycles; only last 3 should be aggregated
+        history = (
+            _history(2, tasks_created=9, tasks_failed=9, prs_merged=0)
+            + _history(3, tasks_created=2, tasks_completed=1, tasks_failed=1,
+                       tasks_failed_infra=0, prs_merged=0)
+        )
+        d = _direction(research_history=history)
+        summary = _build_direction_failure_summary(d)
+        assert summary["cycles_analyzed"] == 3
+        assert summary["tasks_created"] == 6
+        assert summary["tasks_failed_total"] == 3
+        assert summary["tasks_failed_code"] == 3
+        assert summary["tasks_failed_infra"] == 0
+        assert summary["prs_merged"] == 0
+
+    def test_excludes_infra_failures_from_code_failed(self):
+        d = _direction(
+            research_history=_history(3, tasks_created=10, tasks_failed=6,
+                                      tasks_failed_infra=4, prs_merged=0),
+        )
+        summary = _build_direction_failure_summary(d)
+        assert summary["tasks_failed_total"] == 18
+        assert summary["tasks_failed_infra"] == 12
+        assert summary["tasks_failed_code"] == 6
+
+    def test_computes_code_failure_rate(self):
+        d = _direction(
+            research_history=_history(3, tasks_created=4, tasks_failed=3,
+                                      tasks_failed_infra=0, prs_merged=0),
+        )
+        summary = _build_direction_failure_summary(d)
+        # 9 code failed / 12 created = 0.75
+        assert summary["code_failure_rate"] == 0.75
+
+    def test_zero_tasks_created_returns_zero_rate_not_division_error(self):
+        d = _direction(
+            research_history=_history(3, tasks_created=0, tasks_failed=0),
+        )
+        summary = _build_direction_failure_summary(d)
+        assert summary["code_failure_rate"] == 0.0
+        assert summary["cycles_analyzed"] == 3
+
+    def test_empty_history_returns_zero_counts(self):
+        summary = _build_direction_failure_summary(_direction(research_history=[]))
+        assert summary["cycles_analyzed"] == 0
+        assert summary["tasks_created"] == 0
+        assert summary["tasks_failed_code"] == 0
+        assert summary["code_failure_rate"] == 0.0
+
+    def test_missing_research_history_key_handled(self):
+        summary = _build_direction_failure_summary({})
+        assert summary["cycles_analyzed"] == 0
+        assert summary["tasks_created"] == 0
 
 
 # ── _check_direction_completion ──────────────────────────────────────────────

@@ -23,6 +23,9 @@ from sqlmodel import select
 
 from app.github import create_branch, create_pr_comment, get_branch_sha, get_open_pull_requests
 from app.models import (
+    DIAGNOSIS_IN_PROGRESS_KEY,
+    DIAGNOSIS_STARTED_AT_KEY,
+    DIAGNOSIS_TASK_ID_KEY,
     MessageType,
     Project,
     ProjectMessage,
@@ -30,10 +33,12 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
+from app.research_context import _build_research_context
 from app.routers.agent import get_github_token_for_task
 from app.shared_state import runtime_config as _runtime_config
 from app.payload_schemas import validate_internal_payload
 from app.broadcast import broadcast_to_project
+from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,63 @@ logger = logging.getLogger(__name__)
 def _compute_first_attempt_succeeded(attempt_count: int, status: "TaskStatus") -> bool:
     """Return True if the task completed successfully on its first attempt (attempt_count <= 1)."""
     return attempt_count <= 1 and status == TaskStatus.COMPLETED
+
+
+async def _record_remediation_outcome(
+    task: Task, *, merged: bool, session: AsyncSession,
+) -> bool:
+    """Record remediation outcome on the direction the remediation targeted.
+
+    A remediation task is spawned by the autonomous diagnosis pipeline with
+    `diagnosis_task_id` in its context. When such a task reaches a terminal
+    outcome (merged or failed), stamp the linked direction so effectiveness
+    monitoring and escalation logic (direction_lifecycle.py, anomaly_detection.py)
+    can observe attempts, last result, timestamp, and the diagnosis fingerprint.
+
+    Returns True if direction state was updated, False otherwise.
+    """
+    ctx = task.context or {}
+    diagnosis_task_id = ctx.get("diagnosis_task_id")
+    direction_id = ctx.get("direction_id")
+    if not diagnosis_task_id or not direction_id:
+        return False
+    project = await session.get(Project, task.project_id)
+    if not project:
+        return False
+    directions = list(project.directions or [])
+    target = next((d for d in directions if d.get("id") == direction_id), None)
+    if target is None:
+        return False
+    target["remediation_attempts"] = int(target.get("remediation_attempts") or 0) + 1
+    target["last_remediation_result"] = "merged" if merged else "failed"
+    target["last_remediation_at"] = _utcnow().isoformat()
+    target["last_remediation_diagnosis_task_id"] = str(diagnosis_task_id)
+    target["last_remediation_task_id"] = str(task.id)
+    fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint")
+    if fingerprint:
+        target["last_remediation_fingerprint"] = str(fingerprint)
+    project.directions = directions
+    flag_modified(project, "directions")
+    session.add(project)
+    return True
+
+
+async def _record_remediation_if_terminal(
+    task: Task, status: "TaskStatus", session: AsyncSession,
+) -> None:
+    """Stamp remediation outcome on the linked direction when a diagnosis-spawned task terminates."""
+    if status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        return
+    ctx = task.context or {}
+    if not ctx.get("diagnosis_task_id") or not ctx.get("direction_id"):
+        return
+    try:
+        await _record_remediation_outcome(
+            task, merged=(status == TaskStatus.COMPLETED), session=session,
+        )
+    except Exception as exc:
+        logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome for task {task.id}: {exc!r}")
+
 
 # Maps priority string labels to integer values stored on Task.priority.
 TASK_PRIORITY_MAP: Dict[str, int] = {"high": 100, "medium": 50, "low": 0}
@@ -676,15 +738,314 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
                                {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)})
     logger.info(f"[PERF] Created {len(child_tasks)} fix tasks from perf analysis {task.id}")
 
-async def _handle_investigation_completion(task: Task, payload, session: AsyncSession):
-    """Store investigation report logs in plan_output and mark task completed."""
-    if payload.logs:
+# Keywords in root_cause/recommended_fix that mark a diagnosis as structural —
+# the remedy is a scope change or direction edit, not a targeted code fix.
+_STRUCTURAL_DIAGNOSIS_KEYWORDS = (
+    "too broad",
+    "too wide",
+    "overly broad",
+    "scope too",
+    "misaligned",
+    "fundamentally misaligned",
+    "direction scope",
+    "out of scope",
+    "narrow the direction",
+    "narrow the scope",
+    "split the direction",
+    "rewrite the direction",
+)
+
+
+def _is_structural_diagnosis(root_cause: str, recommended_fix: str) -> bool:
+    blob = f"{root_cause}\n{recommended_fix}".lower()
+    return any(kw in blob for kw in _STRUCTURAL_DIAGNOSIS_KEYWORDS)
+
+
+async def _handle_investigation_completion(task: Task, payload, session: AsyncSession) -> None:
+    """Process investigation report: update diagnosis state and spawn remediation.
+
+    The investigate agent writes a JSON report with keys:
+      summary, root_cause, affected_files (list of {path, issue}),
+      recommended_fix, severity, confidence.
+
+    Steps:
+      1. Parse the JSON (fall back to {"raw": logs} on error and stop).
+      2. Locate the linked direction via task.context["direction_id"] and stamp
+         diagnosis_completed_at / diagnosis_summary / diagnosed_affected_files,
+         clearing the diagnosis_in_progress flag.
+      3. Append a diagnosis insight to the direction's research_context.
+      4. If the diagnosis is structural (scope/alignment), append a direction
+         note instead of spawning a fix task.
+      5. Otherwise, when confidence is high and recommended_fix is actionable,
+         spawn a targeted `create` task carrying diagnosis_task_id /
+         diagnosed_direction_id / direction_id so _record_remediation_outcome
+         can stamp effectiveness after the task terminates.
+    """
+    logs = payload.logs or ""
+    report: Optional[Dict[str, Any]] = None
+    if logs:
         try:
-            task.plan_output = json.loads(payload.logs)
-        except (json.JSONDecodeError, Exception):
-            task.plan_output = {"raw": payload.logs}
+            parsed = json.loads(logs)
+            if isinstance(parsed, dict):
+                report = parsed
+        except (json.JSONDecodeError, ValueError):
+            report = None
+
+    if report is None:
+        task.plan_output = {"raw": logs} if logs else {}
+        task.status = TaskStatus.COMPLETED
+        session.add(task)
+        # Still clear diagnosis_in_progress so a malformed report doesn't wedge
+        # the direction out of future auto-pause diagnosis.
+        await _clear_direction_diagnosis_flag(task, session, summary=None)
+        return
+
+    task.plan_output = report
     task.status = TaskStatus.COMPLETED
+
+    summary = str(report.get("summary") or "")[:500]
+    root_cause = str(report.get("root_cause") or "")
+    recommended_fix = str(report.get("recommended_fix") or "").strip()
+    confidence = str(report.get("confidence") or "").lower()
+    severity = str(report.get("severity") or "").lower()
+    raw_affected = report.get("affected_files") or []
+    affected_paths: List[str] = []
+    for entry in raw_affected if isinstance(raw_affected, list) else []:
+        if isinstance(entry, dict):
+            p = entry.get("path")
+        else:
+            p = entry
+        if isinstance(p, str) and p.strip():
+            affected_paths.append(p.strip())
+    # De-duplicate while preserving order
+    seen: set = set()
+    affected_paths = [p for p in affected_paths if not (p in seen or seen.add(p))]
+
+    direction_id = (task.context or {}).get("direction_id")
+    project = await session.get(Project, task.project_id) if direction_id else None
+    direction: Optional[Dict[str, Any]] = None
+    directions_list: List[Dict[str, Any]] = []
+    if project is not None:
+        directions_list = list(project.directions or [])
+        direction = next((d for d in directions_list if d.get("id") == direction_id), None)
+
+    structural = _is_structural_diagnosis(root_cause, recommended_fix)
+    spawn_remediation = (
+        not structural
+        and confidence == "high"
+        and bool(recommended_fix)
+    )
+
+    spawned_child: Optional[Task] = None
+    if spawn_remediation and direction is not None:
+        spawned_child = await _spawn_investigation_remediation(
+            task=task,
+            direction_id=str(direction_id),
+            summary=summary,
+            root_cause=root_cause,
+            recommended_fix=recommended_fix,
+            severity=severity,
+            affected_paths=affected_paths,
+            session=session,
+        )
+
+    # Update direction state
+    if direction is not None and project is not None:
+        now_iso = _utcnow().isoformat()
+        direction["diagnosis_completed_at"] = now_iso
+        if summary:
+            direction["diagnosis_summary"] = summary[:STRATEGIC_RATIONALE_MAX]
+        if affected_paths:
+            direction["diagnosed_affected_files"] = affected_paths[:25]
+        direction.pop(DIAGNOSIS_IN_PROGRESS_KEY, None)
+        direction.pop(DIAGNOSIS_STARTED_AT_KEY, None)
+        direction.pop(DIAGNOSIS_TASK_ID_KEY, None)
+        if spawned_child is not None:
+            direction["remediation_task_id"] = str(spawned_child.id)
+        if structural:
+            note_text = (
+                f"Diagnosis ({now_iso[:10]}) flagged this direction as structurally "
+                f"misaligned. Root cause: {root_cause[:400]}"
+            )
+            if recommended_fix:
+                note_text += f" Recommendation: {recommended_fix[:400]}"
+            note_text = note_text[:STRATEGIC_RATIONALE_MAX]
+            notes = list(direction.get("notes") or [])
+            notes.append({
+                "text": note_text,
+                "added_at": now_iso,
+                "added_by_task": str(task.id),
+                "source": "investigation_diagnosis",
+            })
+            direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+
+        # Append diagnosis insight to research_context via canonical builder
+        diag_line = (
+            f"Last diagnosis ({now_iso[:10]}): {(root_cause or summary)[:200]}"
+        )
+        insights = [diag_line]
+        if affected_paths:
+            insights.append(
+                "Diagnosed affected files: "
+                + ", ".join(affected_paths[:5])
+            )
+        try:
+            direction["research_context"] = _build_research_context(
+                prior_context=direction.get("research_context"),
+                finding_titles=[],
+                key_finding_descriptions=[],
+                cycle_insights=insights,
+                history_entry={},
+            )
+        except Exception as ctx_exc:  # noqa: BLE001
+            logger.warning(
+                f"[INVESTIGATION] Failed to rebuild research_context for direction "
+                f"{direction_id}: {ctx_exc!r}"
+            )
+
+        project.directions = directions_list
+        flag_modified(project, "directions")
+        session.add(project)
+
     session.add(task)
+
+    if spawned_child is not None:
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(spawned_child.id), "status": TaskStatus.QUEUED},
+        )
+        await broadcast_to_project(
+            str(task.project_id),
+            "autonomous_activity",
+            {
+                "investigation_task_id": str(task.id),
+                "remediation_task_id": str(spawned_child.id),
+                "direction_id": direction_id,
+            },
+        )
+        logger.info(
+            f"[INVESTIGATION] Spawned remediation task {spawned_child.id} from "
+            f"investigation {task.id} (direction={direction_id}, "
+            f"confidence={confidence}, files={len(affected_paths)})"
+        )
+    else:
+        reason = (
+            "structural" if structural else
+            ("no_actionable_fix" if not recommended_fix else
+             ("low_confidence" if confidence != "high" else "no_direction"))
+        )
+        logger.info(
+            f"[INVESTIGATION] Task {task.id} completed without spawning remediation "
+            f"(reason={reason}, confidence={confidence}, direction={direction_id})"
+        )
+
+
+async def _clear_direction_diagnosis_flag(
+    task: Task, session: AsyncSession, summary: Optional[str],
+) -> None:
+    """Clear diagnosis_in_progress on the linked direction without full processing.
+
+    Used when the investigation report is unparseable — the direction must not
+    be left pinned as "diagnosis in progress" forever.
+    """
+    direction_id = (task.context or {}).get("direction_id")
+    if not direction_id:
+        return
+    project = await session.get(Project, task.project_id)
+    if project is None:
+        return
+    directions_list = list(project.directions or [])
+    target = next((d for d in directions_list if d.get("id") == direction_id), None)
+    if target is None:
+        return
+    target.pop(DIAGNOSIS_IN_PROGRESS_KEY, None)
+    target.pop(DIAGNOSIS_STARTED_AT_KEY, None)
+    target.pop(DIAGNOSIS_TASK_ID_KEY, None)
+    target["diagnosis_completed_at"] = _utcnow().isoformat()
+    if summary:
+        target["diagnosis_summary"] = summary[:STRATEGIC_RATIONALE_MAX]
+    project.directions = directions_list
+    flag_modified(project, "directions")
+    session.add(project)
+
+
+async def _spawn_investigation_remediation(
+    *,
+    task: Task,
+    direction_id: str,
+    summary: str,
+    root_cause: str,
+    recommended_fix: str,
+    severity: str,
+    affected_paths: List[str],
+    session: AsyncSession,
+) -> Optional[Task]:
+    """Build and persist a targeted `create` task from a high-confidence diagnosis."""
+    prompt_parts = [recommended_fix.strip()]
+    if root_cause:
+        prompt_parts.append(f"\nRoot cause (from diagnosis):\n{root_cause[:1500]}")
+    if affected_paths:
+        prompt_parts.append(
+            "\nKey files to review or modify:\n"
+            + "\n".join(f"- {p}" for p in affected_paths[:10])
+        )
+    prompt_parts.append(
+        f"\nThis task was spawned from investigation {task.id} to remediate a "
+        f"diagnosed failure pattern. Keep the change minimal and scoped to the "
+        f"root cause above."
+    )
+    full_prompt = "\n".join(prompt_parts)[:20000]
+
+    create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
+    title_hint = (summary or recommended_fix or "diagnosed fix")[:80]
+    title = f"fix (diagnosed): {title_hint}"
+    severity_tag = severity if severity in ("critical", "high", "medium", "low") else "medium"
+
+    payload_dict: Dict[str, Any] = {
+        "type": "create",
+        "prompt": full_prompt,
+        "base_branch": "main",
+    }
+    if create_suffix:
+        payload_dict["prompt_suffix"] = create_suffix
+
+    new_task = Task(
+        project_id=task.project_id,
+        title=title,
+        description=(recommended_fix or summary or "")[:500],
+        parent_task_id=task.id,
+        payloads=[validate_internal_payload(
+            payload_dict, "task_completion:investigation_fix"
+        )],
+        context={
+            "diagnosis_task_id": str(task.id),
+            "diagnosed_direction_id": direction_id,
+            "direction_id": direction_id,
+            "severity": severity_tag,
+            "related_files": affected_paths[:25],
+            "diagnosis_trigger": "investigation_completion",
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        requires_approval=False,
+        depends_on=[],
+        priority=TASK_PRIORITY_MAP.get("high" if severity_tag in ("critical", "high") else "medium", 50),
+    )
+    session.add(new_task)
+    await session.flush()
+    history = TaskHistory(
+        task_id=new_task.id,
+        action="SPAWNED",
+        details={
+            "spawned_by": "INVESTIGATION_DIAGNOSIS",
+            "parent_investigation_id": str(task.id),
+            "direction_id": direction_id,
+        },
+    )
+    session.add(history)
+    return new_task
 
 async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSession):
     """Handle Phase 1 completion: chain to Phase 2 (strategic review).
@@ -777,4 +1138,3 @@ async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSes
         session.add(phase1_msg)
     session.add(task)
     await session.commit()
-

@@ -64,6 +64,59 @@ class ProjectSummary(TypedDict):
     queued_count: int
     in_progress_count: int
     circuit_breaker_state: str
+    needs_manual_intervention_count: int
+
+
+class DirectionRemediationInfo(TypedDict):
+    direction_id: str
+    direction_text: str
+    status: str
+    auto_paused: bool
+    paused_reason: Optional[str]
+    paused_at: Optional[str]
+    auto_pause_count: int
+    remediation_attempts: int
+    last_remediation_result: Optional[str]
+    last_remediation_at: Optional[str]
+    error_fingerprint: Optional[str]
+    remediation_monitor_active: bool
+    remediation_monitor_started_at: Optional[str]
+    needs_manual_intervention: bool
+
+
+def _build_direction_remediation_state(project: Project) -> List[DirectionRemediationInfo]:
+    """Surface per-direction diagnosis/remediation state for operators.
+
+    Returns entries for directions that have notable state: active remediation
+    monitoring, any prior remediation attempt, an active auto-pause, or a
+    manual-intervention flag. Directions with no such state are omitted so the
+    operator view stays focused on what actually needs attention.
+    """
+    entries: List[DirectionRemediationInfo] = []
+    for d in (project.directions or []):
+        attempts = int(d.get("remediation_attempts", 0) or 0)
+        monitor_started = d.get("remediation_monitor_started_at")
+        needs_intervention = bool(d.get("needs_manual_intervention"))
+        auto_paused = bool(d.get("auto_paused"))
+        if not (attempts or monitor_started or needs_intervention or auto_paused):
+            continue
+        entries.append({
+            "direction_id": d.get("id", ""),
+            "direction_text": d.get("text", ""),
+            "status": d.get("status", "active"),
+            "auto_paused": auto_paused,
+            "paused_reason": d.get("paused_reason"),
+            "paused_at": d.get("paused_at"),
+            "auto_pause_count": int(d.get("auto_pause_count", 0) or 0),
+            "remediation_attempts": attempts,
+            "last_remediation_result": d.get("last_remediation_result"),
+            "last_remediation_at": d.get("last_remediation_at"),
+            "error_fingerprint": d.get("error_fingerprint"),
+            "remediation_monitor_active": bool(monitor_started),
+            "remediation_monitor_started_at": monitor_started,
+            "needs_manual_intervention": needs_intervention,
+        })
+    return entries
 
 
 def _classify_stuck_failure(task: Task) -> Optional[str]:
@@ -754,6 +807,8 @@ async def get_project_diagnostics(
     except Exception:
         zone_health = {"available": 0, "exhausted": []}
 
+    direction_remediation = _build_direction_remediation_state(project)
+
     return {
         "project_id": str(project_id),
         "stuck_tasks": stuck_tasks,
@@ -761,6 +816,10 @@ async def get_project_diagnostics(
         "queued_count": queued_count,
         "in_progress_count": in_progress_count,
         "zone_health": zone_health,
+        "direction_remediation": direction_remediation,
+        "needs_manual_intervention_count": sum(
+            1 for e in direction_remediation if e["needs_manual_intervention"]
+        ),
     }
 
 
@@ -794,18 +853,33 @@ async def get_global_diagnostics(
         pid = str(task.project_id)
         by_project.setdefault(pid, []).append(task)
 
+    # Fetch project remediation state once so the aggregate can surface
+    # needs_manual_intervention directions even for projects with no active tasks.
+    projects_result = await session.execute(select(Project))
+    remediation_by_project: Dict[str, List[DirectionRemediationInfo]] = {}
+    for proj in projects_result.scalars().all():
+        entries = _build_direction_remediation_state(proj)
+        if entries:
+            remediation_by_project[str(proj.id)] = entries
+
     all_stuck: List[StuckTaskInfo] = []
     project_summaries: List[ProjectSummary] = []
+    all_remediation: List[DirectionRemediationInfo] = []
     total_queued = 0
     total_in_progress = 0
 
-    for pid, tasks in by_project.items():
-        stuck = await _build_stuck_tasks(tasks, now, session)
+    project_ids = set(by_project.keys()) | set(remediation_by_project.keys())
+    for pid in project_ids:
+        tasks = by_project.get(pid, [])
+        stuck = await _build_stuck_tasks(tasks, now, session) if tasks else []
         queued = sum(1 for t in tasks if t.status == TaskStatus.QUEUED)
         in_prog = sum(1 for t in tasks if t.status == TaskStatus.IN_PROGRESS)
         total_queued += queued
         total_in_progress += in_prog
         all_stuck.extend(stuck)
+        remediation = remediation_by_project.get(pid, [])
+        all_remediation.extend(remediation)
+        manual_count = sum(1 for e in remediation if e["needs_manual_intervention"])
 
         cb_raw = get_circuit_breaker(pid)
         project_summaries.append({
@@ -814,6 +888,7 @@ async def get_global_diagnostics(
             "queued_count": queued,
             "in_progress_count": in_prog,
             "circuit_breaker_state": cb_raw.get("state", "CLOSED"),
+            "needs_manual_intervention_count": manual_count,
         })
 
     # All known circuit breakers (includes projects with no active tasks)
@@ -835,4 +910,8 @@ async def get_global_diagnostics(
         "projects": project_summaries,
         "circuit_breakers": all_circuit_breakers,
         "zone_health": zone_health,
+        "direction_remediation": all_remediation,
+        "needs_manual_intervention_count": sum(
+            1 for e in all_remediation if e["needs_manual_intervention"]
+        ),
     }

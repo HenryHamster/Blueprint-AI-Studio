@@ -39,6 +39,27 @@ class ArtifactType(str, Enum):
     PERF_REPORT = "PERF_REPORT"
     INVESTIGATION_REPORT = "INVESTIGATION_REPORT"
 
+
+# --- Auto-pause diagnosis workflow constants ---
+# Shared values for the direction auto-pause -> investigate task spawn flow.
+# Kept here so direction_lifecycle, anomaly_detection, task_completion, and
+# strategic_completion all agree on the same thresholds and key names.
+
+# Minimum hours between successive diagnosis investigate tasks for the same
+# direction. Prevents a flood of investigate spawns when a direction keeps
+# failing health checks on every autonomous tick.
+DIAGNOSIS_DEDUP_WINDOW_HOURS = 24
+
+# Direction dict keys for diagnosis state. The `directions` JSONB field on
+# Project stores these alongside existing pause keys.
+#   DIAGNOSIS_IN_PROGRESS_KEY: bool — true while an investigate task is open
+#   DIAGNOSIS_TASK_ID_KEY:     str  — UUID of the spawned investigate task
+#   DIAGNOSIS_STARTED_AT_KEY:  str  — ISO datetime of spawn (for dedup window)
+DIAGNOSIS_IN_PROGRESS_KEY = "diagnosis_in_progress"
+DIAGNOSIS_TASK_ID_KEY = "diagnosis_task_id"
+DIAGNOSIS_STARTED_AT_KEY = "diagnosis_started_at"
+
+
 # --- Models ---
 
 class AllowedUser(SQLModel, table=True):
@@ -83,6 +104,9 @@ class Project(SQLModel, table=True):
 
     # Autonomous improvement: user-defined high-level directions for research agents
     # Includes directions with status: 'active', 'paused', 'proposed', 'rejected', 'expired'
+    # Auto-pause diagnosis keys (set when an investigate task is spawned to
+    # diagnose repeated code failures — see DIAGNOSIS_* constants above):
+    #   diagnosis_in_progress: bool, diagnosis_task_id: str, diagnosis_started_at: ISO str
     directions: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, default=[]))
     # Strategic product vision maintained by the strategic research agent
     vision: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))

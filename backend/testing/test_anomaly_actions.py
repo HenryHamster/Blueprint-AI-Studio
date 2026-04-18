@@ -19,9 +19,11 @@ from app.anomaly_detection import (
     _check_anomaly_restoration,
     _check_fast_recovery,
     _check_max_duration_safeguard,
+    _error_fingerprint,
     _expire_stale_anomalies,
     anomaly_maintenance_sweep,
     check_anomaly_actions,
+    count_matching_fingerprints,
     _ACTIONABLE_FAILURE_CLASSES,
     _ANOMALY_ACTION_THRESHOLD,
     _FAST_RECOVERY_MIN_SAMPLE,
@@ -996,6 +998,36 @@ def test_reapply_within_reentry_window_resets_timer():
     assert _shared_state.runtime_config["max_concurrent_vms"] == 3
     # forced_restored_at is preserved for observability of the reentry event
     assert _shared_state.anomaly_adjustments["forced_restored_at"] == forced_ts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# count_matching_fingerprints — remediation effectiveness helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _FakeTask:
+    def __init__(self, msg):
+        self.latest_status_message = msg
+
+
+def test_count_matching_fingerprints_empty_inputs():
+    """Empty fingerprint or task list returns 0 without error."""
+    assert count_matching_fingerprints("", [_FakeTask("boom")]) == 0
+    assert count_matching_fingerprints("abc123", []) == 0
+    assert count_matching_fingerprints("abc123", None) == 0
+
+
+def test_count_matching_fingerprints_counts_recurrence_ignoring_task_specifics():
+    """Normalized fingerprints group identical root causes across different PRs/UUIDs."""
+    target = _error_fingerprint("process exited with code 1 on PR #100")
+    tasks = [
+        _FakeTask("process exited with code 1 on PR #200"),
+        _FakeTask("process exited with code 1 on PR #201"),
+        _FakeTask("could not resolve hostname api.github.com"),
+        _FakeTask(None),
+        _FakeTask(""),
+    ]
+    assert count_matching_fingerprints(target, tasks) == 2
 
 
 @pytest.mark.asyncio

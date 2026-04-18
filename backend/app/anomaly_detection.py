@@ -63,6 +63,27 @@ def _error_fingerprint(msg: str) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()[:12]
 
 
+def count_matching_fingerprints(target_fingerprint: str, failed_tasks) -> int:
+    """Count how many failed tasks share ``target_fingerprint``.
+
+    Remediation-effectiveness tracking: after a remediation task completes for a
+    direction, callers (direction_lifecycle) monitor subsequent failed tasks to
+    decide whether the fix held. A non-zero return means the same root-cause
+    error recurred and the remediation was ineffective.
+
+    Accepts any iterable of objects exposing ``latest_status_message``. Tasks
+    with no message are skipped (they cannot be fingerprinted meaningfully).
+    """
+    if not target_fingerprint:
+        return 0
+    count = 0
+    for task in failed_tasks or ():
+        msg = getattr(task, "latest_status_message", None) or ""
+        if msg and _error_fingerprint(msg) == target_fingerprint:
+            count += 1
+    return count
+
+
 def _is_recurring_failure_class(proj_anomalies: dict, failure_class: str) -> bool:
     """Return True if the given failure class has a persistent anomaly with occurrence_count >= 3."""
     entry = proj_anomalies.get(failure_class)

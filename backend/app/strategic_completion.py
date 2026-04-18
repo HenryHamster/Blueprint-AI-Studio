@@ -163,6 +163,53 @@ def _check_direction_health(direction: dict) -> Optional[str]:
     return None
 
 
+# Pause reasons from _check_direction_health whose prefixes indicate
+# code-level failure patterns (Rules 3 and 4) — as opposed to Rule 1
+# ("Saturated: …") and Rule 2 ("Unproductive: …"), which are direction
+# exhaustion and won't benefit from a root-cause investigation.
+_CODE_FAILURE_PAUSE_PREFIXES = ("High code failure rate:", "Recent stall:")
+
+
+def _is_code_failure_pause_reason(pause_reason: Optional[str]) -> bool:
+    """True when pause_reason was produced by Rules 3 or 4 in _check_direction_health.
+
+    Used by the direction_lifecycle auto-pause path to decide whether to spawn
+    an investigate task: code-failure pauses warrant diagnosis, but saturation
+    or zero-merge pauses indicate the direction is exhausted, not broken.
+    """
+    if not pause_reason:
+        return False
+    return pause_reason.startswith(_CODE_FAILURE_PAUSE_PREFIXES)
+
+
+def _build_direction_failure_summary(direction: dict) -> Dict[str, Any]:
+    """Aggregate recent failure metrics from a direction's research_history.
+
+    Returns counts over the last 3 cycles — the same window Rules 3 and 4
+    inspect — suitable for embedding in an investigate task's context so the
+    diagnosis agent sees the failure pattern that triggered the pause.
+    """
+    history = direction.get("research_history") or []
+    recent = history[-3:]
+    tasks_created = sum(e.get("tasks_created", 0) for e in recent)
+    tasks_failed = sum(e.get("tasks_failed", 0) for e in recent)
+    tasks_failed_infra = sum(e.get("tasks_failed_infra", 0) for e in recent)
+    tasks_completed = sum(e.get("tasks_completed", 0) for e in recent)
+    prs_merged = sum(e.get("prs_merged", 0) for e in recent)
+    code_failed = max(0, tasks_failed - tasks_failed_infra)
+    code_failure_rate = (code_failed / tasks_created) if tasks_created > 0 else 0.0
+    return {
+        "cycles_analyzed": len(recent),
+        "tasks_created": tasks_created,
+        "tasks_completed": tasks_completed,
+        "tasks_failed_total": tasks_failed,
+        "tasks_failed_code": code_failed,
+        "tasks_failed_infra": tasks_failed_infra,
+        "prs_merged": prs_merged,
+        "code_failure_rate": round(code_failure_rate, 3),
+    }
+
+
 def _check_direction_completion(direction: dict) -> Optional[str]:
     """Return a completion suggestion string if this direction appears successfully complete, else None."""
     history = direction.get("research_history") or []

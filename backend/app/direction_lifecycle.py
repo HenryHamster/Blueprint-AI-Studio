@@ -5,16 +5,139 @@ direction filtering (cooldown enforcement, auto-pause, completion detection).
 Extracted from autonomous_research.py to create headroom in that module.
 """
 import logging
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
 
-from app.models import Project
-from app.shared_state import runtime_config as _runtime_config
+from app.models import Project, Task, TaskStatus
+from app.payload_schemas import validate_internal_payload
+from app.shared_state import get_circuit_breaker, runtime_config as _runtime_config
+from app.strategic_completion import _is_code_failure_pause_reason
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+_MAX_AUTO_PAUSE_CYCLES = 3
+
+# Recent failed tasks to scan when computing the dominant error fingerprint
+_FINGERPRINT_SAMPLE_SIZE = 10
+# Min matching failures required for a fingerprint to count as "dominant" for the direction
+_FINGERPRINT_MIN_RECURRENCE = 2
+
+
+async def _compute_direction_error_fingerprint(
+    project_id: uuid.UUID, direction_id: str, session: AsyncSession,
+) -> str | None:
+    """Return the dominant error fingerprint across this direction's recent failed tasks.
+
+    Pulls the most recent ``_FINGERPRINT_SAMPLE_SIZE`` failures for ``direction_id``
+    and uses ``count_matching_fingerprints`` to find the fingerprint that recurs
+    most, returning it only if it matches at least ``_FINGERPRINT_MIN_RECURRENCE``
+    failures. The result is stored on the direction so operators see the specific
+    error pattern and the escalation path can compare it against the last
+    remediation's fingerprint.
+    """
+    from app.anomaly_detection import _error_fingerprint, count_matching_fingerprints  # noqa: PLC0415
+
+    failed_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.FAILED,
+            Task.context["direction_id"].as_string() == direction_id,
+        ).order_by(Task.created_at.desc()).limit(_FINGERPRINT_SAMPLE_SIZE)
+    )).scalars().all()
+    best_fp: str | None = None
+    best_count = 0
+    seen: set[str] = set()
+    for t in failed_tasks:
+        msg = t.latest_status_message or ""
+        if not msg:
+            continue
+        fp = _error_fingerprint(msg)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        count = count_matching_fingerprints(fp, failed_tasks)
+        if count > best_count:
+            best_fp, best_count = fp, count
+    return best_fp if best_count >= _FINGERPRINT_MIN_RECURRENCE else None
+
+
+async def _spawn_direction_diagnosis(
+    project: Project, direction: dict, pause_reason: str, session: AsyncSession,
+) -> bool:
+    """Spawn an investigate task for a code-failure auto-pause.
+
+    Guards: pause-reason type (Rule 3/4 only), auto-retire threshold, circuit
+    breaker state, per-direction 24h dedup. On spawn, marks the direction
+    with diagnosis_in_progress=True and returns True.
+    """
+    if not _is_code_failure_pause_reason(pause_reason):
+        return False
+    if direction.get("auto_pause_count", 0) >= _MAX_AUTO_PAUSE_CYCLES:
+        return False
+    if get_circuit_breaker(str(project.id)).get("state") == "OPEN":
+        return False
+    direction_id = direction.get("id")
+    if not direction_id:
+        return False
+    cutoff = _utcnow() - timedelta(hours=24)
+    existing = await session.execute(
+        select(Task.id).where(
+            Task.project_id == project.id,
+            Task.created_at >= cutoff,
+            Task.payloads[0]["type"].as_string() == "investigate",
+            Task.context["direction_id"].as_string() == str(direction_id),
+        ).limit(1)
+    )
+    if existing.first() is not None:
+        return False
+    history = direction.get("research_history") or []
+    recent_lines = "\n".join(
+        f"- created={e.get('tasks_created', 0)} failed={e.get('tasks_failed', 0)} "
+        f"infra_failed={e.get('tasks_failed_infra', 0)} merged={e.get('prs_merged', 0)}"
+        for e in history[-5:]
+    ) or "- (no research history)"
+    prompt = (
+        f"A research direction was auto-paused for repeated code failures.\n\n"
+        f"Direction: {direction.get('text', '')[:200]}\n"
+        f"Pause reason: {pause_reason}\n"
+        f"Auto-pause count: {direction.get('auto_pause_count', 0)}\n\n"
+        f"Recent cycles (tasks_created / failed / infra_failed / merged):\n{recent_lines}\n\n"
+        f"Investigate why tasks spawned for this direction keep failing. "
+        f"Identify the root cause (direction scope, code complexity, systemic "
+        f"architectural issue), affected files, and a recommended fix."
+    )
+    payload = validate_internal_payload(
+        {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+        "direction_lifecycle:auto_pause_diagnosis",
+    )
+    new_task = Task(
+        project_id=project.id,
+        title=f"Investigate direction auto-pause: {(direction.get('text') or '')[:60]}",
+        description=f"Auto-pause reason: {pause_reason}"[:500],
+        payloads=[payload],
+        context={
+            "direction_id": str(direction_id),
+            "pause_reason": pause_reason,
+            "diagnosis_trigger": "direction_auto_pause",
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        priority=70,
+    )
+    session.add(new_task)
+    direction["diagnosis_in_progress"] = True
+    direction["diagnosis_started_at"] = _utcnow().isoformat()
+    logger.info(
+        f"[DIAGNOSIS] Spawned investigate task {new_task.id} for auto-paused "
+        f"direction {direction_id} ({pause_reason[:60]})"
+    )
+    return True
 
 
 async def _process_direction_lifecycle(
@@ -53,6 +176,12 @@ async def _process_direction_lifecycle(
             d["status"] = "active"
             for k in ("auto_paused", "paused_reason", "paused_at"):
                 d.pop(k, None)
+            # Start remediation-effectiveness monitoring when recovering a direction whose
+            # remediation task merged. Subsequent failures with the same error fingerprint
+            # during this window signal the fix did not hold; escalation is triggered below
+            # when the direction is re-paused while monitoring is active.
+            if d.get("last_remediation_result") == "merged":
+                d["remediation_monitor_started_at"] = _utcnow().isoformat()
             logger.info(f"[AUTONOMOUS] Auto-recovered direction {d.get('id')} after {hours:.0f}h cooldown")
             directions_modified = True
         else:
@@ -94,6 +223,46 @@ async def _process_direction_lifecycle(
             d["paused_at"] = _utcnow().isoformat()
             d["auto_paused"] = True
             d["auto_pause_count"] = d.get("auto_pause_count", 0) + 1
+            # Stamp the dominant error fingerprint from the direction's recent failures
+            # so the diagnostics API can surface it and escalation can verify that the
+            # same root cause keeps recurring after remediation.
+            if _is_code_failure_pause_reason(pause_reason):
+                try:
+                    fingerprint = await _compute_direction_error_fingerprint(project.id, did, session)
+                    if fingerprint:
+                        d["error_fingerprint"] = fingerprint
+                except Exception as _fp_exc:
+                    logger.warning(f"[DIAGNOSIS] Failed to compute error fingerprint for {did}: {_fp_exc!r}")
+            # Re-pause while remediation monitoring is active means the fix did not hold.
+            # Flag for manual intervention once attempts reach the escalation threshold so
+            # the diagnostics API and notification dispatcher can surface it to operators.
+            if d.get("remediation_monitor_started_at") and d.get("remediation_attempts", 0) >= 3:
+                d["needs_manual_intervention"] = True
+                logger.warning(
+                    f"[AUTONOMOUS] Direction {did} flagged needs_manual_intervention "
+                    f"after {d.get('remediation_attempts', 0)} remediation attempts"
+                )
+                try:
+                    from app.notification_dispatch import post_remediation_escalation_message  # noqa: PLC0415
+                    from app.strategic_completion import _build_direction_failure_summary  # noqa: PLC0415
+                    summary = _build_direction_failure_summary(d)
+                    rem_summary = (
+                        f"cycles_analyzed={summary['cycles_analyzed']} "
+                        f"tasks_created={summary['tasks_created']} "
+                        f"code_failed={summary['tasks_failed_code']} "
+                        f"merged={summary['prs_merged']} "
+                        f"code_failure_rate={summary['code_failure_rate']}"
+                    )
+                    await post_remediation_escalation_message(
+                        session,
+                        project.id,
+                        direction_text=d.get("text", did) or did,
+                        failure_pattern=d.get("error_fingerprint") or pause_reason,
+                        attempts=int(d.get("remediation_attempts", 0)),
+                        remediation_summary=rem_summary,
+                    )
+                except Exception as _esc_exc:
+                    logger.warning(f"[NOTIFY] Failed to post remediation escalation message: {_esc_exc}")
             logger.info(f"[AUTONOMOUS] Auto-paused direction {did}: {pause_reason}")
             auto_paused_any = True
             try:
@@ -103,7 +272,11 @@ async def _process_direction_lifecycle(
                 )
             except Exception as _e:
                 logger.warning(f"[NOTIFY] Failed to post auto-paused message: {_e}")
-            MAX_AUTO_PAUSE_CYCLES = 3
+            try:
+                await _spawn_direction_diagnosis(project, d, pause_reason, session)
+            except Exception as _e:
+                logger.warning(f"[DIAGNOSIS] Failed to spawn investigate task for {did}: {_e}")
+            MAX_AUTO_PAUSE_CYCLES = _MAX_AUTO_PAUSE_CYCLES
             if d.get("auto_pause_count", 0) >= MAX_AUTO_PAUSE_CYCLES:
                 d["status"] = "completed"
                 d["auto_completed"] = True

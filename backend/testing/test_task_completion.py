@@ -23,6 +23,9 @@ from app.task_completion import (
     _compute_first_attempt_succeeded,
     _validate_plan_dependencies,
     _ensure_branch,
+    _record_remediation_outcome,
+    _handle_investigation_completion,
+    _is_structural_diagnosis,
 )
 from app.models import TaskStatus
 from testing.factories import make_project, make_task
@@ -675,3 +678,370 @@ class TestEnsureBranch:
         assert task.status == TaskStatus.FAILED
         # Token fetch failed before any GitHub call — verify was never reached.
         assert get_sha.await_count == 0
+
+
+# ── _record_remediation_outcome ──────────────────────────────────────────────
+
+class TestRecordRemediationOutcome:
+    @pytest.mark.asyncio
+    async def test_skips_non_remediation_tasks(self, db_session):
+        """Tasks without diagnosis_task_id/direction_id should be ignored."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context={})
+        db_session.add(task)
+        await db_session.commit()
+
+        updated = await _record_remediation_outcome(task, merged=True, session=db_session)
+        assert updated is False
+        assert "remediation_attempts" not in project.directions[0]
+
+    @pytest.mark.asyncio
+    async def test_records_merge_outcome(self, db_session):
+        """A merged remediation task stamps direction with attempts + fingerprint."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={
+                "diagnosis_task_id": "diag-123",
+                "direction_id": "dir-1",
+                "diagnosis_fingerprint": "abc123def456",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        updated = await _record_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert updated is True
+        d = project.directions[0]
+        assert d["remediation_attempts"] == 1
+        assert d["last_remediation_result"] == "merged"
+        assert d["last_remediation_diagnosis_task_id"] == "diag-123"
+        assert d["last_remediation_fingerprint"] == "abc123def456"
+        assert d["last_remediation_task_id"] == str(task.id)
+        assert "last_remediation_at" in d
+
+    @pytest.mark.asyncio
+    async def test_increments_attempts_on_repeat_failure(self, db_session):
+        """Repeated failed remediations accumulate attempts and flip the result."""
+        project = make_project(directions=[{
+            "id": "dir-1",
+            "status": "active",
+            "remediation_attempts": 2,
+            "last_remediation_result": "merged",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={"diagnosis_task_id": "diag-9", "direction_id": "dir-1"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        updated = await _record_remediation_outcome(task, merged=False, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert updated is True
+        d = project.directions[0]
+        assert d["remediation_attempts"] == 3
+        assert d["last_remediation_result"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_no_match_when_direction_missing(self, db_session):
+        """Unknown direction_id is a no-op (returns False, no mutation)."""
+        project = make_project(directions=[{"id": "dir-other"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={"diagnosis_task_id": "diag-1", "direction_id": "dir-missing"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        updated = await _record_remediation_outcome(task, merged=True, session=db_session)
+        assert updated is False
+        assert "remediation_attempts" not in project.directions[0]
+
+
+# ── _handle_investigation_completion ────────────────────────────────────────
+
+class TestIsStructuralDiagnosis:
+    def test_detects_scope_too_broad(self):
+        assert _is_structural_diagnosis("the direction is too broad", "rethink")
+
+    def test_detects_misaligned(self):
+        assert _is_structural_diagnosis("Fundamentally misaligned with codebase", "")
+
+    def test_actionable_root_cause_is_not_structural(self):
+        assert not _is_structural_diagnosis(
+            "missing null check in parse_request", "add guard clause at line 42"
+        )
+
+    def test_case_insensitive(self):
+        assert _is_structural_diagnosis("Direction Scope is unclear", "")
+
+
+class TestHandleInvestigationCompletion:
+    def _payload(self, logs=""):
+        from types import SimpleNamespace
+        from app.models import ArtifactType
+        return SimpleNamespace(logs=logs, artifact_type=ArtifactType.INVESTIGATION_REPORT)
+
+    def _report(self, **overrides) -> str:
+        base = {
+            "summary": "Tasks fail due to missing lock in _record_direction_result",
+            "root_cause": "Concurrent writers race on the direction dict, causing one writer's update to overwrite the other. The bug is in shared_state.record_direction_result which reads, mutates, and writes without a lock.",
+            "affected_files": [
+                {"path": "backend/app/shared_state.py", "issue": "missing lock around direction dict write"},
+                {"path": "backend/app/shared_state.py", "issue": "dup path"},
+                {"path": "backend/app/autonomous_research.py", "issue": "calls the unsafe function"},
+            ],
+            "recommended_fix": "Wrap record_direction_result body in the existing asyncio.Lock held for per-project state. Add a targeted regression test that exercises concurrent calls.",
+            "severity": "high",
+            "confidence": "high",
+        }
+        base.update(overrides)
+        return json.dumps(base)
+
+    async def _setup(self, db_session, mocker, direction_overrides=None):
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        direction = {
+            "id": "dir-invest-1",
+            "text": "Improve pipeline reliability via targeted tests",
+            "status": "paused",
+            "diagnosis_in_progress": True,
+            "diagnosis_started_at": "2026-04-17T00:00:00",
+        }
+        if direction_overrides:
+            direction.update(direction_overrides)
+        project = make_project(directions=[direction])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        return project
+
+    @pytest.mark.asyncio
+    async def test_parses_report_and_stores_on_plan_output(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-invest-1"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        assert task.status == TaskStatus.COMPLETED
+        assert isinstance(task.plan_output, dict)
+        assert task.plan_output["root_cause"].startswith("Concurrent writers")
+
+    @pytest.mark.asyncio
+    async def test_stamps_direction_state_and_clears_flag(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-invest-1"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert "diagnosis_completed_at" in d
+        assert d["diagnosis_summary"].startswith("Tasks fail due to missing lock")
+        assert "backend/app/shared_state.py" in d["diagnosed_affected_files"]
+        assert d["diagnosed_affected_files"].count("backend/app/shared_state.py") == 1
+        assert "diagnosis_in_progress" not in d
+        assert "diagnosis_started_at" not in d
+
+    @pytest.mark.asyncio
+    async def test_appends_diagnosis_to_research_context(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-invest-1"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        ctx = project.directions[0].get("research_context") or ""
+        assert "Last diagnosis" in ctx
+        assert "Diagnosed affected files" in ctx
+        assert "backend/app/shared_state.py" in ctx
+
+    @pytest.mark.asyncio
+    async def test_spawns_remediation_on_high_confidence(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-invest-1"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        children = result.scalars().all()
+        assert len(children) == 1
+        child = children[0]
+        assert child.first_payload["type"] == "create"
+        assert child.first_payload["base_branch"] == "main"
+        assert child.context["diagnosis_task_id"] == str(task.id)
+        assert child.context["diagnosed_direction_id"] == "dir-invest-1"
+        assert child.context["direction_id"] == "dir-invest-1"
+        assert "backend/app/shared_state.py" in child.context["related_files"]
+        assert child.status == TaskStatus.QUEUED
+        assert project.directions[0]["remediation_task_id"] == str(child.id)
+
+    @pytest.mark.asyncio
+    async def test_skips_spawn_for_structural_root_cause(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-invest-1"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        structural_report = self._report(
+            root_cause="The direction scope is too broad — it conflates two unrelated concerns.",
+            recommended_fix="Split the direction into two narrower directions.",
+        )
+        await _handle_investigation_completion(task, self._payload(structural_report), db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        assert result.scalars().all() == []
+
+        d = project.directions[0]
+        notes = d.get("notes") or []
+        assert len(notes) == 1
+        assert "structurally misaligned" in notes[0]["text"]
+        assert notes[0]["source"] == "investigation_diagnosis"
+        assert "remediation_task_id" not in d
+
+    @pytest.mark.asyncio
+    async def test_low_confidence_does_not_spawn(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-invest-1"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(
+            task, self._payload(self._report(confidence="low")), db_session
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        assert result.scalars().all() == []
+        assert "remediation_task_id" not in project.directions[0]
+        assert "diagnosis_in_progress" not in project.directions[0]
+        assert "diagnosis_completed_at" in project.directions[0]
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_falls_back_gracefully(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-invest-1"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        bad_logs = "this is not json at all"
+        await _handle_investigation_completion(task, self._payload(bad_logs), db_session)
+        await db_session.commit()
+        await db_session.refresh(task)
+        await db_session.refresh(project)
+
+        assert task.status == TaskStatus.COMPLETED
+        assert task.plan_output == {"raw": bad_logs}
+        d = project.directions[0]
+        assert "diagnosis_in_progress" not in d
+        assert "diagnosis_completed_at" in d
+
+    @pytest.mark.asyncio
+    async def test_handles_missing_direction_gracefully(self, db_session, mocker):
+        """Task without a direction_id context still completes cleanly."""
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        project = make_project(directions=[])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context={})
+        db_session.add(task)
+        await db_session.commit()
+
+        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        assert task.status == TaskStatus.COMPLETED
+        assert isinstance(task.plan_output, dict)
+
+    @pytest.mark.asyncio
+    async def test_empty_logs_completes_without_raising(self, db_session, mocker):
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        project = make_project(directions=[{"id": "d-1", "diagnosis_in_progress": True}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context={"direction_id": "d-1"})
+        db_session.add(task)
+        await db_session.commit()
+
+        await _handle_investigation_completion(task, self._payload(""), db_session)
+        await db_session.commit()
+        await db_session.refresh(task)
+        await db_session.refresh(project)
+
+        assert task.status == TaskStatus.COMPLETED
+        assert task.plan_output == {}
+        assert "diagnosis_in_progress" not in project.directions[0]

@@ -10,7 +10,11 @@ import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
-from app.routers.admin_debug import _classify_stuck_failure, _build_stuck_tasks
+from app.routers.admin_debug import (
+    _classify_stuck_failure,
+    _build_stuck_tasks,
+    _build_direction_remediation_state,
+)
 from app.models import Project, Task, TaskStatus
 
 
@@ -546,3 +550,81 @@ class TestBuildStuckTasks:
             [healthy_queued, healthy_in_progress], _utc_now(), db_session
         )
         assert result == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Section 3 — _build_direction_remediation_state()
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBuildDirectionRemediationState:
+    """Pure unit tests — operates on Project.directions (JSON)."""
+
+    def _project(self, directions):
+        p = MagicMock(spec=Project)
+        p.directions = directions
+        return p
+
+    def test_omits_directions_with_no_notable_state(self):
+        project = self._project([
+            {"id": "d1", "text": "clean direction", "status": "active"},
+            {"id": "d2", "text": "also clean", "status": "proposed"},
+        ])
+        assert _build_direction_remediation_state(project) == []
+
+    def test_surfaces_auto_paused_direction(self):
+        project = self._project([{
+            "id": "d1", "text": "paused dir", "status": "paused",
+            "auto_paused": True, "paused_reason": "High code failure rate: 0.75",
+            "paused_at": "2026-04-10T00:00:00", "auto_pause_count": 2,
+        }])
+        entries = _build_direction_remediation_state(project)
+        assert len(entries) == 1
+        e = entries[0]
+        assert e["direction_id"] == "d1"
+        assert e["auto_paused"] is True
+        assert e["paused_reason"] == "High code failure rate: 0.75"
+        assert e["auto_pause_count"] == 2
+        assert e["needs_manual_intervention"] is False
+
+    def test_surfaces_active_remediation_monitor(self):
+        project = self._project([{
+            "id": "d1", "text": "monitoring", "status": "active",
+            "remediation_monitor_started_at": "2026-04-15T00:00:00",
+            "remediation_attempts": 1,
+            "last_remediation_result": "merged",
+            "error_fingerprint": "abc123",
+        }])
+        entries = _build_direction_remediation_state(project)
+        assert len(entries) == 1
+        e = entries[0]
+        assert e["remediation_monitor_active"] is True
+        assert e["remediation_attempts"] == 1
+        assert e["last_remediation_result"] == "merged"
+        assert e["error_fingerprint"] == "abc123"
+
+    def test_surfaces_needs_manual_intervention(self):
+        project = self._project([{
+            "id": "d1", "text": "stuck", "status": "paused",
+            "needs_manual_intervention": True,
+            "remediation_attempts": 3,
+            "last_remediation_result": "failed",
+        }])
+        entries = _build_direction_remediation_state(project)
+        assert len(entries) == 1
+        assert entries[0]["needs_manual_intervention"] is True
+        assert entries[0]["remediation_attempts"] == 3
+
+    def test_mixed_directions_only_notable_returned(self):
+        project = self._project([
+            {"id": "clean", "text": "ok", "status": "active"},
+            {"id": "paused", "text": "paused", "status": "paused", "auto_paused": True},
+            {"id": "escalated", "text": "stuck", "status": "paused",
+             "needs_manual_intervention": True, "remediation_attempts": 3},
+        ])
+        entries = _build_direction_remediation_state(project)
+        ids = {e["direction_id"] for e in entries}
+        assert ids == {"paused", "escalated"}
+
+    def test_handles_empty_or_missing_directions(self):
+        assert _build_direction_remediation_state(self._project([])) == []
+        assert _build_direction_remediation_state(self._project(None)) == []

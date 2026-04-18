@@ -1715,6 +1715,102 @@ async def test_auto_recovery_respects_custom_cooldown(db_session, monkeypatch):
     assert d["status"] == "paused", "Direction should stay paused within the custom 100h cooldown"
 
 
+@pytest.mark.asyncio
+async def test_auto_recovery_starts_remediation_monitoring(db_session):
+    """Auto-recovery of a direction with a merged remediation starts an effectiveness window."""
+    direction = _make_paused_direction("d-remed001", hours_ago=50, healthy_after_cooldown=True)
+    direction["last_remediation_result"] = "merged"
+    direction["remediation_attempts"] = 1
+    direction["error_fingerprint"] = "abc123def456"
+    project = Project(
+        name="Remediation Monitor Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-remed001")
+    assert d["status"] == "active"
+    assert d.get("remediation_monitor_started_at"), "monitoring window should be set on recovery"
+    # Tracking fields from the prior remediation must be preserved for fingerprint matching
+    assert d.get("last_remediation_result") == "merged"
+    assert d.get("error_fingerprint") == "abc123def456"
+
+
+@pytest.mark.asyncio
+async def test_re_pause_during_monitoring_flags_manual_intervention(db_session):
+    """Re-pause while remediation monitoring is active and attempts ≥ 3 triggers escalation flag."""
+    direction = {
+        "id": "d-escal001",
+        "text": "Repeatedly failing direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [{"tasks_created": 0}] * 5,  # unhealthy → will re-pause
+        "possibly_saturated": True,
+        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+        "remediation_attempts": 3,
+        "last_remediation_result": "merged",
+    }
+    project = Project(
+        name="Escalation Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-escal001")
+    assert d["status"] == "paused"
+    assert d.get("needs_manual_intervention") is True, "should flag for operator when attempts ≥ 3"
+
+
+@pytest.mark.asyncio
+async def test_re_pause_without_monitoring_does_not_flag_intervention(db_session):
+    """Re-pause without active remediation monitoring does not set needs_manual_intervention."""
+    direction = {
+        "id": "d-nomon001",
+        "text": "Unhealthy direction with no remediation history",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [{"tasks_created": 0}] * 5,
+        "possibly_saturated": True,
+    }
+    project = Project(
+        name="No Escalation Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-nomon001")
+    assert d["status"] == "paused"
+    assert "needs_manual_intervention" not in d
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Diagnosis research on auto-pause
 # ─────────────────────────────────────────────────────────────────────────────

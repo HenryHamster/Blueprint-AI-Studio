@@ -22,6 +22,7 @@ from app.notification_dispatch import (
     post_feedback_acknowledgment,
     post_issue_implementation_spawned_message,
     post_pr_merged_message,
+    post_remediation_escalation_message,
     post_review_feedback_message,
 )
 from app.models import MessageType, Project, ProjectMessage
@@ -433,6 +434,45 @@ async def test_post_auto_fix_result_review_needed(db_session):
     assert "review" in msg.content
     assert "55" in msg.content
     assert msg.context["result"] == "review_needed"
+
+
+@pytest.mark.asyncio
+async def test_post_remediation_escalation_message(db_session):
+    project_id = uuid.uuid4()
+    msg = await post_remediation_escalation_message(
+        db_session, project_id,
+        direction_text="Improve CI reliability",
+        failure_pattern="AssertionError in test_foo",
+        attempts=3,
+        remediation_summary="Added retry wrapper; same fingerprint recurred",
+    )
+    assert msg.project_id == project_id
+    assert msg.message_type == MessageType.BLOCKER
+    assert "Improve CI reliability" in msg.content
+    assert "3" in msg.content
+    assert msg.context["event_type"] == "remediation_escalated"
+    assert msg.context["failure_pattern"] == "AssertionError in test_foo"
+    assert msg.context["attempts"] == 3
+    assert msg.context["remediation_summary"].startswith("Added retry wrapper")
+    assert msg in db_session
+
+
+@pytest.mark.asyncio
+async def test_post_remediation_escalation_message_truncates(db_session):
+    project_id = uuid.uuid4()
+    long_dir = "d" * 200
+    long_pattern = "p" * 500
+    long_summary = "s" * 500
+    msg = await post_remediation_escalation_message(
+        db_session, project_id,
+        direction_text=long_dir,
+        failure_pattern=long_pattern,
+        attempts=5,
+        remediation_summary=long_summary,
+    )
+    assert len(msg.context["direction_text"]) <= 120
+    assert len(msg.context["failure_pattern"]) <= 200
+    assert len(msg.context["remediation_summary"]) <= 240
 
 
 @pytest.mark.asyncio

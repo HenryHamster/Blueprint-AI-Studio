@@ -90,13 +90,7 @@ def _build_scope_overflow_details(ctx: dict, task_scope: str) -> str:
 
 
 def _record_parent_failure(parent: Task, failure_class: str) -> None:
-    """Record a parent-task FAILED transition in deploy_monitoring and direction health.
-
-    Parent-task failure paths (requeue-limit exhaustion, no-children-to-retry)
-    previously only persisted ``failure_category`` on the row, so they never
-    showed up in ``deploy_monitoring['task_results']`` or fed per-direction
-    health tracking.  Mirrors the logic in routers/agent_status.py.
-    """
+    """Record a parent-task FAILED transition in deploy_monitoring and direction health."""
     from app.routers.agent_status import record_task_result
     record_task_result(
         success=False,
@@ -649,7 +643,7 @@ async def _process_post_commit(
     from app.task_completion import (
         _handle_plan_completion, _handle_design_doc_completion,
         _handle_security_audit_completion, _handle_perf_completion,
-        _handle_investigation_completion,
+        _handle_investigation_completion, _record_remediation_if_terminal,
     )
     from app.strategic_completion import _handle_strategic_completion, _record_strategic_task_failure
     from app.research_completion import _handle_research_completion
@@ -1998,6 +1992,8 @@ async def _process_post_commit(
                 logger.warning(
                     f"[RESEARCH] Failed to update direction research outcomes for task {task.id}: {_outcome_exc!r}"
                 )
+
+        await _record_remediation_if_terminal(task, payload.status, session)
 
         # 7. Project State Aggregation
         # Only consider executable tasks (those with a VM) for aggregation.
