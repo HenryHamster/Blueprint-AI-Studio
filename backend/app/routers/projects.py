@@ -25,6 +25,7 @@ from app.payload_schemas import validate_task_payload
 from app.schemas import DeployPayload
 from app.shared_state import limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
+from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +185,8 @@ async def get_project_tasks(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     status: Optional[TaskStatus] = None,
+    direction_id: Optional[str] = None,
+    task_type: Optional[str] = None,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -204,9 +207,16 @@ async def get_project_tasks(
     tasks_stmt = select(Task).where(Task.project_id == project_id)
     if status:
         tasks_stmt = tasks_stmt.where(Task.status == status)
+    if direction_id:
+        tasks_stmt = tasks_stmt.where(Task.context["direction_id"].as_string() == direction_id)
 
-    tasks_stmt = tasks_stmt.order_by(Task.created_at.asc()).offset(offset).limit(limit)
+    tasks_stmt = tasks_stmt.order_by(Task.created_at.asc())
+    if task_type is None:
+        tasks_stmt = tasks_stmt.offset(offset).limit(limit)
     tasks = (await session.execute(tasks_stmt)).scalars().all()
+    if task_type is not None:
+        tasks = [t for t in tasks if (t.first_payload or {}).get("type") == task_type]
+        tasks = tasks[offset:offset + limit]
 
     # Fetch artifacts for these tasks
     task_ids = [t.id for t in tasks]
@@ -232,6 +242,13 @@ async def get_project_tasks(
     # Combine
     result = []
     for t in tasks:
+        if t.vm_provisioned_at and t.vm_stopped_at:
+            duration_seconds = (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+            estimated_cost_usd = duration_seconds * rate
+        else:
+            duration_seconds = None
+            estimated_cost_usd = None
         task_dict = {
             "id": t.id,
             "title": t.title,
@@ -244,6 +261,8 @@ async def get_project_tasks(
             "context": {k: v for k, v in (t.context or {}).items() if not k.startswith("max_plan_")},
             "artifacts": artifacts_by_task.get(t.id, []),
             "research_findings": research_map.get(t.id),
+            "duration_seconds": duration_seconds,
+            "estimated_cost_usd": estimated_cost_usd,
         }
         result.append(task_dict)
 

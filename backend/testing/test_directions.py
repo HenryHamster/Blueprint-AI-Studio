@@ -740,17 +740,129 @@ async def test_task_counts_multiple_directions(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
-async def test_task_counts_ignores_non_research_tasks(client: AsyncClient, mocker):
-    """task-counts does not count tasks whose payload type is not 'research'."""
+async def test_task_counts_includes_non_research_tasks_with_direction_id(
+    client: AsyncClient, db_session, mocker
+):
+    """Non-research tasks with a direction_id in context ARE counted, and
+    appear under their own type bucket in counts_by_type."""
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(client, project_id, text="Direction C")
     direction_id = direction["id"]
 
-    # The initial deploy task has type != "research" — it should not be counted
+    db_session.add(
+        Task(
+            project_id=uuid.UUID(project_id),
+            title="feat: something",
+            payloads=[{"type": "create", "base_branch": "main"}],
+            context={"direction_id": direction_id},
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions/task-counts")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["counts"].get(direction_id) == 1
+    assert body["counts_by_type"][direction_id]["create"] == 1
+
+
+@pytest.mark.asyncio
+async def test_task_counts_context_direction_id_preferred_over_payload(
+    client: AsyncClient, db_session, mocker
+):
+    """context.direction_id takes precedence over payload-derived direction ids."""
+    project_id = await _deploy_project(client, mocker)
+    dir_ctx = await _add_direction(client, project_id, text="Ctx direction")
+    dir_payload = await _add_direction(client, project_id, text="Payload direction")
+
+    db_session.add(
+        Task(
+            project_id=uuid.UUID(project_id),
+            title="Research: mixed",
+            payloads=[{
+                "type": "research",
+                "current_direction_id": dir_payload["id"],
+                "directions": [dir_payload],
+                "base_branch": "main",
+            }],
+            context={"direction_id": dir_ctx["id"]},
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+    )
+    await db_session.commit()
+
     resp = await client.get(f"/api/admin/projects/{project_id}/directions/task-counts")
     assert resp.status_code == 200
     counts = resp.json()["counts"]
-    assert counts.get(direction_id, 0) == 0
+    assert counts.get(dir_ctx["id"]) == 1
+    assert counts.get(dir_payload["id"], 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_task_counts_payload_fallback_when_context_missing(
+    client: AsyncClient, db_session, mocker
+):
+    """Older tasks without context.direction_id are still counted via payload."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Fallback direction")
+    direction_id = direction["id"]
+
+    db_session.add(
+        Task(
+            project_id=uuid.UUID(project_id),
+            title="Research: legacy",
+            payloads=[{
+                "type": "research",
+                "current_direction_id": direction_id,
+                "base_branch": "main",
+            }],
+            context={},
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions/task-counts")
+    assert resp.status_code == 200
+    assert resp.json()["counts"].get(direction_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_task_counts_by_type_breakdown(
+    client: AsyncClient, db_session, mocker
+):
+    """counts_by_type reports per-type counts for mixed task types on a direction."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Mixed types")
+    direction_id = direction["id"]
+
+    for payload_type in ("research", "create", "create", "review"):
+        db_session.add(
+            Task(
+                project_id=uuid.UUID(project_id),
+                title=f"{payload_type} task",
+                payloads=[{"type": payload_type, "base_branch": "main"}],
+                context={"direction_id": direction_id},
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            )
+        )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions/task-counts")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["counts"][direction_id] == 4
+    by_type = body["counts_by_type"][direction_id]
+    assert by_type == {"research": 1, "create": 2, "review": 1}
 
 
 @pytest.mark.asyncio

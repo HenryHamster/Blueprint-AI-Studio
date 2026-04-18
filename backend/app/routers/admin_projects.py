@@ -214,25 +214,33 @@ async def get_direction_task_counts(
     tasks = result.scalars().all()
 
     counts: Dict[str, int] = {}
-    # Per-direction list of active (non-terminal) research tasks.  The UI shows
-    # these as clickable badges so operators can jump from a direction straight
-    # to its in-flight research run.
+    counts_by_type: Dict[str, Dict[str, int]] = {}
     active_tasks: Dict[str, list[dict]] = {}
     for task in tasks:
         payload = task.first_payload
-        if payload.get("type") != "research":
-            continue
+        # Primary: context.direction_id (matches admin_digest.py behavior).
+        # Fallback: payload.current_direction_id, then payload.directions[].id
+        # (for older tasks without context).
         dir_ids: list[str] = []
-        current_did = payload.get("current_direction_id")
-        if current_did:
-            dir_ids.append(current_did)
+        ctx_did = (task.context or {}).get("direction_id")
+        if ctx_did:
+            dir_ids.append(ctx_did)
         else:
-            for direction in payload.get("directions", []):
-                d_id = direction.get("id")
-                if d_id:
-                    dir_ids.append(d_id)
+            current_did = payload.get("current_direction_id")
+            if current_did:
+                dir_ids.append(current_did)
+            else:
+                for direction in payload.get("directions", []):
+                    d_id = direction.get("id")
+                    if d_id:
+                        dir_ids.append(d_id)
+        if not dir_ids:
+            continue
+        task_type = payload.get("type") or "unknown"
         for d_id in dir_ids:
             counts[d_id] = counts.get(d_id, 0) + 1
+            counts_by_type.setdefault(d_id, {})
+            counts_by_type[d_id][task_type] = counts_by_type[d_id].get(task_type, 0) + 1
             active_tasks.setdefault(d_id, []).append({
                 "id": str(task.id),
                 "status": task.status.value if hasattr(task.status, "value") else str(task.status),
@@ -240,7 +248,7 @@ async def get_direction_task_counts(
                 "latest_status_message": (task.latest_status_message or "")[:200],
             })
 
-    return {"counts": counts, "active_tasks": active_tasks}
+    return {"counts": counts, "counts_by_type": counts_by_type, "active_tasks": active_tasks}
 
 
 @router.patch("/projects/{project_id}/autonomous")

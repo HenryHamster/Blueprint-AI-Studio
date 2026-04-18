@@ -82,6 +82,91 @@ async def test_get_project_tasks(client: AsyncClient, mocker):
     assert child_tasks[0]["payloads"][0]["type"] == "smoketest"
 
 @pytest.mark.asyncio
+async def test_get_project_tasks_filter_by_direction_and_type(client: AsyncClient, db_session):
+    """Filter tasks by direction_id (JSONB context) and task_type (first payload)."""
+    project = Project(name="Filter Test", user_id="test-user-123", status=ProjectStatus.DEPLOYING)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+
+    t1 = Task(project_id=project.id, title="A", status=TaskStatus.QUEUED,
+              payloads=[{"type": "research"}], context={"direction_id": "d-1"})
+    t2 = Task(project_id=project.id, title="B", status=TaskStatus.QUEUED,
+              payloads=[{"type": "create"}], context={"direction_id": "d-1"})
+    t3 = Task(project_id=project.id, title="C", status=TaskStatus.QUEUED,
+              payloads=[{"type": "research"}], context={"direction_id": "d-2"})
+    t4 = Task(project_id=project.id, title="D", status=TaskStatus.QUEUED,
+              payloads=[{"type": "create"}], context={})
+    for t in (t1, t2, t3, t4):
+        db_session.add(t)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/projects/{project.id}/tasks?direction_id=d-1")
+    titles = sorted(t["title"] for t in resp.json()["tasks"])
+    assert titles == ["A", "B"]
+
+    resp = await client.get(f"/api/projects/{project.id}/tasks?task_type=research")
+    titles = sorted(t["title"] for t in resp.json()["tasks"])
+    assert titles == ["A", "C"]
+
+    resp = await client.get(
+        f"/api/projects/{project.id}/tasks?direction_id=d-1&task_type=create"
+    )
+    titles = sorted(t["title"] for t in resp.json()["tasks"])
+    assert titles == ["B"]
+
+
+@pytest.mark.asyncio
+async def test_get_project_tasks_includes_cost_fields(client: AsyncClient, db_session):
+    """
+    Completed tasks with VM timing data expose duration_seconds and
+    estimated_cost_usd; tasks without timing return null for both.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    project = Project(
+        name="Cost Fields Project",
+        user_id="test-user-123",
+        status=ProjectStatus.DEPLOYING,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+
+    start = datetime.now(timezone.utc) - timedelta(hours=1)
+    stop = start + timedelta(seconds=3600)
+    completed = Task(
+        project_id=project.id,
+        title="Completed",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_provisioned_at=start,
+        vm_stopped_at=stop,
+        vm_spot=False,
+    )
+    pending = Task(
+        project_id=project.id,
+        title="Pending",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_provisioned_at=start,
+        vm_stopped_at=None,
+    )
+    db_session.add_all([completed, pending])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/projects/{project.id}/tasks")
+    assert resp.status_code == 200
+    by_title = {t["title"]: t for t in resp.json()["tasks"]}
+    assert by_title["Completed"]["duration_seconds"] == pytest.approx(3600.0)
+    assert by_title["Completed"]["estimated_cost_usd"] == pytest.approx(3600.0 * (0.067 / 3600))
+    assert by_title["Pending"]["duration_seconds"] is None
+    assert by_title["Pending"]["estimated_cost_usd"] is None
+
+
+@pytest.mark.asyncio
 async def test_get_project_tasks_not_found(client: AsyncClient):
     """
     Tests that requesting tasks for a non-existent project returns 404.

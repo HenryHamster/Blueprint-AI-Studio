@@ -1707,6 +1707,54 @@ async def test_digest_scope_breakdown_preserves_failure_sub_counts(client: Async
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_cost_by_scope_and_status(client: AsyncClient, db_session):
+    """direction_progress entries include cost_by_scope and cost_by_status breakdowns."""
+    now = _utcnow()
+    project = make_project(
+        directions=[{"id": "dir-1", "text": "D1", "status": "active"}]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two tasks: small/completed (on-demand, 3600s) and medium/failed (spot, 1800s)
+    db_session.add(make_task(
+        project_id=project.id,
+        title="t1",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1", "scope": "small"},
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),
+        vm_spot=False,
+    ))
+    db_session.add(make_task(
+        project_id=project.id,
+        title="t2",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1", "scope": "medium"},
+        vm_provisioned_at=now - timedelta(minutes=60),
+        vm_stopped_at=now - timedelta(minutes=30),
+        vm_spot=True,
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    assert dp["cost_by_scope"] is not None
+    assert "small" in dp["cost_by_scope"]
+    assert "medium" in dp["cost_by_scope"]
+    assert dp["cost_by_scope"]["small"] > 0
+    assert dp["cost_by_status"] is not None
+    assert "COMPLETED" in dp["cost_by_status"]
+    assert "FAILED" in dp["cost_by_status"]
+    total = round(dp["cost_by_scope"]["small"] + dp["cost_by_scope"]["medium"], 2)
+    assert total == dp["estimated_cost_usd"]
+
+
+@pytest.mark.asyncio
 async def test_digest_scope_conversion_rates_absent_without_project(client: AsyncClient, db_session):
     """scope_conversion_rates is null when no project_id is provided."""
     response = await client.get("/api/admin/digest")

@@ -861,13 +861,14 @@ async def test_scope_aware_budget_large_code_error_fails_immediately(
 ):
     """scope=large cuts CODE_ERROR budget to 1, so attempt_count=1 terminally fails."""
     project = await _make_project(reaper_db)
+    # scope=large has a 10min heartbeat-stale threshold — need >10min of staleness
+    # for the reaper to classify this task as orphaned and run the budget check.
     t = Task(
         project_id=project.id,
         payloads=[{"type": "create"}],
         vm_instance_id="vm-large-code-error",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        # scope=large uses a 10-minute heartbeat cutoff, so stale must exceed that.
         last_heartbeat=datetime.utcnow() - timedelta(minutes=11),
         context={"scope": "large", "last_error": "NameError: foo is not defined"},
     )

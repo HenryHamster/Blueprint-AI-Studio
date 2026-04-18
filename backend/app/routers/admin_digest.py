@@ -839,7 +839,21 @@ async def get_digest(
                 latest_research_at = last_entry.get("timestamp") if last_entry else None
                 dir_product_ratio = round(sum(window_product_ratios) / len(window_product_ratios), 3) if window_product_ratios else None
 
-                dir_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in tasks_for_dir if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start)
+                dir_cost = 0.0
+                cost_by_scope: Dict[str, float] = {}
+                cost_by_status: Dict[str, float] = {}
+                for t in tasks_for_dir:
+                    if not (t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start):
+                        continue
+                    rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+                    t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+                    dir_cost += t_cost
+                    scope_key = (t.context or {}).get("scope", "unknown")
+                    cost_by_scope[scope_key] = cost_by_scope.get(scope_key, 0.0) + t_cost
+                    status_key = t.status.value if hasattr(t.status, "value") else str(t.status)
+                    cost_by_status[status_key] = cost_by_status.get(status_key, 0.0) + t_cost
+                cost_by_scope = {k: round(v, 4) for k, v in cost_by_scope.items()}
+                cost_by_status = {k: round(v, 4) for k, v in cost_by_status.items()}
 
                 direction_text = (d.get("text") or d.get("description") or "")[:80]
                 total_prs = prs_merged + prs_rejected
@@ -893,6 +907,8 @@ async def get_digest(
                     "product_ratio": dir_product_ratio,
                     "type_distribution": agg_type_distribution or None,
                     "estimated_cost_usd": round(dir_cost, 2),
+                    "cost_by_scope": cost_by_scope or None,
+                    "cost_by_status": cost_by_status or None,
                     "cost_per_merged_pr": round(dir_cost / prs_merged, 4) if prs_merged > 0 else None,
                     "scope_breakdown": dir_scope_agg or None,
                     "taxonomy_summary": dir_taxonomy_summary or None,

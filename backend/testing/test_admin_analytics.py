@@ -218,8 +218,9 @@ class TestAdminRecordFailureResult:
         shared_state.direction_failure_streaks.pop(direction_id, None)
 
     @pytest.mark.asyncio
-    async def test_agent_timeout_does_not_touch_direction_streak(self, _reset_task_results):
-        """Infra classes (AGENT_TIMEOUT) are ignored by direction health tracking."""
+    async def test_agent_timeout_does_not_touch_code_failure_streak(self, _reset_task_results):
+        """Infra classes (AGENT_TIMEOUT) are tracked on a separate counter and
+        do not increment the direction's code-failure streak."""
         from app.admin import _record_failure_result
         from app.models import Task, TaskStatus
         from app.routers.agent_status import _recorded_task_ids
@@ -239,7 +240,13 @@ class TestAdminRecordFailureResult:
 
         _record_failure_result(task, "AGENT_TIMEOUT")
 
-        assert direction_id not in shared_state.direction_failure_streaks
+        streak = shared_state.direction_failure_streaks.get(direction_id)
+        assert streak is not None
+        assert streak["consecutive_failures"] == 0
+        assert streak["consecutive_infra_failures"] == 1
+        assert streak["last_failure_class"] == "AGENT_TIMEOUT"
+        assert streak["held"] is False
         results = list(shared_state.deploy_monitoring["task_results"])
         assert len(results) == 1
         assert results[0][2] == "AGENT_TIMEOUT"
+        shared_state.direction_failure_streaks.pop(direction_id, None)

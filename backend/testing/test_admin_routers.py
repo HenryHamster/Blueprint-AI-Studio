@@ -597,8 +597,10 @@ class TestAutonomousMode:
             f"/api/admin/projects/{project.id}/directions/task-counts"
         )
         assert resp.status_code == 200
-        counts = resp.json()["counts"]
-        assert counts.get(direction_id) == 1
+        body = resp.json()
+        assert set(body.keys()) >= {"counts", "counts_by_type", "active_tasks"}
+        assert body["counts"].get(direction_id) == 1
+        assert body["counts_by_type"][direction_id]["research"] == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

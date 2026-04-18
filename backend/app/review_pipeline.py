@@ -46,33 +46,23 @@ STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR = 0.8
 
 _FEEDBACK_TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
-# Issue-churn detection: complements the Jaccard-based stuck-cycle check.
-# A cycle exhibits churn when the fix agent keeps resolving the original issues
-# but introducing new ones, so the specific issues rotate (evading stuck
-# detection) while the total CRITICAL+MAJOR count never actually decreases.
+# Issue-churn: fix agent keeps rotating CRITICAL+MAJOR issues without the total
+# count decreasing — evades Jaccard stuck-cycle detection but still unproductive.
 ISSUE_CHURN_WINDOW = 3
 
 
 def _critical_major_count(entry: dict) -> int:
-    issues = entry.get("issues") or []
     return sum(
-        1 for i in issues
+        1 for i in (entry.get("issues") or [])
         if i.get("severity", "").upper() in ("CRITICAL", "MAJOR")
         and (i.get("description") or "").strip()
     )
 
 
 def _detect_issue_churn(history: list) -> tuple[bool, list[int]]:
-    """Return (is_churn, counts) for the last ``ISSUE_CHURN_WINDOW`` entries.
-
-    Churn = every entry in the window has ≥1 CRITICAL/MAJOR issue AND the
-    count never strictly decreases across consecutive iterations (i.e. the
-    fix agent is treading water even as the specific issues rotate).
-    """
     if len(history) < ISSUE_CHURN_WINDOW:
         return (False, [])
-    window = history[-ISSUE_CHURN_WINDOW:]
-    counts = [_critical_major_count(e) for e in window]
+    counts = [_critical_major_count(e) for e in history[-ISSUE_CHURN_WINDOW:]]
     if any(c == 0 for c in counts):
         return (False, counts)
     non_decreasing = all(counts[i + 1] >= counts[i] for i in range(len(counts) - 1))
