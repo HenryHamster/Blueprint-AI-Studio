@@ -199,13 +199,23 @@ def _calibrate_finding_scope(
             # to large for plan decomposition before burning 5-10 minutes on a task that
             # will almost certainly scope-overflow during implementation.
             if direction:
-                _ratios = [
-                    (entry.get("scope_breakdown") or {}).get("medium", {}).get("avg_expansion_ratio")
+                _recent = [
+                    (entry.get("scope_breakdown") or {}).get("medium", {})
                     for entry in (direction.get("research_history") or [])[-3:]
                 ]
-                _ratios = [float(r) for r in _ratios if isinstance(r, (int, float))]
-                if _ratios:
-                    _avg_ratio = sum(_ratios) / len(_ratios)
+                _merged_ratios = [float(m.get("avg_expansion_ratio")) for m in _recent
+                                  if isinstance(m.get("avg_expansion_ratio"), (int, float))]
+                _failed_ratios = [float(m.get("avg_expansion_ratio_failed")) for m in _recent
+                                  if isinstance(m.get("avg_expansion_ratio_failed"), (int, float))]
+                # Prefer the max of merged/failed means — failed ratios reflect the
+                # overflow scenario we're trying to prevent, so they bias conservatively.
+                _candidates = []
+                if _merged_ratios:
+                    _candidates.append(sum(_merged_ratios) / len(_merged_ratios))
+                if _failed_ratios:
+                    _candidates.append(sum(_failed_ratios) / len(_failed_ratios))
+                if _candidates:
+                    _avg_ratio = max(_candidates)
                     _predicted_files = len(_heuristic_files) * _avg_ratio
                     if _predicted_files > 10:
                         logger.info(

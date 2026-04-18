@@ -3097,6 +3097,49 @@ class TestPredictSpawnSuccessDiagnosisSignal:
         assert predict_spawn_success("medium", d) == pytest.approx(2.3 / 3.0)
 
 
+class TestPredictSpawnSuccessAcceptanceSignal:
+    """Unit tests for the operator acceptance-rate signal (Signal 7)."""
+
+    def test_no_pr_data_omits_signal(self):
+        """A direction with zero PRs merged/rejected contributes nothing."""
+        d = {"research_history": [{"decomposition_quality": []}]}
+        assert predict_spawn_success("medium", d) == 0.5
+
+    def test_below_threshold_omits_signal(self):
+        """Fewer than 3 total PRs — signal omitted to avoid single-PR noise."""
+        d = {"research_history": [{"prs_merged": 1, "prs_rejected": 1}]}
+        assert predict_spawn_success("medium", d) == 0.5
+
+    def test_low_acceptance_reduces_confidence(self):
+        """3+ PRs with majority rejected meaningfully reduces P(success)."""
+        d = {
+            "research_history": [
+                {"prs_merged": 1, "prs_rejected": 4},
+            ],
+        }
+        # Only Signal 7 present at weight 1.5: acceptance = 1/5 = 0.2
+        assert predict_spawn_success("medium", d) == pytest.approx(0.2)
+
+    def test_high_acceptance_supports_confidence(self):
+        d = {
+            "research_history": [
+                {"prs_merged": 4, "prs_rejected": 1},
+            ],
+        }
+        assert predict_spawn_success("medium", d) == pytest.approx(0.8)
+
+    def test_aggregate_counts_toward_threshold(self):
+        """history_aggregate PRs count toward the 3-PR minimum."""
+        d = {
+            "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            "history_aggregate": {"total_prs_merged": 0, "total_prs_rejected": 5},
+        }
+        # total PRs = 6 >= 3; acceptance via _compute_acceptance_rate combines
+        # recent (1/1=1.0) with lifetime (1/6≈0.1667): (1.0*3 + 0.1667)/4
+        expected = (1.0 * 3 + 1.0 / 6) / 4
+        assert predict_spawn_success("medium", d) == pytest.approx(expected)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _poor_decomp_history helper unit tests (suppression signal)
 # ─────────────────────────────────────────────────────────────────────────────

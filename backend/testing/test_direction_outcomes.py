@@ -817,7 +817,7 @@ async def test_scope_breakdown_avg_expansion_ratio(db_session: AsyncSession):
         payloads=[{"type": "create"}],
         title="s-no-related",
     )
-    # failed task: excluded even with both fields
+    # failed task: contributes to avg_expansion_ratio_failed (separate from merged bucket)
     await _create_child_task(
         db_session, research_task.id, project.id,
         status=TaskStatus.FAILED,
@@ -839,7 +839,12 @@ async def test_scope_breakdown_avg_expansion_ratio(db_session: AsyncSession):
     await db_session.refresh(project)
     sb = project.directions[0]["research_history"][0]["scope_breakdown"]
     assert sb["small"]["avg_expansion_ratio"] == 1.5
+    assert sb["small"]["avg_expansion_ratio_merged"] == 1.5
     assert sb["medium"]["avg_expansion_ratio"] == 3.0
+    assert sb["medium"]["avg_expansion_ratio_merged"] == 3.0
+    # Failed medium task with 1 related_file and 3 changed files → ratio 3.0
+    assert sb["medium"]["avg_expansion_ratio_failed"] == 3.0
+    assert "avg_expansion_ratio_failed" not in sb["small"]
 
 
 @pytest.mark.asyncio

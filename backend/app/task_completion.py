@@ -309,6 +309,25 @@ def _active_followup_timestamps(
     return active
 
 
+def _project_active_followup_count(
+    project: Project, fp_key: str, *, now: Optional[datetime] = None,
+) -> int:
+    """Sum non-expired follow-up timestamps for ``fp_key`` across all directions.
+
+    Used to enforce a project-wide cap so a shared root cause (e.g. a broken
+    external API) does not trigger N directions × cap follow-ups. ``no_fingerprint``
+    is excluded from cross-direction aggregation because it conflates unrelated
+    errors that happen to lack a real fingerprint.
+    """
+    if not fp_key or fp_key == "no_fingerprint":
+        return 0
+    total = 0
+    for d in (project.directions or []):
+        attempts = (d.get("followup_investigation_attempts_by_fingerprint") or {}).get(fp_key)
+        total += len(_active_followup_timestamps(attempts, now=now))
+    return total
+
+
 async def _find_sibling_fingerprint_investigation(
     project_id, fingerprint, cutoff, session, exclude_task_id=None,
 ) -> Optional[str]:
@@ -417,12 +436,16 @@ async def _maybe_spawn_followup_investigation(
     attempts_by_fp = dict(target.get("followup_investigation_attempts_by_fingerprint") or {})
     now = _utcnow()
     active_ts = _active_followup_timestamps(attempts_by_fp.get(fp_key), now=now)
-    if len(active_ts) >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT:
+    project_active = _project_active_followup_count(project, fp_key, now=now)
+    if (
+        len(active_ts) >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT
+        or project_active >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT
+    ):
         logger.info(
             f"[DIAGNOSIS] Skip follow-up for direction {direction_id}: "
             f"cap reached for fingerprint {fp_key[:40]} "
-            f"({len(active_ts)}/"
-            f"{_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT}, "
+            f"(direction={len(active_ts)}, project={project_active}, "
+            f"cap={_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT}, "
             f"decay={_FOLLOWUP_INVESTIGATION_DECAY_DAYS}d)"
         )
         await _maybe_escalate_exhausted_followups(
@@ -642,7 +665,11 @@ async def _maybe_spawn_low_confidence_followup(
     attempts_by_fp = dict(direction.get("followup_investigation_attempts_by_fingerprint") or {})
     now = _utcnow()
     active_ts = _active_followup_timestamps(attempts_by_fp.get(fp_key), now=now)
-    if len(active_ts) >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT:
+    if (
+        len(active_ts) >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT
+        or _project_active_followup_count(project, fp_key, now=now)
+        >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT
+    ):
         return None
     prior_summary = (direction.get("diagnosis_summary") or "").strip()
     prompt = "\n".join([
@@ -753,7 +780,11 @@ async def _maybe_spawn_reinvestigation_after_failure(
     attempts_by_fp = dict(direction.get("followup_investigation_attempts_by_fingerprint") or {})
     now = _utcnow()
     active_ts = _active_followup_timestamps(attempts_by_fp.get(fp_key), now=now)
-    if len(active_ts) >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT:
+    if (
+        len(active_ts) >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT
+        or _project_active_followup_count(project, fp_key, now=now)
+        >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT
+    ):
         return None
     prior_summary = (direction.get("diagnosis_summary") or "").strip()
     failure_summary = (investigation_task.latest_status_message or "(no error message)")
@@ -1798,7 +1829,7 @@ def _calculate_remediation_scope(
 
     Returns one of "small", "medium", or "large". Routes complex diagnoses
     (>5 files or critical severity) to large scope (plan decomposition); bumps
-    the scope up one level when prior small-scope fixes have already failed.
+    the scope up one level on the first retry after a prior fix attempt failed.
     """
     num_paths = len(affected_paths)
     if num_paths > 5 or severity == "critical":
@@ -1807,7 +1838,7 @@ def _calculate_remediation_scope(
         scope = "small"
     else:
         scope = "medium"
-    if remediation_attempts >= 2:
+    if remediation_attempts >= 1:
         scope = {"small": "medium", "medium": "large", "large": "large"}[scope]
     return scope
 

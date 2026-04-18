@@ -1773,6 +1773,33 @@ class TestFollowupInvestigationOnFailure:
         assert d.get("diagnosis_in_progress") is not True
 
     @pytest.mark.asyncio
+    async def test_follow_up_skipped_when_cap_reached_across_other_directions(self, db_session):
+        """Cross-direction: if siblings already hit the project-wide cap for this
+        fingerprint, a new direction does not get its own per-direction quota."""
+        from app.time_utils import _utcnow
+        recent = _utcnow().isoformat()
+        project = make_project(directions=[
+            {"id": "dir-other", "status": "active",
+             "followup_investigation_attempts_by_fingerprint": {"fp-A": [recent, recent]}},
+            {"id": "dir-1", "status": "active", "text": "fresh direction"},
+        ])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        target = next(d for d in project.directions if d["id"] == "dir-1")
+        assert "followup_investigation_attempts_by_fingerprint" not in target
+        assert target.get("diagnosis_in_progress") is not True
+
+    @pytest.mark.asyncio
     async def test_follow_up_legacy_int_entry_treated_as_expired(self, db_session):
         """Pre-decay int entries (e.g. 2) no longer permanently block recovery."""
         project = make_project(directions=[{
@@ -2449,19 +2476,19 @@ class TestCalculateRemediationScope:
     def test_empty_paths_low_severity_is_small(self):
         assert _calculate_remediation_scope([], "low", 0) == "small"
 
-    def test_bumps_small_to_medium_after_two_attempts(self):
-        assert _calculate_remediation_scope(["a.py"], "low", 2) == "medium"
+    def test_bumps_small_to_medium_on_first_retry(self):
+        assert _calculate_remediation_scope(["a.py"], "low", 1) == "medium"
 
-    def test_bumps_medium_to_large_after_two_attempts(self):
+    def test_bumps_medium_to_large_on_first_retry(self):
         paths = ["a.py", "b.py", "c.py"]
-        assert _calculate_remediation_scope(paths, "medium", 2) == "large"
+        assert _calculate_remediation_scope(paths, "medium", 1) == "large"
 
     def test_large_stays_large_after_bump(self):
         paths = [f"f{i}.py" for i in range(6)]
         assert _calculate_remediation_scope(paths, "medium", 5) == "large"
 
-    def test_single_attempt_does_not_bump(self):
-        assert _calculate_remediation_scope(["a.py"], "low", 1) == "small"
+    def test_initial_attempt_does_not_bump(self):
+        assert _calculate_remediation_scope(["a.py"], "low", 0) == "small"
 
 
 class TestRemediationScopeInPayload:

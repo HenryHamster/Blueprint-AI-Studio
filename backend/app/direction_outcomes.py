@@ -314,6 +314,8 @@ async def _update_direction_research_outcomes(
             scope_breakdown: dict = {}
             expansion_sums: dict = {}
             expansion_counts: dict = {}
+            expansion_failed_sums: dict = {}
+            expansion_failed_counts: dict = {}
             cplx_merged_sum: dict = {}
             cplx_merged_n: dict = {}
             cplx_failed_sum: dict = {}
@@ -325,6 +327,8 @@ async def _update_direction_research_outcomes(
                         "created": 0, "merged": 0, "failed": 0, "failed_infra": 0,
                         "failed_code_error": 0, "failed_scope_overflow": 0,
                         "calibrated_in": 0, "calibrated_out": 0,
+                        "exploration_created": 0, "exploration_merged": 0,
+                        "exploration_failed": 0,
                     }
 
             for ct in child_tasks_rows:
@@ -343,6 +347,12 @@ async def _update_direction_research_outcomes(
                         scope_breakdown[scope]["failed_code_error"] += 1
                     elif fcat == SCOPE_OVERFLOW:
                         scope_breakdown[scope]["failed_scope_overflow"] += 1
+                if ctx_.get("medium_exploration"):
+                    scope_breakdown[scope]["exploration_created"] += 1
+                    if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):
+                        scope_breakdown[scope]["exploration_merged"] += 1
+                    if _counts_as_failure(ct):
+                        scope_breakdown[scope]["exploration_failed"] += 1
                 calibrated_from = ctx_.get("scope_calibrated_from")
                 if calibrated_from:
                     scope_breakdown[scope]["calibrated_in"] += 1
@@ -352,14 +362,27 @@ async def _update_direction_research_outcomes(
                 # Leading indicator of scope overflow risk.
                 related = ctx_.get("related_files") or []
                 changed = ctx_.get("_pr_changed_files") or []
-                if ct.status == TaskStatus.COMPLETED and related and changed:
+                if related and changed:
                     ratio = len(changed) / len(related)
-                    expansion_sums[scope] = expansion_sums.get(scope, 0.0) + ratio
-                    expansion_counts[scope] = expansion_counts.get(scope, 0) + 1
+                    if ct.status == TaskStatus.COMPLETED:
+                        expansion_sums[scope] = expansion_sums.get(scope, 0.0) + ratio
+                        expansion_counts[scope] = expansion_counts.get(scope, 0) + 1
+                    elif _counts_as_failure(ct):
+                        # Failed tasks (especially SCOPE_OVERFLOW) are the exact scenario
+                        # the expansion predictor tries to prevent — track separately so
+                        # scope calibration has a conservative signal.
+                        expansion_failed_sums[scope] = expansion_failed_sums.get(scope, 0.0) + ratio
+                        expansion_failed_counts[scope] = expansion_failed_counts.get(scope, 0) + 1
             for scope_key, count in expansion_counts.items():
                 if count > 0:
-                    scope_breakdown[scope_key]["avg_expansion_ratio"] = round(
-                        expansion_sums[scope_key] / count, 2
+                    avg = round(expansion_sums[scope_key] / count, 2)
+                    scope_breakdown[scope_key]["avg_expansion_ratio"] = avg
+                    scope_breakdown[scope_key]["avg_expansion_ratio_merged"] = avg
+            for scope_key, count in expansion_failed_counts.items():
+                if count > 0:
+                    _ensure_scope(scope_key)
+                    scope_breakdown[scope_key]["avg_expansion_ratio_failed"] = round(
+                        expansion_failed_sums[scope_key] / count, 2
                     )
             # Predictive accuracy: average complexity_score for merged vs failed tasks.
             # If scoring is calibrated, merged > failed at each scope.

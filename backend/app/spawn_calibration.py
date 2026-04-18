@@ -14,6 +14,7 @@ import os
 from datetime import timedelta
 from typing import Any
 
+from app.direction_metrics import _compute_acceptance_rate
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -391,6 +392,26 @@ def predict_spawn_success(
     if diagnosis_score is not None:
         signals.append(diagnosis_score)
         weights.append(1.0)
+
+    # Signal 7: operator acceptance rate (merged / (merged + rejected)) from
+    # research history. Directions where the operator consistently rejects PRs
+    # are wasting compute regardless of code quality, so this feedback must
+    # flow back into spawn gating. Requires 3+ terminal PRs (merged or rejected)
+    # to avoid noise from a single early rejection. Weight 1.5 so a <0.5
+    # acceptance rate meaningfully reduces predicted success but can still be
+    # overridden by strong direction-level signals.
+    history = direction.get("research_history", [])
+    agg = direction.get("history_aggregate") or {}
+    total_prs = (
+        sum(e.get("prs_merged", 0) + e.get("prs_rejected", 0) for e in history)
+        + (agg.get("total_prs_merged") or 0)
+        + (agg.get("total_prs_rejected") or 0)
+    )
+    if total_prs >= 3:
+        acceptance = _compute_acceptance_rate(direction)
+        if acceptance is not None:
+            signals.append(acceptance)
+            weights.append(1.5)
 
     if not signals:
         return 0.5  # insufficient data — neutral
