@@ -178,6 +178,18 @@ async def _attempt_merge_with_retry_and_escalation(
                 await _maybe_create_failure_alert(task, session,
                     f"PR #{ci_pr_number} merge hard-capped after {_merge_failures} failures — manual action required")
                 logger.error(f"[CI] PR #{ci_pr_number} hit merge hard cap ({_merge_failures}) — marking FAILED ({source})")
+                from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
+                from app.routers.agent_status import record_task_result  # noqa: PLC0415
+                from app.shared_state import record_direction_result  # noqa: PLC0415
+                _fc = classify_failure(task)
+                persist_failure_category(task, _fc)
+                record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
+                _direction_id = str((task.context or {}).get("direction_id") or "")
+                if _direction_id:
+                    record_direction_result(
+                        _direction_id, success=False, failure_class=_fc,
+                        project_id=str(task.project_id) if task.project_id else "",
+                    )
     except Exception:
         ci_loop["ci_poll_interval"] = 30
         ci_loop["ci_last_polled"] = _utcnow().isoformat()
@@ -336,9 +348,16 @@ async def handle_ci_completion(
             logger.error(f"[CI] PR #{ci_pr_number} CI failed, fix spawn returned None ({source})")
             from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
             from app.routers.agent_status import record_task_result  # noqa: PLC0415
+            from app.shared_state import record_direction_result  # noqa: PLC0415
             _fc = classify_failure(task)
             persist_failure_category(task, _fc)
             record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
+            _direction_id = str((task.context or {}).get("direction_id") or "")
+            if _direction_id:
+                record_direction_result(
+                    _direction_id, success=False, failure_class=_fc,
+                    project_id=str(task.project_id) if task.project_id else "",
+                )
 
     if task.status == TaskStatus.FAILED:
         await _maybe_create_failure_alert(

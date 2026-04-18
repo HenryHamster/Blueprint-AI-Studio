@@ -24,6 +24,7 @@ from app.shared_state import (
     get_held_directions,
     get_pipeline_health_snapshot,
     DIRECTION_HOLD_THRESHOLD,
+    DIRECTION_INFRA_HOLD_THRESHOLD,
     DIRECTION_HOLD_TIMEOUT_HOURS,
 )
 from app.orchestrator_filters import filter_held_directions
@@ -52,15 +53,15 @@ class TestRecordDirectionResult:
     def setup_method(self):
         _setup()
 
-    def test_infra_failures_do_not_count(self):
+    def test_infra_failures_do_not_count_toward_code_streak(self):
         did = _fresh_direction_id()
         for fc in ("PROVISION_FAILURE", "RATE_LIMIT", "AGENT_TIMEOUT", "EXTERNAL_API"):
             record_direction_result(did, success=False, failure_class=fc)
-        streak = _ss.direction_failure_streaks.get(did)
-        # Entry may not even exist if infra classes are ignored before insertion
-        if streak:
-            assert streak["consecutive_failures"] == 0
-            assert not streak["held"]
+        streak = _ss.direction_failure_streaks[did]
+        assert streak["consecutive_failures"] == 0
+        # Below the infra threshold — not held yet
+        assert not streak["held"]
+        assert streak["consecutive_infra_failures"] == 4
 
     def test_code_error_increments_streak(self):
         did = _fresh_direction_id()
@@ -96,14 +97,59 @@ class TestRecordDirectionResult:
 
     def test_mixed_infra_and_code_errors(self):
         did = _fresh_direction_id()
-        # 2 code errors + 5 infra failures should NOT trigger hold
+        # 2 code errors + 5 infra failures: neither threshold crossed (code=3, infra=6)
         for _ in range(2):
             record_direction_result(did, success=False, failure_class="CODE_ERROR")
         for _ in range(5):
             record_direction_result(did, success=False, failure_class="PROVISION_FAILURE")
         streak = _ss.direction_failure_streaks[did]
         assert streak["consecutive_failures"] == 2
+        assert streak["consecutive_infra_failures"] == 5
         assert not streak["held"]
+
+    def test_infra_hold_triggered_at_infra_threshold(self):
+        did = _fresh_direction_id()
+        for _ in range(DIRECTION_INFRA_HOLD_THRESHOLD):
+            record_direction_result(did, success=False, failure_class="AGENT_TIMEOUT")
+        streak = _ss.direction_failure_streaks[did]
+        assert streak["consecutive_infra_failures"] == DIRECTION_INFRA_HOLD_THRESHOLD
+        assert streak["held"]
+        assert streak["held_reason"] == "infra"
+        held, reason = is_direction_held(did)
+        assert held
+        assert "infra" in reason
+        assert "AGENT_TIMEOUT" in reason
+
+    def test_infra_hold_below_threshold_not_held(self):
+        did = _fresh_direction_id()
+        for _ in range(DIRECTION_INFRA_HOLD_THRESHOLD - 1):
+            record_direction_result(did, success=False, failure_class="PROVISION_FAILURE")
+        streak = _ss.direction_failure_streaks[did]
+        assert not streak["held"]
+
+    def test_success_resets_both_counters(self):
+        did = _fresh_direction_id()
+        for _ in range(2):
+            record_direction_result(did, success=False, failure_class="CODE_ERROR")
+        for _ in range(3):
+            record_direction_result(did, success=False, failure_class="RATE_LIMIT")
+        record_direction_result(did, success=True)
+        streak = _ss.direction_failure_streaks[did]
+        assert streak["consecutive_failures"] == 0
+        assert streak["consecutive_infra_failures"] == 0
+        assert not streak["held"]
+        assert streak["held_reason"] == ""
+
+    def test_code_hold_takes_priority_over_later_infra(self):
+        """Once held by code-error streak, further infra failures don't change reason."""
+        did = _fresh_direction_id()
+        for _ in range(DIRECTION_HOLD_THRESHOLD):
+            record_direction_result(did, success=False, failure_class="CODE_ERROR")
+        record_direction_result(did, success=False, failure_class="PROVISION_FAILURE")
+        streak = _ss.direction_failure_streaks[did]
+        assert streak["held_reason"] == "code"
+        _, reason = is_direction_held(did)
+        assert "CODE_ERROR" in reason
 
     def test_project_id_stored(self):
         did = _fresh_direction_id()

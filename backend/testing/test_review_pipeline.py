@@ -599,6 +599,81 @@ async def test_per_chain_cap_blocks_spawn_and_marks_original(db_session, mocker)
 
 
 @pytest.mark.asyncio
+async def test_cap_exhaustion_records_task_and_direction_result(db_session, mocker):
+    """Review-fix cap exhaustion must surface to deploy_monitoring.task_results
+    and to per-direction failure streaks. Without this, cap failures bypass
+    per-type failure gates and anomaly detection — regression guard for the
+    cluster 2/5 fix of the missing-record_task_result sweep."""
+    from collections import deque
+    import app.shared_state as ss
+    from app.routers import agent_status as _agent_status_mod
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "o", "r"),
+    )
+    mocker.patch("app.github.close_pull_request", new_callable=AsyncMock, return_value=True)
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    # Reset module-level state so the assertions are deterministic.
+    ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+    ss.direction_failure_streaks.clear()
+    _agent_status_mod._recorded_task_ids.clear()
+
+    project = await _make_db_project(db_session)
+    direction_id = "dir-cap-rec"
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small", "direction_id": direction_id},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 777, "branch": "feat/rec", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={"scope": "small", "direction_id": direction_id,
+                 "review_loop": {"iteration": 10,
+                                 "original_task_id": str(original_task.id)}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=777, branch="feat/rec", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Still broken",
+    )
+
+    assert result is None, "Per-chain cap should block spawn"
+
+    results = list(ss.deploy_monitoring["task_results"])
+    assert len(results) == 1, (
+        f"Cap exhaustion must append exactly one deploy_monitoring entry, got {results!r}"
+    )
+    _, outcome, fclass, ttype = results[0]
+    assert outcome == "failure", f"Expected failure outcome, got {outcome!r}"
+    assert fclass == "CODE_ERROR", f"Expected CODE_ERROR failure_class, got {fclass!r}"
+    assert ttype == "create", f"Expected task_type=create, got {ttype!r}"
+
+    streak = ss.direction_failure_streaks.get(direction_id)
+    assert streak is not None, "Cap exhaustion must register a direction failure streak"
+    assert streak["consecutive_failures"] == 1
+    assert streak["last_failure_class"] == "CODE_ERROR"
+
+
+@pytest.mark.asyncio
 async def test_cap_exhaustion_idempotent(db_session, mocker):
     """If rollup or another handler re-enters _spawn_pipeline_task for an
     already-cap-exhausted PR, the side effects (PR close, alert) must fire

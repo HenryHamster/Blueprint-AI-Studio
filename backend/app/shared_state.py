@@ -402,6 +402,11 @@ direction_failure_streaks: Dict[str, Dict] = {}
 
 # Number of consecutive CODE_ERROR failures before a direction is held
 DIRECTION_HOLD_THRESHOLD = 3
+# Higher threshold for consecutive infra failures (PROVISION_FAILURE, RATE_LIMIT,
+# AGENT_TIMEOUT, EXTERNAL_API, SCOPE_OVERFLOW). A single infra failure is noise,
+# but a sustained streak suggests the direction's scope/scale is the real cause
+# (e.g. files that consistently OOM the agent, scope that always overflows).
+DIRECTION_INFRA_HOLD_THRESHOLD = 6
 # Automatic hold expiry (safety valve so a direction doesn't stay blocked forever)
 DIRECTION_HOLD_TIMEOUT_HOURS = 4
 
@@ -418,43 +423,73 @@ def record_direction_result(
 ) -> None:
     """Update the per-direction failure streak on task completion.
 
-    Infra failures (PROVISION_FAILURE, RATE_LIMIT, AGENT_TIMEOUT, EXTERNAL_API)
-    are ignored — they don't reflect direction health.  A success resets the
-    streak and clears any existing hold.
+    Tracks two parallel counters: code failures (CODE_ERROR and other non-infra)
+    and infra failures (PROVISION_FAILURE, RATE_LIMIT, AGENT_TIMEOUT, EXTERNAL_API,
+    SCOPE_OVERFLOW). Each has its own hold threshold. A success resets both
+    counters and clears any existing hold.
     """
     if not direction_id:
         return
 
-    if failure_class in _DIRECTION_INFRA_CLASSES:
-        return
-
     streak = direction_failure_streaks.setdefault(direction_id, {
         "consecutive_failures": 0,
+        "consecutive_infra_failures": 0,
         "last_failure_class": "",
         "last_failure_at": None,
         "held": False,
         "held_at": None,
+        "held_reason": "",
+        "held_failure_class": "",
         "project_id": project_id,
     })
+    # Backfill new fields for entries created before infra tracking existed.
+    streak.setdefault("consecutive_infra_failures", 0)
+    streak.setdefault("held_reason", "")
+    streak.setdefault("held_failure_class", "")
     if project_id:
         streak["project_id"] = project_id
 
     if success:
         streak["consecutive_failures"] = 0
+        streak["consecutive_infra_failures"] = 0
         streak["last_failure_class"] = ""
         streak["held"] = False
         streak["held_at"] = None
-    else:
-        streak["consecutive_failures"] += 1
+        streak["held_reason"] = ""
+        streak["held_failure_class"] = ""
+        return
+
+    if failure_class in _DIRECTION_INFRA_CLASSES:
+        streak["consecutive_infra_failures"] += 1
         streak["last_failure_class"] = failure_class
         streak["last_failure_at"] = _utcnow()
-        if streak["consecutive_failures"] >= DIRECTION_HOLD_THRESHOLD and not streak["held"]:
+        if (
+            streak["consecutive_infra_failures"] >= DIRECTION_INFRA_HOLD_THRESHOLD
+            and not streak["held"]
+        ):
             streak["held"] = True
             streak["held_at"] = _utcnow()
+            streak["held_reason"] = "infra"
+            streak["held_failure_class"] = failure_class
             logger.warning(
                 f"[DIRECTION HEALTH] Direction {direction_id} HELD after "
-                f"{streak['consecutive_failures']} consecutive {failure_class} failures."
+                f"{streak['consecutive_infra_failures']} consecutive infra "
+                f"failures (last: {failure_class})."
             )
+        return
+
+    streak["consecutive_failures"] += 1
+    streak["last_failure_class"] = failure_class
+    streak["last_failure_at"] = _utcnow()
+    if streak["consecutive_failures"] >= DIRECTION_HOLD_THRESHOLD and not streak["held"]:
+        streak["held"] = True
+        streak["held_at"] = _utcnow()
+        streak["held_reason"] = "code"
+        streak["held_failure_class"] = failure_class
+        logger.warning(
+            f"[DIRECTION HEALTH] Direction {direction_id} HELD after "
+            f"{streak['consecutive_failures']} consecutive {failure_class} failures."
+        )
 
 
 def clear_direction_hold(direction_id: str) -> None:
@@ -462,8 +497,11 @@ def clear_direction_hold(direction_id: str) -> None:
     streak = direction_failure_streaks.get(direction_id)
     if streak:
         streak["consecutive_failures"] = 0
+        streak["consecutive_infra_failures"] = 0
         streak["held"] = False
         streak["held_at"] = None
+        streak["held_reason"] = ""
+        streak["held_failure_class"] = ""
 
 
 def is_direction_held(direction_id: str) -> tuple[bool, str]:
@@ -483,10 +521,19 @@ def is_direction_held(direction_id: str) -> tuple[bool, str]:
     if held_at and (_utcnow() - held_at).total_seconds() > DIRECTION_HOLD_TIMEOUT_HOURS * 3600:
         streak["held"] = False
         streak["held_at"] = None
+        streak["held_reason"] = ""
+        streak["held_failure_class"] = ""
         logger.info(f"[DIRECTION HEALTH] Direction {direction_id} hold expired (timeout).")
         return False, ""
+    if streak.get("held_reason") == "infra":
+        count = streak.get("consecutive_infra_failures", 0)
+        fc = streak.get("held_failure_class") or streak["last_failure_class"] or "INFRA"
+        return True, (
+            f"Held: direction has {count} consecutive infra failures "
+            f"(last: {fc}) — investigate scope/scale before retrying"
+        )
     count = streak["consecutive_failures"]
-    fc = streak["last_failure_class"] or "CODE_ERROR"
+    fc = streak.get("held_failure_class") or streak["last_failure_class"] or "CODE_ERROR"
     return True, f"Held: direction has {count} consecutive {fc} failures — awaiting investigation"
 
 
@@ -498,9 +545,11 @@ def get_held_directions() -> Dict[str, Dict]:
         if held:
             result[did] = {
                 "consecutive_failures": streak["consecutive_failures"],
+                "consecutive_infra_failures": streak.get("consecutive_infra_failures", 0),
                 "last_failure_class": streak["last_failure_class"],
                 "last_failure_at": streak["last_failure_at"].isoformat() if streak.get("last_failure_at") else None,
                 "held_at": streak["held_at"].isoformat() if streak.get("held_at") else None,
+                "held_reason": streak.get("held_reason", "code"),
                 "project_id": streak.get("project_id", ""),
                 "reason": reason,
             }

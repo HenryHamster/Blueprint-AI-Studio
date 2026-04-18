@@ -702,20 +702,77 @@ def _expire_stale_anomalies() -> int:
     return expired
 
 
+async def _spawn_held_direction_investigations(session: AsyncSession) -> int:
+    """Spawn investigation tasks for every direction currently on hold.
+
+    Complements autonomous_research._check_idle_research's per-project invocation
+    by running on the faster anomaly-sweep cadence (~10 min vs 30 min) and by
+    covering projects with autonomous_enabled=False — direction holds fire for
+    every project, but the research idle loop only iterates autonomous ones.
+
+    Delegates the per-project spawn (including in-flight dedup and failure-context
+    collection) to the existing helper in autonomous_research so the two entry
+    points stay in sync.
+    """
+    # Deferred import: autonomous_research imports from anomaly_detection.
+    from app.autonomous_research import _spawn_direction_hold_investigation  # noqa: PLC0415
+
+    held = _shared_state.get_held_directions()
+    if not held:
+        return 0
+
+    project_ids: set[str] = {
+        info.get("project_id") for info in held.values() if info.get("project_id")
+    }
+    total = 0
+    for pid_str in project_ids:
+        try:
+            pid = uuid.UUID(pid_str)
+        except (TypeError, ValueError):
+            continue
+        project = await session.get(Project, pid)
+        if project is None:
+            continue
+        try:
+            total += await _spawn_direction_hold_investigation(project, session)
+        except Exception:
+            logger.exception(
+                "[ANOMALY_SWEEP] direction-hold investigation spawn failed for project %s",
+                pid_str,
+            )
+    return total
+
+
 async def anomaly_maintenance_sweep() -> dict:
     """Periodic maintenance independent of autonomous research.
 
-    Expires stale persistent anomalies (>48h since last_seen) and re-evaluates
+    Expires stale persistent anomalies (>48h since last_seen), re-evaluates
     pipeline adjustments so that throttles get restored even when no research
-    cycle is running. Returns a small summary dict for logging.
+    cycle is running, and spawns investigation tasks for any directions that
+    are currently on hold. Returns a small summary dict for logging.
     """
     expired = _expire_stale_anomalies()
     action = await check_anomaly_actions()
-    if expired or action["action"] != "none":
+    spawned = 0
+    # Skip the DB session entirely when no directions are held — the common case
+    # on a healthy pipeline, and it keeps standalone callers DB-free.
+    if _shared_state.get_held_directions():
+        try:
+            from app.database import AsyncSessionLocal  # noqa: PLC0415
+            async with AsyncSessionLocal() as session:
+                spawned = await _spawn_held_direction_investigations(session)
+        except Exception:
+            logger.exception("[ANOMALY_SWEEP] held-direction investigation pass failed")
+    if expired or action["action"] != "none" or spawned:
         logger.info(
-            "[ANOMALY_SWEEP] expired=%d action=%s", expired, action["action"]
+            "[ANOMALY_SWEEP] expired=%d action=%s spawned_investigations=%d",
+            expired, action["action"], spawned,
         )
-    return {"expired": expired, "action": action["action"]}
+    return {
+        "expired": expired,
+        "action": action["action"],
+        "spawned_investigations": spawned,
+    }
 
 
 async def _check_anomaly_proposals(project, session):

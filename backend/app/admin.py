@@ -26,6 +26,33 @@ from app.payload_schemas import TaskType, validate_internal_payload, validate_ta
 
 logger = logging.getLogger(__name__)
 
+
+def _record_failure_result(task: Task, failure_class: str) -> None:
+    """Record a task failure for deployment monitoring and direction health.
+
+    Safe to call alongside persist_failure_category; best-effort (logs on error).
+    """
+    try:
+        from app.routers.agent_status import record_task_result
+        from app.shared_state import record_direction_result
+        record_task_result(
+            success=False,
+            failure_class=failure_class,
+            task_id=str(task.id),
+            task_type=(task.first_payload or {}).get("type", ""),
+        )
+        direction_id = str((task.context or {}).get("direction_id") or "")
+        if direction_id:
+            record_direction_result(
+                direction_id,
+                success=False,
+                failure_class=failure_class,
+                project_id=str(task.project_id) if task.project_id else "",
+            )
+    except Exception:
+        logger.exception(f"[ADMIN] Failed to record failure result for task {task.id}")
+
+
 router = APIRouter(
     prefix="/api/admin",
     tags=["admin"],
@@ -538,6 +565,7 @@ async def bulk_action_tasks(
                                     task.latest_status_message = "Iteration cap reached — no follow-on task spawned"
                                     from app.failure_classification import persist_failure_category  # noqa: PLC0415
                                     persist_failure_category(task, "AGENT_TIMEOUT")
+                                    _record_failure_result(task, "AGENT_TIMEOUT")
                                     session.add(task)
                                     await session.commit()
                                     results.append({"task_id": raw_id, "status": "error", "error": "Iteration cap reached"})
@@ -1273,6 +1301,7 @@ async def modify_task(
                             task.latest_status_message = "Iteration cap reached — no follow-on task spawned"
                             from app.failure_classification import persist_failure_category  # noqa: PLC0415
                             persist_failure_category(task, "AGENT_TIMEOUT")
+                            _record_failure_result(task, "AGENT_TIMEOUT")
                             session.add(task)
                             await session.commit()
                             raise HTTPException(
@@ -1475,6 +1504,7 @@ async def trigger_rollup(
             )
             from app.failure_classification import persist_failure_category  # noqa: PLC0415
             persist_failure_category(task, "AGENT_TIMEOUT")
+            _record_failure_result(task, "AGENT_TIMEOUT")
 
     session.add(task)
     await session.commit()

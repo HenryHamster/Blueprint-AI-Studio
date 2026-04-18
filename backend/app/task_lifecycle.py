@@ -89,6 +89,31 @@ def _build_scope_overflow_details(ctx: dict, task_scope: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _record_parent_failure(parent: Task, failure_class: str) -> None:
+    """Record a parent-task FAILED transition in deploy_monitoring and direction health.
+
+    Parent-task failure paths (requeue-limit exhaustion, no-children-to-retry)
+    previously only persisted ``failure_category`` on the row, so they never
+    showed up in ``deploy_monitoring['task_results']`` or fed per-direction
+    health tracking.  Mirrors the logic in routers/agent_status.py.
+    """
+    from app.routers.agent_status import record_task_result
+    record_task_result(
+        success=False,
+        failure_class=failure_class,
+        task_id=str(parent.id),
+        task_type=(parent.first_payload or {}).get("type", ""),
+    )
+    direction_id = str((parent.context or {}).get("direction_id") or "")
+    if direction_id:
+        _shared_state.record_direction_result(
+            direction_id,
+            success=False,
+            failure_class=failure_class,
+            project_id=str(parent.project_id) if parent.project_id else "",
+        )
+
+
 def _build_retry_prompt_suffix(
     failure_class: "str | None",
     original_status_message: "str | None",
@@ -297,6 +322,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         from app.failure_classification import worst_child_failure_category, persist_failure_category
         worst_cat = worst_child_failure_category(failed_children)
         persist_failure_category(parent, worst_cat)
+        _record_parent_failure(parent, worst_cat)
         session.add(parent)
         await session.commit()
         # Create failure alert
@@ -493,6 +519,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 "No failed subtasks to retry and no successful subtasks to roll up"
             )
             persist_failure_category(parent, AGENT_TIMEOUT)
+            _record_parent_failure(parent, AGENT_TIMEOUT)
             session.add(parent)
             await session.commit()
             await _maybe_create_failure_alert(parent, session, parent.latest_status_message)

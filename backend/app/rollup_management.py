@@ -47,6 +47,31 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
 )
 
 
+def _record_rollup_failure_signals(task: Task, failure_class: str) -> None:
+    """Mirror agent_status's terminal-failure bookkeeping for rollup-side FAILEDs.
+
+    Without this, parent failures terminated inside _check_and_trigger_rollup
+    never reach deploy_monitoring['task_results'] or the per-direction streak,
+    so anomaly detection and direction-hold logic can't see them.
+    """
+    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+    from app.shared_state import record_direction_result  # noqa: PLC0415
+    record_task_result(
+        success=False,
+        failure_class=failure_class,
+        task_id=str(task.id),
+        task_type=task.first_payload.get("type", ""),
+    )
+    direction_id = str((task.context or {}).get("direction_id") or "")
+    if direction_id:
+        record_direction_result(
+            direction_id,
+            success=False,
+            failure_class=failure_class,
+            project_id=str(task.project_id) if task.project_id else "",
+        )
+
+
 async def _dispatch_rollup_approval_alert(
     parent: Task, session: AsyncSession, reason: str, pr_number: int | None = None
 ) -> None:
@@ -158,10 +183,9 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 task.status = TaskStatus.FAILED
                 task.latest_status_message = f"PR #{pr_number} closed without merging"
                 from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
-                from app.routers.agent_status import record_task_result  # noqa: PLC0415
                 _fc = classify_failure(task)
                 persist_failure_category(task, _fc)
-                record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
+                _record_rollup_failure_signals(task, _fc)
                 try:
                     async with AsyncSessionLocal() as write_session:
                         db_task = await write_session.get(Task, task.id)
@@ -518,7 +542,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             parent.status = TaskStatus.FAILED
             parent.latest_status_message = f"{len(failed)} of {len(children)} subtask(s) failed, none succeeded"
             from app.failure_classification import worst_child_failure_category, persist_failure_category  # noqa: PLC0415
-            persist_failure_category(parent, worst_child_failure_category(failed))
+            _fc = worst_child_failure_category(failed)
+            persist_failure_category(parent, _fc)
+            _record_rollup_failure_signals(parent, _fc)
             parent.context = _clear_rollup_transient_state(parent.context)
             session.add(parent)
             await _maybe_create_failure_alert(parent, session, f"{len(failed)} subtasks failed, none succeeded")
@@ -565,7 +591,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 f"{failed_count} of {len(children)} subtask(s) failed, none succeeded"
             )
             from app.failure_classification import worst_child_failure_category, persist_failure_category  # noqa: PLC0415
-            persist_failure_category(parent, worst_child_failure_category(failed_children))
+            _fc = worst_child_failure_category(failed_children)
+            persist_failure_category(parent, _fc)
+            _record_rollup_failure_signals(parent, _fc)
             session.add(parent)
             await _maybe_create_failure_alert(
                 parent, session,
@@ -1306,10 +1334,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             parent.context = _clear_rollup_transient_state(parent.context)
                             parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge blocked, fix not spawned (iteration cap)"
                             from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
-                            from app.routers.agent_status import record_task_result  # noqa: PLC0415
                             _fc = classify_failure(parent)
                             persist_failure_category(parent, _fc)
-                            record_task_result(success=False, failure_class=_fc, task_id=str(parent.id), task_type=parent.first_payload.get("type", ""))
+                            _record_rollup_failure_signals(parent, _fc)
                             await _maybe_create_failure_alert(parent, session, f"Rollup PR #{rollup_pr_number} merge blocked — fix iteration cap exhausted, manual intervention required")
                             logger.warning(f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number}")
                             # NOTE: Do NOT delete staging_branch here — it contains
@@ -1348,10 +1375,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         parent.context = _clear_rollup_transient_state(parent.context)
                         parent.latest_status_message = f"Rollup PR #{rollup_pr_number} created but review not spawned (iteration cap)"
                         from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
-                        from app.routers.agent_status import record_task_result  # noqa: PLC0415
                         _fc = classify_failure(parent)
                         persist_failure_category(parent, _fc)
-                        record_task_result(success=False, failure_class=_fc, task_id=str(parent.id), task_type=parent.first_payload.get("type", ""))
+                        _record_rollup_failure_signals(parent, _fc)
                         await _maybe_create_failure_alert(parent, session, f"Rollup PR #{rollup_pr_number} created but review task could not be spawned — iteration cap exhausted")
                         logger.warning(f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number}")
                         # NOTE: Do NOT delete staging_branch here — it contains
@@ -1420,10 +1446,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     parent.context = _clear_rollup_transient_state(parent.context)
                     parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {type(e).__name__}: {e!r}"[:500]
                     from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
-                    from app.routers.agent_status import record_task_result  # noqa: PLC0415
                     _fc = classify_failure(parent)
                     persist_failure_category(parent, _fc)
-                    record_task_result(success=False, failure_class=_fc, task_id=str(parent.id), task_type=parent.first_payload.get("type", ""))
+                    _record_rollup_failure_signals(parent, _fc)
                     await _maybe_create_failure_alert(
                         parent,
                         session,
@@ -1470,7 +1495,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         parent.latest_status_message = f"{failed_count} of {len(children)} subtasks failed"
         from app.failure_classification import worst_child_failure_category, persist_failure_category  # noqa: PLC0415
         _failed_children = [c for c in children if c.status == TaskStatus.FAILED]
-        persist_failure_category(parent, worst_child_failure_category(_failed_children))
+        _fc = worst_child_failure_category(_failed_children)
+        persist_failure_category(parent, _fc)
+        _record_rollup_failure_signals(parent, _fc)
         parent.context = _clear_rollup_transient_state(parent.context)
         session.add(parent)
         await session.commit()

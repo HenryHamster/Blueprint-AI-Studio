@@ -200,6 +200,8 @@ async def _handle_cap_exhaustion(
     from app.main import _maybe_create_failure_alert  # noqa: PLC0415
     from app.github import close_pull_request, create_pr_comment  # noqa: PLC0415
     from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+    from app.routers.agent_status import record_task_result  # noqa: PLC0415
+    from app.shared_state import record_direction_result  # noqa: PLC0415
     from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
 
     cap_label = "global" if scope == "global" else "per-chain"
@@ -251,6 +253,19 @@ async def _handle_cap_exhaustion(
     except Exception as e:
         logger.warning(f"[PIPELINE] Cap-exhaustion: failed to commit orig {resolved_original_id[:8]}: {e}", exc_info=True)
         return
+
+    # Surface cap-exhaustion to deploy_monitoring + direction health tracking.
+    # Without this, cap failures bypass per-type failure gates and anomaly detection.
+    record_task_result(
+        success=False, failure_class=CODE_ERROR,
+        task_id=str(orig.id), task_type=(orig.first_payload or {}).get("type", ""),
+    )
+    _direction_id = str((orig.context or {}).get("direction_id") or "")
+    if _direction_id:
+        record_direction_result(
+            _direction_id, success=False, failure_class=CODE_ERROR,
+            project_id=str(orig.project_id) if orig.project_id else "",
+        )
 
     try:
         gh_token, owner, repo = await get_github_token_for_task(orig.id, session)

@@ -1695,3 +1695,121 @@ async def test_partial_rollup_proceeds_when_requeue_limit_exhausted(cleanup_db, 
     await cleanup_db.refresh(parent)
     # empty_diff path completes the parent
     assert parent.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_parent_failure_stamps_deploy_monitoring(cleanup_db, mocker):
+    """Path 5: when all children fail and the parent is marked FAILED inside
+    _check_and_trigger_rollup, the failure must land in deploy_monitoring's
+    task_results deque AND in the per-direction streak (when direction_id set)
+    so anomaly detection and direction-hold logic can see the failure."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("token", "owner", "repo"),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+    from app.routers.agent_status import _recorded_task_ids
+    import app.shared_state as _ss
+
+    # Reset deploy_monitoring + dedup so the test sees only its own writes
+    _ss.deploy_monitoring["task_results"].clear()
+    _recorded_task_ids.clear()
+    _ss.direction_failure_streaks.clear()
+
+    project = await _make_project(cleanup_db)
+    direction_id = "dir-deploy-monitor-test"
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "_requeue_count": 3,  # exhaust retries → fall through to FAILED
+            "plan_branch": "blueprint/plan-monitor",
+            "parent_base": "main",
+            "direction_id": direction_id,
+        },
+        plan_output="some plan",
+    )
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+
+    # deploy_monitoring captured the parent failure
+    results = list(_ss.deploy_monitoring["task_results"])
+    assert any(r[1] == "failure" and r[2] == "CODE_ERROR" for r in results), \
+        f"Parent FAILED never reached deploy_monitoring: {results}"
+
+    # Per-direction streak incremented (CODE_ERROR is not infra → counts)
+    streak = _ss.direction_failure_streaks.get(direction_id)
+    assert streak is not None
+    assert streak["consecutive_failures"] == 1
+    assert streak["last_failure_class"] == "CODE_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_parent_failure_after_pr_verification_stamps_deploy_monitoring(
+    cleanup_db, mocker
+):
+    """Path 7 (line ~590): when _verify_pr_merged flips the only completed child
+    to FAILED so completed_count drops to zero, the parent is marked FAILED in
+    the all_done branch. That terminal path must also reach deploy_monitoring."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("token", "owner", "repo"),
+    )
+    # _verify_pr_merged returns True (so all_done loop completes) but the
+    # mocked side-effect flips the child to FAILED before the rollup branch runs.
+    async def _flip_to_failed(task, _session):
+        task.status = TaskStatus.FAILED
+        task.context = {**(task.context or {}), "failure_category": "AGENT_TIMEOUT"}
+        return True
+    mocker.patch(
+        "app.rollup_management._verify_pr_merged",
+        side_effect=_flip_to_failed,
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+    from app.routers.agent_status import _recorded_task_ids
+    import app.shared_state as _ss
+
+    _ss.deploy_monitoring["task_results"].clear()
+    _recorded_task_ids.clear()
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "plan_branch": "blueprint/plan-flip",
+            "parent_base": "main",
+        },
+        plan_output="some plan",
+    )
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={},  # _verify_pr_merged flips this to FAILED before all_done branch
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    results = list(_ss.deploy_monitoring["task_results"])
+    assert any(r[1] == "failure" and r[2] == "AGENT_TIMEOUT" for r in results), \
+        f"Post-verification parent FAILED never reached deploy_monitoring: {results}"

@@ -268,6 +268,101 @@ async def test_requeue_limit_persists_failure_category(tl_db):
 
 
 @pytest.mark.asyncio
+async def test_requeue_limit_records_deploy_monitoring_result(tl_db):
+    """Parent at requeue limit appends a failure entry to deploy_monitoring.task_results.
+
+    Regression guard: previously _requeue_parent_task set FAILED + persisted
+    failure_category but never called record_task_result, so parent-task failures
+    were invisible to deploy health / per-type failure gates.
+    """
+    import app.shared_state as _ss
+    from app.routers.agent_status import _recorded_task_ids
+
+    _ss.deploy_monitoring["task_results"].clear()
+    _recorded_task_ids.clear()
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    await _make_task(
+        session, project.id, status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"failure_category": "CODE_ERROR"},
+        latest_status_message="tests failed",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    entries = list(_ss.deploy_monitoring["task_results"])
+    matching = [e for e in entries if e[1] == "failure" and e[2] == "CODE_ERROR"]
+    assert matching, f"expected a CODE_ERROR failure entry, got {entries}"
+
+
+@pytest.mark.asyncio
+async def test_requeue_limit_records_direction_result_on_non_infra_failure(tl_db):
+    """Parent at requeue limit with direction_id + non-infra failure increments direction streak."""
+    import app.shared_state as _ss
+    from app.routers.agent_status import _recorded_task_ids
+
+    _ss.direction_failure_streaks.clear()
+    _recorded_task_ids.clear()
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3, "direction_id": "d-test-42"},
+    )
+    await _make_task(
+        session, project.id, status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"failure_category": "CODE_ERROR"},
+        latest_status_message="tests failed",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    streak = _ss.direction_failure_streaks.get("d-test-42")
+    assert streak is not None, "expected direction streak to be recorded"
+    assert streak["consecutive_failures"] == 1
+    assert streak["last_failure_class"] == "CODE_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_requeue_no_children_to_retry_records_deploy_monitoring_result(tl_db):
+    """Parent with only CANCELLED children (no failed, no active) records AGENT_TIMEOUT failure.
+
+    Covers the second parent-failure path in _requeue_parent_task: retried_count == 0
+    and no successful/active children — parent is marked FAILED with AGENT_TIMEOUT.
+    """
+    import app.shared_state as _ss
+    from app.routers.agent_status import _recorded_task_ids
+
+    _ss.deploy_monitoring["task_results"].clear()
+    _recorded_task_ids.clear()
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    # Only a CANCELLED child → retried_count=0, no completed, no active.
+    await _make_task(
+        session, project.id, status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    entries = list(_ss.deploy_monitoring["task_results"])
+    matching = [e for e in entries if e[1] == "failure" and e[2] == "AGENT_TIMEOUT"]
+    assert matching, f"expected an AGENT_TIMEOUT failure entry, got {entries}"
+
+
+@pytest.mark.asyncio
 async def test_requeue_cancels_failed_children_and_creates_clones(tl_db, mocker):
     """Failed children are cancelled and replaced with QUEUED clones."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)

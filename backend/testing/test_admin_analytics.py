@@ -1,4 +1,5 @@
 """Tests for admin_analytics endpoints."""
+import uuid
 from collections import deque
 from datetime import timedelta
 
@@ -102,3 +103,90 @@ class TestFailingTaskTypes:
         types_gated = [e["task_type"] for e in resp.json()["gated_types"]]
         assert "create" in types_gated
         assert "review" not in types_gated
+
+
+class TestAdminRecordFailureResult:
+    """Cover the _record_failure_result helper used on admin.py failure paths
+    (bulk/manual review spawn cap reached, rollup review spawn cap reached)."""
+
+    @pytest.mark.asyncio
+    async def test_appends_failure_to_deploy_monitoring(self, _reset_task_results):
+        """A failure recorded via the helper shows up in deploy_monitoring task_results."""
+        from app.admin import _record_failure_result
+        from app.models import Task, TaskStatus
+        from app.routers.agent_status import _recorded_task_ids
+
+        task_id = uuid.uuid4()
+        _recorded_task_ids.discard(str(task_id))
+        task = Task(
+            id=task_id,
+            project_id=uuid.uuid4(),
+            title="t",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "review", "prompt": "x"}],
+        )
+
+        _record_failure_result(task, "AGENT_TIMEOUT")
+
+        results = list(shared_state.deploy_monitoring["task_results"])
+        assert len(results) == 1
+        _ts, outcome, failure_class, task_type = results[0]
+        assert outcome == "failure"
+        assert failure_class == "AGENT_TIMEOUT"
+        assert task_type == "review"
+
+    @pytest.mark.asyncio
+    async def test_updates_direction_streak_for_non_infra_class(self, _reset_task_results):
+        """When the task has a direction_id and failure_class is non-infra (e.g. CODE_ERROR),
+        record_direction_result updates the direction failure streak."""
+        from app.admin import _record_failure_result
+        from app.models import Task, TaskStatus
+        from app.routers.agent_status import _recorded_task_ids
+
+        direction_id = str(uuid.uuid4())
+        shared_state.direction_failure_streaks.pop(direction_id, None)
+        task_id = uuid.uuid4()
+        _recorded_task_ids.discard(str(task_id))
+        task = Task(
+            id=task_id,
+            project_id=uuid.uuid4(),
+            title="t",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create", "prompt": "x"}],
+            context={"direction_id": direction_id},
+        )
+
+        _record_failure_result(task, "CODE_ERROR")
+
+        streak = shared_state.direction_failure_streaks.get(direction_id)
+        assert streak is not None
+        assert streak["consecutive_failures"] == 1
+        assert streak["last_failure_class"] == "CODE_ERROR"
+        shared_state.direction_failure_streaks.pop(direction_id, None)
+
+    @pytest.mark.asyncio
+    async def test_agent_timeout_does_not_touch_direction_streak(self, _reset_task_results):
+        """Infra classes (AGENT_TIMEOUT) are ignored by direction health tracking."""
+        from app.admin import _record_failure_result
+        from app.models import Task, TaskStatus
+        from app.routers.agent_status import _recorded_task_ids
+
+        direction_id = str(uuid.uuid4())
+        shared_state.direction_failure_streaks.pop(direction_id, None)
+        task_id = uuid.uuid4()
+        _recorded_task_ids.discard(str(task_id))
+        task = Task(
+            id=task_id,
+            project_id=uuid.uuid4(),
+            title="t",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "review", "prompt": "x"}],
+            context={"direction_id": direction_id},
+        )
+
+        _record_failure_result(task, "AGENT_TIMEOUT")
+
+        assert direction_id not in shared_state.direction_failure_streaks
+        results = list(shared_state.deploy_monitoring["task_results"])
+        assert len(results) == 1
+        assert results[0][2] == "AGENT_TIMEOUT"

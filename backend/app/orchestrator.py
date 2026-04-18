@@ -1631,6 +1631,24 @@ async def orchestrator_worker():
                                                         failed_task, inner_session,
                                                         (provision_err or "unknown error")[:200]
                                                     )
+                                                    try:
+                                                        record_task_result(
+                                                            success=False,
+                                                            failure_class="PROVISION_FAILURE",
+                                                            task_id=str(failed_task.id),
+                                                            task_type=(failed_task.first_payload or {}).get("type", ""),
+                                                        )
+                                                        _direction_id = str((failed_task.context or {}).get("direction_id") or "")
+                                                        if _direction_id:
+                                                            from app.shared_state import record_direction_result as _rdr
+                                                            _rdr(
+                                                                _direction_id,
+                                                                success=False,
+                                                                failure_class="PROVISION_FAILURE",
+                                                                project_id=str(failed_task.project_id) if failed_task.project_id else "",
+                                                            )
+                                                    except Exception:
+                                                        logger.exception(f"[ORCHESTRATOR] Failed to record provision-exhaustion result for task {t_id}")
                                                     logger.error(f"[ORCHESTRATOR] Task {t_id} provision failed {prov_failures} times — permanent failure")
                                                 else:
                                                     # Requeue for retry

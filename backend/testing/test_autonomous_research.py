@@ -4873,3 +4873,198 @@ def test_detect_dedup_deadlock_productive_cycle_breaks_window():
     deadlocked, consec = _detect_dedup_deadlock(history)
     assert deadlocked is False
     assert consec == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _spawn_direction_hold_investigation
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def _clear_direction_streaks():
+    _shared_state.direction_failure_streaks.clear()
+    yield
+    _shared_state.direction_failure_streaks.clear()
+
+
+async def _hold_direction(direction_id: str, project_id: str, *, failure_class: str = "CODE_ERROR"):
+    from app.shared_state import record_direction_result, DIRECTION_HOLD_THRESHOLD
+    for _ in range(DIRECTION_HOLD_THRESHOLD):
+        record_direction_result(direction_id, success=False, failure_class=failure_class, project_id=project_id)
+
+
+@pytest.mark.asyncio
+async def test_investigation_spawns_on_direction_hold(db_session, _clear_direction_streaks):
+    from app.autonomous_research import _spawn_direction_hold_investigation
+    direction_id = "d-held0001"
+    project = Project(
+        name="Hold Spawn",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(direction_id, text="Investigate me")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _hold_direction(direction_id, str(project.id))
+
+    # Seed a failed task for this direction so failure context is included
+    failed = Task(
+        project_id=project.id,
+        title="Failed task",
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="TypeError: object has no attribute 'x'",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+    await db_session.commit()
+
+    spawned = await _spawn_direction_hold_investigation(project, db_session)
+    assert spawned == 1
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    investigations = [
+        t for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "investigate"
+    ]
+    assert len(investigations) == 1
+    inv = investigations[0]
+    assert inv.context["direction_id"] == direction_id
+    assert inv.context["spawned_by"] == "direction_hold_investigation"
+    assert inv.context["last_failure_class"] == "CODE_ERROR"
+    # Failure context should reach the prompt
+    prompt = inv.payloads[0]["prompt"]
+    assert direction_id in prompt
+    assert "TypeError" in prompt
+
+
+@pytest.mark.asyncio
+async def test_investigation_not_duplicated_when_in_flight(db_session, _clear_direction_streaks):
+    from app.autonomous_research import _spawn_direction_hold_investigation
+    direction_id = "d-held0002"
+    project = Project(
+        name="Hold Dedup",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(direction_id)],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _hold_direction(direction_id, str(project.id))
+
+    # Pre-existing in-flight investigation for this direction
+    existing = Task(
+        project_id=project.id,
+        title="Already investigating",
+        payloads=[{"type": "investigate", "prompt": "in-flight"}],
+        context={"direction_id": direction_id, "spawned_by": "direction_hold_investigation"},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    spawned = await _spawn_direction_hold_investigation(project, db_session)
+    assert spawned == 0
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    investigations = [
+        t for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "investigate"
+    ]
+    assert len(investigations) == 1  # still just the pre-existing one
+
+
+@pytest.mark.asyncio
+async def test_investigation_skipped_when_no_hold(db_session, _clear_direction_streaks):
+    from app.autonomous_research import _spawn_direction_hold_investigation
+    project = Project(
+        name="No Hold",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-nohold01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_direction_hold_investigation(project, db_session)
+    assert spawned == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# anomaly_detection._spawn_held_direction_investigations
+# (cross-project wrapper wired into anomaly_maintenance_sweep)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_anomaly_sweep_spawns_for_held_direction(db_session, _clear_direction_streaks):
+    """Sweep-level helper iterates held directions and spawns investigations,
+    even for projects that are not autonomous-enabled."""
+    from app.anomaly_detection import _spawn_held_direction_investigations
+    direction_id = "d-sweep001"
+    project = Project(
+        name="Sweep Hold",
+        user_id="test-user-123",
+        autonomous_enabled=False,
+        directions=[_active_direction(direction_id, text="Sweep direction")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _hold_direction(direction_id, str(project.id))
+
+    spawned = await _spawn_held_direction_investigations(db_session)
+    assert spawned == 1
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    investigations = [
+        t for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "investigate"
+    ]
+    assert len(investigations) == 1
+    assert investigations[0].context["direction_id"] == direction_id
+    assert investigations[0].context["spawned_by"] == "direction_hold_investigation"
+
+
+@pytest.mark.asyncio
+async def test_anomaly_sweep_dedups_across_projects(db_session, _clear_direction_streaks):
+    """Sweep respects the per-direction in-flight dedup guard."""
+    from app.anomaly_detection import _spawn_held_direction_investigations
+    direction_id = "d-sweep002"
+    project = Project(
+        name="Sweep Dedup",
+        user_id="test-user-123",
+        autonomous_enabled=False,
+        directions=[_active_direction(direction_id)],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _hold_direction(direction_id, str(project.id))
+
+    existing = Task(
+        project_id=project.id,
+        title="Already investigating",
+        payloads=[{"type": "investigate", "prompt": "in-flight"}],
+        context={"direction_id": direction_id, "spawned_by": "direction_hold_investigation"},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    spawned = await _spawn_held_direction_investigations(db_session)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_anomaly_sweep_noop_without_holds(db_session, _clear_direction_streaks):
+    from app.anomaly_detection import _spawn_held_direction_investigations
+    spawned = await _spawn_held_direction_investigations(db_session)
+    assert spawned == 0

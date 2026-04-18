@@ -860,6 +860,114 @@ async def _check_autonomous_research(owner: str, repo: str):
         logger.error(f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}", exc_info=True)
 
 
+async def _spawn_direction_hold_investigation(project: Project, session: AsyncSession) -> int:
+    """Auto-spawn an investigate-type task for each held direction in the project.
+
+    A direction enters the held state after 3 consecutive CODE_ERROR failures (see
+    shared_state.record_direction_result). Without this spawn, the hold silently
+    expires after DIRECTION_HOLD_TIMEOUT_HOURS and the direction resumes blindly
+    retrying. Investigation reports are consumed by _handle_investigation_completion,
+    which can then drive targeted remediation.
+    """
+    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+    held = _shared_state.get_held_directions()
+    if not held:
+        return 0
+
+    project_id_str = str(project.id)
+    direction_map = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
+    spawned = 0
+
+    in_flight = (await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status.in_([
+                TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+            ]),
+        )
+    )).scalars().all()
+    in_flight_dir_ids = {
+        (t.context or {}).get("direction_id")
+        for t in in_flight
+        if (t.context or {}).get("spawned_by") == "direction_hold_investigation"
+    }
+
+    for direction_id, hold_info in held.items():
+        if hold_info.get("project_id") != project_id_str:
+            continue
+        direction = direction_map.get(direction_id)
+        if not direction:
+            continue
+        if direction_id in in_flight_dir_ids:
+            continue
+
+        recent_failed = (await session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.status == TaskStatus.FAILED,
+            ).order_by(Task.created_at.desc()).limit(30)
+        )).scalars().all()
+        dir_failures = [
+            t for t in recent_failed if (t.context or {}).get("direction_id") == direction_id
+        ][:5]
+
+        failure_lines = []
+        fingerprints: list[str] = []
+        for t in dir_failures:
+            err = (t.latest_status_message or "(no message)")[:240]
+            fp = _error_fingerprint(err)
+            fingerprints.append(fp)
+            failure_lines.append(f"- [{str(t.id)[:8]}] fp={fp} | {err}")
+        failure_block = "\n".join(failure_lines) if failure_lines else "(no recent failure details available)"
+
+        direction_text = (direction.get("text") or "?")[:300]
+        fc = hold_info.get("last_failure_class") or "CODE_ERROR"
+        streak_n = hold_info.get("consecutive_failures", "?")
+        prompt = (
+            f"Direction '{direction_text}' (id: {direction_id}) has been placed on hold "
+            f"after {streak_n} consecutive {fc} failures. Diagnose the underlying root cause "
+            f"so the direction can resume.\n\n"
+            f"Recent failed tasks for this direction:\n{failure_block}\n\n"
+            f"Produce the structured diagnosis JSON report. Focus on shared failure patterns "
+            f"across the tasks above (same fingerprint = same root cause)."
+        )
+
+        payload = validate_internal_payload(
+            {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+            "autonomous_research:direction_hold_investigation",
+        )
+        new_task = Task(
+            project_id=project.id,
+            title=f"Investigate direction hold: {direction_text[:80]}",
+            description=f"Auto-spawned on direction {direction_id[:8]} hold ({streak_n} {fc} failures)",
+            payloads=[payload],
+            context={
+                "direction_id": direction_id,
+                "spawned_by": "direction_hold_investigation",
+                "hold_reason": hold_info.get("reason", ""),
+                "last_failure_class": fc,
+                "failure_fingerprints": fingerprints,
+            },
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(new_task)
+        session.add(TaskHistory(
+            task_id=new_task.id, action="SPAWNED",
+            details={"spawned_by": "DIRECTION_HOLD_INVESTIGATION", "direction_id": direction_id},
+        ))
+        logger.info(
+            f"[DIRECTION HEALTH] Spawned investigation task {new_task.id} for held direction {direction_id}"
+        )
+        spawned += 1
+
+    if spawned:
+        await session.commit()
+    return spawned
+
+
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
     from app.anomaly_detection import _expire_stale_proposals, _check_anomaly_proposals  # noqa: PLC0415
@@ -911,6 +1019,8 @@ async def _check_idle_research():
 
                 # Check persistent anomalies for direction proposals (regardless of VM slots)
                 await _check_anomaly_proposals(project, session)
+                # Auto-spawn investigation tasks for any directions placed on hold
+                await _spawn_direction_hold_investigation(project, session)
                 await session.commit()
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)

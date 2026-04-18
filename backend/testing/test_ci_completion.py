@@ -485,6 +485,65 @@ async def test_merge_failure_hard_cap_marks_failed(db_session, mocker):
     assert "hard-capped" in alert_mock.call_args[0][2].lower()
 
 
+@pytest.mark.asyncio
+async def test_merge_failure_hard_cap_records_deploy_monitoring_result(db_session, mocker):
+    """
+    Hard-cap FAILED terminations must appear in deploy_monitoring.task_results so
+    per-type failure gates and anomaly detection see them. Previously these paths
+    set status=FAILED silently without calling record_task_result.
+    """
+    from app.ci_completion import (
+        MERGE_FAILURE_HARD_CAP,
+        _attempt_merge_with_retry_and_escalation,
+    )
+    from app.routers.agent_status import _recorded_task_ids
+    from app.shared_state import deploy_monitoring, direction_failure_streaks
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "server error"},
+    )
+
+    _recorded_task_ids.clear()
+    deploy_monitoring["task_results"].clear()
+    direction_id = uuid.uuid4().hex
+    direction_failure_streaks.pop(direction_id, None)
+
+    project = Project(name="Hard cap monitoring test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project, ci_loop_extra={
+        "merge_failures": MERGE_FAILURE_HARD_CAP - 1,
+    })
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert task.status == TaskStatus.FAILED
+    results = list(deploy_monitoring["task_results"])
+    assert any(r[1] == "failure" for r in results), (
+        f"Expected a failure entry in deploy_monitoring.task_results, got {results}"
+    )
+    assert str(task.id) in _recorded_task_ids
+    # Direction health tracking must also see this failure
+    streak = direction_failure_streaks.get(direction_id)
+    assert streak is not None, "record_direction_result should register a streak entry"
+    assert streak["consecutive_failures"] >= 1
+
+
 # ---------------------------------------------------------------------------
 # 5. Already-merged race condition
 # ---------------------------------------------------------------------------
