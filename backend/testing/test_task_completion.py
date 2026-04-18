@@ -779,6 +779,93 @@ class TestRecordRemediationOutcome:
         assert updated is False
         assert "remediation_attempts" not in project.directions[0]
 
+    @pytest.mark.asyncio
+    async def test_increments_when_fingerprint_matches(self, db_session):
+        """Same fingerprint as prior remediation increments attempts."""
+        project = make_project(directions=[{
+            "id": "dir-1",
+            "status": "active",
+            "remediation_attempts": 2,
+            "last_remediation_fingerprint": "fp-same",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-1",
+                "diagnosis_fingerprint": "fp-same",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_outcome(task, merged=False, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert project.directions[0]["remediation_attempts"] == 3
+
+    @pytest.mark.asyncio
+    async def test_resets_when_fingerprint_differs(self, db_session):
+        """Different fingerprint means a new root cause — counter resets to 1."""
+        project = make_project(directions=[{
+            "id": "dir-1",
+            "status": "active",
+            "remediation_attempts": 2,
+            "last_remediation_fingerprint": "fp-old",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={
+                "diagnosis_task_id": "diag-2",
+                "direction_id": "dir-1",
+                "diagnosis_fingerprint": "fp-new",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["remediation_attempts"] == 1
+        assert d["last_remediation_fingerprint"] == "fp-new"
+
+    @pytest.mark.asyncio
+    async def test_increments_when_no_fingerprint_available(self, db_session):
+        """Missing fingerprint on context falls back to conservative increment."""
+        project = make_project(directions=[{
+            "id": "dir-1",
+            "status": "active",
+            "remediation_attempts": 1,
+            "last_remediation_fingerprint": "fp-prior",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={"diagnosis_task_id": "diag-3", "direction_id": "dir-1"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_outcome(task, merged=False, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["remediation_attempts"] == 2
+        assert d["last_remediation_fingerprint"] == "fp-prior"
+
 
 # ── _record_remediation_if_terminal ─────────────────────────────────────────
 

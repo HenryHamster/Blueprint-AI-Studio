@@ -22,6 +22,15 @@ logger = logging.getLogger(__name__)
 
 _MAX_AUTO_PAUSE_CYCLES = 3
 
+# Remediation monitor window: if a merged remediation happened longer ago than this,
+# a new failure is presumed unrelated and the stale window is cleared instead of
+# triggering escalation.
+_REMEDIATION_MONITOR_EXPIRY_DAYS = 7
+
+# Max time an investigation task may hold diagnosis_in_progress before flags are considered stale.
+# Investigations typically finish in minutes; 4h is a safety ceiling to recover from reaped/timed-out tasks.
+_DIAGNOSIS_STALE_HOURS = 4
+
 # Recent failed tasks to scan when computing the dominant error fingerprint
 _FINGERPRINT_SAMPLE_SIZE = 10
 # Min matching failures required for a fingerprint to count as "dominant" for the direction
@@ -101,12 +110,40 @@ async def _spawn_direction_diagnosis(
         f"infra_failed={e.get('tasks_failed_infra', 0)} merged={e.get('prs_merged', 0)}"
         for e in history[-5:]
     ) or "- (no research history)"
+    recent_failures = (await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status == TaskStatus.FAILED,
+            Task.context["direction_id"].as_string() == str(direction_id),
+        ).order_by(Task.created_at.desc()).limit(3)
+    )).scalars().all()
+    failure_lines = "\n".join(
+        f"- {(t.latest_status_message or '(no message)').strip()[:200]}"
+        for t in recent_failures
+    ) or "- (no recent failed tasks)"
+    fingerprint = direction.get("error_fingerprint")
+    try:
+        if not fingerprint:
+            fingerprint = await _compute_direction_error_fingerprint(
+                project.id, str(direction_id), session,
+            )
+    except Exception as _fp_exc:
+        logger.warning(f"[DIAGNOSIS] Failed to compute error fingerprint for {direction_id}: {_fp_exc!r}")
+        fingerprint = None
+    prior_diagnosis = (direction.get("diagnosis_summary") or "").strip()
+    extras = ""
+    if fingerprint:
+        extras += f"Dominant error fingerprint: {fingerprint[:200]}\n"
+    if prior_diagnosis:
+        extras += f"Prior diagnosis summary: {prior_diagnosis[:400]}\n"
     prompt = (
         f"A research direction was auto-paused for repeated code failures.\n\n"
         f"Direction: {direction.get('text', '')[:200]}\n"
         f"Pause reason: {pause_reason}\n"
-        f"Auto-pause count: {direction.get('auto_pause_count', 0)}\n\n"
+        f"Auto-pause count: {direction.get('auto_pause_count', 0)}\n"
+        f"{extras}\n"
         f"Recent cycles (tasks_created / failed / infra_failed / merged):\n{recent_lines}\n\n"
+        f"Recent failed task messages (truncated):\n{failure_lines}\n\n"
         f"Investigate why tasks spawned for this direction keep failing. "
         f"Identify the root cause (direction scope, code complexity, systemic "
         f"architectural issue), affected files, and a recommended fix."
@@ -200,6 +237,26 @@ async def _process_direction_lifecycle(
                 f"[RESEARCH] Skipping direction {did}: research cycle already active"
             )
             continue
+        # Clear stale diagnosis flags so a re-paused direction can be diagnosed again.
+        # If the investigation task was reaped/timed out without reaching the completion handler,
+        # diagnosis_in_progress stays True and permanently blocks future diagnosis spawning.
+        if d.get("diagnosis_in_progress"):
+            started_at = d.get("diagnosis_started_at")
+            is_stale = True
+            if started_at:
+                try:
+                    age_h = (_utcnow() - datetime.fromisoformat(started_at)).total_seconds() / 3600
+                    is_stale = age_h >= _DIAGNOSIS_STALE_HOURS
+                except (ValueError, TypeError):
+                    is_stale = True
+            if is_stale:
+                logger.warning(
+                    f"[DIAGNOSIS] Clearing stale diagnosis flags for direction {did} "
+                    f"(started_at={started_at})"
+                )
+                d.pop("diagnosis_in_progress", None)
+                d.pop("diagnosis_started_at", None)
+                directions_modified = True
         last_researched = d.get("last_researched_at")
         if last_researched:
             minutes_ago = (now - datetime.fromisoformat(last_researched)).total_seconds() / 60
@@ -236,7 +293,33 @@ async def _process_direction_lifecycle(
             # Re-pause while remediation monitoring is active means the fix did not hold.
             # Flag for manual intervention once attempts reach the escalation threshold so
             # the diagnostics API and notification dispatcher can surface it to operators.
-            if d.get("remediation_monitor_started_at") and d.get("remediation_attempts", 0) >= 3:
+            monitor_started_at = d.get("remediation_monitor_started_at")
+            monitor_expired = False
+            if monitor_started_at:
+                try:
+                    age_days = (_utcnow() - datetime.fromisoformat(monitor_started_at)).total_seconds() / 86400
+                    if age_days > _REMEDIATION_MONITOR_EXPIRY_DAYS:
+                        monitor_expired = True
+                        d.pop("remediation_monitor_started_at", None)
+                        logger.info(
+                            f"[AUTONOMOUS] Cleared stale remediation monitor on {did} "
+                            f"(age {age_days:.1f}d > {_REMEDIATION_MONITOR_EXPIRY_DAYS}d)"
+                        )
+                except (TypeError, ValueError):
+                    pass
+            # Only escalate when the monitor is active AND the recurring failure matches
+            # the fingerprint we already remediated (or fingerprint data is unavailable —
+            # conservative fallback so we don't silently drop escalations).
+            current_fp = d.get("error_fingerprint")
+            last_rem_fp = d.get("last_remediation_fingerprint")
+            fingerprints_match = (
+                not current_fp or not last_rem_fp or str(current_fp) == str(last_rem_fp)
+            )
+            if (
+                monitor_started_at and not monitor_expired
+                and d.get("remediation_attempts", 0) >= 3
+                and fingerprints_match
+            ):
                 d["needs_manual_intervention"] = True
                 logger.warning(
                     f"[AUTONOMOUS] Direction {did} flagged needs_manual_intervention "

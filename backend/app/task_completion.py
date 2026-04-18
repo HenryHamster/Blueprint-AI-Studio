@@ -73,12 +73,17 @@ async def _record_remediation_outcome(
     target = next((d for d in directions if d.get("id") == direction_id), None)
     if target is None:
         return False
-    target["remediation_attempts"] = int(target.get("remediation_attempts") or 0) + 1
+    fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint")
+    prior_fingerprint = target.get("last_remediation_fingerprint")
+    prior_attempts = int(target.get("remediation_attempts") or 0)
+    if fingerprint and prior_fingerprint and str(fingerprint) != str(prior_fingerprint):
+        target["remediation_attempts"] = 1
+    else:
+        target["remediation_attempts"] = prior_attempts + 1
     target["last_remediation_result"] = "merged" if merged else "failed"
     target["last_remediation_at"] = _utcnow().isoformat()
     target["last_remediation_diagnosis_task_id"] = str(diagnosis_task_id)
     target["last_remediation_task_id"] = str(task.id)
-    fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint")
     if fingerprint:
         target["last_remediation_fingerprint"] = str(fingerprint)
     project.directions = directions

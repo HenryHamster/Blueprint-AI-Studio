@@ -368,6 +368,74 @@ async def test_re_pause_after_merged_remediation_escalates(db_session, mocker):
     assert "Remediation escalation" in escalations[0].content
 
 
+async def _run_escalation_scenario(db_session, mocker, *, current_fp, last_rem_fp, monitor_age_hours):
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=current_fp,
+    )
+    direction = {
+        "id": "d-esc",
+        "text": "Re-pausing direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [
+            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+            {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+        ],
+        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=monitor_age_hours)).isoformat(),
+        "remediation_attempts": 3,
+        "last_remediation_result": "merged",
+        "last_remediation_fingerprint": last_rem_fp,
+    }
+    project = Project(
+        name="Escalation scenario",
+        user_id="u-e2e",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    return project.directions[0]
+
+
+@pytest.mark.asyncio
+async def test_escalation_fires_when_fingerprints_match(db_session, mocker):
+    d = await _run_escalation_scenario(
+        db_session, mocker, current_fp="fp-same", last_rem_fp="fp-same", monitor_age_hours=1,
+    )
+    assert d.get("needs_manual_intervention") is True
+
+
+@pytest.mark.asyncio
+async def test_escalation_skipped_when_fingerprints_differ(db_session, mocker):
+    d = await _run_escalation_scenario(
+        db_session, mocker, current_fp="fp-new", last_rem_fp="fp-old", monitor_age_hours=1,
+    )
+    assert d.get("needs_manual_intervention") is not True
+
+
+@pytest.mark.asyncio
+async def test_stale_monitor_cleared_without_escalation(db_session, mocker):
+    d = await _run_escalation_scenario(
+        db_session, mocker, current_fp="fp-same", last_rem_fp="fp-same",
+        monitor_age_hours=24 * 30,
+    )
+    assert d.get("needs_manual_intervention") is not True
+    assert "remediation_monitor_started_at" not in d
+
+
 @pytest.mark.asyncio
 async def test_structural_diagnosis_appends_note_no_remediation(db_session, mocker):
     """A structural diagnosis appends a direction note but does not spawn a remediation task."""
