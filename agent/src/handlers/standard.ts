@@ -827,13 +827,13 @@ Output ONLY a JSON object in a \`\`\`json code fence:
 
               if (isInsufficient(parsedTruncatedFiles)) {
                 reviewCategories.push('incomplete_review');
-                parsedVerdict = 'PASS';
+                parsedVerdict = 'FAIL';
                 const unreviewedAfter = computeMissing(parsedTruncatedFiles);
                 if (unreviewedAfter.length > 0) {
                   unreviewedFiles = unreviewedAfter;
-                  sendLog(ws, `Self-review: truncation retry still missing ${unreviewedAfter.length} file(s) — flagging review as incomplete and forcing PASS. Unreviewed: ${unreviewedAfter.join(', ')}\n`);
+                  sendLog(ws, `Self-review: truncation retry still missing ${unreviewedAfter.length} file(s) — flagging review as incomplete and failing. Unreviewed: ${unreviewedAfter.join(', ')}\n`);
                 } else {
-                  sendLog(ws, 'Self-review: truncation retry still reported zero files read — flagging review as incomplete and forcing PASS.\n');
+                  sendLog(ws, 'Self-review: truncation retry still reported zero files read — flagging review as incomplete and failing.\n');
                 }
               }
             }

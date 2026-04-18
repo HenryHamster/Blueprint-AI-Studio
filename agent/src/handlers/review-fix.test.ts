@@ -77,6 +77,7 @@ beforeEach(() => {
   vi.mocked(indexMod.apiGet).mockResolvedValue({ data: { token: 'fresh' } });
   vi.mocked(indexMod.testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' });
   vi.mocked(indexMod.captureTestBaseline).mockResolvedValue(null);
+  vi.mocked(indexMod.lintFixLoop).mockResolvedValue(true);
   // fetch is used by handleReview for PR metadata
   global.fetch = vi.fn().mockResolvedValue({
     ok: true,

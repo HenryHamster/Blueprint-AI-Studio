@@ -1313,7 +1313,7 @@ describe('self-review phase', () => {
     expect(outcome.truncated_files_read).toEqual(['file1.ts', 'file2.ts']);
   });
 
-  it('flags incomplete_review and forces PASS when truncation retry also reports zero files read', async () => {
+  it('flags incomplete_review and forces FAIL when truncation retry also reports zero files read', async () => {
     const emptyJson = '{"verdict":"FAIL","checks_performed":[],"issues_found":1,"truncated_files_read":[]}';
     const longDiff = 'x'.repeat(3500);
     vi.mocked(runClaudeCode)
@@ -1334,16 +1334,16 @@ describe('self-review phase', () => {
       .mockReturnValue('');
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    // PR should be created (PASS forced) — not blocked
-    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+    // PR should NOT be created — incomplete review now forces FAIL, blocking PR
+    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1] as Record<string, unknown>).status === 'FAILED',
     );
     expect(statusCall).toBeDefined();
     const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
     expect(outcome.categories).toContain('truncation_not_verified');
     expect(outcome.categories).toContain('incomplete_review');
-    expect(outcome.verdict).toBe('PASS'); // forced PASS despite pass 1 reporting FAIL
+    expect(outcome.verdict).toBe('FAIL');
   });
 
   it('does not run truncation retry when failOnTestFailure is false (handleQA)', async () => {
@@ -1401,12 +1401,12 @@ describe('self-review phase', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3); // retry did run
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1] as Record<string, unknown>).status === 'FAILED',
     );
     const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
     expect(outcome.categories).toContain('truncation_not_verified');
     expect(outcome.categories).toContain('incomplete_review');
-    expect(outcome.verdict).toBe('PASS');
+    expect(outcome.verdict).toBe('FAIL');
     expect(outcome.unreviewed_files).toEqual(['d.ts', 'e.ts']);
     expect(outcome.truncated_files_read).toEqual(expect.arrayContaining(['a.ts', 'b.ts', 'c.ts']));
   });

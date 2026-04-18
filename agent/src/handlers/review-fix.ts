@@ -809,9 +809,35 @@ export async function handleFix(
       ? git(['diff', '--name-only', `${fixBaseCommit}..HEAD`]).split('\n').filter(Boolean)
       : [];
     const changedPaths = [...new Set([...fixUncommittedPaths, ...fixCommittedPaths])];
-    await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort, fixBuildConfig);
+    const lintPassed = await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort, fixBuildConfig);
+    if (!lintPassed) {
+      sendLog(ws, 'Lint checks still failing after max attempts — failing review-fix cycle early.\n');
+      await persistAndPostStatus(taskId, {
+        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+        logs: 'Lint/build checks failed after max fix attempts during review-fix cycle.',
+        failure_category: 'lint_failed',
+        changed_files: changedPaths.slice(0, 50),
+      });
+      return;
+    }
 
-    const { testFailuresDetected: fixTestFailures, failureSummary: fixTestFailureSummary } = await testFixLoop(ws, statusRef, model, effort, buildConfig, fixBaselineFailures);
+    const { testFailuresDetected: fixTestFailures, passed: fixTestsPassed, failureSummary: fixTestFailureSummary } = await testFixLoop(ws, statusRef, model, effort, buildConfig, fixBaselineFailures);
+
+    // Match standard handler behaviour: if tests still fail after the fix loop,
+    // fail the task rather than pushing known-broken code into the review pipeline.
+    if (fixTestFailures && !fixTestsPassed) {
+      sendLog(ws, 'Tests failed after review-fix — marking task as FAILED instead of pushing known-broken code.\n');
+      const failedLogs = fixTestFailureSummary
+        ? `Test suite failed after review-fix attempts. Failing tests:\n${fixTestFailureSummary}`
+        : `Test suite failed after review-fix attempts. Last output:\n${sanitize(allOutput.slice(-10_000))}`;
+      await persistAndPostStatus(taskId, {
+        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+        logs: failedLogs,
+        failure_category: 'test_failed',
+        ...(fixTestFailureSummary ? { test_failure_summary: fixTestFailureSummary.slice(0, 5000) } : {}),
+      });
+      return;
+    }
 
     git(['add', '-A']);
 

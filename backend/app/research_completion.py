@@ -301,6 +301,34 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             f for f in prior_deferred
             if isinstance(f, dict) and f.get("type") not in ("direction_proposal", "direction_note")
         ]
+        # Discard findings older than DEFERRED_FINDING_MAX_AGE to prevent stale
+        # entries from blocking fresh findings (priority inversion) and to bound
+        # the deferred list during extended pipeline degradation.
+        _stale_cutoff = _utcnow() - timedelta(hours=48)
+        _fresh_actionable: list[dict] = []
+        _stale_discarded: list[dict] = []
+        for f in prior_actionable:
+            _stamp = f.get("originally_researched_at")
+            _stamp_dt = None
+            if isinstance(_stamp, str):
+                try:
+                    from datetime import datetime as _dt  # noqa: PLC0415
+                    _stamp_dt = _dt.fromisoformat(_stamp.replace("Z", "+00:00"))
+                    if _stamp_dt.tzinfo is not None:
+                        _stamp_dt = _stamp_dt.replace(tzinfo=None)
+                except ValueError:
+                    _stamp_dt = None
+            if _stamp_dt is not None and _stamp_dt < _stale_cutoff:
+                _stale_discarded.append(f)
+            else:
+                _fresh_actionable.append(f)
+        if _stale_discarded:
+            logger.warning(
+                f"[RESEARCH] Discarding {len(_stale_discarded)} stale deferred finding(s) "
+                f"(older than 48h) from task {task.id}: "
+                f"titles={[f.get('title') or f.get('description', '')[:60] for f in _stale_discarded]}"
+            )
+        prior_actionable = _fresh_actionable
         if prior_actionable:
             logger.info(
                 f"[RESEARCH] Prepending {len(prior_actionable)} deferred finding(s) from previous cycle "
