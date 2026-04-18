@@ -106,6 +106,22 @@ interface DigestData {
     total_failures: number;
     dominant_category: string | null;
   } | null;
+  scope_mismatch_summary?: {
+    total_calibrated: number;
+    calibrated_success_rate: number | null;
+    by_original_scope: Record<string, { total: number; completed: number; failed: number }>;
+    top_directions: {
+      direction_id: string;
+      direction_text: string;
+      calibrated_count: number;
+      total_tasks: number;
+      calibration_rate: number;
+    }[];
+  } | null;
+  rejection_pattern_summary?: {
+    total_rejected: number;
+    top_notes: { snippet: string; count: number }[];
+  } | null;
 }
 
 const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
@@ -993,6 +1009,60 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       </span>
                     );
                   })}
+                </div>
+              )}
+
+              {/* Scope mismatch diagnostics */}
+              {digest!.scope_mismatch_summary && digest!.scope_mismatch_summary.total_calibrated > 0 && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Scope mismatch</span>
+                    <span className="text-[10px] text-neutral-400">
+                      {digest!.scope_mismatch_summary.total_calibrated} calibrated
+                    </span>
+                    {digest!.scope_mismatch_summary.calibrated_success_rate != null && (
+                      <span className="text-[10px] text-neutral-500">
+                        · {Math.round(digest!.scope_mismatch_summary.calibrated_success_rate * 100)}% success
+                      </span>
+                    )}
+                    {Object.entries(digest!.scope_mismatch_summary.by_original_scope).map(([orig, b]) => (
+                      <span key={orig} className="text-[10px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 px-1.5 py-0.5 rounded">
+                        {orig}: {b.total}
+                      </span>
+                    ))}
+                  </div>
+                  {digest!.scope_mismatch_summary.top_directions.length > 0 && (
+                    <div className="flex flex-col gap-0.5 ml-1">
+                      {digest!.scope_mismatch_summary.top_directions.map(d => (
+                        <span key={d.direction_id} className="text-[10px] text-neutral-500 truncate">
+                          · {(d.direction_text || d.direction_id).slice(0, 60)}{' '}
+                          <span className="text-cyan-400">{d.calibrated_count}/{d.total_tasks} ({Math.round(d.calibration_rate * 100)}%)</span>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Rejection pattern summary */}
+              {digest!.rejection_pattern_summary && digest!.rejection_pattern_summary.total_rejected > 0 && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Rejection patterns</span>
+                    <span className="text-[10px] text-neutral-400">
+                      {digest!.rejection_pattern_summary.total_rejected} rejected
+                    </span>
+                  </div>
+                  {digest!.rejection_pattern_summary.top_notes.length > 0 && (
+                    <div className="flex flex-col gap-0.5 ml-1">
+                      {digest!.rejection_pattern_summary.top_notes.map((n, i) => (
+                        <span key={i} className="text-[10px] text-neutral-500 truncate">
+                          · {n.snippet.slice(0, 100)}{n.snippet.length > 100 ? '…' : ''}{' '}
+                          <span className="text-purple-400">×{n.count}</span>
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 

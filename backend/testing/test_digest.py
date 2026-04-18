@@ -2886,3 +2886,96 @@ async def test_digest_scope_mismatch_summary_empty(client: AsyncClient, db_sessi
     response = await client.get(f"/api/admin/digest?project_id={project.id}")
     assert response.status_code == 200
     assert response.json()["scope_mismatch_summary"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_retry_pattern_summary(client: AsyncClient, db_session):
+    """retry_pattern_summary aggregates _failure_class_history across failed tasks."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two tasks with identical repeating pattern (retry didn't help)
+    db_session.add(make_task(
+        project_id=project.id, title="r1", status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"_failure_class_history": ["CODE_ERROR", "CODE_ERROR"]},
+    ))
+    db_session.add(make_task(
+        project_id=project.id, title="r2", status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"_failure_class_history": ["CODE_ERROR", "CODE_ERROR"]},
+    ))
+    # One task where retry changed class (not a repeat)
+    db_session.add(make_task(
+        project_id=project.id, title="r3", status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"_failure_class_history": ["PROVISION_FAILURE", "CODE_ERROR"]},
+    ))
+    # Single-entry history — should be ignored
+    db_session.add(make_task(
+        project_id=project.id, title="r4", status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"_failure_class_history": ["CODE_ERROR"]},
+    ))
+    # Completed task — should be ignored even with history
+    db_session.add(make_task(
+        project_id=project.id, title="r5", status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_failure_class_history": ["CODE_ERROR", "CODE_ERROR"]},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    rps = response.json()["retry_pattern_summary"]
+    assert rps["total_multi_attempt_failures"] == 3
+    assert rps["repeat_class_count"] == 2
+    top = rps["top_patterns"]
+    assert top[0]["sequence"] == "CODE_ERROR -> CODE_ERROR"
+    assert top[0]["count"] == 2
+    sequences = {p["sequence"] for p in top}
+    assert "PROVISION_FAILURE -> CODE_ERROR" in sequences
+
+
+@pytest.mark.asyncio
+async def test_failure_stage_distribution_aggregates_stages(client: AsyncClient, db_session):
+    """failure_stage_distribution tallies _previous_failure_stage and falls back to _derive_failure_stage."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id, title="ctx stage",
+        status=TaskStatus.FAILED,
+        context={"_previous_failure_stage": "test"},
+    ))
+    db_session.add(make_task(
+        project_id=project.id, title="derived lint",
+        status=TaskStatus.FAILED,
+        latest_status_message="ruff lint error in handler",
+    ))
+    db_session.add(make_task(
+        project_id=project.id, title="derived lint 2",
+        status=TaskStatus.FAILED,
+        latest_status_message="eslint failure",
+    ))
+    db_session.add(make_task(
+        project_id=project.id, title="provision",
+        status=TaskStatus.FAILED,
+        context={"failure_category": "clone_failed"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    dist = data["failure_stage_distribution"]
+    assert dist["stages"]["test"] == 1
+    assert dist["stages"]["lint"] == 2
+    assert dist["stages"]["provision"] == 1
+    assert dist["total_classified"] == 4
+    assert dist["dominant_stage"] == "lint"

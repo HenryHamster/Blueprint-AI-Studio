@@ -1182,6 +1182,7 @@ async def get_digest(
         TAXONOMY_REVIEW_QUALITY, TAXONOMY_SCOPE_RELATED,
         TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED,
     )
+    from app.failure_stage import _derive_failure_stage
     _failure_class_labels = {
         "CODE_ERROR": "Code Error",
         "PROVISION_FAILURE": "Provision Failure",
@@ -1191,6 +1192,7 @@ async def get_digest(
         "SCOPE_OVERFLOW": "Scope Overflow",
     }
     _failure_class_groups: Dict[str, List[Dict[str, Any]]] = {}
+    _failure_stage_counts: Dict[str, int] = {}
     for t in failed_tasks:
         tid = str(t.id)
         cls = _classify_failure(t, error_log_map.get(tid))
@@ -1198,6 +1200,11 @@ async def get_digest(
         waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
         t_dir_id = (t.context or {}).get("direction_id")
         t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
+        _stage = (t.context or {}).get("_previous_failure_stage")
+        if not _stage:
+            _stage = _derive_failure_stage(cls, t.latest_status_message or error_log_map.get(tid) or "")
+        if _stage:
+            _failure_stage_counts[_stage] = _failure_stage_counts.get(_stage, 0) + 1
         _failure_class_groups.setdefault(cls, []).append({
             "task_id": tid,
             "title": t.title or "Failed task",
@@ -1242,6 +1249,16 @@ async def get_digest(
         },
         "total_failures": _tax_total,
         "dominant_category": max(_tax_keys, key=lambda k: _tax_counts[k]) if _tax_total else None,
+    }
+
+    _stage_total = sum(_failure_stage_counts.values())
+    failure_stage_distribution = {
+        "stages": dict(_failure_stage_counts),
+        "total_classified": _stage_total,
+        "dominant_stage": (
+            max(_failure_stage_counts.items(), key=lambda kv: kv[1])[0]
+            if _stage_total else None
+        ),
     }
 
     # --- recent_completions (up to 10, desc) ---
@@ -1673,6 +1690,32 @@ async def get_digest(
         "top_notes": [{"snippet": s, "count": c} for s, c in _top_notes],
     }
 
+    # --- Retry pattern summary ---
+    # Analyze failed tasks whose _failure_class_history has 2+ entries to see
+    # whether retries changed the failure class or repeated the same one.
+    _multi_attempt = []
+    for _t in failed_tasks:
+        _hist_raw = (_t.context or {}).get("_failure_class_history") or []
+        if not isinstance(_hist_raw, list):
+            continue
+        _hist = [str(h) for h in _hist_raw if h]
+        if len(_hist) >= 2:
+            _multi_attempt.append(_hist)
+    _repeat_count = sum(
+        1 for h in _multi_attempt
+        if any(h[i] == h[i + 1] for i in range(len(h) - 1))
+    )
+    _pattern_counts: Dict[str, int] = {}
+    for _hist in _multi_attempt:
+        _key = " -> ".join(_hist)
+        _pattern_counts[_key] = _pattern_counts.get(_key, 0) + 1
+    _top_patterns = sorted(_pattern_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+    retry_pattern_summary = {
+        "total_multi_attempt_failures": len(_multi_attempt),
+        "repeat_class_count": _repeat_count,
+        "top_patterns": [{"sequence": s, "count": c} for s, c in _top_patterns],
+    }
+
     return {
         "window_hours": hours,
         "generated_at": _utcnow().isoformat(),
@@ -1690,6 +1733,7 @@ async def get_digest(
         "recent_failures": recent_failures,
         "failure_groups": failure_groups,
         "failure_taxonomy_distribution": failure_taxonomy_distribution,
+        "failure_stage_distribution": failure_stage_distribution,
         "recent_completions": recent_completions,
         "direction_progress": direction_progress_list,
         "overall_product_ratio": overall_product_ratio,
@@ -1716,4 +1760,5 @@ async def get_digest(
         "pipeline_filter_funnel": pipeline_filter_funnel or None,
         "scope_mismatch_summary": scope_mismatch_summary,
         "rejection_pattern_summary": rejection_pattern_summary,
+        "retry_pattern_summary": retry_pattern_summary,
     }
