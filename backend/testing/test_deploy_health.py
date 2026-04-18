@@ -1083,6 +1083,153 @@ def test_check_claude_api_health_fresh_rate_limits_return_failed(mocker):
     assert ext["claude_api"] is False
 
 
+# ── Tests: check_github_health (passive + active modes) ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_check_github_health_passive_mode_recent_success(mocker):
+    """Recent last_github_success (< 60s) → skip API call, report healthy."""
+    now = datetime.now(timezone.utc)
+    mocker.patch.object(_hcp._shared_state, "last_github_success", now - timedelta(seconds=30))
+    client_factory = mocker.patch("httpx.AsyncClient")
+
+    ext = {"errors": {"github_api": "stale error"}}
+    result = await _hcp.check_github_health(ext, now)
+
+    assert result is None
+    assert ext["github_api"] is True
+    assert "github_api" not in ext["errors"]
+    client_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_check_github_health_active_mode_stale_success(mocker):
+    """Stale last_github_success (> 60s) → active API probe, healthy on 200."""
+    now = datetime.now(timezone.utc)
+    mocker.patch.object(_hcp._shared_state, "last_github_success", now - timedelta(seconds=120))
+    mocker.patch("app.github.generate_github_app_jwt", return_value="jwt-token")
+
+    mock_resp = mocker.MagicMock(status_code=200)
+    mock_client = mocker.MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.get = AsyncMock(return_value=mock_resp)
+    mocker.patch("httpx.AsyncClient", return_value=mock_client)
+
+    ext = {"errors": {}}
+    result = await _hcp.check_github_health(ext, now)
+
+    assert result is None
+    assert ext["github_api"] is True
+    assert _hcp._shared_state.last_github_success == now
+    mock_client.get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_check_github_health_active_mode_cold_start(mocker):
+    """last_github_success is None → active probe runs."""
+    now = datetime.now(timezone.utc)
+    mocker.patch.object(_hcp._shared_state, "last_github_success", None)
+    mocker.patch("app.github.generate_github_app_jwt", return_value="jwt-token")
+
+    mock_resp = mocker.MagicMock(status_code=200)
+    mock_client = mocker.MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.get = AsyncMock(return_value=mock_resp)
+    mocker.patch("httpx.AsyncClient", return_value=mock_client)
+
+    ext = {"errors": {}}
+    result = await _hcp.check_github_health(ext, now)
+
+    assert result is None
+    assert ext["github_api"] is True
+    mock_client.get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_check_github_health_active_mode_raises(mocker):
+    """API call raises → return 'github_api', record error, set unhealthy."""
+    now = datetime.now(timezone.utc)
+    mocker.patch.object(_hcp._shared_state, "last_github_success", now - timedelta(seconds=120))
+    mocker.patch("app.github.generate_github_app_jwt", return_value="jwt-token")
+
+    mock_client = mocker.MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.get = AsyncMock(side_effect=RuntimeError("connection refused"))
+    mocker.patch("httpx.AsyncClient", return_value=mock_client)
+
+    ext = {"errors": {}}
+    result = await _hcp.check_github_health(ext, now)
+
+    assert result == "github_api"
+    assert ext["github_api"] is False
+    assert "RuntimeError" in ext["errors"]["github_api"]
+    assert "connection refused" in ext["errors"]["github_api"]
+
+
+@pytest.mark.asyncio
+async def test_check_github_health_active_mode_non_200(mocker):
+    """API returns non-200 → return 'github_api' with HTTP status in error."""
+    now = datetime.now(timezone.utc)
+    mocker.patch.object(_hcp._shared_state, "last_github_success", now - timedelta(seconds=120))
+    mocker.patch("app.github.generate_github_app_jwt", return_value="jwt-token")
+
+    mock_resp = mocker.MagicMock(status_code=503)
+    mock_client = mocker.MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.get = AsyncMock(return_value=mock_resp)
+    mocker.patch("httpx.AsyncClient", return_value=mock_client)
+
+    ext = {"errors": {}}
+    result = await _hcp.check_github_health(ext, now)
+
+    assert result == "github_api"
+    assert ext["github_api"] is False
+    assert "503" in ext["errors"]["github_api"]
+
+
+# ── Tests: check_db_health ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_check_db_health_success(mocker):
+    """DB query succeeds → ext['db']=True and returns None."""
+    mock_session = mocker.MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.execute = AsyncMock(return_value=mocker.MagicMock())
+    mocker.patch("app.health_check_primitives.AsyncSessionLocal", return_value=mock_session)
+
+    ext = {"errors": {"db": "stale error"}}
+    result = await _hcp.check_db_health(ext)
+
+    assert result is None
+    assert ext["db"] is True
+    assert "db" not in ext["errors"]
+    mock_session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_check_db_health_failure(mocker):
+    """DB query raises → ext['db']=False and returns 'db' with error recorded."""
+    mock_session = mocker.MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.execute = AsyncMock(side_effect=RuntimeError("connection lost"))
+    mocker.patch("app.health_check_primitives.AsyncSessionLocal", return_value=mock_session)
+
+    ext = {"errors": {}}
+    result = await _hcp.check_db_health(ext)
+
+    assert result == "db"
+    assert ext["db"] is False
+    assert "RuntimeError" in ext["errors"]["db"]
+    assert "connection lost" in ext["errors"]["db"]
+
+
 # ── Tests: flap detection ─────────────────────────────────────────────────────
 
 

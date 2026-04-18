@@ -1267,3 +1267,314 @@ async def test_all_children_cancelled_marks_parent_cancelled(cleanup_db, mocker)
     assert parent.status == TaskStatus.CANCELLED
     assert "cancelled" in (parent.latest_status_message or "").lower()
     mock_create_pr.assert_not_called()
+
+
+# ── Rollup merge conflict state handling ──────────────────────────────────────
+# Covers the mergeable_state state machine that runs after merge_pull_request
+# returns merged=False on a rollup PR targeting an intermediate branch:
+#   - 'dirty'    → real conflict, spawn fix task
+#   - 'behind'   → update_branch; retry budget on failure, fall through when exhausted
+#   - 'blocked'  → defer with counter, enable auto-merge
+#   - 'unstable' → defer with counter, enable auto-merge
+#   - Deferral counter crossing approval threshold flips requires_approval
+
+
+async def _make_rollup_parent_with_pr(session, project_id, *, extra_context=None):
+    """Rollup parent with an existing rollup_pr_number — exercises the resume
+    path so the PR-creation code is skipped and control reaches the merge-phase.
+    Target branch is intermediate (research/*) so the auto-merge branch runs."""
+    ctx = {
+        "research_branch": "research/conflict-stg",
+        "parent_base": "research/conflict-base",
+        "rollup_pr_number": 4242,
+        "rollup_pr_url": "https://github.com/owner/repo/pull/4242",
+    }
+    if extra_context:
+        ctx.update(extra_context)
+    return await _make_task(
+        session, project_id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context=ctx,
+        plan_output="some plan",
+    )
+
+
+def _mock_rollup_merge_conflict_deps(mocker, *, mergeable_state, head_sha="deadbeef"):
+    """Common mocks for reaching the mergeable_state state machine.
+
+    get_pull_request is called three times with different semantics — plumb
+    distinct responses via side_effect:
+      1. existing-PR validation at resume (line ~725): open, not merged
+      2. diff-size fetch (line ~840): small PR
+      3. mergeable_state refetch after failed merge (line ~966)
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "merge conflict"},
+    )
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"merged": False, "state": "open"},
+            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},
+            {"mergeable_state": mergeable_state, "head": {"sha": head_sha}},
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_conflict_dirty_spawns_fix_task(cleanup_db, mocker):
+    """mergeable_state='dirty' → real conflict; spawn a fix task while parent
+    remains EVALUATING, with _is_rollup_review=True marking the fix cycle."""
+    _mock_rollup_merge_conflict_deps(mocker, mergeable_state="dirty")
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="fix-task-id"), None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_spawn.assert_awaited_once()
+    # First positional arg is the parent task; second is the pipeline task type.
+    assert mock_spawn.await_args.args[1] == "fix"
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("_is_rollup_review") is True
+
+
+@pytest.mark.asyncio
+async def test_merge_conflict_behind_calls_update_branch_and_defers(cleanup_db, mocker):
+    """mergeable_state='behind' + update_branch success → no fix task, parent
+    defers to next sweep, behind-retry counter not set on success."""
+    _mock_rollup_merge_conflict_deps(mocker, mergeable_state="behind")
+    mock_update = mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new_callable=AsyncMock,
+        return_value={"updated": True, "message": "ok"},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_update.assert_awaited_once()
+    mock_spawn.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert "_behind_update_retries" not in (parent.context or {})
+
+
+@pytest.mark.asyncio
+async def test_merge_conflict_behind_update_fail_increments_retry_counter(cleanup_db, mocker):
+    """mergeable_state='behind' + update_branch transient failure → defer with
+    _behind_update_retries incremented, still within budget so no fix spawn."""
+    _mock_rollup_merge_conflict_deps(mocker, mergeable_state="behind")
+    mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new_callable=AsyncMock,
+        return_value={"updated": False, "message": "503 Service Unavailable"},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_spawn.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("_behind_update_retries") == 1
+
+
+@pytest.mark.asyncio
+async def test_merge_conflict_behind_budget_exhausted_falls_through_to_fix(cleanup_db, mocker):
+    """Once _behind_update_retries increment equals the budget (default 3),
+    the behind-path falls through to fix-spawn and clears the counter so a
+    future behind state starts fresh."""
+    _mock_rollup_merge_conflict_deps(mocker, mergeable_state="behind")
+    mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new_callable=AsyncMock,
+        return_value={"updated": False, "message": "persistent failure"},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="fix-task-id"), None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    # Pre-seeded at 2 so the increment becomes 3, == budget → fall-through path.
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db, project.id,
+        extra_context={"_behind_update_retries": 2},
+    )
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_spawn.assert_awaited_once()
+    assert mock_spawn.await_args.args[1] == "fix"
+    await cleanup_db.refresh(parent)
+    assert "_behind_update_retries" not in (parent.context or {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["blocked", "unstable"])
+async def test_merge_conflict_blocked_or_unstable_defers_with_counter(cleanup_db, mocker, state):
+    """mergeable_state in {'blocked','unstable'} → defer without spawning fix,
+    increment per-state + total deferral counters, and enable GitHub auto-merge
+    so the PR lands once gates clear without a full orchestrator sweep."""
+    _mock_rollup_merge_conflict_deps(mocker, mergeable_state=state)
+    mock_auto = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_auto.assert_awaited_once()
+    mock_spawn.assert_not_called()
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert parent.status == TaskStatus.EVALUATING
+    assert ctx.get("_merge_deferred_state") == state
+    assert ctx.get("_merge_deferred_count") == 1
+    assert ctx.get("_merge_total_deferrals") == 1
+    assert parent.requires_approval is False
+
+
+@pytest.mark.asyncio
+async def test_merge_conflict_deferral_counter_escalates_to_approval(cleanup_db, mocker):
+    """Once per-state deferral count reaches rollup_merge_deferred_approval
+    (default 30), the parent is marked requires_approval and the approval
+    dispatch fires exactly once (the approval gate is latched by
+    parent.requires_approval, so subsequent sweeps won't re-dispatch)."""
+    _mock_rollup_merge_conflict_deps(mocker, mergeable_state="blocked")
+    mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": False, "message": "not eligible"},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, None),
+    )
+    mock_dispatch = mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert",
+        new_callable=AsyncMock,
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    # Pre-seed one below approval threshold (default 30); per-state alert
+    # latch suppresses the 10-count alert, total-deferral latch suppresses
+    # the 20-count total alert so neither competes with the approval assertion.
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db, project.id,
+        extra_context={
+            "_merge_deferred_state": "blocked",
+            "_merge_deferred_count": 29,
+            "_merge_total_deferrals": 29,
+            "_merge_alerted_states": ["blocked"],
+            "_merge_total_alerted": True,
+        },
+    )
+    child = await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert ctx.get("_merge_deferred_count") == 30
+    assert parent.requires_approval is True
+    mock_dispatch.assert_awaited_once()
+    mock_spawn.assert_not_called()

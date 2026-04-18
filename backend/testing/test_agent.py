@@ -4438,3 +4438,232 @@ async def test_claim_direction_top_first_review_issues_gated_by_min_tasks(client
 
     dc = resp.json().get("direction_context", {})
     assert dc.get("top_first_review_issues") is None
+
+
+async def _setup_smoketest_task(db_session, vm_id: str, base_branch: str = "main"):
+    """Create a project + IN_PROGRESS smoketest task.
+
+    Leaving attempt_count at 0 keeps the task on the normal-retry path on FAILED,
+    so the permanent-failure auto-debug spawn does not also fire — isolating the
+    SMOKETEST plan-task spawn behavior under test.
+    """
+    project = Project(name=f"Smoketest {vm_id}", user_id="test-user-smoketest")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "smoketest", "base_branch": base_branch}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+@pytest.mark.asyncio
+async def test_smoketest_startup_failure_spawns_plan_task_priority_90(client: AsyncClient, db_session, mocker):
+    """SMOKETEST_RESULT with a startup-suite failure spawns a plan task at priority 90."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-startup")
+
+    import json as _json  # noqa: PLC0415
+    smoketest_payload = {
+        "passed": False,
+        "tests": [
+            {"name": "startup_probe", "status": "fail", "message": "port unreachable"},
+        ],
+        "suites": {
+            "startup": {"passed": False, "tests": [{"name": "startup_probe", "status": "fail"}]},
+            "curated": {"passed": True, "tests": []},
+        },
+    }
+    token = create_agent_token(str(task.id), "agent-vm-smoke-startup")
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "SMOKETEST_RESULT",
+        "logs": _json.dumps(smoketest_payload),
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    spawned = result.scalars().all()
+    assert len(spawned) == 1, f"Expected 1 spawned plan task, got {len(spawned)}"
+    plan_task = spawned[0]
+    assert plan_task.priority == 90
+    assert plan_task.first_payload.get("type") == "plan"
+    assert plan_task.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_smoketest_curated_failure_spawns_plan_task_priority_70(client: AsyncClient, db_session, mocker):
+    """SMOKETEST_RESULT with a curated-suite failure (startup ok) spawns plan task at priority 70."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-curated")
+
+    import json as _json  # noqa: PLC0415
+    smoketest_payload = {
+        "passed": False,
+        "tests": [{"name": "login_flow", "status": "fail", "message": "assertion failed"}],
+        "suites": {
+            "startup": {"passed": True, "tests": []},
+            "curated": {"passed": False, "tests": [{"name": "login_flow", "status": "fail"}]},
+        },
+    }
+    token = create_agent_token(str(task.id), "agent-vm-smoke-curated")
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "SMOKETEST_RESULT",
+        "logs": _json.dumps(smoketest_payload),
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    spawned = result.scalars().all()
+    assert len(spawned) == 1
+    assert spawned[0].priority == 70
+    assert spawned[0].first_payload.get("type") == "plan"
+
+
+@pytest.mark.asyncio
+async def test_smoketest_passing_does_not_spawn_plan_task(client: AsyncClient, db_session, mocker):
+    """SMOKETEST_RESULT with passed=true (no failures) does not spawn any child task."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-ok")
+
+    import json as _json  # noqa: PLC0415
+    # Even when status=FAILED is reported, a passed=true smoketest payload must not spawn.
+    smoketest_payload = {
+        "passed": True,
+        "tests": [{"name": "startup_probe", "status": "pass"}],
+        "suites": {"startup": {"passed": True, "tests": []}},
+    }
+    token = create_agent_token(str(task.id), "agent-vm-smoke-ok")
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "SMOKETEST_RESULT",
+        "logs": _json.dumps(smoketest_payload),
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    assert result.scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_debug_result_high_confidence_spawns_fix_task(client: AsyncClient, db_session, mocker):
+    """DEBUG_RESULT with confidence='high' and fix_prompt spawns a create-type fix task."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Debug High", user_id="test-user-debug-high")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Debug: flaky login test",
+        payloads=[{"type": "debug", "base_branch": "main"}],
+        vm_instance_id="agent-vm-debug-high",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json as _json  # noqa: PLC0415
+    debug_payload = {
+        "confidence": "high",
+        "fix_prompt": "Update login handler to normalize email before lookup",
+        "root_cause": "Case-sensitive email comparison",
+    }
+    token = create_agent_token(str(task.id), "agent-vm-debug-high")
+    payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "DEBUG_RESULT",
+        "logs": _json.dumps(debug_payload),
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    spawned = result.scalars().all()
+    assert len(spawned) == 1
+    fix_task = spawned[0]
+    assert fix_task.first_payload.get("type") == "create"
+    assert fix_task.first_payload.get("prompt") == debug_payload["fix_prompt"]
+    assert fix_task.status == TaskStatus.QUEUED
+    assert fix_task.title == "Fix: flaky login test"
+
+
+@pytest.mark.asyncio
+async def test_debug_result_low_confidence_does_not_spawn_fix_task(client: AsyncClient, db_session, mocker):
+    """DEBUG_RESULT with confidence='low' records plan_output but does not spawn a fix task."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Debug Low", user_id="test-user-debug-low")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Debug: intermittent 500 error",
+        payloads=[{"type": "debug", "base_branch": "main"}],
+        vm_instance_id="agent-vm-debug-low",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json as _json  # noqa: PLC0415
+    debug_payload = {
+        "confidence": "low",
+        "fix_prompt": "Possibly add a retry, but unclear",
+        "root_cause": "Unknown — multiple candidate causes",
+    }
+    token = create_agent_token(str(task.id), "agent-vm-debug-low")
+    payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "DEBUG_RESULT",
+        "logs": _json.dumps(debug_payload),
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    assert result.scalars().all() == []
+
+    await db_session.refresh(task)
+    assert task.plan_output == debug_payload
