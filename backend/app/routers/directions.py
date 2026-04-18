@@ -311,6 +311,14 @@ async def update_direction(
                     d.pop("paused_at", None)
                     d.pop("auto_paused", None)
                     d.pop("expired_at", None)
+                    # Operator reactivation acknowledges any escalation — clear
+                    # manual-intervention flag, pending notification state, and
+                    # reset remediation attempts so spawn calibration no longer
+                    # penalizes the direction.
+                    d.pop("needs_manual_intervention", None)
+                    d.pop("escalation_notification_pending", None)
+                    d.pop("escalation_notification_retries", None)
+                    d["remediation_attempts"] = 0
                 # When reviving from expired back to proposed, clear expired_at
                 if payload["status"] == "proposed":
                     d.pop("expired_at", None)

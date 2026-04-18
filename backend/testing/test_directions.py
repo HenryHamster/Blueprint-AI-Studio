@@ -1182,6 +1182,48 @@ async def test_direction_cap_on_reactivation(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
+async def test_reactivation_clears_manual_intervention_state(client: AsyncClient, db_session, mocker):
+    """Operator reactivating a flagged direction clears escalation/intervention state."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Flagged direction")
+    direction_id = direction["id"]
+
+    # Simulate an escalated / flagged state (as set by remediation monitoring).
+    project = (await db_session.execute(
+        select(Project).where(Project.id == uuid.UUID(project_id))
+    )).scalar_one()
+    for d in project.directions:
+        if d["id"] == direction_id:
+            d["status"] = "paused"
+            d["auto_paused"] = True
+            d["paused_reason"] = "Remediation attempts exhausted"
+            d["paused_at"] = datetime.utcnow().isoformat()
+            d["needs_manual_intervention"] = True
+            d["escalation_notification_pending"] = True
+            d["escalation_notification_retries"] = 2
+            d["remediation_attempts"] = 3
+    flag_modified(project, "directions")
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "active"},
+    )
+    assert resp.status_code == 200
+    d = resp.json()["direction"]
+    assert d["status"] == "active"
+    assert "auto_paused" not in d
+    assert "paused_reason" not in d
+    assert "paused_at" not in d
+    assert "needs_manual_intervention" not in d
+    assert "escalation_notification_pending" not in d
+    assert "escalation_notification_retries" not in d
+    assert d["remediation_attempts"] == 0
+
+
+@pytest.mark.asyncio
 async def test_merge_rate_in_list(client: AsyncClient, db_session, mocker):
     """GET directions returns merge_rate for each direction based on research_history."""
     project_id = await _deploy_project(client, mocker)

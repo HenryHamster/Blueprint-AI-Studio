@@ -1143,7 +1143,8 @@ class TestRemediationSuccessPropagation:
         assert "pydantic" in text
 
     @pytest.mark.asyncio
-    async def test_does_not_propagate_on_failed_remediation(self, db_session):
+    async def test_does_not_propagate_success_on_failed_remediation(self, db_session):
+        """Failed remediation should not emit a success note (failure note is a separate source)."""
         project = make_project(directions=[
             {"id": "dir-1", "status": "active"},
             self._paused_sibling("dir-2", "fp-shared"),
@@ -1155,6 +1156,7 @@ class TestRemediationSuccessPropagation:
             project_id=project.id,
             status=TaskStatus.FAILED,
             latest_status_message="build failed",
+            payloads=[{"prompt": "bad fix"}],
             context={
                 "diagnosis_task_id": "diag-1",
                 "direction_id": "dir-1",
@@ -1170,7 +1172,125 @@ class TestRemediationSuccessPropagation:
         await db_session.refresh(project)
 
         sibling = next(d for d in project.directions if d["id"] == "dir-2")
+        notes = sibling.get("notes") or []
+        assert all(n["source"] != "sibling_remediation_success" for n in notes)
+
+
+class TestRemediationFailurePropagation:
+    """Propagation of failed remediation context to sibling directions via fingerprint match."""
+
+    def _paused_sibling(self, direction_id: str, fingerprint: str, **overrides):
+        from app.time_utils import _utcnow as _now
+        sibling = {
+            "id": direction_id,
+            "status": "paused",
+            "auto_paused": True,
+            "error_fingerprint": fingerprint,
+            "paused_at": _now().isoformat(),
+        }
+        sibling.update(overrides)
+        return sibling
+
+    @pytest.mark.asyncio
+    async def test_injects_failure_note_into_sibling_with_matching_fingerprint(self, db_session):
+        project = make_project(directions=[
+            {"id": "dir-1", "status": "active"},
+            self._paused_sibling("dir-2", "fp-shared"),
+        ])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message="ImportError: missing module xyz",
+            payloads=[{"prompt": "Add xyz to requirements.txt to fix startup."}],
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-1",
+                "diagnosis_fingerprint": "fp-shared",
+                "failure_category": "CODE_ERROR",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_outcome(task, merged=False, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sibling = next(d for d in project.directions if d["id"] == "dir-2")
+        notes = sibling.get("notes") or []
+        assert len(notes) == 1
+        note = notes[0]
+        assert note["source"] == "sibling_remediation_failure"
+        assert note["added_by_task"] == str(task.id)
+        text = note["text"]
+        assert "dir-1" in text
+        assert "xyz" in text
+        assert "requirements.txt" in text
+
+    @pytest.mark.asyncio
+    async def test_failure_noop_when_no_siblings_share_fingerprint(self, db_session):
+        project = make_project(directions=[
+            {"id": "dir-1", "status": "active"},
+            self._paused_sibling("dir-2", "fp-other"),
+        ])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message="boom",
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-1",
+                "diagnosis_fingerprint": "fp-shared",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_outcome(task, merged=False, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sibling = next(d for d in project.directions if d["id"] == "dir-2")
         assert not sibling.get("notes")
+
+    @pytest.mark.asyncio
+    async def test_failure_note_respects_max_length(self, db_session):
+        from app.strategic_constants import STRATEGIC_RATIONALE_MAX
+        project = make_project(directions=[
+            {"id": "dir-1", "status": "active"},
+            self._paused_sibling("dir-2", "fp-shared"),
+        ])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message="x" * 500,
+            payloads=[{"prompt": "y" * 500}],
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-1",
+                "diagnosis_fingerprint": "fp-shared",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_outcome(task, merged=False, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sibling = next(d for d in project.directions if d["id"] == "dir-2")
+        note = (sibling.get("notes") or [])[0]
+        assert len(note["text"]) <= STRATEGIC_RATIONALE_MAX
 
 
 # ── _record_remediation_if_terminal ─────────────────────────────────────────
@@ -1365,6 +1485,7 @@ class TestFollowupInvestigationOnFailure:
         assert spawned_task.context["direction_id"] == "dir-1"
         assert spawned_task.context["diagnosis_fingerprint"] == "fp-A"
         assert spawned_task.context["failed_remediation_task_id"] == str(task.id)
+        assert spawned_task.context["original_diagnosis_task_id"] == "diag-1"
 
     @pytest.mark.asyncio
     async def test_follow_up_skipped_by_24h_dedup(self, db_session):
@@ -1780,6 +1901,45 @@ class TestFollowupInvestigationOnFailure:
 
         assert post_mock.await_count == 0
 
+    @pytest.mark.asyncio
+    async def test_follow_up_skipped_by_cross_direction_fingerprint(self, db_session):
+        """A recent investigate task on a sibling direction sharing the same
+        fingerprint blocks a new follow-up and records a dedup note."""
+        project = make_project(directions=[
+            {"id": "dir-1", "status": "active"},
+            {"id": "dir-2", "status": "paused"},
+        ])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        # Sibling direction already has an open investigate with same fingerprint
+        sibling_inv = make_task(
+            project_id=project.id,
+            payloads=[{"type": "investigate", "prompt": "sibling", "base_branch": "main"}],
+            context={"direction_id": "dir-2", "diagnosis_fingerprint": "fp-A"},
+        )
+        db_session.add(sibling_inv)
+        await db_session.commit()
+        task = self._make_remediation_task(project.id, direction_id="dir-1",
+                                           fingerprint="fp-A")
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = next(x for x in project.directions if x["id"] == "dir-1")
+        assert "followup_investigation_attempts_by_fingerprint" not in d
+        assert d.get("diagnosis_in_progress") is not True
+        notes = d.get("notes") or []
+        assert any(n.get("source") == "followup_dedup" for n in notes)
+        assert any(
+            n.get("shared_investigation_task_id") == str(sibling_inv.id)
+            for n in notes
+        )
+
 
 # ── _handle_investigation_completion ────────────────────────────────────────
 
@@ -2032,6 +2192,7 @@ class TestHandleInvestigationCompletion:
         assert followup.payloads[0]["type"] == "investigate"
         assert followup.context["diagnosis_trigger"] == "low_confidence_followup"
         assert followup.context["previous_investigation_task_id"] == str(task.id)
+        assert followup.context["original_diagnosis_task_id"] == str(task.id)
         assert followup.context["diagnosis_fingerprint"] == "fp-low"
         assert "LOW-confidence" in followup.payloads[0]["prompt"]
 
@@ -2482,6 +2643,7 @@ class TestHandleInvestigationTerminalFailure:
         assert followup.payloads[0]["type"] == "investigate"
         assert followup.context["diagnosis_trigger"] == "investigation_failure_followup"
         assert followup.context["previous_investigation_task_id"] == str(task.id)
+        assert followup.context["original_diagnosis_task_id"] == str(task.id)
         assert followup.context["direction_id"] == "dir-1"
         assert followup.context["diagnosis_fingerprint"] == "fp-A"
 

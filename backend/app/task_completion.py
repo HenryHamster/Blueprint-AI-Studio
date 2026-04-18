@@ -118,6 +118,22 @@ async def _record_remediation_outcome(
         target["last_remediation_error_summary"] = (task.latest_status_message or "")[:200]
         history_entry["failure_class"] = target["last_remediation_failure_class"]
         history_entry["error_summary"] = target["last_remediation_error_summary"]
+        if fingerprint:
+            try:
+                _propagate_remediation_failure_to_siblings(
+                    project=project,
+                    directions=directions,
+                    fingerprint=str(fingerprint),
+                    failed_direction_id=str(direction_id),
+                    task=task,
+                    failure_class=target["last_remediation_failure_class"],
+                    error_summary=target["last_remediation_error_summary"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"[DIAGNOSIS] Failed to propagate remediation failure to siblings "
+                    f"for direction {direction_id}: {exc!r}"
+                )
     history_list = list(target.get("remediation_history") or [])
     history_list.append(history_entry)
     target["remediation_history"] = history_list[-_REMEDIATION_HISTORY_MAX:]
@@ -173,6 +189,60 @@ def _propagate_remediation_success_to_siblings(
             "added_at": now_iso,
             "added_by_task": str(task.id),
             "source": "sibling_remediation_success",
+        })
+        direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+
+
+def _propagate_remediation_failure_to_siblings(
+    *,
+    project: Project,
+    directions: List[Dict[str, Any]],
+    fingerprint: str,
+    failed_direction_id: str,
+    task: Task,
+    failure_class: Optional[str],
+    error_summary: Optional[str],
+) -> None:
+    """Inject a 'do not repeat' note into sibling directions sharing ``fingerprint``.
+
+    When a remediation fails, other directions holding on the same error
+    fingerprint should not re-attempt the same approach. Surface the failed
+    prompt, failure class, and error summary so sibling investigations can
+    propose a different fix.
+
+    Mutates ``directions`` in place; the caller persists via ``flag_modified``.
+    """
+    from app.anomaly_detection import find_directions_sharing_fingerprint  # noqa: PLC0415
+
+    siblings = find_directions_sharing_fingerprint(
+        project, fingerprint, exclude_direction_id=failed_direction_id,
+    )
+    if not siblings:
+        return
+    prompt_snippet = (task.first_payload.get("prompt") or "").strip()[:200]
+    now_iso = _utcnow().isoformat()
+    note_text = (
+        f"Sibling remediation FAILED ({now_iso[:10]}) for direction "
+        f"{failed_direction_id} sharing the same error fingerprint. "
+        f"Task: {task.id}. Do not repeat this approach."
+    )
+    if failure_class:
+        note_text += f" Failure: {failure_class}."
+    if error_summary:
+        note_text += f" Error: {error_summary}"
+    if prompt_snippet:
+        note_text += f" Failed approach: {prompt_snippet}"
+    note_text = note_text[:STRATEGIC_RATIONALE_MAX]
+    sibling_ids = {s.get("id") for s in siblings if s.get("id")}
+    for direction in directions:
+        if direction.get("id") not in sibling_ids:
+            continue
+        notes = list(direction.get("notes") or [])
+        notes.append({
+            "text": note_text,
+            "added_at": now_iso,
+            "added_by_task": str(task.id),
+            "source": "sibling_remediation_failure",
         })
         direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
 
@@ -239,6 +309,44 @@ def _active_followup_timestamps(
     return active
 
 
+async def _find_sibling_fingerprint_investigation(
+    project_id, fingerprint, cutoff, session, exclude_task_id=None,
+) -> Optional[str]:
+    """Return ID of a recent investigate task sharing ``fingerprint`` (any direction).
+
+    Mirrors the cross-direction dedup used by direction_lifecycle._spawn_direction_diagnosis:
+    if a sibling direction already has an open investigation for the same root cause,
+    a second direction's follow-up would re-analyze the same fingerprint.
+    """
+    if not fingerprint:
+        return None
+    q = select(Task.id).where(
+        Task.project_id == project_id,
+        Task.created_at >= cutoff,
+        Task.payloads[0]["type"].as_string() == "investigate",
+        Task.context["diagnosis_fingerprint"].as_string() == str(fingerprint),
+    )
+    if exclude_task_id is not None:
+        q = q.where(Task.id != exclude_task_id)
+    row = (await session.execute(q.limit(1))).first()
+    return str(row[0]) if row else None
+
+
+def _append_followup_dedup_note(direction: Dict[str, Any], fingerprint, existing_task_id: str) -> None:
+    note_text = (
+        f"Skipped duplicate follow-up investigation: shares error fingerprint "
+        f"{str(fingerprint)[:80]} with existing investigate task {existing_task_id}."
+    )[:STRATEGIC_RATIONALE_MAX]
+    notes = list(direction.get("notes") or [])
+    notes.append({
+        "text": note_text,
+        "added_at": _utcnow().isoformat(),
+        "source": "followup_dedup",
+        "shared_investigation_task_id": existing_task_id,
+    })
+    direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+
+
 async def _maybe_spawn_followup_investigation(
     task: Task, session: AsyncSession,
 ) -> Optional[Task]:
@@ -292,6 +400,19 @@ async def _maybe_spawn_followup_investigation(
         return None
     fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint") \
         or target.get("last_remediation_fingerprint")
+    shared_id = await _find_sibling_fingerprint_investigation(
+        project.id, fingerprint, cutoff, session,
+    )
+    if shared_id is not None:
+        _append_followup_dedup_note(target, fingerprint, shared_id)
+        project.directions = directions
+        flag_modified(project, "directions")
+        session.add(project)
+        logger.info(
+            f"[DIAGNOSIS] Skip follow-up for direction {direction_id}: shares "
+            f"fingerprint {str(fingerprint)[:40]} with investigate task {shared_id}"
+        )
+        return None
     fp_key = str(fingerprint) if fingerprint else "no_fingerprint"
     attempts_by_fp = dict(target.get("followup_investigation_attempts_by_fingerprint") or {})
     now = _utcnow()
@@ -370,6 +491,11 @@ async def _maybe_spawn_followup_investigation(
         "diagnosis_trigger": "remediation_failure_followup",
         "failed_remediation_task_id": str(task.id),
     }
+    original_diagnosis_task_id = (
+        ctx.get("original_diagnosis_task_id") or ctx.get("diagnosis_task_id")
+    )
+    if original_diagnosis_task_id:
+        task_context["original_diagnosis_task_id"] = str(original_diagnosis_task_id)
     if fingerprint:
         task_context["diagnosis_fingerprint"] = str(fingerprint)
     new_task = Task(
@@ -500,6 +626,18 @@ async def _maybe_spawn_low_confidence_followup(
         (investigation_task.context or {}).get("diagnosis_fingerprint")
         or direction.get("error_fingerprint")
     )
+    shared_id = await _find_sibling_fingerprint_investigation(
+        project.id, fingerprint, cutoff, session,
+        exclude_task_id=investigation_task.id,
+    )
+    if shared_id is not None:
+        _append_followup_dedup_note(direction, fingerprint, shared_id)
+        logger.info(
+            f"[DIAGNOSIS] Skip low-confidence follow-up for direction "
+            f"{direction_id}: shares fingerprint {str(fingerprint)[:40]} "
+            f"with investigate task {shared_id}"
+        )
+        return None
     fp_key = str(fingerprint) if fingerprint else "no_fingerprint"
     attempts_by_fp = dict(direction.get("followup_investigation_attempts_by_fingerprint") or {})
     now = _utcnow()
@@ -523,10 +661,15 @@ async def _maybe_spawn_low_confidence_followup(
         "declare that code signals alone are insufficient and manual "
         "intervention is required.",
     ])[:20000]
+    inv_ctx = investigation_task.context or {}
+    original_diagnosis_task_id = (
+        inv_ctx.get("original_diagnosis_task_id") or str(investigation_task.id)
+    )
     task_ctx: Dict[str, Any] = {
         "direction_id": str(direction_id),
         "diagnosis_trigger": "low_confidence_followup",
         "previous_investigation_task_id": str(investigation_task.id),
+        "original_diagnosis_task_id": str(original_diagnosis_task_id),
     }
     if fingerprint:
         task_ctx["diagnosis_fingerprint"] = str(fingerprint)
@@ -594,6 +737,18 @@ async def _maybe_spawn_reinvestigation_after_failure(
         (investigation_task.context or {}).get("diagnosis_fingerprint")
         or direction.get("error_fingerprint")
     )
+    shared_id = await _find_sibling_fingerprint_investigation(
+        project.id, fingerprint, cutoff, session,
+        exclude_task_id=investigation_task.id,
+    )
+    if shared_id is not None:
+        _append_followup_dedup_note(direction, fingerprint, shared_id)
+        logger.info(
+            f"[DIAGNOSIS] Skip reinvestigation for direction {direction_id}: "
+            f"shares fingerprint {str(fingerprint)[:40]} with investigate "
+            f"task {shared_id}"
+        )
+        return None
     fp_key = str(fingerprint) if fingerprint else "no_fingerprint"
     attempts_by_fp = dict(direction.get("followup_investigation_attempts_by_fingerprint") or {})
     now = _utcnow()
@@ -621,10 +776,15 @@ async def _maybe_spawn_reinvestigation_after_failure(
         "HIGH or MEDIUM confidence, or explicitly declare that code signals "
         "alone are insufficient and manual intervention is required.",
     ])[:20000]
+    inv_ctx = investigation_task.context or {}
+    original_diagnosis_task_id = (
+        inv_ctx.get("original_diagnosis_task_id") or str(investigation_task.id)
+    )
     task_ctx: Dict[str, Any] = {
         "direction_id": str(direction_id),
         "diagnosis_trigger": "investigation_failure_followup",
         "previous_investigation_task_id": str(investigation_task.id),
+        "original_diagnosis_task_id": str(original_diagnosis_task_id),
     }
     if fingerprint:
         task_ctx["diagnosis_fingerprint"] = str(fingerprint)
@@ -1698,6 +1858,9 @@ async def _spawn_investigation_remediation(
         )],
         context={
             "diagnosis_task_id": str(task.id),
+            "original_diagnosis_task_id": str(
+                (task.context or {}).get("original_diagnosis_task_id") or task.id
+            ),
             "diagnosed_direction_id": direction_id,
             "direction_id": direction_id,
             "severity": severity_tag,
