@@ -277,8 +277,11 @@ async def test_direction_stats_conversion_rate():
         "status": "active",
         "text": "Improve test coverage",
         "possibly_saturated": False,
+        "completion_criteria": "Coverage > 80%",
+        "possibly_complete": True,
+        "category": "structural",
         "research_history": [
-            {"timestamp": (now - timedelta(hours=5)).isoformat(), "prs_merged": 1, "tasks_created": 4},
+            {"timestamp": (now - timedelta(hours=5)).isoformat(), "prs_merged": 1, "tasks_created": 4, "prs_rejected": 3},
         ],
     }])
 
@@ -303,6 +306,10 @@ async def test_direction_stats_conversion_rate():
     assert "merge_rate" not in stats[0]
     assert stats[0]["conversion_rate"] == 0.25
     assert stats[0]["possibly_saturated"] is False
+    assert stats[0]["completion_criteria"] == "Coverage > 80%"
+    assert stats[0]["possibly_complete"] is True
+    assert stats[0]["category"] == "structural"
+    assert stats[0]["acceptance_rate"] == 0.25
 
 
 @pytest.mark.asyncio

@@ -287,6 +287,9 @@ async def get_health_overview(
         "mixed": 0,
         "uncategorized": 0,
         "total_active": 0,
+        "possibly_complete_count": 0,
+        "missing_criteria_count": 0,
+        "held_count": 0,
     }
     if project_id:
         project = await session.get(Project, project_id)
@@ -306,6 +309,12 @@ async def get_health_overview(
                 direction_portfolio[cat] += 1
             else:
                 direction_portfolio["uncategorized"] += 1
+            if d.get("possibly_complete"):
+                direction_portfolio["possibly_complete_count"] += 1
+            if not d.get("completion_criteria"):
+                direction_portfolio["missing_criteria_count"] += 1
+            if d.get("needs_manual_intervention") or d.get("auto_paused"):
+                direction_portfolio["held_count"] += 1
         direction_portfolio["total_active"] += len(active_dirs)
 
     # --- 9. Queue depth ---

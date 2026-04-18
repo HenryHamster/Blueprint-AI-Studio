@@ -158,6 +158,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 continue
 
             prs_merged = 0
+            prs_rejected = 0
             tasks_created_total = 0
             sd_totals: Dict[str, int] = {}
             for entry in d.get("research_history") or []:
@@ -165,6 +166,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                     entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
                     if entry_ts >= window_start:
                         prs_merged += entry.get("prs_merged") or 0
+                        prs_rejected += entry.get("prs_rejected") or 0
                         tasks_created_total += entry.get("tasks_created") or 0
                         for k, v in (entry.get("stage_dropout") or {}).items():
                             sd_totals[k] = sd_totals.get(k, 0) + (v or 0)
@@ -172,6 +174,8 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                     pass
 
             dir_conversion_rate = round(prs_merged / tasks_created_total, 3) if tasks_created_total > 0 else None
+            acceptance_denom = prs_merged + prs_rejected
+            acceptance_rate = round(prs_merged / acceptance_denom, 3) if acceptance_denom > 0 else None
             dominant_dropout = (
                 max(sd_totals, key=lambda k: sd_totals[k])
                 if sd_totals and max(sd_totals.values()) > 0
@@ -183,6 +187,10 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 "possibly_saturated": bool(d.get("possibly_saturated", False)),
                 "conversion_rate": dir_conversion_rate,
                 "dominant_dropout_stage": dominant_dropout,
+                "completion_criteria": d.get("completion_criteria"),
+                "possibly_complete": bool(d.get("possibly_complete", False)),
+                "category": d.get("category"),
+                "acceptance_rate": acceptance_rate,
             })
 
         direction_stats.sort(key=lambda x: x["cycles"], reverse=True)
@@ -855,6 +863,18 @@ async def get_digest(
                 cost_by_scope = {k: round(v, 4) for k, v in cost_by_scope.items()}
                 cost_by_status = {k: round(v, 4) for k, v in cost_by_status.items()}
 
+                dir_fa_measured = [
+                    t for t in tasks_for_dir
+                    if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+                    and _derive_completed_at(t) >= window_start
+                    and "_first_attempt_succeeded" in (t.context or {})
+                ]
+                dir_fa_sample_size = len(dir_fa_measured)
+                dir_fa_rate = (
+                    round(sum(1 for t in dir_fa_measured if (t.context or {}).get("_first_attempt_succeeded")) / dir_fa_sample_size, 3)
+                    if dir_fa_sample_size > 0 else None
+                )
+
                 direction_text = (d.get("text") or d.get("description") or "")[:80]
                 total_prs = prs_merged + prs_rejected
                 acceptance_rate = round(prs_merged / total_prs, 3) if total_prs > 0 else None
@@ -901,6 +921,12 @@ async def get_digest(
                     "conversion_rate": conversion_rate,
                     "avg_time_to_merge_hours": avg_time_to_merge_hours,
                     "possibly_saturated": bool(d.get("possibly_saturated", False)),
+                    "possibly_complete": bool(d.get("possibly_complete", False)),
+                    "completion_criteria": d.get("completion_criteria"),
+                    "completion_suggestion": d.get("completion_suggestion"),
+                    "category": d.get("category"),
+                    "status": d.get("status"),
+                    "added_at": d.get("added_at"),
                     "latest_insights": latest_insights,
                     "recent_finding_titles": recent_finding_titles,
                     "latest_research_at": latest_research_at,
@@ -915,6 +941,8 @@ async def get_digest(
                     "stage_dropout": dir_stage_dropout or None,
                     "recent_failure_titles": recent_failed_titles[-3:] or None,
                     "filter_funnel": filter_funnel,
+                    "first_attempt_success_rate": dir_fa_rate,
+                    "first_attempt_sample_size": dir_fa_sample_size,
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
