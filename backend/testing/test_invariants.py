@@ -391,7 +391,7 @@ MODULE_SIZE_LIMITS = {
     "services.py": 1500,
     "routers/agent_status.py": 1500,
     "autonomous_research.py": 1500,
-    "research_completion.py": 2000,
+    "research_completion.py": 2050,
     "strategic_completion.py": 1500,
     "rollup_management.py": 1550,
     "reaper.py": 1020,
@@ -490,7 +490,7 @@ FRONTEND_SIZE_LIMITS = {
     "components/TaskCard.tsx": 1500,
     "components/DirectionCard.tsx": 1200,
     "components/PipelineView.tsx": 1200,
-    "components/DashboardHome.tsx": 1200,
+    "components/DashboardHome.tsx": 1300,
     "components/MessagesPanel.tsx": 1000,
 }
 

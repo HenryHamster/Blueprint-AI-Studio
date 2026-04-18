@@ -48,7 +48,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, recordToolUse, snapshotToolTrace, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
 
 // ── strVal ───────────────────────────────────────────────────────────────────
@@ -772,5 +772,119 @@ describe('condensedAnalysisSections', () => {
     expect(out).toContain('**Files to change**');
     expect(out).not.toContain('**Files used**');
     expect(out).not.toContain('**Implementation approach**');
+  });
+});
+
+// ── parseFailingTests ────────────────────────────────────────────────────────
+describe('parseFailingTests', () => {
+  it('parses pytest FAILED lines with full test ID and reason', () => {
+    const output = [
+      'FAILED backend/testing/test_foo.py::test_bar - AssertionError: expected 1 got 2',
+      'FAILED backend/testing/test_baz.py::test_qux - ValueError',
+    ].join('\n');
+    const result = parseFailingTests(output);
+    expect(result).toEqual(new Set([
+      'backend/testing/test_foo.py::test_bar',
+      'backend/testing/test_baz.py::test_qux',
+    ]));
+  });
+
+  it('parses vitest failure markers (✕, ✗, ×) with descriptions', () => {
+    const output = [
+      '✕ should render component correctly',
+      '✗ handles empty input',
+      '× rejects invalid payload',
+    ].join('\n');
+    const result = parseFailingTests(output);
+    expect(result).toEqual(new Set([
+      'should render component correctly',
+      'handles empty input',
+      'rejects invalid payload',
+    ]));
+  });
+
+  it('handles mixed pytest and vitest output in the same string', () => {
+    const output = [
+      'Running tests...',
+      'FAILED backend/testing/test_foo.py::test_bar - AssertionError',
+      '✕ frontend renders nav',
+      'PASSED backend/testing/test_ok.py::test_ok',
+    ].join('\n');
+    const result = parseFailingTests(output);
+    expect(result).toEqual(new Set([
+      'backend/testing/test_foo.py::test_bar',
+      'frontend renders nav',
+    ]));
+  });
+
+  it('returns an empty Set for output with no test failures', () => {
+    const output = [
+      'All tests passed!',
+      'PASSED backend/testing/test_ok.py::test_ok',
+      '✓ everything works',
+      '',
+    ].join('\n');
+    const result = parseFailingTests(output);
+    expect(result.size).toBe(0);
+  });
+
+  it('handles pytest lines where the test ID contains special characters and parametrize brackets', () => {
+    const output = [
+      'FAILED backend/testing/test_p.py::test_param[case-1] - AssertionError',
+      'FAILED backend/testing/test_p.py::test_unicode_ünîcødé - RuntimeError',
+      'FAILED backend/testing/test_q.py::test_with_space description - fail',
+    ].join('\n');
+    const result = parseFailingTests(output);
+    expect(result.has('backend/testing/test_p.py::test_param[case-1]')).toBe(true);
+    expect(result.has('backend/testing/test_p.py::test_unicode_ünîcødé')).toBe(true);
+    expect(result.has('backend/testing/test_q.py::test_with_space description')).toBe(true);
+  });
+});
+
+// ── recordToolUse ────────────────────────────────────────────────────────────
+describe('recordToolUse', () => {
+  it('records a tool use entry with timestamp, tool name, and input preview', () => {
+    recordToolUse('Bash', { command: 'ls' });
+    const trace = snapshotToolTrace();
+    const entry = trace[trace.length - 1];
+    expect(entry.tool).toBe('Bash');
+    expect(entry.input_preview).toBe('{"command":"ls"}');
+    expect(entry.t).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+  });
+
+  it('truncates input_preview to 200 characters for long inputs', () => {
+    recordToolUse('Bash', { command: 'x'.repeat(500) });
+    const trace = snapshotToolTrace();
+    const entry = trace[trace.length - 1];
+    expect(entry.input_preview.length).toBe(200);
+  });
+
+  it("records '<unserializable>' for inputs with circular references", () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    recordToolUse('Bash', circular);
+    const trace = snapshotToolTrace();
+    const entry = trace[trace.length - 1];
+    expect(entry.input_preview).toBe('<unserializable>');
+  });
+
+  it('evicts oldest entry when buffer exceeds 20 entries (TOOL_TRACE_MAX)', () => {
+    for (let i = 0; i < 25; i++) {
+      recordToolUse(`tool-${i}`, { n: i });
+    }
+    const trace = snapshotToolTrace();
+    expect(trace.length).toBe(20);
+    const tools = trace.map(e => e.tool);
+    expect(tools).toContain('tool-24');
+    expect(tools).toContain('tool-5');
+    expect(tools).not.toContain('tool-4');
+    expect(tools).not.toContain('tool-0');
+  });
+
+  it('handles string input directly without JSON.stringify', () => {
+    recordToolUse('Write', 'raw string value');
+    const trace = snapshotToolTrace();
+    const entry = trace[trace.length - 1];
+    expect(entry.input_preview).toBe('raw string value');
   });
 });

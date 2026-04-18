@@ -261,7 +261,7 @@ export function recordToolUse(toolName: string, input: unknown): void {
   if (_toolTrace.length > TOOL_TRACE_MAX) _toolTrace.shift();
 }
 
-function snapshotToolTrace(): ToolTraceEntry[] {
+export function snapshotToolTrace(): ToolTraceEntry[] {
   return _toolTrace.slice();
 }
 
@@ -921,7 +921,7 @@ function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
  * Returns a Set of stable test IDs (e.g. "path/test_foo.py::test_bar" for pytest,
  * "test description" for vitest) for baseline comparison.
  */
-function parseFailingTests(output: string): Set<string> {
+export function parseFailingTests(output: string): Set<string> {
   const failing = new Set<string>();
   for (const line of output.split('\n')) {
     const trimmed = line.trim();

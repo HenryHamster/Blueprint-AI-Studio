@@ -1,4 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+vi.mock('fs', () => ({
+  default: {
+    readFileSync: vi.fn().mockReturnValue(''),
+    writeFileSync: vi.fn(),
+    existsSync: vi.fn().mockReturnValue(false),
+    appendFileSync: vi.fn(),
+  },
+}));
+
+import fs from 'fs';
 import {
   calcMessageAge,
   parseResearchContext,
@@ -8,6 +19,7 @@ import {
   buildScopeCalibrationSignal,
   formatCochangeHints,
   formatDecompositionOutcomes,
+  readProgressArtifact,
 } from './research-plan.js';
 
 describe('calcMessageAge', () => {
@@ -528,5 +540,41 @@ describe('formatDecompositionOutcomes', () => {
       },
     });
     expect(result).not.toContain('prefer smaller subtasks');
+  });
+});
+
+describe('readProgressArtifact', () => {
+  beforeEach(() => {
+    vi.mocked(fs.existsSync).mockReset().mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReset().mockReturnValue('');
+  });
+
+  it('returns prefixed content when file exists with content', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue('  progress notes here  ');
+    const result = readProgressArtifact('task-123', 'plan');
+    expect(result).toBe('## Pre-Implementation Analysis\n\nprogress notes here');
+    expect(vi.mocked(fs.existsSync)).toHaveBeenCalledWith('/tmp/plan_progress_task-123.md');
+    expect(vi.mocked(fs.readFileSync)).toHaveBeenCalledWith('/tmp/plan_progress_task-123.md', 'utf-8');
+  });
+
+  it('returns undefined when file does not exist', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    expect(readProgressArtifact('task-456', 'research')).toBeUndefined();
+    expect(vi.mocked(fs.readFileSync)).not.toHaveBeenCalled();
+  });
+
+  it('returns undefined when file exists but is whitespace-only', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue('   \n\t  \n');
+    expect(readProgressArtifact('task-789', 'research')).toBeUndefined();
+  });
+
+  it('returns undefined when fs.readFileSync throws', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockImplementation(() => {
+      throw new Error('permission denied');
+    });
+    expect(readProgressArtifact('task-err', 'plan')).toBeUndefined();
   });
 });
