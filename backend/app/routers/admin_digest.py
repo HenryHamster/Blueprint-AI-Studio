@@ -732,7 +732,8 @@ async def get_digest(
         .order_by(Task.started_at.asc().nullsfirst())
         .options(load_only(
             Task.id, Task.status, Task.title, Task.payloads,
-            Task.started_at, Task.project_id,
+            Task.started_at, Task.project_id, Task.context,
+            Task.vm_provisioned_at, Task.vm_spot,
         ))
     )
     active_tasks_all = active_result.scalars().all()
@@ -796,6 +797,7 @@ async def get_digest(
                 prev_dir_scope_agg: Dict[str, Dict[str, int]] = {}
                 window_product_ratios: List[float] = []
                 agg_type_distribution: Dict[str, int] = {}
+                agg_type_breakdown: Dict[str, Dict[str, int]] = {}
                 dir_taxonomy_summary: Dict[str, int] = {}
                 dir_stage_dropout: Dict[str, int] = {}
                 recent_failed_titles: List[str] = []
@@ -807,6 +809,9 @@ async def get_digest(
                 dq_merge_rate_count = 0
                 dq_subtask_count_sum = 0
                 dq_cross_module_sum = 0
+                dir_reviews_dismissed = 0
+                dir_reviews_overridden = 0
+                dir_user_issues_caught = 0
                 for entry in d.get("research_history") or []:
                     try:
                         entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
@@ -815,6 +820,9 @@ async def get_digest(
                     if entry_ts >= window_start:
                         prs_merged += entry.get("prs_merged") or 0
                         prs_rejected += entry.get("prs_rejected") or 0
+                        dir_reviews_dismissed += entry.get("reviews_dismissed") or 0
+                        dir_reviews_overridden += entry.get("reviews_overridden") or 0
+                        dir_user_issues_caught += entry.get("user_issues_caught") or 0
                         findings_tasks_created += entry.get("tasks_created") or 0
                         dir_findings_produced += entry.get("findings_produced") or 0
                         dir_batch_cap_applied += entry.get("batch_cap_applied") or 0
@@ -827,11 +835,36 @@ async def get_digest(
                             agg = dir_scope_agg.setdefault(scope, {"created": 0, "merged": 0, "failed": 0, "failed_infra": 0, "failed_code_error": 0, "failed_scope_overflow": 0, "calibrated_in": 0, "calibrated_out": 0})
                             for k in ("created", "merged", "failed", "failed_infra", "failed_code_error", "failed_scope_overflow", "calibrated_in", "calibrated_out"):
                                 agg[k] += stats.get(k, 0)
+                            # Weighted predictor accumulators (weight by merged/failed counts
+                            # that produced each per-cycle average in direction_outcomes.py).
+                            merged_w = stats.get("merged", 0) or 0
+                            failed_w = stats.get("failed", 0) or 0
+                            for field_name, weight in (
+                                ("avg_expansion_ratio_merged", merged_w),
+                                ("avg_expansion_ratio_failed", failed_w),
+                                ("avg_complexity_merged", merged_w),
+                                ("avg_complexity_failed", failed_w),
+                            ):
+                                v = stats.get(field_name)
+                                if isinstance(v, (int, float)) and weight > 0:
+                                    agg[f"_{field_name}_sum"] = agg.get(f"_{field_name}_sum", 0.0) + float(v) * weight
+                                    agg[f"_{field_name}_w"] = agg.get(f"_{field_name}_w", 0) + weight
+                            for effort, buckets in (stats.get("effort_distribution") or {}).items():
+                                if not isinstance(buckets, dict):
+                                    continue
+                                ed = agg.setdefault("effort_distribution", {})
+                                eb = ed.setdefault(effort, {"created": 0, "merged": 0, "failed": 0})
+                                for bk in ("created", "merged", "failed"):
+                                    eb[bk] += buckets.get(bk, 0) or 0
                         pr = entry.get("product_ratio")
                         if pr is not None:
                             window_product_ratios.append(float(pr))
                         for ttype, cnt in (entry.get("type_distribution") or {}).items():
                             agg_type_distribution[ttype] = agg_type_distribution.get(ttype, 0) + cnt
+                        for ttype, stats in (entry.get("type_breakdown") or {}).items():
+                            tb = agg_type_breakdown.setdefault(ttype, {"created": 0, "merged": 0, "failed": 0})
+                            for k in ("created", "merged", "failed"):
+                                tb[k] += (stats or {}).get(k, 0) or 0
                         for tax, cnt in (entry.get("taxonomy_summary") or {}).items():
                             dir_taxonomy_summary[tax] = dir_taxonomy_summary.get(tax, 0) + cnt
                         for stage, cnt in (entry.get("stage_dropout") or {}).items():
@@ -950,6 +983,15 @@ async def get_digest(
                         "tasks_created": findings_tasks_created,
                     }
 
+                for _sk, _agg in dir_scope_agg.items():
+                    for _field in ("avg_expansion_ratio_merged", "avg_expansion_ratio_failed", "avg_complexity_merged", "avg_complexity_failed"):
+                        w = _agg.pop(f"_{_field}_w", 0)
+                        s = _agg.pop(f"_{_field}_sum", 0.0)
+                        if w > 0:
+                            _agg[_field] = round(s / w, 2)
+                    if "avg_expansion_ratio_merged" in _agg:
+                        _agg["avg_expansion_ratio"] = _agg["avg_expansion_ratio_merged"]
+
                 direction_progress_list.append({
                     "direction_id": did,
                     "direction_text": direction_text,
@@ -973,6 +1015,7 @@ async def get_digest(
                     "latest_research_at": latest_research_at,
                     "product_ratio": dir_product_ratio,
                     "type_distribution": agg_type_distribution or None,
+                    "type_breakdown": agg_type_breakdown or None,
                     "estimated_cost_usd": round(dir_cost, 2),
                     "cost_by_scope": cost_by_scope or None,
                     "cost_by_status": cost_by_status or None,
@@ -990,6 +1033,11 @@ async def get_digest(
                     "lifetime_prs_rejected": lifetime_prs_rejected,
                     "lifetime_tasks_failed": lifetime_tasks_failed,
                     "lifetime_conversion_rate": lifetime_conversion_rate,
+                    "review_quality": {
+                        "reviews_dismissed": dir_reviews_dismissed,
+                        "reviews_overridden": dir_reviews_overridden,
+                        "user_issues_caught": dir_user_issues_caught,
+                    },
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
@@ -1028,6 +1076,8 @@ async def get_digest(
         tid = str(t.id)
         waiting_since = _derive_completed_at(t)
         waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
+        t_dir_id = (t.context or {}).get("direction_id")
+        t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
         needs_attention.append({
             "task_id": tid,
             "title": t.title or "Failed task",
@@ -1036,11 +1086,15 @@ async def get_digest(
             "pr_url": pr_artifact_map.get(tid),
             "waiting_since": waiting_since.isoformat() if waiting_since else None,
             "waiting_hours": waiting_hours,
+            "direction_id": t_dir_id,
+            "direction_text": t_dir_text,
         })
     for t in approval_tasks:
         tid = str(t.id)
         waiting_since = _derive_completed_at(t)
         waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
+        t_dir_id = (t.context or {}).get("direction_id")
+        t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
         needs_attention.append({
             "task_id": tid,
             "title": t.title or "Pending approval",
@@ -1051,6 +1105,8 @@ async def get_digest(
             "waiting_hours": waiting_hours,
             "approval_reason": t.latest_status_message,
             "touched_critical": (t.context or {}).get("touched_critical", []),
+            "direction_id": t_dir_id,
+            "direction_text": t_dir_text,
         })
     needs_attention.sort(key=lambda x: (0 if x["reason"] == "approval_required" else 1, -(x["waiting_hours"] or 0)))
 
@@ -1062,6 +1118,9 @@ async def get_digest(
         ts = _derive_completed_at(t)
         waiting_since = _derive_completed_at(t)
         waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
+        t_dir_id = (t.context or {}).get("direction_id")
+        t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
+        task_type = (t.first_payload).get("type", "create")
         recent_failures.append({
             "task_id": tid,
             "title": t.title or "Failed task",
@@ -1069,6 +1128,9 @@ async def get_digest(
             "error_snippet": error_log_map.get(tid),
             "waiting_hours": waiting_hours,
             "attempt_count": t.attempt_count,
+            "direction_id": t_dir_id,
+            "direction_text": t_dir_text,
+            "task_type": task_type,
         })
 
     # --- failure_groups (classify failures by type) ---
@@ -1092,6 +1154,8 @@ async def get_digest(
         cls = _classify_failure(t, error_log_map.get(tid))
         waiting_since = _derive_completed_at(t)
         waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
+        t_dir_id = (t.context or {}).get("direction_id")
+        t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
         _failure_class_groups.setdefault(cls, []).append({
             "task_id": tid,
             "title": t.title or "Failed task",
@@ -1099,6 +1163,8 @@ async def get_digest(
             "attempt_count": t.attempt_count,
             "waiting_hours": waiting_hours,
             "taxonomy": _classify_taxonomy(t),
+            "direction_id": t_dir_id,
+            "direction_text": t_dir_text,
         })
     failure_groups = sorted(
         [
@@ -1159,16 +1225,26 @@ async def get_digest(
         })
 
     # --- active_tasks list (up to 5, oldest started first) ---
-    active_tasks_list = [
-        {
+    _now_active = _utcnow()
+    active_tasks_list = []
+    for t in active_tasks_all[:5]:
+        at_dir_id = (t.context or {}).get("direction_id")
+        at_dir_text = dir_id_to_text.get(str(at_dir_id)) if at_dir_id else None
+        if t.vm_provisioned_at:
+            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+            running_cost_usd = rate * (_now_active - t.vm_provisioned_at).total_seconds()
+        else:
+            running_cost_usd = None
+        active_tasks_list.append({
             "task_id": str(t.id),
             "title": t.title or "Active task",
             "status": t.status.value if hasattr(t.status, "value") else t.status,
             "task_type": (t.first_payload).get("type", "create"),
             "started_at": t.started_at.isoformat() if t.started_at else None,
-        }
-        for t in active_tasks_all[:5]
-    ]
+            "direction_id": at_dir_id,
+            "direction_text": at_dir_text,
+            "running_cost_usd": running_cost_usd,
+        })
 
     running_statuses = {TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING}
     queued_statuses = {TaskStatus.QUEUED, TaskStatus.EVALUATING}

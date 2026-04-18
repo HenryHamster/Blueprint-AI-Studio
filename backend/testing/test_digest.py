@@ -121,6 +121,79 @@ async def test_digest_with_failed_tasks(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_digest_failed_task_direction_attribution(client: AsyncClient, db_session):
+    """Failed tasks with direction_id context expose direction_id/direction_text in needs_attention, recent_failures, and failure_groups."""
+    project = make_project(
+        directions=[
+            {"id": "dir-f1", "text": "Harden reliability", "status": "active"}
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Failed Task",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"direction_id": "dir-f1"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    attention = data["needs_attention"][0]
+    assert attention["direction_id"] == "dir-f1"
+    assert attention["direction_text"] == "Harden reliability"
+
+    failure = data["recent_failures"][0]
+    assert failure["direction_id"] == "dir-f1"
+    assert failure["direction_text"] == "Harden reliability"
+    assert failure["task_type"] == "create"
+
+    assert data["failure_groups"]
+    group_task = data["failure_groups"][0]["tasks"][0]
+    assert group_task["direction_id"] == "dir-f1"
+    assert group_task["direction_text"] == "Harden reliability"
+
+
+@pytest.mark.asyncio
+async def test_digest_approval_task_direction_attribution(client: AsyncClient, db_session):
+    """Approval-pending tasks with direction_id context expose direction attribution in needs_attention."""
+    project = make_project(
+        directions=[
+            {"id": "dir-a1", "text": "Approval direction", "status": "active"}
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Approval Task",
+        status=TaskStatus.IN_PROGRESS,
+        requires_approval=True,
+        context={"direction_id": "dir-a1"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    approval_items = [a for a in data["needs_attention"] if a["reason"] == "approval_required"]
+    assert approval_items
+    assert approval_items[0]["direction_id"] == "dir-a1"
+    assert approval_items[0]["direction_text"] == "Approval direction"
+
+
+@pytest.mark.asyncio
 async def test_digest_with_pending_approval(client: AsyncClient, db_session):
     """Tasks requiring approval (non-terminal) appear in needs_attention with reason='approval_required'."""
     project = make_project()
@@ -260,6 +333,49 @@ async def test_digest_active_count(client: AsyncClient, db_session):
     # active task should not bleed into completed_count
     completed_titles = [c["title"] for c in data["recent_completions"]]
     assert "Active Task" not in completed_titles
+
+
+@pytest.mark.asyncio
+async def test_digest_active_tasks_direction_and_cost(client: AsyncClient, db_session):
+    """active_tasks entries expose direction_id, direction_text and running_cost_usd."""
+    project = make_project(directions=[{"id": "d-1", "text": "Improve perf", "status": "active"}])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    provisioned_at = _utcnow() - timedelta(hours=1)
+    active_task = make_task(
+        project_id=project.id,
+        title="Directed Active",
+        status=TaskStatus.IN_PROGRESS,
+        context={"direction_id": "d-1"},
+        vm_provisioned_at=provisioned_at,
+        vm_spot=True,
+    )
+    bare_task = make_task(
+        project_id=project.id,
+        title="Bare Active",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(active_task)
+    db_session.add(bare_task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    by_id = {t["task_id"]: t for t in data["active_tasks"]}
+    directed = by_id[str(active_task.id)]
+    assert directed["direction_id"] == "d-1"
+    assert directed["direction_text"] == "Improve perf"
+    assert directed["running_cost_usd"] is not None
+    assert directed["running_cost_usd"] > 0
+
+    bare = by_id[str(bare_task.id)]
+    assert bare["direction_id"] is None
+    assert bare["direction_text"] is None
+    assert bare["running_cost_usd"] is None
 
 
 @pytest.mark.asyncio
@@ -613,6 +729,50 @@ async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_review_quality(client: AsyncClient, db_session):
+    """review_quality aggregates reviews_dismissed/overridden/user_issues_caught across in-window entries."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    recent_ts2 = (_utcnow() - timedelta(hours=2)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-rq",
+                "text": "Review quality direction",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "reviews_dismissed": 2, "reviews_overridden": 1, "user_issues_caught": 3},
+                    {"timestamp": recent_ts2, "reviews_dismissed": 1, "reviews_overridden": 0, "user_issues_caught": 2},
+                    {"timestamp": old_ts, "reviews_dismissed": 99, "reviews_overridden": 99, "user_issues_caught": 99},
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-rq"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    assert dp["review_quality"] == {
+        "reviews_dismissed": 3,
+        "reviews_overridden": 1,
+        "user_issues_caught": 5,
+    }
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_lifetime_metrics(client: AsyncClient, db_session):
     """Lifetime fields combine research_history with history_aggregate evicted totals."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
@@ -787,6 +947,80 @@ async def test_digest_direction_progress_taxonomy_and_failure_titles(client: Asy
     assert len(titles) == 3
     assert "old failed task" not in titles
     assert titles[-1] == "failed task D"
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_type_breakdown(client: AsyncClient, db_session):
+    """direction_progress aggregates type_breakdown across in-window research_history entries."""
+    recent_ts_1 = (_utcnow() - timedelta(hours=10)).isoformat()
+    recent_ts_2 = (_utcnow() - timedelta(hours=5)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=50)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-tb",
+                "text": "Type breakdown direction",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts_1,
+                        "prs_merged": 1,
+                        "tasks_created": 3,
+                        "type_breakdown": {
+                            "create": {"created": 2, "merged": 1, "failed": 1},
+                            "fix": {"created": 1, "merged": 0, "failed": 0},
+                        },
+                    },
+                    {
+                        "timestamp": recent_ts_2,
+                        "prs_merged": 1,
+                        "tasks_created": 2,
+                        "type_breakdown": {
+                            "create": {"created": 1, "merged": 1, "failed": 0},
+                            "review": {"created": 2, "merged": 0, "failed": 2},
+                        },
+                    },
+                    # Outside window — must be excluded
+                    {
+                        "timestamp": old_ts,
+                        "prs_merged": 0,
+                        "tasks_created": 1,
+                        "type_breakdown": {
+                            "create": {"created": 99, "merged": 99, "failed": 99},
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-tb"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    dp_list = data["direction_progress"]
+    assert len(dp_list) == 1
+    dp = dp_list[0]
+    assert dp["direction_id"] == "dir-tb"
+
+    tb = dp["type_breakdown"]
+    assert tb is not None
+    assert tb["create"] == {"created": 3, "merged": 2, "failed": 1}
+    assert tb["fix"] == {"created": 1, "merged": 0, "failed": 0}
+    assert tb["review"] == {"created": 2, "merged": 0, "failed": 2}
 
 
 @pytest.mark.asyncio
@@ -1860,6 +2094,84 @@ async def test_digest_scope_breakdown_preserves_failure_sub_counts(client: Async
     assert sb["failed_infra"] == 1
     assert sb["failed_code_error"] == 2
     assert sb["failed_scope_overflow"] == 1
+
+
+@pytest.mark.asyncio
+async def test_digest_scope_breakdown_includes_efficiency_predictors(client: AsyncClient, db_session):
+    """scope_breakdown aggregates weighted expansion/complexity averages and effort_distribution totals."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    recent_ts2 = (_utcnow() - timedelta(hours=2)).isoformat()
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-1",
+                "text": "D1",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 2,
+                        "tasks_created": 3,
+                        "scope_breakdown": {
+                            "small": {
+                                "created": 3, "merged": 2, "failed": 1,
+                                "avg_expansion_ratio_merged": 1.0,
+                                "avg_expansion_ratio_failed": 3.0,
+                                "avg_complexity_merged": 2.0,
+                                "avg_complexity_failed": 4.0,
+                                "effort_distribution": {
+                                    "low": {"created": 2, "merged": 2, "failed": 0},
+                                    "high": {"created": 1, "merged": 0, "failed": 1},
+                                },
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": recent_ts2,
+                        "prs_merged": 2,
+                        "tasks_created": 3,
+                        "scope_breakdown": {
+                            "small": {
+                                "created": 3, "merged": 2, "failed": 1,
+                                "avg_expansion_ratio_merged": 2.0,
+                                "avg_complexity_merged": 3.0,
+                                "effort_distribution": {
+                                    "low": {"created": 3, "merged": 2, "failed": 1},
+                                },
+                            },
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    sb = response.json()["direction_progress"][0]["scope_breakdown"]["small"]
+    # Weighted by merged counts (2 each cycle): (1.0*2 + 2.0*2)/4 = 1.5
+    assert sb["avg_expansion_ratio_merged"] == 1.5
+    assert sb["avg_expansion_ratio"] == 1.5
+    # Only one cycle had failed expansion ratio: weight=1, value=3.0
+    assert sb["avg_expansion_ratio_failed"] == 3.0
+    # Complexity merged weighted: (2.0*2 + 3.0*2)/4 = 2.5
+    assert sb["avg_complexity_merged"] == 2.5
+    assert sb["avg_complexity_failed"] == 4.0
+    ed = sb["effort_distribution"]
+    assert ed["low"] == {"created": 5, "merged": 4, "failed": 1}
+    assert ed["high"] == {"created": 1, "merged": 0, "failed": 1}
 
 
 @pytest.mark.asyncio
