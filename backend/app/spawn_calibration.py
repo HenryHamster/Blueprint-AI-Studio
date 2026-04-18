@@ -271,6 +271,11 @@ def predict_spawn_success(
        (weight 1.5, large scope only — reflects whether plan decomposition
        actually produces mergeable subtasks for this direction; omitted when
        no decomposition data exists)
+    6. Diagnosis state penalty (weight 1.0). Penalizes directions with active
+       diagnosis indicators: needs_manual_intervention (0.1), diagnosis_in_progress
+       (0.3), or remediation_attempts >= 2 with last_remediation_result='failed'
+       (proportional). Omitted entirely when no diagnosis state is present so
+       healthy directions are unaffected.
 
     Returns a float in [0.0, 1.0]. Falls back to 0.5 when data is insufficient.
     No DB queries — uses only data already loaded during research_completion processing.
@@ -344,6 +349,24 @@ def predict_spawn_success(
     if isinstance(pipeline_rate, (int, float)):
         signals.append(max(0.0, min(1.0, float(pipeline_rate))))
         weights.append(0.5)
+
+    # Signal 6: diagnosis state penalty. needs_manual_intervention is the
+    # strongest indicator (escalation already required), so it overrides
+    # weaker indicators. Omitted entirely when no diagnosis state is present
+    # so directions without diagnosis history are unaffected.
+    diagnosis_score: float | None = None
+    if direction.get("needs_manual_intervention"):
+        diagnosis_score = 0.1
+    elif direction.get("diagnosis_in_progress"):
+        diagnosis_score = 0.3
+    else:
+        rem_attempts = int(direction.get("remediation_attempts") or 0)
+        if rem_attempts >= 2 and direction.get("last_remediation_result") == "failed":
+            # 2 failures → 0.4, 3 → 0.3, 4 → 0.2, 5+ → 0.1.
+            diagnosis_score = max(0.1, 0.5 - 0.1 * (rem_attempts - 1))
+    if diagnosis_score is not None:
+        signals.append(diagnosis_score)
+        weights.append(1.0)
 
     if not signals:
         return 0.5  # insufficient data — neutral

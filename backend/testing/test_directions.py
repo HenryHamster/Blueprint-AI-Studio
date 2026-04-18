@@ -2929,6 +2929,75 @@ class TestPredictSpawnSuccessDecompositionSignal:
         assert predict_spawn_success("large", d) == pytest.approx(2.0 / 3.5)
 
 
+class TestPredictSpawnSuccessDiagnosisSignal:
+    """Unit tests for the diagnosis-state penalty signal (Signal 6)."""
+
+    def test_no_diagnosis_state_omits_signal(self):
+        """A direction with zero diagnosis indicators is unaffected — Signal 6
+        contributes nothing, so the result equals the no-data neutral 0.5.
+        """
+        assert predict_spawn_success("medium", {}) == 0.5
+
+    def test_needs_manual_intervention_applies_low_score(self):
+        """needs_manual_intervention is the strongest indicator: contributes 0.1
+        regardless of other diagnosis fields.
+        """
+        d = {"needs_manual_intervention": True}
+        # Only Signal 6 present at weight 1.0 → 0.1
+        assert predict_spawn_success("medium", d) == pytest.approx(0.1)
+
+    def test_needs_manual_intervention_overrides_other_diagnosis_fields(self):
+        """When needs_manual_intervention is True, weaker indicators are ignored."""
+        d = {
+            "needs_manual_intervention": True,
+            "diagnosis_in_progress": True,
+            "remediation_attempts": 5,
+            "last_remediation_result": "failed",
+        }
+        assert predict_spawn_success("medium", d) == pytest.approx(0.1)
+
+    def test_diagnosis_in_progress_applies_moderate_penalty(self):
+        d = {"diagnosis_in_progress": True}
+        # Only Signal 6 present at weight 1.0 → 0.3
+        assert predict_spawn_success("medium", d) == pytest.approx(0.3)
+
+    def test_failed_remediations_proportional_penalty(self):
+        """rem_attempts=2 with last_result=failed → 0.4; rem_attempts=4 → 0.2."""
+        d2 = {"remediation_attempts": 2, "last_remediation_result": "failed"}
+        assert predict_spawn_success("medium", d2) == pytest.approx(0.4)
+        d4 = {"remediation_attempts": 4, "last_remediation_result": "failed"}
+        assert predict_spawn_success("medium", d4) == pytest.approx(0.2)
+        d10 = {"remediation_attempts": 10, "last_remediation_result": "failed"}
+        # Floored at 0.1.
+        assert predict_spawn_success("medium", d10) == pytest.approx(0.1)
+
+    def test_failed_remediations_below_threshold_omits_signal(self):
+        """rem_attempts=1 — below the 2-attempt threshold — leaves direction
+        unaffected even with last_result=failed.
+        """
+        d = {"remediation_attempts": 1, "last_remediation_result": "failed"}
+        assert predict_spawn_success("medium", d) == 0.5
+
+    def test_merged_remediation_omits_signal(self):
+        """A successful (merged) remediation is not a penalty signal even with
+        many attempts — the direction has already been fixed.
+        """
+        d = {"remediation_attempts": 5, "last_remediation_result": "merged"}
+        assert predict_spawn_success("medium", d) == 0.5
+
+    def test_diagnosis_signal_combines_with_direction_signal(self):
+        """Signal 1 (weight 2.0) at 1.0 combined with Signal 6 (weight 1.0) at 0.3
+        → (2.0*1.0 + 1.0*0.3) / 3.0 = 0.7666...
+        """
+        d = {
+            "research_history": [
+                {"scope_breakdown": {"medium": {"created": 5, "merged": 5, "failed": 0}}},
+            ],
+            "diagnosis_in_progress": True,
+        }
+        assert predict_spawn_success("medium", d) == pytest.approx(2.3 / 3.0)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _poor_decomp_history helper unit tests (suppression signal)
 # ─────────────────────────────────────────────────────────────────────────────

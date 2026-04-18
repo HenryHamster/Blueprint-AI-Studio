@@ -80,23 +80,101 @@ async def _record_remediation_outcome(
         target["remediation_attempts"] = 1
     else:
         target["remediation_attempts"] = prior_attempts + 1
+    now_iso = _utcnow().isoformat()
     target["last_remediation_result"] = "merged" if merged else "failed"
-    target["last_remediation_at"] = _utcnow().isoformat()
+    target["last_remediation_at"] = now_iso
     target["last_remediation_diagnosis_task_id"] = str(diagnosis_task_id)
     target["last_remediation_task_id"] = str(task.id)
     if fingerprint:
         target["last_remediation_fingerprint"] = str(fingerprint)
+    history_entry: Dict[str, Any] = {
+        "task_id": str(task.id),
+        "result": "merged" if merged else "failed",
+        "timestamp": now_iso,
+        "prompt_snippet": ((task.first_payload or {}).get("prompt", "") or "")[:200],
+    }
+    if fingerprint:
+        history_entry["fingerprint"] = str(fingerprint)
     if merged:
         target.pop("last_remediation_failure_class", None)
         target.pop("last_remediation_error_summary", None)
+        if fingerprint:
+            try:
+                _propagate_remediation_success_to_siblings(
+                    project=project,
+                    directions=directions,
+                    fingerprint=str(fingerprint),
+                    successful_direction_id=str(direction_id),
+                    task=task,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"[DIAGNOSIS] Failed to propagate remediation success to siblings "
+                    f"for direction {direction_id}: {exc!r}"
+                )
     else:
         from app.failure_classification import classify_failure  # noqa: PLC0415
         target["last_remediation_failure_class"] = classify_failure(task)
         target["last_remediation_error_summary"] = (task.latest_status_message or "")[:200]
+        history_entry["failure_class"] = target["last_remediation_failure_class"]
+        history_entry["error_summary"] = target["last_remediation_error_summary"]
+    history_list = list(target.get("remediation_history") or [])
+    history_list.append(history_entry)
+    target["remediation_history"] = history_list[-_REMEDIATION_HISTORY_MAX:]
     project.directions = directions
     flag_modified(project, "directions")
     session.add(project)
     return True
+
+
+def _propagate_remediation_success_to_siblings(
+    *,
+    project: Project,
+    directions: List[Dict[str, Any]],
+    fingerprint: str,
+    successful_direction_id: str,
+    task: Task,
+) -> None:
+    """Inject an informational note into paused sibling directions sharing ``fingerprint``.
+
+    When a remediation merges, other auto-paused directions holding on the same
+    error fingerprint likely have the same root cause. Surface the successful
+    fix as a note on each so the next investigation has a concrete starting
+    point rather than re-diagnosing the shared root cause in parallel.
+
+    Does NOT clear holds, ``auto_paused`` flags, or status. Mutates ``directions``
+    in place; the caller is responsible for persisting the change via
+    ``flag_modified``.
+    """
+    from app.anomaly_detection import find_directions_sharing_fingerprint  # noqa: PLC0415
+
+    siblings = find_directions_sharing_fingerprint(
+        project, fingerprint, exclude_direction_id=successful_direction_id,
+    )
+    if not siblings:
+        return
+    prompt_snippet = (task.first_payload.get("prompt") or "").strip()[:200]
+    now_iso = _utcnow().isoformat()
+    note_text = (
+        f"Sibling remediation merged ({now_iso[:10]}) for direction "
+        f"{successful_direction_id} sharing the same error fingerprint. "
+        f"Task: {task.id}."
+    )
+    if prompt_snippet:
+        note_text += f" Approach: {prompt_snippet}"
+    note_text = note_text[:STRATEGIC_RATIONALE_MAX]
+    sibling_ids = {s.get("id") for s in siblings if s.get("id")}
+    for direction in directions:
+        if direction.get("id") not in sibling_ids:
+            continue
+        notes = list(direction.get("notes") or [])
+        notes.append({
+            "text": note_text,
+            "added_at": now_iso,
+            "added_by_task": str(task.id),
+            "source": "sibling_remediation_success",
+        })
+        direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
 
 
 async def _record_remediation_if_terminal(
@@ -128,6 +206,10 @@ async def _record_remediation_if_terminal(
 # auto-recovery cycle. Prevents a never-ending reinvestigate loop when the
 # root cause genuinely can't be diagnosed from code signals alone.
 _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT = 2
+
+# Retain this many recent remediation attempts per direction so follow-up
+# investigations can summarize what was already tried.
+_REMEDIATION_HISTORY_MAX = 5
 
 # Attempts older than this window are treated as expired and do not count
 # against the cap, letting directions that hit the cap recover naturally
@@ -228,6 +310,12 @@ async def _maybe_spawn_followup_investigation(
     failure_class = target.get("last_remediation_failure_class") or "(unknown)"
     error_summary = (target.get("last_remediation_error_summary") or "(no error message)")
     failed_prompt = (task.first_payload or {}).get("prompt", "") or ""
+    prior_history = list(target.get("remediation_history") or [])
+    # Exclude the current failed attempt (just appended by _record_remediation_outcome)
+    # since it is already surfaced separately as "approach that failed".
+    earlier_attempts = [
+        h for h in prior_history if h.get("task_id") != str(task.id)
+    ]
     prompt_parts = [
         "A remediation task spawned from a prior diagnosis on this direction "
         "has failed. Re-investigate the root cause — the earlier recommended "
@@ -243,12 +331,31 @@ async def _maybe_spawn_followup_investigation(
         "",
         f"Failure class: {failure_class}",
         f"Error summary: {str(error_summary)[:400]}",
-        "",
-        "Produce a recommended_fix that is materially different from the prior "
-        "attempt. Consider whether the direction scope is wrong, the prior fix "
-        "targeted a symptom rather than the cause, or a systemic/cross-cutting "
-        "issue (shared infrastructure, framework bug, test harness) is at play.",
     ]
+    if earlier_attempts:
+        lines = ["", "Earlier remediation attempts on this direction (oldest first):"]
+        for i, entry in enumerate(earlier_attempts, start=1):
+            ts = str(entry.get("timestamp") or "")[:19]
+            result = entry.get("result") or "?"
+            parts = [f"  {i}. [{ts}] result={result}"]
+            if entry.get("failure_class"):
+                parts.append(f"class={entry['failure_class']}")
+            snippet = str(entry.get("prompt_snippet") or "").strip()
+            if snippet:
+                parts.append(f"approach={snippet[:200]!r}")
+            err = str(entry.get("error_summary") or "").strip()
+            if err:
+                parts.append(f"error={err[:200]!r}")
+            lines.append("; ".join(parts))
+        prompt_parts.extend(lines)
+    prompt_parts.extend([
+        "",
+        "Produce a recommended_fix that is materially different from all prior "
+        "attempts above. Consider whether the direction scope is wrong, prior "
+        "fixes targeted a symptom rather than the cause, or a systemic/"
+        "cross-cutting issue (shared infrastructure, framework bug, test "
+        "harness) is at play.",
+    ])
     prompt = "\n".join(prompt_parts)[:20000]
     payload = validate_internal_payload(
         {"type": "investigate", "prompt": prompt, "base_branch": "main"},
@@ -290,6 +397,102 @@ async def _maybe_spawn_followup_investigation(
         f"fingerprint={fp_key[:40]}, "
         f"attempt {len(active_ts)}/"
         f"{_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT})"
+    )
+    return new_task
+
+
+async def _maybe_spawn_low_confidence_followup(
+    *,
+    investigation_task: Task,
+    project: Project,
+    direction: Dict[str, Any],
+    session: AsyncSession,
+) -> Optional[Task]:
+    """Spawn a re-investigation when a diagnosis completed at LOW confidence.
+
+    Mirrors the remediation-failure follow-up guards (24h dedup excluding the
+    current investigation, per-fingerprint cap, diagnosis_in_progress flag),
+    but issues a different prompt: ask the agent to narrow scope, reproduce
+    the failure, or examine signals the first pass may have missed — rather
+    than re-running the same root-cause analysis that just produced a weak
+    answer.
+    """
+    direction_id = direction.get("id")
+    if not direction_id or direction.get(DIAGNOSIS_IN_PROGRESS_KEY):
+        return None
+    cutoff = _utcnow() - timedelta(hours=24)
+    existing = await session.execute(
+        select(Task.id).where(
+            Task.project_id == project.id,
+            Task.created_at >= cutoff,
+            Task.id != investigation_task.id,
+            Task.payloads[0]["type"].as_string() == "investigate",
+            Task.context["direction_id"].as_string() == str(direction_id),
+        ).limit(1)
+    )
+    if existing.first() is not None:
+        return None
+    fingerprint = (
+        (investigation_task.context or {}).get("diagnosis_fingerprint")
+        or direction.get("error_fingerprint")
+    )
+    fp_key = str(fingerprint) if fingerprint else "no_fingerprint"
+    attempts_by_fp = dict(direction.get("followup_investigation_attempts_by_fingerprint") or {})
+    now = _utcnow()
+    active_ts = _active_followup_timestamps(attempts_by_fp.get(fp_key), now=now)
+    if len(active_ts) >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT:
+        return None
+    prior_summary = (direction.get("diagnosis_summary") or "").strip()
+    prompt = "\n".join([
+        "A prior investigation on this direction produced a LOW-confidence "
+        "diagnosis. Re-investigate with a different approach: narrow the scope "
+        "to one concrete failing task, try to reproduce the failure, and examine "
+        "signals the prior pass may have missed (raw logs, stack traces, recent "
+        "diffs, CI output) rather than re-running the same root-cause analysis.",
+        "",
+        f"Direction: {(direction.get('text') or '')[:200]}",
+        f"Direction id: {direction_id}",
+        "",
+        f"Prior (low-confidence) summary:\n{prior_summary[:1500] or '(none recorded)'}",
+        "",
+        "Return a diagnosis with HIGH or MEDIUM confidence, or explicitly "
+        "declare that code signals alone are insufficient and manual "
+        "intervention is required.",
+    ])[:20000]
+    task_ctx: Dict[str, Any] = {
+        "direction_id": str(direction_id),
+        "diagnosis_trigger": "low_confidence_followup",
+        "previous_investigation_task_id": str(investigation_task.id),
+    }
+    if fingerprint:
+        task_ctx["diagnosis_fingerprint"] = str(fingerprint)
+    new_task = Task(
+        project_id=project.id,
+        title=f"Re-investigate low-confidence diagnosis: {(direction.get('text') or '')[:50]}",
+        description=(
+            f"Follow-up after low-confidence investigation "
+            f"{str(investigation_task.id)[:8]}"
+        )[:500],
+        payloads=[validate_internal_payload(
+            {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+            "task_completion:low_confidence_followup",
+        )],
+        context=task_ctx,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        priority=70,
+    )
+    session.add(new_task)
+    active_ts.append(now.isoformat())
+    attempts_by_fp[fp_key] = active_ts
+    direction["followup_investigation_attempts_by_fingerprint"] = attempts_by_fp
+    direction[DIAGNOSIS_IN_PROGRESS_KEY] = True
+    direction[DIAGNOSIS_STARTED_AT_KEY] = now.isoformat()
+    logger.info(
+        f"[DIAGNOSIS] Spawned low-confidence follow-up {new_task.id} for "
+        f"direction {direction_id} (fingerprint={fp_key[:40]}, "
+        f"attempt {len(active_ts)}/{_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT})"
     )
     return new_task
 
@@ -1099,6 +1302,24 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
         flag_modified(project, "directions")
         session.add(project)
 
+    spawned_followup: Optional[Task] = None
+    if (
+        spawned_child is None
+        and not structural
+        and confidence == "low"
+        and direction is not None
+        and project is not None
+    ):
+        spawned_followup = await _maybe_spawn_low_confidence_followup(
+            investigation_task=task,
+            project=project,
+            direction=direction,
+            session=session,
+        )
+        if spawned_followup is not None:
+            flag_modified(project, "directions")
+            session.add(project)
+
     session.add(task)
 
     if spawned_child is not None:
@@ -1120,6 +1341,12 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
             f"[INVESTIGATION] Spawned remediation task {spawned_child.id} from "
             f"investigation {task.id} (direction={direction_id}, "
             f"confidence={confidence}, files={len(affected_paths)})"
+        )
+    elif spawned_followup is not None:
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(spawned_followup.id), "status": TaskStatus.QUEUED},
         )
     else:
         reason = (
