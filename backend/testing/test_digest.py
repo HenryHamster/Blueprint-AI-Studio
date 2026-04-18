@@ -504,6 +504,42 @@ async def test_digest_direction_progress_excludes_inactive(client: AsyncClient, 
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_includes_held_and_paused(client: AsyncClient, db_session):
+    """Held and auto_paused directions with recent task activity appear in direction_progress."""
+    project = make_project(
+        directions=[
+            {"id": "dir-held", "text": "Held direction", "status": "held"},
+            {"id": "dir-paused", "text": "Paused direction", "status": "auto_paused"},
+            {"id": "dir-inactive", "text": "Inactive direction", "status": "inactive"},
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for did in ("dir-held", "dir-paused", "dir-inactive"):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Task for {did}",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": did},
+        ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    by_id = {dp["direction_id"]: dp for dp in data["direction_progress"]}
+    assert "dir-held" in by_id
+    assert by_id["dir-held"]["status"] == "held"
+    assert "dir-paused" in by_id
+    assert by_id["dir-paused"]["status"] == "auto_paused"
+    assert "dir-inactive" not in by_id
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_excludes_no_activity(client: AsyncClient, db_session):
     """Active directions with no tasks in the window are omitted from direction_progress."""
     project = make_project(
@@ -574,6 +610,56 @@ async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_sess
 
     assert len(data["direction_progress"]) == 1
     assert data["direction_progress"][0]["prs_merged"] == 3  # only the recent entry
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_lifetime_metrics(client: AsyncClient, db_session):
+    """Lifetime fields combine research_history with history_aggregate evicted totals."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-life",
+                "text": "Lifetime direction",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "prs_merged": 2, "prs_rejected": 1, "tasks_created": 5, "tasks_failed": 1},
+                    {"timestamp": old_ts, "prs_merged": 1, "prs_rejected": 0, "tasks_created": 3, "tasks_failed": 2},
+                ],
+                "history_aggregate": {
+                    "total_cycles": 7,
+                    "total_tasks_created": 20,
+                    "total_prs_merged": 8,
+                    "total_prs_rejected": 4,
+                    "total_tasks_failed": 3,
+                },
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-life"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+
+    assert dp["lifetime_cycles"] == 9  # 2 history entries + 7 aggregated
+    assert dp["lifetime_prs_merged"] == 11  # 2 + 1 + 8
+    assert dp["lifetime_prs_rejected"] == 5  # 1 + 0 + 4
+    assert dp["lifetime_tasks_failed"] == 6  # 1 + 2 + 3
+    assert dp["lifetime_conversion_rate"] == round(11 / 28, 3)  # 11 merged / (5 + 3 + 20) created
 
 
 @pytest.mark.asyncio
@@ -701,6 +787,76 @@ async def test_digest_direction_progress_taxonomy_and_failure_titles(client: Asy
     assert len(titles) == 3
     assert "old failed task" not in titles
     assert titles[-1] == "failed task D"
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_decomposition_summary(client: AsyncClient, db_session):
+    """decomposition_summary aggregates decomposition_quality across in-window research_history entries."""
+    recent_ts_1 = (_utcnow() - timedelta(hours=10)).isoformat()
+    recent_ts_2 = (_utcnow() - timedelta(hours=5)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=50)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-dq",
+                "text": "Decomp direction",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts_1,
+                        "prs_merged": 1,
+                        "tasks_created": 2,
+                        "decomposition_quality": [
+                            {"plan_task_id": "p1", "subtask_count": 3, "subtask_merge_rate": 0.5, "cross_module_count": 1},
+                            {"plan_task_id": "p2", "subtask_count": 5, "subtask_merge_rate": None, "cross_module_count": 0},
+                        ],
+                    },
+                    {
+                        "timestamp": recent_ts_2,
+                        "prs_merged": 1,
+                        "tasks_created": 1,
+                        "decomposition_quality": [
+                            {"plan_task_id": "p3", "subtask_count": 2, "subtask_merge_rate": 1.0, "cross_module_count": 3},
+                        ],
+                    },
+                    {
+                        "timestamp": old_ts,
+                        "prs_merged": 0,
+                        "tasks_created": 0,
+                        "decomposition_quality": [
+                            {"plan_task_id": "p_old", "subtask_count": 99, "subtask_merge_rate": 0.0, "cross_module_count": 99},
+                        ],
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-dq"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    summary = dp["decomposition_summary"]
+    assert summary is not None
+    assert summary["plans_assessed"] == 3
+    # merge rate averaged over the 2 non-None values (0.5, 1.0) => 0.75
+    assert summary["avg_subtask_merge_rate"] == 0.75
+    # subtask_count across 3 plans: (3+5+2)/3 ≈ 3.33
+    assert summary["avg_subtask_count"] == 3.33
+    # cross_module across 3 plans: (1+0+3)/3 ≈ 1.33
+    assert summary["avg_cross_module_count"] == 1.33
 
 
 @pytest.mark.asyncio

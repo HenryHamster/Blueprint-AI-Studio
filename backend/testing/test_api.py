@@ -464,6 +464,39 @@ async def test_admin_tasks_include_estimated_cost_usd(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
+async def test_admin_tasks_filter_by_direction_and_type(client: AsyncClient, db_session):
+    """Admin /api/admin/tasks supports direction_id and task_type filters."""
+    project = await _make_project_with_member(db_session)
+
+    t1 = Task(project_id=project.id, title="A", status=TaskStatus.QUEUED,
+              payloads=[{"type": "research"}], context={"direction_id": "d-1"})
+    t2 = Task(project_id=project.id, title="B", status=TaskStatus.QUEUED,
+              payloads=[{"type": "create"}], context={"direction_id": "d-1"})
+    t3 = Task(project_id=project.id, title="C", status=TaskStatus.QUEUED,
+              payloads=[{"type": "research"}], context={"direction_id": "d-2"})
+    t4 = Task(project_id=project.id, title="D", status=TaskStatus.QUEUED,
+              payloads=[{"type": "create"}], context={})
+    db_session.add_all([t1, t2, t3, t4])
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/tasks", params={"direction_id": "d-1", "limit": 100})
+    assert resp.status_code == 200
+    titles = sorted(t["title"] for t in resp.json()["tasks"])
+    assert titles == ["A", "B"]
+
+    resp = await client.get("/api/admin/tasks", params={"task_type": "research", "limit": 100})
+    titles = sorted(t["title"] for t in resp.json()["tasks"])
+    assert titles == ["A", "C"]
+
+    resp = await client.get(
+        "/api/admin/tasks",
+        params={"direction_id": "d-1", "task_type": "create", "limit": 100},
+    )
+    titles = sorted(t["title"] for t in resp.json()["tasks"])
+    assert titles == ["B"]
+
+
+@pytest.mark.asyncio
 async def test_bulk_action_invalid_action(client: AsyncClient):
     """POST /api/admin/tasks/bulk-action with unknown action returns 400."""
     response = await client.post(

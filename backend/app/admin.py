@@ -153,6 +153,8 @@ async def get_all_tasks(
     archived: Optional[bool] = Query(None),
     search: Optional[str] = Query(None, max_length=200),
     created_after: Optional[datetime] = Query(None),
+    direction_id: Optional[str] = Query(None),
+    task_type: Optional[str] = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -180,6 +182,10 @@ async def get_all_tasks(
         if created_after.tzinfo is not None:
             created_after = created_after.astimezone(timezone.utc).replace(tzinfo=None)
         filters.append(Task.created_at >= created_after)
+    if direction_id:
+        filters.append(Task.context["direction_id"].as_string() == direction_id)
+    if task_type:
+        filters.append(Task.payloads[0]["type"].as_string() == task_type)
 
     count_query = select(func.count()).select_from(Task)
     for f in filters:

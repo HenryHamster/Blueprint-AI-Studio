@@ -752,7 +752,10 @@ async def get_digest(
     if project_id:
         project = await session.get(Project, project_id)
         if project:
-            active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+            active_directions = [
+                d for d in (project.directions or [])
+                if d.get("status") in ("active", "held", "auto_paused")
+            ]
 
             # Build direction_id -> text lookup
             for d in active_directions:
@@ -799,6 +802,11 @@ async def get_digest(
                 dir_findings_produced = 0
                 dir_batch_cap_applied = 0
                 dir_filter_breakdown_agg: Dict[str, int] = {}
+                dq_plans = 0
+                dq_merge_rate_sum = 0.0
+                dq_merge_rate_count = 0
+                dq_subtask_count_sum = 0
+                dq_cross_module_sum = 0
                 for entry in d.get("research_history") or []:
                     try:
                         entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
@@ -828,6 +836,16 @@ async def get_digest(
                             dir_taxonomy_summary[tax] = dir_taxonomy_summary.get(tax, 0) + cnt
                         for stage, cnt in (entry.get("stage_dropout") or {}).items():
                             dir_stage_dropout[stage] = dir_stage_dropout.get(stage, 0) + (cnt or 0)
+                        for dq in (entry.get("decomposition_quality") or []):
+                            if not isinstance(dq, dict):
+                                continue
+                            dq_plans += 1
+                            mr = dq.get("subtask_merge_rate")
+                            if mr is not None:
+                                dq_merge_rate_sum += float(mr)
+                                dq_merge_rate_count += 1
+                            dq_subtask_count_sum += dq.get("subtask_count") or 0
+                            dq_cross_module_sum += dq.get("cross_module_count") or 0
                         for fd in (entry.get("failed_task_details") or []):
                             title = (fd or {}).get("title")
                             if title:
@@ -875,6 +893,17 @@ async def get_digest(
                     if dir_fa_sample_size > 0 else None
                 )
 
+                _history_all = d.get("research_history") or []
+                _agg = d.get("history_aggregate") or {}
+                lifetime_cycles = len(_history_all) + (_agg.get("total_cycles") or 0)
+                lifetime_prs_merged = sum(h.get("prs_merged", 0) for h in _history_all) + (_agg.get("total_prs_merged") or 0)
+                lifetime_prs_rejected = sum(h.get("prs_rejected", 0) for h in _history_all) + (_agg.get("total_prs_rejected") or 0)
+                lifetime_tasks_created = sum(h.get("tasks_created", 0) for h in _history_all) + (_agg.get("total_tasks_created") or 0)
+                lifetime_tasks_failed = sum(h.get("tasks_failed", 0) for h in _history_all) + (_agg.get("total_tasks_failed") or 0)
+                lifetime_conversion_rate = (
+                    round(lifetime_prs_merged / lifetime_tasks_created, 3) if lifetime_tasks_created > 0 else None
+                )
+
                 direction_text = (d.get("text") or d.get("description") or "")[:80]
                 total_prs = prs_merged + prs_rejected
                 acceptance_rate = round(prs_merged / total_prs, 3) if total_prs > 0 else None
@@ -895,6 +924,18 @@ async def get_digest(
                     prev_scope_conversion_rates[_s]["merged"] += _st["merged"]
                     prev_scope_conversion_rates[_s]["calibrated_in"] += _st.get("calibrated_in", 0)
                     prev_scope_conversion_rates[_s]["calibrated_out"] += _st.get("calibrated_out", 0)
+
+                decomposition_summary = None
+                if dq_plans > 0:
+                    decomposition_summary = {
+                        "plans_assessed": dq_plans,
+                        "avg_subtask_merge_rate": (
+                            round(dq_merge_rate_sum / dq_merge_rate_count, 3)
+                            if dq_merge_rate_count > 0 else None
+                        ),
+                        "avg_subtask_count": round(dq_subtask_count_sum / dq_plans, 2),
+                        "avg_cross_module_count": round(dq_cross_module_sum / dq_plans, 2),
+                    }
 
                 filter_funnel = None
                 if dir_findings_produced or dir_batch_cap_applied or dir_filter_breakdown_agg or findings_tasks_created:
@@ -941,8 +982,14 @@ async def get_digest(
                     "stage_dropout": dir_stage_dropout or None,
                     "recent_failure_titles": recent_failed_titles[-3:] or None,
                     "filter_funnel": filter_funnel,
+                    "decomposition_summary": decomposition_summary,
                     "first_attempt_success_rate": dir_fa_rate,
                     "first_attempt_sample_size": dir_fa_sample_size,
+                    "lifetime_cycles": lifetime_cycles,
+                    "lifetime_prs_merged": lifetime_prs_merged,
+                    "lifetime_prs_rejected": lifetime_prs_rejected,
+                    "lifetime_tasks_failed": lifetime_tasks_failed,
+                    "lifetime_conversion_rate": lifetime_conversion_rate,
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
