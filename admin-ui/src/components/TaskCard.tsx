@@ -446,6 +446,8 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
   };
   const borderColor = task.task_type ? (taskTypeBorderColor[task.task_type] ?? 'border-l-neutral-700') : 'border-l-neutral-700';
 
+  const directionId = (task.context as Record<string, unknown> | undefined)?.direction_id as string | undefined;
+
   return (
     <div
       ref={ref}
@@ -532,6 +534,15 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           <span className="inline-flex items-center gap-1 text-[10px] font-medium bg-red-500/10 border border-red-500/30 text-red-400 px-1.5 py-0.5 rounded">
             <AlertTriangle className="w-3 h-3" />
             Blocking {blockingCount} task{blockingCount! > 1 ? 's' : ''}
+          </span>
+        )}
+        {directionId && (
+          <span
+            className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 font-mono"
+            title={`Direction: ${directionId}`}
+          >
+            <Compass className="w-3 h-3" />
+            {directionId.length > 10 ? `${directionId.slice(0, 10)}…` : directionId}
           </span>
         )}
       </div>

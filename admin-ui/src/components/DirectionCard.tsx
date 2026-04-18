@@ -130,6 +130,12 @@ export function DirectionCard({
               {d.proposal_rationale}
             </blockquote>
           )}
+          {d.completion_criteria && (
+            <p className="mt-1.5 text-[11px] text-neutral-500 leading-relaxed">
+              <span className="font-medium text-neutral-600">Done when: </span>
+              <span className="italic">{d.completion_criteria}</span>
+            </p>
+          )}
           <div className="flex items-center gap-2 mt-2">
             <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
               {d.priority}
@@ -170,6 +176,12 @@ export function DirectionCard({
             <blockquote className="mt-2 border-l-2 border-neutral-700/50 pl-2 text-[11px] text-neutral-500 italic leading-relaxed">
               {d.proposal_rationale}
             </blockquote>
+          )}
+          {d.completion_criteria && (
+            <p className="mt-1.5 text-[11px] text-neutral-500 leading-relaxed">
+              <span className="font-medium text-neutral-600">Done when: </span>
+              <span className="italic">{d.completion_criteria}</span>
+            </p>
           )}
           <div className="flex items-center gap-2 mt-2">
             <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
@@ -357,6 +369,12 @@ export function DirectionCard({
               </button>
             </div>
           </div>
+          {d.completion_criteria && (
+            <p className="mt-1.5 text-[11px] text-neutral-500 leading-relaxed">
+              <span className="font-medium text-neutral-600">Done when: </span>
+              <span className="italic">{d.completion_criteria}</span>
+            </p>
+          )}
           {/* Last researched / cooldown subtitle */}
           {key === 'active' && (() => {
             const cooldownStatus = getCooldownStatus(d, cooldownMinutes);

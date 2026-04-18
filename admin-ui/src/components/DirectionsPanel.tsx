@@ -38,6 +38,7 @@ export interface Direction {
   added_at: string;
   status: 'active' | 'completed' | 'paused' | 'proposed' | 'expired';
   category?: 'product' | 'structural' | 'mixed' | null;
+  completion_criteria?: string | null;
   paths?: string[];
   last_researched_at?: string | null;
   proposed_by?: string;
