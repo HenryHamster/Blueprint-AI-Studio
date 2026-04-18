@@ -35,7 +35,7 @@ from app.models import (
 )
 from app.research_context import _build_research_context
 from app.routers.agent import get_github_token_for_task
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import runtime_config as _runtime_config, scope_to_effort
 from app.payload_schemas import validate_internal_payload
 from app.broadcast import broadcast_to_project
 from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
@@ -1195,6 +1195,13 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         subtask_model = subtask_def.get('model') or model
         subtask_effort = subtask_def.get('effort') or effort
         child_scope = subtask_def.get('scope', 'small')
+        # Scope-aware effort floor: small subtasks run cheaper, large subtasks
+        # need deeper analysis. Max-by-rank so an explicit subtask or parent
+        # effort still wins when it is higher than the scope-derived floor.
+        _effort_rank = {"max": 4, "high": 3, "medium": 2, "low": 1}
+        _scope_effort = scope_to_effort(child_scope)
+        if _effort_rank.get(_scope_effort, 0) > _effort_rank.get(subtask_effort or "", 0):
+            subtask_effort = _scope_effort
         child_risk = subtask_def.get('risk', 'low')
         child_approval_reason = subtask_def.get('approval_reason') if child_risk == 'high' else None
         _allowed_types = {'create', 'refactor', 'migrate', 'qa'}

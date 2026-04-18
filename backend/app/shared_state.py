@@ -24,6 +24,21 @@ logger = logging.getLogger(__name__)
 # Analytics/tracking modules use "unknown" to distinguish missing data from a real scope.
 DEFAULT_TASK_SCOPE = "small"
 
+# Maps calibrated task scope to a baseline effort level used at spawn time.
+# small work runs faster/cheaper; large work gets deeper decomposition/analysis.
+# Used by research_completion and task_completion as a floor on top of
+# finding/parent-specified effort via _effort_rank (finding wins when higher).
+_SCOPE_EFFORT_MAP = {"small": "low", "medium": "medium", "large": "high"}
+
+
+def scope_to_effort(scope: Optional[str]) -> str:
+    """Return the baseline effort for a calibrated scope.
+
+    Unknown / missing scopes fall back to "medium" so callers can safely take
+    the max against other effort signals without suppressing them.
+    """
+    return _SCOPE_EFFORT_MAP.get(scope or "", "medium")
+
 # Rate limiter — shared between main.py and admin.py
 # Only enforced in Cloud Run (K_REVISION set), disabled locally for dev/test
 # Uses Redis for cross-instance coordination when REDIS_URL is set,
@@ -152,6 +167,32 @@ runtime_config: Dict = {
         "AGENT_TIMEOUT": 3,
     },
 }
+
+# Scope-aware per-class retry budgets. When a task's context includes a scope
+# matching a key below, the scope-specific budget overrides retry_budgets_by_class.
+# Missing scope (or a scope not in the inner dict) falls back to the uniform
+# retry_budgets_by_class value. Rationale:
+#   CODE_ERROR: small tasks are cheap to retry and often succeed with guidance;
+#     large tasks failing with CODE_ERROR usually reflect a fundamental approach
+#     problem — retrying burns compute without changing the outcome.
+#   AGENT_TIMEOUT: large tasks legitimately need more time, so more timeout
+#     retries are warranted; small tasks shouldn't need many retries.
+SCOPE_AWARE_RETRY_BUDGETS: Dict[str, Dict[str, int]] = {
+    "CODE_ERROR": {"small": 3, "medium": 2, "large": 1},
+    "AGENT_TIMEOUT": {"small": 2, "medium": 3, "large": 4},
+}
+
+
+def resolve_retry_budget(failure_class: str, scope: Optional[str]) -> int:
+    """Return the retry budget for (failure_class, scope), falling back to the
+    uniform retry_budgets_by_class value (or max_retries) if scope is not set
+    or has no scope-specific override."""
+    per_scope = SCOPE_AWARE_RETRY_BUDGETS.get(failure_class)
+    if scope and per_scope and scope in per_scope:
+        return per_scope[scope]
+    return runtime_config.get("retry_budgets_by_class", {}).get(
+        failure_class, runtime_config["max_retries"]
+    )
 
 # --- Autonomous Loop State ---
 autonomous_failure_counts: Dict[str, int] = {}  # project_id -> consecutive failures

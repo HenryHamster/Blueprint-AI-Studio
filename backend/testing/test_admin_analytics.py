@@ -8,6 +8,8 @@ from httpx import AsyncClient
 
 from app import shared_state
 from app.time_utils import _utcnow
+from app.models import TaskStatus
+from testing.factories import make_task
 
 
 @pytest.fixture
@@ -103,6 +105,57 @@ class TestFailingTaskTypes:
         types_gated = [e["task_type"] for e in resp.json()["gated_types"]]
         assert "create" in types_gated
         assert "review" not in types_gated
+
+
+class TestTaskDurationStats:
+    @pytest.mark.asyncio
+    async def test_scope_duration_stats_computes_p50_p90(self, client: AsyncClient, db_session):
+        """Completed tasks grouped by context scope get p50, p90, and sample_size."""
+        now = _utcnow()
+        started_at = now - timedelta(hours=2)
+        # 3 small tasks at 10/20/30s, 3 large tasks at 100/200/300s.
+        # 3+ samples per scope clears the min-floor; separate types ensure only scope path is tested.
+        durations_by_scope = {"small": [10, 20, 30], "large": [100, 200, 300]}
+        for scope, durs in durations_by_scope.items():
+            for secs in durs:
+                completed_at = started_at + timedelta(seconds=secs)
+                db_session.add(make_task(
+                    status=TaskStatus.COMPLETED,
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    context={"scope": scope},
+                    started_at=started_at,
+                    status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                    created_at=started_at,
+                ))
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/task-duration-stats")
+        assert resp.status_code == 200
+        scope_stats = resp.json()["scope_duration_stats"]
+        assert set(scope_stats.keys()) == {"small", "large"}
+        assert scope_stats["small"] == {"p50_seconds": 20.0, "p90_seconds": 30.0, "sample_size": 3}
+        assert scope_stats["large"] == {"p50_seconds": 200.0, "p90_seconds": 300.0, "sample_size": 3}
+
+    @pytest.mark.asyncio
+    async def test_scope_duration_stats_skips_insufficient_samples(self, client: AsyncClient, db_session):
+        """Scopes with fewer than 3 samples are omitted from scope_duration_stats."""
+        now = _utcnow()
+        started_at = now - timedelta(hours=2)
+        for secs in (10, 20):
+            completed_at = started_at + timedelta(seconds=secs)
+            db_session.add(make_task(
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create", "prompt": "x"}],
+                context={"scope": "medium"},
+                started_at=started_at,
+                status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                created_at=started_at,
+            ))
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/task-duration-stats")
+        assert resp.status_code == 200
+        assert resp.json()["scope_duration_stats"] == {}
 
 
 class TestAdminRecordFailureResult:

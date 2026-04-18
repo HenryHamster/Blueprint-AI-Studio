@@ -37,7 +37,7 @@ from app.finding_deduplication import (
 )
 from app.payload_schemas import validate_internal_payload
 from app.scope_complexity import _composite_complexity_score
-from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE
+from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE, scope_to_effort
 from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/callers
     _SCOPE_ORDER,
     SCOPE_FILE_BUDGETS,
@@ -58,6 +58,12 @@ from app.task_completion import (
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+# Task types whose effort is driven by the calibrated scope rather than the
+# type-level task_type_efforts config default. These are the "implementation"
+# types where cost should scale with code-change size; specialized types like
+# research/security_audit/qa keep their type-level effort regardless of scope.
+_SCOPE_AWARE_EFFORT_TYPES = frozenset({"create", "fix", "refactor", "plan"})
 
 from app.direction_metrics import (  # noqa: F401 — re-exported for callers/tests
     _HISTORY_AGG_DEFAULTS,
@@ -744,6 +750,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _combined_suffix = _retry_prompt_suffix
         if type_suffix:
             _combined_suffix = (_combined_suffix + ("\n" if _combined_suffix else "") + type_suffix)
+        # Scope-aware effort override for implementation task types: the scope
+        # (calibrated through history/heuristic/low-confidence/retry) drives the
+        # baseline effort — small→low, medium→medium, large→high — replacing
+        # the coarse type-level config default. Explicit finding_effort still
+        # wins when it ranks higher.
+        if task_type in _SCOPE_AWARE_EFFORT_TYPES:
+            _scope_effort = scope_to_effort(scope)
+            _finding_explicit = finding.get('effort')
+            if _finding_explicit and _effort_rank.get(_finding_explicit, 0) > _effort_rank.get(_scope_effort, 0):
+                finding_effort = _finding_explicit
+            else:
+                finding_effort = _scope_effort
         finding_payload = validate_internal_payload({
             "type": task_type,
             "prompt": full_prompt,

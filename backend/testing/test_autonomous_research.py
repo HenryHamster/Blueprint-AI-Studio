@@ -1435,6 +1435,114 @@ async def test_finding_scope_small_spawns_create_task(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_small_scope_finding_gets_low_effort(db_session, mocker):
+    """Small-scope findings spawn with effort='low' (cheaper/faster)."""
+    direction = _active_direction("d-efflow01", "Small scope low effort direction")
+    project = Project(
+        name="Scope Low Effort Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(
+            "Add null check to specific handler",
+            direction["id"],
+            scope="small",
+        )],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    assert child_tasks[0].payloads[0]["effort"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_large_scope_finding_gets_high_effort(db_session, mocker):
+    """Large-scope findings spawn with effort='high' (deeper decomposition)."""
+    direction = _active_direction("d-effhigh1", "Large scope high effort direction")
+    project = Project(
+        name="Scope High Effort Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(
+            "Migrate auth subsystem to new provider",
+            direction["id"],
+            scope="large",
+        )],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    assert child_tasks[0].payloads[0]["effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_explicit_finding_effort_max_beats_scope_floor(db_session, mocker):
+    """Finding-specified effort wins when it ranks higher than the scope-derived floor."""
+    direction = _active_direction("d-effmax01", "Explicit max effort direction")
+    project = Project(
+        name="Explicit Max Effort Test", user_id="test-user-123", autonomous_enabled=True, directions=[direction]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    finding = _make_finding(
+        "Tiny but critical check requiring max reasoning",
+        direction["id"],
+        scope="small",
+    )
+    finding["effort"] = "max"
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1
+    assert child_tasks[0].payloads[0]["effort"] == "max"
+
+
+@pytest.mark.asyncio
 async def test_finding_type_security_audit_spawns_security_audit_task(db_session, mocker):
     """A finding with type='security_audit' spawns a specialized security_audit task."""
     direction = _active_direction("d-secaud01", "Security audit direction")

@@ -161,23 +161,33 @@ async def get_task_duration_stats(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
-    """p50 duration per task type from COMPLETED tasks in last 7 days."""
+    """p50 duration per task type (plus p50/p90 per context scope) from COMPLETED tasks in last 7 days."""
     filters = [Task.status == TaskStatus.COMPLETED, Task.started_at.is_not(None), Task.created_at >= _utcnow() - timedelta(days=7)]
     if project_id:
         filters.append(Task.project_id == project_id)
     completed = (await session.execute(select(Task).where(*filters))).scalars().all()
     type_durations: dict = defaultdict(list)
+    scope_durations: dict = defaultdict(list)
     for t in completed:
         try: cat = datetime.fromisoformat(t.status_log[-1]["t"]) if t.status_log else t.created_at
         except Exception: cat = t.created_at
         dur = (cat - t.started_at).total_seconds()
-        if dur > 0: type_durations[(t.first_payload).get("type", "create")].append(dur)
+        if dur > 0:
+            type_durations[(t.first_payload).get("type", "create")].append(dur)
+            scope = (t.context or {}).get("scope")
+            if scope in ("small", "medium", "large"): scope_durations[scope].append(dur)
     stats: dict = {}
     for tt, durs in type_durations.items():
         if len(durs) >= 3:
             sd = sorted(durs); mid = len(sd) // 2
             stats[tt] = {"p50_seconds": sd[mid] if len(sd) % 2 else (sd[mid - 1] + sd[mid]) / 2, "sample_count": len(durs)}
-    return {"stats": stats}
+    scope_stats: dict = {}
+    for sc, durs in scope_durations.items():
+        if len(durs) >= 3:
+            sd = sorted(durs); n = len(sd); mid = n // 2
+            p50 = sd[mid] if n % 2 else (sd[mid - 1] + sd[mid]) / 2
+            scope_stats[sc] = {"p50_seconds": p50, "p90_seconds": sd[min(n - 1, int(0.9 * n))], "sample_size": n}
+    return {"stats": stats, "scope_duration_stats": scope_stats}
 
 
 @router.get("/failing-task-types")

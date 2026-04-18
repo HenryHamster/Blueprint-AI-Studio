@@ -301,6 +301,79 @@ async def test_orphan_ignored_without_vm_instance_id(
     assert t.status == TaskStatus.IN_PROGRESS
 
 
+@pytest.mark.asyncio
+async def test_large_scope_heartbeat_within_10min_not_reaped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Large-scope task gets a 10min heartbeat budget — 8min stale stays IN_PROGRESS."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-large-fresh",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=8),
+        context={"scope": "large"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_large_scope_heartbeat_past_10min_reaped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Large-scope task past the 10min threshold is still reaped."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-large-dead",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=11),
+        context={"scope": "large"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_medium_scope_heartbeat_within_7min_not_reaped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Medium-scope task gets a 7min heartbeat budget — 6min stale stays IN_PROGRESS."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-med-fresh",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=6),
+        context={"scope": "medium"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.IN_PROGRESS
+
+
 # ── Provision failure classification ─────────────────────────────────────
 
 
@@ -572,6 +645,55 @@ async def test_per_class_budget_exhaustion_fails_task(
     msg = (t.latest_status_message or "").lower()
     assert "failed after 2 retries" in msg
     assert "code_error" in msg
+
+
+@pytest.mark.asyncio
+async def test_scope_aware_budget_small_code_error_gets_extra_retry(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """scope=small lifts CODE_ERROR budget from 2→3, so attempt_count=2 still retries."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-small-code-error",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=2,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        context={"scope": "small", "last_error": "NameError: foo is not defined"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 3
+
+
+@pytest.mark.asyncio
+async def test_scope_aware_budget_large_code_error_fails_immediately(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """scope=large cuts CODE_ERROR budget to 1, so attempt_count=1 terminally fails."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-large-code-error",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        context={"scope": "large", "last_error": "NameError: foo is not defined"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED
 
 
 # ── Step 5b: retry_after sweep on QUEUED tasks ───────────────────────────

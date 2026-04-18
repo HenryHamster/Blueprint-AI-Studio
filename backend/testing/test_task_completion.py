@@ -23,6 +23,7 @@ from app.task_completion import (
     _compute_first_attempt_succeeded,
     _validate_plan_dependencies,
     _ensure_branch,
+    _handle_plan_completion,
     _record_remediation_outcome,
     _record_remediation_if_terminal,
     _maybe_spawn_followup_investigation,
@@ -2948,3 +2949,74 @@ class TestHandleInvestigationTerminalFailure:
             n.get("shared_investigation_task_id") == str(sibling_inv.id)
             for n in notes
         )
+
+
+# ── _handle_plan_completion — scope-aware subtask effort ──────────────────────
+
+class TestPlanSubtaskScopeAwareEffort:
+    """Plan subtasks inherit effort from parent, but with a scope-aware floor."""
+
+    def _plan_logs(self, subtasks):
+        return json.dumps({"subtasks": subtasks})
+
+    async def _setup_plan_task(self, db_session, mocker, parent_effort="medium"):
+        mocker.patch("app.task_completion._ensure_branch", new_callable=AsyncMock, return_value=True)
+        mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"type": "plan", "prompt": "plan it", "base_branch": "main", "effort": parent_effort}],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        return task
+
+    async def _child_tasks(self, db_session, parent_task):
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == parent_task.id)
+        )
+        return result.scalars().all()
+
+    @pytest.mark.asyncio
+    async def test_large_scope_subtask_raises_effort_above_parent(self, db_session, mocker):
+        """Large-scope subtask under medium-effort parent is floored up to 'high'."""
+        task = await self._setup_plan_task(db_session, mocker, parent_effort="medium")
+        logs = self._plan_logs([
+            {"title": "Sweeping refactor", "prompt": "Do big thing", "scope": "large"},
+        ])
+        await _handle_plan_completion(task, logs, db_session)
+        children = await self._child_tasks(db_session, task)
+        assert len(children) == 1
+        assert children[0].payloads[0]["effort"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_small_scope_subtask_keeps_parent_effort_when_higher(self, db_session, mocker):
+        """Small-scope subtask under medium-effort parent keeps 'medium' (parent floor wins)."""
+        task = await self._setup_plan_task(db_session, mocker, parent_effort="medium")
+        logs = self._plan_logs([
+            {"title": "Small tweak", "prompt": "Narrow fix", "scope": "small"},
+        ])
+        await _handle_plan_completion(task, logs, db_session)
+        children = await self._child_tasks(db_session, task)
+        assert len(children) == 1
+        assert children[0].payloads[0]["effort"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_explicit_subtask_effort_max_beats_scope_floor(self, db_session, mocker):
+        """Subtask-specified effort wins when it ranks higher than the scope floor."""
+        task = await self._setup_plan_task(db_session, mocker, parent_effort="medium")
+        logs = self._plan_logs([
+            {"title": "Critical tiny change", "prompt": "p", "scope": "small", "effort": "max"},
+        ])
+        await _handle_plan_completion(task, logs, db_session)
+        children = await self._child_tasks(db_session, task)
+        assert len(children) == 1
+        assert children[0].payloads[0]["effort"] == "max"

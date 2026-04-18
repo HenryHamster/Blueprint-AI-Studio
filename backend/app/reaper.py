@@ -13,7 +13,7 @@ from app.database import AsyncSessionLocal
 from app.models import Task, TaskStatus
 from app.compute import get_provision_error, record_zone_failure, _capture_serial_for_vm, get_vm_zone, INFRA_PROVISION_PATTERNS, any_zone_available, soonest_zone_recovery
 from app.shared_state import runtime_config as _runtime_config
-from app.shared_state import record_pipeline_event, external_health as _external_health
+from app.shared_state import record_pipeline_event, external_health as _external_health, resolve_retry_budget
 from app.failure_classification import classify_failure, persist_failure_category, INFRA_CLASSES
 from app.time_utils import _utcnow, set_retry_after, parse_retry_after, RETRY_AFTER_MAX_MINUTES
 from app.failure_classification import classify_failure, persist_failure_category
@@ -39,6 +39,25 @@ def _copy_analysis_artifacts_to_previous(ctx: dict) -> None:
     for src, dst in _ANALYSIS_ARTIFACT_KEYS:
         if ctx.get(src):
             ctx[dst] = ctx[src]
+
+
+# Per-scope heartbeat-stale thresholds. Large-scope tasks legitimately run longer
+# stretches without a heartbeat (multi-file self-review, full test suites,
+# cross-module analysis), so reaping at the small-scope 5-minute bar flags them
+# as dead while they're still making progress.
+_HEARTBEAT_STALE_SECONDS_BY_SCOPE = {
+    "small": 300,
+    "medium": 420,
+    "large": 600,
+}
+
+
+def _heartbeat_stale_cutoff(task, now: datetime) -> datetime:
+    scope = (task.context or {}).get("scope")
+    if not scope:
+        scope = (task.first_payload or {}).get("scope")
+    seconds = _HEARTBEAT_STALE_SECONDS_BY_SCOPE.get(scope, 300)
+    return now - timedelta(seconds=seconds)
 
 
 async def reaper_service():
@@ -68,7 +87,6 @@ async def reaper_service():
                 active_tasks = (await session.execute(stmt)).scalars().all()
 
                 now = _utcnow()
-                five_minutes_ago = now - timedelta(minutes=5)
                 six_minutes_ago = now - timedelta(minutes=6)
                 ten_minutes_ago = now - timedelta(minutes=10)
                 fifteen_minutes_ago = now - timedelta(minutes=15)
@@ -80,7 +98,8 @@ async def reaper_service():
                 #     None on a PROVISIONING task means the agent has not contacted us yet.
                 #
                 # Thresholds:
-                #   - IN_PROGRESS + last_heartbeat > 5min ago → agent crashed mid-run (attempt budget)
+                #   - IN_PROGRESS + stale heartbeat → agent crashed mid-run (attempt budget).
+                #     Stale cutoff is scope-aware: 5min (small) / 7min (medium) / 10min (large).
                 #   - PROVISIONING + vm_provisioned_at > 6min ago + no heartbeat → silent pre-claim
                 #     death (provision budget). 6min gives margin over the ~90-150s nominal cold
                 #     boot + auth validation + claim sequence.
@@ -89,11 +108,12 @@ async def reaper_service():
                 for task in active_tasks:
                     if not task.vm_instance_id:
                         continue
+                    hb_cutoff = _heartbeat_stale_cutoff(task, now)
                     if task.status == TaskStatus.PROVISIONING:
                         if task.started_at and task.started_at < fifteen_minutes_ago:
                             orphaned_ids.append(task.id)  # absolute provisioning ceiling
                             logger.warning(f"[REAPER] Task {task.id} stuck in PROVISIONING for >15min (started_at={task.started_at})")
-                        elif task.last_heartbeat and task.last_heartbeat < five_minutes_ago:
+                        elif task.last_heartbeat and task.last_heartbeat < hb_cutoff:
                             # Rare: agent claimed during PROVISIONING (shouldn't happen since
                             # claim_task also flips status to IN_PROGRESS), then went silent.
                             orphaned_ids.append(task.id)
@@ -102,7 +122,7 @@ async def reaper_service():
                             # agent never claimed. Charge provision budget.
                             orphaned_ids.append(task.id)
                     elif task.status == TaskStatus.IN_PROGRESS:
-                        if task.last_heartbeat and task.last_heartbeat < five_minutes_ago:
+                        if task.last_heartbeat and task.last_heartbeat < hb_cutoff:
                             orphaned_ids.append(task.id)
                         elif task.last_heartbeat is None and task.started_at and task.started_at < six_minutes_ago:
                             # Defensive: IN_PROGRESS without any heartbeat shouldn't happen
@@ -157,7 +177,7 @@ async def reaper_service():
                                 _reaper_skip_counts.pop(t.id, None)
                                 if t.status not in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS):
                                     continue
-                                if t.last_heartbeat and t.last_heartbeat >= five_minutes_ago:
+                                if t.last_heartbeat and t.last_heartbeat >= _heartbeat_stale_cutoff(t, now):
                                     continue
                                 orphaned_tasks.append(t)
                                 logger.warning(f"[REAPER] Force-locked persistently skipped task {t.id}")
@@ -177,21 +197,21 @@ async def reaper_service():
                     # expire_all() above ensures these objects have fresh DB values.
                     # Mirrors the state machine above — same thresholds, same branching.
                     now = _utcnow()  # Refresh now — time passed during lock acquisition
-                    five_minutes_ago = now - timedelta(minutes=5)
                     six_minutes_ago = now - timedelta(minutes=6)
                     ten_minutes_ago = now - timedelta(minutes=10)
                     fifteen_minutes_ago = now - timedelta(minutes=15)
                     verified = []
                     for t in orphaned_tasks:
+                        hb_cutoff = _heartbeat_stale_cutoff(t, now)
                         if t.status == TaskStatus.PROVISIONING:
                             if t.started_at and t.started_at < fifteen_minutes_ago:
                                 verified.append(t)
-                            elif t.last_heartbeat and t.last_heartbeat < five_minutes_ago:
+                            elif t.last_heartbeat and t.last_heartbeat < hb_cutoff:
                                 verified.append(t)
                             elif t.vm_provisioned_at and t.vm_provisioned_at < six_minutes_ago and t.last_heartbeat is None:
                                 verified.append(t)
                         elif t.status == TaskStatus.IN_PROGRESS:
-                            if t.last_heartbeat and t.last_heartbeat < five_minutes_ago:
+                            if t.last_heartbeat and t.last_heartbeat < hb_cutoff:
                                 verified.append(t)
                             elif t.last_heartbeat is None and t.started_at and t.started_at < six_minutes_ago:
                                 verified.append(t)
@@ -443,8 +463,8 @@ async def reaper_service():
                         reap_failure_class = classify_failure(task, logs=combined_logs)
                         if reap_failure_class == "CODE_ERROR" and not combined_logs.strip():
                             reap_failure_class = "AGENT_TIMEOUT"
-                        retry_budgets = _runtime_config.get("retry_budgets_by_class", {})
-                        class_budget = retry_budgets.get(reap_failure_class, _runtime_config["max_retries"])
+                        task_scope = (task.context or {}).get("scope")
+                        class_budget = resolve_retry_budget(reap_failure_class, task_scope)
                         can_retry = task.attempt_count < class_budget
 
                     if can_retry:
