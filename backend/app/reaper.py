@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 _reaper_skip_counts: Dict[uuid.UUID, int] = {}
 
 
+_TRANSIENT_5XX_PATTERNS = frozenset({
+    "http 502", "http 503", "http 504",
+    "502 bad gateway", "503 service", "504 gateway",
+    "server error",
+})
+
+
 _ANALYSIS_ARTIFACT_KEYS = (
     ("_pr_diff_summary", "_previous_diff_summary"),
     ("_test_failure_summary", "_previous_test_failure_summary"),
@@ -48,12 +55,28 @@ _HEARTBEAT_STALE_DEFAULTS = {
 }
 
 
+_HEARTBEAT_EFFORT_FLOORS = {
+    "low": 300,
+    "medium": 300,
+    "high": 420,
+    "max": 600,
+}
+
+
 def _heartbeat_stale_cutoff(task, now: datetime) -> datetime:
-    scope = (task.context or {}).get("scope")
-    if not scope:
-        scope = (task.first_payload or {}).get("scope")
+    ctx = task.context or {}
+    payload = task.first_payload or {}
+    scope = ctx.get("scope") or payload.get("scope")
     thresholds = _runtime_config.get("heartbeat_stale_seconds_by_scope", _HEARTBEAT_STALE_DEFAULTS)
     seconds = thresholds.get(scope, thresholds.get("small", 300))
+
+    effort = ctx.get("effort") or payload.get("effort")
+    if not effort:
+        task_type = ctx.get("type") or payload.get("type")
+        if task_type:
+            effort = _runtime_config.get("task_type_efforts", {}).get(task_type)
+    floor = _HEARTBEAT_EFFORT_FLOORS.get(effort, 0)
+    seconds = max(seconds, floor)
     return now - timedelta(seconds=seconds)
 
 
@@ -462,23 +485,18 @@ async def reaper_service():
                             reap_failure_class = "AGENT_TIMEOUT"
                         task_scope = (task.context or {}).get("scope")
                         class_budget = resolve_retry_budget(reap_failure_class, task_scope)
-                        # Detect EXTERNAL_API fast-path: transient 5xx on a task with no
-                        # committed work, where the dependency health check shows recovery.
-                        # These failures skip the attempt_count increment below (mirrors
-                        # the RATE_LIMIT fast-path) since the retry is near-instant and
-                        # not indicative of a code defect.
+                        # Detect EXTERNAL_API fast-path: transient 5xx where the dependency
+                        # health check shows recovery. These failures skip the attempt_count
+                        # increment below (mirrors the RATE_LIMIT fast-path) since the retry
+                        # is near-instant and not indicative of a code defect. Applies whether
+                        # or not the task already has a PR — a transient 502 after pushing
+                        # work should not burn a retry attempt if the dependency recovered.
                         _err_blob = (combined_logs + " " + (task.latest_status_message or "")).lower()
-                        _transient_5xx = any(p in _err_blob for p in (
-                            "http 502", "http 503", "http 504",
-                            "502 bad gateway", "503 service", "504 gateway",
-                            "server error",
-                        ))
-                        _has_work = bool((task.context or {}).get("pr_number"))
+                        _transient_5xx = any(p in _err_blob for p in _TRANSIENT_5XX_PATTERNS)
                         _gh_consec = _external_health.get("consecutive_failures", {}).get("github_api", 0)
                         ext_api_fast_path = (
                             reap_failure_class == "EXTERNAL_API"
                             and _transient_5xx
-                            and not _has_work
                             and _gh_consec == 0
                         )
                         can_retry = task.attempt_count < class_budget
@@ -558,31 +576,28 @@ async def reaper_service():
                             elif is_provision_failure:
                                 delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75-6.25 minutes
                             elif reap_failure_class == "EXTERNAL_API":
-                                # Adaptive delay: transient HTTP 5xx on a task with no successful
-                                # work typically resolves in 1-3 minutes, so don't wait 5+ minutes
-                                # on first retry. Sustained outages fall through to [5,15,30,60].
+                                # Adaptive delay: transient HTTP 5xx typically resolves in 1-3
+                                # minutes, so don't wait 5+ minutes on first retry. Sustained
+                                # outages fall through to [5,15,30,60]. Non-transient errors
+                                # (DNS, TLS, context_length_exceeded) indicate deeper problems
+                                # and always use the longer sequence.
                                 _err_blob = (combined_logs + " " + (task.latest_status_message or "")).lower()
-                                _transient_5xx = any(p in _err_blob for p in (
-                                    "http 502", "http 503", "http 504",
-                                    "502 bad gateway", "503 service", "504 gateway",
-                                    "server error",
-                                ))
-                                _has_work = bool((task.context or {}).get("pr_number"))
+                                _transient_5xx = any(p in _err_blob for p in _TRANSIENT_5XX_PATTERNS)
                                 _gh_consec = _external_health.get("consecutive_failures", {}).get("github_api", 0)
-                                if _transient_5xx and not _has_work and _gh_consec == 0:
+                                if _transient_5xx and _gh_consec == 0:
                                     # Dependency already recovered — requeue immediately.
                                     delay_minutes = 0
-                                elif _transient_5xx and not _has_work and task.attempt_count == 1:
+                                elif _transient_5xx and task.attempt_count == 1:
                                     # First-attempt short delay for transient 5xx.
                                     delay_minutes = 1.5 * random.uniform(0.75, 1.25)
-                                elif _transient_5xx and not _has_work:
+                                elif _transient_5xx:
                                     # Subsequent retries for transient 5xx: [5, 15, 30].
                                     _t5xx_delays = [5, 15, 30]
                                     _idx = min(task.attempt_count - 2, len(_t5xx_delays) - 1)
                                     delay_minutes = _t5xx_delays[_idx] * random.uniform(0.75, 1.25)
                                 else:
-                                    # Non-transient (DNS, TLS, context_length_exceeded) or task
-                                    # already has committed work — use the longer sequence.
+                                    # Non-transient (DNS, TLS, context_length_exceeded) — use
+                                    # the longer sequence since these indicate deeper problems.
                                     _ext_api_delays = [5, 15, 30, 60]
                                     _attempt_idx = min(task.attempt_count - 1, len(_ext_api_delays) - 1)
                                     delay_minutes = _ext_api_delays[_attempt_idx] * random.uniform(0.75, 1.25)

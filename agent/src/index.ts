@@ -802,12 +802,18 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
   }
 }
 
+/** Normalized error fingerprint for detecting identical consecutive failures. */
+export function errorFingerprint(msg: string): string {
+  return msg.replace(/\s+/g, ' ').trim().slice(0, 2000);
+}
+
 /** Run lint checks in a loop, asking Claude to fix failures up to MAX_LINT_FIX_ATTEMPTS times. */
 export async function lintFixLoop(
   changedPaths: string[], ws: WebSocket | null, statusRef: { value: string },
   context: string = 'the code you just wrote', model?: string, effort?: string,
   buildConfig?: BuildConfig
 ): Promise<boolean> {
+  let prevFingerprint: string | null = null;
   for (let attempt = 0; attempt < MAX_LINT_FIX_ATTEMPTS; attempt++) {
     try {
       statusRef.value = attempt === 0 ? 'Running pre-commit checks...' : `Re-running lint (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS})...`;
@@ -815,6 +821,12 @@ export async function lintFixLoop(
       return true;
     } catch (lintErr: unknown) {
       const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
+      const fingerprint = errorFingerprint(msg);
+      if (prevFingerprint !== null && fingerprint === prevFingerprint) {
+        sendLog(ws, `Lint error unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
+        return false;
+      }
+      prevFingerprint = fingerprint;
       sendLog(ws, `Pre-commit check failed (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS}):\n${msg.slice(0, 3000)}\nClaude will attempt to fix...\n`);
       await runClaudeCode(
         `The following lint/build errors were found in ${context}. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}`,
@@ -1092,6 +1104,7 @@ export async function testFixLoop(
 
   sendLog(ws, `Detected test runner(s): ${runners.map(r => r.label).join(', ')}\n`);
 
+  let prevFingerprint: string | null = null;
   for (let attempt = 0; attempt <= MAX_TEST_FIX_ATTEMPTS; attempt++) {
     statusRef.value = attempt === 0 ? 'Running test suite...' : `Re-running tests (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})...`;
     sendLog(ws, `Running tests (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})...\n`);
@@ -1166,6 +1179,13 @@ export async function testFixLoop(
     }
 
     const combinedFailures = fixableFailures.join('\n\n');
+    const fingerprint = errorFingerprint(combinedFailures);
+    if (prevFingerprint !== null && fingerprint === prevFingerprint) {
+      sendLog(ws, `Test failures unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
+      const failureSummary = combinedFailures.slice(0, 2000);
+      return { passed: false, testFailuresDetected: true, failureSummary };
+    }
+    prevFingerprint = fingerprint;
     if (attempt < MAX_TEST_FIX_ATTEMPTS) {
       const preExistingHint = preExistingNote ? ' (pre-existing failures excluded)' : '';
       sendLog(ws, `Tests failed (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})${preExistingHint}:\n${combinedFailures.slice(0, 3000)}\nClaude will attempt to fix...\n`);

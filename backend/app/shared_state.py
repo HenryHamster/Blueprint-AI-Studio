@@ -185,9 +185,14 @@ runtime_config: Dict = {
 #     problem — retrying burns compute without changing the outcome.
 #   AGENT_TIMEOUT: large tasks legitimately need more time, so more timeout
 #     retries are warranted; small tasks shouldn't need many retries.
+#   EXTERNAL_API: transient third-party outages are not correlated with task
+#     scope, but large-scope tasks are expensive to re-run from scratch, so
+#     allow one extra retry over the uniform budget; small-scope tasks fail
+#     cheaply and don't need the full budget.
 SCOPE_AWARE_RETRY_BUDGETS: Dict[str, Dict[str, int]] = {
     "CODE_ERROR": {"small": 3, "medium": 2, "large": 1},
     "AGENT_TIMEOUT": {"small": 2, "medium": 3, "large": 4},
+    "EXTERNAL_API": {"small": 3, "medium": 4, "large": 5},
 }
 
 

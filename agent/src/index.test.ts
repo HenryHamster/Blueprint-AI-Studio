@@ -48,7 +48,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, recordToolUse, snapshotToolTrace, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, recordToolUse, snapshotToolTrace, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
 
 // ── strVal ───────────────────────────────────────────────────────────────────
@@ -482,6 +482,113 @@ describe('testFixLoop directory scoping', () => {
     const cwds = cwdsCalledWith();
     expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
     expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+});
+
+// ── errorFingerprint / duplicate-error early exit ───────────────────────────
+describe('errorFingerprint', () => {
+  it('normalizes whitespace and truncates to 2000 chars', () => {
+    expect(errorFingerprint('  foo\n\tbar  ')).toBe('foo bar');
+    expect(errorFingerprint('x'.repeat(3000)).length).toBe(2000);
+  });
+
+  it('returns same fingerprint for trivially different whitespace', () => {
+    expect(errorFingerprint('err:\n  at foo')).toBe(errorFingerprint('err:  at   foo'));
+  });
+});
+
+describe('lintFixLoop early exit on identical errors', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(spawn).mockImplementation(() => {
+      const proc = {
+        pid: 123, stderr: { on: vi.fn() }, stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') setImmediate(() => cb(0));
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+  });
+
+  it('exits early when consecutive lint errors are identical', async () => {
+    const buildConfig = { directories: [{ path: 'agent', type: 'node', lint_cmd: 'npm run lint' }] };
+    const errorMessage = 'eslint: no-unused-vars at foo.ts:1:1';
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') throw new Error(errorMessage);
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
+    expect(result).toBe(false);
+    const npmCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'npm').length;
+    expect(npmCalls).toBeLessThanOrEqual(2);
+  });
+
+  it('continues when lint errors differ between attempts', async () => {
+    const buildConfig = { directories: [{ path: 'agent', type: 'node', lint_cmd: 'npm run lint' }] };
+    let callCount = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') {
+        callCount++;
+        throw new Error(`eslint error variant ${callCount}`);
+      }
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
+    const npmCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'npm').length;
+    expect(npmCalls).toBe(3);
+  });
+});
+
+describe('testFixLoop early exit on identical errors', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(spawn).mockImplementation(() => {
+      const proc = {
+        pid: 123, stderr: { on: vi.fn() }, stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') setImmediate(() => cb(0));
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+  });
+
+  it('exits early when consecutive test errors are identical', async () => {
+    const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
+    const errorMessage = 'FAIL test.ts > it works';
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') throw new Error(errorMessage);
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.failureSummary).toContain(errorMessage);
+    const npmCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'npm').length;
+    // Early exit after the duplicate on attempt 2: at most 2 test runs
+    expect(npmCalls).toBeLessThanOrEqual(2);
+  });
+
+  it('continues when test errors differ between attempts', async () => {
+    const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
+    let callCount = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') {
+        callCount++;
+        throw new Error(`FAIL variant ${callCount}`);
+      }
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
+    const npmCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'npm').length;
+    // MAX_TEST_FIX_ATTEMPTS = 2, loop runs 3 times when errors differ
+    expect(npmCalls).toBe(3);
   });
 });
 

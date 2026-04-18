@@ -51,6 +51,47 @@ def test_heartbeat_stale_cutoff_respects_runtime_config_override():
             _runtime_config["heartbeat_stale_seconds_by_scope"] = original
 
 
+def test_heartbeat_stale_cutoff_effort_floor_extends_small_scope_max_effort():
+    """Effort floor (max=600s) extends small-scope cutoff (300s) when effort is higher."""
+    class _T:
+        context = {"scope": "small", "effort": "max"}
+        first_payload = None
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=600)
+
+
+def test_heartbeat_stale_cutoff_effort_floor_does_not_weaken_large_scope():
+    """Large-scope threshold (600s) wins over low-effort floor (300s)."""
+    class _T:
+        context = {"scope": "large", "effort": "low"}
+        first_payload = None
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=600)
+
+
+def test_heartbeat_stale_cutoff_effort_from_task_type_fallback():
+    """Effort resolves from task_type_efforts when not explicit in context."""
+    class _T:
+        context = {"scope": "small", "type": "strategic_review"}
+        first_payload = None
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    # strategic_review -> "max" effort -> 600s floor > 300s small scope
+    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=600)
+
+
+def test_heartbeat_stale_cutoff_unknown_effort_uses_scope_threshold():
+    """Unknown effort string falls back to scope-only behavior."""
+    class _T:
+        context = {"scope": "small", "effort": "unknown_effort_xyz"}
+        first_payload = None
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=300)
+
+
 class _StopLoop(Exception):
     """Raised from mocked asyncio.sleep to break the reaper's infinite loop."""
 
@@ -586,9 +627,9 @@ async def test_external_api_retry_delay_escalates_with_attempt_count(
         status=TaskStatus.IN_PROGRESS,
         attempt_count=2,
         last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
-        # pr_number indicates successful work — routes through the non-transient
+        # Non-transient error (DNS resolution) routes through the long
         # [5,15,30,60] sequence rather than the adaptive-5xx fast path.
-        context={"last_error": "api.github.com: 502 bad gateway", "pr_number": 42},
+        context={"last_error": "name resolution failed for api.github.com", "pr_number": 42},
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -685,10 +726,11 @@ async def test_external_api_transient_5xx_skips_delay_when_healthy(
 
 
 @pytest.mark.asyncio
-async def test_external_api_transient_5xx_with_committed_work_burns_budget(
+async def test_external_api_transient_5xx_with_committed_work_takes_fast_path(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
-    """Transient 5xx but task has a PR — fast-path skipped, attempt_count increments."""
+    """Transient 5xx + recovered dependency: fast-path applies even when the task
+    already pushed a PR. A transient 502 after commit shouldn't burn a retry."""
     mocker.patch("app.reaper.random.uniform", return_value=1.0)
     mocker.patch.dict(
         "app.reaper._external_health",
@@ -715,7 +757,9 @@ async def test_external_api_transient_5xx_with_committed_work_burns_budget(
     await reaper_db.refresh(t)
 
     assert t.status == TaskStatus.QUEUED
-    assert t.attempt_count == 1
+    # Fast-path: transient 5xx + healthy dependency must not burn the retry
+    # budget, regardless of whether a PR was created.
+    assert t.attempt_count == 0
 
 
 @pytest.mark.asyncio
@@ -823,7 +867,8 @@ async def test_scope_aware_budget_large_code_error_fails_immediately(
         vm_instance_id="vm-large-code-error",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        # scope=large uses a 10-minute heartbeat cutoff, so stale must exceed that.
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=11),
         context={"scope": "large", "last_error": "NameError: foo is not defined"},
     )
     reaper_db.add(t)
@@ -1997,3 +2042,28 @@ async def test_dep_unblocking_skipped_when_task_is_retried_not_failed(
     assert waiting.depends_on == [str(retrying.id)]
     # Only the main reaper session should have opened — never the dep-session.
     assert call_tracker["n"] == 1
+
+
+def test_resolve_retry_budget_external_api_scope_aware():
+    """EXTERNAL_API has scope-specific budgets; missing scope falls back to uniform."""
+    from app.shared_state import resolve_retry_budget, runtime_config
+
+    assert resolve_retry_budget("EXTERNAL_API", "small") == 3
+    assert resolve_retry_budget("EXTERNAL_API", "medium") == 4
+    assert resolve_retry_budget("EXTERNAL_API", "large") == 5
+
+    uniform = runtime_config.get("retry_budgets_by_class", {}).get(
+        "EXTERNAL_API", runtime_config["max_retries"]
+    )
+    assert resolve_retry_budget("EXTERNAL_API", None) == uniform
+    assert resolve_retry_budget("EXTERNAL_API", "unknown_scope") == uniform
+
+
+def test_transient_5xx_patterns_constant():
+    from app.reaper import _TRANSIENT_5XX_PATTERNS
+
+    assert isinstance(_TRANSIENT_5XX_PATTERNS, frozenset)
+    for p in ("http 502", "http 503", "http 504",
+              "502 bad gateway", "503 service", "504 gateway",
+              "server error"):
+        assert p in _TRANSIENT_5XX_PATTERNS
