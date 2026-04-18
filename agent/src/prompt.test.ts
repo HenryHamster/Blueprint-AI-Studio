@@ -2072,6 +2072,22 @@ describe('buildSelfReviewPrompt', () => {
     expect(result).not.toContain('[PERSISTENT]');
   });
 
+  it('renders direction-specific first-attempt rejections when directionFirstAttemptFeedback is provided', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      directionFirstAttemptFeedback: { 'test-coverage': 8, 'error-handling': 3 },
+    });
+    expect(result).toContain('## Direction-Specific First-Attempt Rejections');
+    expect(result).toContain('test-coverage: 8 rejections');
+    expect(result).toContain('error-handling: 3 rejections');
+    expect(result).toContain('pay extra attention to test-coverage before submitting');
+  });
+
+  it('omits direction-specific first-attempt rejections when directionFirstAttemptFeedback is empty', () => {
+    const result = buildSelfReviewPrompt({ ...baseOpts, directionFirstAttemptFeedback: {} });
+    expect(result).not.toContain('## Direction-Specific First-Attempt Rejections');
+  });
+
   it('omits first-attempt rejection priorities when firstAttemptByCategory is undefined', () => {
     const result = buildSelfReviewPrompt(baseOpts);
     expect(result).not.toContain('## First-Attempt Rejection Priorities');

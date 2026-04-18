@@ -4440,6 +4440,60 @@ async def test_claim_direction_top_first_review_issues_gated_by_min_tasks(client
     assert dc.get("top_first_review_issues") is None
 
 
+@pytest.mark.asyncio
+async def test_claim_direction_first_attempt_feedback_in_direction_context(client: AsyncClient, db_session):
+    """direction_context.first_attempt_feedback exposes per-direction rejection category counts from design_doc."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Direction FA Feedback Test", user_id="test-user-dfa-ctx")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Refactor auth",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [],
+        }
+    ]
+    flag_modified(project, "directions")
+    project.design_doc = {
+        "direction_first_attempt_feedback": {
+            direction_id: {
+                "test-coverage": 5,
+                "error-handling": 2,
+                "total": 7,
+                "last_updated": "2026-04-18T00:00:00",
+            },
+            "_project": {"type-safety": 3, "total": 3},
+        }
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "new in direction"}],
+        vm_instance_id="agent-vm-dfa-ctx",
+        context={"direction_id": direction_id},
+    )
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dfa-ctx")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    dc = resp.json().get("direction_context", {})
+    fa = dc.get("first_attempt_feedback")
+    assert fa == {"test-coverage": 5, "error-handling": 2}
+    assert list(fa.keys())[0] == "test-coverage"  # sorted by count desc
+
+
 async def _setup_smoketest_task(db_session, vm_id: str, base_branch: str = "main"):
     """Create a project + IN_PROGRESS smoketest task.
 

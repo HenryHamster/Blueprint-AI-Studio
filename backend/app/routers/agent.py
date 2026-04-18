@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
@@ -1305,6 +1305,23 @@ async def claim_task(
                     success_chars += s_entry_len
                     direction_successful_analysis.append(s_entry)
 
+                direction_first_attempt_feedback: Optional[Dict[str, int]] = None
+                try:
+                    dfa_all = (project_for_playbook.design_doc or {}).get(
+                        "direction_first_attempt_feedback"
+                    ) or {}
+                    dfa_entry = dfa_all.get(str(direction_id)) or {}
+                    dfa_cats = {
+                        k: v for k, v in dfa_entry.items()
+                        if k not in ("total", "last_updated") and isinstance(v, int) and v > 0
+                    }
+                    if dfa_cats:
+                        direction_first_attempt_feedback = dict(
+                            sorted(dfa_cats.items(), key=lambda kv: -kv[1])
+                        )
+                except Exception:
+                    logger.exception("[AGENT] Failed to read direction_first_attempt_feedback (non-critical)")
+
                 response["direction_context"] = {
                     "title": direction.get("title", ""),
                     "priority": direction.get("priority", ""),
@@ -1315,6 +1332,7 @@ async def claim_task(
                     "direction_successful_analysis": direction_successful_analysis,
                     "scope_success_rates": scope_success_rates,
                     "top_first_review_issues": direction_top_first_review_issues,
+                    "first_attempt_feedback": direction_first_attempt_feedback,
                 }
 
             # Surface saturation / deadlock signals to research agents so they can

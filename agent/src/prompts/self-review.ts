@@ -59,6 +59,7 @@ export function buildSelfReviewPrompt(opts: {
   taskScope?: string;
   scopeOverflowWarning?: string;
   firstAttemptByCategory?: Record<string, number>;
+  directionFirstAttemptFeedback?: Record<string, number>;
   persistentReviewIssues?: string[];
   analysisPlan?: string;
   planCompletion?: {
@@ -101,6 +102,17 @@ export function buildSelfReviewPrompt(opts: {
           })
           .join('\n');
         return `\n## First-Attempt Rejection Priorities\nThese categories most often block first-attempt approval — weight your checks accordingly:\n${lines}\n`;
+      })()
+    : '';
+
+  const directionFirstAttemptFeedback = opts.directionFirstAttemptFeedback;
+  const directionFeedbackSection = directionFirstAttemptFeedback && Object.keys(directionFirstAttemptFeedback).length > 0
+    ? (() => {
+        const sorted = Object.entries(directionFirstAttemptFeedback)
+          .sort(([, a], [, b]) => b - a);
+        const summary = sorted.map(([cat, n]) => `${cat}: ${n} rejections`).join(', ');
+        const topCat = sorted[0][0];
+        return `\n## Direction-Specific First-Attempt Rejections\nFor this direction, the most common first-attempt rejection categories are: ${summary} — weight your checks accordingly and pay extra attention to ${topCat} before submitting.\n`;
       })()
     : '';
 
@@ -184,7 +196,7 @@ export function buildSelfReviewPrompt(opts: {
   const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
 
   return `You are performing a self-review of the changes you just made for this task.
-${restrictionsSection}${scopeSpecificSection}${issueDistSection}${firstAttemptSection}${topIssuesSection}${playbookSection}${scopeOverflowSection}${planSection}${planCompletionSection}${diffSection}${buildVerificationSection}
+${restrictionsSection}${directionFeedbackSection}${scopeSpecificSection}${issueDistSection}${firstAttemptSection}${topIssuesSection}${playbookSection}${scopeOverflowSection}${planSection}${planCompletionSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.

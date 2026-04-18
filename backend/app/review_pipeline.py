@@ -46,6 +46,47 @@ STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR = 0.8
 
 _FEEDBACK_TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
+# Issue-churn detection: complements the Jaccard-based stuck-cycle check.
+# A cycle exhibits churn when the fix agent keeps resolving the original issues
+# but introducing new ones, so the specific issues rotate (evading stuck
+# detection) while the total CRITICAL+MAJOR count never actually decreases.
+ISSUE_CHURN_WINDOW = 3
+
+
+def _critical_major_count(entry: dict) -> int:
+    issues = entry.get("issues") or []
+    return sum(
+        1 for i in issues
+        if i.get("severity", "").upper() in ("CRITICAL", "MAJOR")
+        and (i.get("description") or "").strip()
+    )
+
+
+def _detect_issue_churn(history: list) -> tuple[bool, list[int]]:
+    """Return (is_churn, counts) for the last ``ISSUE_CHURN_WINDOW`` entries.
+
+    Churn = every entry in the window has ≥1 CRITICAL/MAJOR issue AND the
+    count never strictly decreases across consecutive iterations (i.e. the
+    fix agent is treading water even as the specific issues rotate).
+    """
+    if len(history) < ISSUE_CHURN_WINDOW:
+        return (False, [])
+    window = history[-ISSUE_CHURN_WINDOW:]
+    counts = [_critical_major_count(e) for e in window]
+    if any(c == 0 for c in counts):
+        return (False, counts)
+    non_decreasing = all(counts[i + 1] >= counts[i] for i in range(len(counts) - 1))
+    return (non_decreasing, counts)
+
+
+_CHURN_NARROW_FOCUS_PREFIX = (
+    "⚠️ ISSUE CHURN DETECTED: the prior {window} fix iterations resolved some "
+    "issues but introduced new ones (CRITICAL+MAJOR counts: {counts}). "
+    "Address ONLY the explicitly listed issues below. Do NOT modify files "
+    "that are not directly referenced by those issues. Do NOT refactor, "
+    "reformat, or clean up unrelated code in this iteration.\n\n"
+)
+
 # Utilization at/above this fraction of the scope file budget signals the fix
 # agent to prefer minimal fixes over expansive refactoring — gives headroom
 # before a fix iteration would tip the PR into scope-overflow territory.
@@ -672,6 +713,34 @@ async def _spawn_pipeline_task(
                     exc_info=True,
                 )
             return (None, False)
+
+        # Issue-churn detection: complements stuck-cycle above. If total
+        # CRITICAL+MAJOR count fails to decrease across the last
+        # ISSUE_CHURN_WINDOW iterations (even though the specific issues are
+        # rotating and so evading Jaccard stuck detection), halve the
+        # remaining iteration cap and instruct the fix agent to narrow focus.
+        is_churn, churn_counts = _detect_issue_churn(new_review_history)
+        if is_churn and task_type == "fix":
+            remaining = max(per_chain_cap - iteration, 0)
+            reduced_cap = iteration + (remaining // 2)
+            if reduced_cap < per_chain_cap:
+                logger.warning(
+                    f"[PIPELINE] Issue churn detected for PR #{pr_number}: "
+                    f"CRITICAL+MAJOR counts {churn_counts} non-decreasing over "
+                    f"{ISSUE_CHURN_WINDOW} iterations. Reducing cap "
+                    f"{per_chain_cap} → {reduced_cap}; injecting narrow-focus directive."
+                )
+                per_chain_cap = reduced_cap
+            else:
+                logger.warning(
+                    f"[PIPELINE] Issue churn detected for PR #{pr_number}: "
+                    f"counts {churn_counts}; injecting narrow-focus directive."
+                )
+            narrow_prefix = _CHURN_NARROW_FOCUS_PREFIX.format(
+                window=ISSUE_CHURN_WINDOW, counts=churn_counts
+            )
+            payload_data["prompt"] = narrow_prefix + (payload_data.get("prompt") or "")
+            fix_prompt = narrow_prefix + (fix_prompt or "")
 
     payload_data = validate_internal_payload(payload_data, f"review_pipeline:{task_type}:pr#{pr_number}")
     source_ctx = source_task.context or {}

@@ -601,6 +601,10 @@ Output ONLY a JSON object in a \`\`\`json code fence:
       const scopeSpecificReviewIssues = selfReviewProjectCtx?.scope_specific_review_issues as
         | Array<{ description: string; count: number; category: string; scope: string }>
         | undefined;
+      const selfReviewDirectionCtx = task.direction_context as Record<string, unknown> | undefined;
+      const directionFirstAttemptFeedback = selfReviewDirectionCtx?.first_attempt_feedback as
+        | Record<string, number>
+        | undefined;
 
       const selfReviewTaskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
       const selfReviewAnalysisPlan = selfReviewTaskScope === 'medium' && analysisContext
@@ -645,6 +649,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         taskScope: selfReviewTaskScope,
         scopeOverflowWarning,
         firstAttemptByCategory: firstAttemptByCat,
+        directionFirstAttemptFeedback,
         persistentReviewIssues,
         analysisPlan: selfReviewAnalysisPlan,
         planCompletion,

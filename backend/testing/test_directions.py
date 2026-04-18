@@ -3139,6 +3139,34 @@ class TestPredictSpawnSuccessAcceptanceSignal:
         expected = (1.0 * 3 + 1.0 / 6) / 4
         assert predict_spawn_success("medium", d) == pytest.approx(expected)
 
+    def test_related_files_small_count_no_penalty(self):
+        """1-2 related_files emit no file-count signal."""
+        assert predict_spawn_success("small", {}, related_files=["backend/app/a.py"]) == 0.5
+        assert predict_spawn_success(
+            "small", {}, related_files=["backend/app/a.py", "backend/app/b.py"],
+        ) == 0.5
+
+    def test_related_files_moderate_penalty(self):
+        """3-4 files → moderate 0.6 penalty at weight 1.0."""
+        files = [f"backend/app/f{i}.py" for i in range(3)]
+        assert predict_spawn_success("small", {}, related_files=files) == pytest.approx(0.6)
+
+    def test_related_files_strong_penalty(self):
+        """5+ files → strong 0.3 penalty at weight 1.0."""
+        files = [f"backend/app/f{i}.py" for i in range(5)]
+        assert predict_spawn_success("small", {}, related_files=files) == pytest.approx(0.3)
+
+    def test_cross_module_span_penalty(self):
+        """related_files spanning 2+ top-level dirs triggers cross-module penalty."""
+        files = ["backend/app/a.py", "agent/src/b.ts"]
+        # file-count skipped (2 files), cross-module 0.4 alone
+        assert predict_spawn_success("small", {}, related_files=files) == pytest.approx(0.4)
+
+    def test_single_top_level_no_cross_module_penalty(self):
+        """All files under one top-level dir → no cross-module signal."""
+        files = ["backend/app/a.py", "backend/app/b.py"]
+        assert predict_spawn_success("small", {}, related_files=files) == 0.5
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _poor_decomp_history helper unit tests (suppression signal)

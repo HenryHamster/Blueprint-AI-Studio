@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 from app.models import Project, Task, TaskStatus
 from app.review_pipeline import (
+    ISSUE_CHURN_WINDOW,
     MAX_REVIEW_FIX_ITERATIONS,
     PIPELINE_TASK_STALE_MINUTES,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
@@ -25,6 +26,7 @@ from app.review_pipeline import (
     STUCK_CYCLE_THRESHOLD_DEFAULT,
     STUCK_CYCLE_THRESHOLD_REFACTOR,
     _compute_scope_budget_utilization,
+    _detect_issue_churn,
     _feedback_jaccard,
     _feedback_token_set,
     _is_pipeline_task_stale,
@@ -2801,3 +2803,136 @@ class TestComputeScopeBudgetUtilization:
         result = _compute_scope_budget_utilization(files, "large")
         assert result["budget"] == 20
         assert result["percentage"] == 50
+
+
+# ── issue-churn detection ─────────────────────────────────────────────────────
+
+
+class TestDetectIssueChurn:
+    def _entry(self, issues):
+        return {"iteration": 0, "feedback": "f", "issues": issues}
+
+    def test_short_history_no_churn(self):
+        hist = [self._entry([_issue("a")]), self._entry([_issue("b")])]
+        is_churn, counts = _detect_issue_churn(hist)
+        assert is_churn is False
+
+    def test_non_decreasing_distinct_issues_is_churn(self):
+        # Counts 2, 2, 2 with entirely different issues each iter → churn.
+        hist = [
+            self._entry([_issue("a1"), _issue("a2")]),
+            self._entry([_issue("b1"), _issue("b2")]),
+            self._entry([_issue("c1"), _issue("c2")]),
+        ]
+        is_churn, counts = _detect_issue_churn(hist)
+        assert is_churn is True
+        assert counts == [2, 2, 2]
+
+    def test_strictly_decreasing_not_churn(self):
+        hist = [
+            self._entry([_issue("a1"), _issue("a2"), _issue("a3")]),
+            self._entry([_issue("b1"), _issue("b2")]),
+            self._entry([_issue("c1")]),
+        ]
+        is_churn, _ = _detect_issue_churn(hist)
+        assert is_churn is False
+
+    def test_zero_in_window_not_churn(self):
+        hist = [
+            self._entry([_issue("a1")]),
+            self._entry([]),
+            self._entry([_issue("c1")]),
+        ]
+        is_churn, _ = _detect_issue_churn(hist)
+        assert is_churn is False
+
+    def test_minor_issues_ignored(self):
+        hist = [
+            self._entry([_issue("a", "MINOR")]),
+            self._entry([_issue("b", "MINOR")]),
+            self._entry([_issue("c", "MINOR")]),
+        ]
+        is_churn, counts = _detect_issue_churn(hist)
+        assert is_churn is False
+        assert counts == [0, 0, 0]
+
+
+@pytest.mark.asyncio
+async def test_issue_churn_injects_narrow_focus_and_halves_cap(db_session, mocker):
+    """When CRITICAL+MAJOR counts don't decrease across ISSUE_CHURN_WINDOW iterations
+    (but the specific issues rotate, evading stuck-cycle detection), the spawned fix
+    task should get a narrow-focus directive prefix and a reduced per-chain cap."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Build a review_history carried into the source task with 2 prior entries,
+    # each having 2 CRITICAL issues but with distinct descriptions (no token
+    # overlap with each other or current → evades stuck detection).
+    prior_history = [
+        {"iteration": 0, "feedback": "f0",
+         "issues": [_issue("alpha widget broken"), _issue("beta gauge crash")]},
+        {"iteration": 1, "feedback": "f1",
+         "issues": [_issue("gamma router panic"), _issue("delta cache miss")]},
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 701, "branch": "b1", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(original_task.id),
+                "pr_number": 701,
+                "branch": "b1",
+                "base_branch": "main",
+                "review_history": prior_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Current iteration has 2 NEW CRITICAL issues (distinct tokens) → count 2,
+    # matching prior counts → non-decreasing → churn.
+    current_issues = [_issue("epsilon timer off"), _issue("zeta parser err")]
+
+    result, spawned = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=701, branch="b1", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Please fix.",
+        current_feedback="new feedback",
+        current_issues=current_issues,
+    )
+
+    assert result is not None, "Churn must not block spawn (only stuck-cycle blocks)"
+    assert spawned is True
+
+    # Narrow-focus directive prefixed to the fix prompt.
+    payload = result.first_payload or {}
+    assert "ISSUE CHURN DETECTED" in (payload.get("prompt") or "")
+    assert "Please fix." in payload["prompt"]
+
+    # Per-chain cap reduced (original cap minus half of remaining).
+    ctx_cap = (result.context or {}).get("review_loop", {}).get("max_iterations")
+    source_cap_ctx = (source_task.context or {}).get("review_loop", {}).get("max_iterations")
+    # Source task didn't set max_iterations → per-chain cap came from
+    # _max_review_iterations(). New task's cap should be strictly less.
+    from app.review_pipeline import _max_review_iterations
+    baseline = _max_review_iterations(source_task)
+    assert ctx_cap is not None and ctx_cap < baseline, (
+        f"Churn should reduce cap below baseline {baseline}, got {ctx_cap}"
+    )

@@ -662,7 +662,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _confidence_threshold = _runtime_config.get("spawn_confidence_threshold", 0.25)
         _pred_dir_id = finding.get("direction_id") or _parent_direction_id
         _pred_direction = _directions_by_id.get(str(_pred_dir_id)) if _pred_dir_id else {}
-        _pred_p = predict_spawn_success(scope, _pred_direction or {}, _scope_cal_project)
+        _pred_p = predict_spawn_success(
+            scope, _pred_direction or {}, _scope_cal_project, related_files=related_files
+        )
         _low_confidence = _pred_p < _confidence_threshold
         if _low_confidence:
             logger.info(
