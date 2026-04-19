@@ -27,6 +27,7 @@ from app.direction_lifecycle import (
 from app.models import Alert, AlertSeverity, ArtifactType, MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.autonomous_research import _spawn_task_failure_investigation
 from app.failure_classification import (
+    CODE_ERROR,
     TAXONOMY_CODE_DEFECT,
     should_trigger_code_defect_investigation,
 )
@@ -1791,6 +1792,7 @@ async def test_full_task_failure_remediation_loop(db_session, mocker):
     assert investigate_task.context["direction_id"] == direction_id
     assert investigate_task.context["source_task_id"] == str(failed_task.id)
     assert investigate_task.context["failure_taxonomy"] == TAXONOMY_CODE_DEFECT
+    assert investigate_task.context["last_failure_class"] == CODE_ERROR
 
     # Stage 3: investigation completes with a high-confidence actionable report.
     await _handle_investigation_completion(
@@ -1805,6 +1807,7 @@ async def test_full_task_failure_remediation_loop(db_session, mocker):
     assert remediation.first_payload["type"] == "create"
     assert remediation.context["diagnosis_task_id"] == str(investigate_task.id)
     assert remediation.context["direction_id"] == direction_id
+    assert remediation.context["trigger_failure_class"] == CODE_ERROR
 
     # Stage 4: remediation reaches COMPLETED → _record_remediation_if_terminal stamps direction.
     remediation.status = TaskStatus.COMPLETED
@@ -1824,6 +1827,7 @@ async def test_full_task_failure_remediation_loop(db_session, mocker):
     assert len(history) == 1
     assert history[0]["task_id"] == str(remediation.id)
     assert history[0]["result"] == "merged"
+    assert history[0]["trigger_failure_class"] == CODE_ERROR
 
 
 @pytest.mark.asyncio

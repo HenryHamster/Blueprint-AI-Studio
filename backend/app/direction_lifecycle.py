@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.failure_classification import classify_failure, classify_failure_taxonomy
 from app.models import Project, Task, TaskStatus
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import get_circuit_breaker, runtime_config as _runtime_config
@@ -361,6 +362,10 @@ async def _spawn_direction_diagnosis(
         task_context["diagnosis_fingerprint"] = str(fingerprint)
     if shared_directions:
         task_context["shared_fingerprint_directions"] = shared_directions
+    if recent_failures:
+        first_failure = recent_failures[0]
+        task_context["last_failure_class"] = classify_failure(first_failure)
+        task_context["failure_taxonomy"] = classify_failure_taxonomy(first_failure)
     new_task = Task(
         project_id=project.id,
         title=f"Investigate direction auto-pause: {(direction.get('text') or '')[:60]}",

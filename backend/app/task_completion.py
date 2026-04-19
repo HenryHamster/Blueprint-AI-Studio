@@ -524,6 +524,12 @@ async def _maybe_spawn_followup_investigation(
         task_context["original_diagnosis_task_id"] = str(original_diagnosis_task_id)
     if fingerprint:
         task_context["diagnosis_fingerprint"] = str(fingerprint)
+    inherited_failure_class = ctx.get("trigger_failure_class")
+    if inherited_failure_class:
+        task_context["last_failure_class"] = inherited_failure_class
+    inherited_failure_taxonomy = ctx.get("trigger_failure_taxonomy")
+    if inherited_failure_taxonomy:
+        task_context["failure_taxonomy"] = inherited_failure_taxonomy
     new_task = Task(
         project_id=project.id,
         title=f"Investigate remediation failure: {(target.get('text') or '')[:60]}",
@@ -708,6 +714,12 @@ async def _maybe_spawn_low_confidence_followup(
     }
     if fingerprint:
         task_ctx["diagnosis_fingerprint"] = str(fingerprint)
+    inherited_failure_class = inv_ctx.get("last_failure_class")
+    if inherited_failure_class:
+        task_ctx["last_failure_class"] = inherited_failure_class
+    inherited_failure_taxonomy = inv_ctx.get("failure_taxonomy")
+    if inherited_failure_taxonomy:
+        task_ctx["failure_taxonomy"] = inherited_failure_taxonomy
     new_task = Task(
         project_id=project.id,
         title=f"Re-investigate low-confidence diagnosis: {(direction.get('text') or '')[:50]}",
@@ -868,6 +880,12 @@ async def _maybe_spawn_reinvestigation_after_failure(
     }
     if fingerprint:
         task_ctx["diagnosis_fingerprint"] = str(fingerprint)
+    inherited_failure_class = inv_ctx.get("last_failure_class")
+    if inherited_failure_class:
+        task_ctx["last_failure_class"] = inherited_failure_class
+    inherited_failure_taxonomy = inv_ctx.get("failure_taxonomy")
+    if inherited_failure_taxonomy:
+        task_ctx["failure_taxonomy"] = inherited_failure_taxonomy
     new_task = Task(
         project_id=project.id,
         title=f"Re-investigate after failure: {(direction.get('text') or '')[:50]}",
