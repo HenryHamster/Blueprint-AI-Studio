@@ -109,6 +109,33 @@ def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any
     }
 
 
+def _compute_first_attempt_breakdowns(terminal_tasks: List[Task]) -> Dict[str, Any]:
+    """Compute overall first-attempt success rate plus playbook and arch-context
+    effectiveness comparisons from a list of terminal tasks."""
+    def _fa_rate(tasks):
+        measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+        if not measured:
+            return None
+        succ = sum(1 for t in measured if t.context["_first_attempt_succeeded"])
+        return round(succ / len(measured), 2)
+
+    measured = [t for t in terminal_tasks if "_first_attempt_succeeded" in (t.context or {})]
+    with_pb = [t for t in measured if (t.context or {}).get("_had_playbook") is True]
+    without_pb = [t for t in measured if (t.context or {}).get("_had_playbook") is False]
+    with_arch = [t for t in measured if (t.context or {}).get("_had_arch_context") is True]
+    without_arch = [t for t in measured if (t.context or {}).get("_had_arch_context") is False]
+    sample_size = len(measured)
+
+    return {
+        "overall": _fa_rate(terminal_tasks),
+        "with_playbook": _fa_rate(with_pb),
+        "without_playbook": _fa_rate(without_pb),
+        "with_arch_context": _fa_rate(with_arch),
+        "without_arch_context": _fa_rate(without_arch),
+        "sample_size": sample_size,
+    }
+
+
 async def compute_pipeline_health_summary(session: AsyncSession, project_id: uuid.UUID, lookback_hours: int = 24) -> Dict[str, Any]:
     """Compute lightweight pipeline health metrics for the specified lookback window.
 
@@ -2286,10 +2313,12 @@ async def get_digest(
     }
 
     _review_quality = _compute_review_quality_metrics(completed_tasks + failed_tasks)
+    _first_attempt_success_rate = _compute_first_attempt_breakdowns(completed_tasks + failed_tasks)
 
     return {
         "window_hours": hours,
         "total_merge_retries_saved": total_merge_retries_saved,
+        "first_attempt_success_rate": _first_attempt_success_rate,
         "self_review_effectiveness": _review_quality["self_review_effectiveness"],
         "self_review_prediction_accuracy": _review_quality["self_review_prediction_accuracy"],
         "review_accuracy": _review_quality["review_accuracy"],

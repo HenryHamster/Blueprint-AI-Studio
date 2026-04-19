@@ -303,6 +303,14 @@ interface DigestData {
     precision: number | null;
     recall: number | null;
   } | null;
+  first_attempt_success_rate?: {
+    overall: number | null;
+    with_playbook: number | null;
+    without_playbook: number | null;
+    with_arch_context: number | null;
+    without_arch_context: number | null;
+    sample_size: number;
+  } | null;
   pipeline_acceptance_rate?: number | null;
   pipeline_conversion_rate?: number | null;
   overall_product_ratio?: number | null;
@@ -1339,6 +1347,41 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     )}
                   </span>
                 )}
+                {digest!.first_attempt_success_rate && digest!.first_attempt_success_rate.sample_size >= 5 && (() => {
+                  const fas = digest!.first_attempt_success_rate!;
+                  const tone = (r: number | null) => r == null ? 'text-neutral-500' : r >= 0.8 ? 'text-emerald-400' : r >= 0.5 ? 'text-amber-400' : 'text-red-400';
+                  const compareTone = (w: number | null, wo: number | null) =>
+                    w == null || wo == null ? 'text-neutral-500' : w > wo ? 'text-emerald-400' : w < wo ? 'text-red-400' : 'text-amber-400';
+                  const fmt = (r: number | null) => r == null ? '—' : `${Math.round(r * 100)}%`;
+                  return (
+                    <>
+                      {fas.overall != null && (
+                        <span
+                          className={`flex items-center gap-1 ${tone(fas.overall)}`}
+                          title={`First-attempt success rate (n=${fas.sample_size})`}
+                        >
+                          {Math.round(fas.overall * 100)}% 1st-attempt
+                        </span>
+                      )}
+                      {(fas.with_playbook != null || fas.without_playbook != null) && (
+                        <span
+                          className={compareTone(fas.with_playbook, fas.without_playbook)}
+                          title="First-attempt success with vs without playbook"
+                        >
+                          Playbook: {fmt(fas.with_playbook)} vs {fmt(fas.without_playbook)} without
+                        </span>
+                      )}
+                      {(fas.with_arch_context != null || fas.without_arch_context != null) && (
+                        <span
+                          className={compareTone(fas.with_arch_context, fas.without_arch_context)}
+                          title="First-attempt success with vs without arch context"
+                        >
+                          Arch context: {fmt(fas.with_arch_context)} vs {fmt(fas.without_arch_context)} without
+                        </span>
+                      )}
+                    </>
+                  );
+                })()}
                 {digest!.pipeline_acceptance_rate != null && (() => {
                   const pct = Math.round(digest!.pipeline_acceptance_rate! * 100);
                   const tone = pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
