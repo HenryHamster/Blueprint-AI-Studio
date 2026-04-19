@@ -264,6 +264,16 @@ async def _record_remediation_if_terminal(
     ctx = task.context or {}
     if not ctx.get("diagnosis_task_id") or not ctx.get("direction_id"):
         return
+    # Tasks that produce a PR enter the review pipeline — their true outcome
+    # (merged vs. rejected) is only known after the review task completes or the
+    # pipeline exhausts its iteration cap. Recording on the PR-creating task's
+    # COMPLETED would prematurely stamp merged=True before review/CI has run.
+    # FAILED/CANCELLED still record immediately since no viable PR exists.
+    _REVIEW_PIPELINE_TYPES = {"create", "refactor", "docs", "qa", "deps", "migrate"}
+    if status == TaskStatus.COMPLETED:
+        task_type = (task.first_payload or {}).get("type")
+        if task_type in _REVIEW_PIPELINE_TYPES:
+            return
     try:
         recorded = await _record_remediation_outcome(
             task, merged=(status == TaskStatus.COMPLETED), session=session,
@@ -2033,6 +2043,12 @@ async def _spawn_investigation_remediation(
         "diagnosis_recommended_fix": recommended_fix[:2000],
         "scope": scope,
     }
+    diagnosis_fingerprint = parent_ctx.get("diagnosis_fingerprint")
+    if diagnosis_fingerprint:
+        remediation_context["diagnosis_fingerprint"] = diagnosis_fingerprint
+    error_fingerprint = parent_ctx.get("error_fingerprint")
+    if error_fingerprint:
+        remediation_context["error_fingerprint"] = error_fingerprint
     trigger_failure_class = parent_ctx.get("last_failure_class")
     if trigger_failure_class:
         remediation_context["trigger_failure_class"] = trigger_failure_class

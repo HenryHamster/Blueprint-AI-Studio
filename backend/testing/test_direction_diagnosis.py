@@ -1809,7 +1809,10 @@ async def test_full_task_failure_remediation_loop(db_session, mocker):
     assert remediation.context["direction_id"] == direction_id
     assert remediation.context["trigger_failure_class"] == CODE_ERROR
 
-    # Stage 4: remediation reaches COMPLETED → _record_remediation_if_terminal stamps direction.
+    # Stage 4: remediation create task COMPLETED opens a PR but the true outcome
+    # is driven by the review pipeline — recording is deferred until the review
+    # task (which carries the same diagnosis_task_id/direction_id context)
+    # reaches COMPLETED after the PR actually merges.
     remediation.status = TaskStatus.COMPLETED
     db_session.add(remediation)
     await db_session.commit()
@@ -1817,15 +1820,40 @@ async def test_full_task_failure_remediation_loop(db_session, mocker):
     await _record_remediation_if_terminal(remediation, TaskStatus.COMPLETED, db_session)
     await db_session.commit()
     await db_session.refresh(project)
+    d = next(dd for dd in project.directions if dd["id"] == direction_id)
+    assert "last_remediation_result" not in d, (
+        "Create task COMPLETED must NOT stamp the direction — outcome awaits review"
+    )
+
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR",
+        description="review",
+        payloads=[{"type": "review", "pr_number": 1, "branch": "b"}],
+        context={
+            "direction_id": direction_id,
+            "diagnosis_task_id": str(investigate_task.id),
+            "trigger_failure_class": CODE_ERROR,
+        },
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    await _record_remediation_if_terminal(review_task, TaskStatus.COMPLETED, db_session)
+    await db_session.commit()
+    await db_session.refresh(project)
 
     d = next(dd for dd in project.directions if dd["id"] == direction_id)
     assert d["last_remediation_result"] == "merged"
     assert d["remediation_attempts"] == 1
-    assert d["last_remediation_task_id"] == str(remediation.id)
+    assert d["last_remediation_task_id"] == str(review_task.id)
     assert d["last_remediation_diagnosis_task_id"] == str(investigate_task.id)
     history = d.get("remediation_history") or []
     assert len(history) == 1
-    assert history[0]["task_id"] == str(remediation.id)
+    assert history[0]["task_id"] == str(review_task.id)
     assert history[0]["result"] == "merged"
     assert history[0]["trigger_failure_class"] == CODE_ERROR
 

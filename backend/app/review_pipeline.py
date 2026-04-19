@@ -449,6 +449,18 @@ async def _handle_cap_exhaustion(
     except Exception as e:
         logger.warning(f"[PIPELINE] Cap-exhaustion: failed to create alert for PR #{pr_number}: {e}")
 
+    # Record remediation failure on the linked direction. Cap exhaustion sets
+    # orig.status = FAILED directly on the ORM, bypassing the status update
+    # handler that normally fires _record_remediation_if_terminal — without this
+    # call, a remediation create task that hit the cap would leave the direction
+    # stuck on its last 'merged' stamp (recorded prematurely on PR creation).
+    try:
+        from app.task_completion import _record_remediation_if_terminal  # noqa: PLC0415
+        await _record_remediation_if_terminal(orig, TaskStatus.FAILED, session)
+        await session.commit()
+    except Exception as e:
+        logger.warning(f"[PIPELINE] Cap-exhaustion: failed to record remediation outcome for PR #{pr_number}: {e}")
+
     try:
         from app.autonomous_research import _spawn_review_convergence_investigation  # noqa: PLC0415
         if await _spawn_review_convergence_investigation(

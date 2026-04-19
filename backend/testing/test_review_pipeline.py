@@ -745,6 +745,76 @@ async def test_cap_exhaustion_records_task_and_direction_result(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_cap_exhaustion_records_remediation_failure_on_direction(db_session, mocker):
+    """Cap exhaustion on a remediation create task must stamp the linked direction
+    with a failed outcome. Without this call, a premature 'merged' recorded on PR
+    creation would persist even though the PR was auto-closed."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "o", "r"),
+    )
+    mocker.patch("app.github.close_pull_request", new_callable=AsyncMock, return_value=True)
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    direction_id = "dir-cap-remed"
+    project = await _make_db_project(db_session)
+    project.directions = [{"id": direction_id, "status": "active"}]
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Remediate", "base_branch": "main"}],
+        context={
+            "scope": "small",
+            "direction_id": direction_id,
+            "diagnosis_task_id": "diag-cap",
+        },
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 888, "branch": "feat/rec",
+                   "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "small",
+            "direction_id": direction_id,
+            "diagnosis_task_id": "diag-cap",
+            "review_loop": {"iteration": 10,
+                            "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=888, branch="feat/rec", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Still broken",
+    )
+    assert result is None
+
+    await db_session.refresh(project)
+    direction = next(d for d in project.directions if d["id"] == direction_id)
+    assert direction.get("remediation_attempts") == 1, (
+        f"Cap exhaustion must record a remediation attempt on the direction, got {direction!r}"
+    )
+    assert direction.get("last_remediation_result") == "failed"
+
+
+@pytest.mark.asyncio
 async def test_cap_exhaustion_idempotent(db_session, mocker):
     """If rollup or another handler re-enters _spawn_pipeline_task for an
     already-cap-exhausted PR, the side effects (PR close, alert) must fire

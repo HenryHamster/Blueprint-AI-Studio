@@ -1419,6 +1419,71 @@ class TestRecordRemediationIfTerminal:
         await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
         assert boom.await_count == 1
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("task_type", ["create", "refactor", "docs", "qa", "deps", "migrate"])
+    async def test_completed_pr_creating_type_does_not_record(self, db_session, task_type):
+        """Tasks that produce a PR must not record 'merged' on their own COMPLETED —
+        the review pipeline drives the real outcome."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"type": task_type, "prompt": "x"}],
+            context=self._diag_ctx(),
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
+        await db_session.refresh(project)
+        assert "remediation_attempts" not in project.directions[0]
+
+    @pytest.mark.asyncio
+    async def test_completed_review_type_does_record(self, db_session):
+        """Review tasks represent the PR's actual outcome — COMPLETED means merged."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"type": "review", "pr_number": 1, "branch": "b"}],
+            context=self._diag_ctx(),
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["remediation_attempts"] == 1
+        assert d["last_remediation_result"] == "merged"
+
+    @pytest.mark.asyncio
+    async def test_failed_pr_creating_type_still_records(self, db_session):
+        """FAILED/CANCELLED still record immediately — no PR to wait on."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "x"}],
+            context=self._diag_ctx(),
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["remediation_attempts"] == 1
+        assert d["last_remediation_result"] == "failed"
+
 
 # ── follow-up investigation on remediation failure ──────────────────────────
 
@@ -1659,6 +1724,44 @@ class TestFollowupInvestigationOnFailure:
         assert remediation is not None
         assert remediation.context["trigger_failure_class"] == "CODE_ERROR"
         assert remediation.context["trigger_failure_taxonomy"] == {"kind": "import"}
+        # Fingerprint propagates from the parent investigation context so that
+        # _record_remediation_outcome can set last_remediation_fingerprint and
+        # sibling/follow-up logic can key off the same fingerprint.
+        assert remediation.context["diagnosis_fingerprint"] == "fp-A"
+
+    @pytest.mark.asyncio
+    async def test_remediation_propagates_error_fingerprint_fallback(self, db_session):
+        """When parent has only error_fingerprint (no diagnosis_fingerprint), that
+        value is propagated onto the spawned remediation so follow-up logic can
+        still key off a stable fingerprint."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active", "text": "demo",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        parent = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"direction_id": "dir-1", "error_fingerprint": "ef-B"},
+            payloads=[{"type": "investigate", "prompt": "x"}],
+        )
+        db_session.add(parent)
+        await db_session.commit()
+        await db_session.refresh(parent)
+
+        from app.task_completion import _spawn_investigation_remediation
+        remediation = await _spawn_investigation_remediation(
+            task=parent,
+            direction_id="dir-1",
+            summary="s", root_cause="rc", recommended_fix="rf",
+            severity="medium", confidence="high",
+            affected_paths=["a.py"], remediation_attempts=0,
+            session=db_session,
+        )
+        assert remediation is not None
+        assert "diagnosis_fingerprint" not in remediation.context
+        assert remediation.context["error_fingerprint"] == "ef-B"
 
     @pytest.mark.asyncio
     async def test_follow_up_prompt_includes_earlier_attempts(self, db_session):
@@ -1721,7 +1824,9 @@ class TestFollowupInvestigationOnFailure:
 
     @pytest.mark.asyncio
     async def test_merged_remediation_does_not_spawn_followup(self, db_session):
-        """A completed (merged) remediation must not trigger a follow-up investigation."""
+        """A completed remediation must not trigger a follow-up investigation.
+        For PR-creating types, outcome recording is deferred until the review
+        pipeline resolves, so last_remediation_result stays unset here."""
         project = make_project(directions=[{"id": "dir-1", "status": "active"}])
         db_session.add(project)
         await db_session.commit()
@@ -1736,7 +1841,6 @@ class TestFollowupInvestigationOnFailure:
         await db_session.refresh(project)
 
         d = project.directions[0]
-        assert d["last_remediation_result"] == "merged"
         assert "followup_investigation_attempts_by_fingerprint" not in d
         assert d.get("diagnosis_in_progress") is not True
 
