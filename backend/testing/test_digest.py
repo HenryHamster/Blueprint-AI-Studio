@@ -3957,3 +3957,101 @@ async def test_digest_prior_investigation_reuse(client: AsyncClient, db_session)
     assert reuse["merged_with_prior"] == 1
     assert reuse["failed_with_prior"] == 1
     assert reuse["merge_rate"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_digest_investigation_conversion_breakdown(client: AsyncClient, db_session):
+    """investigate tasks categorize into structural/low/actionable/unparseable buckets."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    inv_structural = make_task(
+        project_id=project.id,
+        title="inv structural",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=5),
+        plan_output={
+            "summary": "scope problem",
+            "root_cause": "direction scope is too broad",
+            "recommended_fix": "narrow the direction",
+            "confidence": "high",
+        },
+    )
+    inv_low = make_task(
+        project_id=project.id,
+        title="inv low confidence",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=4),
+        plan_output={
+            "summary": "unclear",
+            "root_cause": "flaky test",
+            "recommended_fix": "retry",
+            "confidence": "low",
+        },
+    )
+    inv_actionable = make_task(
+        project_id=project.id,
+        title="inv actionable",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=3),
+        plan_output={
+            "summary": "null deref",
+            "root_cause": "missing null check",
+            "recommended_fix": "add guard clause in foo()",
+            "confidence": "high",
+        },
+    )
+    inv_unparseable = make_task(
+        project_id=project.id,
+        title="inv unparseable",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=2),
+        plan_output={"raw": "garbage logs"},
+    )
+    inv_nofix = make_task(
+        project_id=project.id,
+        title="inv no recommended fix",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=1),
+        plan_output={
+            "summary": "something",
+            "root_cause": "unknown",
+            "recommended_fix": "",
+            "confidence": "medium",
+        },
+    )
+    db_session.add_all([inv_structural, inv_low, inv_actionable, inv_unparseable, inv_nofix])
+    await db_session.commit()
+    await db_session.refresh(inv_actionable)
+
+    rem_child = make_task(
+        project_id=project.id,
+        title="remediation of actionable",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=2),
+        context={"diagnosis_task_id": str(inv_actionable.id), "direction_id": "d1"},
+    )
+    db_session.add(rem_child)
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    ic = response.json()["investigation_conversion"]
+
+    assert ic["total_completed"] == 5
+    assert ic["parseable"] == 4
+    assert ic["unparseable"] == 1
+    assert ic["structural"] == 1
+    assert ic["low_confidence"] == 1
+    assert ic["actionable"] == 1
+    assert ic["remediation_spawned"] == 1

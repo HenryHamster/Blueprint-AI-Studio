@@ -211,11 +211,11 @@ async def reaper_service():
                             ).with_for_update(skip_locked=True)
                             force_locked = list((await session.execute(force_stmt)).scalars().all())
                             for t in force_locked:
-                                _reaper_skip_counts.pop(t.id, None)
                                 if t.status not in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS):
                                     continue
                                 if t.last_heartbeat and t.last_heartbeat >= _heartbeat_stale_cutoff(t, now):
                                     continue
+                                _reaper_skip_counts.pop(t.id, None)
                                 orphaned_tasks.append(t)
                                 logger.warning(f"[REAPER] Force-locked persistently skipped task {t.id}")
                         except Exception as e:

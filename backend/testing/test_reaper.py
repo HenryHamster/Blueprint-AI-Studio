@@ -1298,6 +1298,66 @@ async def test_force_lock_timeout_resets_skip_count(
 
 
 @pytest.mark.asyncio
+async def test_force_lock_reverify_healthy_preserves_skip_count(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_skip_counts, mocker
+):
+    """When force-lock re-verification finds the task is no longer stale
+    (heartbeat arrived during lock acquisition), the skip_count entry must be
+    preserved so the reaper can force-lock sooner if staleness recurs."""
+    from sqlalchemy import update as _sa_update
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-force-healthy",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    task_id = t.id
+    clean_skip_counts[task_id] = 4  # one more skip will trigger force-lock
+
+    real_execute = AsyncSession.execute
+    state = {"for_update_calls": 0}
+    fresh_ts = datetime.utcnow()
+
+    async def mock_execute(self, stmt, *args, **kwargs):
+        if isinstance(stmt, TextClause):
+            return _FakeResult([])
+        if getattr(stmt, "_for_update_arg", None) is not None:
+            state["for_update_calls"] += 1
+            if state["for_update_calls"] == 1:
+                # Step-2 skip-locked: filter out the task so it's not acquired
+                result = await real_execute(self, stmt, *args, **kwargs)
+                rows = result.scalars().all()
+                return _FakeResult([r for r in rows if getattr(r, "id", None) != task_id])
+            # Force-lock query: refresh the heartbeat first, then acquire
+            await real_execute(
+                self,
+                _sa_update(Task).where(Task.id == task_id).values(last_heartbeat=fresh_ts),
+            )
+            await self.commit()
+            result = await real_execute(self, stmt, *args, **kwargs)
+            return _FakeResult(result.scalars().all())
+        return await real_execute(self, stmt, *args, **kwargs)
+
+    mocker.patch.object(AsyncSession, "execute", mock_execute)
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert state["for_update_calls"] >= 2, "force-lock query must run"
+    assert t.status == TaskStatus.IN_PROGRESS, "healthy task must not be reaped"
+    assert t.attempt_count == 0, "retry budget must not be burned"
+    assert clean_skip_counts.get(task_id) == 5, (
+        "skip_count must be preserved (not popped) when force-lock re-verify finds task healthy"
+    )
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_refresh_between_step1_and_step2_not_reaped(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):

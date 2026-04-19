@@ -81,6 +81,10 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             breaker["state"] = "HALF_OPEN"
             logger.warning(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
         else:
+            logger.warning(
+                f"[CIRCUIT BREAKER] Skipping autonomous research spawn for project={project.id} "
+                f"— circuit breaker state=OPEN (still in cooldown)"
+            )
             return  # Still in cooldown
     elif breaker["state"] == "HALF_OPEN":
         # Check if existing test task is stuck — treat as failure after 30 min
@@ -734,6 +738,10 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
             breaker["state"] = "HALF_OPEN"
             logger.warning(f"[CIRCUIT BREAKER] OPEN → HALF-OPEN for {project.id} (cooldown elapsed, allowing one test task)")
         else:
+            logger.warning(
+                f"[CIRCUIT BREAKER] Skipping periodic task spawn (type={task_type}) for project={project.id} "
+                f"— circuit breaker state=OPEN (still in cooldown)"
+            )
             return  # Still in cooldown
     elif breaker["state"] == "HALF_OPEN":
         test_id = breaker.get("half_open_task_id")

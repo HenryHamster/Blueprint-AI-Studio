@@ -2354,6 +2354,55 @@ async def get_digest(
             key = "unknown"
         cumulative_merged_by_trigger_class[key] = cumulative_merged_by_trigger_class.get(key, 0) + 1
 
+    from app.task_completion import _is_structural_diagnosis
+
+    _inv_ids_with_remediation = {
+        str((r.context or {}).get("diagnosis_task_id"))
+        for r in _rem_tasks
+        if (r.context or {}).get("diagnosis_task_id")
+    }
+    _PARSEABLE_KEYS = ("summary", "root_cause", "recommended_fix", "confidence")
+    ic_total = 0
+    ic_parseable = 0
+    ic_unparseable = 0
+    ic_structural = 0
+    ic_low_confidence = 0
+    ic_actionable = 0
+    ic_remediation_spawned = 0
+    for t in _inv_tasks:
+        if t.status != TaskStatus.COMPLETED:
+            continue
+        ic_total += 1
+        po = t.plan_output if isinstance(t.plan_output, dict) else None
+        parseable = bool(po) and any(str(po.get(k) or "").strip() for k in _PARSEABLE_KEYS)
+        if parseable:
+            ic_parseable += 1
+        else:
+            ic_unparseable += 1
+            continue
+        root_cause = str((po or {}).get("root_cause") or "")
+        recommended_fix = str((po or {}).get("recommended_fix") or "")
+        confidence = str((po or {}).get("confidence") or "").strip().lower()
+        structural = _is_structural_diagnosis(root_cause, recommended_fix)
+        if structural:
+            ic_structural += 1
+            continue
+        if confidence == "low":
+            ic_low_confidence += 1
+        elif confidence in ("high", "medium") and recommended_fix.strip():
+            ic_actionable += 1
+        if str(t.id) in _inv_ids_with_remediation:
+            ic_remediation_spawned += 1
+    investigation_conversion = {
+        "total_completed": ic_total,
+        "parseable": ic_parseable,
+        "unparseable": ic_unparseable,
+        "structural": ic_structural,
+        "low_confidence": ic_low_confidence,
+        "actionable": ic_actionable,
+        "remediation_spawned": ic_remediation_spawned,
+    }
+
     remediation_funnel = {
         "investigations_spawned": investigations_spawned,
         "investigations_completed": investigations_completed,
@@ -2448,4 +2497,5 @@ async def get_digest(
         "resurrection_outcome_summary": resurrection_outcome_summary,
         "recurring_error_clusters": recurring_error_clusters,
         "remediation_funnel": remediation_funnel,
+        "investigation_conversion": investigation_conversion,
     }

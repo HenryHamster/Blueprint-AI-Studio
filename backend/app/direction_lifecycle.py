@@ -183,7 +183,12 @@ async def _spawn_direction_diagnosis(
         return False
     if direction.get("code_failure_pause_count", 0) >= _MAX_AUTO_PAUSE_CYCLES:
         return False
-    if get_circuit_breaker(str(project.id)).get("state") == "OPEN":
+    breaker_state = get_circuit_breaker(str(project.id)).get("state")
+    if breaker_state == "OPEN":
+        logger.warning(
+            f"[DIAGNOSIS] Skipping diagnosis spawn for project={project.id} "
+            f"direction={direction.get('id')} — circuit breaker state={breaker_state}"
+        )
         return False
     direction_id = direction.get("id")
     if not direction_id:
