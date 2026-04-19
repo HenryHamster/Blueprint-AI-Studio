@@ -2295,6 +2295,48 @@ async def get_digest(
             "elapsed_hours": elapsed_hours,
         })
 
+    _ci_rem_result = await session.execute(select(Task).where(*_funnel_filters))
+    _ci_rem_tasks = [
+        t for t in _ci_rem_result.scalars().all()
+        if (t.context or {}).get("auto_remediation") is True
+    ]
+    ci_auto_remediation: Dict[str, Any] = {
+        "spawned": len(_ci_rem_tasks),
+        "merged": sum(1 for t in _ci_rem_tasks if t.status == TaskStatus.COMPLETED),
+        "failed": sum(1 for t in _ci_rem_tasks if t.status == TaskStatus.FAILED),
+        "by_ci_failure_type": {},
+    }
+    _ci_type_buckets: Dict[str, Dict[str, int]] = {}
+    for t in _ci_rem_tasks:
+        ci_type = str((t.context or {}).get("ci_failure_type") or "unknown").strip() or "unknown"
+        bucket = _ci_type_buckets.setdefault(ci_type, {"spawned": 0, "merged": 0, "failed": 0})
+        bucket["spawned"] += 1
+        if t.status == TaskStatus.COMPLETED:
+            bucket["merged"] += 1
+        elif t.status == TaskStatus.FAILED:
+            bucket["failed"] += 1
+    ci_auto_remediation["by_ci_failure_type"] = _ci_type_buckets
+
+    _cum_filters = [Task.status == TaskStatus.COMPLETED]
+    if project_id:
+        _cum_filters.append(Task.project_id == project_id)
+    _cum_result = await session.execute(select(Task).where(*_cum_filters))
+    cumulative_merged_by_trigger_class: Dict[str, int] = {}
+    for r in _cum_result.scalars().all():
+        ctx = r.context or {}
+        if not (ctx.get("diagnosis_task_id") or ctx.get("auto_remediation") is True):
+            continue
+        trigger_cls = ctx.get("trigger_failure_class")
+        if not trigger_cls:
+            diag_id = ctx.get("diagnosis_task_id")
+            inv = _inv_by_id.get(str(diag_id)) if diag_id else None
+            if inv is not None:
+                trigger_cls = (inv.context or {}).get("last_failure_class")
+        key = str(trigger_cls).strip() if trigger_cls else "unknown"
+        if not key:
+            key = "unknown"
+        cumulative_merged_by_trigger_class[key] = cumulative_merged_by_trigger_class.get(key, 0) + 1
+
     remediation_funnel = {
         "investigations_spawned": investigations_spawned,
         "investigations_completed": investigations_completed,
@@ -2307,9 +2349,11 @@ async def get_digest(
         "investigations_by_confidence": investigations_by_confidence,
         "failed_remediations_by_class": failed_remediations_by_class,
         "merged_remediations_by_trigger_class": merged_remediations_by_trigger_class,
+        "cumulative_merged_by_trigger_class": cumulative_merged_by_trigger_class,
         "remediation_success_by_confidence": remediation_success_by_confidence,
         "recent_investigations": recent_investigations,
         "active_investigations_detail": active_investigations_detail,
+        "ci_auto_remediation": ci_auto_remediation,
     }
 
     _review_quality = _compute_review_quality_metrics(completed_tasks + failed_tasks)

@@ -3742,3 +3742,129 @@ async def test_digest_remediation_funnel(client: AsyncClient, db_session):
         "CODE_ERROR": 1,
         "LINT_ERROR": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_digest_cumulative_merged_by_trigger_class(client: AsyncClient, db_session):
+    """cumulative_merged_by_trigger_class counts across all time; per-window counts only in-window."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    inv_in = make_task(
+        project_id=project.id,
+        title="investigate in-window",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=3),
+        plan_output={"summary": "rc"},
+    )
+    db_session.add(inv_in)
+    await db_session.commit()
+    await db_session.refresh(inv_in)
+
+    # In-window diagnosis-driven remediation
+    rem_in = make_task(
+        project_id=project.id,
+        title="rem in-window",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=2),
+        context={
+            "diagnosis_task_id": str(inv_in.id),
+            "trigger_failure_class": "CODE_ERROR",
+        },
+    )
+    # Out-of-window diagnosis-driven remediation
+    rem_old = make_task(
+        project_id=project.id,
+        title="rem out-of-window",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(days=5),
+        context={
+            "diagnosis_task_id": "00000000-0000-0000-0000-000000000001",
+            "trigger_failure_class": "CODE_ERROR",
+        },
+    )
+    # In-window CI auto-remediation
+    ci_in = make_task(
+        project_id=project.id,
+        title="ci in-window",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=1),
+        context={"auto_remediation": True, "trigger_failure_class": "LINT_ERROR"},
+    )
+    # Out-of-window CI auto-remediation
+    ci_old = make_task(
+        project_id=project.id,
+        title="ci out-of-window",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(days=10),
+        context={"auto_remediation": True, "trigger_failure_class": "LINT_ERROR"},
+    )
+    db_session.add_all([rem_in, rem_old, ci_in, ci_old])
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    funnel = response.json()["remediation_funnel"]
+
+    # Per-window only sees rem_in (diagnosis-driven, in-window)
+    assert funnel["merged_remediations_by_trigger_class"] == {"CODE_ERROR": 1}
+    # Cumulative includes both diagnosis-driven and CI auto-remediation, all time
+    assert funnel["cumulative_merged_by_trigger_class"] == {
+        "CODE_ERROR": 2,
+        "LINT_ERROR": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_digest_ci_auto_remediation(client: AsyncClient, db_session):
+    """CI auto-remediation tasks (no diagnosis_task_id) surface in ci_auto_remediation."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    ci_merged = make_task(
+        project_id=project.id,
+        title="ci auto-remediation merged",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=2),
+        context={
+            "auto_remediation": True,
+            "trigger_failure_class": "CODE_ERROR",
+            "ci_failure_type": "test",
+        },
+    )
+    ci_failed = make_task(
+        project_id=project.id,
+        title="ci auto-remediation failed",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=1),
+        context={
+            "auto_remediation": True,
+            "trigger_failure_class": "CODE_ERROR",
+            "ci_failure_type": "build",
+        },
+    )
+    db_session.add_all([ci_merged, ci_failed])
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    ci = response.json()["remediation_funnel"]["ci_auto_remediation"]
+
+    assert ci["spawned"] == 2
+    assert ci["merged"] == 1
+    assert ci["failed"] == 1
+    assert ci["by_ci_failure_type"]["test"] == {"spawned": 1, "merged": 1, "failed": 0}
+    assert ci["by_ci_failure_type"]["build"] == {"spawned": 1, "merged": 0, "failed": 1}

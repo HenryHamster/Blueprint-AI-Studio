@@ -547,6 +547,58 @@ async def test_non_suspended_branch_spawns_normally(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_full_ci_remediation_cycle_spawn_to_trackable_outcome(db_session: AsyncSession):
+    """End-to-end: CI failure spawns task → task completes → outcome is trackable by trigger class."""
+    project = await _create_project(db_session)
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+        mock_ctx.return_value = (["CI / tests"], "AssertionError: boom", "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme",
+            repo="webapp",
+            head_sha="cafed00d",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    spawned = (await session_tasks(db_session, project.id))
+    assert len(spawned) == 1
+    task = spawned[0]
+
+    # (2) Verify context fields required for downstream tracking
+    assert task.context["auto_remediation"] is True
+    assert task.context["trigger_failure_class"] == "CODE_ERROR"
+    assert task.context["ci_failure_type"] == "test"
+    assert task.context["ci_failure_sha"] == "cafed00d"
+    assert task.status == TaskStatus.QUEUED
+
+    # (3) Simulate successful merge
+    task.status = TaskStatus.COMPLETED
+    await db_session.flush()
+
+    # (4) Verify the task is queryable as a completed CI auto-remediation and
+    # aggregatable by trigger_failure_class — the shape the digest funnel relies on.
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status == TaskStatus.COMPLETED,
+        )
+    )
+    completed = [t for t in result.scalars().all() if (t.context or {}).get("auto_remediation") is True]
+    assert len(completed) == 1
+
+    by_trigger: dict[str, int] = {}
+    for t in completed:
+        cls = (t.context or {}).get("trigger_failure_class") or "unknown"
+        by_trigger[cls] = by_trigger.get(cls, 0) + 1
+    assert by_trigger == {"CODE_ERROR": 1}
+
+
+@pytest.mark.asyncio
 async def test_find_matching_prior_investigation_matches_on_file_path(db_session: AsyncSession):
     """A recent completed investigate task whose affected file appears in the error summary matches."""
     project = await _create_project(db_session)
