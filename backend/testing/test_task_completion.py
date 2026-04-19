@@ -1552,21 +1552,21 @@ class TestFollowupInvestigationOnFailure:
         assert spawned_task.context["diagnosis_trigger"] == "remediation_failure_followup"
         assert spawned_task.context["direction_id"] == "dir-1"
         assert spawned_task.context["diagnosis_fingerprint"] == "fp-A"
+        assert spawned_task.context["failure_fingerprints"] == ["fp-A"]
         assert spawned_task.context["failed_remediation_task_id"] == str(task.id)
         assert spawned_task.context["original_diagnosis_task_id"] == "diag-1"
 
     @pytest.mark.asyncio
     async def test_follow_up_skipped_by_24h_dedup(self, db_session):
-        """An investigate task created in the last 24h blocks a new follow-up."""
+        """A recent investigate task with matching fingerprint blocks a new follow-up."""
         project = make_project(directions=[{"id": "dir-1", "status": "active"}])
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
-        # Pre-seed a recent investigate task for this direction
         prior = make_task(
             project_id=project.id,
             payloads=[{"type": "investigate", "prompt": "old", "base_branch": "main"}],
-            context={"direction_id": "dir-1"},
+            context={"direction_id": "dir-1", "diagnosis_fingerprint": "fp-A"},
         )
         db_session.add(prior)
         await db_session.commit()
@@ -1582,6 +1582,33 @@ class TestFollowupInvestigationOnFailure:
         d = project.directions[0]
         assert "followup_investigation_attempts_by_fingerprint" not in d
         assert d.get("diagnosis_in_progress") is not True
+
+    @pytest.mark.asyncio
+    async def test_follow_up_not_blocked_by_unrelated_fingerprint(self, db_session):
+        """A recent investigate task for a different fingerprint must NOT block a follow-up."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        prior = make_task(
+            project_id=project.id,
+            payloads=[{"type": "investigate", "prompt": "old", "base_branch": "main"}],
+            context={"direction_id": "dir-1", "diagnosis_fingerprint": "fp-OTHER"},
+        )
+        db_session.add(prior)
+        await db_session.commit()
+        task = self._make_remediation_task(project.id, fingerprint="fp-A")
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert "fp-A" in (d.get("followup_investigation_attempts_by_fingerprint") or {})
+        assert d.get("diagnosis_in_progress") is True
 
     @pytest.mark.asyncio
     async def test_follow_up_skipped_when_cap_reached(self, db_session):
@@ -2442,6 +2469,7 @@ class TestHandleInvestigationCompletion:
         assert followup.context["previous_investigation_task_id"] == str(task.id)
         assert followup.context["original_diagnosis_task_id"] == str(task.id)
         assert followup.context["diagnosis_fingerprint"] == "fp-low"
+        assert followup.context["failure_fingerprints"] == ["fp-low"]
         assert "LOW-confidence" in followup.payloads[0]["prompt"]
 
         d = project.directions[0]
@@ -2702,13 +2730,21 @@ class TestCalculateRemediationScope:
     def test_empty_paths_low_severity_is_small(self):
         assert _calculate_remediation_scope([], "low", 0) == "small"
 
-    def test_retry_does_not_escalate_small(self):
-        """Retries keep the same scope — medium-scope remediations fail at 0%."""
+    def test_first_retry_does_not_escalate_small(self):
+        """First retry (attempts=1) still uses small — conservative escalation."""
         assert _calculate_remediation_scope(["a.py"], "low", 1) == "small"
 
-    def test_retry_does_not_escalate_five_paths(self):
+    def test_first_retry_does_not_escalate_five_paths(self):
         paths = ["a.py", "b.py", "c.py", "d.py", "e.py"]
         assert _calculate_remediation_scope(paths, "medium", 1) == "small"
+
+    def test_second_retry_escalates_small_to_large(self):
+        """Second retry (attempts>=2) escalates small to large for plan decomposition."""
+        assert _calculate_remediation_scope(["a.py"], "low", 2) == "large"
+
+    def test_later_retry_escalates_small_to_large(self):
+        paths = ["a.py", "b.py", "c.py", "d.py", "e.py"]
+        assert _calculate_remediation_scope(paths, "medium", 3) == "large"
 
     def test_large_stays_large_after_retry(self):
         paths = [f"f{i}.py" for i in range(6)]
@@ -2812,8 +2848,25 @@ class TestRemediationScopeInPayload:
         assert child.context["scope"] == "small"
 
     @pytest.mark.asyncio
-    async def test_retries_do_not_escalate_scope(self, db_session, mocker):
-        """Prior retry count should not escalate a small-scope diagnosis to medium."""
+    async def test_first_retry_keeps_small_scope(self, db_session, mocker):
+        """First retry (attempts=1) still uses small — conservative escalation."""
+        project = await self._setup(
+            db_session, mocker, direction_overrides={"remediation_attempts": 1},
+        )
+        task = make_task(project_id=project.id, context={"direction_id": "dir-scope-1"})
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await db_session.commit()
+        child = await self._spawned_child(db_session, task.id)
+        assert child is not None
+        assert child.context["scope"] == "small"
+
+    @pytest.mark.asyncio
+    async def test_second_retry_escalates_scope_to_large(self, db_session, mocker):
+        """Second retry (attempts>=2) escalates small to large for plan decomposition."""
         project = await self._setup(
             db_session, mocker, direction_overrides={"remediation_attempts": 2},
         )
@@ -2826,7 +2879,7 @@ class TestRemediationScopeInPayload:
         await db_session.commit()
         child = await self._spawned_child(db_session, task.id)
         assert child is not None
-        assert child.context["scope"] == "small"
+        assert child.context["scope"] == "large"
 
 
 # ── _handle_investigation_terminal_failure ──────────────────────────────────
@@ -2905,6 +2958,7 @@ class TestHandleInvestigationTerminalFailure:
         assert followup.context["original_diagnosis_task_id"] == str(task.id)
         assert followup.context["direction_id"] == "dir-1"
         assert followup.context["diagnosis_fingerprint"] == "fp-A"
+        assert followup.context["failure_fingerprints"] == ["fp-A"]
 
     @pytest.mark.asyncio
     async def test_cancelled_clears_flag_no_respawn(self, db_session):
@@ -3169,7 +3223,7 @@ class TestHandleInvestigationTerminalFailure:
         sibling = make_task(
             project_id=project.id,
             payloads=[{"type": "investigate", "prompt": "p", "base_branch": "main"}],
-            context={"direction_id": "dir-1"},
+            context={"direction_id": "dir-1", "diagnosis_fingerprint": "fp-A"},
         )
         db_session.add(sibling)
         await db_session.commit()

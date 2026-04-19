@@ -349,6 +349,34 @@ def _project_active_followup_count(
     return total
 
 
+async def _recent_followup_investigation_exists(
+    project_id, direction_id, cutoff, fingerprint, session, exclude_task_id=None,
+) -> bool:
+    """Return True if a recent investigate task for this direction blocks a follow-up.
+
+    Mirrors the fingerprint-aware dedup used by the initial-spawn path in
+    ``autonomous_research._recent_investigation_exists``: when ``fingerprint`` is
+    provided, only investigations whose ``diagnosis_fingerprint`` matches block
+    the new follow-up — distinct failure patterns on the same direction can each
+    proceed. Per-direction concurrent capping continues to be enforced by the
+    ``diagnosis_in_progress`` flag at the caller.
+    """
+    q = select(Task.id).where(
+        Task.project_id == project_id,
+        Task.created_at >= cutoff,
+        Task.payloads[0]["type"].as_string() == "investigate",
+        Task.context["direction_id"].as_string() == str(direction_id),
+    )
+    if exclude_task_id is not None:
+        q = q.where(Task.id != exclude_task_id)
+    if fingerprint:
+        q = q.where(
+            Task.context["diagnosis_fingerprint"].as_string() == str(fingerprint)
+        )
+    row = (await session.execute(q.limit(1))).first()
+    return row is not None
+
+
 async def _find_sibling_fingerprint_investigation(
     project_id, fingerprint, cutoff, session, exclude_task_id=None,
 ) -> Optional[str]:
@@ -424,22 +452,17 @@ async def _maybe_spawn_followup_investigation(
         )
         return None
     cutoff = _utcnow() - timedelta(hours=24)
-    existing = await session.execute(
-        select(Task.id).where(
-            Task.project_id == project.id,
-            Task.created_at >= cutoff,
-            Task.payloads[0]["type"].as_string() == "investigate",
-            Task.context["direction_id"].as_string() == str(direction_id),
-        ).limit(1)
-    )
-    if existing.first() is not None:
-        logger.debug(
-            f"[DIAGNOSIS] Skip follow-up for direction {direction_id}: "
-            f"investigate task already created in last 24h"
-        )
-        return None
     fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint") \
         or target.get("last_remediation_fingerprint")
+    if await _recent_followup_investigation_exists(
+        project.id, direction_id, cutoff, fingerprint, session,
+    ):
+        logger.debug(
+            f"[DIAGNOSIS] Skip follow-up for direction {direction_id}: "
+            f"investigate task already created in last 24h "
+            f"(fingerprint={str(fingerprint)[:40] if fingerprint else 'none'})"
+        )
+        return None
     shared_id = await _find_sibling_fingerprint_investigation(
         project.id, fingerprint, cutoff, session,
     )
@@ -542,6 +565,7 @@ async def _maybe_spawn_followup_investigation(
         task_context["original_diagnosis_task_id"] = str(original_diagnosis_task_id)
     if fingerprint:
         task_context["diagnosis_fingerprint"] = str(fingerprint)
+        task_context["failure_fingerprints"] = [str(fingerprint)]
     inherited_failure_class = ctx.get("trigger_failure_class")
     if inherited_failure_class:
         task_context["last_failure_class"] = inherited_failure_class
@@ -661,21 +685,15 @@ async def _maybe_spawn_low_confidence_followup(
     if not direction_id or direction.get(DIAGNOSIS_IN_PROGRESS_KEY):
         return None
     cutoff = _utcnow() - timedelta(hours=24)
-    existing = await session.execute(
-        select(Task.id).where(
-            Task.project_id == project.id,
-            Task.created_at >= cutoff,
-            Task.id != investigation_task.id,
-            Task.payloads[0]["type"].as_string() == "investigate",
-            Task.context["direction_id"].as_string() == str(direction_id),
-        ).limit(1)
-    )
-    if existing.first() is not None:
-        return None
     fingerprint = (
         (investigation_task.context or {}).get("diagnosis_fingerprint")
         or direction.get("error_fingerprint")
     )
+    if await _recent_followup_investigation_exists(
+        project.id, direction_id, cutoff, fingerprint, session,
+        exclude_task_id=investigation_task.id,
+    ):
+        return None
     shared_id = await _find_sibling_fingerprint_investigation(
         project.id, fingerprint, cutoff, session,
         exclude_task_id=investigation_task.id,
@@ -732,6 +750,7 @@ async def _maybe_spawn_low_confidence_followup(
     }
     if fingerprint:
         task_ctx["diagnosis_fingerprint"] = str(fingerprint)
+        task_ctx["failure_fingerprints"] = [str(fingerprint)]
     inherited_failure_class = inv_ctx.get("last_failure_class")
     if inherited_failure_class:
         task_ctx["last_failure_class"] = inherited_failure_class
@@ -814,21 +833,15 @@ async def _maybe_spawn_reinvestigation_after_failure(
     if not direction_id or direction.get(DIAGNOSIS_IN_PROGRESS_KEY):
         return None
     cutoff = _utcnow() - timedelta(hours=24)
-    existing = await session.execute(
-        select(Task.id).where(
-            Task.project_id == project.id,
-            Task.created_at >= cutoff,
-            Task.id != investigation_task.id,
-            Task.payloads[0]["type"].as_string() == "investigate",
-            Task.context["direction_id"].as_string() == str(direction_id),
-        ).limit(1)
-    )
-    if existing.first() is not None:
-        return None
     fingerprint = (
         (investigation_task.context or {}).get("diagnosis_fingerprint")
         or direction.get("error_fingerprint")
     )
+    if await _recent_followup_investigation_exists(
+        project.id, direction_id, cutoff, fingerprint, session,
+        exclude_task_id=investigation_task.id,
+    ):
+        return None
     shared_id = await _find_sibling_fingerprint_investigation(
         project.id, fingerprint, cutoff, session,
         exclude_task_id=investigation_task.id,
@@ -909,6 +922,7 @@ async def _maybe_spawn_reinvestigation_after_failure(
     }
     if fingerprint:
         task_ctx["diagnosis_fingerprint"] = str(fingerprint)
+        task_ctx["failure_fingerprints"] = [str(fingerprint)]
     inherited_failure_class = inv_ctx.get("last_failure_class")
     if inherited_failure_class:
         task_ctx["last_failure_class"] = inherited_failure_class
@@ -1704,10 +1718,14 @@ def _calculate_remediation_scope(
     Returns "small" or "large". Pipeline data shows the medium tier is a dead
     zone (near-zero merge rate) — complex enough to fail but not decomposed by
     the plan agent. Route <=5 affected files to small and >5 to large so large
-    remediations get plan-based decomposition. Retries do NOT escalate scope.
+    remediations get plan-based decomposition. On the second retry and beyond
+    (remediation_attempts >= 2), escalate small to large so the plan agent can
+    decompose fixes that proved too complex for a single create task.
     """
-    del remediation_attempts, severity  # retained for signature compatibility
+    del severity  # retained for signature compatibility
     if len(affected_paths) > 5:
+        return "large"
+    if remediation_attempts >= 2:
         return "large"
     return "small"
 
