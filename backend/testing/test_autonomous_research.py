@@ -2220,6 +2220,76 @@ def test_auto_decompose_skipped_when_all_clusters_exceed_small_budget():
     assert fhash == "h"
 
 
+def test_split_oversized_clusters_by_subdir_splits_on_real_subdirs():
+    """Oversized cluster spanning two sub-dirs splits into per-sub-dir groups."""
+    from app.cochange_decomposition import split_oversized_clusters_by_subdir
+    cluster = [
+        "backend/app/a.py",
+        "backend/app/b.py",
+        "backend/app/c.py",
+        "backend/app/d.py",
+        "backend/testing/e.py",
+        "backend/testing/f.py",
+        "backend/testing/g.py",
+    ]
+    out = split_oversized_clusters_by_subdir([cluster], small_budget=6)
+    assert out is not None
+    assert {tuple(sorted(g)) for g in out} == {
+        ("backend/app/a.py", "backend/app/b.py", "backend/app/c.py", "backend/app/d.py"),
+        ("backend/testing/e.py", "backend/testing/f.py", "backend/testing/g.py"),
+    }
+
+
+def test_split_oversized_clusters_by_subdir_refuses_root_level_files():
+    """Root-level (bare-filename) files have no sub-dir prefix, so don't fragment."""
+    from app.cochange_decomposition import split_oversized_clusters_by_subdir
+    cluster = [f"a{i}.py" for i in range(7)]
+    out = split_oversized_clusters_by_subdir([cluster], small_budget=6)
+    assert out is None
+
+
+def test_split_oversized_clusters_by_subdir_refuses_mixed_root_and_subdir():
+    """Mixed root-level + sub-dir files: refuse split so root-level files aren't
+    fragmented into singletons while sub-dir files get grouped."""
+    from app.cochange_decomposition import split_oversized_clusters_by_subdir
+    cluster = [
+        "root_a.py",
+        "backend/app/a.py",
+        "backend/app/b.py",
+        "backend/testing/c.py",
+        "backend/testing/d.py",
+        "backend/testing/e.py",
+        "backend/testing/f.py",
+    ]
+    out = split_oversized_clusters_by_subdir([cluster], small_budget=6)
+    assert out is None
+
+
+def test_split_oversized_clusters_by_subdir_refuses_all_singleton_subgroups():
+    """Sub-grouping produces only singletons — refuse to flood the orchestrator."""
+    from app.cochange_decomposition import split_oversized_clusters_by_subdir
+    cluster = [
+        "backend/app/a.py",
+        "backend/lib/b.py",
+        "backend/cli/c.py",
+        "backend/util/d.py",
+        "backend/core/e.py",
+        "backend/util2/f.py",
+        "backend/util3/g.py",
+    ]
+    out = split_oversized_clusters_by_subdir([cluster], small_budget=6)
+    assert out is None
+
+
+def test_split_oversized_clusters_by_subdir_leaves_fitting_clusters_alone():
+    """Clusters already within small_budget pass through unchanged; None when
+    no split progress is made."""
+    from app.cochange_decomposition import split_oversized_clusters_by_subdir
+    fitting = ["a.py", "b.py", "c.py"]
+    out = split_oversized_clusters_by_subdir([fitting], small_budget=6)
+    assert out is None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. _handle_research_completion — JSONB research_history Updates
 # ─────────────────────────────────────────────────────────────────────────────

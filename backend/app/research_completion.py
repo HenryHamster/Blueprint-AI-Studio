@@ -783,6 +783,28 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         "pipeline_medium=%.2f, frac=%.3f",
                         _pred_dir_id, float(_pipeline_medium), float(_explore_frac),
                     )
+            # Suppress exploration when medium→large escalations in this direction
+            # have also been failing: if both direct medium execution and the
+            # escalation fallback merge poorly, spawning more medium findings just
+            # feeds a losing pipeline regardless of exploration-merge stats.
+            _esc_attempted = 0
+            _esc_merged = 0
+            for _entry in ((_pred_direction or {}).get("research_history") or [])[-3:]:
+                _esc = (_entry.get("escalation_outcomes") or {}).get("medium_to_large") or {}
+                _esc_attempted += int(_esc.get("attempted") or 0)
+                _esc_merged += int(_esc.get("merged") or 0)
+            if (
+                _esc_attempted >= 3
+                and isinstance(_explore_frac, (int, float))
+                and (_esc_merged / _esc_attempted) < 0.30
+            ):
+                _explore_frac = float(_explore_frac) * 0.5
+                logger.info(
+                    "[RESEARCH] Suppressing exploration for direction %s: medium→large "
+                    "escalation rate=%.2f (%d/%d) < 0.30, frac=%.3f",
+                    _pred_dir_id, _esc_merged / _esc_attempted, _esc_merged,
+                    _esc_attempted, float(_explore_frac),
+                )
             # Enforce a minimum exploration fraction so directions with zero
             # observed exploration merges still occasionally attempt medium scope —
             # otherwise the fraction locks at 0 and no new data is ever collected.

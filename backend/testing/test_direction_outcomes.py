@@ -614,12 +614,12 @@ async def test_taxonomy_fields_in_outcome_entries(db_session: AsyncSession):
                               status=TaskStatus.FAILED,
                               context={"failure_category": "CODE_ERROR", "scope": "small"},
                               title="rq1", latest_status_message="pytest failed in tests")
-    # scope_related: CODE_ERROR with positive scope evidence (scope_calibrated_from)
+    # scope_related: CODE_ERROR with positive scope evidence (status-msg keyword)
     await _create_child_task(db_session, research_task.id, project.id,
                               status=TaskStatus.FAILED,
                               context={"failure_category": "CODE_ERROR", "scope": "medium",
                                        "scope_calibrated_from": "small"},
-                              title="sc1", latest_status_message="something broke")
+                              title="sc1", latest_status_message="task exceeds scope budget")
     # code_defect: CODE_ERROR small with no classifying signal
     await _create_child_task(db_session, research_task.id, project.id,
                               status=TaskStatus.FAILED,
@@ -763,6 +763,102 @@ async def test_scope_breakdown_tracks_calibration(db_session: AsyncSession):
     assert sb["medium"]["created"] == 0
     assert sb["medium"]["calibrated_in"] == 0
     assert sb["medium"]["calibrated_out"] == 1
+
+
+@pytest.mark.asyncio
+async def test_escalation_outcomes_tracks_attempt_merge_fail(db_session: AsyncSession):
+    """escalation_outcomes buckets tasks whose effective scope exceeds the
+    original (calibrated_from), keyed ``{from}_to_{to}``, with attempted/
+    merged/failed counters. Downsizing (e.g. medium → small) and same-scope
+    calibration must NOT show up in escalation_outcomes."""
+    direction_id = "d-escalate"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=4)]
+    await db_session.flush()
+
+    # Escalation small → medium, merged
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "medium", "scope_calibrated_from": "small"},
+        payloads=[{"type": "create"}],
+        title="esc-sm-md-merged",
+    )
+    # Escalation small → medium, failed
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "medium", "scope_calibrated_from": "small"},
+        payloads=[{"type": "create"}],
+        title="esc-sm-md-failed",
+    )
+    # Escalation medium → large, attempted only (still running)
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "large", "scope_calibrated_from": "medium"},
+        payloads=[{"type": "create"}],
+        title="esc-md-lg-running",
+    )
+    # Downsize medium → small — must NOT appear in escalation_outcomes
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "small", "scope_calibrated_from": "medium"},
+        payloads=[{"type": "create"}],
+        title="downsize-md-sm",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    eo = entry["escalation_outcomes"]
+
+    assert set(eo.keys()) == {"small_to_medium", "medium_to_large"}
+    assert eo["small_to_medium"] == {"attempted": 2, "merged": 1, "failed": 1}
+    assert eo["medium_to_large"] == {"attempted": 1, "merged": 0, "failed": 0}
+
+
+@pytest.mark.asyncio
+async def test_escalation_outcomes_empty_when_no_escalations(db_session: AsyncSession):
+    """escalation_outcomes is an empty dict when no child is calibrated upward."""
+    direction_id = "d-no-escalate"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "small"},
+        payloads=[{"type": "create"}],
+        title="plain-small",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["escalation_outcomes"] == {}
 
 
 @pytest.mark.asyncio

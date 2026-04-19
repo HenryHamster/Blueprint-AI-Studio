@@ -2310,11 +2310,11 @@ async def test_trend_history_includes_failed_by_taxonomy(client: AsyncClient, db
         created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
         latest_status_message="pytest tests failed",
     ))
-    # A scope_related failure (positive evidence: scope_calibrated_from)
+    # A scope_related failure (positive evidence: status-msg scope keyword)
     db_session.add(make_task(
         project_id=project.id, status=TaskStatus.FAILED,
         created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-        latest_status_message="error",
+        latest_status_message="scope too large for task",
         context={"scope": "medium", "scope_calibrated_from": "small"},
     ))
     # A residual code_defect failure (no scope, no review keywords)

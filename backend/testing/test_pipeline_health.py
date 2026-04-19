@@ -147,9 +147,9 @@ async def test_failure_taxonomy_distribution_mixed():
                   latest_status_message="pytest tests failed"),
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=2),
                   latest_status_message="ruff lint error"),
-        # scope_related (positive scope evidence: scope_calibrated_from)
+        # scope_related (positive scope evidence: status-msg scope keyword)
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=3),
-                  latest_status_message="build error",
+                  latest_status_message="too many files changed",
                   context={"scope": "large", "scope_calibrated_from": "medium"}),
         # infra_related
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=4),
@@ -541,7 +541,7 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "failure_taxonomy", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_conversion_rates", "scope_file_budgets", "medium_scope_review_iterations", "direction_first_attempt_feedback", "medium_scope_measurement"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "failure_taxonomy", "failure_taxonomy_by_scope", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_conversion_rates", "scope_file_budgets", "medium_scope_review_iterations", "direction_first_attempt_feedback", "medium_scope_measurement"}
     fa = result["first_attempt_success_rate"]
     assert "first_attempt_by_review_category" in fa
     assert "with_arch_context" in fa

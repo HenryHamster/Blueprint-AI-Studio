@@ -325,6 +325,8 @@ async def _update_direction_research_outcomes(
             # effective scope). calibrated_out: tasks originally proposed at this scope but
             # calibrated to a smaller one (counted at the original scope).
             scope_breakdown: dict = {}
+            escalation_outcomes: dict = {}
+            SCOPE_RANK = {"small": 0, "medium": 1, "large": 2}
             expansion_sums: dict = {}
             expansion_counts: dict = {}
             expansion_failed_sums: dict = {}
@@ -382,6 +384,23 @@ async def _update_direction_research_outcomes(
                     scope_breakdown[scope]["calibrated_in"] += 1
                     _ensure_scope(calibrated_from)
                     scope_breakdown[calibrated_from]["calibrated_out"] += 1
+                    # Track escalations (original smaller -> effective larger) so we can
+                    # measure whether escalation actually resolves the task or just burns
+                    # compute at a larger scope.
+                    if (
+                        calibrated_from in SCOPE_RANK
+                        and scope in SCOPE_RANK
+                        and SCOPE_RANK[scope] > SCOPE_RANK[calibrated_from]
+                    ):
+                        key = f"{calibrated_from}_to_{scope}"
+                        bucket = escalation_outcomes.setdefault(
+                            key, {"attempted": 0, "merged": 0, "failed": 0}
+                        )
+                        bucket["attempted"] += 1
+                        if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):
+                            bucket["merged"] += 1
+                        if _counts_as_failure(ct):
+                            bucket["failed"] += 1
                 # File expansion ratio: actual files touched / expected files.
                 # Leading indicator of scope overflow risk.
                 related = ctx_.get("related_files") or []
@@ -429,6 +448,7 @@ async def _update_direction_research_outcomes(
                 if n > 0 and sk in scope_breakdown:
                     scope_breakdown[sk]["avg_complexity_failed"] = round(cplx_failed_sum[sk] / n, 2)
             entry["scope_breakdown"] = scope_breakdown
+            entry["escalation_outcomes"] = escalation_outcomes
 
             # Decomposition quality: per plan-parent metrics so future calibration
             # can correlate decomposition shape (breadth, file overlap, cross-module

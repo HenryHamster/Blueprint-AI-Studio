@@ -84,6 +84,53 @@ def cluster_files_by_toplevel_dir(files: list[str]) -> list[list[str]] | None:
     return [groups[t] for t in order]
 
 
+def split_oversized_clusters_by_subdir(
+    clusters: list[list[str]], small_budget: int
+) -> list[list[str]] | None:
+    """Second-pass split: break oversized clusters by next sub-directory segment.
+
+    For each cluster exceeding ``small_budget``, regroup its files by the first
+    two path segments (e.g. ``backend/app`` vs ``backend/testing``). Returns a
+    new flat cluster list when at least one oversized cluster was actually
+    split and at least one resulting sub-cluster fits the small budget; else
+    None so callers can fall back to the prior behavior.
+
+    Refuses to split a cluster when any of its files lacks a real sub-directory
+    prefix (no ``/``) — the key would degrade to the bare filename and
+    fragment the cluster into singletons. Also requires at least one resulting
+    sub-cluster to contain two or more files, to avoid pure-singleton splits
+    that would flood the orchestrator with per-file tasks.
+    """
+    new_clusters: list[list[str]] = []
+    made_progress = False
+    for cluster in clusters:
+        if len(cluster) <= small_budget:
+            new_clusters.append(cluster)
+            continue
+        if any("/" not in f for f in cluster):
+            new_clusters.append(cluster)
+            continue
+        subgroups: dict[str, list[str]] = {}
+        order: list[str] = []
+        for f in cluster:
+            parts = f.split("/", 2)
+            key = "/".join(parts[:2])
+            if key not in subgroups:
+                order.append(key)
+            subgroups.setdefault(key, []).append(f)
+        if len(subgroups) >= 2 and any(len(g) >= 2 for g in subgroups.values()):
+            made_progress = True
+            for k in order:
+                new_clusters.append(subgroups[k])
+        else:
+            new_clusters.append(cluster)
+    if not made_progress or len(new_clusters) < 2:
+        return None
+    if not any(len(c) <= small_budget for c in new_clusters):
+        return None
+    return new_clusters
+
+
 def auto_decompose_findings_by_cochange(
     deduplicated: list[tuple[int, dict, str]],
     cochange_index: dict | None,
@@ -136,13 +183,21 @@ def auto_decompose_findings_by_cochange(
             if f_clusters and len(f_clusters) >= 2:
                 f_title = finding.get("title", f"Research finding #{orig_i+1}")
                 if all(len(c) > small_budget for c in f_clusters):
-                    logger.info(
-                        "[RESEARCH] Skipping co-change decomposition for '%s': "
-                        "all %d clusters exceed small-scope budget (%d files)",
-                        f_title, len(f_clusters), small_budget,
+                    subdir_split = split_oversized_clusters_by_subdir(
+                        f_clusters, small_budget
                     )
-                    expanded.append((orig_i, finding, fhash))
-                    continue
+                    if subdir_split is not None:
+                        f_clusters = subdir_split
+                        cluster_source = f"{cluster_source}+subdir"
+                    else:
+                        logger.info(
+                            "[RESEARCH] Skipping co-change decomposition for "
+                            "'%s': all %d clusters exceed small-scope budget "
+                            "(%d files) and sub-dir split produced no fit",
+                            f_title, len(f_clusters), small_budget,
+                        )
+                        expanded.append((orig_i, finding, fhash))
+                        continue
                 logger.info(
                     "[RESEARCH] Auto-decomposing medium finding '%s' into %d "
                     "sub-findings via %s clustering: %s",

@@ -129,6 +129,26 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "dominant_category": max(_taxonomy_keys, key=lambda k: taxonomy_counts[k]) if _tax_total else None,
     }
 
+    _scope_taxonomy_counts: Dict[str, Dict[str, int]] = {}
+    for t in failed_tasks:
+        scope = (t.context or {}).get("scope", "unknown")
+        bucket = _scope_taxonomy_counts.setdefault(scope, {k: 0 for k in _taxonomy_keys})
+        bucket[_classify_taxonomy(t)] += 1
+    failure_taxonomy_by_scope = {}
+    for scope, counts in _scope_taxonomy_counts.items():
+        tot = sum(counts.values())
+        failure_taxonomy_by_scope[scope] = {
+            "categories": {
+                k: {
+                    "count": counts[k],
+                    "percentage": round(counts[k] / tot * 100, 1) if tot else 0.0,
+                }
+                for k in _taxonomy_keys
+            },
+            "total_failures": tot,
+            "dominant_category": max(_taxonomy_keys, key=lambda k: counts[k]) if tot else None,
+        }
+
     # Direction stats: conversion_rate and cycle count per active direction
     direction_stats: List[Dict[str, Any]] = []
     project = await session.get(Project, project_id)
@@ -648,6 +668,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "trend": trend,
         "failure_distribution": failure_distribution,
         "failure_taxonomy": failure_taxonomy,
+        "failure_taxonomy_by_scope": failure_taxonomy_by_scope,
         "direction_stats": direction_stats,
         "first_attempt_success_rate": first_attempt_success_rate,
         "first_review_approval_rate": first_review_approval_rate,
