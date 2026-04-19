@@ -206,6 +206,9 @@ async def _handle_main_branch_ci_failure_inner(
         "ci_failure_type": failure_type,
         "trigger_failure_class": "CODE_ERROR",
     }
+    if error_summary:
+        from app.anomaly_detection import _error_fingerprint
+        task_context["_previous_error_fingerprint"] = _error_fingerprint(error_summary)
     if prior_investigation is not None:
         task_context["prior_diagnosis_task_id"] = str(prior_investigation.id)
 

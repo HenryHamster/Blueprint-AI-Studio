@@ -1079,6 +1079,26 @@ async def _spawn_task_failure_investigation(
         # which the caller has just marked FAILED) and require the top
         # (THRESHOLD - 1) to all be review_quality. One non-review-quality
         # failure breaks the streak.
+        required_streak = REVIEW_QUALITY_STREAK_THRESHOLD - 1
+        # If a convergence investigation already exists for this direction
+        # within the last 7 days, that's strong independent evidence of
+        # chronic review-quality problems — lower the streak requirement
+        # by 1 so we trigger faster on repeat offenders.
+        convergence_cutoff = _utcnow() - timedelta(days=7)
+        convergence_recent = (await session.execute(
+            select(Task).where(
+                Task.project_id == task.project_id,
+                Task.created_at >= convergence_cutoff,
+            )
+        )).scalars().all()
+        has_convergence = any(
+            (t.context or {}).get("direction_id") == direction_id
+            and (t.context or {}).get("spawned_by") == "review_convergence_investigation"
+            for t in convergence_recent
+        )
+        if has_convergence:
+            required_streak = max(1, required_streak - 1)
+
         recent = (await session.execute(
             select(Task).where(
                 Task.project_id == task.project_id,
@@ -1088,8 +1108,8 @@ async def _spawn_task_failure_investigation(
         )).scalars().all()
         dir_recent = [
             t for t in recent if (t.context or {}).get("direction_id") == direction_id
-        ][:REVIEW_QUALITY_STREAK_THRESHOLD - 1]
-        if len(dir_recent) < REVIEW_QUALITY_STREAK_THRESHOLD - 1:
+        ][:required_streak]
+        if len(dir_recent) < required_streak:
             return False
         if not all(classify_failure_taxonomy(t) == TAXONOMY_REVIEW_QUALITY for t in dir_recent):
             return False
@@ -1273,6 +1293,42 @@ async def _spawn_review_convergence_investigation(
     if await _recent_investigation_exists(orig_task.project_id, direction_id, session):
         return False
 
+    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+    from app.failure_classification import CODE_ERROR, TAXONOMY_REVIEW_QUALITY  # noqa: PLC0415
+    from app.task_completion import _find_sibling_fingerprint_investigation  # noqa: PLC0415
+
+    fp_source = (orig_task.latest_status_message or "").strip()
+    if not fp_source:
+        history_for_fp = review_history or (orig_task.context or {}).get(
+            "review_loop", {}
+        ).get("review_history") or []
+        for entry in reversed(history_for_fp):
+            for iss in (entry.get("issues") or []):
+                desc = (iss.get("description") or "").strip()
+                if desc:
+                    fp_source = desc
+                    break
+            if fp_source:
+                break
+            fb = entry.get("feedback")
+            if fb:
+                fp_source = str(fb).strip()
+                break
+    diagnosis_fingerprint = _error_fingerprint(fp_source) if fp_source else ""
+
+    if diagnosis_fingerprint:
+        sibling_cutoff = _utcnow() - timedelta(hours=24)
+        shared_id = await _find_sibling_fingerprint_investigation(
+            orig_task.project_id, diagnosis_fingerprint, sibling_cutoff, session,
+        )
+        if shared_id is not None:
+            logger.info(
+                f"[REVIEW CONVERGENCE] Skip spawn for PR #{pr_number} "
+                f"(direction {direction_id}): shares fingerprint "
+                f"{diagnosis_fingerprint[:40]} with existing investigate task {shared_id}"
+            )
+            return False
+
     history = review_history or (orig_task.context or {}).get("review_loop", {}).get("review_history") or []
     issues_lines: list[str] = []
     for entry in history[-3:]:
@@ -1317,6 +1373,10 @@ async def _spawn_review_convergence_investigation(
             "review_iterations": iterations,
             "convergence_trigger": trigger,
             "convergence_detail": detail,
+            "last_failure_class": CODE_ERROR,
+            "failure_taxonomy": TAXONOMY_REVIEW_QUALITY,
+            "failure_fingerprints": [diagnosis_fingerprint] if diagnosis_fingerprint else [],
+            **({"diagnosis_fingerprint": diagnosis_fingerprint} if diagnosis_fingerprint else {}),
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,

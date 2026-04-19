@@ -5641,6 +5641,81 @@ async def test_task_failure_investigation_spawns_for_review_quality_streak(db_se
 
 
 @pytest.mark.asyncio
+async def test_task_failure_investigation_lowered_streak_with_convergence_investigation(db_session):
+    """A recent convergence investigation on the direction lowers the
+    review-quality streak threshold by 1 (requires 1 prior fail, not 2)."""
+    from app.autonomous_research import _spawn_task_failure_investigation
+    direction_id = "d-revq0099"
+    project = Project(
+        name="Lowered Streak",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(direction_id)],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Backdate past the 24h _recent_investigation_exists dedup but within
+    # the 7-day convergence lookback window.
+    from datetime import datetime, timedelta, timezone
+    backdated = datetime.now(timezone.utc) - timedelta(days=3)
+    convergence_inv = Task(
+        project_id=project.id,
+        title="Prior convergence investigation",
+        payloads=[{"type": "investigate", "prompt": "diag", "base_branch": "main"}],
+        context={
+            "direction_id": direction_id,
+            "spawned_by": "review_convergence_investigation",
+        },
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        created_at=backdated,
+    )
+    db_session.add(convergence_inv)
+
+    prior = Task(
+        project_id=project.id,
+        title="Prior lint fail",
+        payloads=[{"type": "create", "prompt": "do"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="ruff: lint error in module.py",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(prior)
+    await db_session.commit()
+
+    failed = Task(
+        project_id=project.id,
+        title="Current lint fail",
+        payloads=[{"type": "create", "prompt": "do"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="eslint: style violations in handler.ts",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+    await db_session.commit()
+    await db_session.refresh(failed)
+
+    assert await _spawn_task_failure_investigation(failed, db_session) is True
+    await db_session.commit()
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    investigations = [
+        t for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "investigate"
+        and t.context.get("spawned_by") != "review_convergence_investigation"
+    ]
+    assert len(investigations) == 1
+    assert investigations[0].context["failure_taxonomy"] == "review_quality"
+
+
+@pytest.mark.asyncio
 async def test_task_failure_investigation_skipped_by_cross_direction_fingerprint(db_session):
     """Existing investigate task on a sibling direction sharing the same
     fingerprint blocks a new initial investigation spawn."""
@@ -5910,6 +5985,119 @@ async def test_review_convergence_investigation_skips_investigate_type(db_sessio
         orig, db_session,
         pr_number=1, iterations=5, detail="x", trigger="review_cap_exhausted",
     ) is False
+
+
+@pytest.mark.asyncio
+async def test_review_convergence_investigation_sets_fingerprint_and_failure_class(db_session):
+    from app.autonomous_research import _spawn_review_convergence_investigation
+    from app.anomaly_detection import _error_fingerprint
+    direction_id = "d-convfp01"
+    project = Project(
+        name="Conv FP",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(direction_id)],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    status_msg = "AssertionError: expected non-empty result"
+    orig = Task(
+        project_id=project.id,
+        title="Stuck create fp",
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message=status_msg,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    spawned = await _spawn_review_convergence_investigation(
+        orig, db_session,
+        pr_number=9001, iterations=10,
+        detail="global", trigger="review_cap_exhausted",
+    )
+    assert spawned is True
+    await db_session.commit()
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    inv = next(
+        t for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "investigate"
+    )
+    expected_fp = _error_fingerprint(status_msg)
+    assert inv.context["diagnosis_fingerprint"] == expected_fp
+    assert inv.context["failure_fingerprints"] == [expected_fp]
+    assert inv.context["last_failure_class"] == "CODE_ERROR"
+    assert inv.context["failure_taxonomy"] == "review_quality"
+
+
+@pytest.mark.asyncio
+async def test_review_convergence_investigation_skipped_by_cross_direction_fingerprint(db_session):
+    from app.autonomous_research import _spawn_review_convergence_investigation
+    from app.anomaly_detection import _error_fingerprint
+    project = Project(
+        name="Conv Cross Dir",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            _active_direction("d-convx001", "Direction one"),
+            _active_direction("d-convx002", "Direction two"),
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    status_msg = "TypeError: cannot concatenate str and int"
+    shared_fp = _error_fingerprint(status_msg)
+    sibling_inv = Task(
+        project_id=project.id,
+        title="Sibling investigation",
+        payloads=[{"type": "investigate", "prompt": "sibling", "base_branch": "main"}],
+        context={"direction_id": "d-convx002", "diagnosis_fingerprint": shared_fp},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(sibling_inv)
+    await db_session.commit()
+    await db_session.refresh(sibling_inv)
+
+    orig = Task(
+        project_id=project.id,
+        title="Stuck PR",
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        context={"direction_id": "d-convx001"},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message=status_msg,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    spawned = await _spawn_review_convergence_investigation(
+        orig, db_session,
+        pr_number=9100, iterations=10,
+        detail="global", trigger="review_cap_exhausted",
+    )
+    assert spawned is False
+    await db_session.commit()
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    investigations = [
+        t for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "investigate"
+    ]
+    assert len(investigations) == 1
+    assert investigations[0].id == sibling_inv.id
 
 
 # ─────────────────────────────────────────────────────────────────────────────

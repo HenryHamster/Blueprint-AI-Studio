@@ -170,6 +170,32 @@ async def test_happy_path_spawns_task(db_session: AsyncSession):
     assert call_kwargs[1]["failed_checks"] == ["CI / tests"]
 
 
+@pytest.mark.asyncio
+async def test_task_context_includes_error_fingerprint(db_session: AsyncSession):
+    """Auto-remediation task context should carry _previous_error_fingerprint for cross-direction dedup."""
+    from app.anomaly_detection import _error_fingerprint
+
+    project = await _create_project(db_session)
+    error_summary = "AssertionError: expected 1 but got 2 in test_foo"
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+        mock_ctx.return_value = (["CI / tests"], error_summary, "test")
+
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    tasks = await session_tasks(db_session, project.id)
+    assert len(tasks) == 1
+    assert tasks[0].context["_previous_error_fingerprint"] == _error_fingerprint(error_summary)
+
+
 async def session_tasks(session: AsyncSession, project_id: uuid.UUID) -> list[Task]:
     result = await session.execute(
         select(Task).where(
