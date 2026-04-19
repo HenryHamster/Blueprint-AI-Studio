@@ -2290,6 +2290,87 @@ def test_split_oversized_clusters_by_subdir_leaves_fitting_clusters_alone():
     assert out is None
 
 
+def test_cluster_files_by_subdir_splits_on_second_level_dirs():
+    """Files in one top-level dir spanning 2+ second-level dirs split by subdir."""
+    from app.cochange_decomposition import cluster_files_by_subdir
+    clusters = cluster_files_by_subdir([
+        "backend/app/x.py",
+        "backend/app/y.py",
+        "backend/testing/test_x.py",
+    ])
+    assert clusters is not None
+    cluster_sets = {frozenset(c) for c in clusters}
+    assert cluster_sets == {
+        frozenset({"backend/app/x.py", "backend/app/y.py"}),
+        frozenset({"backend/testing/test_x.py"}),
+    }
+
+
+def test_cluster_files_by_subdir_returns_none_when_single_subdir():
+    """Files all sharing the same second-level dir → None."""
+    from app.cochange_decomposition import cluster_files_by_subdir
+    assert cluster_files_by_subdir([
+        "backend/app/a.py",
+        "backend/app/b.py",
+        "backend/app/c.py",
+    ]) is None
+
+
+def test_cluster_files_by_subdir_requires_min_files():
+    """Fewer than 3 files → None."""
+    from app.cochange_decomposition import cluster_files_by_subdir
+    assert cluster_files_by_subdir([
+        "backend/app/a.py",
+        "backend/testing/b.py",
+    ]) is None
+
+
+def test_cluster_files_by_subdir_returns_none_for_multi_toplevel():
+    """Multiple top-level dirs → None (toplevel clustering handles that case)."""
+    from app.cochange_decomposition import cluster_files_by_subdir
+    assert cluster_files_by_subdir([
+        "backend/app/a.py",
+        "backend/testing/b.py",
+        "agent/src/c.ts",
+    ]) is None
+
+
+def test_cluster_files_by_subdir_returns_none_when_missing_subdir():
+    """Files without a real second-level dir (only 2 segments) → None."""
+    from app.cochange_decomposition import cluster_files_by_subdir
+    assert cluster_files_by_subdir([
+        "backend/a.py",
+        "backend/b.py",
+        "backend/c.py",
+    ]) is None
+
+
+def test_auto_decompose_falls_back_to_subdir_within_single_toplevel():
+    """Medium finding all under one top-level but spanning subdirs decomposes."""
+    from app.cochange_decomposition import auto_decompose_findings_by_cochange
+
+    finding = {
+        "title": "Backend cross-subdir cleanup",
+        "description": "desc",
+        "scope": "medium",
+        "related_files": [
+            "backend/app/x.py",
+            "backend/app/y.py",
+            "backend/testing/test_x.py",
+        ],
+    }
+    result = auto_decompose_findings_by_cochange(
+        [(0, finding, "h0")], {}, None, _decomp_hash_fn,
+    )
+    assert len(result) == 2
+    assert all(sub["scope"] == "small" for _, sub, _ in result)
+    sub_file_sets = {frozenset(sub["related_files"]) for _, sub, _ in result}
+    assert sub_file_sets == {
+        frozenset({"backend/app/x.py", "backend/app/y.py"}),
+        frozenset({"backend/testing/test_x.py"}),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. _handle_research_completion — JSONB research_history Updates
 # ─────────────────────────────────────────────────────────────────────────────

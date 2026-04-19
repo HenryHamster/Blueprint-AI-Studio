@@ -134,9 +134,13 @@ def _aggregate_scope_breakdown(history_entries: list[dict]) -> dict[str, dict]:
             bucket = agg.setdefault(scope, {
                 "created": 0, "merged": 0, "failed": 0,
                 "failed_infra": 0, "failed_scope_overflow": 0,
+                "failure_stages": {},
             })
             for key in ("created", "merged", "failed", "failed_infra", "failed_scope_overflow"):
                 bucket[key] += stats.get(key, 0)
+            stage_bucket = bucket["failure_stages"]
+            for stage_name, count in (stats.get("failure_stages") or {}).items():
+                stage_bucket[stage_name] = stage_bucket.get(stage_name, 0) + count
     return agg
 
 

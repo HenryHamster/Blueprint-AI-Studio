@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.failure_stage import _derive_failure_stage
 from app.failure_classification import (
     CODE_ERROR,
     INFRA_CLASSES,
@@ -344,6 +345,7 @@ async def _update_direction_research_outcomes(
                         "calibrated_in": 0, "calibrated_out": 0,
                         "exploration_created": 0, "exploration_merged": 0,
                         "exploration_failed": 0,
+                        "failure_stages": {},
                     }
 
             for ct in child_tasks_rows:
@@ -373,6 +375,13 @@ async def _update_direction_research_outcomes(
                         scope_breakdown[scope]["failed_code_error"] += 1
                     elif fcat == SCOPE_OVERFLOW:
                         scope_breakdown[scope]["failed_scope_overflow"] += 1
+                    stage_name = (
+                        ctx_.get("_previous_failure_stage")
+                        or _derive_failure_stage(fcat, ct.latest_status_message or "")
+                        or "unknown"
+                    )
+                    stages_bucket = scope_breakdown[scope]["failure_stages"]
+                    stages_bucket[stage_name] = stages_bucket.get(stage_name, 0) + 1
                 if ctx_.get("medium_exploration"):
                     scope_breakdown[scope]["exploration_created"] += 1
                     if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):
@@ -447,6 +456,15 @@ async def _update_direction_research_outcomes(
             for sk, n in cplx_failed_n.items():
                 if n > 0 and sk in scope_breakdown:
                     scope_breakdown[sk]["avg_complexity_failed"] = round(cplx_failed_sum[sk] / n, 2)
+            skip_counts = (
+                (research_task_obj.context or {}).get("skipped_low_confidence_by_scope", {})
+                if research_task_obj else {}
+            )
+            for sk, cnt in (skip_counts or {}).items():
+                _ensure_scope(sk)
+                scope_breakdown[sk]["skipped_low_confidence"] = (
+                    scope_breakdown[sk].get("skipped_low_confidence", 0) + int(cnt)
+                )
             entry["scope_breakdown"] = scope_breakdown
             entry["escalation_outcomes"] = escalation_outcomes
 
@@ -518,6 +536,33 @@ async def _update_direction_research_outcomes(
                     })
             entry["decomposition_quality"] = decomposition_quality
 
+            # Co-change auto-decomposition outcomes: track merge rate of
+            # sub-findings produced by auto_decompose_findings_by_cochange so
+            # spawn_calibration can factor in whether splitting medium findings
+            # into smaller ones actually improves conversion.
+            _decomp_stats = (
+                ((research_task_obj.context or {}) if research_task_obj else {})
+                .get("cochange_decomposition_stats") or {}
+            ).get(direction_id)
+            if _decomp_stats:
+                _decomposed = [
+                    ct for ct in child_tasks_rows
+                    if (ct.context or {}).get("auto_decomposed")
+                ]
+                _sub_merged = sum(
+                    1 for ct in _decomposed
+                    if ct.status == TaskStatus.COMPLETED
+                    and (ct.context or {}).get("pr_merged")
+                )
+                _sub_total = len(_decomposed)
+                entry["cochange_decomposition"] = {
+                    "medium_findings_split": _decomp_stats.get("medium_findings_split", 0),
+                    "sub_findings_produced": _decomp_stats.get("sub_findings_produced", 0),
+                    "sub_findings_merged": _sub_merged,
+                    "sub_findings_total": _sub_total,
+                    "merge_rate": round(_sub_merged / _sub_total, 3) if _sub_total > 0 else None,
+                }
+
             # Maintain research_context: promote proposed findings based on outcomes
             ctx = d.get("research_context", "")
             if ctx:
@@ -528,8 +573,6 @@ async def _update_direction_research_outcomes(
                         continue
                     if _counts_as_failure(ct):
                         # Move matching proposed finding to Failed Approaches
-                        from app.task_lifecycle import _derive_failure_stage  # noqa: PLC0415
-
                         reason = (ct.latest_status_message or "")[:120]
                         category = (ct.context or {}).get("failure_category") or _classify_failure(ct)
                         ts = ct.vm_stopped_at or ct.updated_at

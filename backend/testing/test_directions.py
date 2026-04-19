@@ -3427,7 +3427,7 @@ async def test_low_confidence_medium_auto_escalates_to_large(db_session, mocker)
     direction_id = "d-lowconf1"
     _, task, _ = await _setup_escalation_project(db_session, direction_id, None)
     _mock_escalation_externals(mocker, direction_id)
-    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.0)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.15)
     # Disable exploration-bypass randomness so the escalation path is deterministic.
     mocker.patch.dict("app.shared_state.runtime_config", {"medium_exploration_fraction": 0})
 
@@ -3481,7 +3481,7 @@ async def test_exploration_floor_prevents_zero_collapse(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(task)
     _mock_escalation_externals(mocker, direction_id)
-    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.0)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.15)
     # Force the random draw below the floor so the exploration path is taken
     # iff the floor is applied; without the floor, _explore_frac would be 0
     # and random.random() < 0 is always False regardless of the draw.
@@ -3530,7 +3530,7 @@ async def test_exploration_floor_skipped_when_proven_unviable(db_session, mocker
     await db_session.commit()
     await db_session.refresh(task)
     _mock_escalation_externals(mocker, direction_id)
-    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.0)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.15)
     # Even with the random draw forced below the floor, the floor must be
     # skipped (proven-unviable branch) so escalation to large occurs.
     mocker.patch("app.research_completion.random.random", return_value=0.01)
@@ -3581,7 +3581,7 @@ async def test_exploration_floor_skipped_when_pipeline_unviable(db_session, mock
     await db_session.commit()
     await db_session.refresh(task)
     _mock_escalation_externals(mocker, direction_id)
-    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.0)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.15)
     mocker.patch("app.research_completion.random.random", return_value=0.01)
     runtime_config["pipeline_scope_merge_rates"] = {"medium": 0.02}
     try:
@@ -3598,6 +3598,105 @@ async def test_exploration_floor_skipped_when_pipeline_unviable(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_hard_skip_below_threshold_drops_finding(db_session, mocker):
+    """Medium-scope finding with P(success) below medium_hard_skip_threshold is
+    dropped entirely (no child task spawned) and recorded in deferred_findings
+    with skip_reason='ultra_low_confidence'."""
+    from app.shared_state import runtime_config
+    direction_id = "d-hardskip-1"
+    _, task, _ = await _setup_escalation_project(db_session, direction_id, None)
+    _mock_escalation_externals(mocker, direction_id)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.05)
+    runtime_config["medium_hard_skip_threshold"] = 0.10
+    try:
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        runtime_config.pop("medium_hard_skip_threshold", None)
+
+    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    children = result.scalars().all()
+    assert len(children) == 0
+    await db_session.refresh(task)
+    deferred = (task.context or {}).get("deferred_findings") or []
+    assert len(deferred) == 1
+    assert deferred[0]["skip_reason"] == "ultra_low_confidence"
+    assert deferred[0]["deferred_reason"] == "ultra_low_confidence"
+    skip_counts = (task.context or {}).get("skipped_low_confidence_by_scope") or {}
+    assert skip_counts.get("medium") == 1
+
+
+@pytest.mark.asyncio
+async def test_hard_skip_above_threshold_runs_normal_path(db_session, mocker):
+    """Finding above hard_skip threshold but below confidence_threshold still
+    follows the normal exploration/escalation path."""
+    from app.shared_state import runtime_config
+    direction_id = "d-hardskip-2"
+    _, task, _ = await _setup_escalation_project(db_session, direction_id, None)
+    _mock_escalation_externals(mocker, direction_id)
+    # 0.15 is above hard_skip (0.10) but below confidence_threshold (default 0.25)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.15)
+    mocker.patch.dict("app.shared_state.runtime_config", {"medium_exploration_fraction": 0})
+    runtime_config["medium_hard_skip_threshold"] = 0.10
+    try:
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        runtime_config.pop("medium_hard_skip_threshold", None)
+
+    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    children = result.scalars().all()
+    assert len(children) == 1
+    # Escalated to large+plan via the normal low-confidence path.
+    assert children[0].context["scope"] == "large"
+    assert children[0].context["scope_calibrated_from"] == "medium"
+    await db_session.refresh(task)
+    assert not (task.context or {}).get("skipped_low_confidence_by_scope")
+
+
+@pytest.mark.asyncio
+async def test_hard_skip_counter_in_scope_breakdown(db_session, mocker):
+    """skipped_low_confidence counter from the parent research task surfaces in
+    the per-direction scope_breakdown after _update_direction_research_outcomes
+    runs."""
+    from app.shared_state import runtime_config
+    from app.direction_outcomes import _update_direction_research_outcomes
+    direction_id = "d-hardskip-3"
+    project, task, _ = await _setup_escalation_project(db_session, direction_id, None)
+    _mock_escalation_externals(mocker, direction_id)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.05)
+    runtime_config["medium_hard_skip_threshold"] = 0.10
+    # Seed a research_history entry so _update_direction_research_outcomes finds it.
+    project.directions[0]["research_history"] = [{"task_id": str(task.id), "tasks_created": 0}]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    try:
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        runtime_config.pop("medium_hard_skip_threshold", None)
+
+    # Spawn at least one dummy child so the rebuild logic engages.
+    dummy_child = Task(
+        project_id=project.id,
+        title="dummy",
+        parent_task_id=task.id,
+        payloads=[{"type": "create"}],
+        context={"scope": "small", "direction_id": direction_id},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(dummy_child)
+    await db_session.commit()
+
+    await _update_direction_research_outcomes(project.id, direction_id, str(task.id), db_session)
+    await db_session.refresh(project)
+    sb = project.directions[0]["research_history"][0]["scope_breakdown"]
+    assert sb["medium"]["skipped_low_confidence"] == 1
+
+
+@pytest.mark.asyncio
 async def test_auto_escalate_suppressed_by_poor_decomp_history(db_session, mocker):
     """Medium-scope low-confidence finding stays at medium when prior plan
     decompositions merged poorly (shares suppression with _calibrate_scope)."""
@@ -3607,7 +3706,7 @@ async def test_auto_escalate_suppressed_by_poor_decomp_history(db_session, mocke
         [{"subtask_merge_rate": 0.1, "subtask_count": 5}],
     )
     _mock_escalation_externals(mocker, direction_id)
-    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.0)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.15)
 
     await _handle_research_completion(task, "", db_session)
 

@@ -171,11 +171,13 @@ _MID_BUDGET_NARROW_FOCUS_PREFIX = (
 # before a fix iteration would tip the PR into scope-overflow territory.
 SCOPE_PRESSURE_WARN_THRESHOLD = 0.7
 
-# Hard cap: when a medium-scope PR has consumed ≥90% of its production file
-# budget, the fix agent has no room to add files. Reduce the remaining
-# review-fix iterations to at most this many additional attempts and enforce
-# a no-new-files constraint — convert wasted iterations into early
-# convergence or early failure instead of burning full budget.
+# Graduated iteration cap: once a medium-scope PR crosses
+# SCOPE_PRESSURE_WARN_THRESHOLD (70%) of its production-file budget, the
+# remaining review-fix iterations are scaled down by how close the PR is to
+# full budget. At 70% utilization the fix agent keeps ~30% of its remaining
+# budget; at 90% only ~10% (floor of 2); at 95%+ the floor of 2 dominates.
+# The no-new-files prompt stays gated on the stricter
+# SCOPE_PRESSURE_HARD_CAP_PERCENTAGE (90%) level.
 SCOPE_PRESSURE_HARD_CAP_PERCENTAGE = 90
 SCOPE_PRESSURE_HARD_CAP_REMAINING = 2
 
@@ -871,12 +873,12 @@ async def _spawn_pipeline_task(
             payload_data["prompt"] = mid_prefix + (payload_data.get("prompt") or "")
             fix_prompt = mid_prefix + (fix_prompt or "")
 
-    # Scope-budget pressure hard cap: a medium-scope fix cycle already at
-    # ≥90% of its production file budget has no room to expand. Reduce
-    # remaining iterations to at most SCOPE_PRESSURE_HARD_CAP_REMAINING and
-    # enforce no-new-files on the fix agent. The marker persists via the
-    # spawned task's context so subsequent review/fix spawns enforce the
-    # same ceiling.
+    # Graduated scope-budget pressure cap: a medium-scope fix cycle's
+    # remaining iterations are scaled down by how close the PR is to its
+    # production file budget. Activation is at SCOPE_PRESSURE_WARN_THRESHOLD
+    # (70%); the no-new-files prompt still only fires at
+    # SCOPE_PRESSURE_HARD_CAP_PERCENTAGE (90%). The derived cap persists via
+    # the spawned task's context so subsequent spawns respect the ceiling.
     scope_budget_hard_cap: int | None = None
     if task_type == "fix":
         _scope_for_pressure = (source_task.context or {}).get(
@@ -893,27 +895,37 @@ async def _spawn_pipeline_task(
         if (
             _util_for_pressure
             and _scope_for_pressure == "medium"
-            and _util_for_pressure.get("percentage", 0) >= SCOPE_PRESSURE_HARD_CAP_PERCENTAGE
+            and _util_for_pressure.get("percentage", 0)
+                >= SCOPE_PRESSURE_WARN_THRESHOLD * 100
         ):
-            hard_cap_target = iteration + SCOPE_PRESSURE_HARD_CAP_REMAINING
-            if hard_cap_target < per_chain_cap:
-                logger.warning(
-                    f"[PIPELINE] Scope-budget pressure for PR #{pr_number}: "
-                    f"utilization {_util_for_pressure['percentage']}% ≥ "
-                    f"{SCOPE_PRESSURE_HARD_CAP_PERCENTAGE}% (non-test "
-                    f"{_util_for_pressure['non_test_file_count']}/"
-                    f"{_util_for_pressure['budget']}). Reducing cap "
-                    f"{per_chain_cap} → {hard_cap_target} and enforcing no-new-files."
+            util_pct = _util_for_pressure["percentage"]
+            base_remaining = per_chain_cap - iteration
+            if base_remaining > 0:
+                graduated_remaining = max(
+                    SCOPE_PRESSURE_HARD_CAP_REMAINING,
+                    round(base_remaining * (1.0 - util_pct / 100)),
                 )
-                per_chain_cap = hard_cap_target
-            scope_budget_hard_cap = hard_cap_target
-            hard_prefix = _SCOPE_PRESSURE_HARD_CAP_PREFIX.format(
-                count=_util_for_pressure['non_test_file_count'],
-                budget=_util_for_pressure['budget'],
-                pct=_util_for_pressure['percentage'],
-            )
-            payload_data["prompt"] = hard_prefix + (payload_data.get("prompt") or "")
-            fix_prompt = hard_prefix + (fix_prompt or "")
+                hard_cap_target = iteration + graduated_remaining
+                if hard_cap_target < per_chain_cap:
+                    logger.warning(
+                        f"[PIPELINE] Scope-budget pressure for PR #{pr_number}: "
+                        f"utilization {util_pct}% ≥ "
+                        f"{round(SCOPE_PRESSURE_WARN_THRESHOLD * 100)}% (non-test "
+                        f"{_util_for_pressure['non_test_file_count']}/"
+                        f"{_util_for_pressure['budget']}). Reducing cap "
+                        f"{per_chain_cap} → {hard_cap_target} "
+                        f"(graduated remaining={graduated_remaining})."
+                    )
+                    per_chain_cap = hard_cap_target
+                scope_budget_hard_cap = hard_cap_target
+            if util_pct >= SCOPE_PRESSURE_HARD_CAP_PERCENTAGE:
+                hard_prefix = _SCOPE_PRESSURE_HARD_CAP_PREFIX.format(
+                    count=_util_for_pressure['non_test_file_count'],
+                    budget=_util_for_pressure['budget'],
+                    pct=util_pct,
+                )
+                payload_data["prompt"] = hard_prefix + (payload_data.get("prompt") or "")
+                fix_prompt = hard_prefix + (fix_prompt or "")
 
     payload_data = validate_internal_payload(payload_data, f"review_pipeline:{task_type}:pr#{pr_number}")
     source_ctx = source_task.context or {}

@@ -547,6 +547,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _pipeline_degraded, _health_reason = _assess_spawn_health()
     _impl_spawned = 0
     _deferred_findings: list[dict] = []
+    _low_conf_skipped_findings: list[dict] = []
+    _scope_skip_counts: dict[str, int] = {}
 
     # Create all child tasks — no wave dependencies, priority ordering handles dispatch order
     child_tasks = []
@@ -573,6 +575,32 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         task.context,
         _finding_hash,
     )
+    # Track auto-decomposition outcomes per direction so direction_outcomes
+    # can correlate decomposition success with merge rates (parallels
+    # plan-parent decomposition_quality tracking).
+    _decomp_stats_by_dir: dict[str, dict] = {}
+    for _oi, _f, _ in deduplicated:
+        if not _f.get("auto_decomposed"):
+            continue
+        _did = str(_f.get("direction_id") or _parent_direction_id or "")
+        if not _did:
+            continue
+        _s = _decomp_stats_by_dir.setdefault(
+            _did, {"sub_findings_produced": 0, "_orig_ids": set()}
+        )
+        _s["sub_findings_produced"] += 1
+        _s["_orig_ids"].add(_oi)
+    if _decomp_stats_by_dir:
+        _ctx = dict(task.context or {})
+        _ctx["cochange_decomposition_stats"] = {
+            _did: {
+                "medium_findings_split": len(_s["_orig_ids"]),
+                "sub_findings_produced": _s["sub_findings_produced"],
+            }
+            for _did, _s in _decomp_stats_by_dir.items()
+        }
+        task.context = _ctx
+        flag_modified(task, "context")
 
     for orig_i, finding, fhash in deduplicated:
         scope = finding.get("scope", DEFAULT_TASK_SCOPE)
@@ -739,6 +767,24 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "[RESEARCH] Low-confidence spawn '%s' (scope=%s, type=%s): P(success)=%.2f < threshold=%.2f",
                 title, scope, task_type, _pred_p, _confidence_threshold,
             )
+        # Hard skip gate: ultra-low-confidence medium findings are dropped
+        # entirely rather than spawned, escalated, or explored. Runs BEFORE
+        # the exploration lottery so exploration cannot override the gate.
+        _hard_skip_threshold = _runtime_config.get("medium_hard_skip_threshold", 0.10)
+        if (
+            scope == "medium"
+            and isinstance(_hard_skip_threshold, (int, float))
+            and _pred_p < float(_hard_skip_threshold)
+        ):
+            logger.info(
+                "[RESEARCH] Hard-skipping ultra-low-confidence finding '%s' "
+                "(scope=%s): P(success)=%.2f < hard_skip=%.2f",
+                title, scope, _pred_p, float(_hard_skip_threshold),
+            )
+            _low_conf_skipped_findings.append(finding)
+            _scope_skip_counts[scope] = _scope_skip_counts.get(scope, 0) + 1
+            continue
+
         _medium_exploration = False
         if _low_confidence and scope == "medium" and not _poor_decomp_history(_pred_direction or {}):
             # Exploration fraction: let a configurable share of medium findings bypass the
@@ -966,6 +1012,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **({"complexity_score": finding["_complexity_score"], "complexity_signals": finding.get("_complexity_signals", {})} if "_complexity_score" in finding else {}),
                 **({"low_confidence_spawn": True, "low_confidence_spawn_rate": round(_pred_p, 3)} if _low_confidence else {}),
                 **({"medium_exploration": True} if _medium_exploration else {}),
+                **({"auto_decomposed": True} if finding.get("auto_decomposed") else {}),
                 **prior_retry_ctx,
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -996,10 +1043,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _all_deferred = (
         [_stamp_deferral(f, "degradation_gate") for f in _deferred_findings]
         + [_stamp_deferral(f, "batch_cap") for f in _batch_cap_deferred]
+        + [
+            {**_stamp_deferral(f, "ultra_low_confidence"), "skip_reason": "ultra_low_confidence"}
+            for f in _low_conf_skipped_findings
+        ]
     )
-    if _all_deferred:
+    if _all_deferred or _scope_skip_counts:
         ctx = dict(task.context or {})
-        ctx["deferred_findings"] = _all_deferred
+        if _all_deferred:
+            ctx["deferred_findings"] = _all_deferred
+        if _scope_skip_counts:
+            ctx["skipped_low_confidence_by_scope"] = _scope_skip_counts
         task.context = ctx
         flag_modified(task, "context")
         session.add(task)

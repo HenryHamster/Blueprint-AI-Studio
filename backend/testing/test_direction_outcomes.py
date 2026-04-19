@@ -1005,6 +1005,89 @@ async def test_scope_breakdown_failed_scope_overflow_counter(db_session: AsyncSe
 
 
 @pytest.mark.asyncio
+async def test_scope_breakdown_failure_stages_per_scope(db_session: AsyncSession):
+    """failure_stages counts per-stage failures within each scope bucket."""
+    direction_id = "d-stages"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=4)]
+    await db_session.flush()
+
+    # small — test failure
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "small", "failure_category": "CODE_ERROR"},
+        payloads=[{"type": "create"}],
+        title="s-test", latest_status_message="pytest assert failed",
+    )
+    # small — lint failure
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "small", "failure_category": "CODE_ERROR"},
+        payloads=[{"type": "create"}],
+        title="s-lint", latest_status_message="ruff E501",
+    )
+    # medium — merge failure via _previous_failure_stage
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "medium", "failure_category": "CODE_ERROR",
+                 "_previous_failure_stage": "merge"},
+        payloads=[{"type": "create"}],
+        title="m-merge", latest_status_message="something else",
+    )
+    # medium — unknown stage (AGENT_TIMEOUT, generic message)
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "medium", "failure_category": "AGENT_TIMEOUT"},
+        payloads=[{"type": "create"}],
+        title="m-unknown", latest_status_message="No heartbeat for 300s",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    sb = project.directions[0]["research_history"][0]["scope_breakdown"]
+    assert sb["small"]["failure_stages"] == {"test": 1, "lint": 1}
+    assert sb["medium"]["failure_stages"] == {"merge": 1, "unknown": 1}
+
+
+def test_aggregate_scope_breakdown_sums_failure_stages():
+    """_aggregate_scope_breakdown sums failure_stages counts across history entries."""
+    from app.spawn_calibration import _aggregate_scope_breakdown
+
+    entries = [
+        {"scope_breakdown": {
+            "small": {"created": 2, "merged": 1, "failed": 1,
+                      "failed_infra": 0, "failed_scope_overflow": 0,
+                      "failure_stages": {"test": 1}},
+        }},
+        {"scope_breakdown": {
+            "small": {"created": 3, "merged": 1, "failed": 2,
+                      "failed_infra": 0, "failed_scope_overflow": 0,
+                      "failure_stages": {"test": 1, "lint": 1}},
+            "medium": {"created": 1, "merged": 0, "failed": 1,
+                       "failed_infra": 0, "failed_scope_overflow": 0,
+                       "failure_stages": {"merge": 1}},
+        }},
+    ]
+    agg = _aggregate_scope_breakdown(entries)
+    assert agg["small"]["failure_stages"] == {"test": 2, "lint": 1}
+    assert agg["medium"]["failure_stages"] == {"merge": 1}
+
+
+@pytest.mark.asyncio
 async def test_scope_breakdown_no_expansion_ratio_when_no_data(db_session: AsyncSession):
     """avg_expansion_ratio is omitted when no qualifying tasks exist for a scope."""
     direction_id = "d-no-expand"

@@ -84,6 +84,38 @@ def cluster_files_by_toplevel_dir(files: list[str]) -> list[list[str]] | None:
     return [groups[t] for t in order]
 
 
+def cluster_files_by_subdir(files: list[str]) -> list[list[str]] | None:
+    """Group files by first two path segments within a single top-level dir.
+
+    Third-tier fallback for findings confined to one top-level dir (e.g. all
+    ``backend/``) that still span multiple second-level dirs like
+    ``backend/app`` vs ``backend/testing``. Requires 3+ files, all sharing the
+    same top-level dir, each with at least three path segments, and spanning
+    2+ second-level directories; otherwise None.
+    """
+    if len(files) < 3:
+        return None
+    top_levels: set[str] = set()
+    for f in files:
+        parts = f.split("/")
+        if len(parts) < 3:
+            return None
+        top_levels.add(parts[0])
+    if len(top_levels) != 1:
+        return None
+    groups: dict[str, list[str]] = {}
+    order: list[str] = []
+    for f in files:
+        parts = f.split("/", 2)
+        key = "/".join(parts[:2])
+        if key not in groups:
+            order.append(key)
+        groups.setdefault(key, []).append(f)
+    if len(groups) < 2:
+        return None
+    return [groups[k] for k in order]
+
+
 def split_oversized_clusters_by_subdir(
     clusters: list[list[str]], small_budget: int
 ) -> list[list[str]] | None:
@@ -180,6 +212,9 @@ def auto_decompose_findings_by_cochange(
             if f_clusters is None:
                 f_clusters = cluster_files_by_toplevel_dir(f_files)
                 cluster_source = "top-level-dir"
+            if f_clusters is None:
+                f_clusters = cluster_files_by_subdir(f_files)
+                cluster_source = "subdir"
             if f_clusters and len(f_clusters) >= 2:
                 f_title = finding.get("title", f"Research finding #{orig_i+1}")
                 if all(len(c) > small_budget for c in f_clusters):

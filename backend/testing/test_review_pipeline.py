@@ -2472,6 +2472,151 @@ async def test_scope_budget_utilization_attached_to_review_spawn(db_session, moc
     assert util["scope"] == "small"
 
 
+# ── Graduated scope-pressure iteration cap ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_scope_pressure_graduated_cap_at_mid_utilization(db_session, mocker):
+    """Medium task at 71% (5/7 prod) gets a graduated cap well below per_chain_cap
+    but no no-new-files prompt (below 90%)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 701, "branch": "feat/gc1",
+                   "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            "_pr_changed_files": [
+                "backend/app/a.py", "backend/app/b.py", "backend/app/c.py",
+                "backend/app/d.py", "backend/app/e.py",
+                "backend/testing/test_a.py",
+            ],
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=701, branch="feat/gc1", base_branch="main",
+        fix_prompt="Address review feedback",
+    )
+    assert created is True and result is not None
+    ctx = result.context or {}
+    # source iteration=0 → spawned iteration=1, base_remaining=11, 71% util
+    # → round(11 * 0.29) = 3 remaining, hard_cap = 1 + 3 = 4
+    assert ctx.get("_scope_budget_hard_cap") == 4
+    # No no-new-files prompt below 90%
+    payload = result.payloads[0] if result.payloads else {}
+    assert "SCOPE BUDGET EXHAUSTED" not in (payload.get("prompt") or "")
+
+
+@pytest.mark.asyncio
+async def test_scope_pressure_floor_of_two_at_high_utilization(db_session, mocker):
+    """At 86% the graduated formula floors at 2; at 100% it still floors at 2."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 702, "branch": "feat/gc2",
+                   "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(6)],  # 6/7=86%
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=702, branch="feat/gc2", base_branch="main",
+        fix_prompt="fix",
+    )
+    ctx = result.context or {}
+    # iteration=1, base_remaining=11, 86% util → round(11*0.14)=2 → floor=2 →
+    # hard_cap=1+2=3
+    assert ctx.get("_scope_budget_hard_cap") == 3
+    payload = result.payloads[0] if result.payloads else {}
+    # 86% < 90% → no hard_prefix yet
+    assert "SCOPE BUDGET EXHAUSTED" not in (payload.get("prompt") or "")
+
+
+@pytest.mark.asyncio
+async def test_scope_pressure_no_new_files_still_at_90_percent(db_session, mocker):
+    """At ≥90% the no-new-files prompt still fires alongside the graduated cap."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 703, "branch": "feat/gc3",
+                   "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(7)],  # 7/7=100%
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=703, branch="feat/gc3", base_branch="main",
+        fix_prompt="Address feedback",
+    )
+    ctx = result.context or {}
+    # iteration=1, base_remaining=11, 100% util → round(0)=0 → floor=2 →
+    # hard_cap=1+2=3
+    assert ctx.get("_scope_budget_hard_cap") == 3
+    payload = result.payloads[0] if result.payloads else {}
+    assert "SCOPE BUDGET EXHAUSTED" in (payload.get("prompt") or "")
+
+
+@pytest.mark.asyncio
+async def test_scope_pressure_inactive_below_warn_threshold(db_session, mocker):
+    """Below 70% utilization the graduated cap does not activate at all."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 704, "branch": "feat/gc4",
+                   "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(4)],  # 4/7=57%
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=704, branch="feat/gc4", base_branch="main",
+        fix_prompt="fix",
+    )
+    ctx = result.context or {}
+    assert "_scope_budget_hard_cap" not in ctx
+    payload = result.payloads[0] if result.payloads else {}
+    assert "SCOPE BUDGET EXHAUSTED" not in (payload.get("prompt") or "")
+
+
 # ── filter_pipeline_duplicates: pre-dispatch dedup safety net ─────────────────
 
 
