@@ -353,6 +353,57 @@ async def test_digest_provision_waste_metrics(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_digest_analysis_overflow_summary(client: AsyncClient, db_session):
+    """analysis_overflow_summary counts failed tasks with scope_gate_triggered=analysis_overflow,
+    breaks down by scope, and sums VM cost using the standard rate calculation."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    overflow_small = make_task(
+        project_id=project.id,
+        title="overflow small",
+        status=TaskStatus.FAILED,
+        context={"scope_gate_triggered": "analysis_overflow", "scope": "small"},
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=5),
+        vm_spot=False,
+    )
+    overflow_medium = make_task(
+        project_id=project.id,
+        title="overflow medium",
+        status=TaskStatus.FAILED,
+        context={"scope_gate_triggered": "analysis_overflow", "scope": "medium"},
+        vm_provisioned_at=now - timedelta(minutes=30),
+        vm_stopped_at=now - timedelta(minutes=5),
+        vm_spot=True,
+    )
+    # Non-overflow failure — should NOT contribute
+    other = make_task(
+        project_id=project.id,
+        title="unrelated",
+        status=TaskStatus.FAILED,
+        context={"scope": "small"},
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=5),
+        vm_spot=False,
+    )
+    db_session.add_all([overflow_small, overflow_medium, other])
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    summary = data["analysis_overflow_summary"]
+    assert summary["total_count"] == 2
+    assert summary["by_scope"] == {"small": 1, "medium": 1}
+    assert summary["cost_usd"] > 0
+
+
+@pytest.mark.asyncio
 async def test_digest_recent_failures_includes_failure_class_and_scope(client: AsyncClient, db_session):
     """recent_failures entries include failure_class and scope fields."""
     project = make_project()
@@ -3300,6 +3351,47 @@ async def test_digest_review_cap_exhaustion_summary(client: AsyncClient, db_sess
     dirs = {d["direction_id"] for d in top}
     assert "d-bbb" in dirs
     assert "d-ccc" not in dirs
+    assert "total_cost_usd" in summary
+    assert "avg_cost_usd" in summary
+
+
+@pytest.mark.asyncio
+async def test_digest_review_cap_exhaustion_summary_cost(client: AsyncClient, db_session):
+    """review_cap_exhaustion_summary.total_cost_usd sums VM cost for cap-exhausted tasks."""
+    from app.routers.admin_analytics import SPOT_RATE, ON_DEMAND_RATE
+    from datetime import datetime, timezone
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.now(timezone.utc)
+    # 1 hour spot task
+    db_session.add(make_task(
+        project_id=project.id, title="c1", status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"failure_detail": "review_cap_exhausted", "review_cap_iterations": 16, "direction_id": "d-aaa"},
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),
+        vm_spot=True,
+    ))
+    # 30 min on-demand task
+    db_session.add(make_task(
+        project_id=project.id, title="c2", status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"failure_detail": "review_cap_exhausted", "review_cap_iterations": 12, "direction_id": "d-aaa"},
+        vm_provisioned_at=now - timedelta(minutes=60),
+        vm_stopped_at=now - timedelta(minutes=30),
+        vm_spot=False,
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    summary = response.json()["review_cap_exhaustion_summary"]
+    expected = SPOT_RATE * 3600 + ON_DEMAND_RATE * 1800
+    assert summary["total_cost_usd"] == pytest.approx(round(expected, 4))
+    assert summary["avg_cost_usd"] == pytest.approx(round(expected / 2, 4))
 
 
 @pytest.mark.asyncio
@@ -3322,6 +3414,8 @@ async def test_digest_review_cap_exhaustion_summary_empty(client: AsyncClient, d
     assert summary["count"] == 0
     assert summary["avg_iterations"] is None
     assert summary["top_directions"] == []
+    assert summary["total_cost_usd"] == 0.0
+    assert summary["avg_cost_usd"] is None
 
 
 @pytest.mark.asyncio
@@ -3477,3 +3571,61 @@ async def test_digest_retry_recovery_cost_from_prior_attempts(client: AsyncClien
     body = response.json()
 
     assert body["retry_recovery_cost_usd"] == pytest.approx(1.75)
+
+
+@pytest.mark.asyncio
+async def test_digest_escalation_outcome_summary(client: AsyncClient, db_session):
+    """escalation_outcome_summary aggregates escalation_outcomes across directions and recent history."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    recent_ts2 = (_utcnow() - timedelta(hours=2)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-e1",
+                "text": "Dir 1",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "escalation_outcomes": {
+                        "small_to_medium": {"attempted": 4, "merged": 2, "failed": 2},
+                        "medium_to_large": {"attempted": 1, "merged": 0, "failed": 1},
+                    }},
+                    {"timestamp": old_ts, "escalation_outcomes": {
+                        "small_to_medium": {"attempted": 99, "merged": 99, "failed": 0},
+                    }},
+                ],
+            },
+            {
+                "id": "dir-e2",
+                "text": "Dir 2",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts2, "escalation_outcomes": {
+                        "small_to_medium": {"attempted": 2, "merged": 1, "failed": 1},
+                        "small_to_large": {"attempted": 1, "merged": 1, "failed": 0},
+                    }},
+                ],
+            },
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    summary = response.json()["escalation_outcome_summary"]
+    assert summary is not None
+    assert summary["total_attempted"] == 8
+    assert summary["total_merged"] == 4
+    assert summary["total_failed"] == 4
+    assert summary["overall_success_rate"] == 0.5
+
+    by_path = summary["by_path"]
+    assert by_path["small_to_medium"] == {
+        "attempted": 6, "merged": 3, "failed": 3, "success_rate": 0.5,
+    }
+    assert by_path["small_to_large"]["attempted"] == 1
+    assert by_path["small_to_large"]["success_rate"] == 1.0
+    assert by_path["medium_to_large"]["success_rate"] == 0.0

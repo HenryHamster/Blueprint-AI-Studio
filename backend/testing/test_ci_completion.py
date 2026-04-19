@@ -476,6 +476,65 @@ async def test_update_branch_failure_threshold_spawns_fix(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_update_branch_threshold_scales_with_merge_budget(db_session, mocker):
+    """
+    When the task has nearly exhausted its merge hard cap, the update_branch
+    failure threshold shrinks so a single update_branch failure escalates.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "behind"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "Base branch was modified"},
+    )
+    mocker.patch(
+        "app.github.update_branch",
+        return_value={"updated": False, "message": "422 validation failed"},
+    )
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(name="Update branch dynamic threshold test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Small scope → hard cap 8. With 7 merge_failures consumed, only 1
+    # update_branch attempt should be allowed before escalating.
+    task = _make_task(
+        db_session, project,
+        ci_loop_extra={
+            "ci_passed": True,
+            "update_branch_failures": 0,
+            "merge_failures": 7,
+        },
+    )
+    task.context = {**(task.context or {}), "scope": "small"}
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook",
+    )
+
+    assert result is False
+    spawn_mock.assert_called_once()
+    assert spawn_mock.call_args.kwargs.get("fix_reason") == "update_branch_failed"
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("update_branch_failures") == 1
+
+
+@pytest.mark.asyncio
 async def test_update_branch_success_resets_counter(db_session, mocker):
     """
     A successful update_branch call resets update_branch_failures to 0, so
@@ -1414,6 +1473,51 @@ async def test_merge_repeated_identical_error_triggers_early_exit(db_session, mo
     assert review_loop.get("merge_error_streak") == 2
     assert review_loop.get("merge_failures") == 2, "must exit well before hard cap"
     assert "identical" in (task.latest_status_message or "").lower()
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_merge_deterministic_error_triggers_early_exit_on_first_occurrence(db_session, mocker):
+    """
+    Deterministic non-retryable merge errors (e.g. "head sha can't be blank")
+    should trigger immediate early exit on the first occurrence, without
+    waiting for a 2-streak.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "Head sha can't be blank"},
+    )
+
+    project = Project(name="Deterministic early exit", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No prior failures — this is the first attempt.
+    task = _make_task(db_session, project, ci_loop_extra={})
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    assert task.status == TaskStatus.FAILED
+    assert task.requires_approval is True
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_failures") == 1, "must exit on first occurrence"
+    assert review_loop.get("merge_error_streak") == 1
+    assert "deterministic" in (task.latest_status_message or "").lower()
     alert_mock.assert_called_once()
 
 

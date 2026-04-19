@@ -1283,6 +1283,24 @@ async def get_digest(
     cost_by_failure_class = {k: round(v, 4) for k, v in _cost_by_failure_class.items()}
     total_failed_cost_usd = round(sum(_cost_by_failure_class.values()), 4)
     provision_waste_cost_usd = round(_provision_waste_cost, 4)
+
+    _analysis_overflow_count = 0
+    _analysis_overflow_cost = 0.0
+    _analysis_overflow_by_scope: Dict[str, int] = {}
+    for t in failed_tasks:
+        _ctx = t.context or {}
+        if _ctx.get("scope_gate_triggered") == "analysis_overflow":
+            _analysis_overflow_count += 1
+            _scope = _ctx.get("scope") or "unknown"
+            _analysis_overflow_by_scope[_scope] = _analysis_overflow_by_scope.get(_scope, 0) + 1
+            if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start:
+                _rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+                _analysis_overflow_cost += _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+    analysis_overflow_summary = {
+        "total_count": _analysis_overflow_count,
+        "by_scope": _analysis_overflow_by_scope,
+        "cost_usd": round(_analysis_overflow_cost, 4),
+    }
     provision_waste_by_direction = sorted(
         [
             {**e, "provision_cost_usd": round(e["provision_cost_usd"], 4)}
@@ -1818,6 +1836,55 @@ async def get_digest(
             "top_directions": _top_dirs[:3],
         }
 
+    # --- Escalation outcome summary ---
+    # Aggregate escalation_outcomes across all active directions and recent
+    # research_history entries, so operators can see whether scope escalation
+    # is productive or just burning compute.
+    escalation_outcome_summary: Optional[Dict[str, Any]] = None
+    if project_id:
+        _proj_esc = await session.get(Project, project_id)
+        if _proj_esc:
+            _esc_paths: Dict[str, Dict[str, int]] = {}
+            for _d in (_proj_esc.directions or []):
+                if _d.get("status") not in ("active", "held", "auto_paused"):
+                    continue
+                for _entry in _d.get("research_history") or []:
+                    try:
+                        _ets = datetime.fromisoformat(_entry.get("timestamp", ""))
+                    except (ValueError, TypeError):
+                        continue
+                    if _ets < window_start:
+                        continue
+                    for _path, _counts in (_entry.get("escalation_outcomes") or {}).items():
+                        if not isinstance(_counts, dict):
+                            continue
+                        _b = _esc_paths.setdefault(
+                            str(_path), {"attempted": 0, "merged": 0, "failed": 0}
+                        )
+                        _b["attempted"] += int(_counts.get("attempted") or 0)
+                        _b["merged"] += int(_counts.get("merged") or 0)
+                        _b["failed"] += int(_counts.get("failed") or 0)
+            _by_path: Dict[str, Dict[str, Any]] = {}
+            _tot_att = _tot_mer = _tot_fail = 0
+            for _path, _b in _esc_paths.items():
+                _att = _b["attempted"]
+                _by_path[_path] = {
+                    "attempted": _att,
+                    "merged": _b["merged"],
+                    "failed": _b["failed"],
+                    "success_rate": round(_b["merged"] / _att, 3) if _att else None,
+                }
+                _tot_att += _att
+                _tot_mer += _b["merged"]
+                _tot_fail += _b["failed"]
+            escalation_outcome_summary = {
+                "total_attempted": _tot_att,
+                "total_merged": _tot_mer,
+                "total_failed": _tot_fail,
+                "overall_success_rate": round(_tot_mer / _tot_att, 3) if _tot_att else None,
+                "by_path": _by_path,
+            }
+
     # --- Latest strategic cycle ---
     latest_cycle = None
     if project_id:
@@ -1892,6 +1959,7 @@ async def get_digest(
     ]
     _cap_iters: List[int] = []
     _cap_dir_counts: Dict[str, int] = {}
+    _cap_total_cost = 0.0
     for _t in _cap_tasks:
         _ctx = _t.context or {}
         _it = _ctx.get("review_cap_iterations")
@@ -1901,11 +1969,16 @@ async def get_digest(
         if _did:
             _did_s = str(_did)
             _cap_dir_counts[_did_s] = _cap_dir_counts.get(_did_s, 0) + 1
+        if _t.vm_provisioned_at and _t.vm_stopped_at and _t.vm_stopped_at >= window_start:
+            _rate = SPOT_RATE if _t.vm_spot else ON_DEMAND_RATE
+            _cap_total_cost += _rate * (_t.vm_stopped_at - _t.vm_provisioned_at).total_seconds()
     _top_cap_dirs = sorted(_cap_dir_counts.items(), key=lambda x: x[1], reverse=True)[:3]
     review_cap_exhaustion_summary = {
         "count": len(_cap_tasks),
         "avg_iterations": (sum(_cap_iters) / len(_cap_iters)) if _cap_iters else None,
         "top_directions": [{"direction_id": d, "count": c} for d, c in _top_cap_dirs],
+        "total_cost_usd": round(_cap_total_cost, 4),
+        "avg_cost_usd": round(_cap_total_cost / len(_cap_tasks), 4) if _cap_tasks else None,
     }
 
     # --- Recurring error fingerprint clusters ---
@@ -1991,6 +2064,7 @@ async def get_digest(
         "total_failed_cost_usd": total_failed_cost_usd,
         "provision_waste_cost_usd": provision_waste_cost_usd,
         "provision_waste_by_direction": provision_waste_by_direction,
+        "analysis_overflow_summary": analysis_overflow_summary,
         "retry_overhead_cost_usd": retry_overhead_cost_usd,
         "retry_recovery_cost_usd": retry_recovery_cost_usd,
         "retry_waste_by_direction": retry_waste_by_direction,
@@ -2017,6 +2091,7 @@ async def get_digest(
         "pipeline_conversion_rate": pipeline_conversion_rate,
         "pipeline_filter_funnel": pipeline_filter_funnel or None,
         "scope_mismatch_summary": scope_mismatch_summary,
+        "escalation_outcome_summary": escalation_outcome_summary,
         "rejection_pattern_summary": rejection_pattern_summary,
         "retry_pattern_summary": retry_pattern_summary,
         "review_cap_exhaustion_summary": review_cap_exhaustion_summary,

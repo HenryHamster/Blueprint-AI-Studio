@@ -68,6 +68,22 @@ def _normalize_merge_error(msg: str) -> str:
     return out.strip().lower()
 
 
+# Deterministically non-retryable merge errors. Retrying these cannot succeed
+# without external state change (corrupt refs, GitHub-level blocks), so we skip
+# the usual 2-streak requirement and exit on first occurrence.
+_DETERMINISTIC_MERGE_ERROR_PATTERNS = (
+    "head sha can't be blank",
+    "pull request is not mergeable",
+    "base branch was modified",
+)
+
+
+def _is_deterministic_merge_error(normalized_msg: str) -> bool:
+    if not normalized_msg:
+        return False
+    return any(pat in normalized_msg for pat in _DETERMINISTIC_MERGE_ERROR_PATTERNS)
+
+
 def _review_approved(review_loop: dict) -> bool:
     """True if a review task signed off on this PR.
 
@@ -210,17 +226,20 @@ async def _attempt_merge_with_retry_and_escalation(
             ci_loop["update_branch_failures"] = _ub_failures
             task.context = {**(task.context or {}), "review_loop": ci_loop}
             flag_modified(task, "context")
-            if _ub_failures < 3:
+            _hard_cap_ub = _merge_hard_cap_for_task(task)
+            _merge_failures_so_far = ci_loop.get("merge_failures", 0)
+            _ub_threshold = max(1, min(3, _hard_cap_ub - _merge_failures_so_far))
+            if _ub_failures < _ub_threshold:
                 task.latest_status_message = (
                     f"PR #{ci_pr_number} branch behind base — update_branch failed "
-                    f"({_ub_failures}x): {(_upd.get('message') or '')[:120]} — re-entering CI polling"
+                    f"({_ub_failures}/{_ub_threshold}): {(_upd.get('message') or '')[:120]} — re-entering CI polling"
                 )
                 logger.warning(
-                    f"[CI] PR #{ci_pr_number} behind base — update_branch failed ({_ub_failures}x): "
-                    f"{_upd.get('message')} ({source})"
+                    f"[CI] PR #{ci_pr_number} behind base — update_branch failed "
+                    f"({_ub_failures}/{_ub_threshold}): {_upd.get('message')} ({source})"
                 )
                 return False
-            # 3+ consecutive update_branch failures — escalate to fix task with rebase.
+            # update_branch failures exceeded dynamic threshold — escalate to fix task with rebase.
             from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
             from app.rollup_state import _is_rollup_parent_awaiting_merge  # noqa: PLC0415
             active_tasks = (await session.execute(
@@ -419,11 +438,12 @@ async def _attempt_merge_with_retry_and_escalation(
                 await _maybe_create_failure_alert(task, session,
                     f"PR #{ci_pr_number} merge failed {_merge_failures} times — "
                     f"hard cap imminent ({_hard_cap - _merge_failures} retries remaining)")
+            _deterministic = _is_deterministic_merge_error(_norm_cur)
             _repeated_identical = _err_streak >= 2
-            if _merge_failures >= _hard_cap or _repeated_identical:
+            if _merge_failures >= _hard_cap or _repeated_identical or _deterministic:
                 task.status = TaskStatus.FAILED
                 task.requires_approval = True
-                _early_exit = _repeated_identical and _merge_failures < _hard_cap
+                _early_exit = (_repeated_identical or _deterministic) and _merge_failures < _hard_cap
                 if _early_exit:
                     _retries_saved = _hard_cap - _merge_failures
                     task.context = {
@@ -431,11 +451,18 @@ async def _attempt_merge_with_retry_and_escalation(
                         "_merge_retries_saved": _retries_saved,
                         "review_loop": ci_loop,
                     }
-                    task.latest_status_message = (
-                        f"PR #{ci_pr_number} merge failed with identical error "
-                        f"{_err_streak} times in a row: {merge_msg[:200]} — "
-                        f"giving up, needs manual intervention"
-                    )
+                    if _deterministic and not _repeated_identical:
+                        task.latest_status_message = (
+                            f"PR #{ci_pr_number} merge failed with deterministic "
+                            f"non-retryable error: {merge_msg[:200]} — "
+                            f"giving up, needs manual intervention"
+                        )
+                    else:
+                        task.latest_status_message = (
+                            f"PR #{ci_pr_number} merge failed with identical error "
+                            f"{_err_streak} times in a row: {merge_msg[:200]} — "
+                            f"giving up, needs manual intervention"
+                        )
                 else:
                     task.latest_status_message = (
                         f"PR #{ci_pr_number} merge failed {_merge_failures} times "
