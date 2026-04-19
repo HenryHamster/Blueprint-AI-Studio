@@ -38,12 +38,14 @@ interface DirectionProgress {
   product_ratio?: number | null;
   estimated_cost_usd?: number | null;
   cost_per_merged_pr?: number | null;
+  avg_time_to_merge_hours?: number | null;
   cost_by_scope?: Record<string, number> | null;
   cost_by_type?: Record<string, number> | null;
   spot_cost_usd?: number | null;
   on_demand_cost_usd?: number | null;
   scope_breakdown?: Record<string, { created: number; merged: number; failed: number; failed_infra?: number; failed_code_error?: number; failed_scope_overflow?: number; calibrated_in?: number; calibrated_out?: number }> | null;
   taxonomy_summary?: Record<string, number> | null;
+  review_quality?: { reviews_dismissed?: number; reviews_overridden?: number; user_issues_caught?: number } | null;
   stage_dropout?: Record<string, number> | null;
   recent_failure_titles?: string[] | null;
 }
@@ -114,8 +116,8 @@ interface DigestData {
   completed_count?: number;
   pipeline_conversion_rate?: number | null;
   pipeline_acceptance_rate?: number | null;
-  scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
-  prev_scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
+  scope_conversion_rates?: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null;
+  prev_scope_conversion_rates?: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null;
   cost_by_failure_class?: Record<string, number> | null;
   total_failed_cost_usd?: number | null;
   failure_taxonomy_distribution?: {
@@ -730,9 +732,19 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                           {d.cost_per_merged_pr != null && (
                             <span className="text-neutral-400" title="Cost per merged PR">${d.cost_per_merged_pr.toFixed(2)}/PR</span>
                           )}
+                          {d.avg_time_to_merge_hours != null && (
+                            <span className={d.avg_time_to_merge_hours < 2 ? 'text-emerald-400' : d.avg_time_to_merge_hours <= 6 ? 'text-amber-400' : 'text-red-400'} title="Average time from task creation to PR merge">~{d.avg_time_to_merge_hours.toFixed(1)}h/PR</span>
+                          )}
                         </div>
                         {d.taxonomy_summary && <div className="flex gap-1 mt-1 flex-wrap">{TAXONOMY_ORDER.map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return v ? <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span> : null; })}</div>}
-                        {d.scope_breakdown && Object.keys(d.scope_breakdown).length > 0 && <div className="flex gap-1 mt-1 flex-wrap">{(['small', 'medium', 'large'] as const).map(sz => { const s = d.scope_breakdown?.[sz]; if (!s || (!s.merged && !s.failed)) return null; const total = s.merged + s.failed; const rate = total > 0 ? s.merged / total : 0; const color = rate >= 0.7 ? 'border-emerald-700 bg-emerald-900/40 text-emerald-300' : rate >= 0.4 ? 'border-amber-700 bg-amber-900/40 text-amber-300' : 'border-red-700 bg-red-900/40 text-red-300'; return <span key={sz} title={`${sz}: ${s.merged} merged / ${s.failed} failed (${Math.round(rate * 100)}%)`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${color}`}>{sz[0].toUpperCase()} {s.merged}/{s.failed}</span>; })}</div>}
+                        {d.scope_breakdown && Object.keys(d.scope_breakdown).length > 0 && <div className="flex gap-1 mt-1 flex-wrap">{(['small', 'medium', 'large'] as const).map(sz => { const s = d.scope_breakdown?.[sz]; if (!s || (!s.merged && !s.failed)) return null; const total = s.merged + s.failed; const rate = total > 0 ? s.merged / total : 0; const color = rate >= 0.7 ? 'border-emerald-700 bg-emerald-900/40 text-emerald-300' : rate >= 0.4 ? 'border-amber-700 bg-amber-900/40 text-amber-300' : 'border-red-700 bg-red-900/40 text-red-300'; const subtypes = [[s.failed_code_error, 'code'], [s.failed_infra, 'infra'], [s.failed_scope_overflow, 'scope']].filter(([v]) => typeof v === 'number' && (v as number) > 0).map(([v, l]) => `${v} ${l}`).join(', '); const subtypeStr = subtypes ? ` (${subtypes})` : ''; return <span key={sz} title={`${sz}: ${s.merged} merged / ${s.failed} failed${subtypeStr} (${Math.round(rate * 100)}%)`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${color}`}>{sz[0].toUpperCase()} {s.merged}/{s.failed}</span>; })}</div>}
+                        {d.review_quality && (d.review_quality.reviews_dismissed || d.review_quality.reviews_overridden || d.review_quality.user_issues_caught) ? (
+                          <div className="flex gap-1 mt-1 flex-wrap">
+                            {d.review_quality.reviews_dismissed ? <span title="Automated reviews dismissed by the system" className="text-[9px] leading-none px-1 py-0.5 rounded border border-amber-700 bg-amber-900/40 text-amber-300">{d.review_quality.reviews_dismissed} dismissed</span> : null}
+                            {d.review_quality.reviews_overridden ? <span title="Reviews overridden by an operator" className="text-[9px] leading-none px-1 py-0.5 rounded border border-red-700 bg-red-900/40 text-red-300">{d.review_quality.reviews_overridden} overridden</span> : null}
+                            {d.review_quality.user_issues_caught ? <span title="Real issues caught by review" className="text-[9px] leading-none px-1 py-0.5 rounded border border-emerald-700 bg-emerald-900/40 text-emerald-300">{d.review_quality.user_issues_caught} caught</span> : null}
+                          </div>
+                        ) : null}
                         {d.stage_dropout && Object.values(d.stage_dropout).some(v => v) && <div className="flex gap-1 mt-1 flex-wrap">{Object.entries(d.stage_dropout).filter(([, v]) => v).sort((a, b) => b[1] - a[1]).map(([stage, v]) => <span key={stage} title={`Failed at ${stage}: ${v}`} className="text-[9px] leading-none px-1 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-300">{STAGE_DROPOUT_LABELS[stage] ?? stage} {v}</span>)}</div>}
                         {d.recent_failure_titles && d.recent_failure_titles.length > 0 && (
                           <ul className="mt-1 space-y-0.5">
@@ -864,8 +876,8 @@ function ScopeConversionRatesSection({
   prevScopeRates,
   loading,
 }: {
-  scopeRates: Record<string, { created: number; merged: number }> | null | undefined;
-  prevScopeRates: Record<string, { created: number; merged: number }> | null | undefined;
+  scopeRates: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null | undefined;
+  prevScopeRates: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null | undefined;
   loading: boolean;
 }) {
   if (loading) return null;
@@ -878,7 +890,8 @@ function ScopeConversionRatesSection({
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Scope Conversion Rates</h2>
       <div className="flex gap-2 flex-wrap">
         {scopes.map(scope => {
-          const { created, merged } = scopeRates[scope];
+          const { created, merged, calibrated_in = 0, calibrated_out = 0 } = scopeRates[scope];
+          const recalibrated = calibrated_in + calibrated_out;
           const rate = created > 0 ? merged / created : null;
           const prev = prevScopeRates?.[scope];
           const prevRate = prev && prev.created > 0 ? prev.merged / prev.created : null;
@@ -905,6 +918,9 @@ function ScopeConversionRatesSection({
                 {trend && <TrendIcon className={`w-3.5 h-3.5 ${trendColor}`} />}
               </div>
               <p className="text-[10px] text-neutral-600 mt-0.5">{merged}/{created} merged</p>
+              {recalibrated > 0 && (
+                <p className="text-[10px] text-neutral-600 mt-0.5">{recalibrated} recalibrated</p>
+              )}
             </div>
           );
         })}
