@@ -2967,14 +2967,14 @@ class TestStuckCycleThreshold:
         assert self._stuck_threshold("refactor") == STUCK_CYCLE_THRESHOLD_REFACTOR
         assert STUCK_CYCLE_THRESHOLD_REFACTOR > STUCK_CYCLE_THRESHOLD_DEFAULT
 
-    def test_create_threshold_is_50(self):
-        assert self._stuck_threshold("create") == 0.5
+    def test_create_uses_default_threshold(self):
+        assert self._stuck_threshold("create") == STUCK_CYCLE_THRESHOLD_DEFAULT
 
-    def test_fix_threshold_is_50(self):
-        assert self._stuck_threshold("fix") == 0.5
+    def test_fix_uses_default_threshold(self):
+        assert self._stuck_threshold("fix") == STUCK_CYCLE_THRESHOLD_DEFAULT
 
-    def test_plan_threshold_is_50(self):
-        assert self._stuck_threshold("plan") == 0.5
+    def test_plan_uses_default_threshold(self):
+        assert self._stuck_threshold("plan") == STUCK_CYCLE_THRESHOLD_DEFAULT
 
     def test_refactor_60pct_repeat_not_stuck(self):
         """60% repeat rate is below the refactor threshold — should NOT escalate."""

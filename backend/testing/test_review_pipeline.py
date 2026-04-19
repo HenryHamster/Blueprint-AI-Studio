@@ -122,7 +122,7 @@ class TestMaxReviewIterations:
     def test_constants_match_expected_values(self):
         """Tripwire: cap constants must not change without a deliberate review."""
         assert MAX_REVIEW_FIX_ITERATIONS == 16
-        assert STUCK_CYCLE_THRESHOLD_DEFAULT == 0.5
+        assert STUCK_CYCLE_THRESHOLD_DEFAULT == 0.55
         assert STUCK_CYCLE_THRESHOLD_REFACTOR == 0.65
 
     # ── Direction-aware reduction ─────────────────────────────────────────────
@@ -1043,7 +1043,7 @@ async def test_stuck_cycle_detects_rephrased_issue(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    prior_issues = [_issue("Error handling missing in payment processor", "CRITICAL")]
+    prior_issues = [_issue("Error handling code missing in payment processor", "CRITICAL")]
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
@@ -1068,8 +1068,8 @@ async def test_stuck_cycle_detects_rephrased_issue(db_session, mocker):
     await db_session.refresh(source_task)
 
     # Same underlying issue, different phrasing. Exact-match would miss this;
-    # token Jaccard (4 shared / 6 union ≈ 0.67) correctly identifies the repeat.
-    current_issues = [_issue("Payment processor lacks error handling", "CRITICAL")]
+    # token Jaccard (5 shared / 7 union ≈ 0.71) correctly identifies the repeat.
+    current_issues = [_issue("Payment processor code lacks error handling", "CRITICAL")]
 
     result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
@@ -1840,7 +1840,7 @@ def test_stuck_cycle_issue_similarity_threshold_constants():
     """Tripwire: rephrased-issue thresholds must stay above 0.6 so that two
     issues sharing only boilerplate tokens (e.g. processUser vs processOrder,
     Jaccard = 0.6) cannot trigger the secondary fallback."""
-    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT == 0.65
+    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT == 0.68
     assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR == 0.7
     assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT > 0.6
     assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR > 0.6
@@ -1849,8 +1849,8 @@ def test_stuck_cycle_issue_similarity_threshold_constants():
 def test_stuck_cycle_medium_thresholds_lower_than_default():
     """Tripwire: medium-scope thresholds must sit below the defaults so that
     higher-complexity tasks bail out of stuck cycles earlier."""
-    assert STUCK_CYCLE_THRESHOLD_MEDIUM == 0.45
-    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM == 0.65
+    assert STUCK_CYCLE_THRESHOLD_MEDIUM == 0.50
+    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM == 0.68
     assert STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM == 0.65
     assert STUCK_CYCLE_THRESHOLD_MEDIUM < STUCK_CYCLE_THRESHOLD_DEFAULT
     assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM == STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT
@@ -1860,7 +1860,7 @@ def test_stuck_cycle_medium_thresholds_lower_than_default():
 async def _run_stuck_scope_case(
     db_session, mocker, *, scope: str, pr_number: int
 ):
-    """Drive _spawn_pipeline_task at ~45% exact-issue repeat.
+    """Drive _spawn_pipeline_task at ~54.5% exact-issue repeat.
 
     Returns the result tuple plus the reloaded original task so callers can
     assert scope-conditional stuck behaviour.
@@ -1881,10 +1881,10 @@ async def _run_stuck_scope_case(
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    # 5 of 11 current CRITICAL issues repeat → ~45.5% exact-match, clears the
-    # 0.45 medium threshold but stays below the 0.5 default. New issues share
+    # 6 of 11 current CRITICAL issues repeat → ~54.5% exact-match, clears the
+    # 0.50 medium threshold but stays below the 0.55 default. New issues share
     # no tokens with prior, keeping Jaccard below both rephrased thresholds.
-    prior_issues = [_issue(f"alpha issue {i}", "CRITICAL") for i in range(5)]
+    prior_issues = [_issue(f"alpha issue {i}", "CRITICAL") for i in range(6)]
     branch = f"b-{scope}"
     source_task = make_task(
         project_id=project.id,
@@ -1915,12 +1915,12 @@ async def _run_stuck_scope_case(
         _issue("alpha issue 2", "CRITICAL"),  # repeats
         _issue("alpha issue 3", "CRITICAL"),  # repeats
         _issue("alpha issue 4", "CRITICAL"),  # repeats
+        _issue("alpha issue 5", "CRITICAL"),  # repeats
         _issue("zeta fresh concern", "CRITICAL"),
         _issue("omega distinct finding", "CRITICAL"),
         _issue("kappa separate worry", "CRITICAL"),
         _issue("theta new worry", "CRITICAL"),
         _issue("sigma other concern", "CRITICAL"),
-        _issue("delta different problem", "CRITICAL"),
     ]
     result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
@@ -1935,23 +1935,23 @@ async def _run_stuck_scope_case(
 
 
 @pytest.mark.asyncio
-async def test_stuck_cycle_medium_scope_triggers_at_45pct(db_session, mocker):
-    """Medium-scope tasks trigger the stuck cycle at ~45% exact-match repeat."""
+async def test_stuck_cycle_medium_scope_triggers_at_55pct(db_session, mocker):
+    """Medium-scope tasks trigger the stuck cycle at ~54.5% exact-match repeat."""
     result, original_task = await _run_stuck_scope_case(
         db_session, mocker, scope="medium", pr_number=701
     )
-    assert result is None, "Medium scope must stuck-detect at the lower 0.45 threshold"
+    assert result is None, "Medium scope must stuck-detect at the lower 0.50 threshold"
     assert original_task.requires_approval is True
 
 
 @pytest.mark.asyncio
-async def test_stuck_cycle_small_scope_unaffected_at_45pct(db_session, mocker):
-    """Small-scope tasks keep the 0.5 default threshold and pass through at ~45%."""
+async def test_stuck_cycle_small_scope_unaffected_at_55pct(db_session, mocker):
+    """Small-scope tasks keep the 0.55 default threshold and pass through at ~54.5%."""
     result, original_task = await _run_stuck_scope_case(
         db_session, mocker, scope="small", pr_number=702
     )
     assert result is not None, (
-        "Small scope must not trigger at ~45% — default threshold remains 0.5"
+        "Small scope must not trigger at ~54.5% — default threshold remains 0.55"
     )
     assert result.status == TaskStatus.QUEUED
     assert original_task.requires_approval is not True
@@ -1982,7 +1982,7 @@ async def test_stuck_cycle_detects_rephrased_issues(db_session, mocker):
     prior_issues = [
         _issue("Missing null check in handler", "CRITICAL"),
         _issue("Race condition in scheduler", "CRITICAL"),
-        _issue("Query builder uses direct concat", "CRITICAL"),
+        _issue("Query builder direct concat", "CRITICAL"),
     ]
     source_task = make_task(
         project_id=project.id,
@@ -2040,10 +2040,7 @@ async def test_stuck_cycle_rephrased_fallback_ignores_distinct_targets(db_sessio
     """Issues sharing boilerplate tokens but targeting genuinely different
     symbols must NOT trip the rephrased-issue fallback. 'Missing error
     handling in processUser' vs 'Missing error handling in processOrder'
-    yields Jaccard = 0.6, just below the 0.65 default threshold.
-
-    Scoped to 'small' because medium-scope now uses a 0.55 threshold and
-    would (correctly, for its tighter budget) treat 0.6 as a stuck cycle.
+    yields Jaccard = 0.6, just below the 0.68 default threshold.
     """
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
@@ -3388,7 +3385,8 @@ class TestRepeatingIssues:
 async def test_issue_churn_injects_narrow_focus_and_reduces_cap(db_session, mocker):
     """When CRITICAL+MAJOR counts don't decrease across ISSUE_CHURN_WINDOW iterations
     (but the specific issues rotate, evading stuck-cycle detection), the spawned fix
-    task should get a narrow-focus directive prefix and a reduced per-chain cap."""
+    task should get a narrow-focus directive prefix. On the first detection the cap
+    is not reduced so the directive has budget to take effect."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
@@ -3453,22 +3451,20 @@ async def test_issue_churn_injects_narrow_focus_and_reduces_cap(db_session, mock
     assert "ISSUE CHURN DETECTED" in (payload.get("prompt") or "")
     assert "Please fix." in payload["prompt"]
 
-    # Per-chain cap reduced (original cap minus one-third of remaining).
+    # First churn detection: cap unchanged so the narrow-focus directive has
+    # iteration budget to take effect.
     ctx_cap = (result.context or {}).get("review_loop", {}).get("max_iterations")
-    source_cap_ctx = (source_task.context or {}).get("review_loop", {}).get("max_iterations")
-    # Source task didn't set max_iterations → per-chain cap came from
-    # _max_review_iterations(). New task's cap should be strictly less.
     from app.review_pipeline import _max_review_iterations
     baseline = _max_review_iterations(source_task)
-    assert ctx_cap is not None and ctx_cap < baseline, (
-        f"Churn should reduce cap below baseline {baseline}, got {ctx_cap}"
+    assert ctx_cap == baseline, (
+        f"First churn detection should leave cap at baseline {baseline}, got {ctx_cap}"
     )
 
 
 @pytest.mark.asyncio
-async def test_first_churn_detection_uses_one_third_reduction(db_session, mocker):
-    """First churn detection reduces remaining budget by 1/3:
-    reduced_cap = iteration + (remaining * 2 // 3)."""
+async def test_first_churn_detection_does_not_reduce_cap(db_session, mocker):
+    """First churn detection injects a narrow-focus directive but leaves the
+    per-chain cap unchanged so the directive has budget to take effect."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
@@ -3515,10 +3511,11 @@ async def test_first_churn_detection_uses_one_third_reduction(db_session, mocker
         current_feedback="fb", current_issues=current_issues,
     )
 
-    # medium scope → baseline 12; iteration = 3; remaining = 9.
-    # First detection: 3 + 9*2//3 = 9.
+    # medium scope → baseline 12; first detection leaves cap unchanged.
+    from app.review_pipeline import _max_review_iterations
+    baseline = _max_review_iterations(source_task)
     new_loop = (result.context or {}).get("review_loop", {})
-    assert new_loop.get("max_iterations") == 9
+    assert new_loop.get("max_iterations") == baseline
     assert new_loop.get("churn_detections") == 1
 
 

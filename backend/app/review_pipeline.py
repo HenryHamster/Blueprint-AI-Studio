@@ -25,12 +25,12 @@ logger = logging.getLogger(__name__)
 
 MAX_REVIEW_FIX_ITERATIONS = 16
 
-STUCK_CYCLE_THRESHOLD_DEFAULT = 0.5
+STUCK_CYCLE_THRESHOLD_DEFAULT = 0.55
 STUCK_CYCLE_THRESHOLD_REFACTOR = 0.65
 # Medium-scope tasks juggle more complexity and are more likely to produce
 # repeating CRITICAL/MAJOR issues across iterations. Detect the stuck cycle
 # 1-2 iterations earlier than the default to save the remaining budget.
-STUCK_CYCLE_THRESHOLD_MEDIUM = 0.45
+STUCK_CYCLE_THRESHOLD_MEDIUM = 0.50
 
 # Token-level Jaccard thresholds used by the feedback-text fallback when one or
 # both review_history entries lack a structured `issues` list (e.g. verdict
@@ -46,9 +46,9 @@ STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM = 0.65
 # sharing boilerplate tokens but targeting different symbols (e.g. "Missing
 # error handling in processUser" vs "…processOrder" → Jaccard 0.6) do NOT
 # trigger a false positive.
-STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT = 0.65
+STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT = 0.68
 STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR = 0.7
-STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM = 0.65
+STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM = 0.68
 
 
 def _stuck_thresholds(scope: str, is_refactor: bool) -> tuple[float, float, float]:
@@ -833,24 +833,31 @@ async def _spawn_pipeline_task(
         is_churn, churn_counts = _detect_issue_churn(new_review_history)
         if is_churn and task_type == "fix":
             churn_detections += 1
-            remaining = max(per_chain_cap - iteration, 0)
             if churn_detections >= 2:
+                remaining = max(per_chain_cap - iteration, 0)
                 reduced_cap = iteration + (remaining // 2)
+                if reduced_cap < per_chain_cap:
+                    logger.warning(
+                        f"[PIPELINE] Issue churn detected for PR #{pr_number} "
+                        f"(detection #{churn_detections}): "
+                        f"CRITICAL+MAJOR counts {churn_counts} non-decreasing over "
+                        f"{ISSUE_CHURN_WINDOW} iterations. Reducing cap "
+                        f"{per_chain_cap} → {reduced_cap}; injecting narrow-focus directive."
+                    )
+                    per_chain_cap = reduced_cap
+                else:
+                    logger.warning(
+                        f"[PIPELINE] Issue churn detected for PR #{pr_number} "
+                        f"(detection #{churn_detections}): "
+                        f"counts {churn_counts}; injecting narrow-focus directive."
+                    )
             else:
-                reduced_cap = iteration + (remaining * 2 // 3)
-            if reduced_cap < per_chain_cap:
                 logger.warning(
                     f"[PIPELINE] Issue churn detected for PR #{pr_number} "
                     f"(detection #{churn_detections}): "
                     f"CRITICAL+MAJOR counts {churn_counts} non-decreasing over "
-                    f"{ISSUE_CHURN_WINDOW} iterations. Reducing cap "
-                    f"{per_chain_cap} → {reduced_cap}; injecting narrow-focus directive."
-                )
-                per_chain_cap = reduced_cap
-            else:
-                logger.warning(
-                    f"[PIPELINE] Issue churn detected for PR #{pr_number}: "
-                    f"counts {churn_counts}; injecting narrow-focus directive."
+                    f"{ISSUE_CHURN_WINDOW} iterations. Injecting narrow-focus "
+                    f"directive without cap reduction to allow directive to take effect."
                 )
             narrow_prefix = _CHURN_NARROW_FOCUS_PREFIX.format(
                 window=ISSUE_CHURN_WINDOW, counts=churn_counts
