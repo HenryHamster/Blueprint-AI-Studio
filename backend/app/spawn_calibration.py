@@ -428,10 +428,18 @@ def predict_spawn_success(
     # implementation difficulty. Omitted when all files share one top-level dir.
     if related_files:
         file_count = len(related_files)
-        if file_count >= 5:
+        # Scope-aware thresholds: small has a 6-file budget so 5+ is already
+        # over-budget; medium/large have a 10-file budget (7 production files)
+        # so thresholds shift up by 2 to avoid over-penalizing findings at
+        # their natural file counts.
+        if scope == "small":
+            strong_threshold, moderate_threshold = 5, 3
+        else:
+            strong_threshold, moderate_threshold = 7, 5
+        if file_count >= strong_threshold:
             signals.append(0.3)
             weights.append(1.0)
-        elif file_count >= 3:
+        elif file_count >= moderate_threshold:
             signals.append(0.6)
             weights.append(1.0)
 

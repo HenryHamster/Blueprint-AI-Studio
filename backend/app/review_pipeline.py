@@ -26,14 +26,19 @@ logger = logging.getLogger(__name__)
 MAX_REVIEW_FIX_ITERATIONS = 16
 
 STUCK_CYCLE_THRESHOLD_DEFAULT = 0.5
-STUCK_CYCLE_THRESHOLD_REFACTOR = 0.75
+STUCK_CYCLE_THRESHOLD_REFACTOR = 0.65
+# Medium-scope tasks juggle more complexity and are more likely to produce
+# repeating CRITICAL/MAJOR issues across iterations. Detect the stuck cycle
+# 1-2 iterations earlier than the default to save the remaining budget.
+STUCK_CYCLE_THRESHOLD_MEDIUM = 0.4
 
 # Token-level Jaccard thresholds used by the feedback-text fallback when one or
 # both review_history entries lack a structured `issues` list (e.g. verdict
 # parsing fell back to log/keyword scraping). Set higher than the structured
 # thresholds because text comparison is noisier.
 STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT = 0.7
-STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR = 0.85
+STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR = 0.75
+STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM = 0.6
 
 # Secondary Jaccard thresholds for the rephrased-issue fallback: both sides
 # have structured CRITICAL/MAJOR issues but the exact-match proportion falls
@@ -42,7 +47,34 @@ STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR = 0.85
 # error handling in processUser" vs "…processOrder" → Jaccard 0.6) do NOT
 # trigger a false positive.
 STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT = 0.65
-STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR = 0.8
+STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR = 0.7
+STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM = 0.55
+
+
+def _stuck_thresholds(scope: str, is_refactor: bool) -> tuple[float, float, float]:
+    """Return (exact_match, issue_similarity, text_similarity) thresholds.
+
+    Refactor takes priority over scope because refactor feedback structurally
+    repeats. Medium scope lowers all three thresholds so higher-complexity
+    tasks bail out 1-2 iterations earlier than the default.
+    """
+    if is_refactor:
+        return (
+            STUCK_CYCLE_THRESHOLD_REFACTOR,
+            STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR,
+            STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR,
+        )
+    if scope == "medium":
+        return (
+            STUCK_CYCLE_THRESHOLD_MEDIUM,
+            STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM,
+            STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM,
+        )
+    return (
+        STUCK_CYCLE_THRESHOLD_DEFAULT,
+        STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
+        STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT,
+    )
 
 _FEEDBACK_TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
@@ -673,6 +705,10 @@ async def _spawn_pipeline_task(
         # because the fix agent cannot fully resolve architectural concerns in scope
         source_type = (source_task.first_payload or {}).get("type", "")
         is_refactor = source_type == "refactor"
+        source_scope = (source_task.context or {}).get("scope", "medium")
+        stuck_threshold, issue_threshold, text_threshold = _stuck_thresholds(
+            source_scope, is_refactor
+        )
 
         is_stuck = False
         stuck_detail = ""
@@ -683,7 +719,6 @@ async def _spawn_pipeline_task(
                 if desc in prev_critical_major
             )
             total_count = len(curr_critical_major)
-            stuck_threshold = STUCK_CYCLE_THRESHOLD_REFACTOR if is_refactor else STUCK_CYCLE_THRESHOLD_DEFAULT
             if matched_count / total_count >= stuck_threshold:
                 is_stuck = True
                 stuck_detail = f"{matched_count}/{total_count} issues repeated"
@@ -699,11 +734,6 @@ async def _spawn_pipeline_task(
                 similarity = _feedback_jaccard(
                     " ".join(prev_critical_major), " ".join(curr_critical_major)
                 )
-                issue_threshold = (
-                    STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR
-                    if is_refactor
-                    else STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT
-                )
                 if similarity >= issue_threshold:
                     is_stuck = True
                     stuck_detail = (
@@ -718,7 +748,6 @@ async def _spawn_pipeline_task(
             curr_feedback = (curr_entry.get("feedback") or "").strip()
             if prev_feedback and curr_feedback:
                 similarity = _feedback_jaccard(prev_feedback, curr_feedback)
-                text_threshold = STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR if is_refactor else STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT
                 if similarity >= text_threshold:
                     is_stuck = True
                     stuck_detail = f"feedback similarity {similarity:.0%} ≥ {text_threshold:.0%}"

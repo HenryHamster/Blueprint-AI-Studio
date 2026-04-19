@@ -117,6 +117,27 @@ def _record_parent_failure(parent: Task, failure_class: str) -> None:
         )
 
 
+_CODE_ERROR_STAGE_GUIDANCE: dict[str, str] = {
+    "test": (
+        "The previous attempt failed at the test stage. Focus on the specific failing tests "
+        "shown in the error log and consider a fundamentally different approach if the same "
+        "tests keep failing."
+    ),
+    "lint": (
+        "The previous attempt failed at the lint stage. Run the linter locally before committing "
+        "and check for type errors (ruff, eslint, tsc --noEmit)."
+    ),
+    "build": (
+        "The previous attempt failed at the build stage. Verify import paths and module resolution, "
+        "and ensure any new files are wired into the build correctly."
+    ),
+    "merge": (
+        "The previous attempt failed at the merge stage. Check for merge conflicts with the target "
+        "branch and rebase onto the latest base before retrying."
+    ),
+}
+
+
 def _build_retry_prompt_suffix(
     failure_class: "str | None",
     original_status_message: "str | None",
@@ -208,14 +229,18 @@ def _build_retry_prompt_suffix(
             scope_override = "large"
 
     elif failure_class == "CODE_ERROR":
-        error_text = (original_status_message or "").lower()
-        hints = []
-        if any(kw in error_text for kw in ["test", "assert", "pytest", "jest", "vitest"]):
-            hints.append("Fix the specific failing tests shown in the error log before making other changes.")
-        if any(kw in error_text for kw in ["lint", "ruff", "eslint", "tsc"]):
-            hints.append("Fix lint/type errors first — run the linter before committing.")
-        if hints:
-            extra_guidance = "RETRY GUIDANCE: " + " ".join(hints) + "\n"
+        stage_guidance = _CODE_ERROR_STAGE_GUIDANCE.get(ctx.get("_previous_failure_stage") or "")
+        if stage_guidance:
+            extra_guidance = "RETRY GUIDANCE: " + stage_guidance + "\n"
+        else:
+            error_text = (original_status_message or "").lower()
+            hints = []
+            if any(kw in error_text for kw in ["test", "assert", "pytest", "jest", "vitest"]):
+                hints.append("Fix the specific failing tests shown in the error log before making other changes.")
+            if any(kw in error_text for kw in ["lint", "ruff", "eslint", "tsc"]):
+                hints.append("Fix lint/type errors first — run the linter before committing.")
+            if hints:
+                extra_guidance = "RETRY GUIDANCE: " + " ".join(hints) + "\n"
         failing_tests = ctx.get("_previous_failing_tests", [])
         error_files = ctx.get("_previous_error_files", [])
         current_failing = _extract_failing_tests(original_status_message or "")

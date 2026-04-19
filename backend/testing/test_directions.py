@@ -3279,6 +3279,20 @@ class TestPredictSpawnSuccessAcceptanceSignal:
         files = ["backend/app/a.py", "backend/app/b.py"]
         assert predict_spawn_success("small", {}, related_files=files) == 0.5
 
+    def test_related_files_scope_aware_thresholds(self):
+        """Medium scope uses shifted thresholds (7+/5+) so 5 files gets
+        the moderate penalty (0.6) rather than small's strong 0.3.
+        Small scope is unchanged — 5 files still gets 0.3."""
+        files = [f"backend/app/f{i}.py" for i in range(5)]
+        medium_score = predict_spawn_success("medium", {}, related_files=files)
+        small_score = predict_spawn_success("small", {}, related_files=files)
+        assert small_score == pytest.approx(0.3)
+        assert medium_score == pytest.approx(0.6)
+        assert medium_score > small_score
+        # Medium with 7 files hits the strong 0.3 penalty.
+        files7 = [f"backend/app/f{i}.py" for i in range(7)]
+        assert predict_spawn_success("medium", {}, related_files=files7) == pytest.approx(0.3)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _poor_decomp_history helper unit tests (suppression signal)

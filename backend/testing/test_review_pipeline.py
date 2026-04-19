@@ -20,10 +20,13 @@ from app.review_pipeline import (
     MAX_REVIEW_FIX_ITERATIONS,
     PIPELINE_TASK_STALE_MINUTES,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
+    STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR,
     STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT,
+    STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM,
     STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR,
     STUCK_CYCLE_THRESHOLD_DEFAULT,
+    STUCK_CYCLE_THRESHOLD_MEDIUM,
     STUCK_CYCLE_THRESHOLD_REFACTOR,
     _compute_scope_budget_utilization,
     _detect_issue_churn,
@@ -118,7 +121,7 @@ class TestMaxReviewIterations:
         """Tripwire: cap constants must not change without a deliberate review."""
         assert MAX_REVIEW_FIX_ITERATIONS == 16
         assert STUCK_CYCLE_THRESHOLD_DEFAULT == 0.5
-        assert STUCK_CYCLE_THRESHOLD_REFACTOR == 0.75
+        assert STUCK_CYCLE_THRESHOLD_REFACTOR == 0.65
 
     # ── Direction-aware reduction ─────────────────────────────────────────────
 
@@ -1093,8 +1096,8 @@ async def test_stuck_cycle_not_triggered_below_threshold(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_refactor_stuck_threshold_is_75pct(db_session, mocker):
-    """For refactor source tasks, the stuck threshold is 75%, not 50%.
+async def test_refactor_stuck_threshold_is_65pct(db_session, mocker):
+    """For refactor source tasks, the stuck threshold is 65%, not 50%.
     At exactly 60% repeat, a non-refactor would be stuck but a refactor is not."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
@@ -1137,7 +1140,7 @@ async def test_refactor_stuck_threshold_is_75pct(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    # 3 of 5 current issues repeat → 60%, below 75% refactor threshold.
+    # 3 of 5 current issues repeat → 60%, below 65% refactor threshold.
     current_issues = [
         _issue("structural issue 0", "CRITICAL"),  # repeats
         _issue("structural issue 1", "CRITICAL"),  # repeats
@@ -1156,14 +1159,14 @@ async def test_refactor_stuck_threshold_is_75pct(db_session, mocker):
     )
 
     assert result is not None, (
-        "60% repeat rate is below the 75% refactor threshold — spawn should proceed"
+        "60% repeat rate is below the 65% refactor threshold — spawn should proceed"
     )
     assert result.status == TaskStatus.QUEUED
 
 
 @pytest.mark.asyncio
 async def test_refactor_stuck_at_80pct(db_session, mocker):
-    """For refactor source tasks, 80% repeat rate exceeds the 75% threshold → stuck."""
+    """For refactor source tasks, 80% repeat rate exceeds the 65% threshold → stuck."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -1205,7 +1208,7 @@ async def test_refactor_stuck_at_80pct(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(source_task)
 
-    # 4 of 5 current issues repeat → 80% ≥ 75% → stuck.
+    # 4 of 5 current issues repeat → 80% ≥ 65% → stuck.
     current_issues = [
         _issue("arch issue 0", "CRITICAL"),
         _issue("arch issue 1", "CRITICAL"),
@@ -1223,10 +1226,77 @@ async def test_refactor_stuck_at_80pct(db_session, mocker):
         current_issues=current_issues,
     )
 
-    assert result is None, "80% repeat rate exceeds the 75% refactor threshold → stuck"
+    assert result is None, "80% repeat rate exceeds the 65% refactor threshold → stuck"
 
     await db_session.refresh(original_task)
     assert original_task.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_refactor_stuck_detected_earlier_at_70pct(db_session, mocker):
+    """Lowered refactor threshold (0.65) catches stuck cycles at 70% that the
+    previous 0.75 threshold would have let continue for additional iterations."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "refactor", "prompt": "Restructure", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # 10 prior CRITICAL issues; 7 of 10 current issues repeat → 70%.
+    prior_issues = [_issue(f"layer issue {i}", "CRITICAL") for i in range(10)]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "refactor", "pr_number": 305, "branch": "b5", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 305,
+                "branch": "b5",
+                "base_branch": "main",
+                "review_history": [
+                    {"iteration": 0, "feedback": "layer concerns", "issues": prior_issues},
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    current_issues = [_issue(f"layer issue {i}", "CRITICAL") for i in range(7)] + [
+        _issue("new A", "CRITICAL"),
+        _issue("new B", "CRITICAL"),
+        _issue("new C", "MAJOR"),
+    ]
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=305, branch="b5", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Partial",
+        current_feedback="Partial",
+        current_issues=current_issues,
+    )
+
+    assert result is None, (
+        "70% repeat rate meets the lowered 65% refactor threshold → stuck "
+        "(previously 0.75 would have let this continue)"
+    )
 
 
 # ── Edge cases ────────────────────────────────────────────────────────────────
@@ -1700,7 +1770,7 @@ def test_stuck_cycle_text_threshold_constants():
     """Tripwire: text-fallback thresholds must remain higher than the structured
     thresholds to compensate for the noisier comparison."""
     assert STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT == 0.7
-    assert STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR == 0.85
+    assert STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR == 0.75
     assert STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT > STUCK_CYCLE_THRESHOLD_DEFAULT
     assert STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR > STUCK_CYCLE_THRESHOLD_REFACTOR
 
@@ -1710,9 +1780,114 @@ def test_stuck_cycle_issue_similarity_threshold_constants():
     issues sharing only boilerplate tokens (e.g. processUser vs processOrder,
     Jaccard = 0.6) cannot trigger the secondary fallback."""
     assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT == 0.65
-    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR == 0.8
+    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR == 0.7
     assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT > 0.6
     assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR > 0.6
+
+
+def test_stuck_cycle_medium_thresholds_lower_than_default():
+    """Tripwire: medium-scope thresholds must sit below the defaults so that
+    higher-complexity tasks bail out of stuck cycles earlier."""
+    assert STUCK_CYCLE_THRESHOLD_MEDIUM == 0.4
+    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM == 0.55
+    assert STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM == 0.6
+    assert STUCK_CYCLE_THRESHOLD_MEDIUM < STUCK_CYCLE_THRESHOLD_DEFAULT
+    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM < STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT
+    assert STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM < STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT
+
+
+async def _run_stuck_scope_case(
+    db_session, mocker, *, scope: str, pr_number: int
+):
+    """Drive _spawn_pipeline_task at exactly 40% exact-issue repeat.
+
+    Returns the result tuple plus the reloaded original task so callers can
+    assert scope-conditional stuck behaviour.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # 2 of 5 current CRITICAL issues repeat → 40% exact-match, clears the
+    # 0.4 medium threshold but stays below the 0.5 default. New issues share
+    # no tokens with prior, keeping Jaccard below both rephrased thresholds.
+    prior_issues = [_issue(f"alpha issue {i}", "CRITICAL") for i in range(5)]
+    branch = f"b-{scope}"
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": pr_number, "branch": branch,
+                   "base_branch": "main", "original_task_id": str(original_task.id)}],
+        context={
+            "scope": scope,
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": pr_number,
+                "branch": branch,
+                "base_branch": "main",
+                "review_history": [
+                    {"iteration": 0, "feedback": "prev", "issues": prior_issues},
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    current_issues = [
+        _issue("alpha issue 0", "CRITICAL"),  # repeats
+        _issue("alpha issue 1", "CRITICAL"),  # repeats
+        _issue("zeta fresh concern", "CRITICAL"),
+        _issue("omega distinct finding", "CRITICAL"),
+        _issue("kappa separate worry", "CRITICAL"),
+    ]
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=pr_number, branch=branch, base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Partial",
+        current_feedback="Partial",
+        current_issues=current_issues,
+    )
+    await db_session.refresh(original_task)
+    return result, original_task
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_medium_scope_triggers_at_40pct(db_session, mocker):
+    """Medium-scope tasks trigger the stuck cycle at 40% exact-match repeat."""
+    result, original_task = await _run_stuck_scope_case(
+        db_session, mocker, scope="medium", pr_number=701
+    )
+    assert result is None, "Medium scope must stuck-detect at the lower 0.4 threshold"
+    assert original_task.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_small_scope_unaffected_at_40pct(db_session, mocker):
+    """Small-scope tasks keep the 0.5 default threshold and pass through at 40%."""
+    result, original_task = await _run_stuck_scope_case(
+        db_session, mocker, scope="small", pr_number=702
+    )
+    assert result is not None, (
+        "Small scope must not trigger at 40% — default threshold remains 0.5"
+    )
+    assert result.status == TaskStatus.QUEUED
+    assert original_task.requires_approval is not True
 
 
 @pytest.mark.asyncio
@@ -1798,7 +1973,11 @@ async def test_stuck_cycle_rephrased_fallback_ignores_distinct_targets(db_sessio
     """Issues sharing boilerplate tokens but targeting genuinely different
     symbols must NOT trip the rephrased-issue fallback. 'Missing error
     handling in processUser' vs 'Missing error handling in processOrder'
-    yields Jaccard = 0.6, just below the 0.65 default threshold."""
+    yields Jaccard = 0.6, just below the 0.65 default threshold.
+
+    Scoped to 'small' because medium-scope now uses a 0.55 threshold and
+    would (correctly, for its tighter budget) treat 0.6 as a stuck cycle.
+    """
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
@@ -1822,7 +2001,7 @@ async def test_stuck_cycle_rephrased_fallback_ignores_distinct_targets(db_sessio
         payloads=[{"type": "create", "pr_number": 402, "branch": "b2", "base_branch": "main",
                    "original_task_id": str(original_task.id)}],
         context={
-            "scope": "medium",
+            "scope": "small",
             "review_loop": {
                 "iteration": 1,
                 "original_task_id": str(original_task.id),

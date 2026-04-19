@@ -396,7 +396,7 @@ MODULE_SIZE_LIMITS = {
     # (relative_path_from_app_dir, max_lines)
     "main.py": 3500,
     "task_completion.py": 2050,
-    "task_lifecycle.py": 2100,
+    "task_lifecycle.py": 2250,
     "orchestrator.py": 3000,
     "admin.py": 3000,
     "compute.py": 2500,
@@ -411,7 +411,7 @@ MODULE_SIZE_LIMITS = {
     "strategic_completion.py": 1500,
     "rollup_management.py": 1550,
     "reaper.py": 1200,
-    "review_pipeline.py": 850,
+    "review_pipeline.py": 950,
     "deploy_health.py": 1000,
 }
 

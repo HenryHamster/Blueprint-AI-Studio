@@ -2955,7 +2955,7 @@ class TestRefactorDeferralLogic:
 
 
 class TestStuckCycleThreshold:
-    """Blocker 2: Refactor-type source tasks should use a 75% repeat threshold
+    """Blocker 2: Refactor-type source tasks should use an elevated repeat threshold
     so structural review feedback that can't be fully resolved doesn't prematurely
     escalate to requires_approval."""
 
@@ -2964,7 +2964,8 @@ class TestStuckCycleThreshold:
         return STUCK_CYCLE_THRESHOLD_REFACTOR if source_type == "refactor" else STUCK_CYCLE_THRESHOLD_DEFAULT
 
     def test_refactor_threshold_is_75(self):
-        assert self._stuck_threshold("refactor") == 0.75
+        assert self._stuck_threshold("refactor") == STUCK_CYCLE_THRESHOLD_REFACTOR
+        assert STUCK_CYCLE_THRESHOLD_REFACTOR > STUCK_CYCLE_THRESHOLD_DEFAULT
 
     def test_create_threshold_is_50(self):
         assert self._stuck_threshold("create") == 0.5
@@ -2976,12 +2977,12 @@ class TestStuckCycleThreshold:
         assert self._stuck_threshold("plan") == 0.5
 
     def test_refactor_60pct_repeat_not_stuck(self):
-        """60% repeat rate is below the 75% refactor threshold — should NOT escalate."""
+        """60% repeat rate is below the refactor threshold — should NOT escalate."""
         matched_count, total_count = 3, 5
         assert matched_count / total_count < self._stuck_threshold("refactor")
 
     def test_refactor_80pct_repeat_is_stuck(self):
-        """80% repeat rate exceeds 75% refactor threshold — should escalate."""
+        """80% repeat rate exceeds the refactor threshold — should escalate."""
         matched_count, total_count = 4, 5
         assert matched_count / total_count >= self._stuck_threshold("refactor")
 

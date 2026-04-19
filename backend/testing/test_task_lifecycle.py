@@ -1681,6 +1681,54 @@ class TestBuildRetryPromptSuffix:
         assert "backend/app/main.py" in guidance
         assert "agent/src/index.ts" in guidance
 
+    def test_code_error_stage_test_guidance(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "something unexpected", attempt=1, task_scope="small",
+            ctx={"_previous_failure_stage": "test"},
+        )
+        assert "test stage" in guidance
+        assert "different approach" in guidance
+
+    def test_code_error_stage_lint_guidance(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "something unexpected", attempt=1, task_scope="small",
+            ctx={"_previous_failure_stage": "lint"},
+        )
+        assert "lint stage" in guidance
+        assert "type errors" in guidance
+
+    def test_code_error_stage_build_guidance(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "something unexpected", attempt=1, task_scope="small",
+            ctx={"_previous_failure_stage": "build"},
+        )
+        assert "build stage" in guidance
+        assert "import paths" in guidance
+
+    def test_code_error_stage_merge_guidance(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "something unexpected", attempt=1, task_scope="small",
+            ctx={"_previous_failure_stage": "merge"},
+        )
+        assert "merge stage" in guidance
+        assert "merge conflicts" in guidance
+
+    def test_code_error_stage_takes_precedence_over_keyword(self):
+        """When stage is set, use stage guidance instead of keyword-matched hints."""
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "pytest assertion failed", attempt=1, task_scope="small",
+            ctx={"_previous_failure_stage": "lint"},
+        )
+        assert "lint stage" in guidance
+        assert "failing tests" not in guidance.lower()
+
+    def test_code_error_unknown_stage_falls_back_to_keyword(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "pytest assertion failed", attempt=1, task_scope="small",
+            ctx={"_previous_failure_stage": "provision"},
+        )
+        assert "failing tests" in guidance.lower()
+
     def test_agent_timeout_oom_subtype_guidance(self):
         guidance, _ = _build_retry_prompt_suffix(
             "AGENT_TIMEOUT", "exit code 137 out of memory",

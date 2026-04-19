@@ -728,6 +728,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     "[RESEARCH] Adaptive exploration fraction for direction %s: rate=%.2f (%d/%d), frac=%.3f",
                     _pred_dir_id, _exp_rate, _exp_merged, _exp_created, float(_explore_frac),
                 )
+            elif _exp_created == 0 and isinstance(_explore_frac, (int, float)):
+                # No direction-level exploration history: use pipeline-wide medium
+                # merge rate as a prior so new directions don't burn attempts at the
+                # optimistic fixed default when the pipeline is underperforming.
+                _pipeline_rates = _runtime_config.get("pipeline_scope_merge_rates") or {}
+                _pipeline_medium = _pipeline_rates.get("medium")
+                if isinstance(_pipeline_medium, (int, float)) and _pipeline_medium < 0.5:
+                    _base = float(_explore_frac)
+                    _explore_frac = _base * (float(_pipeline_medium) / 0.5)
+                    logger.info(
+                        "[RESEARCH] Pipeline-prior exploration fraction for direction %s: "
+                        "pipeline_medium=%.2f, frac=%.3f",
+                        _pred_dir_id, float(_pipeline_medium), float(_explore_frac),
+                    )
             if isinstance(_explore_frac, (int, float)) and _explore_frac > 0 and random.random() < float(_explore_frac):
                 _medium_exploration = True
                 logger.info("[RESEARCH] Exploration bypass keeping medium scope for '%s' (P=%.2f, explore_frac=%.2f)",
