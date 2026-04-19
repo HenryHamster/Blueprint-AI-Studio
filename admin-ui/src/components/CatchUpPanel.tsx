@@ -103,6 +103,9 @@ interface DirectionProgress {
   acceptance_rate?: number | null;
   first_attempt_success_rate?: number | null;
   cost_per_merged_pr?: number | null;
+  estimated_cost_usd?: number | null;
+  cost_by_scope?: Record<string, number> | null;
+  avg_time_to_merge_hours?: number | null;
   auto_paused?: boolean;
   paused_reason?: string | null;
   needs_manual_intervention?: boolean;
@@ -115,6 +118,27 @@ interface DirectionProgress {
   lifetime_prs_rejected?: number;
   lifetime_tasks_failed?: number;
   lifetime_conversion_rate?: number | null;
+  review_quality?: {
+    reviews_dismissed?: number;
+    reviews_overridden?: number;
+    user_issues_caught?: number;
+  } | null;
+  filter_funnel?: {
+    findings_produced?: number;
+    hash_dedup?: number;
+    word_overlap?: number;
+    file_overlap?: number;
+    type_filtered?: number;
+    empty_prompt?: number;
+    batch_cap?: number;
+    tasks_created?: number;
+  } | null;
+  decomposition_summary?: {
+    plans_assessed?: number;
+    avg_subtask_merge_rate?: number | null;
+    avg_subtask_count?: number;
+    avg_cross_module_count?: number;
+  } | null;
 }
 
 interface ActiveTask {
@@ -470,6 +494,13 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                     ${dp.cost_per_merged_pr.toFixed(2)}/PR
                   </span>
                 )}
+                {typeof dp.avg_time_to_merge_hours === 'number' && dp.avg_time_to_merge_hours > 0 && (
+                  <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded font-mono" title="Average hours from PR creation to merge">
+                    {dp.avg_time_to_merge_hours < 1
+                      ? `${Math.round(dp.avg_time_to_merge_hours * 60)}m/merge`
+                      : `${dp.avg_time_to_merge_hours.toFixed(1)}h/merge`}
+                  </span>
+                )}
               </div>
             </button>
             {isExpanded && (
@@ -546,6 +577,74 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                   return (
                     <span className="text-[9px] text-neutral-500">
                       Lifetime: {cycles} cycle{cycles !== 1 ? 's' : ''} · {merged} merged · {failed} failed · {conv} conversion
+                    </span>
+                  );
+                })()}
+                {(() => {
+                  const rq = dp.review_quality;
+                  if (!rq) return null;
+                  const dismissed = rq.reviews_dismissed ?? 0;
+                  const overridden = rq.reviews_overridden ?? 0;
+                  const caught = rq.user_issues_caught ?? 0;
+                  if (!dismissed && !overridden && !caught) return null;
+                  const parts: string[] = [];
+                  if (dismissed) parts.push(`${dismissed} dismissed`);
+                  if (overridden) parts.push(`${overridden} overridden`);
+                  if (caught) parts.push(`${caught} issues caught`);
+                  return (
+                    <span className="text-[9px] text-neutral-500">
+                      Review feedback: {parts.join(' · ')}
+                    </span>
+                  );
+                })()}
+                {(() => {
+                  const ff = dp.filter_funnel;
+                  if (!ff) return null;
+                  const produced = ff.findings_produced ?? 0;
+                  const created = ff.tasks_created ?? 0;
+                  if (!produced && !created) return null;
+                  const filters: string[] = [];
+                  if (ff.hash_dedup) filters.push(`${ff.hash_dedup} hash`);
+                  if (ff.word_overlap) filters.push(`${ff.word_overlap} word`);
+                  if (ff.file_overlap) filters.push(`${ff.file_overlap} file`);
+                  if (ff.type_filtered) filters.push(`${ff.type_filtered} type`);
+                  if (ff.empty_prompt) filters.push(`${ff.empty_prompt} empty`);
+                  if (ff.batch_cap) filters.push(`${ff.batch_cap} cap`);
+                  const conv = produced > 0 ? ` (${Math.round((created / produced) * 100)}%)` : '';
+                  return (
+                    <span className="text-[9px] text-neutral-500">
+                      Funnel: {produced} findings → {created} tasks{conv}
+                      {filters.length > 0 ? ` · filtered: ${filters.join(' · ')}` : ''}
+                    </span>
+                  );
+                })()}
+                {(() => {
+                  const ds = dp.decomposition_summary;
+                  if (!ds || !ds.plans_assessed) return null;
+                  const rate = typeof ds.avg_subtask_merge_rate === 'number'
+                    ? `${Math.round(ds.avg_subtask_merge_rate * 100)}%`
+                    : '—';
+                  const count = typeof ds.avg_subtask_count === 'number' ? ds.avg_subtask_count : null;
+                  return (
+                    <span className="text-[9px] text-neutral-500">
+                      Plan quality: {rate} subtask merge rate across {ds.plans_assessed} plan{ds.plans_assessed !== 1 ? 's' : ''}
+                      {count !== null ? ` · avg ${count} subtasks` : ''}
+                    </span>
+                  );
+                })()}
+                {(() => {
+                  const total = dp.estimated_cost_usd ?? 0;
+                  if (!total) return null;
+                  const breakdown = dp.cost_by_scope
+                    ? Object.entries(dp.cost_by_scope)
+                        .filter(([, v]) => typeof v === 'number' && v > 0)
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([scope, v]) => `${scope} $${v.toFixed(2)}`)
+                        .join(' · ')
+                    : '';
+                  return (
+                    <span className="text-[9px] text-neutral-500 font-mono">
+                      Cost: ${total.toFixed(2)}{breakdown ? ` — ${breakdown}` : ''}
                     </span>
                   );
                 })()}
@@ -1357,6 +1456,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       const cost = costByTaxonomy[cat];
                       const trend = trendFor(cat);
                       const isActive = activeTaxonomyFilter === cat;
+                      const isDominant = digest!.failure_taxonomy_distribution!.dominant_category === cat;
                       return (
                         <button
                           key={cat}
@@ -1367,9 +1467,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             setFailuresExpanded(true);
                           }}
                           aria-pressed={isActive}
-                          className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border transition-all ${TAXONOMY_COLORS[cat]} ${isActive ? 'ring-2 ring-white/60' : 'hover:opacity-80'}`}
-                          title={`${TAXONOMY_LABELS[cat]}: ${entry.count} (${Math.round(entry.percentage)}%)${cost ? ` · $${cost.toFixed(2)}` : ''} — click to ${isActive ? 'clear' : 'filter'}`}
+                          className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border transition-all ${TAXONOMY_COLORS[cat]} ${isActive ? 'ring-2 ring-white/60' : isDominant ? 'ring-1 ring-amber-300/70 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]' : 'hover:opacity-80'}`}
+                          title={`${TAXONOMY_LABELS[cat]}: ${entry.count} (${Math.round(entry.percentage)}%)${cost ? ` · $${cost.toFixed(2)}` : ''}${isDominant ? ' — dominant category' : ''} — click to ${isActive ? 'clear' : 'filter'}`}
                         >
+                          {isDominant && <span aria-label="dominant" className="text-amber-300">★</span>}
                           {TAXONOMY_LABELS[cat]}
                           <span className="font-bold">{entry.count}</span>
                           <span className={`font-bold ${trend.color}`}>{trend.arrow}</span>
@@ -1402,6 +1503,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     const count = digest!.failure_stage_distribution!.stages[stage];
                     if (!count) return null;
                     const isActive = activeStageFilter === stage;
+                    const isDominant = digest!.failure_stage_distribution!.dominant_stage === stage;
                     return (
                       <button
                         key={stage}
@@ -1412,9 +1514,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           setFailuresExpanded(true);
                         }}
                         aria-pressed={isActive}
-                        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border transition-all ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'} ${isActive ? 'ring-2 ring-white/60' : 'hover:opacity-80'}`}
-                        title={`${stage}: ${count} — click to ${isActive ? 'clear' : 'filter'}`}
+                        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border transition-all ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'} ${isActive ? 'ring-2 ring-white/60' : isDominant ? 'ring-1 ring-amber-300/70 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]' : 'hover:opacity-80'}`}
+                        title={`${stage}: ${count}${isDominant ? ' — dominant stage' : ''} — click to ${isActive ? 'clear' : 'filter'}`}
                       >
+                        {isDominant && <span aria-label="dominant" className="text-amber-300">★</span>}
                         {stage}
                         <span className="font-bold">{count}</span>
                       </button>
