@@ -97,8 +97,12 @@ interface DirectionProgress {
   tasks_created: number;
   prs_merged: number;
   possibly_saturated: boolean;
+  possibly_complete?: boolean;
+  completion_criteria?: string | null;
+  completion_suggestion?: string | null;
   latest_insights?: string[];
   recent_finding_titles?: string[];
+  recent_failure_titles?: string[];
   latest_research_at?: string | null;
   prs_rejected?: number;
   acceptance_rate?: number | null;
@@ -279,6 +283,16 @@ interface DigestData {
   pipeline_conversion_rate?: number | null;
   overall_product_ratio?: number | null;
   pipeline_filter_funnel?: Record<string, number> | null;
+  latest_cycle?: {
+    cycle_id?: string | null;
+    started_at?: string | null;
+    completed_at?: string | null;
+    outcome?: string | null;
+    directions_created?: number | null;
+    directions_retired?: number | null;
+    vision_updated?: boolean | null;
+    summary_text?: string | null;
+  } | null;
   remediation_funnel?: {
     investigations_spawned: number;
     investigations_completed: number;
@@ -536,6 +550,11 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                     needs intervention
                   </span>
                 )}
+                {dp.possibly_complete && (
+                  <span className="text-[9px] bg-sky-500/10 text-sky-400 border border-sky-500/20 px-1.5 py-0.5 rounded" title={dp.completion_suggestion || "Direction may be complete"}>
+                    possibly complete
+                  </span>
+                )}
                 {dp.priority && (
                   <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="Direction priority">
                     {dp.priority}
@@ -567,10 +586,24 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
             </button>
             {isExpanded && (
               <div className="mt-1 ml-5 flex flex-col gap-1">
+                {dp.completion_criteria && (
+                  <span className="text-[10px] text-neutral-400">Completion: {dp.completion_criteria}</span>
+                )}
+                {dp.completion_suggestion && (
+                  <span className="text-[10px] text-neutral-500 italic">{dp.completion_suggestion}</span>
+                )}
                 {dp.recent_finding_titles && dp.recent_finding_titles.length > 0 && (
                   <div className="flex flex-col gap-0.5">
                     {dp.recent_finding_titles.slice(0, 3).map((title, i) => (
                       <span key={i} className="text-[10px] text-neutral-400">· {title}</span>
+                    ))}
+                  </div>
+                )}
+                {dp.recent_failure_titles && dp.recent_failure_titles.length > 0 && (
+                  <div className="flex flex-col gap-0.5">
+                    <span className="text-[9px] text-red-400 uppercase tracking-wide">recent failures:</span>
+                    {dp.recent_failure_titles.slice(0, 3).map((title, i) => (
+                      <span key={i} className="text-[10px] text-red-300">· {title}</span>
                     ))}
                   </div>
                 )}
@@ -773,6 +806,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
   const [failuresExpanded, setFailuresExpanded] = useState(false);
   const [completionsExpanded, setCompletionsExpanded] = useState(false);
   const [remediationExpanded, setRemediationExpanded] = useState(false);
+  const [cycleSummaryExpanded, setCycleSummaryExpanded] = useState(false);
   const [expandedSnippets, setExpandedSnippets] = useState<Set<string>>(new Set());
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [activeTaxonomyFilter, setActiveTaxonomyFilter] = useState<string | null>(null);
@@ -1104,6 +1138,43 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     >
                       {digest!.trend === 'improving' ? 'Improving' : digest!.trend === 'declining' ? 'Declining' : 'Stable'}
                     </span>
+                  )}
+                </div>
+              )}
+              {digest!.latest_cycle && (
+                <div className="flex flex-col gap-1 p-2 rounded border border-neutral-800 bg-neutral-900/40">
+                  <div className="flex items-center gap-2 text-[11px]">
+                    <span className="font-semibold text-neutral-400">Latest strategic cycle</span>
+                    {digest!.latest_cycle.outcome && (
+                      <span className="px-1.5 py-0.5 rounded border text-[10px] bg-neutral-800/60 text-neutral-300 border-neutral-700">
+                        {digest!.latest_cycle.outcome}
+                      </span>
+                    )}
+                    {digest!.latest_cycle.completed_at && (
+                      <span className="text-[10px] text-neutral-600 font-mono">{timeAgo(digest!.latest_cycle.completed_at)}</span>
+                    )}
+                    <span className="text-[10px] text-neutral-500">
+                      +{digest!.latest_cycle.directions_created ?? 0} / −{digest!.latest_cycle.directions_retired ?? 0} directions
+                    </span>
+                    {digest!.latest_cycle.vision_updated && (
+                      <span className="text-[10px] text-cyan-400">vision updated</span>
+                    )}
+                  </div>
+                  {digest!.latest_cycle.summary_text && (
+                    <div className="text-[11px] text-neutral-400 leading-relaxed">
+                      {cycleSummaryExpanded || digest!.latest_cycle.summary_text.length <= 200
+                        ? digest!.latest_cycle.summary_text
+                        : digest!.latest_cycle.summary_text.slice(0, 200) + '…'}
+                      {digest!.latest_cycle.summary_text.length > 200 && (
+                        <button
+                          type="button"
+                          onClick={() => setCycleSummaryExpanded(v => !v)}
+                          className="ml-1 text-[10px] text-cyan-500 hover:text-cyan-400"
+                        >
+                          {cycleSummaryExpanded ? 'less' : 'more'}
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
               )}
