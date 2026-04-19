@@ -1005,6 +1005,64 @@ async def test_scope_breakdown_failed_scope_overflow_counter(db_session: AsyncSe
 
 
 @pytest.mark.asyncio
+async def test_scope_breakdown_failed_analysis_overflow_counter(db_session: AsyncSession):
+    """scope_gate_triggered='analysis_overflow' increments failed_analysis_overflow.
+
+    Other scope_gate values (post_review_overflow) and non-analysis failures
+    leave the counter untouched — a stronger mismatch signal than generic
+    SCOPE_OVERFLOW, used by spawn_calibration to detect systemic scope
+    misestimation.
+    """
+    direction_id = "d-analysis-overflow"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    await db_session.flush()
+
+    # medium + analysis_overflow
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "medium", "failure_category": "SCOPE_OVERFLOW",
+                 "scope_gate_triggered": "analysis_overflow"},
+        payloads=[{"type": "create"}],
+        title="m-ao", latest_status_message="analysis overflow",
+    )
+    # medium + post_review_overflow — must NOT increment
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "medium", "failure_category": "SCOPE_OVERFLOW",
+                 "scope_gate_triggered": "post_review_overflow"},
+        payloads=[{"type": "create"}],
+        title="m-pro", latest_status_message="post review overflow",
+    )
+    # small + no scope_gate
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "small", "failure_category": "CODE_ERROR"},
+        payloads=[{"type": "create"}],
+        title="s-code", latest_status_message="test failed",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    sb = project.directions[0]["research_history"][0]["scope_breakdown"]
+    assert sb["medium"]["failed_analysis_overflow"] == 1
+    assert sb["small"]["failed_analysis_overflow"] == 0
+
+
+@pytest.mark.asyncio
 async def test_scope_breakdown_failure_stages_per_scope(db_session: AsyncSession):
     """failure_stages counts per-stage failures within each scope bucket."""
     direction_id = "d-stages"

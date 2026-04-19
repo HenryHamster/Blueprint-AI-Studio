@@ -961,7 +961,19 @@ async def _spawn_pipeline_task(
     # it on subsequent review/fix iterations for this chain.
     prior_hard_cap = source_ctx.get('_scope_budget_hard_cap')
     effective_hard_cap = scope_budget_hard_cap
-    if isinstance(prior_hard_cap, int) and prior_hard_cap > 0:
+    # Only propagate a prior hard cap while the PR is still under scope pressure.
+    # If utilization has dropped below the warn threshold (or is unknown), the
+    # fix chain has successfully narrowed its footprint and the iteration
+    # restriction is no longer warranted — let the cap relax back to per_chain_cap.
+    _prior_cap_still_relevant = (
+        utilization is not None
+        and utilization.get("percentage", 0) >= SCOPE_PRESSURE_WARN_THRESHOLD * 100
+    )
+    if (
+        isinstance(prior_hard_cap, int)
+        and prior_hard_cap > 0
+        and _prior_cap_still_relevant
+    ):
         effective_hard_cap = (
             min(effective_hard_cap, prior_hard_cap)
             if effective_hard_cap is not None else prior_hard_cap

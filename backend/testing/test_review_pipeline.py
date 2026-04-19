@@ -2617,6 +2617,78 @@ async def test_scope_pressure_inactive_below_warn_threshold(db_session, mocker):
     assert "SCOPE BUDGET EXHAUSTED" not in (payload.get("prompt") or "")
 
 
+@pytest.mark.asyncio
+async def test_prior_hard_cap_propagates_while_under_pressure(db_session, mocker):
+    """A prior hard cap on the source task is carried forward to the spawn when
+    current utilization is still ≥ warn threshold."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 710, "branch": "feat/gc10",
+                   "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            # 5/7 non-test = 71% (above warn threshold)
+            "_pr_changed_files": [
+                "backend/app/a.py", "backend/app/b.py", "backend/app/c.py",
+                "backend/app/d.py", "backend/app/e.py",
+                "backend/testing/test_a.py",
+            ],
+            "_scope_budget_hard_cap": 2,  # tighter than any freshly-derived cap
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=710, branch="feat/gc10", base_branch="main",
+        fix_prompt="fix",
+    )
+    ctx = result.context or {}
+    # Prior cap (2) is tighter than freshly-derived (4), so min wins.
+    assert ctx.get("_scope_budget_hard_cap") == 2
+
+
+@pytest.mark.asyncio
+async def test_prior_hard_cap_relaxes_when_utilization_drops(db_session, mocker):
+    """A prior hard cap is NOT propagated once the PR file footprint has dropped
+    below the warn threshold — the iteration restriction relaxes back."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 711, "branch": "feat/gc11",
+                   "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            # 4/7 non-test = 57% — below warn threshold
+            "_pr_changed_files": [f"backend/app/p{i}.py" for i in range(4)],
+            "_scope_budget_hard_cap": 3,  # prior cap from a tighter earlier spawn
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=711, branch="feat/gc11", base_branch="main",
+        fix_prompt="fix",
+    )
+    ctx = result.context or {}
+    # Utilization below warn threshold → prior cap must NOT propagate.
+    assert "_scope_budget_hard_cap" not in ctx
+
+
 # ── filter_pipeline_duplicates: pre-dispatch dedup safety net ─────────────────
 
 

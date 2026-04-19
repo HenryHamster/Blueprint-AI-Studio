@@ -3829,6 +3829,23 @@ class TestCalibrateFindingScope:
         assert scope == "large"
         assert cal == "medium"
 
+    def test_adaptive_threshold_exceeds_0_6_when_pipeline_medium_very_low(self, monkeypatch):
+        """When pipeline medium rate is below 0.10, the adaptive threshold
+        should exceed the old 0.6 ceiling so catastrophic medium performance
+        escalates more borderline findings."""
+        from app.shared_state import runtime_config
+        # Score 0.61 is above old ceiling (0.6) but below new adaptive
+        # threshold (0.45 + (0.4-0.05)*0.5 = 0.625) — should escalate.
+        monkeypatch.setattr(
+            "app.research_completion._composite_complexity_score",
+            lambda files, direction, cochange: (0.61, {"sig": "borderline"}),
+        )
+        monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {"medium": 0.05})
+        finding = {"title": "t", "related_files": self._single_module_files(2)}
+        scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
+        assert scope == "large"
+        assert cal == "medium"
+
     def test_adaptive_threshold_baseline_when_pipeline_medium_healthy(self, monkeypatch):
         """Score of 0.5 passes through when pipeline medium rate is healthy."""
         from app.shared_state import runtime_config

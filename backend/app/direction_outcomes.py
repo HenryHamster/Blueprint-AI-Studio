@@ -342,6 +342,7 @@ async def _update_direction_research_outcomes(
                     scope_breakdown[s] = {
                         "created": 0, "merged": 0, "failed": 0, "failed_infra": 0,
                         "failed_code_error": 0, "failed_scope_overflow": 0,
+                        "failed_analysis_overflow": 0,
                         "calibrated_in": 0, "calibrated_out": 0,
                         "exploration_created": 0, "exploration_merged": 0,
                         "exploration_failed": 0,
@@ -375,6 +376,8 @@ async def _update_direction_research_outcomes(
                         scope_breakdown[scope]["failed_code_error"] += 1
                     elif fcat == SCOPE_OVERFLOW:
                         scope_breakdown[scope]["failed_scope_overflow"] += 1
+                    if ctx_.get("scope_gate_triggered") == "analysis_overflow":
+                        scope_breakdown[scope]["failed_analysis_overflow"] += 1
                     stage_name = (
                         ctx_.get("_previous_failure_stage")
                         or _derive_failure_stage(fcat, ct.latest_status_message or "")

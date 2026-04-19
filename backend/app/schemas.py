@@ -25,6 +25,7 @@ class AgentStatusPayload(BaseModel):
     logs: str | None = Field(None, max_length=500000)
     verdict_json: str | None = Field(None, max_length=10000)
     failure_category: str | None = Field(None, max_length=50)
+    scope_gate_triggered: str | None = Field(None, max_length=50)
     changed_files: List[str] | None = Field(None, max_length=100)
     test_failure_summary: str | None = Field(None, max_length=5000)
     self_review_outcome: Dict[str, Any] | None = None

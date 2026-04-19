@@ -438,6 +438,11 @@ async def update_agent_status(
         ctx = dict(task.context or {})
         ctx['failure_category'] = normalize_agent_failure_category(payload.failure_category, task)
         task.context = ctx
+    if payload.scope_gate_triggered:
+        ctx = dict(task.context or {})
+        ctx['scope_gate_triggered'] = payload.scope_gate_triggered
+        task.context = ctx
+        flag_modified(task, 'context')
     if payload.file_change_details:
         ctx = dict(task.context or {})
         ctx['_file_change_details'] = payload.file_change_details[:50]

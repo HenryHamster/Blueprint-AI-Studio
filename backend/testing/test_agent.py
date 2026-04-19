@@ -4134,6 +4134,55 @@ async def test_file_change_details_stored_in_task_context(client: AsyncClient, d
 
 
 @pytest.mark.asyncio
+async def test_scope_gate_triggered_stored_in_task_context(client: AsyncClient, db_session, mocker):
+    """Agent status with scope_gate_triggered='analysis_overflow' persists
+    the value to task.context so direction_outcomes can differentiate
+    analysis-phase overflow from post-implementation overflow."""
+    from app.routers.agent import _terminated_task_ids
+
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+
+    project = Project(name="Scope Gate Test", user_id="test-user-sg")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-sg",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    _terminated_task_ids.pop(task_id_str, None)
+
+    token = create_agent_token(str(task.id), "agent-vm-sg")
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "ERROR_LOG",
+        "logs": "analysis phase could not plan within budget",
+        "failure_category": "scope_overflow",
+        "scope_gate_triggered": "analysis_overflow",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("scope_gate_triggered") == "analysis_overflow", (
+        f"Expected scope_gate_triggered in task.context, got: {ctx}"
+    )
+
+    _terminated_task_ids.pop(task_id_str, None)
+
+
+@pytest.mark.asyncio
 async def test_agent_status_pr_artifact_stores_enriched_context(client: AsyncClient, db_session, mocker):
     """COMPLETED+PULL_REQUEST status with diff_summary, self_review_outcome, and
     test_failure_summary stores them in task context as _pr_diff_summary,

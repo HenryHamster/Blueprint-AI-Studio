@@ -3312,6 +3312,83 @@ class TestPredictSpawnSuccessAcceptanceSignal:
         files7 = [f"backend/app/f{i}.py" for i in range(7)]
         assert predict_spawn_success("medium", {}, related_files=files7) == pytest.approx(0.3)
 
+    def test_analysis_overflow_dominance_penalizes_medium(self):
+        """50%+ of medium failures being analysis_overflow triggers 0.2 penalty."""
+        # 2 medium failures, both analysis_overflow — scope merge rate = 0/2 = 0.0
+        # with weight 2.0, plus analysis_overflow signal 0.2 at weight 1.5.
+        d = {
+            "research_history": [
+                {
+                    "scope_breakdown": {
+                        "medium": {
+                            "created": 2, "merged": 0, "failed": 2,
+                            "failed_infra": 2, "failed_scope_overflow": 2,
+                            "failed_analysis_overflow": 2,
+                        },
+                    },
+                },
+            ],
+        }
+        # Signal 1: 0/2 = 0.0 weight 2.0
+        # Signal 10: 0.2 weight 1.5
+        # Signal 3 omitted (tasks_created=0 in history entry)
+        expected = (0.0 * 2.0 + 0.2 * 1.5) / (2.0 + 1.5)
+        assert predict_spawn_success("medium", d) == pytest.approx(expected)
+
+    def test_analysis_overflow_below_threshold_omitted(self):
+        """<50% analysis_overflow share of failures does not trigger signal 10."""
+        d = {
+            "research_history": [
+                {
+                    "scope_breakdown": {
+                        "medium": {
+                            "created": 5, "merged": 1, "failed": 4,
+                            "failed_infra": 4, "failed_scope_overflow": 4,
+                            "failed_analysis_overflow": 1,
+                        },
+                    },
+                },
+            ],
+        }
+        # Only signal 1: merge rate = 1/5 = 0.2
+        assert predict_spawn_success("medium", d) == pytest.approx(0.2)
+
+    def test_analysis_overflow_sample_too_small_omitted(self):
+        """Single failure (sample < 2) does not trigger signal 10 even at 100%."""
+        d = {
+            "research_history": [
+                {
+                    "scope_breakdown": {
+                        "medium": {
+                            "created": 1, "merged": 0, "failed": 1,
+                            "failed_infra": 1, "failed_scope_overflow": 1,
+                            "failed_analysis_overflow": 1,
+                        },
+                    },
+                },
+            ],
+        }
+        # effective = 1 < 2 → signal 1 omitted; signal 10 also requires failed>=2
+        assert predict_spawn_success("medium", d) == 0.5
+
+    def test_analysis_overflow_small_scope_not_affected(self):
+        """Signal 10 is medium-only."""
+        d = {
+            "research_history": [
+                {
+                    "scope_breakdown": {
+                        "small": {
+                            "created": 2, "merged": 0, "failed": 2,
+                            "failed_infra": 2, "failed_scope_overflow": 2,
+                            "failed_analysis_overflow": 2,
+                        },
+                    },
+                },
+            ],
+        }
+        # Only signal 1: 0/2 = 0.0
+        assert predict_spawn_success("small", d) == pytest.approx(0.0)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _poor_decomp_history helper unit tests (suppression signal)

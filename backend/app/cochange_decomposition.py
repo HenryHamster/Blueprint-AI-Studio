@@ -250,6 +250,28 @@ def auto_decompose_findings_by_cochange(
                         f"{f_title} (cluster {ci + 1}/{len(f_clusters)})"
                     )
                     sub["auto_decomposed"] = True
+                    file_lines = "\n".join(f"- {p}" for p in cluster)
+                    other_count = len(f_clusters) - 1
+                    noun = "cluster" if other_count == 1 else "clusters"
+                    preamble = (
+                        f"## Scope boundary (cluster {ci + 1}/{len(f_clusters)})\n"
+                        "This task is one part of a larger finding that was "
+                        "auto-decomposed by co-change clustering. Focus your "
+                        "implementation exclusively on this cluster's "
+                        f"{len(cluster)} file(s):\n"
+                        f"{file_lines}\n"
+                        f"{other_count} other {noun} cover the remaining "
+                        "files from the original finding and will be handled "
+                        "by separate tasks. "
+                        "Do not modify files outside this cluster — edits to "
+                        "other files belong to the sibling tasks.\n\n"
+                    )
+                    if sub.get("prompt"):
+                        sub["prompt"] = preamble + sub["prompt"]
+                    elif sub.get("description"):
+                        sub["description"] = preamble + sub["description"]
+                    else:
+                        sub["prompt"] = preamble
                     sub_hash = finding_hash_fn(
                         sub["title"], sub.get("description", "")
                     )

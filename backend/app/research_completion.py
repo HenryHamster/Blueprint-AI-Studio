@@ -272,7 +272,7 @@ def _calibrate_finding_scope(
                 _runtime_config.get("pipeline_scope_merge_rates") or {}
             ).get("medium")
             if isinstance(_pipeline_medium, (int, float)) and _pipeline_medium < 0.4:
-                _cc_threshold = min(0.6, 0.45 + (0.4 - float(_pipeline_medium)) * 0.5)
+                _cc_threshold = min(0.75, 0.45 + (0.4 - float(_pipeline_medium)) * 0.5)
             if _cc_score < _cc_threshold:
                 logger.info(
                     "[RESEARCH] Upgrading scope medium→large for '%s' "

@@ -134,10 +134,14 @@ def _aggregate_scope_breakdown(history_entries: list[dict]) -> dict[str, dict]:
             bucket = agg.setdefault(scope, {
                 "created": 0, "merged": 0, "failed": 0,
                 "failed_infra": 0, "failed_scope_overflow": 0,
+                "failed_analysis_overflow": 0,
                 "failure_stages": {},
             })
-            for key in ("created", "merged", "failed", "failed_infra", "failed_scope_overflow"):
-                bucket[key] += stats.get(key, 0)
+            for key in (
+                "created", "merged", "failed", "failed_infra",
+                "failed_scope_overflow", "failed_analysis_overflow",
+            ):
+                bucket[key] = bucket.get(key, 0) + stats.get(key, 0)
             stage_bucket = bucket["failure_stages"]
             for stage_name, count in (stats.get("failure_stages") or {}).items():
                 stage_bucket[stage_name] = stage_bucket.get(stage_name, 0) + count
@@ -453,6 +457,19 @@ def predict_spawn_success(
         if len(top_dirs) >= 2:
             signals.append(0.4)
             weights.append(1.0)
+
+    # Signal 10: analysis_overflow dominance at medium scope. When 50%+ of a
+    # direction's medium-scope failures come from the agent's analysis_overflow
+    # gate (could not produce a valid implementation plan within the medium
+    # budget), the research agent's scope estimate is systematically too
+    # optimistic for this direction. Stronger signal than post-implementation
+    # scope_overflow, so apply a steep 0.2 penalty with weight 1.5.
+    if scope == "medium" and scope_stats:
+        failed_total = scope_stats.get("failed", 0)
+        analysis_overflow = scope_stats.get("failed_analysis_overflow", 0)
+        if failed_total >= 2 and analysis_overflow / failed_total >= 0.5:
+            signals.append(0.2)
+            weights.append(1.5)
 
     if not signals:
         return 0.5  # insufficient data — neutral

@@ -2140,6 +2140,47 @@ def test_auto_decompose_path_fallback_skipped_for_single_directory():
     assert result[0][1] is finding
 
 
+def test_auto_decompose_prepends_scope_boundary_preamble_to_prompt():
+    """Decomposed sub-findings get a scope-boundary preamble naming cluster size + index."""
+    from app.cochange_decomposition import auto_decompose_findings_by_cochange
+
+    def _hash(title: str, desc: str) -> str:
+        return f"{title}|{desc}"
+
+    original_prompt = "Original task description body."
+    finding = {
+        "title": "Cross-module refactor",
+        "prompt": original_prompt,
+        "scope": "medium",
+        "related_files": [
+            "backend/app/x.py",
+            "backend/app/y.py",
+            "agent/src/z.ts",
+        ],
+    }
+    result = auto_decompose_findings_by_cochange(
+        [(0, finding, "h0")], {}, None, _hash,
+    )
+    assert len(result) == 2
+    for _, sub, _ in result:
+        prompt = sub["prompt"]
+        assert prompt.endswith(original_prompt)
+        assert "Scope boundary" in prompt
+        assert f"cluster " in prompt.lower()
+        assert f"/{len(result)}" in prompt  # cluster N/M
+        for f in sub["related_files"]:
+            assert f in prompt
+        # other clusters' files should not be listed
+        other_files = {
+            f for _, other, _ in result if other is not sub
+            for f in other["related_files"]
+        }
+        for f in other_files:
+            assert f not in prompt
+        # cluster's file count appears
+        assert f"{len(sub['related_files'])} file" in prompt
+
+
 def _decomp_hash_fn(title: str, desc: str) -> str:
     return f"{title}|{desc}"
 
