@@ -22,6 +22,7 @@ from app.models import Task, TaskStatus, Project, DeploymentState, DeploymentSta
 from app.auth import get_current_user, require_admin
 from app.broadcast import broadcast_to_project
 from app.admin import _get_user_project, _get_user_project_with_role
+from app.reaper import _heartbeat_stale_cutoff
 
 logger = logging.getLogger(__name__)
 
@@ -157,10 +158,11 @@ async def _build_stuck_tasks(
     from app.compute import get_zone_health  # noqa: PLC0415
     stuck: List[StuckTaskInfo] = []
     # Align with reaper's pre-claim threshold (6 min) so diagnostics don't flag a
-    # PROVISIONING task before the reaper would act on it. heartbeat threshold
-    # stays at 5 min to match reaper's IN_PROGRESS threshold.
+    # PROVISIONING task before the reaper would act on it. IN_PROGRESS heartbeat
+    # threshold is computed per-task via reaper._heartbeat_stale_cutoff to match
+    # the reaper's scope-aware logic (small=300, medium=420, large=900, plus
+    # effort-based floors).
     provision_timeout_secs = 6 * 60
-    no_heartbeat_secs = 5 * 60
     long_queued_secs = 30 * 60
     stuck_deps_secs = 10 * 60
     evaluating_timeout_secs = 2 * 3600  # 2 hours
@@ -224,10 +226,12 @@ async def _build_stuck_tasks(
                     remediation_hint = "VM provision timed out — reaper will detect and retry"
 
         elif task.status == TaskStatus.IN_PROGRESS and task.last_heartbeat is not None:
-            heartbeat_age = (now - task.last_heartbeat).total_seconds()
-            if heartbeat_age > no_heartbeat_secs:
+            hb_cutoff = _heartbeat_stale_cutoff(task, now)
+            if task.last_heartbeat < hb_cutoff:
+                heartbeat_age = (now - task.last_heartbeat).total_seconds()
+                threshold_secs = (now - hb_cutoff).total_seconds()
                 stuck_reason = "no_heartbeat"
-                stuck_for_seconds = int(heartbeat_age - no_heartbeat_secs)
+                stuck_for_seconds = int(heartbeat_age - threshold_secs)
                 remediation_hint = f"No heartbeat for {_fmt_duration(heartbeat_age)} — VM may have crashed, reaper will clean up"
 
         elif task.status == TaskStatus.QUEUED:

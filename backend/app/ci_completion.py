@@ -17,6 +17,7 @@ accepted as a fallback so in-flight tasks from before the gate split still merge
 """
 import asyncio
 import logging
+import re
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +32,27 @@ logger = logging.getLogger(__name__)
 # the PR is clearly stuck (e.g. corrupted ci_wait_started bypassing the CI backstop
 # in services.py). Mark FAILED with requires_approval to force manual intervention.
 MERGE_FAILURE_HARD_CAP = 15
+
+
+_MERGE_ERR_NORMALIZE_PATTERNS = (
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<UUID>"),
+    (re.compile(r"\b[0-9a-fA-F]{12,}\b"), "<HEX>"),
+    (re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"), "<TS>"),
+    (re.compile(r"\b\d{10,}\b"), "<N>"),
+    (re.compile(r"\b\d+\b"), "<n>"),
+    (re.compile(r"\s+"), " "),
+)
+
+
+def _normalize_merge_error(msg: str) -> str:
+    """Strip variable data (IDs, timestamps, counts) so streak detection sees
+    structurally-identical errors as equal across retries."""
+    if not msg:
+        return ""
+    out = msg
+    for pattern, repl in _MERGE_ERR_NORMALIZE_PATTERNS:
+        out = pattern.sub(repl, out)
+    return out.strip().lower()
 
 
 def _review_approved(review_loop: dict) -> bool:
@@ -355,7 +377,9 @@ async def _attempt_merge_with_retry_and_escalation(
             # Track repeated-identical-error streak for early exit: if the merge
             # API keeps returning the same error, retrying won't change anything.
             _prev_err = ci_loop.get("merge_last_error")
-            if _prev_err is not None and _prev_err == merge_msg:
+            _norm_cur = _normalize_merge_error(merge_msg)
+            _norm_prev = _normalize_merge_error(_prev_err) if _prev_err is not None else None
+            if _norm_prev is not None and _norm_prev == _norm_cur:
                 _err_streak = ci_loop.get("merge_error_streak", 1) + 1
             else:
                 _err_streak = 1

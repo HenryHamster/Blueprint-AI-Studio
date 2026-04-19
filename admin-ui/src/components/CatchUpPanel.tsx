@@ -205,6 +205,9 @@ interface DigestData {
   scope_conversion_rates?: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null;
   prev_scope_conversion_rates?: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null;
   total_failed_cost_usd?: number | null;
+  retry_overhead_cost_usd?: number | null;
+  retry_task_count?: number | null;
+  avg_retries_before_failure?: number | null;
   total_estimated_cost_usd?: number | null;
   daily_cost_usd?: number | null;
   daily_cost_ceiling_usd?: number | null;
@@ -1733,6 +1736,24 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                         });
                       })()}
                     </div>
+                  )}
+                </div>
+              )}
+
+              {/* Retry overhead cost */}
+              {digest!.retry_task_count != null && digest!.retry_task_count > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Retry waste</span>
+                  <span className="text-[10px] text-amber-400 inline-flex items-center gap-0.5">
+                    <DollarSign className="w-2.5 h-2.5" />{(digest!.retry_overhead_cost_usd ?? 0).toFixed(2)} wasted
+                  </span>
+                  <span className="text-[10px] text-neutral-400">
+                    · {digest!.retry_task_count} over-retried task{digest!.retry_task_count === 1 ? '' : 's'}
+                  </span>
+                  {digest!.avg_retries_before_failure != null && (
+                    <span className="text-[10px] text-neutral-500">
+                      · avg {digest!.avg_retries_before_failure.toFixed(1)} attempts before failure
+                    </span>
                   )}
                 </div>
               )}

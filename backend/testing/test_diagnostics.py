@@ -274,6 +274,23 @@ class TestBuildStuckTasks:
         result = await _build_stuck_tasks([task], _utc_now(), db_session)
         assert result == []
 
+    @pytest.mark.asyncio
+    async def test_no_heartbeat_uses_scope_aware_threshold(self, db_session):
+        """Large-scope task with 8-min heartbeat silence is NOT stuck (threshold=15min)."""
+        project = Project(name="diag-hb-scope", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = _make_task(project.id, TaskStatus.IN_PROGRESS, heartbeat_ago_secs=8 * 60)
+        task.context = {"scope": "large"}
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        result = await _build_stuck_tasks([task], _utc_now(), db_session)
+        assert result == []
+
     # ── long_queued ───────────────────────────────────────────────────────────
 
     @pytest.mark.asyncio
