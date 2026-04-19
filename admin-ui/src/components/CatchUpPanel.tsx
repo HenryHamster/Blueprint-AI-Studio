@@ -93,6 +93,7 @@ interface DirectionProgress {
   first_attempt_success_rate?: number | null;
   cost_per_merged_pr?: number | null;
   auto_paused?: boolean;
+  paused_reason?: string | null;
   needs_manual_intervention?: boolean;
   scope_breakdown?: Record<string, { created?: number; merged?: number; failed?: number }> | null;
   taxonomy_summary?: Record<string, number> | null;
@@ -161,8 +162,8 @@ interface DigestData {
     dominant_stage: string | null;
   } | null;
   cost_by_failure_class?: Record<string, number> | null;
-  scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
-  prev_scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
+  scope_conversion_rates?: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null;
+  prev_scope_conversion_rates?: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null;
   total_failed_cost_usd?: number | null;
   total_estimated_cost_usd?: number | null;
   daily_cost_usd?: number | null;
@@ -312,6 +313,14 @@ function CompletionRow({ c, onSelectTask }: { c: RecentCompletion; onSelectTask:
     >
       <span className="flex-1 truncate text-neutral-400">{c.title}</span>
       <div className="shrink-0 flex items-center gap-2">
+        {c.direction_text && (
+          <span
+            className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 truncate max-w-[12rem]"
+            title={c.direction_text}
+          >
+            {c.direction_text.length > 40 ? c.direction_text.slice(0, 40) + '…' : c.direction_text}
+          </span>
+        )}
         {c.pr_url && isSafeUrl(c.pr_url) && (
           <a
             href={c.pr_url}
@@ -390,7 +399,7 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                   </span>
                 )}
                 {dp.auto_paused && (
-                  <span className="text-[9px] bg-red-500/20 text-red-400 border border-red-500/30 px-1.5 py-0.5 rounded" title="Direction auto-paused">
+                  <span className="text-[9px] bg-red-500/20 text-red-400 border border-red-500/30 px-1.5 py-0.5 rounded" title={dp.paused_reason || "Direction auto-paused"}>
                     paused
                   </span>
                 )}
@@ -1347,7 +1356,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   {['small', 'medium', 'large']
                     .filter(s => digest!.scope_conversion_rates?.[s] != null)
                     .map(scope => {
-                      const { created, merged } = digest!.scope_conversion_rates![scope];
+                      const { created, merged, calibrated_in = 0, calibrated_out = 0 } = digest!.scope_conversion_rates![scope];
+                      const recalCount = (calibrated_in || 0) + (calibrated_out || 0);
                       const rate = created > 0 ? merged / created : null;
                       const prev = digest!.prev_scope_conversion_rates?.[scope];
                       const prevRate = prev && prev.created > 0 ? prev.merged / prev.created : null;
@@ -1364,9 +1374,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                         : rate >= 0.3 ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
                         : 'bg-red-500/10 text-red-400 border-red-500/20';
                       return (
-                        <span key={scope} className={`text-[10px] border px-1.5 py-0.5 rounded inline-flex items-center gap-1 ${color}`}>
+                        <span
+                          key={scope}
+                          className={`text-[10px] border px-1.5 py-0.5 rounded inline-flex items-center gap-1 ${color}`}
+                          title={recalCount > 0 ? `Recalibrations: ${calibrated_in} in, ${calibrated_out} out` : undefined}
+                        >
                           {scope}: {rate != null ? `${Math.round(rate * 100)}%` : '--'} ({merged}/{created})
                           {arrow && <span className={arrowColor}>{arrow}</span>}
+                          {recalCount > 0 && <span className="text-neutral-400">· {recalCount} recal</span>}
                         </span>
                       );
                     })}
