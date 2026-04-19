@@ -753,11 +753,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # otherwise the fraction locks at 0 and no new data is ever collected.
             # Skip the floor when the operator has explicitly disabled exploration
             # by setting the base fraction to 0.
+            # Once a direction has enough exploration data to make an informed
+            # decision (3+ attempts with 0 merges), skip the floor — the data
+            # collection purpose is fulfilled and continued exploration is waste.
+            _exploration_proven_unviable = _exp_created >= 3 and _exp_merged == 0
             if (
                 isinstance(_explore_frac, (int, float))
                 and isinstance(_explore_frac_base, (int, float))
                 and float(_explore_frac_base) > 0
                 and 0 <= float(_explore_frac) < MEDIUM_EXPLORATION_FLOOR
+                and not _exploration_proven_unviable
             ):
                 _explore_frac = MEDIUM_EXPLORATION_FLOOR
             if isinstance(_explore_frac, (int, float)) and _explore_frac > 0 and random.random() < float(_explore_frac):

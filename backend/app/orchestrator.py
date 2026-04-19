@@ -1203,6 +1203,27 @@ async def orchestrator_worker():
                                 len(eligible_ids),
                             )
 
+                        # Confidence floor: during degraded operation, skip tasks
+                        # whose P(success) is below the configured floor so scarce
+                        # slots go to higher-confidence work. Skipped tasks remain
+                        # QUEUED and become eligible again next cycle.
+                        _conf_floor = float(_runtime_config.get("dispatch_confidence_floor", 0.10) or 0.0)
+                        if _conf_floor > 0:
+                            _before_floor = list(eligible_ids)
+                            eligible_ids = [
+                                tid for tid in eligible_ids
+                                if _confidence_score(tid) >= _conf_floor
+                            ]
+                            _skipped = len(_before_floor) - len(eligible_ids)
+                            if _skipped > 0:
+                                logger.info(
+                                    "[ORCHESTRATOR] Confidence floor (%.2f) skipped "
+                                    "%d task(s) during degraded operation (%s)",
+                                    _conf_floor,
+                                    _skipped,
+                                    ", ".join(_degradation_signals),
+                                )
+
 
                 # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]

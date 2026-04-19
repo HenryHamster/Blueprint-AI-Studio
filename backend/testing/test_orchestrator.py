@@ -1649,3 +1649,53 @@ class TestHealthAwareDispatch:
         max_vms = 8
         slots_available = 4  # == 4.0 (exactly 50%)
         assert not (slots_available < max_vms * 0.5)
+
+    # ── Dispatch confidence floor tests ──────────────────────────────────────
+
+    def test_confidence_floor_default_from_runtime_config(self):
+        """Default floor is 0.10 when the key is missing from runtime_config."""
+        _runtime_config: dict = {}
+        _conf_floor = float(_runtime_config.get("dispatch_confidence_floor", 0.10) or 0.0)
+        assert _conf_floor == 0.10
+
+    def test_confidence_floor_none_value_coerced_to_zero(self):
+        """An explicit None value in runtime_config disables the floor (treated as 0.0)."""
+        _runtime_config = {"dispatch_confidence_floor": None}
+        _conf_floor = float(_runtime_config.get("dispatch_confidence_floor", 0.10) or 0.0)
+        assert _conf_floor == 0.0
+
+    def test_confidence_floor_filters_low_confidence_tasks(self):
+        """Tasks with P(success) below the floor are removed from eligible_ids."""
+        confidence_by_id = {"t_low": 0.05, "t_mid": 0.15, "t_high": 0.50}
+        eligible_ids = ["t_low", "t_mid", "t_high"]
+        _conf_floor = 0.10
+        filtered = [tid for tid in eligible_ids if confidence_by_id[tid] >= _conf_floor]
+        assert filtered == ["t_mid", "t_high"]
+
+    def test_confidence_floor_at_threshold_is_kept(self):
+        """A task with P(success) exactly at the floor is kept (>= comparison)."""
+        confidence_by_id = {"t_exact": 0.10, "t_above": 0.20}
+        eligible_ids = ["t_exact", "t_above"]
+        _conf_floor = 0.10
+        filtered = [tid for tid in eligible_ids if confidence_by_id[tid] >= _conf_floor]
+        assert filtered == ["t_exact", "t_above"]
+
+    def test_confidence_floor_zero_skips_filter(self):
+        """_conf_floor == 0 bypasses the filter entirely — no tasks removed."""
+        confidence_by_id = {"t1": 0.01, "t2": 0.99}
+        eligible_ids = ["t1", "t2"]
+        _conf_floor = 0.0
+        if _conf_floor > 0:
+            filtered = [tid for tid in eligible_ids if confidence_by_id[tid] >= _conf_floor]
+        else:
+            filtered = eligible_ids
+        assert filtered == ["t1", "t2"]
+
+    def test_confidence_floor_respects_runtime_config_override(self):
+        """An operator-provided floor overrides the 0.10 default."""
+        _runtime_config = {"dispatch_confidence_floor": 0.25}
+        _conf_floor = float(_runtime_config.get("dispatch_confidence_floor", 0.10) or 0.0)
+        confidence_by_id = {"t_low": 0.15, "t_high": 0.30}
+        eligible_ids = ["t_low", "t_high"]
+        filtered = [tid for tid in eligible_ids if confidence_by_id[tid] >= _conf_floor]
+        assert filtered == ["t_high"]

@@ -245,19 +245,21 @@ def _calibrate_scope(
         if small_rate is not None and small_rate >= threshold:
             # Suppress upgrade if prior plan decompositions for this direction
             # produced poorly-merging subtasks — continuing to route medium→large
-            # would just generate more failing decompositions. Leave scope at
-            # medium and let predict_spawn_success gate it via confidence.
+            # would just generate more failing decompositions. Fall through to
+            # the downgrade loop so the task routes to the healthy small scope
+            # rather than being stuck at a failing medium scope.
             if _poor_decomp_history(direction, direction.get("title", direction.get("id", "?"))):
-                return proposed_scope, None
-            larger = _SCOPE_ORDER[idx + 1]
-            logger.info(
-                "[RESEARCH] Upgrading scope %s→%s(decompose) for direction '%s' "
-                "(%s medium rate %.0f%% < %.0f%%, small rate %.0f%% healthy)",
-                proposed_scope, larger,
-                direction.get("title", direction.get("id", "?")),
-                source, rate * 100, threshold * 100, small_rate * 100,
-            )
-            return larger, proposed_scope
+                pass  # fall through to downgrade loop below
+            else:
+                larger = _SCOPE_ORDER[idx + 1]
+                logger.info(
+                    "[RESEARCH] Upgrading scope %s→%s(decompose) for direction '%s' "
+                    "(%s medium rate %.0f%% < %.0f%%, small rate %.0f%% healthy)",
+                    proposed_scope, larger,
+                    direction.get("title", direction.get("id", "?")),
+                    source, rate * 100, threshold * 100, small_rate * 100,
+                )
+                return larger, proposed_scope
 
     # Downgrade to next smaller scope with acceptable rate
     for smaller_scope in reversed(_SCOPE_ORDER[:idx]):

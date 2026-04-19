@@ -2768,6 +2768,25 @@ class TestCalibrateScope:
         assert result_scope == "small"
         assert calibrated_from == "medium"
 
+    def test_medium_downgrades_to_small_when_decomp_history_poor(self):
+        """Medium below threshold + small healthy + poor decomposition history →
+        downgrade to small rather than upgrading to large or staying at medium.
+
+        Guards the dead-zone bug where _poor_decomp_history suppressed the
+        medium→large upgrade and the function returned early at medium, skipping
+        the downgrade loop entirely.
+        """
+        d = self._direction([
+            {"medium": {"created": 10, "merged": 2, "failed": 8}},  # 20% < 40%
+            {"small": {"created": 5, "merged": 4, "failed": 1}},    # 80% healthy
+        ])
+        d["research_history"][-1]["decomposition_quality"] = [
+            {"subtask_merge_rate": 0.1, "subtask_count": 5},
+        ]
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "small"
+        assert calibrated_from == "medium"
+
     def test_large_does_not_upgrade(self):
         """Upgrade path only fires for medium — large below threshold still downgrades normally."""
         d = self._direction([
@@ -3427,7 +3446,11 @@ async def test_low_confidence_medium_auto_escalates_to_large(db_session, mocker)
 @pytest.mark.asyncio
 async def test_exploration_floor_prevents_zero_collapse(db_session, mocker):
     """Directions with exploration_created>0 but exploration_merged=0 still get
-    the exploration floor instead of collapsing to fraction=0 (death spiral)."""
+    the exploration floor instead of collapsing to fraction=0 (death spiral).
+
+    Uses exploration_created<3 so the _exploration_proven_unviable branch is
+    NOT triggered — the floor should still apply in the early-data regime.
+    """
     direction_id = "d-floor-1"
     direction = {
         "id": direction_id,
@@ -3437,7 +3460,7 @@ async def test_exploration_floor_prevents_zero_collapse(db_session, mocker):
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
         "research_history": [{
-            "scope_breakdown": {"medium": {"exploration_created": 5, "exploration_merged": 0}},
+            "scope_breakdown": {"medium": {"exploration_created": 2, "exploration_merged": 0}},
         }],
     }
     project = Project(name="Floor test", user_id="test-user-123",
@@ -3470,6 +3493,58 @@ async def test_exploration_floor_prevents_zero_collapse(db_session, mocker):
     children = result.scalars().all()
     assert len(children) == 1
     assert children[0].context["scope"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_exploration_floor_skipped_when_proven_unviable(db_session, mocker):
+    """Once a direction has 3+ exploration attempts with 0 merges, the
+    exploration floor is skipped and the low-confidence scope escalates to
+    large — continued exploration is waste once the data is informative."""
+    direction_id = "d-unviable-1"
+    direction = {
+        "id": direction_id,
+        "text": "Proven-unviable medium exploration",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [{
+            "scope_breakdown": {"medium": {"exploration_created": 5, "exploration_merged": 0}},
+        }],
+    }
+    project = Project(name="Unviable test", user_id="test-user-123",
+                      autonomous_enabled=True, directions=[direction])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        title="Research: unviable",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    _mock_escalation_externals(mocker, direction_id)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.0)
+    # Even with the random draw forced below the floor, the floor must be
+    # skipped (proven-unviable branch) so escalation to large occurs.
+    mocker.patch("app.research_completion.random.random", return_value=0.01)
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    children = result.scalars().all()
+    assert len(children) == 1
+    child = children[0]
+    assert child.context["scope"] == "large"
+    assert child.context["scope_calibrated_from"] == "medium"
+    assert child.context["low_confidence_spawn"] is True
+    assert child.first_payload["type"] == "plan"
 
 
 @pytest.mark.asyncio

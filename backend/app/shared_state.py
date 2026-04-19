@@ -131,6 +131,10 @@ runtime_config: Dict = {
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
     "spawn_confidence_threshold": 0.25,  # P(success) below this injects low_confidence_spawn=True into task context
+    # During degraded operation only, tasks whose P(success) falls below this floor
+    # are skipped this dispatch cycle (remain QUEUED) so scarce slots go to higher-
+    # confidence work. Does not apply during healthy operation.
+    "dispatch_confidence_floor": 0.10,
     # Fraction of low-confidence medium-scope findings that bypass the escalation
     # gate and run as medium tasks, breaking the self-reinforcing feedback loop
     # where no medium tasks run → medium pipeline rate stays low → all medium
