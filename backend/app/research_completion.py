@@ -156,11 +156,39 @@ def _parse_research_insights(task_id: str) -> List[Dict[str, Any]]:
     return []
 
 
+def _avg_medium_expansion_ratio(
+    directions: List[Dict[str, Any]],
+) -> Optional[float]:
+    """Aggregate medium-scope expansion ratios across ``directions``'s last 3
+    research_history entries. Prefers max(mean_merged, mean_failed) so the
+    failed-task overflow signal biases conservatively. Returns None when no
+    directions contribute any ratio data.
+    """
+    _merged: list[float] = []
+    _failed: list[float] = []
+    for _d in directions:
+        for entry in (_d.get("research_history") or [])[-3:]:
+            _m = (entry.get("scope_breakdown") or {}).get("medium", {})
+            _r = _m.get("avg_expansion_ratio")
+            if isinstance(_r, (int, float)):
+                _merged.append(float(_r))
+            _rf = _m.get("avg_expansion_ratio_failed")
+            if isinstance(_rf, (int, float)):
+                _failed.append(float(_rf))
+    _candidates = []
+    if _merged:
+        _candidates.append(sum(_merged) / len(_merged))
+    if _failed:
+        _candidates.append(sum(_failed) / len(_failed))
+    return max(_candidates) if _candidates else None
+
+
 def _calibrate_finding_scope(
     finding: Dict[str, Any],
     scope: str,
     direction: Optional[Dict[str, Any]],
     cochange_index: Optional[Dict[str, Any]],
+    all_directions: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[str, Optional[str]]:
     """Apply pre-spawn scope-upgrade heuristics (file count, cross-module span,
     expansion-ratio prediction, composite complexity).
@@ -197,40 +225,34 @@ def _calibrate_finding_scope(
             scope = "large"
             scope_calibrated_from = "medium:cross_module"
         elif _heuristic_files:
-            # Predictive expansion-ratio check: direction's historical avg_expansion_ratio
+            # Predictive expansion-ratio check: historical avg_expansion_ratio
             # (actual files touched / expected related_files) multiplied by this finding's
             # related_files predicts how many files the task will actually touch. If that
             # exceeds the medium overflow threshold (10 in SCOPE_OVERFLOW_THRESHOLDS), route
             # to large for plan decomposition before burning 5-10 minutes on a task that
             # will almost certainly scope-overflow during implementation.
-            if direction:
-                _recent = [
-                    (entry.get("scope_breakdown") or {}).get("medium", {})
-                    for entry in (direction.get("research_history") or [])[-3:]
-                ]
-                _merged_ratios = [float(m.get("avg_expansion_ratio")) for m in _recent
-                                  if isinstance(m.get("avg_expansion_ratio"), (int, float))]
-                _failed_ratios = [float(m.get("avg_expansion_ratio_failed")) for m in _recent
-                                  if isinstance(m.get("avg_expansion_ratio_failed"), (int, float))]
-                # Prefer the max of merged/failed means — failed ratios reflect the
-                # overflow scenario we're trying to prevent, so they bias conservatively.
-                _candidates = []
-                if _merged_ratios:
-                    _candidates.append(sum(_merged_ratios) / len(_merged_ratios))
-                if _failed_ratios:
-                    _candidates.append(sum(_failed_ratios) / len(_failed_ratios))
-                if _candidates:
-                    _avg_ratio = max(_candidates)
-                    _predicted_files = len(_heuristic_files) * _avg_ratio
-                    if _predicted_files > 10:
-                        logger.info(
-                            "[RESEARCH] Upgrading scope medium→large for '%s' "
-                            "(expansion-ratio prediction: %d related_files × %.2f avg_ratio "
-                            "= %.1f predicted files > 10 threshold)",
-                            title, len(_heuristic_files), _avg_ratio, _predicted_files,
-                        )
-                        scope = "large"
-                        scope_calibrated_from = "medium"
+            _avg_ratio = (
+                _avg_medium_expansion_ratio([direction]) if direction else None
+            )
+            _ratio_source = "direction"
+            if _avg_ratio is None and all_directions:
+                _avg_ratio = _avg_medium_expansion_ratio(all_directions)
+                _ratio_source = "project"
+            if _avg_ratio is None:
+                # Conservative prior for brand-new projects with no expansion-ratio
+                # data anywhere — still applies the safety net rather than skipping.
+                _avg_ratio = 2.0
+                _ratio_source = "default"
+            _predicted_files = len(_heuristic_files) * _avg_ratio
+            if _predicted_files > 10:
+                logger.info(
+                    "[RESEARCH] Upgrading scope medium→large for '%s' "
+                    "(expansion-ratio prediction [%s]: %d related_files × %.2f avg_ratio "
+                    "= %.1f predicted files > 10 threshold)",
+                    title, _ratio_source, len(_heuristic_files), _avg_ratio, _predicted_files,
+                )
+                scope = "large"
+                scope_calibrated_from = "medium"
         # Composite complexity score: combines file count, historical expansion,
         # cochange cluster density, and cross-module span into a single merge-
         # probability estimate. Upgrades when score indicates low P(merge) even if
@@ -241,11 +263,23 @@ def _calibrate_finding_scope(
             )
             finding["_complexity_score"] = round(_cc_score, 3)
             finding["_complexity_signals"] = _cc_signals
-            if _cc_score < 0.45:
+            # Adaptive escalation threshold: baseline 0.45, tightened when the
+            # pipeline-wide medium merge rate is below the healthy 40% band so
+            # more borderline medium findings get pre-escalated to large for
+            # plan decomposition during periods of poor medium performance.
+            _cc_threshold = 0.45
+            _pipeline_medium = (
+                _runtime_config.get("pipeline_scope_merge_rates") or {}
+            ).get("medium")
+            if isinstance(_pipeline_medium, (int, float)) and _pipeline_medium < 0.4:
+                _cc_threshold = min(0.6, 0.45 + (0.4 - float(_pipeline_medium)) * 0.5)
+            if _cc_score < _cc_threshold:
                 logger.info(
                     "[RESEARCH] Upgrading scope medium→large for '%s' "
-                    "(composite complexity %.2f < 0.45, signals=%s)",
-                    title, _cc_score, _cc_signals,
+                    "(composite complexity %.2f < %.2f, pipeline_medium=%s, signals=%s)",
+                    title, _cc_score, _cc_threshold,
+                    f"{_pipeline_medium:.2f}" if isinstance(_pipeline_medium, (int, float)) else "n/a",
+                    _cc_signals,
                 )
                 scope = "large"
                 scope_calibrated_from = "medium"
@@ -636,6 +670,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _heur_direction = _directions_by_id.get(str(_heur_dir_id)) if _heur_dir_id else None
             scope, _heur_calibrated_from = _calibrate_finding_scope(
                 finding, scope, _heur_direction, _cochange_index_for_decomp,
+                all_directions=list(_directions_by_id.values()),
             )
             if _heur_calibrated_from is not None:
                 scope_calibrated_from = _heur_calibrated_from

@@ -171,6 +171,21 @@ _MID_BUDGET_NARROW_FOCUS_PREFIX = (
 # before a fix iteration would tip the PR into scope-overflow territory.
 SCOPE_PRESSURE_WARN_THRESHOLD = 0.7
 
+# Hard cap: when a medium-scope PR has consumed ≥90% of its production file
+# budget, the fix agent has no room to add files. Reduce the remaining
+# review-fix iterations to at most this many additional attempts and enforce
+# a no-new-files constraint — convert wasted iterations into early
+# convergence or early failure instead of burning full budget.
+SCOPE_PRESSURE_HARD_CAP_PERCENTAGE = 90
+SCOPE_PRESSURE_HARD_CAP_REMAINING = 2
+
+_SCOPE_PRESSURE_HARD_CAP_PREFIX = (
+    "🚫 SCOPE BUDGET EXHAUSTED: this PR has consumed {count}/{budget} "
+    "({pct}%) of its medium-scope production file budget. You MUST NOT add "
+    "any new production files — only modify the existing changed files. "
+    "Defer any new-file work to follow-up tasks.\n\n"
+)
+
 
 def _is_test_file(path: str) -> bool:
     p = path.lower()
@@ -286,6 +301,14 @@ def _max_review_iterations(task: Task, direction_data: dict | None = None) -> in
         )
         if (acceptance_rate is not None and acceptance_rate < 0.3) or high_rejection_ratio:
             limit = max(1, round(limit * 0.7))
+
+    # Scope-budget hard cap: once a medium-scope PR crosses 90% of its
+    # file budget, a prior spawn persists an absolute iteration ceiling via
+    # _scope_budget_hard_cap. Honor it regardless of scope/direction-aware
+    # logic so the reduction survives across subsequent review/fix spawns.
+    hard_cap = ctx.get('_scope_budget_hard_cap')
+    if isinstance(hard_cap, int) and hard_cap > 0:
+        limit = min(limit, hard_cap)
 
     return min(limit, MAX_REVIEW_FIX_ITERATIONS)
 
@@ -840,6 +863,50 @@ async def _spawn_pipeline_task(
             payload_data["prompt"] = mid_prefix + (payload_data.get("prompt") or "")
             fix_prompt = mid_prefix + (fix_prompt or "")
 
+    # Scope-budget pressure hard cap: a medium-scope fix cycle already at
+    # ≥90% of its production file budget has no room to expand. Reduce
+    # remaining iterations to at most SCOPE_PRESSURE_HARD_CAP_REMAINING and
+    # enforce no-new-files on the fix agent. The marker persists via the
+    # spawned task's context so subsequent review/fix spawns enforce the
+    # same ceiling.
+    scope_budget_hard_cap: int | None = None
+    if task_type == "fix":
+        _scope_for_pressure = (source_task.context or {}).get(
+            'scope', source_loop.get('scope', 'medium')
+        )
+        _changed_for_pressure = (
+            (source_task.context or {}).get("_pr_changed_files")
+            or ((orig.context or {}).get("_pr_changed_files") if orig else None)
+            or []
+        )
+        _util_for_pressure = _compute_scope_budget_utilization(
+            _changed_for_pressure, _scope_for_pressure
+        )
+        if (
+            _util_for_pressure
+            and _scope_for_pressure == "medium"
+            and _util_for_pressure.get("percentage", 0) >= SCOPE_PRESSURE_HARD_CAP_PERCENTAGE
+        ):
+            hard_cap_target = iteration + SCOPE_PRESSURE_HARD_CAP_REMAINING
+            if hard_cap_target < per_chain_cap:
+                logger.warning(
+                    f"[PIPELINE] Scope-budget pressure for PR #{pr_number}: "
+                    f"utilization {_util_for_pressure['percentage']}% ≥ "
+                    f"{SCOPE_PRESSURE_HARD_CAP_PERCENTAGE}% (non-test "
+                    f"{_util_for_pressure['non_test_file_count']}/"
+                    f"{_util_for_pressure['budget']}). Reducing cap "
+                    f"{per_chain_cap} → {hard_cap_target} and enforcing no-new-files."
+                )
+                per_chain_cap = hard_cap_target
+            scope_budget_hard_cap = hard_cap_target
+            hard_prefix = _SCOPE_PRESSURE_HARD_CAP_PREFIX.format(
+                count=_util_for_pressure['non_test_file_count'],
+                budget=_util_for_pressure['budget'],
+                pct=_util_for_pressure['percentage'],
+            )
+            payload_data["prompt"] = hard_prefix + (payload_data.get("prompt") or "")
+            fix_prompt = hard_prefix + (fix_prompt or "")
+
     payload_data = validate_internal_payload(payload_data, f"review_pipeline:{task_type}:pr#{pr_number}")
     source_ctx = source_task.context or {}
     propagated_scope = source_ctx.get('scope', source_loop.get('scope', 'medium'))
@@ -869,6 +936,18 @@ async def _spawn_pipeline_task(
     utilization = _compute_scope_budget_utilization(changed_files, propagated_scope)
     if utilization:
         propagated_ctx['scope_budget_utilization'] = utilization
+    # Persist the scope-budget hard cap (either newly triggered this spawn or
+    # carried forward from a prior spawn) so _max_review_iterations enforces
+    # it on subsequent review/fix iterations for this chain.
+    prior_hard_cap = source_ctx.get('_scope_budget_hard_cap')
+    effective_hard_cap = scope_budget_hard_cap
+    if isinstance(prior_hard_cap, int) and prior_hard_cap > 0:
+        effective_hard_cap = (
+            min(effective_hard_cap, prior_hard_cap)
+            if effective_hard_cap is not None else prior_hard_cap
+        )
+    if effective_hard_cap is not None:
+        propagated_ctx['_scope_budget_hard_cap'] = effective_hard_cap
     # Propagate the original create task's planned file list so the reviewer can
     # objectively detect scope creep (files changed but not in the original plan).
     planned_files = (orig.context or {}).get("related_files") if orig else None

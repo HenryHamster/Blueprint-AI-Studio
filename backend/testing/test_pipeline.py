@@ -3814,3 +3814,30 @@ class TestCalibrateFindingScope:
         assert scope == "medium"
         assert cal is None
         assert finding["_complexity_score"] == 0.9
+
+    def test_adaptive_threshold_tightens_when_pipeline_medium_low(self, monkeypatch):
+        """Score of 0.5 passes at baseline 0.45 but gets escalated when pipeline
+        medium rate is 0.2 (tightened threshold ~0.55)."""
+        from app.shared_state import runtime_config
+        monkeypatch.setattr(
+            "app.research_completion._composite_complexity_score",
+            lambda files, direction, cochange: (0.5, {"sig": "borderline"}),
+        )
+        monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {"medium": 0.2})
+        finding = {"title": "t", "related_files": self._single_module_files(2)}
+        scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
+        assert scope == "large"
+        assert cal == "medium"
+
+    def test_adaptive_threshold_baseline_when_pipeline_medium_healthy(self, monkeypatch):
+        """Score of 0.5 passes through when pipeline medium rate is healthy."""
+        from app.shared_state import runtime_config
+        monkeypatch.setattr(
+            "app.research_completion._composite_complexity_score",
+            lambda files, direction, cochange: (0.5, {"sig": "borderline"}),
+        )
+        monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {"medium": 0.6})
+        finding = {"title": "t", "related_files": self._single_module_files(2)}
+        scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
+        assert scope == "medium"
+        assert cal is None
