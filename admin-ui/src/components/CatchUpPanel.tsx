@@ -38,6 +38,7 @@ interface FailureGroupTask {
   waiting_hours?: number;
   taxonomy?: string;
   timeout_subtype?: string | null;
+  failure_stage?: string | null;
 }
 
 const TIMEOUT_SUBTYPE_LABELS: Record<string, string> = {
@@ -140,6 +141,8 @@ interface DigestData {
     total_classified: number;
     dominant_stage: string | null;
   } | null;
+  cost_by_failure_class?: Record<string, number> | null;
+  total_failed_cost_usd?: number | null;
   rejection_pattern_summary?: {
     total_rejected: number;
     top_notes: { snippet: string; count: number }[];
@@ -152,11 +155,16 @@ interface DigestData {
   recurring_error_clusters?: {
     fingerprint: string;
     count: number;
-    error_snippet: string | null;
+    error_snippet: string;
     direction_ids: string[];
     task_types: string[];
-    first_task_id?: string | null;
-  }[];
+    first_task_id: string;
+  }[] | null;
+  review_cap_exhaustion_summary?: {
+    count: number;
+    avg_iterations: number | null;
+    top_directions: { direction_id: string; count: number }[];
+  } | null;
 }
 
 const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
@@ -1065,6 +1073,11 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               {digest!.failure_taxonomy_distribution && digest!.failure_taxonomy_distribution.total_failures > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Root cause</span>
+                  {digest!.total_failed_cost_usd != null && digest!.total_failed_cost_usd > 0 && (
+                    <span className="text-[10px] text-red-400/80" title="Total cost of failed tasks">
+                      ${digest!.total_failed_cost_usd.toFixed(2)} wasted
+                    </span>
+                  )}
                   {TAXONOMY_ORDER.map(cat => {
                     const entry = digest!.failure_taxonomy_distribution!.categories[cat];
                     if (!entry || entry.count === 0) return null;
@@ -1157,6 +1170,80 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                 </div>
               )}
 
+              {/* Systemic errors — clusters of failures with matching error fingerprints */}
+              {(digest!.recurring_error_clusters ?? []).length > 0 && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Systemic errors</span>
+                    <span className="text-[10px] text-neutral-400">
+                      {digest!.recurring_error_clusters!.length} cluster{digest!.recurring_error_clusters!.length !== 1 ? 's' : ''}
+                    </span>
+                  </div>
+                  <div className="flex flex-col gap-1 ml-1">
+                    {digest!.recurring_error_clusters!.map(cluster => {
+                      const snippet = cluster.error_snippet.length > 120
+                        ? cluster.error_snippet.slice(0, 120) + '…'
+                        : cluster.error_snippet;
+                      const dirCount = cluster.direction_ids.length;
+                      return (
+                        <div
+                          key={cluster.fingerprint}
+                          role="button"
+                          tabIndex={0}
+                          className="flex flex-col gap-0.5 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                          onClick={() => onSelectTask({ id: cluster.first_task_id })}
+                          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: cluster.first_task_id }); } }}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="flex-1 truncate text-neutral-400 font-mono text-[10px]">{snippet}</span>
+                            <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20">
+                              ×{cluster.count}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-1 text-[10px] text-neutral-500">
+                            {dirCount > 1 && (
+                              <span className="text-amber-400">across {dirCount} directions</span>
+                            )}
+                            {cluster.task_types.map(tt => (
+                              <span key={tt} className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1 py-0.5 rounded uppercase tracking-wider">
+                                {tt}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Review cap exhaustion summary */}
+              {digest!.review_cap_exhaustion_summary && digest!.review_cap_exhaustion_summary.count > 0 && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Review cap exhaustion</span>
+                    <span className="text-[10px] text-neutral-400">
+                      {digest!.review_cap_exhaustion_summary.count} task{digest!.review_cap_exhaustion_summary.count !== 1 ? 's' : ''} hit cap
+                    </span>
+                    {digest!.review_cap_exhaustion_summary.avg_iterations != null && (
+                      <span className="text-[10px] text-neutral-500">
+                        · avg {digest!.review_cap_exhaustion_summary.avg_iterations.toFixed(1)} iter
+                      </span>
+                    )}
+                  </div>
+                  {digest!.review_cap_exhaustion_summary.top_directions.length > 0 && (
+                    <div className="flex flex-col gap-0.5 ml-1">
+                      {digest!.review_cap_exhaustion_summary.top_directions.map(d => (
+                        <span key={d.direction_id} className="text-[10px] text-neutral-500 truncate">
+                          · {d.direction_id}{' '}
+                          <span className="text-red-400">×{d.count}</span>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Retry pattern summary */}
               {digest!.retry_pattern_summary && digest!.retry_pattern_summary.total_multi_attempt_failures > 0 && (
                 <div className="flex flex-col gap-1">
@@ -1184,33 +1271,6 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                 </div>
               )}
 
-              {/* Recurring error clusters */}
-              {(digest!.recurring_error_clusters ?? []).length > 0 && (
-                <div className="flex flex-col gap-1">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Recurring errors</span>
-                    <span className="text-[10px] text-neutral-400">
-                      {digest!.recurring_error_clusters!.length} cluster{digest!.recurring_error_clusters!.length !== 1 ? 's' : ''}
-                    </span>
-                  </div>
-                  <div className="flex flex-col gap-0.5 ml-1">
-                    {digest!.recurring_error_clusters!.map(c => {
-                      const snippet = (c.error_snippet ?? c.fingerprint ?? '').replace(/\s+/g, ' ').trim();
-                      const truncated = snippet.length > 100 ? snippet.slice(0, 100) + '…' : snippet;
-                      const dirCount = c.direction_ids.length;
-                      return (
-                        <span key={c.fingerprint} className="text-[10px] text-neutral-500 truncate">
-                          · {truncated}{' '}
-                          <span className="text-red-400">×{c.count}</span>
-                          {dirCount > 0 && (
-                            <span className="text-neutral-600"> · {dirCount} dir{dirCount !== 1 ? 's' : ''}</span>
-                          )}
-                        </span>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
 
               {/* Recent failures grouped by classification (not in needs_attention) */}
               {extraFailureGroups.length > 0 && (
@@ -1250,6 +1310,11 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                 {group.label}
                               </span>
                               <span className="text-[11px] text-neutral-500">× {group.tasks.length}</span>
+                              {digest!.cost_by_failure_class?.[group.failure_class] != null && digest!.cost_by_failure_class[group.failure_class] > 0 && (
+                                <span className="text-[10px] text-red-400/70 font-mono" title={`Cost of ${group.label} failures`}>
+                                  ${digest!.cost_by_failure_class[group.failure_class].toFixed(2)}
+                                </span>
+                              )}
                             </button>
                             {isGroupExpanded && (
                               <div className="flex flex-col gap-1 ml-5">
@@ -1268,6 +1333,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                         </span>
                                       )}
                                       <span className="flex-1 truncate text-neutral-400">{t.title}</span>
+                                      {t.failure_stage && (
+                                        <span
+                                          className="shrink-0 text-[9px] font-mono px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40"
+                                          title={`Failure stage: ${t.failure_stage}`}
+                                        >
+                                          {t.failure_stage}
+                                        </span>
+                                      )}
                                       {group.failure_class === 'AGENT_TIMEOUT' && t.timeout_subtype && (
                                         <span
                                           className="shrink-0 text-[9px] font-mono px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400/80 border border-amber-500/20"

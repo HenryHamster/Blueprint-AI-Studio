@@ -1225,6 +1225,7 @@ async def get_digest(
             "timeout_subtype": _classify_timeout_subtype(t, error_log_map.get(tid)) if cls == _AGENT_TIMEOUT else None,
             "direction_id": t_dir_id,
             "direction_text": t_dir_text,
+            "failure_stage": _stage,
         })
     failure_groups = sorted(
         [
