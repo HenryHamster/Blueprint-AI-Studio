@@ -14,6 +14,8 @@ from datetime import timedelta
 import pytest
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy import select
+
 from app.models import Project, Task, TaskStatus
 from app.review_pipeline import (
     ISSUE_CHURN_WINDOW,
@@ -183,6 +185,23 @@ class TestMaxReviewIterations:
         d = self._direction_data([])
         assert _max_review_iterations(self._task(scope="small"), direction_data=d) == 10
 
+    # ── Retry carry-forward: _prior_review_iterations_consumed ──────────────
+
+    def test_prior_iterations_reduce_cap(self):
+        """Retry clones carry forward prior iteration count; half is deducted."""
+        t = make_task(context={"scope": "medium", "_prior_review_iterations_consumed": 8})
+        # medium cap 12, minus 8//2 = 4 → 8
+        assert _max_review_iterations(t) == 8
+
+    def test_prior_iterations_floor_at_three(self):
+        """Heavy prior usage cannot drive the cap below 3."""
+        t = make_task(context={"scope": "small", "_prior_review_iterations_consumed": 100})
+        assert _max_review_iterations(t) == 3
+
+    def test_prior_iterations_zero_no_reduction(self):
+        t = make_task(context={"scope": "medium", "_prior_review_iterations_consumed": 0})
+        assert _max_review_iterations(t) == 12
+
 
 # ── DB-backed helpers ─────────────────────────────────────────────────────────
 
@@ -202,6 +221,48 @@ async def _persist(db_session, *tasks) -> None:
     await db_session.commit()
     for t in tasks:
         await db_session.refresh(t)
+
+
+# ── _requeue_parent_task: carry-forward review iterations ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_requeue_carries_forward_prior_review_iterations(db_session, mocker):
+    """Cloning a failed child captures its review_loop.iteration into
+    _prior_review_iterations_consumed, and the clone's cap reflects the deduction."""
+    from app.task_lifecycle import _requeue_parent_task
+
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        context={"plan_branch": "plan/test"},
+    )
+    await _persist(db_session, parent)
+    child = make_task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+        context={"scope": "medium", "review_loop": {"iteration": 8}},
+        payloads=[{"type": "create", "prompt": "do a thing", "base_branch": "main"}],
+        latest_status_message="some failure",
+    )
+    await _persist(db_session, child)
+
+    await _requeue_parent_task(parent, db_session)
+
+    clone = (await db_session.execute(
+        select(Task).where(
+            Task.parent_task_id == parent.id,
+            Task.status == TaskStatus.QUEUED,
+        )
+    )).scalars().first()
+    assert clone is not None
+    assert (clone.context or {}).get("_prior_review_iterations_consumed") == 8
+    # medium cap 12, minus 8//2 = 4 → 8
+    assert _max_review_iterations(clone) == 8
 
 
 # ── _spawn_pipeline_task: iteration cap ───────────────────────────────────────

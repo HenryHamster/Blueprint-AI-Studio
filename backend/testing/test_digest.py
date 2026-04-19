@@ -192,6 +192,71 @@ async def test_digest_failed_task_direction_attribution(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
+async def test_digest_retry_waste_by_direction(client: AsyncClient, db_session):
+    """retry_waste_by_direction groups retry-overhead cost by direction_id, sorted descending."""
+    project = make_project(
+        directions=[
+            {"id": "dir-A", "text": "Direction Alpha", "status": "active"},
+            {"id": "dir-B", "text": "Direction Beta", "status": "active"},
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # dir-A: one retry, 2h on-demand → expensive
+    t_a = make_task(
+        project_id=project.id,
+        title="A retry",
+        status=TaskStatus.FAILED,
+        context={"direction_id": "dir-A", "_attempt_number": 2},
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(minutes=5),
+        vm_spot=False,
+    )
+    # dir-B: two retries, each 30min spot → cheaper
+    t_b1 = make_task(
+        project_id=project.id,
+        title="B retry 1",
+        status=TaskStatus.FAILED,
+        context={"direction_id": "dir-B", "_attempt_number": 2},
+        vm_provisioned_at=now - timedelta(minutes=35),
+        vm_stopped_at=now - timedelta(minutes=5),
+        vm_spot=True,
+    )
+    t_b2 = make_task(
+        project_id=project.id,
+        title="B retry 2",
+        status=TaskStatus.FAILED,
+        context={"direction_id": "dir-B", "_attempt_number": 3},
+        vm_provisioned_at=now - timedelta(minutes=35),
+        vm_stopped_at=now - timedelta(minutes=5),
+        vm_spot=True,
+    )
+    db_session.add_all([t_a, t_b1, t_b2])
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    breakdown = data["retry_waste_by_direction"]
+    assert len(breakdown) == 2
+    # Sorted descending by cost — dir-A (on-demand, 2h) > dir-B (spot, 2x30min)
+    assert breakdown[0]["direction_id"] == "dir-A"
+    assert breakdown[0]["direction_text"] == "Direction Alpha"
+    assert breakdown[0]["retry_task_count"] == 1
+    assert breakdown[0]["retry_cost_usd"] > 0
+
+    assert breakdown[1]["direction_id"] == "dir-B"
+    assert breakdown[1]["direction_text"] == "Direction Beta"
+    assert breakdown[1]["retry_task_count"] == 2
+    assert breakdown[1]["retry_cost_usd"] > 0
+    assert breakdown[0]["retry_cost_usd"] > breakdown[1]["retry_cost_usd"]
+
+
+@pytest.mark.asyncio
 async def test_digest_recent_failures_includes_failure_class_and_scope(client: AsyncClient, db_session):
     """recent_failures entries include failure_class and scope fields."""
     project = make_project()
@@ -548,6 +613,41 @@ async def test_digest_active_tasks_includes_scope(client: AsyncClient, db_sessio
     by_id = {t["task_id"]: t for t in data["active_tasks"]}
     assert by_id[str(scoped_task.id)]["scope"] == "large"
     assert by_id[str(bare_task.id)]["scope"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_active_tasks_includes_review_iteration(client: AsyncClient, db_session):
+    """active_tasks entries expose review_iteration and review_cap from task.context."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    iter_task = make_task(
+        project_id=project.id,
+        title="In-review Active",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "medium", "review_loop": {"iteration": 4}},
+    )
+    fresh_task = make_task(
+        project_id=project.id,
+        title="Fresh Active",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    db_session.add(iter_task)
+    db_session.add(fresh_task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    by_id = {t["task_id"]: t for t in data["active_tasks"]}
+    assert by_id[str(iter_task.id)]["review_iteration"] == 4
+    assert by_id[str(iter_task.id)]["review_cap"] == 12
+    assert by_id[str(fresh_task.id)]["review_iteration"] == 0
+    assert by_id[str(fresh_task.id)]["review_cap"] == 10
 
 
 @pytest.mark.asyncio

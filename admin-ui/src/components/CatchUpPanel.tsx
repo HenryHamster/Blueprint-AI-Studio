@@ -150,6 +150,8 @@ interface ActiveTask {
   running_cost_usd?: number | null;
   direction_text?: string | null;
   scope?: string | null;
+  review_iteration?: number | null;
+  review_cap?: number | null;
 }
 
 interface DigestData {
@@ -206,6 +208,7 @@ interface DigestData {
   prev_scope_conversion_rates?: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null;
   total_failed_cost_usd?: number | null;
   retry_overhead_cost_usd?: number | null;
+  retry_waste_by_direction?: { direction_id: string; direction_text: string; retry_cost_usd: number; retry_task_count: number }[] | null;
   retry_task_count?: number | null;
   avg_retries_before_failure?: number | null;
   total_estimated_cost_usd?: number | null;
@@ -1403,6 +1406,22 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                               {t.scope}
                             </span>
                           )}
+                          {t.review_iteration != null && t.review_iteration > 0 && t.review_cap != null && t.review_cap > 0 && (() => {
+                            const ratio = t.review_iteration! / t.review_cap!;
+                            const colorCls = ratio > 0.9
+                              ? "bg-red-500/10 text-red-400 border-red-500/20"
+                              : ratio > 0.7
+                                ? "bg-amber-500/10 text-amber-400 border-amber-500/20"
+                                : "bg-neutral-700/20 text-neutral-400 border-neutral-700/30";
+                            return (
+                              <span
+                                className={`shrink-0 text-[9px] font-mono px-1.5 py-0.5 rounded border ${colorCls}`}
+                                title={`review iterations: ${t.review_iteration}/${t.review_cap}`}
+                              >
+                                {t.review_iteration}/{t.review_cap} iter
+                              </span>
+                            );
+                          })()}
                           {t.running_cost_usd != null && t.running_cost_usd > 0 && (
                             <span className="shrink-0 inline-flex items-center gap-0.5 text-[9px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                               <DollarSign className="w-2.5 h-2.5" />
@@ -1754,6 +1773,17 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     <span className="text-[10px] text-neutral-500">
                       · avg {digest!.avg_retries_before_failure.toFixed(1)} attempts before failure
                     </span>
+                  )}
+                  {digest!.retry_waste_by_direction && digest!.retry_waste_by_direction.length > 0 && (
+                    <ul className="w-full flex flex-col gap-0.5 mt-0.5 ml-2">
+                      {digest!.retry_waste_by_direction.map((d) => (
+                        <li key={d.direction_id} className="text-[10px] text-neutral-400">
+                          · <span className="text-neutral-300">{d.direction_text || d.direction_id}</span>
+                          <span className="text-amber-400 ml-1">${d.retry_cost_usd.toFixed(2)}</span>
+                          <span className="text-neutral-500 ml-1">({d.retry_task_count} task{d.retry_task_count === 1 ? '' : 's'})</span>
+                        </li>
+                      ))}
+                    </ul>
                   )}
                 </div>
               )}

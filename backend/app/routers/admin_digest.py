@@ -1246,15 +1246,37 @@ async def get_digest(
     _retry_overhead_cost = 0.0
     _retry_task_count = 0
     _retry_attempt_sum = 0
+    _retry_waste_by_dir: Dict[str, Dict[str, Any]] = {}
     for t in failed_tasks:
         _attempt = ((t.context or {}).get("_attempt_number") or 0)
         if _attempt > 1:
             _retry_task_count += 1
             _retry_attempt_sum += _attempt
+            _task_retry_cost = 0.0
             if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start:
                 _rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-                _retry_overhead_cost += _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+                _task_retry_cost = _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+                _retry_overhead_cost += _task_retry_cost
+            _rw_did = (t.context or {}).get("direction_id")
+            if _rw_did:
+                _key = str(_rw_did)
+                _entry = _retry_waste_by_dir.setdefault(_key, {
+                    "direction_id": _key,
+                    "direction_text": dir_id_to_text.get(_key, ""),
+                    "retry_cost_usd": 0.0,
+                    "retry_task_count": 0,
+                })
+                _entry["retry_cost_usd"] += _task_retry_cost
+                _entry["retry_task_count"] += 1
     retry_overhead_cost_usd = round(_retry_overhead_cost, 4)
+    retry_waste_by_direction = sorted(
+        [
+            {**e, "retry_cost_usd": round(e["retry_cost_usd"], 4)}
+            for e in _retry_waste_by_dir.values()
+        ],
+        key=lambda x: x["retry_cost_usd"],
+        reverse=True,
+    )[:5]
     retry_task_count = _retry_task_count
     avg_retries_before_failure = round(_retry_attempt_sum / _retry_task_count, 2) if _retry_task_count else None
 
@@ -1348,6 +1370,7 @@ async def get_digest(
 
     # --- active_tasks list (up to 5, oldest started first) ---
     _now_active = _utcnow()
+    from app.review_pipeline import _max_review_iterations
     active_tasks_list = []
     for t in active_tasks_all[:5]:
         at_dir_id = (t.context or {}).get("direction_id")
@@ -1357,6 +1380,13 @@ async def get_digest(
             running_cost_usd = rate * (_now_active - t.vm_provisioned_at).total_seconds()
         else:
             running_cost_usd = None
+        t_ctx = t.context or {}
+        review_iteration = (t_ctx.get("review_loop") or {}).get("iteration", 0)
+        try:
+            review_cap = _max_review_iterations(t)
+        except Exception:
+            scope_val = t_ctx.get("scope")
+            review_cap = {"small": 10, "medium": 12}.get(scope_val, 16)
         active_tasks_list.append({
             "task_id": str(t.id),
             "title": t.title or "Active task",
@@ -1366,7 +1396,9 @@ async def get_digest(
             "direction_id": at_dir_id,
             "direction_text": at_dir_text,
             "running_cost_usd": running_cost_usd,
-            "scope": (t.context or {}).get("scope"),
+            "scope": t_ctx.get("scope"),
+            "review_iteration": review_iteration,
+            "review_cap": review_cap,
         })
 
     running_statuses = {TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING}
@@ -1872,6 +1904,7 @@ async def get_digest(
         "cost_by_failure_class": cost_by_failure_class,
         "total_failed_cost_usd": total_failed_cost_usd,
         "retry_overhead_cost_usd": retry_overhead_cost_usd,
+        "retry_waste_by_direction": retry_waste_by_direction,
         "retry_task_count": retry_task_count,
         "avg_retries_before_failure": avg_retries_before_failure,
         "retry_success_count": retry_success_count,

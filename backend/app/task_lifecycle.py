@@ -605,6 +605,18 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         except Exception:
             logger.exception("[REQUEUE] Failed to extract review issues for task %s", child.id)
 
+        # Carry forward the review-iteration count consumed by the prior attempt.
+        # _max_review_iterations subtracts half of this from the new cap (floor 3)
+        # so retries don't each receive a fresh full iteration budget.
+        try:
+            prior_iter = int(
+                ((child_ctx.get("review_loop") or {}).get("iteration") or 0)
+            )
+            if prior_iter > 0:
+                clone_ctx["_prior_review_iterations_consumed"] = prior_iter
+        except (TypeError, ValueError):
+            pass
+
         if new_payloads and isinstance(new_payloads[0], dict):
             existing_suffix = new_payloads[0].get("prompt_suffix", "") or ""
             extra_guidance, scope_override = _build_retry_prompt_suffix(

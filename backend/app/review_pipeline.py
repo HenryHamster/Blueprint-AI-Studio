@@ -310,6 +310,14 @@ def _max_review_iterations(task: Task, direction_data: dict | None = None) -> in
     if isinstance(hard_cap, int) and hard_cap > 0:
         limit = min(limit, hard_cap)
 
+    # Retry carry-forward: if a prior attempt of this task (before parent requeue
+    # cloned it) already burned review iterations, subtract half of that usage
+    # from the fresh cap so retries don't each get a full budget. Floor at 3 so
+    # a heavily-iterated prior attempt doesn't leave the retry dead on arrival.
+    prior_consumed = ctx.get('_prior_review_iterations_consumed')
+    if isinstance(prior_consumed, int) and prior_consumed > 0:
+        limit = max(limit - prior_consumed // 2, 3)
+
     return min(limit, MAX_REVIEW_FIX_ITERATIONS)
 
 
