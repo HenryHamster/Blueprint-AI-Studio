@@ -34,6 +34,7 @@ from app.payload_schemas import validate_internal_payload
 from app.notification_dispatch import post_auto_fix_result_message
 from app.failure_classification import (
     classify_failure,
+    INFRA_CLASSES,
     _timeout_subtype_from_message,
     TIMEOUT_OOM,
     TIMEOUT_HEARTBEAT_LOST,
@@ -42,6 +43,7 @@ from app.failure_classification import (
     TIMEOUT_PROCESS_CRASH,
     TIMEOUT_EXECUTION,
 )
+from app.retry_budget import classify_override_reason, compute_effective_max_requeues
 
 logger = logging.getLogger(__name__)
 
@@ -434,8 +436,16 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     MAX_PARENT_REQUEUES = 3
     parent_ctx = parent.context or {}
     requeue_count = parent_ctx.get("_requeue_count", 0)
-    if requeue_count >= MAX_PARENT_REQUEUES:
-        logger.warning(f"[REQUEUE] Parent {parent.id} hit re-evaluation limit ({requeue_count} attempts) — failing permanently")
+
+    effective_max = await compute_effective_max_requeues(
+        parent, session, MAX_PARENT_REQUEUES
+    )
+
+    if requeue_count >= effective_max:
+        logger.warning(
+            f"[REQUEUE] Parent {parent.id} hit re-evaluation limit "
+            f"({requeue_count}/{effective_max} attempts) — failing permanently"
+        )
         parent.status = TaskStatus.FAILED
         parent.latest_status_message = f"Re-evaluation limit reached ({requeue_count} attempts) — children consistently failing"
         failed_children = (await session.execute(
@@ -605,8 +615,10 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 failure_class, original_status_message, attempt, task_scope, clone_ctx,
             )
             if scope_override:
+                _override_reason = classify_override_reason(failure_class, clone_ctx)
                 clone_ctx["scope"] = scope_override
                 clone_ctx["_scope_reduced"] = True
+                clone_ctx["scope_calibrated_from"] = f"{task_scope}:{_override_reason}"
             if extra_guidance:
                 new_payloads[0]["prompt_suffix"] = extra_guidance + ("\n" + existing_suffix if existing_suffix else "")
 

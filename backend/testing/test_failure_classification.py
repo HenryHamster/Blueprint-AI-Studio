@@ -10,6 +10,7 @@ from app.failure_classification import (
     PROVISION_FAILURE,
     RATE_LIMIT,
     SCOPE_OVERFLOW,
+    persist_failure_category,
     TAXONOMY_CODE_DEFECT,
     TAXONOMY_INFRA_RELATED,
     TAXONOMY_REVIEW_QUALITY,
@@ -87,6 +88,25 @@ def _task(msg: str = "", ctx: dict | None = None) -> Task:
     t.latest_status_message = msg
     t.context = ctx or {}
     return t
+
+
+class TestPersistFailureCategoryTimeoutSubtype:
+    def test_agent_timeout_persists_subtype_from_status(self):
+        task = _task("exit code 137 out of memory")
+        persist_failure_category(task, AGENT_TIMEOUT)
+        assert task.context["failure_category"] == AGENT_TIMEOUT
+        assert task.context["timeout_subtype"] == TIMEOUT_OOM
+
+    def test_agent_timeout_combines_logs(self):
+        task = _task("")
+        persist_failure_category(task, AGENT_TIMEOUT, logs="No heartbeat received after 300s")
+        assert task.context["timeout_subtype"] == TIMEOUT_HEARTBEAT_LOST
+
+    def test_non_timeout_does_not_write_subtype(self):
+        task = _task("AssertionError")
+        persist_failure_category(task, CODE_ERROR)
+        assert task.context["failure_category"] == CODE_ERROR
+        assert "timeout_subtype" not in task.context
 
 
 class TestClassifyFailureCodeError:

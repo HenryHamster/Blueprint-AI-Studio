@@ -154,14 +154,22 @@ def worst_child_failure_category(children: list["Task"]) -> str:
     return best_cat
 
 
-def persist_failure_category(task: "Task", failure_class: str) -> None:
+def persist_failure_category(task: "Task", failure_class: str, logs: Optional[str] = None) -> None:
     """Write ``failure_class`` onto ``task.context['failure_category']`` in place.
 
     All terminal-FAILED code paths must call this (or write the key themselves)
     so direction rollups and research dedup can tell infra from code failures.
+    For AGENT_TIMEOUT, also persists ``timeout_subtype`` (computed from the
+    task's status message plus optional ``logs``) so downstream systems —
+    direction_outcomes, scope calibration, analytics — can correlate subtype
+    with retry outcomes without recomputing from the (possibly overwritten)
+    status message later.
     """
     ctx = dict(task.context or {})
     ctx["failure_category"] = failure_class
+    if failure_class == AGENT_TIMEOUT:
+        status_msg = task.latest_status_message or ""
+        ctx["timeout_subtype"] = _timeout_subtype_from_message(status_msg + " " + (logs or ""))
     task.context = ctx
 
 

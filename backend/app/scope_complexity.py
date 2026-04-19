@@ -4,6 +4,12 @@ Extracted from app.research_completion to keep that module under its
 line-count guardrail. Contains composite-merge-probability scoring that
 combines file count, historical expansion ratio, cochange cluster density,
 and cross-module span into a single P(merge) estimate in [0, 1].
+
+Uses multiplicative factors so moderate values across multiple dimensions
+do not cascade into premature escalation — each dimension contributes a
+factor in [0.5, 1.0], and the product gives the composite probability.
+Extreme values in any single dimension can still drive the composite below
+the escalation threshold.
 """
 from app.cochange_decomposition import (
     cluster_files_by_cochange as _cluster_files_by_cochange,
@@ -13,25 +19,43 @@ from app.cochange_decomposition import (
 def _composite_complexity_score(
     related_files: list[str], direction: dict | None, cochange_index: dict | None,
 ) -> tuple[float, dict]:
-    """Estimate P(merge) in [0,1] from file count, historical expansion ratio,
-    cochange cluster density, and cross-module span. Lower = more complex."""
+    """Estimate P(merge) in [0,1] as a product of per-dimension factors.
+
+    Each dimension returns a factor in [0.5, 1.0]; the composite is the
+    product. Lower = more complex / less likely to merge.
+    """
     n = len(related_files or [])
-    score = 1.0 - min(0.08 * max(0, n - 2), 0.32)
+    # File count: no penalty up to 2 files, linear down to 0.5 at n=10+.
+    f_files = max(0.5, 1.0 - 0.0625 * max(0, n - 2))
     ratio = 0.0
+    f_ratio = 1.0
     if direction and n > 0:
         rs = [(e.get("scope_breakdown") or {}).get("medium", {}).get("avg_expansion_ratio")
               for e in (direction.get("research_history") or [])[-3:]]
         rs = [float(r) for r in rs if isinstance(r, (int, float))]
         if rs:
             ratio = sum(rs) / len(rs)
-            score -= min(0.12 * max(0.0, ratio - 1.0), 0.3)
+            # ratio=1.0 → 1.0; ratio=5.0+ → floor 0.5.
+            f_ratio = max(0.5, 1.0 - 0.125 * max(0.0, ratio - 1.0))
+    f_clusters = 1.0
     if n > 1 and cochange_index:
         clusters = _cluster_files_by_cochange(list(related_files), cochange_index)
         if clusters is None:
-            score -= 0.1
+            f_clusters = 0.9
         elif len(clusters) > 1:
-            score -= min(0.08 * (len(clusters) - 1), 0.24)
+            f_clusters = max(0.5, 1.0 - 0.08 * (len(clusters) - 1))
     modules = {"/".join(f.split("/", 2)[:2]) if "/" in f else f for f in (related_files or [])}
-    if len(modules) > 1:
-        score -= min(0.12 * (len(modules) - 1), 0.3)
-    return max(0.0, min(1.0, score)), {"files": n, "expansion_ratio": round(ratio, 2), "modules": len(modules)}
+    # modules=1 → 1.0; modules=5+ → floor 0.5.
+    f_modules = max(0.5, 1.0 - 0.125 * max(0, len(modules) - 1))
+    score = f_files * f_ratio * f_clusters * f_modules
+    return max(0.0, min(1.0, score)), {
+        "files": n,
+        "expansion_ratio": round(ratio, 2),
+        "modules": len(modules),
+        "factors": {
+            "files": round(f_files, 3),
+            "ratio": round(f_ratio, 3),
+            "clusters": round(f_clusters, 3),
+            "modules": round(f_modules, 3),
+        },
+    }

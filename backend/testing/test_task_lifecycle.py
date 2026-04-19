@@ -335,6 +335,92 @@ async def test_requeue_limit_records_direction_result_on_non_infra_failure(tl_db
 
 
 @pytest.mark.asyncio
+async def test_requeue_same_class_consecutive_failures_reduces_budget(tl_db):
+    """Two consecutive CODE_ERROR failures reduce effective budget to 2."""
+    session, _ = tl_db
+    project = await _make_project(session)
+    # requeue_count=2 is below base max (3) but at the reduced max — should fail.
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 2},
+    )
+    await _make_task(
+        session, project.id, status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "failure_category": "CODE_ERROR",
+            "_previous_failure_class": "CODE_ERROR",
+        },
+        latest_status_message="tests failed",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "Re-evaluation limit reached" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_requeue_different_class_failures_preserve_full_budget(tl_db, mocker):
+    """A class change between attempts preserves the full MAX_PARENT_REQUEUES=3 budget."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 2},
+    )
+    # Current failure is CODE_ERROR, previous was SCOPE_OVERFLOW → different class.
+    await _make_task(
+        session, project.id, status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "failure_category": "CODE_ERROR",
+            "_previous_failure_class": "SCOPE_OVERFLOW",
+            "_attempt_number": 2,
+        },
+        latest_status_message="tests failed",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    # Budget intact: parent was requeued (EVALUATING), not failed.
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.context["_requeue_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_requeue_same_class_infra_exempt_from_budget_reduction(tl_db, mocker):
+    """Same-class INFRA failures (e.g., PROVISION_FAILURE) are exempt from budget shrink."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 2},
+    )
+    await _make_task(
+        session, project.id, status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "failure_category": "PROVISION_FAILURE",
+            "_previous_failure_class": "PROVISION_FAILURE",
+            "_attempt_number": 2,
+        },
+        latest_status_message="provisioning failed",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    # INFRA class exempt → full budget preserved, parent requeued not failed.
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.context["_requeue_count"] == 3
+
+
+@pytest.mark.asyncio
 async def test_requeue_no_children_to_retry_records_deploy_monitoring_result(tl_db):
     """Parent with only CANCELLED children (no failed, no active) records AGENT_TIMEOUT failure.
 
@@ -575,6 +661,7 @@ async def test_requeue_scope_overflow_medium_escalates_to_large(tl_db, mocker):
     assert clone is not None
     assert clone.context.get("scope") == "large"
     assert clone.context.get("_scope_reduced") is True
+    assert clone.context.get("scope_calibrated_from") == "medium:scope_overflow_escalation"
     prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
     assert "scope" in prompt_suffix.lower()
     assert "file-count budget" in prompt_suffix.lower()

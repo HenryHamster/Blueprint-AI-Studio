@@ -2,6 +2,10 @@
 
 Standalone (no DB): only imports the scoring function and monkeypatches
 its co-change cluster helper.
+
+Scoring is multiplicative: each dimension contributes a factor in
+[0.5, 1.0], and the composite is the product. Moderate values across
+dimensions should not cascade below the 0.45 escalation threshold.
 """
 from unittest.mock import patch
 
@@ -12,29 +16,24 @@ def _score(files, direction=None, cochange_index=None):
     return _composite_complexity_score(files, direction, cochange_index)
 
 
-class TestFileCountPenalty:
+class TestFileCountFactor:
     def test_no_penalty_up_to_two_files(self):
-        s0, _ = _score([])
-        s1, _ = _score(["pkg/sub/a.py"])
-        s2, _ = _score(["pkg/sub/a.py", "pkg/sub/b.py"])
-        assert s0 == 1.0
-        assert s1 == 1.0
-        assert s2 == 1.0
+        for files in ([], ["pkg/sub/a.py"], ["pkg/sub/a.py", "pkg/sub/b.py"]):
+            s, _ = _score(files)
+            assert s == 1.0
 
     def test_penalty_starts_at_three_files(self):
         s, meta = _score(["pkg/sub/a.py", "pkg/sub/b.py", "pkg/sub/c.py"])
-        assert s == 1.0 - 0.08
+        assert abs(s - (1.0 - 0.0625)) < 1e-9
         assert meta["files"] == 3
+        assert meta["factors"]["files"] == round(1.0 - 0.0625, 3)
 
-    def test_penalty_caps_at_point_three_two(self):
-        # 0.08 * max(0, n-2) capped at 0.32 → cap reached at n >= 6
-        s6, _ = _score([f"pkg/sub/f{i}.py" for i in range(6)])
-        s10, _ = _score([f"pkg/sub/f{i}.py" for i in range(10)])
-        assert abs(s6 - (1.0 - 0.32)) < 1e-9
-        assert abs(s10 - (1.0 - 0.32)) < 1e-9
+    def test_file_factor_floors_at_half(self):
+        s, _ = _score([f"pkg/sub/f{i}.py" for i in range(20)])
+        assert s == 0.5
 
 
-class TestExpansionRatioPenalty:
+class TestExpansionRatioFactor:
     def test_ratio_above_one_reduces_score(self):
         direction = {
             "research_history": [
@@ -43,8 +42,8 @@ class TestExpansionRatioPenalty:
             ]
         }
         s, meta = _score(["a.py"], direction=direction)
-        # n=1 → no file penalty; ratio=1.5 → penalty = 0.12 * 0.5 = 0.06
-        assert abs(s - (1.0 - 0.06)) < 1e-9
+        # n=1 no file penalty; ratio=1.5 → factor = 1 - 0.125*0.5 = 0.9375
+        assert abs(s - 0.9375) < 1e-9
         assert meta["expansion_ratio"] == 1.5
 
     def test_ratio_at_or_below_one_no_penalty(self):
@@ -56,14 +55,14 @@ class TestExpansionRatioPenalty:
         s, _ = _score(["a.py"], direction=direction)
         assert s == 1.0
 
-    def test_ratio_penalty_caps_at_point_three(self):
+    def test_ratio_factor_floors_at_half(self):
         direction = {
             "research_history": [
                 {"scope_breakdown": {"medium": {"avg_expansion_ratio": 10.0}}},
             ]
         }
         s, _ = _score(["a.py"], direction=direction)
-        assert abs(s - (1.0 - 0.3)) < 1e-9
+        assert s == 0.5
 
     def test_ratio_ignored_when_no_files(self):
         direction = {
@@ -76,7 +75,6 @@ class TestExpansionRatioPenalty:
         assert meta["expansion_ratio"] == 0.0
 
     def test_only_last_three_history_entries_used(self):
-        # Older entries with huge ratio should be ignored; only last 3 used.
         direction = {
             "research_history": [
                 {"scope_breakdown": {"medium": {"avg_expansion_ratio": 999.0}}},
@@ -90,18 +88,18 @@ class TestExpansionRatioPenalty:
         assert s == 1.0
 
 
-class TestCochangeClustering:
-    def test_none_cluster_triggers_fallback_penalty(self):
+class TestCochangeFactor:
+    def test_none_cluster_applies_fallback_factor(self):
         with patch(
             "app.scope_complexity._cluster_files_by_cochange", return_value=None
         ):
             s, _ = _score(
-                ["pkg/sub/a.py", "pkg/sub/b.py"], cochange_index={"pkg/sub/a.py": {"pkg/sub/b.py": 1}}
+                ["pkg/sub/a.py", "pkg/sub/b.py"],
+                cochange_index={"pkg/sub/a.py": {"pkg/sub/b.py": 1}},
             )
-        # n=2 → no file penalty; single module; None cluster → -0.1
         assert abs(s - 0.9) < 1e-9
 
-    def test_multi_cluster_penalty(self):
+    def test_multi_cluster_factor(self):
         with patch(
             "app.scope_complexity._cluster_files_by_cochange",
             return_value=[["pkg/sub/a.py"], ["pkg/sub/b.py"], ["pkg/sub/c.py"]],
@@ -110,20 +108,8 @@ class TestCochangeClustering:
                 ["pkg/sub/a.py", "pkg/sub/b.py", "pkg/sub/c.py"],
                 cochange_index={"pkg/sub/a.py": {"pkg/sub/b.py": 1}},
             )
-        # n=3 → -0.08; clusters=3 → -0.08*2=0.16 penalty
-        assert abs(s - (1.0 - 0.08 - 0.16)) < 1e-9
-
-    def test_multi_cluster_penalty_caps(self):
-        clusters = [[f"pkg/sub/f{i}.py"] for i in range(10)]
-        with patch(
-            "app.scope_complexity._cluster_files_by_cochange", return_value=clusters
-        ):
-            s, _ = _score(
-                ["pkg/sub/a.py", "pkg/sub/b.py"],
-                cochange_index={"pkg/sub/a.py": {"pkg/sub/b.py": 1}},
-            )
-        # cluster penalty capped at 0.24
-        assert abs(s - (1.0 - 0.24)) < 1e-9
+        # f_files = 1 - 0.0625 = 0.9375; f_clusters = 1 - 0.08*2 = 0.84
+        assert abs(s - (0.9375 * 0.84)) < 1e-9
 
     def test_single_cluster_no_penalty(self):
         with patch(
@@ -151,34 +137,78 @@ class TestCochangeClustering:
             assert m.call_count == 0
 
 
-class TestCrossModuleSpan:
+class TestCrossModuleFactor:
     def test_single_module_no_penalty(self):
         s, meta = _score(["backend/app/a.py", "backend/app/b.py"])
         assert s == 1.0
         assert meta["modules"] == 1
 
-    def test_two_modules_penalty(self):
+    def test_two_modules_factor(self):
         s, meta = _score(["backend/app/a.py", "admin-ui/src/b.ts"])
-        assert abs(s - (1.0 - 0.12)) < 1e-9
+        # f_modules = 1 - 0.125 = 0.875
+        assert abs(s - 0.875) < 1e-9
         assert meta["modules"] == 2
 
-    def test_three_modules_scales_linearly(self):
+    def test_three_modules(self):
         s, meta = _score(
             ["backend/app/a.py", "admin-ui/src/b.ts", "agent/src/c.ts"]
         )
-        # n=3 file penalty 0.08 + module penalty 0.12*2=0.24
-        assert abs(s - (1.0 - 0.08 - 0.24)) < 1e-9
+        # f_files = 1 - 0.0625 = 0.9375; f_modules = 1 - 0.125*2 = 0.75
+        assert abs(s - (0.9375 * 0.75)) < 1e-9
         assert meta["modules"] == 3
 
-    def test_module_penalty_caps(self):
-        files = [f"mod{i}/sub/f.py" for i in range(10)]
-        s, _ = _score(files)
-        # file penalty maxed 0.32; module penalty capped at 0.3
-        assert abs(s - max(0.0, 1.0 - 0.32 - 0.3)) < 1e-9
+
+class TestCompositeBehavior:
+    def test_moderate_across_dimensions_stays_above_threshold(self):
+        """5-file, 2-module finding with moderate expansion (1.5x) should
+        stay at medium: composite must remain >= 0.45."""
+        direction = {
+            "research_history": [
+                {"scope_breakdown": {"medium": {"avg_expansion_ratio": 1.5}}},
+            ]
+        }
+        files = [
+            "backend/app/a.py",
+            "backend/app/b.py",
+            "backend/app/c.py",
+            "backend/app/d.py",
+            "admin-ui/src/e.ts",
+        ]
+        s, _ = _score(files, direction=direction)
+        assert s >= 0.45, f"moderate case escalated prematurely: score={s:.3f}"
+
+    def test_extreme_across_dimensions_escalates(self):
+        """10-file, 3-module finding with high expansion (3x) should
+        escalate: composite must fall below 0.45."""
+        direction = {
+            "research_history": [
+                {"scope_breakdown": {"medium": {"avg_expansion_ratio": 3.0}}},
+            ]
+        }
+        files = (
+            [f"backend/app/f{i}.py" for i in range(4)]
+            + [f"admin-ui/src/g{i}.ts" for i in range(3)]
+            + [f"agent/src/h{i}.ts" for i in range(3)]
+        )
+        s, _ = _score(files, direction=direction)
+        assert s < 0.45, f"extreme case failed to escalate: score={s:.3f}"
+
+    def test_single_extreme_dimension_escalates(self):
+        """A single extreme dimension (e.g. very high expansion ratio)
+        should drive the composite below the threshold on its own when
+        combined with any other mild penalty."""
+        direction = {
+            "research_history": [
+                {"scope_breakdown": {"medium": {"avg_expansion_ratio": 20.0}}},
+            ]
+        }
+        files = [f"backend/app/f{i}.py" for i in range(8)]
+        s, _ = _score(files, direction=direction)
+        assert s < 0.45
 
 
 class TestClampingAndEmpty:
-    def test_score_clamped_to_zero_floor(self):
+    def test_score_bounded(self):
         direction = {
             "research_history": [
                 {"scope_breakdown": {"medium": {"avg_expansion_ratio": 100.0}}},
@@ -191,17 +221,13 @@ class TestClampingAndEmpty:
         ):
             s, _ = _score(files, direction=direction, cochange_index={"x": {"y": 1}})
         assert 0.0 <= s <= 1.0
-        assert s == 0.0
-
-    def test_score_clamped_upper_bound(self):
-        s, _ = _score([])
-        assert 0.0 <= s <= 1.0
-        assert s == 1.0
 
     def test_empty_related_files(self):
         s, meta = _score([], direction=None, cochange_index=None)
         assert s == 1.0
-        assert meta == {"files": 0, "expansion_ratio": 0.0, "modules": 0}
+        assert meta["files"] == 0
+        assert meta["expansion_ratio"] == 0.0
+        assert meta["modules"] == 0
 
     def test_none_direction_and_cochange(self):
         s, meta = _score(
@@ -209,7 +235,7 @@ class TestClampingAndEmpty:
             direction=None,
             cochange_index=None,
         )
-        assert abs(s - (1.0 - 0.08)) < 1e-9
+        assert abs(s - (1.0 - 0.0625)) < 1e-9
         assert meta["expansion_ratio"] == 0.0
 
     def test_none_related_files_treated_as_empty(self):

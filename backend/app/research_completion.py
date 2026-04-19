@@ -241,10 +241,10 @@ def _calibrate_finding_scope(
             )
             finding["_complexity_score"] = round(_cc_score, 3)
             finding["_complexity_signals"] = _cc_signals
-            if _cc_score < 0.5:
+            if _cc_score < 0.45:
                 logger.info(
                     "[RESEARCH] Upgrading scope medium→large for '%s' "
-                    "(composite complexity %.2f < 0.50, signals=%s)",
+                    "(composite complexity %.2f < 0.45, signals=%s)",
                     title, _cc_score, _cc_signals,
                 )
                 scope = "large"
