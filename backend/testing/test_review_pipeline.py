@@ -2358,6 +2358,75 @@ async def test_self_review_outcome_propagates_to_spawned_review(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_diagnosis_fingerprint_propagates_across_review_fix_iteration(
+    db_session, mocker
+):
+    """Fingerprint-dependent outcome recording requires diagnosis_fingerprint (and
+    trigger_failure_class / trigger_failure_taxonomy) to survive multi-iteration
+    review-fix cycles. The explicit propagation from the original create task is
+    the safety net when the source task's context has drifted and no longer holds
+    these fields. Ensure they are copied onto the spawned fix task."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Remediate X", "base_branch": "main"}],
+        context={
+            "scope": "small",
+            "diagnosis_task_id": "diag-fp",
+            "diagnosis_fingerprint": "fp-abc123",
+            "error_fingerprint": "err-xyz789",
+            "trigger_failure_class": "code_error",
+            "trigger_failure_taxonomy": "CODE_DEFECT",
+            "diagnosis_root_cause": "rc",
+            "diagnosis_recommended_fix": "rf",
+        },
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Source task is a mid-cycle review task whose context has drifted — it no
+    # longer carries diagnosis_fingerprint. The explicit copy from orig must
+    # restore it on the spawned fix task.
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 444, "branch": "feat/fp",
+                   "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 1,
+                            "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=444, branch="feat/fp", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Address feedback",
+    )
+    assert created is True
+    assert result is not None
+    ctx = result.context or {}
+    assert ctx.get("diagnosis_fingerprint") == "fp-abc123", (
+        "diagnosis_fingerprint must survive review-fix iteration via explicit "
+        "propagation from the original create task"
+    )
+    assert ctx.get("error_fingerprint") == "err-xyz789"
+    assert ctx.get("trigger_failure_class") == "code_error"
+    assert ctx.get("trigger_failure_taxonomy") == "CODE_DEFECT"
+
+
+@pytest.mark.asyncio
 async def test_self_review_outcome_absent_when_not_on_source(db_session, mocker):
     """When the source task has no `_self_review_outcome`, the spawned task's
     context must not synthesize one."""

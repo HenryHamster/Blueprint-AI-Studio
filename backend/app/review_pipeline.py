@@ -1032,6 +1032,8 @@ async def _spawn_pipeline_task(
         for _dk in (
             "diagnosis_task_id", "diagnosis_root_cause",
             "diagnosis_recommended_fix", "severity", "diagnosis_confidence",
+            "diagnosis_fingerprint", "error_fingerprint",
+            "trigger_failure_class", "trigger_failure_taxonomy",
         ):
             if orig_ctx_src.get(_dk) is not None:
                 propagated_ctx[_dk] = orig_ctx_src[_dk]

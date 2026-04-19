@@ -850,6 +850,17 @@ async def _maybe_spawn_reinvestigation_after_failure(
         or _project_active_followup_count(project, fp_key, now=now)
         >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT
     ):
+        logger.info(
+            f"[DIAGNOSIS] Skip reinvestigation for direction {direction_id}: "
+            f"cap reached for fingerprint {fp_key[:40]} "
+            f"(direction={len(active_ts)}, "
+            f"cap={_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT})"
+        )
+        directions = list(project.directions or [])
+        await _maybe_escalate_exhausted_followups(
+            project=project, direction=direction, directions=directions,
+            fp_key=fp_key, session=session,
+        )
         return None
     prior_summary = (direction.get("diagnosis_summary") or "").strip()
     failure_summary = (investigation_task.latest_status_message or "(no error message)")

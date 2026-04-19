@@ -3246,6 +3246,49 @@ class TestHandleInvestigationTerminalFailure:
             for n in notes
         )
 
+    @pytest.mark.asyncio
+    async def test_reinvestigation_cap_exhausted_escalates(self, db_session, mocker):
+        """Cap hit on investigation-failure path flags needs_manual_intervention + posts."""
+        from app.time_utils import _utcnow
+        post_mock = mocker.patch(
+            "app.notification_dispatch.post_remediation_escalation_message",
+            new_callable=AsyncMock,
+        )
+        recent_ts = [_utcnow().isoformat(), _utcnow().isoformat()]
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused", "text": "rollup reliability",
+            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent_ts)},
+            "remediation_history": [
+                {"task_id": "old-1", "result": "failed", "fingerprint": "fp-A",
+                 "timestamp": "2026-04-10T00:00:00"},
+            ],
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        failed_inv = self._make_investigation_task(
+            project.id, direction_id="dir-1", fingerprint="fp-A",
+        )
+        db_session.add(failed_inv)
+        await db_session.commit()
+        await db_session.refresh(failed_inv)
+
+        target = next(d for d in project.directions if d["id"] == "dir-1")
+        spawned = await _maybe_spawn_reinvestigation_after_failure(
+            investigation_task=failed_inv,
+            project=project,
+            direction=target,
+            session=db_session,
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert spawned is None
+        d = project.directions[0]
+        assert d.get("needs_manual_intervention") is True
+        assert post_mock.await_count == 1
+        assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": recent_ts}
+
 
 # ── _handle_plan_completion — scope-aware subtask effort ──────────────────────
 
