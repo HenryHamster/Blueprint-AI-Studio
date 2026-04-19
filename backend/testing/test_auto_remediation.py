@@ -662,6 +662,107 @@ async def test_remediation_spawn_to_feedback_clears_escalation_state(db_session:
 
 
 @pytest.mark.asyncio
+async def test_pipeline_exhaustion_propagates_to_auto_remediation_branch(db_session: AsyncSession):
+    """When a review/fix task fails permanently on an auto-remediation PR, the
+    original create task's auto_remediation context drives post_auto_fix_result_message
+    with result='failed' so the branch's failure counter advances toward suspension."""
+    from app.routers.agent_status import _propagate_pipeline_failure_to_original
+
+    project = await _create_project(db_session)
+    await db_session.flush()
+
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "auto-fix CI", "base_branch": "main"}],
+        context={
+            "auto_remediation": True,
+            "ci_failure_sha": "abc123",
+            "ci_failure_branch": "main",
+        },
+        status=TaskStatus.COMPLETED,
+        created_by="SYSTEM_AUTO_REMEDIATION",
+    )
+    db_session.add(original)
+    await db_session.flush()
+
+    review = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "review",
+            "pr_number": 9999,
+            "branch": "blueprint/auto-fix",
+            "original_task_id": str(original.id),
+        }],
+        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 9999}},
+        status=TaskStatus.FAILED,
+    )
+    db_session.add(review)
+    await db_session.flush()
+
+    with patch(
+        "app.notification_dispatch.post_auto_fix_result_message",
+        new_callable=AsyncMock,
+    ) as mock_post, patch(
+        "app.routers.agent_status._check_and_trigger_rollup",
+        new_callable=AsyncMock,
+    ):
+        await _propagate_pipeline_failure_to_original(review, db_session)
+        assert mock_post.await_count == 1
+        kwargs = mock_post.await_args.kwargs
+        assert kwargs["branch"] == "main"
+        assert kwargs["result"] == "failed"
+        assert kwargs["task_id"] == original.id
+
+    await db_session.refresh(original)
+    assert original.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_pipeline_exhaustion_skips_non_remediation_tasks(db_session: AsyncSession):
+    """Non-auto-remediation originals still get cancelled, but no auto-fix failure message is posted."""
+    from app.routers.agent_status import _propagate_pipeline_failure_to_original
+
+    project = await _create_project(db_session)
+    await db_session.flush()
+
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "regular work"}],
+        context={},
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(original)
+    await db_session.flush()
+
+    review = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "review",
+            "pr_number": 42,
+            "branch": "blueprint/task-x",
+            "original_task_id": str(original.id),
+        }],
+        context={"review_loop": {"original_task_id": str(original.id), "pr_number": 42}},
+        status=TaskStatus.FAILED,
+    )
+    db_session.add(review)
+    await db_session.flush()
+
+    with patch(
+        "app.notification_dispatch.post_auto_fix_result_message",
+        new_callable=AsyncMock,
+    ) as mock_post, patch(
+        "app.routers.agent_status._check_and_trigger_rollup",
+        new_callable=AsyncMock,
+    ):
+        await _propagate_pipeline_failure_to_original(review, db_session)
+        mock_post.assert_not_awaited()
+
+    await db_session.refresh(original)
+    assert original.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
 async def test_find_matching_prior_investigation_matches_on_file_path(db_session: AsyncSession):
     """A recent completed investigate task whose affected file appears in the error summary matches."""
     project = await _create_project(db_session)

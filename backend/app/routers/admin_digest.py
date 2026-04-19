@@ -2302,7 +2302,10 @@ async def get_digest(
     ]
     ci_auto_remediation: Dict[str, Any] = {
         "spawned": len(_ci_rem_tasks),
-        "merged": sum(1 for t in _ci_rem_tasks if t.status == TaskStatus.COMPLETED),
+        "merged": sum(
+            1 for t in _ci_rem_tasks
+            if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged") is True
+        ),
         "failed": sum(1 for t in _ci_rem_tasks if t.status == TaskStatus.FAILED),
         "by_ci_failure_type": {},
     }
@@ -2311,7 +2314,7 @@ async def get_digest(
         ci_type = str((t.context or {}).get("ci_failure_type") or "unknown").strip() or "unknown"
         bucket = _ci_type_buckets.setdefault(ci_type, {"spawned": 0, "merged": 0, "failed": 0})
         bucket["spawned"] += 1
-        if t.status == TaskStatus.COMPLETED:
+        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged") is True:
             bucket["merged"] += 1
         elif t.status == TaskStatus.FAILED:
             bucket["failed"] += 1
@@ -2337,6 +2340,8 @@ async def get_digest(
     for r in _cum_result.scalars().all():
         ctx = r.context or {}
         if not (ctx.get("diagnosis_task_id") or ctx.get("auto_remediation") is True):
+            continue
+        if ctx.get("pr_merged") is not True:
             continue
         trigger_cls = ctx.get("trigger_failure_class")
         if not trigger_cls:

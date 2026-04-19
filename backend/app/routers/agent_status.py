@@ -340,6 +340,49 @@ def _get_applicable_types(tasks: list) -> list[str]:
     return sorted(types) if types else []
 
 
+async def _propagate_pipeline_failure_to_original(task: Task, session: AsyncSession) -> None:
+    """When a review/fix task fails permanently, cancel its original create task
+    (so rollup excludes it) and, if the original was an auto-remediation task,
+    propagate the failure to the branch's auto-fix escalation counter."""
+    task_payload = task.first_payload
+    task_type = task_payload.get("type", "")
+    if task_type not in ("review", "fix"):
+        return
+    original_task_id = ((task.context or {}).get("review_loop", {}).get("original_task_id", "")
+                        or task_payload.get("original_task_id", ""))
+    if not original_task_id:
+        return
+    try:
+        orig = await session.get(Task, uuid.UUID(original_task_id))
+        if not (orig and orig.status == TaskStatus.COMPLETED):
+            return
+        orig.status = TaskStatus.CANCELLED
+        orig.latest_status_message = f"Pipeline {task_type} task failed — PR excluded from rollup"
+        session.add(orig)
+        await session.commit()
+        if orig.parent_task_id:
+            await _check_and_trigger_rollup(orig, session)
+        logger.error(f"[PIPELINE] Cancelled original task {original_task_id} — {task_type} failed, skipping in rollup")
+        # Auto-remediation: review/fix cycle exhaustion means the remediation
+        # attempt failed. The review task itself doesn't carry auto_remediation
+        # in its context, so propagate via the original create task's context.
+        if (orig.context or {}).get("auto_remediation") is True:
+            try:
+                from app.notification_dispatch import post_auto_fix_result_message  # noqa: PLC0415
+                _ar_branch = (orig.context or {}).get("ci_failure_branch", "main")
+                await post_auto_fix_result_message(
+                    session, orig.project_id,
+                    branch=_ar_branch,
+                    result="failed",
+                    task_id=orig.id,
+                )
+                await session.commit()
+            except Exception as _ar_exc:
+                logger.warning("[AUTO-REMEDIATION] Failed to post failure result after pipeline exhaustion: %s", _ar_exc)
+    except Exception as e:
+        logger.warning(f"[PIPELINE] Failed to propagate failure to {original_task_id}: {e}", exc_info=True)
+
+
 @router.post("/api/agent/status")
 @limiter.limit("120/minute")
 async def update_agent_status(
@@ -1221,25 +1264,7 @@ async def update_agent_status(
         # skips it (via cancelled-child logic) instead of hanging forever.
         # Other children's work is preserved — only this PR is excluded from the rollup.
         if payload.status == TaskStatus.FAILED:
-            task_payload = task.first_payload
-            task_type = task_payload.get("type", "")
-            if task_type in ("review", "fix"):
-                original_task_id = ((task.context or {}).get("review_loop", {}).get("original_task_id", "")
-                                    or task_payload.get("original_task_id", ""))
-                if original_task_id:
-                    try:
-                        orig = await session.get(Task, uuid.UUID(original_task_id))
-                        if orig and orig.status == TaskStatus.COMPLETED:
-                            orig.status = TaskStatus.CANCELLED
-                            orig.latest_status_message = f"Pipeline {task_type} task failed — PR excluded from rollup"
-                            session.add(orig)
-                            await session.commit()
-                            # Trigger rollup check so parent can proceed with remaining children
-                            if orig.parent_task_id:
-                                await _check_and_trigger_rollup(orig, session)
-                            logger.error(f"[PIPELINE] Cancelled original task {original_task_id} — {task_type} failed, skipping in rollup")
-                    except Exception as e:
-                        logger.warning(f"[PIPELINE] Failed to propagate failure to {original_task_id}: {e}", exc_info=True)
+            await _propagate_pipeline_failure_to_original(task, session)
 
         if payload.status == TaskStatus.COMPLETED and task.created_by == "ORCHESTRATOR":
             project_key = str(task.project_id)
