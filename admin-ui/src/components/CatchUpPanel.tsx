@@ -328,6 +328,7 @@ interface DigestData {
   pipeline_acceptance_rate?: number | null;
   pipeline_conversion_rate?: number | null;
   overall_product_ratio?: number | null;
+  overall_type_distribution?: Record<string, number> | null;
   pipeline_filter_funnel?: Record<string, number> | null;
   latest_cycle?: {
     cycle_id?: string | null;
@@ -1473,6 +1474,23 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </span>
                   );
                 })()}
+                {digest!.overall_type_distribution && Object.keys(digest!.overall_type_distribution).length > 0 && (
+                  <span className="flex items-center gap-1" title="Task type distribution across all directions">
+                    {Object.entries(digest!.overall_type_distribution)
+                      .sort((a, b) => b[1] - a[1])
+                      .map(([type, count]) => {
+                        const style = TASK_TYPE_STYLES[type];
+                        return (
+                          <span
+                            key={type}
+                            className={`${style?.bg ?? 'bg-neutral-500/10 border-neutral-500/20'} ${style?.text ?? 'text-neutral-400'} border px-1.5 py-0.5 rounded font-semibold uppercase tracking-wider text-[10px]`}
+                          >
+                            {style?.label ?? type} {count}
+                          </span>
+                        );
+                      })}
+                  </span>
+                )}
                 {digest!.pending_approval_count > 0 && (
                   <span className="flex items-center gap-1">
                     <AlertTriangle className="w-3 h-3 text-amber-400" />
