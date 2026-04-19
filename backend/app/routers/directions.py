@@ -318,6 +318,7 @@ async def update_direction(
                     d.pop("needs_manual_intervention", None)
                     d.pop("escalation_notification_pending", None)
                     d.pop("escalation_notification_retries", None)
+                    d.pop("last_researched_at", None)
                     d["remediation_attempts"] = 0
                 # When reviving from expired back to proposed, clear expired_at
                 if payload["status"] == "proposed":

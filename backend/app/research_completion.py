@@ -1400,7 +1400,7 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
     Appends a minimal history entry tagged research_task_failed=True to the direction
     referenced in task.context.direction_id (falling back to the payload field).
     """
-    from app.failure_classification import classify_failure  # noqa: PLC0415
+    from app.failure_classification import INFRA_CLASSES, classify_failure  # noqa: PLC0415
 
     direction_id = (task.context or {}).get("direction_id") or task.first_payload.get("current_direction_id")
     if not direction_id:
@@ -1436,7 +1436,9 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
         )
     target["research_history"] = new_history[-10:]
     target["last_researched_at"] = now_iso
-    target["last_cycle_productive"] = False
+    # Infra failures are transient — use the shorter productive cooldown so the
+    # direction is retried promptly instead of waiting out the full unproductive window.
+    target["last_cycle_productive"] = failure_category in INFRA_CLASSES
     project.directions = directions
     flag_modified(project, "directions")
     session.add(project)

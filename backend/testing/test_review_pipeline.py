@@ -297,19 +297,28 @@ class TestShouldAutoApproveSmallDiff:
         skip, _ = should_auto_approve_small_diff(t, None)
         assert skip is False
 
-    def test_non_create_refactor_rejected(self):
+    def test_non_eligible_type_rejected(self):
         t = self._task(
-            type_="fix",
+            type_="plan",
             files=["app/foo.py"],
             diff=[{"file": "app/foo.py", "added": 5, "removed": 0}],
         )
         skip, _ = should_auto_approve_small_diff(t, None)
         assert skip is False
 
+    def test_fix_type_eligible(self):
+        t = self._task(
+            type_="fix",
+            files=["app/foo.py"],
+            diff=[{"file": "app/foo.py", "added": 5, "removed": 0}],
+        )
+        skip, _ = should_auto_approve_small_diff(t, None)
+        assert skip is True
+
     def test_too_many_lines_rejected(self):
         t = self._task(
             files=["app/foo.py"],
-            diff=[{"file": "app/foo.py", "added": 50, "removed": 0}],
+            diff=[{"file": "app/foo.py", "added": 100, "removed": 0}],
         )
         skip, reason = should_auto_approve_small_diff(t, None)
         assert skip is False
@@ -317,11 +326,13 @@ class TestShouldAutoApproveSmallDiff:
 
     def test_too_many_non_test_files_rejected(self):
         t = self._task(
-            files=["app/a.py", "app/b.py", "app/c.py"],
+            files=["app/a.py", "app/b.py", "app/c.py", "app/d.py", "app/e.py"],
             diff=[
                 {"file": "app/a.py", "added": 1, "removed": 0},
                 {"file": "app/b.py", "added": 1, "removed": 0},
                 {"file": "app/c.py", "added": 1, "removed": 0},
+                {"file": "app/d.py", "added": 1, "removed": 0},
+                {"file": "app/e.py", "added": 1, "removed": 0},
             ],
         )
         skip, _ = should_auto_approve_small_diff(t, None)

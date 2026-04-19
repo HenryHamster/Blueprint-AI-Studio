@@ -983,8 +983,8 @@ async def _process_post_commit(
                     and _runtime_config.get("auto_approve_small_diff_enabled", True)
                 ):
                     try:
-                        max_lines = int(_runtime_config.get("auto_approve_max_lines", 20))
-                        max_files = int(_runtime_config.get("auto_approve_max_files", 2))
+                        max_lines = int(_runtime_config.get("auto_approve_max_lines", 50))
+                        max_files = int(_runtime_config.get("auto_approve_max_files", 4))
                         _aa_tok, _aa_owner, _aa_repo = await get_github_token_for_task(task.id, session)
                         _aa_pr = await get_pull_request(_aa_tok, _aa_owner, _aa_repo, pr_number, project_id=str(task.project_id))
                         lines_changed = int(_aa_pr.get("additions", 0) or 0) + int(_aa_pr.get("deletions", 0) or 0)

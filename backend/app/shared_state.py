@@ -153,8 +153,8 @@ runtime_config: Dict = {
     # direction acceptance rate > 50%), the review task is skipped and the PR
     # proceeds directly to CI-gated merge. Set auto_approve_max_lines to 0 to
     # disable the fast-path entirely.
-    "auto_approve_max_lines": 20,
-    "auto_approve_max_files": 2,
+    "auto_approve_max_lines": 50,
+    "auto_approve_max_files": 4,
     # TTL (days) for deferred findings carried forward by autonomous_research.
     # Findings older than this window are dropped rather than reprocessed, so
     # stale context doesn't keep surfacing work the system already declined to

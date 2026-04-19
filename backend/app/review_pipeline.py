@@ -256,20 +256,20 @@ def should_auto_approve_small_diff(
     readable string suitable for task status messages and operator logs.
 
     Gates (all must pass):
-    - source task type is create or refactor
+    - source task type is create, refactor, or fix
     - scope is 'small' (medium/large always get full review)
     - diff size known and <= runtime_config auto_approve_max_lines
     - non-test file count <= runtime_config auto_approve_max_files
     - direction acceptance_rate > AUTO_APPROVE_MIN_ACCEPTANCE_RATE when
       direction history is available (new directions pass by default)
     """
-    max_lines = _runtime_config.get("auto_approve_max_lines", 20)
-    max_files = _runtime_config.get("auto_approve_max_files", 2)
+    max_lines = _runtime_config.get("auto_approve_max_lines", 50)
+    max_files = _runtime_config.get("auto_approve_max_files", 4)
     if not max_lines or max_lines <= 0:
         return (False, "auto-approve disabled (auto_approve_max_lines=0)")
 
     source_type = (source_task.first_payload or {}).get("type", "")
-    if source_type not in ("create", "refactor"):
+    if source_type not in ("create", "refactor", "fix"):
         return (False, f"source type {source_type!r} not eligible")
 
     ctx = source_task.context or {}
