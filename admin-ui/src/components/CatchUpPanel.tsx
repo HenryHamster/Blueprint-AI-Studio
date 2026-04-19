@@ -96,6 +96,7 @@ interface DirectionProgress {
   needs_manual_intervention?: boolean;
   scope_breakdown?: Record<string, { created?: number; merged?: number; failed?: number }> | null;
   taxonomy_summary?: Record<string, number> | null;
+  stage_dropout?: Record<string, number> | null;
   rejection_reasons?: { task_id?: string; title?: string; rejection_note?: string }[] | null;
 }
 
@@ -164,6 +165,8 @@ interface DigestData {
   prev_scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
   total_failed_cost_usd?: number | null;
   total_estimated_cost_usd?: number | null;
+  daily_cost_usd?: number | null;
+  daily_cost_ceiling_usd?: number | null;
   rejection_pattern_summary?: {
     total_rejected: number;
     top_notes: { snippet: string; count: number }[];
@@ -451,6 +454,20 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                       return (
                         <span key={cat} className={`text-[9px] px-1.5 py-0.5 rounded border ${TAXONOMY_COLORS[cat]}`} title={TAXONOMY_LABELS[cat]}>
                           {TAXONOMY_LABELS[cat]} {cnt}
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+                {dp.stage_dropout && Object.keys(dp.stage_dropout).length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1">
+                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">stages:</span>
+                    {STAGE_ORDER.map(stage => {
+                      const cnt = dp.stage_dropout?.[stage];
+                      if (!cnt) return null;
+                      return (
+                        <span key={stage} className={`text-[9px] px-1.5 py-0.5 rounded border ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'}`}>
+                          {stage} {cnt}
                         </span>
                       );
                     })}
@@ -899,6 +916,27 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     <DollarSign className="w-2.5 h-2.5" />{digest!.total_estimated_cost_usd.toFixed(2)} total
                   </span>
                 )}
+                {digest!.daily_cost_usd != null && digest!.daily_cost_usd > 0 && (() => {
+                  const spent = digest!.daily_cost_usd!;
+                  const ceiling = digest!.daily_cost_ceiling_usd ?? 0;
+                  const ratio = ceiling > 0 ? spent / ceiling : 0;
+                  const tone = ceiling <= 0
+                    ? 'text-neutral-500'
+                    : ratio >= 0.9
+                      ? 'text-red-500'
+                      : ratio >= 0.7
+                        ? 'text-amber-500'
+                        : 'text-emerald-500';
+                  const title = ceiling > 0
+                    ? `Today: $${spent.toFixed(2)} of $${ceiling.toFixed(2)} daily ceiling (${Math.round(ratio * 100)}%)`
+                    : `Today: $${spent.toFixed(2)} (no daily ceiling set)`;
+                  return (
+                    <span className={`inline-flex items-center gap-0.5 font-mono ${tone}`} title={title}>
+                      <DollarSign className="w-2.5 h-2.5" />{spent.toFixed(2)} today
+                      {ceiling > 0 && <span className="text-neutral-500">/{ceiling.toFixed(0)}</span>}
+                    </span>
+                  );
+                })()}
                 {digest!.research_cycles > 0 && (
                   <span>{digest!.research_cycles} research cycle{digest!.research_cycles !== 1 ? 's' : ''}</span>
                 )}
