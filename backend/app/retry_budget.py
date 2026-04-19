@@ -77,7 +77,13 @@ async def compute_effective_max_requeues(
     - AGENT_TIMEOUT appears 2+ times in history: reduce by 1, despite being
       in INFRA_CLASSES, since repeat timeouts signal scope/complexity exceeds
       the runtime budget rather than transient infrastructure.
+    - The same specific tests failed across attempts (child's
+      ``_previous_failing_tests`` overlaps with failing tests extracted from
+      its own ``latest_status_message``): reduce by 1. Retry guidance cannot
+      fix deterministic test failures, so fail the parent earlier instead of
+      exhausting the full CODE_ERROR budget.
     """
+    from app.task_lifecycle import _extract_failing_tests
     children = (await session.execute(
         select(Task).where(
             Task.parent_task_id == parent.id,
@@ -85,6 +91,7 @@ async def compute_effective_max_requeues(
         )
     )).scalars().all()
     reduction = 0
+    recurring_tests = False
     for child in children:
         ctx = child.context or {}
         current_class = classify_failure(child, logs=ctx.get("last_error") or None)
@@ -106,6 +113,13 @@ async def compute_effective_max_requeues(
                     reduction = max(reduction, 2)
                 elif cls not in INFRA_CLASSES and count >= 2:
                     reduction = max(reduction, 1)
+        prev_failing = ctx.get("_previous_failing_tests") or []
+        if isinstance(prev_failing, list) and prev_failing:
+            current_failing = _extract_failing_tests(child.latest_status_message or "")
+            if any(t in set(prev_failing) for t in current_failing):
+                recurring_tests = True
+    if recurring_tests:
+        reduction += 1
     return max_requeues - reduction
 
 

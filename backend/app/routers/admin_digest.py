@@ -1677,6 +1677,25 @@ async def get_digest(
     total_spot_cost_usd = round(total_spot_cost_usd, 2)
     total_on_demand_cost_usd = round(total_on_demand_cost_usd, 2)
 
+    # Provisioning overhead: cost of time spent between VM provision and agent claim
+    # (vm_provisioned_at → vm_started_at). When vm_started_at is missing, the agent
+    # never claimed the task, so the entire VM lifetime counts as provisioning waste.
+    _provisioning_overhead_raw = 0.0
+    _total_compute_cost_raw = total_spot_cost_usd + total_on_demand_cost_usd
+    for t in all_tasks:
+        if not (t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start):
+            continue
+        rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+        prov_end = t.vm_started_at if (t.vm_started_at and t.vm_started_at >= t.vm_provisioned_at) else t.vm_stopped_at
+        if prov_end <= t.vm_provisioned_at:
+            continue
+        _provisioning_overhead_raw += rate * (prov_end - t.vm_provisioned_at).total_seconds()
+    provisioning_overhead_usd = round(_provisioning_overhead_raw, 2)
+    provisioning_overhead_pct = (
+        round(_provisioning_overhead_raw / _total_compute_cost_raw, 3)
+        if _total_compute_cost_raw > 0 else None
+    )
+
     # Compute today's cost for cost ceiling warning
     today_start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     daily_cost_usd = round(sum(
@@ -1924,6 +1943,8 @@ async def get_digest(
         "total_estimated_cost_usd": total_estimated_cost_usd,
         "spot_cost_usd": total_spot_cost_usd,
         "on_demand_cost_usd": total_on_demand_cost_usd,
+        "provisioning_overhead_usd": provisioning_overhead_usd,
+        "provisioning_overhead_pct": provisioning_overhead_pct,
         "cost_by_failure_class": cost_by_failure_class,
         "total_failed_cost_usd": total_failed_cost_usd,
         "retry_overhead_cost_usd": retry_overhead_cost_usd,

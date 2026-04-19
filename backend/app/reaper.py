@@ -63,6 +63,22 @@ _HEARTBEAT_EFFORT_FLOORS = {
 }
 
 
+_PRECLAIM_STALE_DEFAULTS = {
+    "small": 360,
+    "medium": 480,
+    "large": 600,
+}
+
+
+def _preclaim_stale_cutoff(task, now: datetime) -> datetime:
+    ctx = task.context or {}
+    payload = task.first_payload or {}
+    scope = ctx.get("scope") or payload.get("scope")
+    thresholds = _runtime_config.get("preclaim_stale_seconds_by_scope", _PRECLAIM_STALE_DEFAULTS)
+    seconds = thresholds.get(scope, thresholds.get("small", 360))
+    return now - timedelta(seconds=seconds)
+
+
 def _heartbeat_stale_cutoff(task, now: datetime) -> datetime:
     ctx = task.context or {}
     payload = task.first_payload or {}
@@ -107,7 +123,6 @@ async def reaper_service():
                 active_tasks = (await session.execute(stmt)).scalars().all()
 
                 now = _utcnow()
-                six_minutes_ago = now - timedelta(minutes=6)
                 ten_minutes_ago = now - timedelta(minutes=10)
                 fifteen_minutes_ago = now - timedelta(minutes=15)
 
@@ -137,8 +152,9 @@ async def reaper_service():
                             # Rare: agent claimed during PROVISIONING (shouldn't happen since
                             # claim_task also flips status to IN_PROGRESS), then went silent.
                             orphaned_ids.append(task.id)
-                        elif task.vm_provisioned_at and task.vm_provisioned_at < six_minutes_ago and task.last_heartbeat is None:
-                            # Silent pre-claim death: VM was dispatched 6+ min ago and the
+                        elif task.vm_provisioned_at and task.vm_provisioned_at < _preclaim_stale_cutoff(task, now) and task.last_heartbeat is None:
+                            # Silent pre-claim death: VM was dispatched long enough ago
+                            # (scope-aware: small 6min, medium 8min, large 10min) and the
                             # agent never claimed. Charge provision budget.
                             orphaned_ids.append(task.id)
                     elif task.status == TaskStatus.IN_PROGRESS:
@@ -218,7 +234,6 @@ async def reaper_service():
                     # expire_all() above ensures these objects have fresh DB values.
                     # Mirrors the state machine above — same thresholds, same branching.
                     now = _utcnow()  # Refresh now — time passed during lock acquisition
-                    six_minutes_ago = now - timedelta(minutes=6)
                     ten_minutes_ago = now - timedelta(minutes=10)
                     fifteen_minutes_ago = now - timedelta(minutes=15)
                     verified = []
@@ -229,7 +244,7 @@ async def reaper_service():
                                 verified.append(t)
                             elif t.last_heartbeat and t.last_heartbeat < hb_cutoff:
                                 verified.append(t)
-                            elif t.vm_provisioned_at and t.vm_provisioned_at < six_minutes_ago and t.last_heartbeat is None:
+                            elif t.vm_provisioned_at and t.vm_provisioned_at < _preclaim_stale_cutoff(t, now) and t.last_heartbeat is None:
                                 verified.append(t)
                         elif t.status == TaskStatus.IN_PROGRESS:
                             if t.last_heartbeat and t.last_heartbeat < hb_cutoff:

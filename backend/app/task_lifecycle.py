@@ -198,7 +198,7 @@ def _build_retry_prompt_suffix(
                 "- Commit working changes early and often\n"
                 "- If the task requires changes across many files, pick the 2-3 most important\n"
             )
-        if subtype != TIMEOUT_CASCADE:
+        if subtype not in (TIMEOUT_CASCADE, TIMEOUT_ITERATION_LIMIT):
             if attempt >= 2 and task_scope == "large":
                 scope_override = "medium"
             elif attempt >= 2 and task_scope == "medium":

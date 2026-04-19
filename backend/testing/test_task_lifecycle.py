@@ -432,6 +432,40 @@ async def test_requeue_alternating_pattern_in_history_reduces_budget(tl_db, mock
 
 
 @pytest.mark.asyncio
+async def test_requeue_recurring_failing_tests_reduces_budget(tl_db, mocker):
+    """Same specific tests failing across attempts triggers an additional budget
+    reduction on top of any class-based reduction, so deterministic test failures
+    exit retry sooner rather than consuming the full CODE_ERROR budget.
+    """
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 2},
+    )
+    # Same test ID shows up in prior-attempt ctx and in the current status message.
+    await _make_task(
+        session, project.id, status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "failure_category": "CODE_ERROR",
+            "_previous_failing_tests": ["tests/test_foo.py::test_bar"],
+            "_attempt_number": 2,
+        },
+        latest_status_message="FAILED tests/test_foo.py::test_bar - AssertionError",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    # With MAX_PARENT_REQUEUES=3 and _requeue_count=2, normally requeued (2<3).
+    # The recurring-tests reduction brings effective max down to 2 → parent FAILED.
+    assert parent.status == TaskStatus.FAILED
+    assert "Re-evaluation limit reached" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
 async def test_requeue_same_class_infra_exempt_from_budget_reduction(tl_db, mocker):
     """Same-class INFRA failures (e.g., PROVISION_FAILURE) are exempt from budget shrink."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
@@ -1868,6 +1902,20 @@ class TestBuildRetryPromptSuffix:
             "AGENT_TIMEOUT", None, attempt=3, task_scope="medium", ctx={}
         )
         assert override == "small"
+
+    def test_agent_timeout_iteration_limit_no_downgrade(self):
+        _, override = _build_retry_prompt_suffix(
+            "AGENT_TIMEOUT", "Review-fix cycle limit reached",
+            attempt=3, task_scope="medium", ctx={},
+        )
+        assert override is None
+
+    def test_agent_timeout_iteration_limit_large_no_downgrade(self):
+        _, override = _build_retry_prompt_suffix(
+            "AGENT_TIMEOUT", "review-fix cap reached",
+            attempt=2, task_scope="large", ctx={},
+        )
+        assert override is None
 
     def test_agent_timeout_small_no_downgrade(self):
         _, override = _build_retry_prompt_suffix(
