@@ -1742,7 +1742,7 @@ async def test_small_scope_with_few_related_files_stays_small(db_session, mocker
 
 @pytest.mark.asyncio
 async def test_medium_scope_with_few_related_files_stays_medium(db_session, mocker, monkeypatch):
-    """Medium-scope finding with <5 related_files is not upgraded by the file-count heuristic."""
+    """Medium-scope finding with <8 related_files is not upgraded by the file-count heuristic."""
     # Disable cold-start baseline upgrade so this test isolates the file-count heuristic.
     monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
     direction = _active_direction("d-fchint02", "File-count heuristic under threshold")
@@ -1784,7 +1784,7 @@ async def test_medium_scope_with_few_related_files_stays_medium(db_session, mock
 
 @pytest.mark.asyncio
 async def test_medium_scope_cross_module_related_files_auto_decomposes(db_session, mocker, monkeypatch):
-    """2-file cross-module medium finding auto-decomposes into per-file small sub-findings."""
+    """3-module cross-module medium finding auto-decomposes into per-file small sub-findings."""
     monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
     direction = _active_direction("d-xmod01", "Cross-module heuristic direction")
     project = Project(
@@ -1796,8 +1796,12 @@ async def test_medium_scope_cross_module_related_files_auto_decomposes(db_sessio
 
     task = await _make_research_task(project, direction, db_session)
 
-    finding = _make_finding("Change spanning backend and agent", direction["id"], scope="medium")
-    finding["related_files"] = ["backend/app/foo.py", "agent/src/bar.ts"]
+    finding = _make_finding("Change spanning backend, agent, and admin-ui", direction["id"], scope="medium")
+    finding["related_files"] = [
+        "backend/app/foo.py",
+        "agent/src/bar.ts",
+        "admin-ui/src/baz.tsx",
+    ]
 
     _patch_research_externals(mocker)
     mocker.patch(
@@ -1811,14 +1815,18 @@ async def test_medium_scope_cross_module_related_files_auto_decomposes(db_sessio
         select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 2
+    assert len(child_tasks) == 3
     files_seen = set()
     for ct in child_tasks:
         assert ct.payloads[0]["type"] == "create"
         assert ct.context["scope"] == "small"
         assert ct.context["scope_calibrated_from"] == "medium"
         files_seen.update(ct.context.get("related_files") or [])
-    assert files_seen == {"backend/app/foo.py", "agent/src/bar.ts"}
+    assert files_seen == {
+        "backend/app/foo.py",
+        "agent/src/bar.ts",
+        "admin-ui/src/baz.tsx",
+    }
 
 
 @pytest.mark.asyncio

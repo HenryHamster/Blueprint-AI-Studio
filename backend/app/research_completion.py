@@ -245,16 +245,16 @@ def _calibrate_finding_scope(
 
     if scope == "medium":
         _heuristic_files = finding.get("related_files") or []
-        if len(_heuristic_files) >= 5:
+        if len(_heuristic_files) >= 8:
             logger.info(
                 "[RESEARCH] Upgrading scope medium→large for '%s' "
-                "(file-count heuristic: %d related_files >= 5)",
+                "(file-count heuristic: %d related_files >= 8)",
                 title, len(_heuristic_files),
             )
             scope = "large"
             scope_calibrated_from = "medium"
-        elif len({f.split("/", 1)[0] for f in _heuristic_files if "/" in f}) >= 2:
-            # Cross-module heuristic: related_files span 2+ top-level directories
+        elif len({f.split("/", 1)[0] for f in _heuristic_files if "/" in f}) >= 3:
+            # Cross-module heuristic: related_files span 3+ top-level directories
             # (e.g. backend + agent + admin-ui). These face language boundaries,
             # separate build/test systems, and independent CI — upgrade to large
             # for plan decomposition into per-module subtasks.
@@ -968,15 +968,37 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 # No direction-level exploration history: use pipeline-wide medium
                 # merge rate as a prior so new directions don't burn attempts at the
                 # optimistic fixed default when the pipeline is underperforming.
+                # Exception: if the direction has ZERO medium-scope outcomes in its
+                # recent research_history (no medium key in scope_breakdown across
+                # the last 3 cycles), it is data-starved — applying the pipeline
+                # discount creates a self-reinforcing loop where medium is never
+                # attempted, no direction-specific data is collected, and the
+                # fraction stays suppressed forever. Use the base fraction so the
+                # direction gets a fair chance to collect its own medium data.
+                _has_medium_history = False
+                for _entry in ((_pred_direction or {}).get("research_history") or [])[-3:]:
+                    if (_entry.get("scope_breakdown") or {}).get("medium"):
+                        _has_medium_history = True
+                        break
                 _pipeline_rates = _runtime_config.get("pipeline_scope_merge_rates") or {}
                 _pipeline_medium = _pipeline_rates.get("medium")
-                if isinstance(_pipeline_medium, (int, float)) and _pipeline_medium < 0.5:
+                if (
+                    _has_medium_history
+                    and isinstance(_pipeline_medium, (int, float))
+                    and _pipeline_medium < 0.5
+                ):
                     _base = float(_explore_frac)
                     _explore_frac = _base * (float(_pipeline_medium) / 0.5)
                     logger.info(
                         "[RESEARCH] Pipeline-prior exploration fraction for direction %s: "
                         "pipeline_medium=%.2f, frac=%.3f",
                         _pred_dir_id, float(_pipeline_medium), float(_explore_frac),
+                    )
+                elif not _has_medium_history:
+                    logger.info(
+                        "[RESEARCH] Data-starved direction %s: no medium history, "
+                        "using base exploration fraction=%.3f (pipeline prior skipped)",
+                        _pred_dir_id, float(_explore_frac),
                     )
             # Suppress exploration when medium→large escalations in this direction
             # have also been failing: if both direct medium execution and the

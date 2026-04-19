@@ -3766,19 +3766,19 @@ class TestCalibrateFindingScope:
         assert cal is None
 
     def test_file_count_heuristic_upgrades_medium_to_large(self):
-        finding = {"title": "t", "related_files": self._single_module_files(5)}
+        finding = {"title": "t", "related_files": self._single_module_files(8)}
         scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
         assert scope == "large"
         assert cal == "medium"
 
     def test_medium_auto_decomposed_still_escalates_on_file_count(self):
         # Auto-decomposed sub-findings at medium scope must still pass through
-        # _calibrate_finding_scope's medium→large safety gates. A 7-file
+        # _calibrate_finding_scope's medium→large safety gates. A 9-file
         # medium-scope auto_decomposed finding should be escalated to large
-        # by the file-count heuristic (>=5 files).
+        # by the file-count heuristic (>=8 files).
         finding = {
             "title": "t",
-            "related_files": self._single_module_files(7),
+            "related_files": self._single_module_files(9),
             "auto_decomposed": True,
         }
         scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
@@ -3788,11 +3788,30 @@ class TestCalibrateFindingScope:
     def test_cross_module_heuristic_upgrades_medium_to_large(self):
         finding = {
             "title": "t",
-            "related_files": ["backend/app/foo.py", "agent/src/bar.ts"],
+            "related_files": [
+                "backend/app/foo.py",
+                "agent/src/bar.ts",
+                "admin-ui/src/baz.tsx",
+            ],
         }
         scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
         assert scope == "large"
         assert cal == "medium:cross_module"
+
+    def test_two_module_span_stays_medium(self, monkeypatch):
+        # Findings spanning 2 top-level dirs (e.g. backend + agent) should NOT
+        # escalate — only 3+ modules trigger the cross-module heuristic.
+        monkeypatch.setattr(
+            "app.research_completion._composite_complexity_score",
+            lambda files, direction, cochange: (0.9, {"sig": "healthy"}),
+        )
+        finding = {
+            "title": "t",
+            "related_files": ["backend/app/foo.py", "agent/src/bar.ts"],
+        }
+        scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
+        assert scope == "medium"
+        assert cal is None
 
     def test_expansion_ratio_prediction_upgrades_medium_to_large(self):
         finding = {"title": "t", "related_files": self._single_module_files(4)}
