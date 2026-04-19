@@ -3790,6 +3790,25 @@ async def test_digest_remediation_funnel(client: AsyncClient, db_session):
         "CODE_ERROR": 1,
         "LINT_ERROR": 1,
     }
+    # Per-class investigation stage counts: inv_fallback has
+    # context.last_failure_class=LINT_ERROR; the other three investigations
+    # have no class set and bucket into "unknown".
+    assert funnel["investigations_spawned_by_class"] == {
+        "LINT_ERROR": 1,
+        "unknown": 3,
+    }
+    # Two completed with no class (inv_done, inv_no_summary) and one completed
+    # with LINT_ERROR (inv_fallback). inv_active is IN_PROGRESS so excluded.
+    assert funnel["investigations_completed_by_class"] == {
+        "LINT_ERROR": 1,
+        "unknown": 2,
+    }
+    # rem_merged has trigger CODE_ERROR; the other two remediations have
+    # no trigger class set → "unknown".
+    assert funnel["remediations_spawned_by_class"] == {
+        "CODE_ERROR": 1,
+        "unknown": 2,
+    }
 
 
 @pytest.mark.asyncio

@@ -2349,6 +2349,19 @@ async def get_digest(
         cls = _classify_failure(r) or "unknown"
         failed_remediations_by_class[cls] = failed_remediations_by_class.get(cls, 0) + 1
 
+    investigations_spawned_by_class: Dict[str, int] = {}
+    investigations_completed_by_class: Dict[str, int] = {}
+    for t in _inv_tasks:
+        cls = str((t.context or {}).get("last_failure_class") or "unknown").strip() or "unknown"
+        investigations_spawned_by_class[cls] = investigations_spawned_by_class.get(cls, 0) + 1
+        if t.status == TaskStatus.COMPLETED:
+            investigations_completed_by_class[cls] = investigations_completed_by_class.get(cls, 0) + 1
+
+    remediations_spawned_by_class: Dict[str, int] = {}
+    for r in _rem_tasks:
+        cls = str((r.context or {}).get("trigger_failure_class") or "unknown").strip() or "unknown"
+        remediations_spawned_by_class[cls] = remediations_spawned_by_class.get(cls, 0) + 1
+
     merged_remediations_by_trigger_class: Dict[str, int] = {}
     for r in _rem_tasks:
         if r.status != TaskStatus.COMPLETED:
@@ -2564,6 +2577,9 @@ async def get_digest(
         "investigations_by_confidence": investigations_by_confidence,
         "failed_remediations_by_class": failed_remediations_by_class,
         "merged_remediations_by_trigger_class": merged_remediations_by_trigger_class,
+        "investigations_spawned_by_class": investigations_spawned_by_class,
+        "investigations_completed_by_class": investigations_completed_by_class,
+        "remediations_spawned_by_class": remediations_spawned_by_class,
         "cumulative_merged_by_trigger_class": cumulative_merged_by_trigger_class,
         "remediation_success_by_confidence": remediation_success_by_confidence,
         "recent_investigations": recent_investigations,

@@ -17,6 +17,7 @@ import { RecentErrorsWidget } from './RecentErrorsWidget';
 import { DirectionAutoPauseWidget } from './DirectionAutoPauseWidget';
 import { PRMonitorSection, type OpenPR } from './PRMonitorSection';
 import { MediumScopeWidget, type MediumScopeMeasurement } from './MediumScopeWidget';
+import { RemediationFunnelSection } from './RemediationFunnelSection';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
@@ -134,6 +135,33 @@ interface DigestData {
     dominant_stage: string | null;
   } | null;
   pipeline_filter_funnel?: Record<string, number> | null;
+  remediation_funnel?: {
+    investigations_spawned?: number;
+    investigations_completed?: number;
+    investigations_with_diagnosis?: number;
+    remediations_spawned?: number;
+    remediations_merged?: number;
+    remediations_failed?: number;
+    avg_time_to_remediation_hours?: number | null;
+    active_investigations?: number;
+    investigations_by_confidence?: Record<string, number> | null;
+    failed_remediations_by_class?: Record<string, number> | null;
+    merged_remediations_by_trigger_class?: Record<string, number> | null;
+    investigations_spawned_by_class?: Record<string, number> | null;
+    investigations_completed_by_class?: Record<string, number> | null;
+    remediations_spawned_by_class?: Record<string, number> | null;
+    remediation_success_by_confidence?: Record<string, { merged: number; failed: number }> | null;
+    diagnosis_drop_off_by_reason?: Record<string, number> | null;
+  } | null;
+  investigation_conversion?: {
+    total_completed?: number;
+    parseable?: number;
+    unparseable?: number;
+    structural?: number;
+    low_confidence?: number;
+    actionable?: number;
+    remediation_spawned?: number;
+  } | null;
 }
 
 const STAGE_ORDER = ['provision', 'clone', 'test', 'lint', 'build', 'pr_creation', 'merge', 'review'] as const;
@@ -674,6 +702,15 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               </section>
             );
           })()}
+
+          {/* Section 1f: Remediation Funnel */}
+          {selectedProjectId && (
+            <RemediationFunnelSection
+              funnel={digest?.remediation_funnel ?? null}
+              conversion={digest?.investigation_conversion ?? null}
+              loading={loading}
+            />
+          )}
 
           {/* Section 2: Direction Portfolio Health */}
           <section>
