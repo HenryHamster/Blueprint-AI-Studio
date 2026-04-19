@@ -673,6 +673,17 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         }
       }
 
+      const selfReviewTaskCtx = (task.context as Record<string, unknown> | undefined) || {};
+      const remediationContext = selfReviewTaskCtx.diagnosis_task_id
+        ? {
+            diagnosisTaskId: strVal(selfReviewTaskCtx.diagnosis_task_id),
+            rootCause: strVal(selfReviewTaskCtx.diagnosis_root_cause) || undefined,
+            recommendedFix: strVal(selfReviewTaskCtx.diagnosis_recommended_fix) || undefined,
+            severity: strVal(selfReviewTaskCtx.severity) || undefined,
+            confidence: strVal(selfReviewTaskCtx.diagnosis_confidence) || undefined,
+          }
+        : undefined;
+
       const selfReviewPrompt = buildSelfReviewPrompt({
         diff: reviewDiff,
         reviewPlaybook,
@@ -689,6 +700,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         planCompletion,
         topFirstReviewIssues,
         scopeSpecificReviewIssues,
+        remediationContext,
       });
 
       const headBeforeReview = git(['rev-parse', 'HEAD']);

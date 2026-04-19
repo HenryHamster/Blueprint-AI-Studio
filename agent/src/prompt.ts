@@ -709,6 +709,35 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     prefix += scopeLines.join('\n') + '\n';
   }
 
+  // Append remediation context when this task was spawned from an investigation.
+  // The payload prompt already contains the root cause and recommended fix — this
+  // section adds framing so the agent treats it as a diagnosed fix.
+  if (taskContext && taskContext.diagnosis_task_id) {
+    const remLines: string[] = ['## Remediation Context'];
+    remLines.push(
+      'This task is a diagnosed fix spawned from a prior investigation. The payload contains the root cause and recommended fix — validate that your changes resolve that specific root cause, not adjacent issues.',
+    );
+    const severity = strVal(taskContext.severity);
+    if (severity) remLines.push(`- Severity: ${severity}`);
+    const confidence = strVal(taskContext.diagnosis_confidence);
+    if (confidence) remLines.push(`- Diagnosis confidence: ${confidence}`);
+    const attemptsRaw = taskContext.remediation_attempts;
+    let attempts: number | null = null;
+    if (typeof attemptsRaw === 'number' && Number.isFinite(attemptsRaw)) {
+      attempts = attemptsRaw;
+    } else if (dirCtx && typeof dirCtx.remediation_attempts === 'number') {
+      attempts = dirCtx.remediation_attempts as number;
+    }
+    if (attempts !== null && attempts > 0) {
+      remLines.push(`- Prior remediation attempts on this direction: ${attempts} — if a previous remediation failed to hold, favor a different angle over repeating the prior fix shape.`);
+    }
+    if (confidence === 'low') {
+      remLines.push('- Confidence is low: treat the recommended fix as a hypothesis, verify the root cause before applying, and prefer the smallest reversible change.');
+    }
+    remLines.push('');
+    prefix += remLines.join('\n') + '\n';
+  }
+
   return prefix;
 }
 

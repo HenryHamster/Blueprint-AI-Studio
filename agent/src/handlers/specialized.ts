@@ -665,6 +665,17 @@ Instructions:
   "confidence": "high|medium|low"
 }
 
+Confidence scoring criteria (be honest — low confidence triggers follow-up investigation, medium/high triggers an automated remediation task):
+- "high": You found the exact code location causing the failure with clear evidence — a specific function, wrong condition, missing check, or faulty expression directly explains the observed behavior. A fix can be written without further investigation.
+- "medium": Strong hypothesis supported by code analysis, but some uncertainty remains — likely cause identified but you could not reproduce it, verify it end-to-end, or rule out other contributors.
+- "low": Root cause unclear. Multiple plausible explanations, insufficient evidence in the code, or the failure could be environmental/transient. Prefer this over guessing.
+
+recommended_fix guidance:
+- Write it as a self-contained prompt for an implementing agent that will NOT see this investigation's full context. Be concrete and specific.
+- Good: "Add a null check for \`user.profile\` in \`getUserDisplayName\` (src/user.ts:42) before accessing \`.name\`; return the fallback 'Anonymous' when profile is null."
+- Bad: "Fix the error handling" / "Improve null safety" / "Handle the edge case".
+- Name the file paths, function names, and exact conditions to change. Include the intended behavior, not just the symptom.
+
 IMPORTANT:
 - Write ONLY the JSON object to /tmp/investigation_report_${taskId}.json — no markdown, no code fences, no extra text.
 - Do NOT modify any files in the repository.

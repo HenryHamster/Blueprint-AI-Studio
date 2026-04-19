@@ -170,6 +170,29 @@ describe('buildContextPrefix', () => {
     expect(buildContextPrefix({ project_context: undefined })).toBe('');
   });
 
+  it('renders ## Remediation Context when task.context has diagnosis_task_id', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: {
+        diagnosis_task_id: 'abc-123',
+        severity: 'high',
+        diagnosis_confidence: 'medium',
+        remediation_attempts: 2,
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Remediation Context');
+    expect(result).toContain('diagnosed fix');
+    expect(result).toContain('Severity: high');
+    expect(result).toContain('Diagnosis confidence: medium');
+    expect(result).toContain('Prior remediation attempts on this direction: 2');
+  });
+
+  it('omits ## Remediation Context when diagnosis_task_id is absent', () => {
+    const task = { payloads: [{ type: 'create' }], context: { severity: 'high' } };
+    expect(buildContextPrefix(task)).not.toContain('## Remediation Context');
+  });
+
   it('renders ## Direction Context section with goal, priority and failed approaches when direction_context is present', () => {
     const task = {
       project_context: {

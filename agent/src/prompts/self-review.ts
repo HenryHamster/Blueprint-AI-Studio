@@ -73,6 +73,13 @@ export function buildSelfReviewPrompt(opts: {
   };
   topFirstReviewIssues?: Array<{ description: string; count: number; category: string }>;
   scopeSpecificReviewIssues?: Array<{ description: string; count: number; category: string; scope: string }>;
+  remediationContext?: {
+    diagnosisTaskId?: string;
+    rootCause?: string;
+    recommendedFix?: string;
+    severity?: string;
+    confidence?: string;
+  };
 }): string {
   const restrictionsSection = opts.claudeMd
     ? `\n## File Restrictions (from CLAUDE.md)\n${opts.claudeMd.slice(0, 500)}\n`
@@ -174,6 +181,19 @@ export function buildSelfReviewPrompt(opts: {
     ? `\n## ⚠️ Scope Overflow Warning\n${opts.scopeOverflowWarning}\nFor each file listed, confirm it is necessary for this task. Revert any files that are not essential.\n`
     : '';
 
+  const rc = opts.remediationContext;
+  const remediationSection = rc && (rc.rootCause || rc.recommendedFix || rc.diagnosisTaskId)
+    ? (() => {
+        const lines = ['## Remediation Review'];
+        lines.push('This PR was created to fix a diagnosed issue. Verify the changes specifically address the diagnosed root cause rather than doing a generic review.');
+        if (rc.severity) lines.push(`- Severity: ${rc.severity}`);
+        if (rc.confidence) lines.push(`- Diagnosis confidence: ${rc.confidence}`);
+        if (rc.rootCause) lines.push(`- Root cause: ${rc.rootCause}`);
+        if (rc.recommendedFix) lines.push(`- Recommended fix: ${rc.recommendedFix}`);
+        return '\n' + lines.join('\n') + '\n';
+      })()
+    : '';
+
   const planSection = opts.analysisPlan && opts.analysisPlan.trim()
     ? `\n## Pre-Implementation Plan (verify changes align with this)\n${opts.analysisPlan.trim()}\n`
     : '';
@@ -197,7 +217,7 @@ export function buildSelfReviewPrompt(opts: {
   const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
 
   return `You are performing a self-review of the changes you just made for this task.
-${restrictionsSection}${directionFeedbackSection}${scopeSpecificSection}${issueDistSection}${firstAttemptSection}${topIssuesSection}${playbookSection}${scopeOverflowSection}${planSection}${planCompletionSection}${diffSection}${buildVerificationSection}
+${restrictionsSection}${remediationSection}${directionFeedbackSection}${scopeSpecificSection}${issueDistSection}${firstAttemptSection}${topIssuesSection}${playbookSection}${scopeOverflowSection}${planSection}${planCompletionSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.

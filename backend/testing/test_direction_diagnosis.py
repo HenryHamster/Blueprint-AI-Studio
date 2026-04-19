@@ -25,7 +25,16 @@ from app.direction_lifecycle import (
     _spawn_direction_diagnosis,
 )
 from app.models import Alert, AlertSeverity, ArtifactType, MessageType, Project, ProjectMessage, Task, TaskStatus
-from app.task_completion import _handle_investigation_completion, _record_remediation_outcome
+from app.autonomous_research import _spawn_task_failure_investigation
+from app.failure_classification import (
+    TAXONOMY_CODE_DEFECT,
+    should_trigger_code_defect_investigation,
+)
+from app.task_completion import (
+    _handle_investigation_completion,
+    _record_remediation_if_terminal,
+    _record_remediation_outcome,
+)
 from app.time_utils import _utcnow
 
 
@@ -1715,3 +1724,192 @@ async def test_partial_success_skips_escalation(db_session, mocker):
     assert d.get("needs_manual_intervention") is not True
     assert d.get("last_remediation_result") == "partial_success"
     assert post_mock.await_count == 0, "escalation notification must not fire on partial success"
+
+
+@pytest.mark.asyncio
+async def test_full_task_failure_remediation_loop(db_session, mocker):
+    """End-to-end: failed CODE_ERROR task → investigation → remediation → merge outcome recorded.
+
+    Exercises the detect-diagnose-fix-merge cycle through its real seams:
+    ``should_trigger_code_defect_investigation`` gates spawning,
+    ``_spawn_task_failure_investigation`` creates the investigate task,
+    ``_handle_investigation_completion`` spawns the remediation child, and
+    ``_record_remediation_if_terminal`` stamps the direction on merge.
+    """
+    mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+
+    direction_id = "d-e2e-loop-1"
+    project = Project(
+        name="E2E Task-Failure Loop",
+        user_id="u-e2e-loop",
+        autonomous_enabled=True,
+        directions=[{
+            "id": direction_id,
+            "text": "Direction under remediation",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            "research_history": [],
+        }],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    # Stage 1: a directed create task fails with a CODE_ERROR / code_defect signature.
+    failed_task = Task(
+        project_id=project.id,
+        title="Create feature X",
+        description="original work",
+        payloads=[{"type": "create", "prompt": "add feature X", "base_branch": "main"}],
+        context={"direction_id": direction_id, "scope": "small"},
+        status=TaskStatus.FAILED,
+        latest_status_message="AttributeError: NoneType has no 'x'",
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(failed_task)
+    await db_session.commit()
+    await db_session.refresh(failed_task)
+
+    assert should_trigger_code_defect_investigation(failed_task) is True
+
+    # Stage 2: spawn the investigation and verify its context links back to the source.
+    spawned = await _spawn_task_failure_investigation(failed_task, db_session)
+    assert spawned is True
+    await db_session.commit()
+
+    investigate_task = (await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != failed_task.id,
+        )
+    )).scalars().one()
+    assert investigate_task.first_payload["type"] == "investigate"
+    assert investigate_task.context["direction_id"] == direction_id
+    assert investigate_task.context["source_task_id"] == str(failed_task.id)
+    assert investigate_task.context["failure_taxonomy"] == TAXONOMY_CODE_DEFECT
+
+    # Stage 3: investigation completes with a high-confidence actionable report.
+    await _handle_investigation_completion(
+        investigate_task, _investigate_payload(_HIGH_CONFIDENCE_REPORT), db_session,
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    remediation = (await db_session.execute(
+        select(Task).where(Task.parent_task_id == investigate_task.id)
+    )).scalars().one()
+    assert remediation.first_payload["type"] == "create"
+    assert remediation.context["diagnosis_task_id"] == str(investigate_task.id)
+    assert remediation.context["direction_id"] == direction_id
+
+    # Stage 4: remediation reaches COMPLETED → _record_remediation_if_terminal stamps direction.
+    remediation.status = TaskStatus.COMPLETED
+    db_session.add(remediation)
+    await db_session.commit()
+
+    await _record_remediation_if_terminal(remediation, TaskStatus.COMPLETED, db_session)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    d = next(dd for dd in project.directions if dd["id"] == direction_id)
+    assert d["last_remediation_result"] == "merged"
+    assert d["remediation_attempts"] == 1
+    assert d["last_remediation_task_id"] == str(remediation.id)
+    assert d["last_remediation_diagnosis_task_id"] == str(investigate_task.id)
+    history = d.get("remediation_history") or []
+    assert len(history) == 1
+    assert history[0]["task_id"] == str(remediation.id)
+    assert history[0]["result"] == "merged"
+
+
+@pytest.mark.asyncio
+async def test_full_task_failure_remediation_loop_failed_outcome(db_session, mocker):
+    """End-to-end companion: remediation task FAILS → direction records failure.
+
+    Exercises the same seams as ``test_full_task_failure_remediation_loop`` but
+    verifies the not-merged branch of ``_record_remediation_if_terminal``:
+    ``last_remediation_result='failed'`` and a history entry with
+    ``result='failed'``. Complements the merged-path e2e test to ensure both
+    outcomes of the detect-diagnose-fix-merge cycle are exercised together.
+    """
+    mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+
+    direction_id = "d-e2e-loop-failed"
+    project = Project(
+        name="E2E Task-Failure Loop (failed outcome)",
+        user_id="u-e2e-loop-failed",
+        autonomous_enabled=True,
+        directions=[{
+            "id": direction_id,
+            "text": "Direction under remediation (failed path)",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            "research_history": [],
+        }],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    failed_task = Task(
+        project_id=project.id,
+        title="Create feature Y",
+        description="original work",
+        payloads=[{"type": "create", "prompt": "add feature Y", "base_branch": "main"}],
+        context={"direction_id": direction_id, "scope": "small"},
+        status=TaskStatus.FAILED,
+        latest_status_message="TypeError: cannot concat str and int",
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(failed_task)
+    await db_session.commit()
+    await db_session.refresh(failed_task)
+
+    assert should_trigger_code_defect_investigation(failed_task) is True
+    assert await _spawn_task_failure_investigation(failed_task, db_session) is True
+    await db_session.commit()
+
+    investigate_task = (await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != failed_task.id,
+        )
+    )).scalars().one()
+
+    await _handle_investigation_completion(
+        investigate_task, _investigate_payload(_HIGH_CONFIDENCE_REPORT), db_session,
+    )
+    await db_session.commit()
+
+    remediation = (await db_session.execute(
+        select(Task).where(Task.parent_task_id == investigate_task.id)
+    )).scalars().one()
+    assert remediation.context["diagnosis_task_id"] == str(investigate_task.id)
+
+    # Remediation task itself fails (fix didn't land) → direction records failure.
+    remediation.status = TaskStatus.FAILED
+    remediation.latest_status_message = "merge conflict: fix could not be applied"
+    db_session.add(remediation)
+    await db_session.commit()
+
+    await _record_remediation_if_terminal(remediation, TaskStatus.FAILED, db_session)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    d = next(dd for dd in project.directions if dd["id"] == direction_id)
+    assert d["last_remediation_result"] == "failed"
+    assert d["remediation_attempts"] == 1
+    assert d["last_remediation_task_id"] == str(remediation.id)
+    assert d["last_remediation_diagnosis_task_id"] == str(investigate_task.id)
+    history = d.get("remediation_history") or []
+    assert len(history) == 1
+    assert history[0]["task_id"] == str(remediation.id)
+    assert history[0]["result"] == "failed"

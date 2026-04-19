@@ -1012,6 +1012,18 @@ async def _spawn_pipeline_task(
         )
     if effective_hard_cap is not None:
         propagated_ctx['_scope_budget_hard_cap'] = effective_hard_cap
+    # Propagate diagnosis context from the original create task when the PR was
+    # spawned by autonomous remediation. The reviewer uses these to verify the
+    # fix targets the diagnosed root cause rather than doing a generic review.
+    orig_ctx_src = (orig.context or {}) if orig else {}
+    if orig_ctx_src.get("diagnosis_task_id"):
+        for _dk in (
+            "diagnosis_task_id", "diagnosis_root_cause",
+            "diagnosis_recommended_fix", "severity", "diagnosis_confidence",
+        ):
+            if orig_ctx_src.get(_dk) is not None:
+                propagated_ctx[_dk] = orig_ctx_src[_dk]
+
     # Propagate the original create task's planned file list so the reviewer can
     # objectively detect scope creep (files changed but not in the original plan).
     planned_files = (orig.context or {}).get("related_files") if orig else None
