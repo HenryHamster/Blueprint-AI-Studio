@@ -1223,12 +1223,29 @@ async def get_digest(
     _failure_class_groups: Dict[str, List[Dict[str, Any]]] = {}
     _failure_stage_counts: Dict[str, int] = {}
     _cost_by_failure_class: Dict[str, float] = {}
+    _provision_waste_cost = 0.0
+    _provision_waste_by_dir: Dict[str, Dict[str, Any]] = {}
     for t in failed_tasks:
         tid = str(t.id)
         cls = _classify_failure(t, error_log_map.get(tid))
+        _task_cost = 0.0
         if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start:
             _rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            _cost_by_failure_class[cls] = _cost_by_failure_class.get(cls, 0.0) + _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            _task_cost = _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            _cost_by_failure_class[cls] = _cost_by_failure_class.get(cls, 0.0) + _task_cost
+        if cls == "PROVISION_FAILURE":
+            _provision_waste_cost += _task_cost
+            _pw_did = (t.context or {}).get("direction_id")
+            if _pw_did:
+                _pw_key = str(_pw_did)
+                _pw_entry = _provision_waste_by_dir.setdefault(_pw_key, {
+                    "direction_id": _pw_key,
+                    "direction_text": dir_id_to_text.get(_pw_key, ""),
+                    "provision_cost_usd": 0.0,
+                    "provision_task_count": 0,
+                })
+                _pw_entry["provision_cost_usd"] += _task_cost
+                _pw_entry["provision_task_count"] += 1
         waiting_since = _derive_completed_at(t)
         waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
         t_dir_id = (t.context or {}).get("direction_id")
@@ -1265,6 +1282,15 @@ async def get_digest(
     )
     cost_by_failure_class = {k: round(v, 4) for k, v in _cost_by_failure_class.items()}
     total_failed_cost_usd = round(sum(_cost_by_failure_class.values()), 4)
+    provision_waste_cost_usd = round(_provision_waste_cost, 4)
+    provision_waste_by_direction = sorted(
+        [
+            {**e, "provision_cost_usd": round(e["provision_cost_usd"], 4)}
+            for e in _provision_waste_by_dir.values()
+        ],
+        key=lambda x: x["provision_cost_usd"],
+        reverse=True,
+    )[:5]
 
     _retry_overhead_cost = 0.0
     _retry_task_count = 0
@@ -1307,12 +1333,18 @@ async def get_digest(
     _retry_success_by_class: Dict[str, int] = {}
     _retry_failure_by_class: Dict[str, int] = {}
     _retry_success_count = 0
+    _retry_recovery_cost = 0.0
     for t in completed_tasks:
         _ctx = t.context or {}
         if (_ctx.get("_attempt_number") or 0) > 1:
             _retry_success_count += 1
             _cls = _ctx.get("_previous_failure_class") or "UNKNOWN"
             _retry_success_by_class[_cls] = _retry_success_by_class.get(_cls, 0) + 1
+            try:
+                _retry_recovery_cost += float(_ctx.get("_prior_attempts_cost") or 0.0)
+            except (TypeError, ValueError):
+                pass
+    retry_recovery_cost_usd = round(_retry_recovery_cost, 4)
     for t in failed_tasks:
         _ctx = t.context or {}
         if (_ctx.get("_attempt_number") or 0) > 1:
@@ -1918,8 +1950,18 @@ async def get_digest(
         if c["count"] >= 2
     ][:5]
 
+    total_merge_retries_saved = 0
+    merge_early_exit_count = 0
+    for _t in completed_tasks + failed_tasks:
+        _saved = (_t.context or {}).get("_merge_retries_saved")
+        if isinstance(_saved, int) and _saved > 0:
+            total_merge_retries_saved += _saved
+            merge_early_exit_count += 1
+
     return {
         "window_hours": hours,
+        "total_merge_retries_saved": total_merge_retries_saved,
+        "merge_early_exit_count": merge_early_exit_count,
         "generated_at": _utcnow().isoformat(),
         "completed_count": len(completed_tasks),
         "failed_count": len(failed_tasks),
@@ -1947,7 +1989,10 @@ async def get_digest(
         "provisioning_overhead_pct": provisioning_overhead_pct,
         "cost_by_failure_class": cost_by_failure_class,
         "total_failed_cost_usd": total_failed_cost_usd,
+        "provision_waste_cost_usd": provision_waste_cost_usd,
+        "provision_waste_by_direction": provision_waste_by_direction,
         "retry_overhead_cost_usd": retry_overhead_cost_usd,
+        "retry_recovery_cost_usd": retry_recovery_cost_usd,
         "retry_waste_by_direction": retry_waste_by_direction,
         "retry_task_count": retry_task_count,
         "avg_retries_before_failure": avg_retries_before_failure,

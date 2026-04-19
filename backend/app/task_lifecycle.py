@@ -534,6 +534,18 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         clone_ctx = {k: v for k, v in child_ctx.items() if k not in _ctx_keys_to_strip}
         clone_ctx["_attempt_number"] = attempt + 1
         clone_ctx["_max_attempts"] = MAX_PARENT_REQUEUES + 1
+
+        # Accumulate VM cost of prior failed attempts so the digest can compute
+        # total compute burned on retries that eventually succeeded.
+        try:
+            from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+            if child.vm_provisioned_at and child.vm_stopped_at:
+                _rate = SPOT_RATE if child.vm_spot else ON_DEMAND_RATE
+                _attempt_cost = _rate * (child.vm_stopped_at - child.vm_provisioned_at).total_seconds()
+                _prior_cost = float(clone_ctx.get("_prior_attempts_cost") or 0.0)
+                clone_ctx["_prior_attempts_cost"] = round(_prior_cost + max(_attempt_cost, 0.0), 6)
+        except Exception:
+            logger.exception("[REQUEUE] Failed to accumulate prior attempt cost for task %s", child.id)
         clone_ctx["_previous_error"] = (original_status_message or "")[:5000]
         clone_ctx["_previous_failure_class"] = failure_class
         _prior_history = clone_ctx.get("_failure_class_history") or []

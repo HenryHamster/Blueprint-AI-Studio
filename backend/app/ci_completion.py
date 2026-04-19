@@ -419,7 +419,7 @@ async def _attempt_merge_with_retry_and_escalation(
                 await _maybe_create_failure_alert(task, session,
                     f"PR #{ci_pr_number} merge failed {_merge_failures} times — "
                     f"hard cap imminent ({_hard_cap - _merge_failures} retries remaining)")
-            _repeated_identical = _err_streak >= 3
+            _repeated_identical = _err_streak >= 2
             if _merge_failures >= _hard_cap or _repeated_identical:
                 task.status = TaskStatus.FAILED
                 task.requires_approval = True

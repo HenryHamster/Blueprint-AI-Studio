@@ -1371,7 +1371,7 @@ async def test_ci_wait_started_resets_when_checks_restart(db_session, mocker):
 @pytest.mark.asyncio
 async def test_merge_repeated_identical_error_triggers_early_exit(db_session, mocker):
     """
-    When the merge API returns the same error message 3 times in a row, the
+    When the merge API returns the same error message 2 times in a row, the
     handler escalates immediately (FAILED + requires_approval) instead of
     burning all 15 retries.
     """
@@ -1394,11 +1394,11 @@ async def test_merge_repeated_identical_error_triggers_early_exit(db_session, mo
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Prior two attempts both returned "upstream timeout"; this call is the 3rd.
+    # Prior attempt returned "upstream timeout"; this call is the 2nd.
     task = _make_task(db_session, project, ci_loop_extra={
-        "merge_failures": 2,
+        "merge_failures": 1,
         "merge_last_error": "upstream timeout",
-        "merge_error_streak": 2,
+        "merge_error_streak": 1,
     })
     await db_session.commit()
     await db_session.refresh(task)
@@ -1411,8 +1411,8 @@ async def test_merge_repeated_identical_error_triggers_early_exit(db_session, mo
     assert task.status == TaskStatus.FAILED
     assert task.requires_approval is True
     review_loop = (task.context or {}).get("review_loop", {})
-    assert review_loop.get("merge_error_streak") == 3
-    assert review_loop.get("merge_failures") == 3, "must exit well before hard cap"
+    assert review_loop.get("merge_error_streak") == 2
+    assert review_loop.get("merge_failures") == 2, "must exit well before hard cap"
     assert "identical" in (task.latest_status_message or "").lower()
     alert_mock.assert_called_once()
 

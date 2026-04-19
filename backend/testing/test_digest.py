@@ -151,6 +151,30 @@ async def test_digest_with_failed_tasks(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_digest_aggregates_merge_retries_saved(client: AsyncClient, db_session):
+    """total_merge_retries_saved sums _merge_retries_saved across completed+failed tasks;
+    merge_early_exit_count counts tasks with a positive saved value."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t1 = make_task(project_id=project.id, status=TaskStatus.FAILED, context={"_merge_retries_saved": 3})
+    t2 = make_task(project_id=project.id, status=TaskStatus.COMPLETED, context={"_merge_retries_saved": 2})
+    t3 = make_task(project_id=project.id, status=TaskStatus.FAILED, context={"_merge_retries_saved": 0})
+    t4 = make_task(project_id=project.id, status=TaskStatus.FAILED, context={})
+    for t in (t1, t2, t3, t4):
+        db_session.add(t)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_merge_retries_saved"] == 5
+    assert data["merge_early_exit_count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_digest_failed_task_direction_attribution(client: AsyncClient, db_session):
     """Failed tasks with direction_id context expose direction_id/direction_text in needs_attention, recent_failures, and failure_groups."""
     project = make_project(
@@ -254,6 +278,78 @@ async def test_digest_retry_waste_by_direction(client: AsyncClient, db_session):
     assert breakdown[1]["retry_task_count"] == 2
     assert breakdown[1]["retry_cost_usd"] > 0
     assert breakdown[0]["retry_cost_usd"] > breakdown[1]["retry_cost_usd"]
+
+
+@pytest.mark.asyncio
+async def test_digest_provision_waste_metrics(client: AsyncClient, db_session):
+    """provision_waste_cost_usd sums VM cost of PROVISION_FAILURE tasks;
+    provision_waste_by_direction groups and sorts by cost descending."""
+    project = make_project(
+        directions=[
+            {"id": "dir-A", "text": "Direction Alpha", "status": "active"},
+            {"id": "dir-B", "text": "Direction Beta", "status": "active"},
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # dir-A: 2h on-demand provision failure (expensive)
+    pf_a = make_task(
+        project_id=project.id,
+        title="A prov fail",
+        status=TaskStatus.FAILED,
+        latest_status_message="quota exceeded for region us-central1",
+        context={"direction_id": "dir-A"},
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(minutes=5),
+        vm_spot=False,
+    )
+    # dir-B: 30min spot provision failure
+    pf_b = make_task(
+        project_id=project.id,
+        title="B prov fail",
+        status=TaskStatus.FAILED,
+        latest_status_message="quota exceeded for zone us-central1-a",
+        context={"direction_id": "dir-B"},
+        vm_provisioned_at=now - timedelta(minutes=35),
+        vm_stopped_at=now - timedelta(minutes=5),
+        vm_spot=True,
+    )
+    # Non-provision failure — should NOT contribute
+    other = make_task(
+        project_id=project.id,
+        title="Code error",
+        status=TaskStatus.FAILED,
+        latest_status_message="AssertionError: thing broke",
+        context={"direction_id": "dir-A"},
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=5),
+        vm_spot=False,
+    )
+    db_session.add_all([pf_a, pf_b, other])
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert "provision_waste_cost_usd" in data
+    assert data["provision_waste_cost_usd"] > 0
+    # Should match cost_by_failure_class["PROVISION_FAILURE"]
+    assert data["provision_waste_cost_usd"] == pytest.approx(
+        data["cost_by_failure_class"].get("PROVISION_FAILURE", 0.0)
+    )
+
+    breakdown = data["provision_waste_by_direction"]
+    assert len(breakdown) == 2
+    assert breakdown[0]["direction_id"] == "dir-A"
+    assert breakdown[0]["direction_text"] == "Direction Alpha"
+    assert breakdown[0]["provision_task_count"] == 1
+    assert breakdown[0]["provision_cost_usd"] > breakdown[1]["provision_cost_usd"]
+    assert breakdown[1]["direction_id"] == "dir-B"
+    assert breakdown[1]["provision_task_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -3331,3 +3427,53 @@ async def test_digest_retry_overhead_cost_computation(client: AsyncClient, db_se
 
     expected_cost = ON_DEMAND_RATE * 3600 + SPOT_RATE * 1800
     assert body["retry_overhead_cost_usd"] == pytest.approx(round(expected_cost, 4))
+
+
+@pytest.mark.asyncio
+async def test_digest_retry_recovery_cost_from_prior_attempts(client: AsyncClient, db_session):
+    """retry_recovery_cost_usd sums _prior_attempts_cost across completed tasks
+    with _attempt_number > 1 — the compute burned on failed attempts that
+    eventually succeeded via retry."""
+    now = _utcnow()
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Successful retry with recorded prior-attempt cost
+    db_session.add(make_task(
+        project_id=project.id,
+        title="succeeded on retry",
+        status=TaskStatus.COMPLETED,
+        context={"_attempt_number": 2, "_prior_attempts_cost": 0.50},
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),
+        vm_spot=False,
+    ))
+    # Successful retry with multi-attempt accumulated cost
+    db_session.add(make_task(
+        project_id=project.id,
+        title="succeeded on 3rd",
+        status=TaskStatus.COMPLETED,
+        context={"_attempt_number": 3, "_prior_attempts_cost": 1.25},
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=15),
+        vm_spot=True,
+    ))
+    # First-attempt success — excluded (no prior cost)
+    db_session.add(make_task(
+        project_id=project.id,
+        title="first attempt success",
+        status=TaskStatus.COMPLETED,
+        context={"_attempt_number": 1, "_prior_attempts_cost": 9.0},
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),
+        vm_spot=False,
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["retry_recovery_cost_usd"] == pytest.approx(1.75)
