@@ -2119,6 +2119,21 @@ async def get_digest(
         cls = _classify_failure(r) or "unknown"
         failed_remediations_by_class[cls] = failed_remediations_by_class.get(cls, 0) + 1
 
+    merged_remediations_by_trigger_class: Dict[str, int] = {}
+    for r in _rem_tasks:
+        if r.status != TaskStatus.COMPLETED:
+            continue
+        trigger_cls = (r.context or {}).get("trigger_failure_class")
+        if not trigger_cls:
+            diag_id = (r.context or {}).get("diagnosis_task_id")
+            inv = _inv_by_id.get(str(diag_id)) if diag_id else None
+            if inv is not None:
+                trigger_cls = (inv.context or {}).get("last_failure_class")
+        key = str(trigger_cls).strip() if trigger_cls else "unknown"
+        if not key:
+            key = "unknown"
+        merged_remediations_by_trigger_class[key] = merged_remediations_by_trigger_class.get(key, 0) + 1
+
     remediation_success_by_confidence: Dict[str, Dict[str, int]] = {}
     for r in _rem_tasks:
         if r.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
@@ -2183,6 +2198,7 @@ async def get_digest(
         "active_investigations": active_investigations,
         "investigations_by_confidence": investigations_by_confidence,
         "failed_remediations_by_class": failed_remediations_by_class,
+        "merged_remediations_by_trigger_class": merged_remediations_by_trigger_class,
         "remediation_success_by_confidence": remediation_success_by_confidence,
         "recent_investigations": recent_investigations,
         "active_investigations_detail": active_investigations_detail,

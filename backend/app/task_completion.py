@@ -95,6 +95,9 @@ async def _record_remediation_outcome(
     }
     if fingerprint:
         history_entry["fingerprint"] = str(fingerprint)
+    trigger_failure_class = ctx.get("trigger_failure_class")
+    if trigger_failure_class:
+        history_entry["trigger_failure_class"] = trigger_failure_class
     if merged:
         target.pop("last_remediation_failure_class", None)
         target.pop("last_remediation_error_summary", None)
@@ -1623,27 +1626,42 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
                                {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)})
     logger.info(f"[PERF] Created {len(child_tasks)} fix tasks from perf analysis {task.id}")
 
-# Keywords in root_cause/recommended_fix that mark a diagnosis as structural —
-# the remedy is a scope change or direction edit, not a targeted code fix.
-_STRUCTURAL_DIAGNOSIS_KEYWORDS = (
-    "too broad",
-    "too wide",
-    "overly broad",
-    "scope too",
-    "misaligned",
+# Phrases that unambiguously indicate a structural (direction-level) diagnosis
+# regardless of surrounding context.
+_STRUCTURAL_STRONG_KEYWORDS = (
     "fundamentally misaligned",
     "direction scope",
-    "out of scope",
+    "direction is too broad",
+    "direction is too wide",
     "narrow the direction",
     "narrow the scope",
     "split the direction",
     "rewrite the direction",
 )
 
+# Weaker keywords — scope-related language that only signals a structural
+# diagnosis when paired with a direction/goal-level context word. Without the
+# context gate, phrases like "validation scope too narrow" or "out of scope for
+# this module" get misclassified as structural.
+_STRUCTURAL_WEAK_KEYWORDS = (
+    "too broad",
+    "too wide",
+    "overly broad",
+    "scope too",
+    "misaligned",
+    "out of scope",
+)
+
+_STRUCTURAL_CONTEXT_WORDS = ("direction", "goal", "vision")
+
 
 def _is_structural_diagnosis(root_cause: str, recommended_fix: str) -> bool:
     blob = f"{root_cause}\n{recommended_fix}".lower()
-    return any(kw in blob for kw in _STRUCTURAL_DIAGNOSIS_KEYWORDS)
+    if any(kw in blob for kw in _STRUCTURAL_STRONG_KEYWORDS):
+        return True
+    if not any(w in blob for w in _STRUCTURAL_CONTEXT_WORDS):
+        return False
+    return any(kw in blob for kw in _STRUCTURAL_WEAK_KEYWORDS)
 
 
 async def _handle_investigation_completion(task: Task, payload, session: AsyncSession) -> None:
@@ -1669,12 +1687,39 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
     logs = payload.logs or ""
     report: Optional[Dict[str, Any]] = None
     if logs:
-        try:
-            parsed = json.loads(logs)
-            if isinstance(parsed, dict):
-                report = parsed
-        except (json.JSONDecodeError, ValueError):
-            report = None
+        candidates: List[str] = [logs]
+        # Strip markdown code fences (```json ... ``` or ``` ... ```)
+        fence_stripped = re.sub(r"^\s*```(?:json)?\s*\n?|\n?```\s*$", "", logs.strip(), flags=re.IGNORECASE)
+        if fence_stripped and fence_stripped != logs:
+            candidates.append(fence_stripped)
+        used_fallback = False
+        for idx, candidate in enumerate(candidates):
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    report = parsed
+                    if idx > 0:
+                        used_fallback = True
+                    break
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if report is None:
+            # Last resort: extract first balanced-looking JSON object via regex
+            match = re.search(r"\{.*\}", logs, flags=re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                    if isinstance(parsed, dict):
+                        report = parsed
+                        used_fallback = True
+                except (json.JSONDecodeError, ValueError):
+                    report = None
+        if used_fallback:
+            logger.warning(
+                "investigation_report_fallback_parse task_id=%s raw_prefix=%r",
+                task.id,
+                logs[:200],
+            )
 
     if report is None:
         task.plan_output = {"raw": logs} if logs else {}
@@ -1692,6 +1737,14 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
     root_cause = str(report.get("root_cause") or "")
     recommended_fix = str(report.get("recommended_fix") or "").strip()
     confidence = str(report.get("confidence") or "").lower()
+    if confidence not in ("high", "medium", "low") and recommended_fix:
+        logger.warning(
+            "[DIAGNOSIS] Investigation %s missing/invalid confidence=%r but has "
+            "recommended_fix; defaulting to 'medium'. Improve investigation prompt.",
+            task.id,
+            report.get("confidence"),
+        )
+        confidence = "medium"
     severity = str(report.get("severity") or "").lower()
     raw_affected = report.get("affected_files") or []
     affected_paths: List[str] = []
@@ -1947,6 +2000,29 @@ async def _spawn_investigation_remediation(
     if create_suffix:
         payload_dict["prompt_suffix"] = create_suffix
 
+    parent_ctx = task.context or {}
+    remediation_context: Dict[str, Any] = {
+        "diagnosis_task_id": str(task.id),
+        "original_diagnosis_task_id": str(
+            parent_ctx.get("original_diagnosis_task_id") or task.id
+        ),
+        "diagnosed_direction_id": direction_id,
+        "direction_id": direction_id,
+        "severity": severity_tag,
+        "diagnosis_confidence": confidence if confidence in ("high", "medium") else "high",
+        "related_files": affected_paths[:25],
+        "diagnosis_trigger": "investigation_completion",
+        "diagnosis_root_cause": root_cause[:2000],
+        "diagnosis_recommended_fix": recommended_fix[:2000],
+        "scope": scope,
+    }
+    trigger_failure_class = parent_ctx.get("last_failure_class")
+    if trigger_failure_class:
+        remediation_context["trigger_failure_class"] = trigger_failure_class
+    trigger_failure_taxonomy = parent_ctx.get("failure_taxonomy")
+    if trigger_failure_taxonomy:
+        remediation_context["trigger_failure_taxonomy"] = trigger_failure_taxonomy
+
     new_task = Task(
         project_id=task.project_id,
         title=title,
@@ -1955,21 +2031,7 @@ async def _spawn_investigation_remediation(
         payloads=[validate_internal_payload(
             payload_dict, "task_completion:investigation_fix"
         )],
-        context={
-            "diagnosis_task_id": str(task.id),
-            "original_diagnosis_task_id": str(
-                (task.context or {}).get("original_diagnosis_task_id") or task.id
-            ),
-            "diagnosed_direction_id": direction_id,
-            "direction_id": direction_id,
-            "severity": severity_tag,
-            "diagnosis_confidence": confidence if confidence in ("high", "medium") else "high",
-            "related_files": affected_paths[:25],
-            "diagnosis_trigger": "investigation_completion",
-            "diagnosis_root_cause": root_cause[:2000],
-            "diagnosis_recommended_fix": recommended_fix[:2000],
-            "scope": scope,
-        },
+        context=remediation_context,
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",

@@ -1988,6 +1988,14 @@ class TestIsStructuralDiagnosis:
     def test_case_insensitive(self):
         assert _is_structural_diagnosis("Direction Scope is unclear", "")
 
+    def test_scope_word_in_code_context_is_not_structural(self):
+        assert not _is_structural_diagnosis(
+            "The validation scope too narrowly checks input types", ""
+        )
+        assert not _is_structural_diagnosis(
+            "This import is out of scope for this module", ""
+        )
+
 
 class TestHandleInvestigationCompletion:
     def _payload(self, logs=""):
