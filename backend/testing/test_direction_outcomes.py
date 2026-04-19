@@ -1121,6 +1121,58 @@ async def test_scope_breakdown_failure_stages_per_scope(db_session: AsyncSession
     assert sb["medium"]["failure_stages"] == {"merge": 1, "unknown": 1}
 
 
+@pytest.mark.asyncio
+async def test_scope_breakdown_merged_cross_module(db_session: AsyncSession):
+    """merged_cross_module counts merged tasks whose PR touches 2+ top-level dirs."""
+    direction_id = "d-xmod"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    await db_session.flush()
+
+    # merged, cross-module (backend + admin-ui)
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"scope": "medium", "pr_merged": True,
+                 "_pr_changed_files": ["backend/app/a.py", "admin-ui/src/b.ts"]},
+        payloads=[{"type": "create"}],
+        title="x1",
+    )
+    # merged, single-module
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"scope": "medium", "pr_merged": True,
+                 "_pr_changed_files": ["backend/app/x.py", "backend/app/y.py"]},
+        payloads=[{"type": "create"}],
+        title="x2",
+    )
+    # merged, no changed files recorded
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"scope": "small", "pr_merged": True},
+        payloads=[{"type": "create"}],
+        title="x3",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    sb = project.directions[0]["research_history"][0]["scope_breakdown"]
+    assert sb["medium"]["merged"] == 2
+    assert sb["medium"]["merged_cross_module"] == 1
+    assert sb["small"]["merged"] == 1
+    assert sb["small"]["merged_cross_module"] == 0
+
+
 def test_aggregate_scope_breakdown_sums_failure_stages():
     """_aggregate_scope_breakdown sums failure_stages counts across history entries."""
     from app.spawn_calibration import _aggregate_scope_breakdown

@@ -340,7 +340,8 @@ async def _update_direction_research_outcomes(
             def _ensure_scope(s: str) -> None:
                 if s not in scope_breakdown:
                     scope_breakdown[s] = {
-                        "created": 0, "merged": 0, "failed": 0, "failed_infra": 0,
+                        "created": 0, "merged": 0, "merged_cross_module": 0,
+                        "failed": 0, "failed_infra": 0,
                         "failed_code_error": 0, "failed_scope_overflow": 0,
                         "failed_analysis_overflow": 0,
                         "scope_trim_count": 0,
@@ -368,6 +369,16 @@ async def _update_direction_research_outcomes(
                         effort_bucket["failed"] += 1
                 if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):
                     scope_breakdown[scope]["merged"] += 1
+                    changed_files_for_span = ctx_.get("_pr_changed_files") or []
+                    top_dirs = {
+                        f.split("/", 1)[0]
+                        for f in changed_files_for_span
+                        if isinstance(f, str) and "/" in f
+                    }
+                    if len(top_dirs) >= 2:
+                        scope_breakdown[scope]["merged_cross_module"] = (
+                            scope_breakdown[scope].get("merged_cross_module", 0) + 1
+                        )
                 if _counts_as_failure(ct):
                     scope_breakdown[scope]["failed"] += 1
                     fcat = ctx_.get("failure_category") or _classify_failure(ct)

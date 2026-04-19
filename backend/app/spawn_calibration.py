@@ -132,13 +132,15 @@ def _aggregate_scope_breakdown(history_entries: list[dict]) -> dict[str, dict]:
     for entry in history_entries:
         for scope, stats in (entry.get("scope_breakdown") or {}).items():
             bucket = agg.setdefault(scope, {
-                "created": 0, "merged": 0, "failed": 0,
+                "created": 0, "merged": 0, "merged_cross_module": 0,
+                "failed": 0,
                 "failed_infra": 0, "failed_scope_overflow": 0,
                 "failed_analysis_overflow": 0,
                 "failure_stages": {},
             })
             for key in (
-                "created", "merged", "failed", "failed_infra",
+                "created", "merged", "merged_cross_module",
+                "failed", "failed_infra",
                 "failed_scope_overflow", "failed_analysis_overflow",
             ):
                 bucket[key] = bucket.get(key, 0) + stats.get(key, 0)

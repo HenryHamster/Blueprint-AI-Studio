@@ -2663,6 +2663,68 @@ async def test_digest_scope_breakdown_preserves_failure_sub_counts(client: Async
 
 
 @pytest.mark.asyncio
+async def test_digest_scope_breakdown_includes_cross_module_and_failure_stages(client: AsyncClient, db_session):
+    """scope_breakdown aggregates merged_cross_module and failure_stages per scope."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    recent_ts2 = (_utcnow() - timedelta(hours=2)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-xmod",
+                "text": "Direction xmod",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 2,
+                        "tasks_created": 3,
+                        "scope_breakdown": {
+                            "medium": {
+                                "created": 3, "merged": 2, "merged_cross_module": 1,
+                                "failed": 1,
+                                "failure_stages": {"test": 1},
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": recent_ts2,
+                        "prs_merged": 1,
+                        "tasks_created": 2,
+                        "scope_breakdown": {
+                            "medium": {
+                                "created": 2, "merged": 1, "merged_cross_module": 1,
+                                "failed": 1,
+                                "failure_stages": {"test": 1, "merge": 1},
+                            },
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-xmod"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    sb = response.json()["direction_progress"][0]["scope_breakdown"]["medium"]
+    assert sb["merged"] == 3
+    assert sb["merged_cross_module"] == 2
+    assert sb["failure_stages"] == {"test": 2, "merge": 1}
+
+
+@pytest.mark.asyncio
 async def test_digest_scope_breakdown_includes_efficiency_predictors(client: AsyncClient, db_session):
     """scope_breakdown aggregates weighted expansion/complexity averages and effort_distribution totals."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
