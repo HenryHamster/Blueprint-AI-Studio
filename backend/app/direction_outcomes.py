@@ -234,6 +234,49 @@ async def _update_direction_research_outcomes(
                 and ct.created_at is not None
             ]
             entry["avg_time_to_merge_hours"] = round(sum(merge_durations) / len(merge_durations), 2) if merge_durations else None
+            # avg_implementation_hours: time the agent spent producing a PR
+            # (vm_stopped_at - created_at) across ALL completed children, not
+            # just merged ones. Pairs with avg_review_hours below to split
+            # avg_time_to_merge_hours into implementation vs review-pipeline time.
+            impl_durations = [
+                (ct.vm_stopped_at - ct.created_at).total_seconds() / 3600
+                for ct in child_tasks_rows
+                if ct.status == TaskStatus.COMPLETED
+                and ct.vm_stopped_at is not None
+                and ct.created_at is not None
+            ]
+            entry["avg_implementation_hours"] = round(sum(impl_durations) / len(impl_durations), 2) if impl_durations else None
+            # avg_review_hours: time from implementation finish to PR merge.
+            # PR merge timestamp isn't stored; approximate via the matching
+            # review child's vm_stopped_at (latest if multiple iterations),
+            # falling back to the merged task's updated_at.
+            review_end_by_pr: dict = {}
+            for ct in child_tasks_rows:
+                if (ct.first_payload or {}).get("type") != "review":
+                    continue
+                if ct.vm_stopped_at is None:
+                    continue
+                pr_num = (ct.context or {}).get("pr_number")
+                if pr_num is None:
+                    continue
+                prev = review_end_by_pr.get(pr_num)
+                if prev is None or ct.vm_stopped_at > prev:
+                    review_end_by_pr[pr_num] = ct.vm_stopped_at
+            review_durations = []
+            for ct in child_tasks_rows:
+                if not (
+                    ct.status == TaskStatus.COMPLETED
+                    and (ct.context or {}).get("pr_merged")
+                    and ct.vm_stopped_at is not None
+                ):
+                    continue
+                pr_num = (ct.context or {}).get("pr_number")
+                end_ts = review_end_by_pr.get(pr_num) if pr_num is not None else None
+                if end_ts is None:
+                    end_ts = ct.updated_at
+                if end_ts is not None and end_ts >= ct.vm_stopped_at:
+                    review_durations.append((end_ts - ct.vm_stopped_at).total_seconds() / 3600)
+            entry["avg_review_hours"] = round(sum(review_durations) / len(review_durations), 2) if review_durations else None
             # Capture failed task details so research agents can see WHY tasks failed
             failed_details = []
             infra_failures = 0

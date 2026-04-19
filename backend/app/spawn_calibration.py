@@ -338,9 +338,8 @@ def predict_spawn_success(
     7. Operator acceptance rate from research history (weight 1.5).
     8. Finding file-count complexity (weight 1.0): 3-4 files moderate penalty,
        5+ files strong penalty. Omitted for 1-2 files. Requires related_files.
-    9. Cross-module span (weight 1.0): penalizes findings whose related_files
-       span 3+ top-level directories, matching the scope-escalation threshold
-       in research_completion.py. Omitted otherwise.
+       Cross-module span is not a separate signal here — the composite complexity
+       score already includes a module-span factor, so double-counting is avoided.
 
     Returns a float in [0.0, 1.0]. Falls back to 0.5 when data is insufficient.
     No DB queries — uses only data already loaded during research_completion processing.
@@ -456,10 +455,9 @@ def predict_spawn_success(
     # Signal 8: finding file-count complexity. Findings touching more files are
     # harder to implement correctly, especially at small scope (6-file budget).
     # Graduated penalty; omitted for 1-2 files so simple findings aren't affected.
-    # Signal 9: cross-module span. related_files spanning 3+ top-level directories
-    # cross language/build-system boundaries, raising implementation difficulty.
-    # Threshold matches the scope-escalation rule in research_completion.py, which
-    # keeps 2-module findings (e.g. backend/ + agent/) at medium scope.
+    # Cross-module span is intentionally NOT a separate signal here: the composite
+    # complexity score (weight 1.5, added elsewhere) already includes a module-span
+    # factor, so an explicit penalty would double-count the module dimension.
     if related_files:
         file_count = len(related_files)
         # Scope-aware thresholds: small has a 6-file budget so 5+ is already
@@ -475,11 +473,6 @@ def predict_spawn_success(
             weights.append(1.0)
         elif file_count >= moderate_threshold:
             signals.append(0.6)
-            weights.append(1.0)
-
-        top_dirs = {f.split("/", 1)[0] for f in related_files if "/" in f}
-        if len(top_dirs) >= 3:
-            signals.append(0.4)
             weights.append(1.0)
 
     # Signal 10: analysis_overflow dominance at medium scope. When 50%+ of a

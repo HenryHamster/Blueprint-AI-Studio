@@ -826,3 +826,80 @@ async def test_find_matching_prior_investigation_no_match_returns_none(db_sessio
         project_id=project.id, error_summary="unrelated failure xyz",
         session=db_session,
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_prior_investigation_propagates_diagnosis_context(db_session: AsyncSession):
+    """When a prior investigation matches, the spawned task carries diagnosis_task_id+direction_id."""
+    direction_id = str(uuid.uuid4())
+    project = await _create_project(
+        db_session,
+        directions=[{"id": direction_id, "title": "fix auth", "status": "active"}],
+    )
+    inv = Task(
+        project_id=project.id,
+        title="Investigate CI",
+        payloads=[{"type": "investigate"}],
+        status=TaskStatus.COMPLETED,
+        context={"direction_id": direction_id, "diagnosis_fingerprint": "fp-abc"},
+        plan_output={
+            "summary": "flaky auth middleware test",
+            "root_cause": "session token mismatch",
+            "affected_files": [{"path": "backend/app/auth.py"}],
+            "recommended_fix": "reset session cache",
+        },
+    )
+    db_session.add(inv)
+    await db_session.flush()
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+        mock_ctx.return_value = (["CI"], "FAILED backend/app/auth.py::test_session token mismatch", "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="deadbeef",
+            head_branch="main", project_id=project.id,
+            config=_default_config(), session=db_session,
+        )
+
+    tasks = await session_tasks(db_session, project.id)
+    assert len(tasks) == 1
+    ctx = tasks[0].context
+    assert ctx["prior_diagnosis_task_id"] == str(inv.id)
+    assert ctx["diagnosis_task_id"] == str(inv.id)
+    assert ctx["direction_id"] == direction_id
+    assert ctx["diagnosis_fingerprint"] == "fp-abc"
+
+
+@pytest.mark.asyncio
+async def test_remediation_outcome_recorded_when_auto_remediation_merges(db_session: AsyncSession):
+    """An auto-remediation task carrying diagnosis context updates direction state on merge."""
+    from app.task_completion import _record_remediation_outcome
+
+    direction_id = str(uuid.uuid4())
+    project = await _create_project(
+        db_session,
+        directions=[{"id": direction_id, "title": "fix auth", "status": "active"}],
+    )
+    task = Task(
+        project_id=project.id,
+        title="Auto-fix",
+        payloads=[{"type": "create", "prompt": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "auto_remediation": True,
+            "diagnosis_task_id": str(uuid.uuid4()),
+            "direction_id": direction_id,
+            "diagnosis_fingerprint": "fp-abc",
+        },
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    recorded = await _record_remediation_outcome(task, merged=True, session=db_session)
+    assert recorded is True
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target["last_remediation_result"] == "merged"
+    assert target["remediation_attempts"] == 1
+    assert target["last_remediation_fingerprint"] == "fp-abc"
+    assert len(target["remediation_history"]) == 1

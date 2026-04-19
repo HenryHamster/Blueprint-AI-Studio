@@ -57,7 +57,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     from app.main import _maybe_create_circuit_breaker_alert  # noqa: PLC0415
     from app.task_lifecycle import _increment_research_spawn_count  # noqa: PLC0415
     from app.research_completion import _compute_momentum_factor, _compute_productivity_score, _compute_acceptance_rate  # noqa: PLC0415
-    from app.direction_metrics import _compute_direction_quality_score  # noqa: PLC0415
+    from app.direction_metrics import _compute_direction_quality_score, _compute_difficulty_index  # noqa: PLC0415
     from app.anomaly_detection import _compute_research_anomalies, check_anomaly_actions  # noqa: PLC0415
     from app.direction_lifecycle import _process_direction_lifecycle  # noqa: PLC0415
     # Guard: autonomous must be enabled
@@ -199,6 +199,16 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             momentum = _compute_momentum_factor(d)
             acceptance_rate = _compute_acceptance_rate(d)
             quality_score = _compute_direction_quality_score(d)
+            difficulty = _compute_difficulty_index(d)
+            priority = d.get("priority", "medium")
+            # Easy directions get a slight boost; hard directions are deprioritized
+            # unless flagged high-priority (operator override).
+            if difficulty < 5:
+                difficulty_bonus = -1
+            elif difficulty > 20 and priority != "high":
+                difficulty_bonus = 1
+            else:
+                difficulty_bonus = 0
             is_new = 0 if d.get("last_researched_at") else -1  # small novelty bonus
             category_bonus = -1 if d.get("category") == "product" else 0  # product directions preferred
             # Vision rank matters: top vision priority = 0, unlisted = N.
@@ -211,6 +221,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 category_bonus,                                  # product category within same priority
                 is_new,                                          # novelty bonus within same priority
                 v_rank,                                          # vision priority drives selection
+                difficulty_bonus,                                # easy boost / hard deprioritization
                 -(productivity_score * momentum),                # productivity within same vision rank
                 -quality_score,                                  # taxonomy-based quality; higher = earlier
                 acceptance_rate if acceptance_rate is not None else 0.5,  # low acceptance = deprioritized

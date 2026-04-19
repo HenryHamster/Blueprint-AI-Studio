@@ -211,6 +211,18 @@ async def _handle_main_branch_ci_failure_inner(
         task_context["_previous_error_fingerprint"] = _error_fingerprint(error_summary)
     if prior_investigation is not None:
         task_context["prior_diagnosis_task_id"] = str(prior_investigation.id)
+        # Propagate diagnosis linkage so _record_remediation_outcome can stamp
+        # the direction's remediation_history when this task reaches a terminal
+        # outcome. Without these fields, the merge/fail handlers early-return
+        # and the direction never observes the remediation result.
+        prior_ctx = prior_investigation.context or {}
+        prior_direction_id = prior_ctx.get("direction_id")
+        if prior_direction_id:
+            task_context["diagnosis_task_id"] = str(prior_investigation.id)
+            task_context["direction_id"] = str(prior_direction_id)
+            prior_fingerprint = prior_ctx.get("diagnosis_fingerprint") or prior_ctx.get("error_fingerprint")
+            if prior_fingerprint:
+                task_context["diagnosis_fingerprint"] = str(prior_fingerprint)
 
     task = Task(
         project_id=project_id,

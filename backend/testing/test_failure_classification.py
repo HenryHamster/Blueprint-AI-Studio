@@ -336,6 +336,15 @@ class TestClassifyFailureTaxonomyEdges:
         t = _task("AttributeError: NoneType has no 'x'", {"scope": "small"})
         assert classify_failure_taxonomy(t) == TAXONOMY_CODE_DEFECT
 
+    def test_bare_complexity_is_code_defect_not_scope(self):
+        """'time complexity' / 'reduce complexity' are code-quality, not scope."""
+        t = _task("reduce time complexity of implementation", {"scope": "small"})
+        assert classify_failure_taxonomy(t) == TAXONOMY_CODE_DEFECT
+
+    def test_scope_complexity_phrase_is_scope_related(self):
+        t = _task("aborted: scope complexity exceeds budget", {"scope": "small"})
+        assert classify_failure_taxonomy(t) == TAXONOMY_SCOPE_RELATED
+
 
 def _code_defect_task(task_type: str = "create", direction_id: str | None = "d-1") -> Task:
     ctx: dict = {"scope": "small"}

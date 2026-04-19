@@ -57,7 +57,8 @@ _REVIEW_QUALITY_KEYWORDS = (
 
 _SCOPE_KEYWORDS = (
     "too many changes", "too many files", "multi-file conflict",
-    "scope too large", "complexity", "exceeds scope",
+    "scope too large", "exceeds scope",
+    "scope complexity", "implementation complexity exceeds", "complexity budget",
 )
 
 

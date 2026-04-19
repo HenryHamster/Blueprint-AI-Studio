@@ -2,6 +2,7 @@
 import pytest
 from unittest.mock import patch
 from app.strategic_analysis import _build_outcome_evaluation
+from app.direction_metrics import _compute_difficulty_index
 
 
 def _make_project(directions=None, vision=None):
@@ -490,3 +491,47 @@ def test_confirmed_and_proposed_findings():
     assert any("Finding plain" in c for c in d["confirmed"])
     assert any("Finding confirmed" in c for c in d["confirmed"])
     assert any("Finding proposed" in c for c in d["proposed"])
+
+
+# ---------------------------------------------------------------------------
+# difficulty_index
+# ---------------------------------------------------------------------------
+
+def test_difficulty_index_no_history_defaults_to_one():
+    assert _compute_difficulty_index({}) == 1.0
+
+
+def test_difficulty_index_no_merges_defaults_to_one():
+    d = {"research_history": [{"tasks_created": 10, "prs_merged": 0}]}
+    assert _compute_difficulty_index(d) == 1.0
+
+
+def test_difficulty_index_all_merges():
+    d = {"research_history": [{"tasks_created": 3, "prs_merged": 3}]}
+    assert _compute_difficulty_index(d) == 1.0
+
+
+def test_difficulty_index_mixed_uses_history_and_aggregate():
+    d = {
+        "research_history": [{"tasks_created": 10, "prs_merged": 2}],
+        "history_aggregate": {"total_tasks_created": 40, "total_prs_merged": 3},
+    }
+    # (10+40)/(2+3) = 10.0
+    assert _compute_difficulty_index(d) == 10.0
+
+
+def test_difficulty_index_capped_at_thirty():
+    d = {"research_history": [{"tasks_created": 1000, "prs_merged": 1}]}
+    assert _compute_difficulty_index(d) == 30.0
+
+
+def test_difficulty_index_surfaced_in_outcome_evaluation():
+    directions = [{
+        "id": "dir-1",
+        "status": "active",
+        "research_history": [{"timestamp": "2026-01-01T00:00:00",
+                              "tasks_created": 20, "prs_merged": 2}],
+    }]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    assert result["directions"][0]["difficulty_index"] == 10.0

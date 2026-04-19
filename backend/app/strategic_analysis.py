@@ -13,6 +13,7 @@ def _build_outcome_evaluation(project) -> dict:
     All data lives on project.directions and project.vision — no DB queries needed.
     """
     from app.research_context import _parse_research_context  # noqa: PLC0415
+    from app.direction_metrics import _compute_difficulty_index  # noqa: PLC0415
     vision = project.vision or {}
     directions = project.directions or []
     now_iso = _utcnow().isoformat()
@@ -91,6 +92,7 @@ def _build_outcome_evaluation(project) -> dict:
             outcome["acceptance_rate"] = acceptance_rate
         if avg_time_to_merge_hours is not None:
             outcome["avg_time_to_merge_hours"] = avg_time_to_merge_hours
+        outcome["difficulty_index"] = round(_compute_difficulty_index(d), 2)
         if rejected > 0:
             total_prs = merged + rejected
             outcome["operator_rejection_rate"] = round(rejected / total_prs, 2) if total_prs > 0 else None

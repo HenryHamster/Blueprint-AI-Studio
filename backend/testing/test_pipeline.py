@@ -4100,3 +4100,32 @@ class TestPredictSpawnSuccessExpansionRatio:
                 runtime_config.pop("pipeline_scope_merge_rates", None)
             else:
                 runtime_config["pipeline_scope_merge_rates"] = prev
+
+
+class TestPredictSpawnSuccessNoCrossModulePenalty:
+    """Cross-module span must NOT produce an explicit spawn penalty — the
+    composite complexity score already covers the module-span dimension, and a
+    separate signal here would double-penalize legitimate multi-system PRs."""
+
+    def test_three_module_related_files_match_single_module(self):
+        from app.spawn_calibration import predict_spawn_success
+        from app.shared_state import runtime_config
+
+        direction: dict = {"research_history": []}
+        prev = runtime_config.get("pipeline_scope_merge_rates")
+        runtime_config["pipeline_scope_merge_rates"] = {}
+        try:
+            # Same file count (2-3) but one spans 3 top-level dirs. Previously
+            # the explicit cross-module signal (0.4 @ weight 1.0) would drag
+            # p_cross below p_single; after removal both yield the neutral
+            # fallback because no other signal fires.
+            cross = ["backend/a.py", "agent/b.ts", "admin-ui/c.tsx"]
+            single = ["backend/a.py", "backend/b.py"]
+            p_cross = predict_spawn_success("medium", direction, related_files=cross)
+            p_single = predict_spawn_success("medium", direction, related_files=single)
+            assert p_cross == p_single == 0.5
+        finally:
+            if prev is None:
+                runtime_config.pop("pipeline_scope_merge_rates", None)
+            else:
+                runtime_config["pipeline_scope_merge_rates"] = prev

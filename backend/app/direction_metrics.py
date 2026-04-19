@@ -113,6 +113,23 @@ def _compute_acceptance_rate(d: dict) -> float | None:
     return (recent_rate * 3 + lifetime_rate) / 4
 
 
+def _compute_difficulty_index(d: dict) -> float:
+    """Return tasks-per-merge ratio across direction lifetime.
+
+    Higher values mean the direction needed more attempts per successful merge
+    (empirically harder). Defaults to 1.0 when no merges have happened yet
+    (treat as easy until proven otherwise) and is capped at 30 to avoid
+    blowups from directions with many failures and zero merges.
+    """
+    history = d.get("research_history", [])
+    agg = d.get("history_aggregate", {})
+    total_tasks = sum(e.get("tasks_created", 0) for e in history) + (agg.get("total_tasks_created") or 0)
+    total_merged = sum(e.get("prs_merged", 0) for e in history) + (agg.get("total_prs_merged") or 0)
+    if total_merged <= 0:
+        return 1.0
+    return min(30.0, total_tasks / total_merged)
+
+
 def _compute_productivity_score(d: dict) -> float:
     """Return net productivity score for a direction, with recency weighting.
 
