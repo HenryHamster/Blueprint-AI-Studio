@@ -27,6 +27,7 @@ interface RemediationFunnelData {
   investigations_by_confidence?: Record<string, number> | null;
   failed_remediations_by_class?: Record<string, number> | null;
   merged_remediations_by_trigger_class?: Record<string, number> | null;
+  cumulative_merged_by_trigger_class?: Record<string, number> | null;
   investigations_spawned_by_class?: Record<string, number> | null;
   investigations_completed_by_class?: Record<string, number> | null;
   remediations_spawned_by_class?: Record<string, number> | null;
@@ -242,11 +243,22 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
       </div>
 
       {/* Per-failure-class breakdown */}
-      {classKeys.length > 0 && (
+      {classKeys.length > 0 && (() => {
+        const bottleneckCandidates = classKeys
+          .map(cls => {
+            const r = funnel.remediations_spawned_by_class?.[cls] ?? 0;
+            const m = funnel.merged_remediations_by_trigger_class?.[cls] ?? 0;
+            return { cls, r, rate: r > 0 ? m / r : null };
+          })
+          .filter(x => x.r >= 2 && x.rate != null);
+        const bottleneckCls = bottleneckCandidates.length > 0
+          ? bottleneckCandidates.reduce((a, b) => ((a.rate ?? 1) <= (b.rate ?? 1) ? a : b)).cls
+          : null;
+        return (
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 mb-2">
           <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">By failure class</div>
           <div className="space-y-1">
-            <div className="grid grid-cols-[minmax(110px,1fr)_repeat(7,minmax(44px,1fr))] gap-2 text-[9px] uppercase tracking-wide text-neutral-600">
+            <div className="grid grid-cols-[minmax(110px,1fr)_repeat(8,minmax(44px,1fr))] gap-2 text-[9px] uppercase tracking-wide text-neutral-600">
               <span>Class</span>
               <span className="text-right">Spawned</span>
               <span className="text-right">Completed</span>
@@ -255,6 +267,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
               <span className="text-right">Merged</span>
               <span className="text-right">Failed</span>
               <span className="text-right" title="Merged / Remediated">Merge%</span>
+              <span className="text-right" title="All-time cumulative merged remediations">All-time</span>
             </div>
             {classKeys.map(cls => {
               const s = funnel.investigations_spawned_by_class?.[cls] ?? 0;
@@ -262,11 +275,17 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
               const r = funnel.remediations_spawned_by_class?.[cls] ?? 0;
               const m = funnel.merged_remediations_by_trigger_class?.[cls] ?? 0;
               const f = funnel.failed_remediations_by_class?.[cls] ?? 0;
+              const cumM = funnel.cumulative_merged_by_trigger_class?.[cls] ?? 0;
               const complRate = s > 0 ? pct(c, s) : null;
               const mergeRate = r > 0 ? pct(m, r) : null;
               const rateColor = (v: number) => v >= 60 ? 'text-emerald-400' : v >= 30 ? 'text-amber-400' : 'text-red-400';
+              const isBottleneck = cls === bottleneckCls;
               return (
-                <div key={cls} className="grid grid-cols-[minmax(110px,1fr)_repeat(7,minmax(44px,1fr))] gap-2 text-[11px] items-center">
+                <div
+                  key={cls}
+                  className={`grid grid-cols-[minmax(110px,1fr)_repeat(8,minmax(44px,1fr))] gap-2 text-[11px] items-center ${isBottleneck ? 'border-l-2 border-red-500/60 bg-red-500/5 pl-1 rounded-sm' : ''}`}
+                  title={isBottleneck ? 'Lowest merge rate among classes with ≥2 remediations (bottleneck)' : undefined}
+                >
                   <span className={`inline-flex justify-center text-[9px] font-semibold px-1.5 py-0.5 rounded border ${classBadge(cls)}`}>
                     {cls}
                   </span>
@@ -281,12 +300,14 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
                   <span className={`text-right font-mono ${mergeRate == null ? 'text-neutral-600' : rateColor(mergeRate)}`}>
                     {mergeRate == null ? '—' : `${mergeRate}%`}
                   </span>
+                  <span className="text-right font-mono text-neutral-400" title="Cumulative all-time merged">{cumM}</span>
                 </div>
               );
             })}
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* Drop-off + confidence */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
