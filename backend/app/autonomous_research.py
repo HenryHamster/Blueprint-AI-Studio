@@ -1021,12 +1021,17 @@ async def _spawn_task_failure_investigation(
     function adds 24h dedup per direction and builds the investigation prompt.
     """
     from app.failure_classification import (  # noqa: PLC0415
-        CODE_ERROR, TAXONOMY_CODE_DEFECT,
+        AGENT_TIMEOUT, CODE_ERROR, TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED,
         should_trigger_code_defect_investigation,
+        should_trigger_timeout_investigation,
     )
 
-    if not should_trigger_code_defect_investigation(task):
+    is_code_defect = should_trigger_code_defect_investigation(task)
+    is_timeout = (not is_code_defect) and should_trigger_timeout_investigation(task)
+    if not (is_code_defect or is_timeout):
         return False
+    last_failure_class = CODE_ERROR if is_code_defect else AGENT_TIMEOUT
+    failure_taxonomy = TAXONOMY_CODE_DEFECT if is_code_defect else TAXONOMY_INFRA_RELATED
 
     ctx = task.context or {}
     direction_id = ctx.get("direction_id")
@@ -1048,7 +1053,7 @@ async def _spawn_task_failure_investigation(
         failing_tests_str = str(failing_tests)[:400]
 
     prompt_lines = [
-        f"Task {str(task.id)[:8]} ({ttype}) failed with CODE_ERROR / code_defect "
+        f"Task {str(task.id)[:8]} ({ttype}) failed with {last_failure_class} / {failure_taxonomy} "
         f"after exhausting its retry budget. Diagnose the root cause.",
         "",
         f"Direction: {direction_id}",
@@ -1078,8 +1083,8 @@ async def _spawn_task_failure_investigation(
             "direction_id": direction_id,
             "spawned_by": "task_failure_investigation",
             "source_task_id": str(task.id),
-            "last_failure_class": CODE_ERROR,
-            "failure_taxonomy": TAXONOMY_CODE_DEFECT,
+            "last_failure_class": last_failure_class,
+            "failure_taxonomy": failure_taxonomy,
             "failure_fingerprints": [prev_fp] if prev_fp else [],
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",

@@ -5,6 +5,7 @@ When a check_run webhook arrives with conclusion=failure on a protected branch
 failure and opens a fix PR.  Guard rails prevent runaway spawning.
 """
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -180,6 +181,13 @@ async def _handle_main_branch_ci_failure_inner(
             logger.warning("[AUTO-REMEDIATION] Failed to send skip webhook notification: %s", exc)
         return
 
+    # ── Look up prior investigation that may have diagnosed this failure ──
+    prior_investigation = await _find_matching_prior_investigation(
+        project_id=project_id,
+        error_summary=error_summary,
+        session=session,
+    )
+
     # ── Create the fix task ──
     prompt = _build_remediation_prompt(
         head_branch=head_branch,
@@ -187,7 +195,18 @@ async def _handle_main_branch_ci_failure_inner(
         failed_checks=failed_checks,
         error_summary=error_summary,
         failure_type=failure_type,
+        prior_investigation=prior_investigation,
     )
+
+    task_context: dict[str, Any] = {
+        "auto_remediation": True,
+        "ci_failure_sha": head_sha,
+        "ci_failure_branch": head_branch,
+        "ci_failure_checks": failed_checks,
+        "ci_failure_type": failure_type,
+    }
+    if prior_investigation is not None:
+        task_context["prior_diagnosis_task_id"] = str(prior_investigation.id)
 
     task = Task(
         project_id=project_id,
@@ -199,13 +218,7 @@ async def _handle_main_branch_ci_failure_inner(
             "title": f"fix: auto-remediate CI failure on {head_branch}",
             "prompt": prompt,
         }],
-        context={
-            "auto_remediation": True,
-            "ci_failure_sha": head_sha,
-            "ci_failure_branch": head_branch,
-            "ci_failure_checks": failed_checks,
-            "ci_failure_type": failure_type,
-        },
+        context=task_context,
         status=TaskStatus.QUEUED,
         created_by="SYSTEM_AUTO_REMEDIATION",
     )
@@ -294,6 +307,64 @@ async def _extract_ci_context(
     return failed_checks, error_summary, failure_type
 
 
+async def _find_matching_prior_investigation(
+    *,
+    project_id: uuid.UUID,
+    error_summary: str,
+    session: AsyncSession,
+) -> Task | None:
+    """Return a recent completed investigate task whose diagnosis matches the CI failure.
+
+    Matches via (1) any diagnosed affected-file path appearing in error_summary, or
+    (2) keyword overlap between the investigation's summary/root_cause and
+    error_summary. Requires a non-empty summary and root_cause in plan_output.
+    """
+    if not error_summary:
+        return None
+    cutoff = _utcnow() - timedelta(hours=48)
+    rows = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+        )
+    )).scalars().all()
+
+    err_lower = error_summary.lower()
+    err_tokens = set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{3,}", err_lower))
+
+    best: Task | None = None
+    best_score = 0
+    for t in rows:
+        payloads = t.payloads or []
+        if not payloads or (payloads[0] or {}).get("type") != "investigate":
+            continue
+        po = t.plan_output if isinstance(t.plan_output, dict) else None
+        if not po:
+            continue
+        summary = str(po.get("summary") or "").strip()
+        root_cause = str(po.get("root_cause") or "").strip()
+        if not summary or not root_cause:
+            continue
+
+        score = 0
+        for entry in (po.get("affected_files") or []):
+            p = entry.get("path") if isinstance(entry, dict) else entry
+            if isinstance(p, str) and p and p.lower() in err_lower:
+                score += 5
+
+        diag_tokens = set(re.findall(
+            r"[a-zA-Z_][a-zA-Z0-9_]{3,}",
+            (summary + " " + root_cause).lower(),
+        ))
+        score += len(err_tokens & diag_tokens)
+
+        if score > best_score and score >= 3:
+            best_score = score
+            best = t
+    return best
+
+
 def _build_remediation_prompt(
     *,
     head_branch: str,
@@ -301,6 +372,7 @@ def _build_remediation_prompt(
     failed_checks: list[str],
     error_summary: str,
     failure_type: str = "unknown",
+    prior_investigation: Task | None = None,
 ) -> str:
     """Build the agent prompt for a CI auto-remediation task."""
     checks_text = "\n".join(f"  - {name}" for name in failed_checks) if failed_checks else "  (check names not available)"
@@ -316,11 +388,25 @@ def _build_remediation_prompt(
     }
     type_guidance = type_guidance_map.get(failure_type, type_guidance_map["unknown"])
 
+    diagnosis_section = ""
+    if prior_investigation is not None and isinstance(prior_investigation.plan_output, dict):
+        po = prior_investigation.plan_output
+        root_cause = str(po.get("root_cause") or "").strip()
+        recommended_fix = str(po.get("recommended_fix") or "").strip()
+        if root_cause or recommended_fix:
+            diagnosis_section = (
+                f"\nDIAGNOSIS CONTEXT (from prior investigation {str(prior_investigation.id)[:8]}):\n"
+                f"- Root cause: {root_cause[:800] or '(none recorded)'}\n"
+                f"- Recommended fix: {recommended_fix[:800] or '(none recorded)'}\n"
+                f"Use this diagnosis as a starting point, but verify it still applies.\n"
+            )
+
     return (
         f"CI is failing on the `{head_branch}` branch at commit {head_sha}.\n\n"
         f"Failure classification: {failure_type} (test failures, build errors, lint issues, or mixed)\n\n"
         f"Failed checks:\n{checks_text}\n\n"
-        f"Error output (truncated):\n```\n{summary_text}\n```\n\n"
+        f"Error output (truncated):\n```\n{summary_text}\n```\n"
+        f"{diagnosis_section}\n"
         f"IMPORTANT — CI environment differences:\n"
         f"CI runs backend tests against PostgreSQL, not SQLite. Patterns that behave\n"
         f"differently include: FOR UPDATE / skip_locked (no-op in SQLite, blocks in\n"

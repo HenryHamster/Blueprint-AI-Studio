@@ -122,6 +122,37 @@ def should_trigger_code_defect_investigation(task: "Task") -> bool:
     return True
 
 
+# AGENT_TIMEOUT sub-types that indicate a code-caused failure (resource exhaustion
+# or process crash) worth investigating. Operational sub-types (cascade, iteration
+# limit, execution timeout) are excluded — they reflect orchestrator decisions or
+# wall-clock limits, not defects in the code under test.
+INVESTIGATABLE_TIMEOUT_SUBTYPES: frozenset[str] = frozenset({
+    "oom",
+    "process_crash",
+    "heartbeat_lost",
+})
+
+
+def should_trigger_timeout_investigation(task: "Task") -> bool:
+    """Return True if an AGENT_TIMEOUT failure warrants spawning an investigation.
+
+    Mirrors ``should_trigger_code_defect_investigation`` but for the subset of
+    timeout sub-types that indicate code-caused resource issues (OOM, crash,
+    heartbeat loss) rather than operational cancellations.
+    """
+    payload = (task.payloads or [{}])[0] if hasattr(task, "payloads") else {}
+    task_type = (payload or {}).get("type") if isinstance(payload, dict) else None
+    if task_type in _INVESTIGATION_EXCLUDED_TYPES:
+        return False
+    ctx = task.context or {}
+    if not ctx.get("direction_id"):
+        return False
+    if classify_failure(task) != AGENT_TIMEOUT:
+        return False
+    subtype = ctx.get("timeout_subtype") or classify_timeout_subtype(task)
+    return subtype in INVESTIGATABLE_TIMEOUT_SUBTYPES
+
+
 _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     'clone_failed': PROVISION_FAILURE,
     'build_failed': CODE_ERROR,

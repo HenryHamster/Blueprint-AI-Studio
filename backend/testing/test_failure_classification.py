@@ -27,6 +27,7 @@ from app.failure_classification import (
     classify_failure_taxonomy,
     classify_timeout_subtype,
     should_trigger_code_defect_investigation,
+    should_trigger_timeout_investigation,
 )
 from app.models import Task
 
@@ -366,3 +367,40 @@ class TestShouldTriggerCodeDefectInvestigation:
         t = _task("No heartbeat received", {"direction_id": "d-1"})
         t.payloads = [{"type": "create", "prompt": "p"}]
         assert should_trigger_code_defect_investigation(t) is False
+
+
+def _timeout_task(subtype: str, task_type: str = "create", direction_id: str | None = "d-1") -> Task:
+    ctx: dict = {"timeout_subtype": subtype}
+    if direction_id is not None:
+        ctx["direction_id"] = direction_id
+    t = _task("No heartbeat received after 300s", ctx)
+    t.payloads = [{"type": task_type, "prompt": "p"}]
+    return t
+
+
+class TestShouldTriggerTimeoutInvestigation:
+    def test_oom_triggers(self):
+        assert should_trigger_timeout_investigation(_timeout_task("oom")) is True
+
+    def test_process_crash_triggers(self):
+        assert should_trigger_timeout_investigation(_timeout_task("process_crash")) is True
+
+    def test_heartbeat_lost_triggers(self):
+        assert should_trigger_timeout_investigation(_timeout_task("heartbeat_lost")) is True
+
+    def test_cascade_skipped(self):
+        assert should_trigger_timeout_investigation(_timeout_task("cascade_cancellation")) is False
+
+    def test_iteration_limit_skipped(self):
+        assert should_trigger_timeout_investigation(_timeout_task("iteration_limit")) is False
+
+    def test_no_direction_skipped(self):
+        assert should_trigger_timeout_investigation(_timeout_task("oom", direction_id=None)) is False
+
+    def test_investigate_type_skipped(self):
+        assert should_trigger_timeout_investigation(_timeout_task("oom", task_type="investigate")) is False
+
+    def test_non_timeout_failure_skipped(self):
+        t = _task("AttributeError: NoneType has no 'x'", {"direction_id": "d-1", "timeout_subtype": "oom"})
+        t.payloads = [{"type": "create", "prompt": "p"}]
+        assert should_trigger_timeout_investigation(t) is False

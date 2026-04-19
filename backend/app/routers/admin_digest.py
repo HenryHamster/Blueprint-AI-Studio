@@ -2105,6 +2105,35 @@ async def get_digest(
         round(sum(_ttr_values) / len(_ttr_values), 2) if _ttr_values else None
     )
 
+    investigations_by_confidence: Dict[str, int] = {}
+    for t in _inv_tasks:
+        if t.status != TaskStatus.COMPLETED or not isinstance(t.plan_output, dict):
+            continue
+        conf = str((t.plan_output or {}).get("confidence") or "unknown").strip().lower() or "unknown"
+        investigations_by_confidence[conf] = investigations_by_confidence.get(conf, 0) + 1
+
+    failed_remediations_by_class: Dict[str, int] = {}
+    for r in _rem_tasks:
+        if r.status != TaskStatus.FAILED:
+            continue
+        cls = _classify_failure(r) or "unknown"
+        failed_remediations_by_class[cls] = failed_remediations_by_class.get(cls, 0) + 1
+
+    remediation_success_by_confidence: Dict[str, Dict[str, int]] = {}
+    for r in _rem_tasks:
+        if r.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            continue
+        diag_id = (r.context or {}).get("diagnosis_task_id")
+        inv = _inv_by_id.get(str(diag_id)) if diag_id else None
+        conf = "unknown"
+        if inv is not None and isinstance(inv.plan_output, dict):
+            conf = str((inv.plan_output or {}).get("confidence") or "unknown").strip().lower() or "unknown"
+        bucket = remediation_success_by_confidence.setdefault(conf, {"merged": 0, "failed": 0})
+        if r.status == TaskStatus.COMPLETED:
+            bucket["merged"] += 1
+        else:
+            bucket["failed"] += 1
+
     remediation_funnel = {
         "investigations_spawned": investigations_spawned,
         "investigations_completed": investigations_completed,
@@ -2114,6 +2143,9 @@ async def get_digest(
         "remediations_failed": remediations_failed,
         "avg_time_to_remediation_hours": avg_time_to_remediation_hours,
         "active_investigations": active_investigations,
+        "investigations_by_confidence": investigations_by_confidence,
+        "failed_remediations_by_class": failed_remediations_by_class,
+        "remediation_success_by_confidence": remediation_success_by_confidence,
     }
 
     return {

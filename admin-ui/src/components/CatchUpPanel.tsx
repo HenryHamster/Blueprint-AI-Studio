@@ -288,6 +288,9 @@ interface DigestData {
     remediations_failed: number;
     avg_time_to_remediation_hours: number | null;
     active_investigations: number;
+    investigations_by_confidence?: Record<string, number>;
+    failed_remediations_by_class?: Record<string, number>;
+    remediation_success_by_confidence?: Record<string, { merged: number; failed: number }>;
   } | null;
 }
 

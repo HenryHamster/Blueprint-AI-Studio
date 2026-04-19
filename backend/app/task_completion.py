@@ -670,6 +670,11 @@ async def _maybe_spawn_low_confidence_followup(
         or _project_active_followup_count(project, fp_key, now=now)
         >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT
     ):
+        directions = list(project.directions or [])
+        await _maybe_escalate_exhausted_followups(
+            project=project, direction=direction, directions=directions,
+            fp_key=fp_key, session=session,
+        )
         return None
     prior_summary = (direction.get("diagnosis_summary") or "").strip()
     prompt = "\n".join([

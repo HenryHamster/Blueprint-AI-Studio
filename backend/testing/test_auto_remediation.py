@@ -16,6 +16,7 @@ from app.auto_remediation import (
     _handle_main_branch_ci_failure_inner,
     _extract_ci_context,
     _build_remediation_prompt,
+    _find_matching_prior_investigation,
     _utcnow,
 )
 
@@ -542,3 +543,43 @@ async def test_non_suspended_branch_spawns_normally(db_session: AsyncSession):
         )
 
     assert await _count_auto_tasks(db_session, project.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_find_matching_prior_investigation_matches_on_file_path(db_session: AsyncSession):
+    """A recent completed investigate task whose affected file appears in the error summary matches."""
+    project = await _create_project(db_session)
+    inv = Task(
+        project_id=project.id,
+        title="Investigate CI",
+        payloads=[{"type": "investigate"}],
+        status=TaskStatus.COMPLETED,
+        plan_output={
+            "summary": "flaky auth middleware test",
+            "root_cause": "session token mismatch",
+            "affected_files": [{"path": "backend/app/auth.py"}],
+            "recommended_fix": "reset session cache",
+        },
+    )
+    db_session.add(inv)
+    await db_session.flush()
+
+    match = await _find_matching_prior_investigation(
+        project_id=project.id,
+        error_summary="FAILED backend/app/auth.py::test_session something",
+        session=db_session,
+    )
+    assert match is not None and match.id == inv.id
+
+
+@pytest.mark.asyncio
+async def test_find_matching_prior_investigation_no_match_returns_none(db_session: AsyncSession):
+    """Empty error summary or no matching investigation returns None."""
+    project = await _create_project(db_session)
+    assert await _find_matching_prior_investigation(
+        project_id=project.id, error_summary="", session=db_session,
+    ) is None
+    assert await _find_matching_prior_investigation(
+        project_id=project.id, error_summary="unrelated failure xyz",
+        session=db_session,
+    ) is None
