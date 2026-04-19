@@ -234,10 +234,10 @@ def _calibrate_finding_scope(
 
     if scope == "small":
         _heuristic_files = finding.get("related_files") or []
-        if len(_heuristic_files) >= 3:
+        if len(_heuristic_files) >= 4:
             logger.info(
                 "[RESEARCH] Upgrading scope small→medium for '%s' "
-                "(file-count heuristic: %d related_files >= 3)",
+                "(file-count heuristic: %d related_files >= 4)",
                 title, len(_heuristic_files),
             )
             scope = "medium"
@@ -306,6 +306,25 @@ def _calibrate_finding_scope(
         # cochange cluster density, and cross-module span into a single merge-
         # probability estimate. Upgrades when score indicates low P(merge) even if
         # individual binary checks above let the task through.
+        if scope == "medium":
+            # Unconditional escalation: if pipeline-wide medium merge rate has
+            # collapsed to at-or-below the exploration floor, medium scope is
+            # proven unviable system-wide. Skip the composite-complexity check
+            # entirely and route to large for plan decomposition.
+            _pipeline_medium_rate = (
+                _runtime_config.get("pipeline_scope_merge_rates") or {}
+            ).get("medium")
+            if (
+                isinstance(_pipeline_medium_rate, (int, float))
+                and float(_pipeline_medium_rate) <= MEDIUM_EXPLORATION_FLOOR
+            ):
+                logger.info(
+                    "[RESEARCH] Upgrading scope medium→large for '%s' "
+                    "(pipeline medium merge rate %.3f <= exploration floor %.3f — "
+                    "unconditional escalation)",
+                    title, float(_pipeline_medium_rate), MEDIUM_EXPLORATION_FLOOR,
+                )
+                return "large", "medium:pipeline_floor"
         if scope == "medium":
             _cc_score, _cc_signals = _composite_complexity_score(
                 finding.get("related_files") or [], direction, cochange_index,
@@ -736,12 +755,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Skip when _calibrate_scope just fired: historical merge-rate data is
         # a stronger signal than file-count heuristics, so a freshly-applied
         # downgrade (e.g. medium→small) should not be reversed by the small→medium
-        # heuristic that fires on related_files >= 3.
-        # Also skip heuristics for auto-decomposed findings: the decomposition
-        # is a deliberate small-scope decision that must not be reversed by the
-        # small→medium related_files>=3 heuristic (decomposed clusters often
-        # span 3-5 files by design).
-        if not _history_calibration_fired and not finding.get("auto_decomposed"):
+        # heuristic that fires on related_files >= 4.
+        # Also skip heuristics for auto-decomposed findings AT SMALL SCOPE: the
+        # decomposition is a deliberate small-scope decision that must not be
+        # reversed by the small→medium related_files>=4 heuristic (decomposed
+        # clusters often span 3-5 files by design). Medium-scope decomposed
+        # sub-findings still need the medium→large safety gates (file count,
+        # cross-module span, expansion ratio, composite complexity).
+        _skip_auto_decomp = finding.get("auto_decomposed") and scope == "small"
+        if not _history_calibration_fired and not _skip_auto_decomp:
             _heur_dir_id = finding.get("direction_id") or _parent_direction_id
             _heur_direction = _directions_by_id.get(str(_heur_dir_id)) if _heur_dir_id else None
             scope, _heur_calibrated_from = _calibrate_finding_scope(

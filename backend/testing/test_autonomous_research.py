@@ -1619,7 +1619,7 @@ async def test_medium_scope_with_many_related_files_upgrades_to_large(db_session
 
 @pytest.mark.asyncio
 async def test_small_scope_with_many_related_files_upgrades_to_medium(db_session, mocker, monkeypatch):
-    """Small-scope finding with >=3 related_files is upgraded to medium via pre-spawn heuristic."""
+    """Small-scope finding with >=4 related_files is upgraded to medium via pre-spawn heuristic."""
     monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
     direction = _active_direction("d-fchint03", "Small file-count heuristic direction")
     project = Project(
@@ -1636,7 +1636,7 @@ async def test_small_scope_with_many_related_files_upgrades_to_medium(db_session
         direction["id"],
         scope="small",
     )
-    finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(3)]
+    finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(4)]
 
     _patch_research_externals(mocker)
     mocker.patch(

@@ -3699,7 +3699,7 @@ async def test_exploration_floor_skipped_when_pipeline_unviable(db_session, mock
     assert len(children) == 1
     child = children[0]
     assert child.context["scope"] == "large"
-    assert child.context["scope_calibrated_from"] == "medium"
+    assert child.context["scope_calibrated_from"] == "medium:pipeline_floor"
 
 
 @pytest.mark.asyncio

@@ -3771,6 +3771,20 @@ class TestCalibrateFindingScope:
         assert scope == "large"
         assert cal == "medium"
 
+    def test_medium_auto_decomposed_still_escalates_on_file_count(self):
+        # Auto-decomposed sub-findings at medium scope must still pass through
+        # _calibrate_finding_scope's medium→large safety gates. A 7-file
+        # medium-scope auto_decomposed finding should be escalated to large
+        # by the file-count heuristic (>=5 files).
+        finding = {
+            "title": "t",
+            "related_files": self._single_module_files(7),
+            "auto_decomposed": True,
+        }
+        scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
+        assert scope == "large"
+        assert cal == "medium"
+
     def test_cross_module_heuristic_upgrades_medium_to_large(self):
         finding = {
             "title": "t",
@@ -3835,26 +3849,59 @@ class TestCalibrateFindingScope:
         escalates more borderline findings."""
         from app.shared_state import runtime_config
         # Score 0.61 is above old ceiling (0.6) but below new adaptive
-        # threshold (0.45 + (0.4-0.05)*0.5 = 0.625) — should escalate.
+        # threshold (0.45 + (0.4-0.08)*0.5 = 0.61) — should escalate.
+        # Use 0.08 (just above MEDIUM_EXPLORATION_FLOOR=0.05) so the
+        # unconditional-floor gate does not short-circuit this test.
         monkeypatch.setattr(
             "app.research_completion._composite_complexity_score",
-            lambda files, direction, cochange: (0.61, {"sig": "borderline"}),
+            lambda files, direction, cochange: (0.6, {"sig": "borderline"}),
         )
-        monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {"medium": 0.05})
+        monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {"medium": 0.08})
         finding = {"title": "t", "related_files": self._single_module_files(2)}
         scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
         assert scope == "large"
         assert cal == "medium"
 
+    def test_unconditional_escalation_at_exploration_floor(self, monkeypatch):
+        """When pipeline medium merge rate is at-or-below MEDIUM_EXPLORATION_FLOOR,
+        medium-scope findings must unconditionally escalate to large — skipping
+        the composite-complexity check entirely — because pipeline data proves
+        medium scope unviable system-wide."""
+        from app.shared_state import runtime_config
+        from app.research_completion import MEDIUM_EXPLORATION_FLOOR
+
+        # A deliberately healthy complexity score that would otherwise pass.
+        _called = {"n": 0}
+
+        def _unexpected(*args, **kwargs):
+            _called["n"] += 1
+            return (0.99, {"sig": "healthy"})
+
+        monkeypatch.setattr(
+            "app.research_completion._composite_complexity_score", _unexpected,
+        )
+        monkeypatch.setitem(
+            runtime_config,
+            "pipeline_scope_merge_rates",
+            {"medium": MEDIUM_EXPLORATION_FLOOR},
+        )
+        finding = {"title": "t", "related_files": self._single_module_files(2)}
+        scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
+        assert scope == "large"
+        assert cal == "medium:pipeline_floor"
+        # Composite complexity check must be skipped entirely.
+        assert _called["n"] == 0
+        assert "_complexity_score" not in finding
+
     def test_small_upgrade_to_medium_runs_complexity_and_escalates_to_large(self, monkeypatch):
-        """A small finding with 3+ related_files across cochange clusters should
+        """A small finding with 4+ related_files across cochange clusters should
         be upgraded to medium by file-count, then have composite complexity
         scored, and further escalated to large when score is below threshold."""
         monkeypatch.setattr(
             "app.research_completion._composite_complexity_score",
             lambda files, direction, cochange: (0.2, {"sig": "low", "clusters": 2}),
         )
-        finding = {"title": "t", "related_files": self._single_module_files(3)}
+        finding = {"title": "t", "related_files": self._single_module_files(4)}
         scope, cal = _calibrate_finding_scope(finding, "small", None, None)
         assert scope == "large"
         assert cal == "medium"
@@ -3868,7 +3915,7 @@ class TestCalibrateFindingScope:
             "app.research_completion._composite_complexity_score",
             lambda files, direction, cochange: (0.9, {"sig": "healthy"}),
         )
-        finding = {"title": "t", "related_files": self._single_module_files(3)}
+        finding = {"title": "t", "related_files": self._single_module_files(4)}
         scope, cal = _calibrate_finding_scope(finding, "small", None, None)
         assert scope == "medium"
         assert cal == "small"
