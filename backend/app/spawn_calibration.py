@@ -28,7 +28,7 @@ _SCOPE_ORDER = ["small", "medium", "large"]
 # MEDIUM_ANALYSIS_PLAN_FILE_LIMIT in agent/src/constants.ts — keep in sync.
 SCOPE_FILE_BUDGETS: dict[str, dict[str, int]] = {
     "small": {"total_files_max": 6},
-    "medium": {"production_files_max": 7, "total_files_max": 10},
+    "medium": {"production_files_max": 10, "total_files_max": 10},
     "large": {"total_files_max": 20},
 }
 
@@ -339,7 +339,8 @@ def predict_spawn_success(
     8. Finding file-count complexity (weight 1.0): 3-4 files moderate penalty,
        5+ files strong penalty. Omitted for 1-2 files. Requires related_files.
     9. Cross-module span (weight 1.0): penalizes findings whose related_files
-       span 2+ top-level directories. Omitted otherwise.
+       span 3+ top-level directories, matching the scope-escalation threshold
+       in research_completion.py. Omitted otherwise.
 
     Returns a float in [0.0, 1.0]. Falls back to 0.5 when data is insufficient.
     No DB queries — uses only data already loaded during research_completion processing.
@@ -455,13 +456,14 @@ def predict_spawn_success(
     # Signal 8: finding file-count complexity. Findings touching more files are
     # harder to implement correctly, especially at small scope (6-file budget).
     # Graduated penalty; omitted for 1-2 files so simple findings aren't affected.
-    # Signal 9: cross-module span. related_files spanning 2+ top-level directories
-    # (e.g. backend/ + agent/) cross language/build-system boundaries, raising
-    # implementation difficulty. Omitted when all files share one top-level dir.
+    # Signal 9: cross-module span. related_files spanning 3+ top-level directories
+    # cross language/build-system boundaries, raising implementation difficulty.
+    # Threshold matches the scope-escalation rule in research_completion.py, which
+    # keeps 2-module findings (e.g. backend/ + agent/) at medium scope.
     if related_files:
         file_count = len(related_files)
         # Scope-aware thresholds: small has a 6-file budget so 5+ is already
-        # over-budget; medium/large have a 10-file budget (7 production files)
+        # over-budget; medium/large have a 10-file budget (10 production files)
         # so thresholds shift up by 2 to avoid over-penalizing findings at
         # their natural file counts.
         if scope == "small":
@@ -476,7 +478,7 @@ def predict_spawn_success(
             weights.append(1.0)
 
         top_dirs = {f.split("/", 1)[0] for f in related_files if "/" in f}
-        if len(top_dirs) >= 2:
+        if len(top_dirs) >= 3:
             signals.append(0.4)
             weights.append(1.0)
 

@@ -2080,27 +2080,36 @@ def test_cluster_files_by_cochange_ignores_below_threshold_scores():
 
 
 def test_cluster_files_by_toplevel_dir_requires_min_files_and_dirs():
-    """Path-based fallback requires 3+ files spanning 2+ top-level directories."""
+    """Path-based fallback requires 3+ files spanning 3+ top-level directories.
+
+    2-module findings stay coherent — only 3+ module findings decompose,
+    matching the scope-escalation threshold.
+    """
     from app.cochange_decomposition import cluster_files_by_toplevel_dir
     assert cluster_files_by_toplevel_dir(["backend/a.py", "agent/b.ts"]) is None
     assert cluster_files_by_toplevel_dir(
         ["backend/a.py", "backend/b.py", "backend/c.py"]
     ) is None
+    # 2-module findings (backend + agent) don't decompose.
+    assert cluster_files_by_toplevel_dir(
+        ["backend/a.py", "backend/b.py", "agent/c.ts"]
+    ) is None
     # Root-level files don't establish a directory span.
     assert cluster_files_by_toplevel_dir(["a.py", "b.py", "c.py"]) is None
     clusters = cluster_files_by_toplevel_dir(
-        ["backend/a.py", "backend/b.py", "agent/c.ts"]
+        ["backend/a.py", "agent/b.ts", "admin-ui/c.tsx"]
     )
     assert clusters is not None
     cluster_sets = {frozenset(c) for c in clusters}
     assert cluster_sets == {
-        frozenset({"backend/a.py", "backend/b.py"}),
-        frozenset({"agent/c.ts"}),
+        frozenset({"backend/a.py"}),
+        frozenset({"agent/b.ts"}),
+        frozenset({"admin-ui/c.tsx"}),
     }
 
 
 def test_auto_decompose_falls_back_to_path_when_cochange_empty():
-    """Medium finding with files across 2 top-level dirs splits when cochange is empty."""
+    """Medium finding with files across 3+ top-level dirs splits when cochange is empty."""
     from app.cochange_decomposition import auto_decompose_findings_by_cochange
 
     def _hash(title: str, desc: str) -> str:
@@ -2112,21 +2121,64 @@ def test_auto_decompose_falls_back_to_path_when_cochange_empty():
         "scope": "medium",
         "related_files": [
             "backend/app/x.py",
-            "backend/app/y.py",
-            "agent/src/z.ts",
+            "agent/src/y.ts",
+            "admin-ui/src/z.tsx",
         ],
     }
     result = auto_decompose_findings_by_cochange(
         [(0, finding, "h0")], {}, None, _hash,
     )
-    assert len(result) == 2
+    assert len(result) == 3
     assert all(sub["scope"] == "small" for _, sub, _ in result)
     assert all(sub["auto_decomposed"] for _, sub, _ in result)
     sub_file_sets = {frozenset(sub["related_files"]) for _, sub, _ in result}
     assert sub_file_sets == {
-        frozenset({"backend/app/x.py", "backend/app/y.py"}),
-        frozenset({"agent/src/z.ts"}),
+        frozenset({"backend/app/x.py"}),
+        frozenset({"agent/src/y.ts"}),
+        frozenset({"admin-ui/src/z.tsx"}),
     }
+
+
+def test_auto_decompose_keeps_two_module_medium_finding_intact():
+    """2-module medium findings pass through without decomposition.
+
+    Matches the scope-escalation threshold: only 3+ module findings fragment.
+    """
+    from app.cochange_decomposition import auto_decompose_findings_by_cochange
+
+    def _hash(title: str, desc: str) -> str:
+        return f"{title}|{desc}"
+
+    finding = {
+        "title": "Backend + agent touch",
+        "description": "desc",
+        "scope": "medium",
+        "related_files": [
+            "backend/app/x.py",
+            "agent/src/y.ts",
+        ],
+    }
+    result = auto_decompose_findings_by_cochange(
+        [(0, finding, "h0")], {}, None, _hash,
+    )
+    assert len(result) == 1
+    assert result[0][1] is finding
+
+    finding_three = {
+        "title": "Backend + agent cluster",
+        "description": "desc",
+        "scope": "medium",
+        "related_files": [
+            "backend/app/x.py",
+            "backend/app/y.py",
+            "agent/src/z.ts",
+        ],
+    }
+    result = auto_decompose_findings_by_cochange(
+        [(0, finding_three, "h0")], {}, None, _hash,
+    )
+    assert len(result) == 1
+    assert result[0][1] is finding_three
 
 
 def test_auto_decompose_path_fallback_skipped_for_single_directory():
@@ -2166,14 +2218,14 @@ def test_auto_decompose_prepends_scope_boundary_preamble_to_prompt():
         "scope": "medium",
         "related_files": [
             "backend/app/x.py",
-            "backend/app/y.py",
-            "agent/src/z.ts",
+            "agent/src/y.ts",
+            "admin-ui/src/z.tsx",
         ],
     }
     result = auto_decompose_findings_by_cochange(
         [(0, finding, "h0")], {}, None, _hash,
     )
-    assert len(result) == 2
+    assert len(result) == 3
     for _, sub, _ in result:
         prompt = sub["prompt"]
         assert prompt.endswith(original_prompt)

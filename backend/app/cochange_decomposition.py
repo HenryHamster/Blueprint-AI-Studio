@@ -62,9 +62,13 @@ def cluster_files_by_toplevel_dir(files: list[str]) -> list[list[str]] | None:
     """Group files by their top-level directory (e.g. backend/, agent/, admin-ui/).
 
     Fallback clustering for sparse-cochange findings: returns one cluster per
-    top-level dir when 3+ directory-prefixed files span 2+ dirs, else None.
+    top-level dir when 3+ directory-prefixed files span 3+ dirs, else None.
     Root-level files (no ``/``) don't establish a directory span and are
     ignored — if after filtering fewer than 3 files remain, returns None.
+
+    The 3+ dir threshold matches the scope-escalation threshold so that
+    2-module medium findings stay coherent rather than being fragmented into
+    per-module tasks.
     """
     if len(files) < 3:
         return None
@@ -79,7 +83,7 @@ def cluster_files_by_toplevel_dir(files: list[str]) -> list[list[str]] | None:
             order.append(top)
         groups.setdefault(top, []).append(f)
         kept += 1
-    if kept < 3 or len(groups) < 2:
+    if kept < 3 or len(groups) < 3:
         return None
     return [groups[t] for t in order]
 
@@ -205,14 +209,7 @@ def auto_decompose_findings_by_cochange(
         ):
             f_clusters: list[list[str]] | None = None
             cluster_source = ""
-            if len(f_files) == 2:
-                tops = [
-                    f.split("/", 1)[0] if "/" in f else "" for f in f_files
-                ]
-                if tops[0] and tops[1] and tops[0] != tops[1]:
-                    f_clusters = [[f_files[0]], [f_files[1]]]
-                    cluster_source = "cross-module"
-            else:
+            if len(f_files) >= 3:
                 f_clusters = (
                     cluster_files_by_cochange(f_files, cochange_index)
                     if cochange_index

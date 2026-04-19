@@ -1010,7 +1010,7 @@ async def test_scope_file_budgets_surfaced_with_agent_limits():
 
     budgets = result["scope_file_budgets"]
     assert budgets["small"]["total_files_max"] == 6
-    assert budgets["medium"]["production_files_max"] == 7
+    assert budgets["medium"]["production_files_max"] == 10
     assert budgets["medium"]["total_files_max"] == 10
     assert budgets["large"]["total_files_max"] == 20
 

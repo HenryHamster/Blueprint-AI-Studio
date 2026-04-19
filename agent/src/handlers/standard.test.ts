@@ -1729,7 +1729,7 @@ describe('analysis-phase scope feasibility gate', () => {
   });
 
   it('retries analysis with narrowing guidance when plan exceeds the limit', async () => {
-    const overflowFiles = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts', 'g.ts', 'h.ts'];
+    const overflowFiles = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts', 'g.ts', 'h.ts', 'i.ts', 'j.ts', 'k.ts'];
     const narrowedFiles = ['a.ts', 'b.ts'];
     vi.mocked(parseAnalysisPlanFiles)
       .mockReturnValueOnce(overflowFiles)
@@ -1749,7 +1749,7 @@ describe('analysis-phase scope feasibility gate', () => {
   });
 
   it('fails fast with scope_overflow when narrowing retry still exceeds the limit', async () => {
-    const overflow = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts', 'g.ts', 'h.ts'];
+    const overflow = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts', 'g.ts', 'h.ts', 'i.ts', 'j.ts', 'k.ts'];
     vi.mocked(parseAnalysisPlanFiles).mockReturnValue(overflow);
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- a.ts' })
@@ -1778,7 +1778,7 @@ describe('analysis-phase scope feasibility gate', () => {
   });
 
   it('triggers narrowing retry when production+test total exceeds the combined budget', async () => {
-    // 6 production + 5 test = 11 > overflow threshold (10) but 6 ≤ production limit (7)
+    // 6 production + 5 test = 11 > overflow threshold (10) but 6 ≤ production limit (10)
     const productionOver = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts'];
     const testOver = ['a.test.ts', 'b.test.ts', 'c.test.ts', 'd.test.ts', 'e.test.ts'];
     const productionNarrowed = ['a.ts', 'b.ts'];

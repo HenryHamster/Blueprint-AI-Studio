@@ -63,7 +63,7 @@ export const SCOPE_OVERFLOW_THRESHOLDS: Record<string, number> = {
 // proposes more files than this, the handler retries the analysis with a
 // narrowing directive once, then fails fast rather than burning the
 // implementation budget on a task that will hit SCOPE_OVERFLOW_THRESHOLDS.
-export const MEDIUM_ANALYSIS_PLAN_FILE_LIMIT = 7;
+export const MEDIUM_ANALYSIS_PLAN_FILE_LIMIT = 10;
 
 // Claude Code runner
 export const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
