@@ -805,6 +805,11 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                         {digest!.failed_delta > 0 ? '↑' : '↓'}
                       </span>
                     )}
+                    {digest!.total_failed_cost_usd != null && digest!.total_failed_cost_usd > 0 && (
+                      <span className="inline-flex items-center gap-0.5 text-neutral-500 font-mono">
+                        ·<DollarSign className="w-2.5 h-2.5" />{digest!.total_failed_cost_usd.toFixed(2)} wasted
+                      </span>
+                    )}
                   </span>
                 )}
                 {digest!.research_cycles > 0 && (
@@ -1070,30 +1075,44 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
 
               {/* Failure taxonomy root-cause pills */}
-              {digest!.failure_taxonomy_distribution && digest!.failure_taxonomy_distribution.total_failures > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Root cause</span>
-                  {digest!.total_failed_cost_usd != null && digest!.total_failed_cost_usd > 0 && (
-                    <span className="text-[10px] text-red-400/80" title="Total cost of failed tasks">
-                      ${digest!.total_failed_cost_usd.toFixed(2)} wasted
-                    </span>
-                  )}
-                  {TAXONOMY_ORDER.map(cat => {
-                    const entry = digest!.failure_taxonomy_distribution!.categories[cat];
-                    if (!entry || entry.count === 0) return null;
-                    return (
-                      <span
-                        key={cat}
-                        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border ${TAXONOMY_COLORS[cat]}`}
-                        title={`${TAXONOMY_LABELS[cat]}: ${entry.count} (${Math.round(entry.percentage)}%)`}
-                      >
-                        {TAXONOMY_LABELS[cat]}
-                        <span className="font-bold">{entry.count}</span>
-                      </span>
-                    );
-                  })}
-                </div>
-              )}
+              {digest!.failure_taxonomy_distribution && digest!.failure_taxonomy_distribution.total_failures > 0 && (() => {
+                const costByTaxonomy: Record<string, number> = {};
+                const costByClass = digest!.cost_by_failure_class ?? {};
+                for (const g of digest!.failure_groups ?? []) {
+                  const groupCost = costByClass[g.failure_class] ?? 0;
+                  if (!groupCost || g.tasks.length === 0) continue;
+                  const perTask = groupCost / g.tasks.length;
+                  for (const t of g.tasks) {
+                    if (!t.taxonomy) continue;
+                    costByTaxonomy[t.taxonomy] = (costByTaxonomy[t.taxonomy] ?? 0) + perTask;
+                  }
+                }
+                return (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Root cause</span>
+                    {TAXONOMY_ORDER.map(cat => {
+                      const entry = digest!.failure_taxonomy_distribution!.categories[cat];
+                      if (!entry || entry.count === 0) return null;
+                      const cost = costByTaxonomy[cat];
+                      return (
+                        <span
+                          key={cat}
+                          className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border ${TAXONOMY_COLORS[cat]}`}
+                          title={`${TAXONOMY_LABELS[cat]}: ${entry.count} (${Math.round(entry.percentage)}%)${cost ? ` · $${cost.toFixed(2)}` : ''}`}
+                        >
+                          {TAXONOMY_LABELS[cat]}
+                          <span className="font-bold">{entry.count}</span>
+                          {cost != null && cost > 0 && (
+                            <span className="inline-flex items-center font-mono font-normal opacity-80">
+                              ·<DollarSign className="w-2.5 h-2.5" />{cost.toFixed(2)}
+                            </span>
+                          )}
+                        </span>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
 
               {/* Failure stage distribution pills */}
               {digest!.failure_stage_distribution && digest!.failure_stage_distribution.total_classified > 0 && (
