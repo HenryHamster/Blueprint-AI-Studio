@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import type { RefObject } from 'react';
 import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw, DollarSign, Compass } from 'lucide-react';
 import { apiFetch } from '../api';
@@ -110,6 +110,7 @@ interface DirectionProgress {
   cost_per_merged_pr?: number | null;
   estimated_cost_usd?: number | null;
   cost_by_scope?: Record<string, number> | null;
+  cost_by_type?: Record<string, number> | null;
   avg_time_to_merge_hours?: number | null;
   auto_paused?: boolean;
   paused_reason?: string | null;
@@ -486,8 +487,25 @@ function SkeletonRow() {
   );
 }
 
+type DirectionSortKey = 'default' | 'acceptance_asc' | 'cost_desc' | 'first_attempt_asc';
+
+const DIRECTION_SORT_STORAGE_KEY = 'catchup.directionProgress.sort';
+
 function DirectionProgressSection({ directions }: { directions: DirectionProgress[] }) {
   const [expandedDirections, setExpandedDirections] = useState<Set<string>>(new Set());
+  const [sortKey, setSortKey] = useState<DirectionSortKey>(() => {
+    if (typeof window === 'undefined') return 'default';
+    const stored = window.localStorage.getItem(DIRECTION_SORT_STORAGE_KEY);
+    if (stored === 'acceptance_asc' || stored === 'cost_desc' || stored === 'first_attempt_asc' || stored === 'default') {
+      return stored;
+    }
+    return 'default';
+  });
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem(DIRECTION_SORT_STORAGE_KEY, sortKey);
+  }, [sortKey]);
 
   const toggleDirection = (id: string) => {
     setExpandedDirections(prev => {
@@ -498,10 +516,38 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
     });
   };
 
+  const sortedDirections = useMemo(() => {
+    if (sortKey === 'default') return directions;
+    const arr = [...directions];
+    const numOr = (v: number | null | undefined, fallback: number) => (typeof v === 'number' ? v : fallback);
+    if (sortKey === 'acceptance_asc') {
+      arr.sort((a, b) => numOr(a.acceptance_rate, Infinity) - numOr(b.acceptance_rate, Infinity));
+    } else if (sortKey === 'cost_desc') {
+      arr.sort((a, b) => numOr(b.estimated_cost_usd, -Infinity) - numOr(a.estimated_cost_usd, -Infinity));
+    } else if (sortKey === 'first_attempt_asc') {
+      arr.sort((a, b) => numOr(a.first_attempt_success_rate, Infinity) - numOr(b.first_attempt_success_rate, Infinity));
+    }
+    return arr;
+  }, [directions, sortKey]);
+
   return (
     <div className="flex flex-col gap-1">
-      <div className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest mb-0.5">Directions</div>
-      {directions.map(dp => {
+      <div className="flex items-center justify-between mb-0.5">
+        <div className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest">Directions</div>
+        <select
+          value={sortKey}
+          onChange={e => setSortKey(e.target.value as DirectionSortKey)}
+          className="text-[10px] bg-neutral-950 border border-neutral-800/80 text-neutral-400 rounded px-1.5 py-0.5 cursor-pointer hover:bg-neutral-800/30"
+          aria-label="Sort directions"
+          title="Sort directions"
+        >
+          <option value="default">Default order</option>
+          <option value="acceptance_asc">Acceptance rate ↑</option>
+          <option value="cost_desc">Cost ↓</option>
+          <option value="first_attempt_asc">First-attempt ↑</option>
+        </select>
+      </div>
+      {sortedDirections.map(dp => {
         const isExpanded = expandedDirections.has(dp.direction_id);
         return (
           <div key={dp.direction_id}>
@@ -752,10 +798,24 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                         .map(([scope, v]) => `${scope} $${v.toFixed(2)}`)
                         .join(' · ')
                     : '';
+                  const typeBreakdown = dp.cost_by_type
+                    ? Object.entries(dp.cost_by_type)
+                        .filter(([, v]) => typeof v === 'number' && v > 0)
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([t, v]) => `${t} $${v.toFixed(2)}`)
+                        .join(' · ')
+                    : '';
                   return (
-                    <span className="text-[9px] text-neutral-500 font-mono">
-                      Cost: ${total.toFixed(2)}{breakdown ? ` — ${breakdown}` : ''}
-                    </span>
+                    <>
+                      <span className="text-[9px] text-neutral-500 font-mono">
+                        Cost: ${total.toFixed(2)}{breakdown ? ` — ${breakdown}` : ''}
+                      </span>
+                      {typeBreakdown && (
+                        <span className="text-[9px] text-neutral-500 font-mono">
+                          By type: {typeBreakdown}
+                        </span>
+                      )}
+                    </>
                   );
                 })()}
                 {dp.rejection_reasons && dp.rejection_reasons.length > 0 && (
@@ -2519,6 +2579,69 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             );
                           })}
                         </div>
+                        {(() => {
+                          const confOrder = ['high', 'medium', 'low'];
+                          const confColor: Record<string, string> = {
+                            high: 'text-emerald-400',
+                            medium: 'text-amber-400',
+                            low: 'text-neutral-400',
+                          };
+                          const ibc = rf.investigations_by_confidence ?? {};
+                          const rsbc = rf.remediation_success_by_confidence ?? {};
+                          const frbc = rf.failed_remediations_by_class ?? {};
+                          const ibcEntries = confOrder.filter(k => (ibc[k] ?? 0) > 0);
+                          const rsbcEntries = confOrder.filter(k => {
+                            const v = rsbc[k];
+                            return v && (v.merged + v.failed) > 0;
+                          });
+                          const frbcEntries = Object.entries(frbc)
+                            .filter(([, v]) => v > 0)
+                            .sort((a, b) => b[1] - a[1]);
+                          if (!ibcEntries.length && !rsbcEntries.length && !frbcEntries.length) return null;
+                          return (
+                            <div className="flex flex-col gap-1 text-[10px] text-neutral-400 border-t border-neutral-800 pt-1.5">
+                              {ibcEntries.length > 0 && (
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-neutral-500 w-24 shrink-0">confidence:</span>
+                                  {ibcEntries.map(k => (
+                                    <span key={k} className="inline-flex items-baseline gap-1">
+                                      <span className={confColor[k]}>{k}</span>
+                                      <span className="font-mono text-neutral-300">{ibc[k]}</span>
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                              {rsbcEntries.length > 0 && (
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-neutral-500 w-24 shrink-0">success/conf:</span>
+                                  {rsbcEntries.map(k => {
+                                    const v = rsbc[k]!;
+                                    const total = v.merged + v.failed;
+                                    const pct = total > 0 ? Math.round((v.merged / total) * 100) : 0;
+                                    return (
+                                      <span key={k} className="inline-flex items-baseline gap-1">
+                                        <span className={confColor[k]}>{k}</span>
+                                        <span className="font-mono text-neutral-300">{pct}%</span>
+                                        <span className="text-neutral-600">({v.merged}/{total})</span>
+                                      </span>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                              {frbcEntries.length > 0 && (
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-neutral-500 w-24 shrink-0">failed class:</span>
+                                  {frbcEntries.map(([cls, count]) => (
+                                    <span key={cls} className="inline-flex items-baseline gap-1">
+                                      <span className="text-red-400">{cls}</span>
+                                      <span className="font-mono text-neutral-300">{count}</span>
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </div>
                     )}
                   </div>
