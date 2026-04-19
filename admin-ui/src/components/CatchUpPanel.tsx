@@ -75,6 +75,17 @@ interface RecentCompletion {
   task_type: string;
   direction_id?: string | null;
   direction_text?: string | null;
+  scope?: string | null;
+  duration_seconds?: number | null;
+  review_iterations?: number | null;
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const minutes = seconds / 60;
+  if (minutes < 60) return `${Math.round(minutes)}m`;
+  const hours = minutes / 60;
+  return hours < 10 ? `${hours.toFixed(1)}h` : `${Math.round(hours)}h`;
 }
 
 interface DirectionProgress {
@@ -321,6 +332,27 @@ function CompletionRow({ c, onSelectTask }: { c: RecentCompletion; onSelectTask:
             {c.direction_text.length > 40 ? c.direction_text.slice(0, 40) + '…' : c.direction_text}
           </span>
         )}
+        {c.scope && (
+          <span
+            className="shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
+            title={`scope: ${c.scope}`}
+          >
+            {c.scope}
+          </span>
+        )}
+        {typeof c.duration_seconds === 'number' && c.duration_seconds > 0 && (
+          <span className="text-[9px] text-neutral-500 font-mono" title="duration">
+            {formatDuration(c.duration_seconds)}
+          </span>
+        )}
+        {typeof c.review_iterations === 'number' && c.review_iterations > 1 && (
+          <span
+            className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20"
+            title="review iterations"
+          >
+            {c.review_iterations} cycles
+          </span>
+        )}
         {c.pr_url && isSafeUrl(c.pr_url) && (
           <a
             href={c.pr_url}
@@ -391,6 +423,11 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                 {dp.prs_merged > 0 && (
                   <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded">
                     {dp.prs_merged} PR{dp.prs_merged !== 1 ? 's' : ''}
+                  </span>
+                )}
+                {typeof dp.prs_rejected === 'number' && dp.prs_rejected > 0 && (
+                  <span className="text-[9px] bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded" title="PRs rejected">
+                    {dp.prs_rejected} rejected
                   </span>
                 )}
                 {dp.possibly_saturated && (
@@ -891,7 +928,13 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                         {digest!.trend_history.map((p, i) => {
                           const rate = p.success_rate ?? 0;
                           const color = rate >= 0.8 ? 'bg-emerald-400' : rate >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
-                          return <div key={i} className={`w-1 rounded-sm ${p.success_rate == null ? 'bg-neutral-700' : color}`} style={{height: `${Math.max(rate * 100, 8)}%`}} />;
+                          const dateLabel = (() => {
+                            const d = new Date(p.period_end);
+                            return isNaN(d.getTime()) ? p.period_end : d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+                          })();
+                          const ratePart = p.success_rate == null ? 'no data' : `${Math.round(p.success_rate * 100)}%`;
+                          const title = `${dateLabel}: ${ratePart} (${p.completed} done, ${p.failed} failed)`;
+                          return <div key={i} title={title} className={`w-1 rounded-sm ${p.success_rate == null ? 'bg-neutral-700' : color}`} style={{height: `${Math.max(rate * 100, 8)}%`}} />;
                         })}
                       </div>
                     )}
@@ -908,7 +951,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     <CheckCircle className="w-3 h-3 text-emerald-500" />
                     {digest!.completed_count} completed
                     {digest!.completed_delta != null && digest!.completed_delta !== 0 && (
-                      <span className={digest!.completed_delta > 0 ? 'text-emerald-400' : 'text-red-400'}>
+                      <span
+                        className={digest!.completed_delta > 0 ? 'text-emerald-400' : 'text-red-400'}
+                        title={digest!.prev_completed_count != null ? `was ${digest!.prev_completed_count} last period` : undefined}
+                      >
                         {digest!.completed_delta > 0 ? '↑' : '↓'}
                       </span>
                     )}
@@ -919,7 +965,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     <XCircle className="w-3 h-3 text-red-500" />
                     {digest!.failed_count} failed
                     {digest!.failed_delta != null && digest!.failed_delta !== 0 && (
-                      <span className={digest!.failed_delta > 0 ? 'text-red-400' : 'text-emerald-400'}>
+                      <span
+                        className={digest!.failed_delta > 0 ? 'text-red-400' : 'text-emerald-400'}
+                        title={digest!.prev_failed_count != null ? `was ${digest!.prev_failed_count} last period` : undefined}
+                      >
                         {digest!.failed_delta > 0 ? '↑' : '↓'}
                       </span>
                     )}
