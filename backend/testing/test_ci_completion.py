@@ -12,7 +12,72 @@ Covers:
 import uuid
 import pytest
 
+from app.ci_completion import _normalize_merge_error
 from app.models import Project, Task, TaskStatus
+
+
+# ---------------------------------------------------------------------------
+# _normalize_merge_error — unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_merge_error_empty_string():
+    assert _normalize_merge_error("") == ""
+
+
+def test_normalize_merge_error_strips_uuid():
+    out = _normalize_merge_error("merge failed for job 550e8400-e29b-41d4-a716-446655440000 retry")
+    assert "550e8400" not in out
+    assert "<uuid>" in out
+
+
+def test_normalize_merge_error_strips_timestamp():
+    out = _normalize_merge_error("at 2026-04-19T12:34:56.789Z merge aborted")
+    assert "2026" not in out
+    assert "<ts>" in out
+
+
+def test_normalize_merge_error_strips_long_hex():
+    # Long hex (>=12 chars) gets <HEX>; short hex stays literal
+    out = _normalize_merge_error("sha deadbeefcafe1234 invalid")
+    assert "deadbeefcafe1234" not in out
+    assert "<hex>" in out
+
+
+def test_normalize_merge_error_replaces_numbers():
+    short = _normalize_merge_error("retry 5 of 10")
+    # both short ints replaced with <n>
+    assert "5" not in short and "10" not in short
+    assert "<n>" in short
+    long_num = _normalize_merge_error("request id 1234567890 failed")
+    assert "1234567890" not in long_num
+    assert "<n>" in long_num
+
+
+def test_normalize_merge_error_mixed_variable_data():
+    msg = (
+        "Job 550e8400-e29b-41d4-a716-446655440000 at 2026-04-19T12:34:56Z "
+        "failed after 3 retries with sha deadbeefcafe9999"
+    )
+    out = _normalize_merge_error(msg)
+    assert "<uuid>" in out
+    assert "<ts>" in out
+    assert "<hex>" in out
+    assert "<n>" in out
+    # whitespace collapsed, lowercased
+    assert out == out.lower()
+    assert "  " not in out
+
+
+def test_normalize_merge_error_structural_equivalence():
+    a = "Merge attempt 1 for job 550e8400-e29b-41d4-a716-446655440000 at 2026-04-19T12:34:56Z failed"
+    b = "Merge attempt 7 for job 11111111-2222-3333-4444-555555555555 at 2026-04-20T01:02:03Z failed"
+    assert _normalize_merge_error(a) == _normalize_merge_error(b)
+
+
+# ---------------------------------------------------------------------------
+# Merge retry / escalation tests
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------

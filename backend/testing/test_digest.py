@@ -3268,3 +3268,66 @@ async def test_failure_stage_distribution_aggregates_stages(client: AsyncClient,
     assert dist["stages"]["provision"] == 1
     assert dist["total_classified"] == 4
     assert dist["dominant_stage"] == "lint"
+
+
+@pytest.mark.asyncio
+async def test_digest_retry_overhead_cost_computation(client: AsyncClient, db_session):
+    """Digest response surfaces retry_overhead_cost_usd, retry_task_count,
+    and avg_retries_before_failure for failed tasks with _attempt_number > 1."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+
+    now = _utcnow()
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Retry on-demand: attempt 2, 1h of VM time (in-window)
+    db_session.add(make_task(
+        project_id=project.id,
+        title="retry on-demand",
+        status=TaskStatus.FAILED,
+        context={"_attempt_number": 2},
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),
+        vm_spot=False,
+    ))
+    # Retry spot: attempt 3, 30m of VM time (in-window)
+    db_session.add(make_task(
+        project_id=project.id,
+        title="retry spot",
+        status=TaskStatus.FAILED,
+        context={"_attempt_number": 3},
+        vm_provisioned_at=now - timedelta(minutes=60),
+        vm_stopped_at=now - timedelta(minutes=30),
+        vm_spot=True,
+    ))
+    # First-attempt failure: must be excluded from retry counts
+    db_session.add(make_task(
+        project_id=project.id,
+        title="first attempt",
+        status=TaskStatus.FAILED,
+        context={"_attempt_number": 1},
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),
+        vm_spot=False,
+    ))
+    # Retry with no VM timing: counts toward retry_task_count but not cost
+    db_session.add(make_task(
+        project_id=project.id,
+        title="retry no-vm",
+        status=TaskStatus.FAILED,
+        context={"_attempt_number": 4},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["retry_task_count"] == 3  # attempts 2, 3, 4 (attempt 1 excluded)
+    # avg = (2 + 3 + 4) / 3 = 3.0
+    assert body["avg_retries_before_failure"] == pytest.approx(3.0)
+
+    expected_cost = ON_DEMAND_RATE * 3600 + SPOT_RATE * 1800
+    assert body["retry_overhead_cost_usd"] == pytest.approx(round(expected_cost, 4))

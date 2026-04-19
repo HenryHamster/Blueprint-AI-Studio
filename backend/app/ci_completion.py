@@ -423,7 +423,14 @@ async def _attempt_merge_with_retry_and_escalation(
             if _merge_failures >= _hard_cap or _repeated_identical:
                 task.status = TaskStatus.FAILED
                 task.requires_approval = True
-                if _repeated_identical and _merge_failures < _hard_cap:
+                _early_exit = _repeated_identical and _merge_failures < _hard_cap
+                if _early_exit:
+                    _retries_saved = _hard_cap - _merge_failures
+                    task.context = {
+                        **(task.context or {}),
+                        "_merge_retries_saved": _retries_saved,
+                        "review_loop": ci_loop,
+                    }
                     task.latest_status_message = (
                         f"PR #{ci_pr_number} merge failed with identical error "
                         f"{_err_streak} times in a row: {merge_msg[:200]} — "
@@ -456,6 +463,21 @@ async def _attempt_merge_with_retry_and_escalation(
                     record_direction_result(
                         _direction_id, success=False, failure_class=_fc,
                         project_id=str(task.project_id) if task.project_id else "",
+                    )
+                if _early_exit and task.project_id:
+                    from app.broadcast import broadcast_to_project  # noqa: PLC0415
+                    await broadcast_to_project(
+                        str(task.project_id),
+                        "task_updated",
+                        {
+                            "task_id": str(task.id),
+                            "status": task.status,
+                            "details": {
+                                "merge_early_exit": True,
+                                "retries_saved": _retries_saved,
+                                "error_streak": _err_streak,
+                            },
+                        },
                     )
     except Exception:
         ci_loop["ci_poll_interval"] = 30

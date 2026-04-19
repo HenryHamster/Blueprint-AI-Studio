@@ -1148,6 +1148,7 @@ async def get_digest(
             "direction_text": t_dir_text,
             "failure_class": _classify_failure(t, error_log_map.get(tid)),
             "scope": (t.context or {}).get("scope"),
+            "merge_retries_saved": (t.context or {}).get("_merge_retries_saved"),
         })
     for t in approval_tasks:
         tid = str(t.id)
@@ -1200,6 +1201,7 @@ async def get_digest(
             "failure_class": _rf_cls,
             "timeout_subtype": _classify_timeout_subtype(t, error_log_map.get(tid)) if _rf_cls == _AGENT_TIMEOUT else None,
             "scope": (t.context or {}).get("scope"),
+            "merge_retries_saved": (t.context or {}).get("_merge_retries_saved"),
         })
 
     # --- failure_groups (classify failures by type) ---

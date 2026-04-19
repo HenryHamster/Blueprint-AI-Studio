@@ -20,6 +20,7 @@ interface NeedsAttentionItem {
   scope?: string | null;
   direction_id?: string | null;
   direction_text?: string | null;
+  merge_retries_saved?: number | null;
 }
 
 interface RecentFailure {
@@ -1223,6 +1224,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                 title={FAILURE_CLASS_CONFIG[item.failure_class].hint}
                               >
                                 {FAILURE_CLASS_CONFIG[item.failure_class].label}
+                              </span>
+                            )}
+                            {item.reason === 'failed' && typeof item.merge_retries_saved === 'number' && item.merge_retries_saved > 0 && (
+                              <span
+                                className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                                title="Merge failed with identical error repeatedly — early exit saved these retry attempts"
+                              >
+                                saved {item.merge_retries_saved} {item.merge_retries_saved === 1 ? 'retry' : 'retries'}
                               </span>
                             )}
                             {item.reason === 'failed' && item.pr_url && isSafeUrl(item.pr_url) && (
