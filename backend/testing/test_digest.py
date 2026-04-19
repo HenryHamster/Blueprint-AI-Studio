@@ -514,6 +514,120 @@ async def test_digest_recurring_error_clusters_empty_when_all_unique(client: Asy
 
 
 @pytest.mark.asyncio
+async def test_digest_recurring_patterns_from_persistent_anomalies(client: AsyncClient, db_session):
+    """persistent_anomalies entries with occurrence_count >= 2 appear in recurring_patterns."""
+    from app import shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    _ss.persistent_anomalies[proj_key] = {
+        "CrossDirectionFingerprint_fp-rec-001": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 4,
+            "severity": "high",
+            "latest_details": "Fingerprint fp-rec-001 affects 2 directions.",
+        },
+        "CODE_ERROR": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 1,  # below threshold, should be filtered out
+            "severity": "medium",
+            "latest_details": "low-count anomaly",
+        },
+    }
+    try:
+        # Failed task in last 48h with same fingerprint and a direction, so
+        # affected_direction_count > 0 and remediation_status is unaddressed.
+        db_session.add(make_task(
+            project_id=project.id,
+            title="Recurring fail",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={"direction_id": "dir-recur"},
+            latest_status_message="boom: same root cause",
+        ))
+        await db_session.commit()
+
+        # Seed persistent_anomalies key with the actual fingerprint of the message.
+        from app.anomaly_detection import _error_fingerprint
+        actual_fp = _error_fingerprint("boom: same root cause")
+        _ss.persistent_anomalies[proj_key][f"CrossDirectionFingerprint_{actual_fp}"] = {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 3,
+            "severity": "high",
+            "latest_details": "boom affects directions",
+        }
+
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+
+        patterns = data["recurring_patterns"]
+        assert len(patterns) == 2  # two with occurrence_count >= 2, one filtered
+        fps = {p["fingerprint"] for p in patterns}
+        assert "fp-rec-001" in fps
+        assert actual_fp in fps
+        # Sorted by occurrence_count desc — fp-rec-001 (4) first.
+        assert patterns[0]["fingerprint"] == "fp-rec-001"
+        assert patterns[0]["occurrence_count"] == 4
+        assert patterns[0]["severity"] == "high"
+        assert patterns[0]["remediation_status"] == "unaddressed"
+        assert patterns[0]["proactive"] is False
+        # actual_fp entry should count the matching failed task's direction.
+        actual_entry = next(p for p in patterns if p["fingerprint"] == actual_fp)
+        assert actual_entry["affected_direction_count"] == 1
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
+async def test_digest_recurring_patterns_remediation_status_investigating(client: AsyncClient, db_session):
+    """An in-flight investigate task with matching diagnosis_fingerprint marks status=investigating."""
+    from app import shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    _ss.persistent_anomalies[proj_key] = {
+        "CrossDirectionFingerprint_fp-inv-001": {
+            "first_seen": "2026-04-18T00:00:00+00:00",
+            "last_seen": "2026-04-19T00:00:00+00:00",
+            "occurrence_count": 3,
+            "severity": "high",
+            "latest_details": "fp-inv-001 pattern",
+        },
+    }
+    try:
+        db_session.add(make_task(
+            project_id=project.id,
+            title="Active investigation",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "investigate"}],
+            context={"diagnosis_fingerprint": "fp-inv-001", "proactive": True},
+        ))
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/digest?project_id={project.id}")
+        assert response.status_code == 200
+        data = response.json()
+        patterns = data["recurring_patterns"]
+        assert len(patterns) == 1
+        assert patterns[0]["remediation_status"] == "investigating"
+        assert patterns[0]["proactive"] is True
+    finally:
+        _ss.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
 async def test_digest_approval_task_direction_attribution(client: AsyncClient, db_session):
     """Approval-pending tasks with direction_id context expose direction attribution in needs_attention."""
     project = make_project(

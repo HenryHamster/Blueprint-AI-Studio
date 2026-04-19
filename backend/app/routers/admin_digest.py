@@ -2592,6 +2592,75 @@ async def get_digest(
         "diagnosis_drop_off_by_reason": diagnosis_drop_off_by_reason,
     }
 
+    # --- Recurring failure patterns (from persistent_anomalies) ---
+    from app.shared_state import persistent_anomalies as _persistent_anomalies  # noqa: PLC0415
+    _fp_48h_cutoff = _utcnow() - timedelta(hours=48)
+    _fp_dirs_48h: Dict[str, set] = {}
+    _fp_count_48h: Dict[str, int] = {}
+    for _t in failed_tasks:
+        if _derive_completed_at(_t) < _fp_48h_cutoff:
+            continue
+        _msg = _t.latest_status_message or ""
+        if not _msg:
+            continue
+        _fp_ = _error_fingerprint(_msg)
+        _did = (_t.context or {}).get("direction_id")
+        if _did:
+            _fp_dirs_48h.setdefault(_fp_, set()).add(str(_did))
+        _fp_count_48h[_fp_] = _fp_count_48h.get(_fp_, 0) + 1
+
+    _fp_task_states: Dict[str, Dict[str, Any]] = {}
+    _inflight_statuses = {TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING}
+    for _t in list(all_tasks) + list(active_tasks_all):
+        _ctx = _t.context or {}
+        _fp_ = (
+            _ctx.get("diagnosis_fingerprint")
+            or _ctx.get("error_fingerprint")
+            or _ctx.get("_previous_error_fingerprint")
+        )
+        if not _fp_:
+            continue
+        _entry = _fp_task_states.setdefault(str(_fp_), {"inflight": False, "merged": False, "proactive": False})
+        if _t.status == TaskStatus.COMPLETED and _ctx.get("pr_url"):
+            _entry["merged"] = True
+        if _t.status in _inflight_statuses:
+            _entry["inflight"] = True
+        if _ctx.get("proactive") or _ctx.get("proactive_investigation"):
+            _entry["proactive"] = True
+
+    recurring_patterns: List[Dict[str, Any]] = []
+    _anoms_map = (
+        {str(project_id): _persistent_anomalies.get(str(project_id), {})}
+        if project_id else _persistent_anomalies
+    )
+    for _proj_anoms in _anoms_map.values():
+        for _key, _info in _proj_anoms.items():
+            if _info.get("occurrence_count", 0) < 2:
+                continue
+            _fp_key = _key[len("CrossDirectionFingerprint_"):] if _key.startswith("CrossDirectionFingerprint_") else _key
+            _state = _fp_task_states.get(_fp_key, {})
+            _recent = _fp_count_48h.get(_fp_key, 0)
+            if _state.get("merged") and _recent == 0:
+                _status = "fix_verified"
+            elif _state.get("merged"):
+                _status = "fix_shipped"
+            elif _state.get("inflight"):
+                _status = "investigating"
+            else:
+                _status = "unaddressed"
+            recurring_patterns.append({
+                "fingerprint": _fp_key,
+                "occurrence_count": _info.get("occurrence_count", 0),
+                "first_seen": _info.get("first_seen"),
+                "last_seen": _info.get("last_seen"),
+                "severity": _info.get("severity"),
+                "example_message": (_info.get("latest_details") or "")[:240],
+                "affected_direction_count": len(_fp_dirs_48h.get(_fp_key, set())),
+                "remediation_status": _status,
+                "proactive": bool(_state.get("proactive", False)),
+            })
+    recurring_patterns.sort(key=lambda x: x["occurrence_count"], reverse=True)
+
     _review_quality = _compute_review_quality_metrics(completed_tasks + failed_tasks)
     _first_attempt_success_rate = _compute_first_attempt_breakdowns(
         completed_tasks + failed_tasks,
@@ -2670,6 +2739,7 @@ async def get_digest(
         "review_cap_exhaustion_summary": review_cap_exhaustion_summary,
         "resurrection_outcome_summary": resurrection_outcome_summary,
         "recurring_error_clusters": recurring_error_clusters,
+        "recurring_patterns": recurring_patterns,
         "remediation_funnel": remediation_funnel,
         "investigation_conversion": investigation_conversion,
     }

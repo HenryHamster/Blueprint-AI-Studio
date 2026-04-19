@@ -9,7 +9,7 @@ import logging
 import os
 import random
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -358,6 +358,84 @@ def _calibrate_finding_scope(
                 scope = "large"
                 scope_calibrated_from = "medium"
     return scope, scope_calibrated_from
+
+
+def _build_preventive_context(
+    finding: Dict[str, Any],
+    directions_by_id: Dict[str, Dict[str, Any]],
+    project_anomalies: Optional[Dict[str, Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """Produce a concise preventive warning when a finding's related_files
+    overlap with recently-diagnosed failure hotspots or active anomaly patterns.
+
+    Returns None when no overlap exists, so callers can skip injection.
+    """
+    related_files = [f for f in (finding.get("related_files") or []) if isinstance(f, str)]
+    if not related_files:
+        return None
+    related_set = set(related_files)
+    cutoff = _utcnow() - timedelta(days=14)
+
+    hotspot: Optional[Dict[str, Any]] = None
+    for d in directions_by_id.values():
+        affected = [a for a in (d.get("diagnosed_affected_files") or []) if isinstance(a, str)]
+        overlap = sorted(related_set.intersection(affected))
+        if not overlap:
+            continue
+        completed_at = d.get("diagnosis_completed_at")
+        if not isinstance(completed_at, str):
+            continue
+        try:
+            ts = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+        except ValueError:
+            continue
+        if ts < cutoff:
+            continue
+        hotspot = {
+            "overlap_files": overlap,
+            "summary": (d.get("diagnosis_summary") or "").strip()[:220],
+            "fingerprint": d.get("last_remediation_fingerprint"),
+        }
+        break
+
+    anomaly_match: Optional[Dict[str, Any]] = None
+    if project_anomalies:
+        modules = {f.split("/", 1)[0].lower() for f in related_files if "/" in f}
+        for key, info in project_anomalies.items():
+            details = (info.get("latest_details") or "").lower()
+            if not details:
+                continue
+            if any(m and m in details for m in modules):
+                anomaly_match = {"key": key, "details": info.get("latest_details") or ""}
+                break
+
+    if not hotspot and not anomaly_match:
+        return None
+
+    parts: list[str] = []
+    if hotspot:
+        files_str = ", ".join(hotspot["overlap_files"][:3])
+        fp_str = f" (fingerprint {hotspot['fingerprint']})" if hotspot["fingerprint"] else ""
+        root = hotspot["summary"] or "see direction diagnosis"
+        parts.append(
+            f"Files {files_str} were recently involved in a recurring failure{fp_str}. "
+            f"Root cause: {root}."
+        )
+    if anomaly_match:
+        parts.append(
+            f"Active cross-direction anomaly {anomaly_match['key']}: "
+            f"{anomaly_match['details'][:140]}"
+        )
+    parts.append("Ensure your changes don't reintroduce this pattern.")
+    warning = " ".join(parts)[:500]
+    return {
+        "warning": warning,
+        "fingerprint": hotspot["fingerprint"] if hotspot else None,
+        "overlap_files": hotspot["overlap_files"] if hotspot else [],
+        "anomaly_key": anomaly_match["key"] if anomaly_match else None,
+    }
 
 
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
@@ -1107,6 +1185,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     f"the most critical files from related_files and avoid incidental edits that "
                     f"would push the change past the budget."
                 )
+        from app import shared_state as _ss_pc  # noqa: PLC0415
+        _project_anomalies = _ss_pc.persistent_anomalies.get(str(task.project_id))
+        _preventive = _build_preventive_context(
+            finding, _directions_by_id, _project_anomalies,
+        )
+
         finding_payload = validate_internal_payload({
             "type": task_type,
             "prompt": full_prompt,
@@ -1141,6 +1225,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **({"auto_decomposed": True} if finding.get("auto_decomposed") else {}),
                 **({"_predicted_file_utilization": _predicted_utilization} if _predicted_utilization is not None else {}),
                 **({"_file_budget_warning": _file_budget_warning} if _file_budget_warning else {}),
+                **({"preventive_context": _preventive, "has_preventive_context": True} if _preventive else {}),
                 **prior_retry_ctx,
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",

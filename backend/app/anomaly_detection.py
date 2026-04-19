@@ -16,7 +16,8 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 import app.shared_state as _shared_state
-from app.models import Project, Task, TaskStatus
+from app.models import Project, Task, TaskHistory, TaskStatus
+from app.payload_schemas import validate_internal_payload
 from app.strategic_completion import _is_direction_duplicate
 from app.time_utils import _utcnow
 
@@ -360,6 +361,18 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                 "severity": a["severity"],
                 "latest_details": a["details"],
             }
+        # Stash cross-direction fingerprint metadata so the proactive spawner
+        # can build an investigation prompt without re-querying tasks.
+        if anomaly_key.startswith("CrossDirectionFingerprint_"):
+            entry = proj_anomalies[anomaly_key]
+            if a.get("fingerprint"):
+                entry["fingerprint"] = a["fingerprint"]
+            if a.get("affected_directions"):
+                entry["affected_directions"] = list(a["affected_directions"])
+            fp = a.get("fingerprint")
+            if fp and fp in fp_counts:
+                entry["failure_count"] = fp_counts[fp]
+                entry["example_message"] = fp_example.get(fp, "")[:500]
     # Expire anomalies not seen for 48h
     stale_cutoff = (now - timedelta(hours=48)).isoformat()
     for key in list(proj_anomalies):
@@ -902,35 +915,200 @@ async def _spawn_held_direction_investigations(session: AsyncSession) -> int:
     return total
 
 
+# Caps for proactive fingerprint-pattern investigations (spawned from persistent
+# CrossDirectionFingerprint anomalies during the maintenance sweep).
+_PROACTIVE_INVESTIGATION_PER_PROJECT_CAP = 1
+_PROACTIVE_INVESTIGATION_SYSTEM_CAP = 2
+
+
+async def _count_active_proactive_investigations(session: AsyncSession) -> int:
+    """Count in-flight proactive-pattern investigations system-wide."""
+    active_statuses = (
+        TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+    )
+    rows = (await session.execute(
+        select(Task.id).where(
+            Task.status.in_(active_statuses),
+            Task.payloads[0]["type"].as_string() == "investigate",
+            Task.context["diagnosis_trigger"].as_string() == "proactive_pattern_detection",
+        )
+    )).all()
+    return len(rows)
+
+
+async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> int:
+    """Spawn investigate tasks for persistent cross-direction fingerprint patterns.
+
+    Looks at ``persistent_anomalies`` for entries keyed ``CrossDirectionFingerprint_<fp>``
+    that carry stashed fingerprint/affected_directions metadata. For each such
+    entry not yet spawned, opens a targeted investigation describing the
+    systemic pattern. Applies a per-project cap of 1 and a system-wide
+    concurrent cap of 2 to avoid flooding the pipeline.
+    """
+    from app.autonomous_research import _recent_investigation_exists  # noqa: PLC0415
+
+    if not _shared_state.persistent_anomalies:
+        return 0
+
+    system_active = await _count_active_proactive_investigations(session)
+    if system_active >= _PROACTIVE_INVESTIGATION_SYSTEM_CAP:
+        return 0
+
+    spawned = 0
+    for proj_key, proj_anomalies in list(_shared_state.persistent_anomalies.items()):
+        if system_active + spawned >= _PROACTIVE_INVESTIGATION_SYSTEM_CAP:
+            break
+        per_project_spawned = 0
+        try:
+            pid = uuid.UUID(proj_key)
+        except (TypeError, ValueError):
+            continue
+        for anomaly_key, entry in proj_anomalies.items():
+            if per_project_spawned >= _PROACTIVE_INVESTIGATION_PER_PROJECT_CAP:
+                break
+            if not anomaly_key.startswith("CrossDirectionFingerprint_"):
+                continue
+            if entry.get("proactive_investigation_spawned"):
+                continue
+            fingerprint = entry.get("fingerprint")
+            affected = entry.get("affected_directions") or []
+            if not fingerprint or len(affected) < 2:
+                continue
+            failure_count = int(entry.get("failure_count", 0) or 0)
+            if failure_count < 3:
+                continue
+            primary_direction = affected[0]
+            try:
+                if await _recent_investigation_exists(
+                    pid, primary_direction, session, error_fingerprint=fingerprint,
+                ):
+                    entry["proactive_investigation_spawned"] = True
+                    entry["proactive_investigation_spawned_at"] = _utcnow().isoformat()
+                    continue
+            except Exception:
+                logger.exception(
+                    "[ANOMALY_SWEEP] proactive dedup check failed for %s/%s",
+                    proj_key, anomaly_key,
+                )
+                continue
+
+            example = (entry.get("example_message") or "")[:240]
+            affected_list = ", ".join(affected)[:300]
+            prompt = (
+                f"A recurring error pattern (fingerprint {fingerprint}) has been "
+                f"detected across {len(affected)} directions with {failure_count} "
+                f"failures in the last 48h — affected directions: {affected_list}.\n\n"
+                f"Example error message:\n{example}\n\n"
+                "This pattern suggests a systemic root cause (shared infra, "
+                "framework, dependency, or cross-cutting code path) rather than "
+                "direction-specific issues. Diagnose the underlying root cause "
+                "and recommend a fix. Produce the structured diagnosis JSON report."
+            )
+            payload = validate_internal_payload(
+                {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+                "anomaly_detection:proactive_pattern_investigation",
+            )
+            new_task = Task(
+                project_id=pid,
+                title=f"Proactive investigation: fingerprint {fingerprint} "
+                      f"spans {len(affected)} directions",
+                description=(
+                    f"Auto-spawned from cross-direction pattern "
+                    f"({failure_count} failures across {len(affected)} directions)"
+                )[:500],
+                payloads=[payload],
+                context={
+                    "direction_id": primary_direction,
+                    "spawned_by": "proactive_pattern_detection",
+                    "diagnosis_trigger": "proactive_pattern_detection",
+                    "proactive_pattern_fix": True,
+                    "error_fingerprint": fingerprint,
+                    "failure_fingerprints": [fingerprint],
+                    "affected_directions": list(affected),
+                    "failure_count": failure_count,
+                    "example_message": example,
+                },
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+            )
+            session.add(new_task)
+            session.add(TaskHistory(
+                task_id=new_task.id, action="SPAWNED",
+                details={
+                    "spawned_by": "PROACTIVE_PATTERN_DETECTION",
+                    "fingerprint": fingerprint,
+                    "affected_directions": list(affected),
+                },
+            ))
+            entry["proactive_investigation_spawned"] = True
+            entry["proactive_investigation_spawned_at"] = _utcnow().isoformat()
+            logger.info(
+                "[ANOMALY_SWEEP] Spawned proactive investigation for fingerprint "
+                "%s (project %s, %d directions, %d failures)",
+                fingerprint, proj_key, len(affected), failure_count,
+            )
+            spawned += 1
+            per_project_spawned += 1
+            if system_active + spawned >= _PROACTIVE_INVESTIGATION_SYSTEM_CAP:
+                break
+
+    if spawned:
+        await session.commit()
+    return spawned
+
+
 async def anomaly_maintenance_sweep() -> dict:
     """Periodic maintenance independent of autonomous research.
 
     Expires stale persistent anomalies (>48h since last_seen), re-evaluates
     pipeline adjustments so that throttles get restored even when no research
-    cycle is running, and spawns investigation tasks for any directions that
-    are currently on hold. Returns a small summary dict for logging.
+    cycle is running, spawns investigation tasks for any directions that are
+    currently on hold, and spawns proactive investigations for recurring
+    cross-direction fingerprint patterns. Returns a small summary dict for
+    logging.
     """
     expired = _expire_stale_anomalies()
     action = await check_anomaly_actions()
     spawned = 0
-    # Skip the DB session entirely when no directions are held — the common case
-    # on a healthy pipeline, and it keeps standalone callers DB-free.
-    if _shared_state.get_held_directions():
+    proactive_spawned = 0
+    # Open a DB session when either pass has work to do.
+    needs_session = bool(_shared_state.get_held_directions()) or any(
+        key.startswith("CrossDirectionFingerprint_")
+        for proj in _shared_state.persistent_anomalies.values()
+        for key in proj
+    )
+    if needs_session:
         try:
             from app.database import AsyncSessionLocal  # noqa: PLC0415
             async with AsyncSessionLocal() as session:
-                spawned = await _spawn_held_direction_investigations(session)
+                if _shared_state.get_held_directions():
+                    try:
+                        spawned = await _spawn_held_direction_investigations(session)
+                    except Exception:
+                        logger.exception(
+                            "[ANOMALY_SWEEP] held-direction investigation pass failed"
+                        )
+                try:
+                    proactive_spawned = await _spawn_proactive_fingerprint_investigations(session)
+                except Exception:
+                    logger.exception(
+                        "[ANOMALY_SWEEP] proactive fingerprint investigation pass failed"
+                    )
         except Exception:
-            logger.exception("[ANOMALY_SWEEP] held-direction investigation pass failed")
-    if expired or action["action"] != "none" or spawned:
+            logger.exception("[ANOMALY_SWEEP] maintenance session failed to open")
+    if expired or action["action"] != "none" or spawned or proactive_spawned:
         logger.info(
-            "[ANOMALY_SWEEP] expired=%d action=%s spawned_investigations=%d",
-            expired, action["action"], spawned,
+            "[ANOMALY_SWEEP] expired=%d action=%s spawned_investigations=%d "
+            "proactive_investigations_spawned=%d",
+            expired, action["action"], spawned, proactive_spawned,
         )
     return {
         "expired": expired,
         "action": action["action"],
         "spawned_investigations": spawned,
+        "proactive_investigations_spawned": proactive_spawned,
     }
 
 

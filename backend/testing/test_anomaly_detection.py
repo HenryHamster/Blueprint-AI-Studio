@@ -608,3 +608,221 @@ async def test_cross_direction_below_count_threshold_no_anomaly():
     result = await _compute_research_anomalies(project_id, session)
 
     assert not any(a["signal"].startswith("CrossDirectionFingerprint_") for a in result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Proactive fingerprint investigation spawning
+# ─────────────────────────────────────────────────────────────────────────────
+
+import app.shared_state as _shared_state  # noqa: E402
+from app.anomaly_detection import _spawn_proactive_fingerprint_investigations  # noqa: E402
+from app.models import Task as _TaskModel  # noqa: E402
+
+
+def _make_proactive_session(active_proactive_count: int = 0):
+    """Build an AsyncSession mock for proactive-spawn tests.
+
+    First execute() call: _count_active_proactive_investigations → N rows.
+    Subsequent execute() calls: consumed by _recent_investigation_exists
+    (mocked separately via monkeypatch, so returns empty).
+    """
+    session = AsyncMock()
+    adds: list = []
+
+    def _add(obj):
+        adds.append(obj)
+    session.add = MagicMock(side_effect=_add)
+    session.commit = AsyncMock()
+    session.flush = AsyncMock()
+
+    count_result = MagicMock()
+    count_result.all.return_value = [("row",)] * active_proactive_count
+
+    empty_result = MagicMock()
+    empty_result.all.return_value = []
+
+    session.execute = AsyncMock(
+        side_effect=[count_result, empty_result, empty_result, empty_result]
+    )
+    return session, adds
+
+
+@pytest.mark.asyncio
+async def test_proactive_fingerprint_spawns_investigation(monkeypatch):
+    """Persistent cross-direction fingerprint entry → proactive investigate task spawned."""
+    project_id = uuid.uuid4()
+    fp = "abc123def456"
+    _shared_state.persistent_anomalies.clear()
+    _shared_state.persistent_anomalies[str(project_id)] = {
+        f"CrossDirectionFingerprint_{fp}": {
+            "first_seen": _utcnow().isoformat(),
+            "last_seen": _utcnow().isoformat(),
+            "occurrence_count": 1,
+            "severity": "high",
+            "latest_details": "systemic",
+            "fingerprint": fp,
+            "affected_directions": ["d-aaa", "d-bbb"],
+            "failure_count": 5,
+            "example_message": "ImportError: cannot import name Foo",
+        }
+    }
+
+    async def _no_recent(*args, **kwargs):
+        return False
+    monkeypatch.setattr(
+        "app.autonomous_research._recent_investigation_exists", _no_recent,
+    )
+
+    session, adds = _make_proactive_session(active_proactive_count=0)
+    try:
+        spawned = await _spawn_proactive_fingerprint_investigations(session)
+    finally:
+        _shared_state.persistent_anomalies.clear()
+
+    assert spawned == 1
+    tasks = [o for o in adds if isinstance(o, _TaskModel)]
+    assert len(tasks) == 1
+    new_task = tasks[0]
+    ctx = new_task.context
+    assert ctx["diagnosis_trigger"] == "proactive_pattern_detection"
+    assert ctx["proactive_pattern_fix"] is True
+    assert ctx["error_fingerprint"] == fp
+    assert ctx["affected_directions"] == ["d-aaa", "d-bbb"]
+    assert ctx["failure_count"] == 5
+    assert new_task.payloads[0]["type"] == "investigate"
+
+
+@pytest.mark.asyncio
+async def test_proactive_fingerprint_dedup_flag(monkeypatch):
+    """Entries already flagged as spawned are skipped."""
+    project_id = uuid.uuid4()
+    fp = "aaa111bbb222"
+    _shared_state.persistent_anomalies.clear()
+    _shared_state.persistent_anomalies[str(project_id)] = {
+        f"CrossDirectionFingerprint_{fp}": {
+            "severity": "high",
+            "occurrence_count": 1,
+            "fingerprint": fp,
+            "affected_directions": ["d-x", "d-y"],
+            "failure_count": 4,
+            "example_message": "err",
+            "proactive_investigation_spawned": True,
+        }
+    }
+
+    async def _no_recent(*args, **kwargs):
+        return False
+    monkeypatch.setattr(
+        "app.autonomous_research._recent_investigation_exists", _no_recent,
+    )
+
+    session, adds = _make_proactive_session(active_proactive_count=0)
+    try:
+        spawned = await _spawn_proactive_fingerprint_investigations(session)
+    finally:
+        _shared_state.persistent_anomalies.clear()
+
+    assert spawned == 0
+    assert not [o for o in adds if isinstance(o, _TaskModel)]
+
+
+@pytest.mark.asyncio
+async def test_proactive_fingerprint_respects_recent_investigation_exists(monkeypatch):
+    """Pre-existing investigation for the fingerprint blocks spawn and marks flag."""
+    project_id = uuid.uuid4()
+    fp = "ccc333ddd444"
+    _shared_state.persistent_anomalies.clear()
+    entry = {
+        "severity": "high",
+        "occurrence_count": 1,
+        "fingerprint": fp,
+        "affected_directions": ["d-1", "d-2"],
+        "failure_count": 5,
+        "example_message": "err",
+    }
+    _shared_state.persistent_anomalies[str(project_id)] = {
+        f"CrossDirectionFingerprint_{fp}": entry,
+    }
+
+    async def _yes_recent(*args, **kwargs):
+        return True
+    monkeypatch.setattr(
+        "app.autonomous_research._recent_investigation_exists", _yes_recent,
+    )
+
+    session, adds = _make_proactive_session(active_proactive_count=0)
+    try:
+        spawned = await _spawn_proactive_fingerprint_investigations(session)
+    finally:
+        _shared_state.persistent_anomalies.clear()
+
+    assert spawned == 0
+    assert not [o for o in adds if isinstance(o, _TaskModel)]
+    assert entry.get("proactive_investigation_spawned") is True
+
+
+@pytest.mark.asyncio
+async def test_proactive_fingerprint_per_project_cap(monkeypatch):
+    """Two eligible fingerprints in one project → at most 1 spawn."""
+    project_id = uuid.uuid4()
+    _shared_state.persistent_anomalies.clear()
+    _shared_state.persistent_anomalies[str(project_id)] = {
+        "CrossDirectionFingerprint_fp1aaa": {
+            "severity": "high", "occurrence_count": 1,
+            "fingerprint": "fp1aaa",
+            "affected_directions": ["d-a", "d-b"],
+            "failure_count": 4, "example_message": "e1",
+        },
+        "CrossDirectionFingerprint_fp2bbb": {
+            "severity": "high", "occurrence_count": 1,
+            "fingerprint": "fp2bbb",
+            "affected_directions": ["d-c", "d-d"],
+            "failure_count": 4, "example_message": "e2",
+        },
+    }
+
+    async def _no_recent(*args, **kwargs):
+        return False
+    monkeypatch.setattr(
+        "app.autonomous_research._recent_investigation_exists", _no_recent,
+    )
+
+    session, adds = _make_proactive_session(active_proactive_count=0)
+    try:
+        spawned = await _spawn_proactive_fingerprint_investigations(session)
+    finally:
+        _shared_state.persistent_anomalies.clear()
+
+    assert spawned == 1
+    assert len([o for o in adds if isinstance(o, _TaskModel)]) == 1
+
+
+@pytest.mark.asyncio
+async def test_proactive_fingerprint_system_concurrent_cap(monkeypatch):
+    """When system cap is reached, no new spawns occur."""
+    project_id = uuid.uuid4()
+    fp = "eee555fff666"
+    _shared_state.persistent_anomalies.clear()
+    _shared_state.persistent_anomalies[str(project_id)] = {
+        f"CrossDirectionFingerprint_{fp}": {
+            "severity": "high", "occurrence_count": 1,
+            "fingerprint": fp,
+            "affected_directions": ["d-m", "d-n"],
+            "failure_count": 5, "example_message": "err",
+        }
+    }
+
+    async def _no_recent(*args, **kwargs):
+        return False
+    monkeypatch.setattr(
+        "app.autonomous_research._recent_investigation_exists", _no_recent,
+    )
+
+    session, adds = _make_proactive_session(active_proactive_count=2)
+    try:
+        spawned = await _spawn_proactive_fingerprint_investigations(session)
+    finally:
+        _shared_state.persistent_anomalies.clear()
+
+    assert spawned == 0
+    assert not [o for o in adds if isinstance(o, _TaskModel)]

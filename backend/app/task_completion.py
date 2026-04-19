@@ -1864,6 +1864,8 @@ async def _spawn_investigation_remediation(
     trigger_failure_taxonomy = parent_ctx.get("failure_taxonomy")
     if trigger_failure_taxonomy:
         remediation_context["trigger_failure_taxonomy"] = trigger_failure_taxonomy
+    if parent_ctx.get("proactive_pattern_fix"):
+        remediation_context["proactive_pattern_fix"] = True
 
     new_task = Task(
         project_id=task.project_id,
