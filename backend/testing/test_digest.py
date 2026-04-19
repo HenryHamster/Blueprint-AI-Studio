@@ -2443,6 +2443,54 @@ async def test_trend_history_includes_first_attempt_rate(client: AsyncClient, db
 
 
 @pytest.mark.asyncio
+async def test_first_attempt_success_rate_breakdowns(client: AsyncClient, db_session):
+    """first_attempt_success_rate includes by_type, by_scope, trend, and first_attempt_by_review_category."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    prev = _prev_ts()
+
+    # Current window: create/small success, refactor/medium failure w/ review cats
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.COMPLETED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        payloads=[{"type": "create"}],
+        context={"_first_attempt_succeeded": True, "scope": "small"},
+    ))
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.COMPLETED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        payloads=[{"type": "refactor"}],
+        context={
+            "_first_attempt_succeeded": False,
+            "scope": "medium",
+            "_first_attempt_rejection_categories": {"architecture": 1, "correctness": 1},
+        },
+    ))
+    # Previous window: all failures — to produce an 'improving' trend
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.FAILED,
+            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+            payloads=[{"type": "create"}],
+            context={"_first_attempt_succeeded": False, "scope": "small"},
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    fa = response.json()["first_attempt_success_rate"]
+
+    assert fa["by_type"] == {"create": 1.0, "refactor": 0.0}
+    assert fa["by_scope"] == {"small": 1.0, "medium": 0.0}
+    assert fa["trend"] == "improving"
+    assert fa["first_attempt_by_review_category"] == {"architecture": 1.0, "correctness": 1.0}
+
+
+@pytest.mark.asyncio
 async def test_trend_history_includes_failed_by_taxonomy(client: AsyncClient, db_session):
     """trend_history entries include failed_by_taxonomy counts parallel to failed_by_class."""
     project = make_project()
@@ -3900,6 +3948,63 @@ async def test_digest_ci_auto_remediation(client: AsyncClient, db_session):
     assert ci["failed"] == 1
     assert ci["by_ci_failure_type"]["test"] == {"spawned": 2, "merged": 1, "failed": 0}
     assert ci["by_ci_failure_type"]["build"] == {"spawned": 1, "merged": 0, "failed": 1}
+
+
+@pytest.mark.asyncio
+async def test_digest_includes_first_review_approval_rate(client: AsyncClient, db_session):
+    """/api/admin/digest returns first_review_approval_rate with expected structure."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Merged create task approved on first review (no rejection categories).
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={
+            "pr_merged": True,
+            "scope": "small",
+            "_had_playbook": True,
+            "_had_review_measurements": True,
+        },
+    ))
+    # Merged refactor task rejected on first review.
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "refactor"}],
+        context={
+            "pr_merged": True,
+            "scope": "medium",
+            "_had_playbook": False,
+            "_had_review_measurements": False,
+            "_first_attempt_rejection_categories": ["correctness"],
+        },
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    fra = data["first_review_approval_rate"]
+    assert set(fra.keys()) >= {
+        "overall", "sample_size", "by_type", "by_scope",
+        "with_playbook", "without_playbook",
+        "with_measurements", "without_measurements",
+    }
+    assert fra["sample_size"] == 2
+    assert fra["overall"] == 0.5
+    assert fra["by_type"]["create"] == 1.0
+    assert fra["by_type"]["refactor"] == 0.0
+    assert fra["by_scope"]["small"] == 1.0
+    assert fra["by_scope"]["medium"] == 0.0
+    assert fra["with_playbook"] == 1.0
+    assert fra["without_playbook"] == 0.0
+    assert fra["with_measurements"] == 1.0
+    assert fra["without_measurements"] == 0.0
 
 
 @pytest.mark.asyncio

@@ -109,7 +109,10 @@ def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any
     }
 
 
-def _compute_first_attempt_breakdowns(terminal_tasks: List[Task]) -> Dict[str, Any]:
+def _compute_first_attempt_breakdowns(
+    terminal_tasks: List[Task],
+    prev_terminal_tasks: List[Task] | None = None,
+) -> Dict[str, Any]:
     """Compute overall first-attempt success rate plus playbook and arch-context
     effectiveness comparisons from a list of terminal tasks."""
     def _fa_rate(tasks):
@@ -126,13 +129,132 @@ def _compute_first_attempt_breakdowns(terminal_tasks: List[Task]) -> Dict[str, A
     without_arch = [t for t in measured if (t.context or {}).get("_had_arch_context") is False]
     sample_size = len(measured)
 
+    by_type_groups: Dict[str, list] = {}
+    for t in terminal_tasks:
+        task_type = (t.first_payload or {}).get("type", "create")
+        by_type_groups.setdefault(task_type, []).append(t)
+    by_type: Dict[str, float] = {}
+    for task_type, tasks in by_type_groups.items():
+        rate = _fa_rate(tasks)
+        if rate is not None:
+            by_type[task_type] = rate
+
+    by_scope_groups: Dict[str, list] = {}
+    for t in terminal_tasks:
+        scope = (t.context or {}).get("scope", "unknown")
+        by_scope_groups.setdefault(scope, []).append(t)
+    by_scope: Dict[str, float] = {}
+    for scope, tasks in by_scope_groups.items():
+        rate = _fa_rate(tasks)
+        if rate is not None:
+            by_scope[scope] = rate
+
+    overall = _fa_rate(terminal_tasks)
+    trend: str | None = None
+    if prev_terminal_tasks is not None:
+        prev_rate = _fa_rate(prev_terminal_tasks)
+        if overall is not None and prev_rate is not None:
+            delta = overall - prev_rate
+            if delta > 0.05:
+                trend = "improving"
+            elif delta < -0.05:
+                trend = "declining"
+            else:
+                trend = "stable"
+
+    first_attempt_by_review_category: Dict[str, float] | None = None
+    failed_with_cats = [
+        t for t in terminal_tasks
+        if "_first_attempt_rejection_categories" in (t.context or {})
+    ]
+    if failed_with_cats:
+        total_with_cats = len(failed_with_cats)
+        cat_counts: Dict[str, int] = {}
+        for t in failed_with_cats:
+            cats = (t.context or {}).get("_first_attempt_rejection_categories", {})
+            for cat in cats:
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        first_attempt_by_review_category = {
+            cat: round(count / total_with_cats, 2)
+            for cat, count in sorted(cat_counts.items(), key=lambda x: -x[1])
+        }
+
     return {
-        "overall": _fa_rate(terminal_tasks),
+        "overall": overall,
         "with_playbook": _fa_rate(with_pb),
         "without_playbook": _fa_rate(without_pb),
         "with_arch_context": _fa_rate(with_arch),
         "without_arch_context": _fa_rate(without_arch),
         "sample_size": sample_size,
+        "by_type": by_type,
+        "by_scope": by_scope,
+        "trend": trend,
+        "first_attempt_by_review_category": first_attempt_by_review_category,
+    }
+
+
+_REVIEW_ELIGIBLE_TYPES = {"create", "refactor"}
+
+
+def _compute_first_review_approval_breakdowns(terminal_tasks: List[Task]) -> Dict[str, Any]:
+    """Compute first-review approval rate with playbook/measurement/type/scope breakdowns.
+
+    A task is 'review-eligible' if it is a create/refactor type with pr_merged=True.
+    A task is 'approved on first review' if _first_attempt_rejection_categories is absent.
+    """
+    def _rate(tasks):
+        eligible = [
+            t for t in tasks
+            if (t.first_payload or {}).get("type", "create") in _REVIEW_ELIGIBLE_TYPES
+            and (t.context or {}).get("pr_merged") is True
+        ]
+        if not eligible:
+            return None
+        approved = sum(
+            1 for t in eligible
+            if "_first_attempt_rejection_categories" not in (t.context or {})
+        )
+        return round(approved / len(eligible), 2)
+
+    by_type: Dict[str, list] = {}
+    by_scope: Dict[str, list] = {}
+    for t in terminal_tasks:
+        task_type = (t.first_payload or {}).get("type", "create")
+        by_type.setdefault(task_type, []).append(t)
+        scope = (t.context or {}).get("scope", "unknown")
+        by_scope.setdefault(scope, []).append(t)
+
+    fra_by_type: Dict[str, float] = {}
+    for task_type, tasks in by_type.items():
+        r = _rate(tasks)
+        if r is not None:
+            fra_by_type[task_type] = r
+    fra_by_scope: Dict[str, float] = {}
+    for scope, tasks in by_scope.items():
+        r = _rate(tasks)
+        if r is not None:
+            fra_by_scope[scope] = r
+
+    with_pb = [t for t in terminal_tasks if (t.context or {}).get("_had_playbook") is True]
+    without_pb = [t for t in terminal_tasks if (t.context or {}).get("_had_playbook") is False]
+    with_m = [t for t in terminal_tasks if (t.context or {}).get("_had_review_measurements") is True]
+    without_m = [t for t in terminal_tasks if (t.context or {}).get("_had_review_measurements") is False]
+
+    eligible_merged = [
+        t for t in terminal_tasks
+        if (t.first_payload or {}).get("type", "create") in _REVIEW_ELIGIBLE_TYPES
+        and (t.context or {}).get("pr_merged") is True
+    ]
+
+    return {
+        "overall": _rate(terminal_tasks),
+        "sample_size": len(eligible_merged),
+        "by_type": fra_by_type,
+        "by_scope": fra_by_scope,
+        "with_playbook": _rate(with_pb),
+        "without_playbook": _rate(without_pb),
+        "with_measurements": _rate(with_m),
+        "without_measurements": _rate(without_m),
     }
 
 
@@ -2452,12 +2574,17 @@ async def get_digest(
     }
 
     _review_quality = _compute_review_quality_metrics(completed_tasks + failed_tasks)
-    _first_attempt_success_rate = _compute_first_attempt_breakdowns(completed_tasks + failed_tasks)
+    _first_attempt_success_rate = _compute_first_attempt_breakdowns(
+        completed_tasks + failed_tasks,
+        prev_terminal_tasks=prev_completed_tasks + prev_failed_tasks,
+    )
+    _first_review_approval_rate = _compute_first_review_approval_breakdowns(completed_tasks + failed_tasks)
 
     return {
         "window_hours": hours,
         "total_merge_retries_saved": total_merge_retries_saved,
         "first_attempt_success_rate": _first_attempt_success_rate,
+        "first_review_approval_rate": _first_review_approval_rate,
         "self_review_effectiveness": _review_quality["self_review_effectiveness"],
         "self_review_prediction_accuracy": _review_quality["self_review_prediction_accuracy"],
         "review_accuracy": _review_quality["review_accuracy"],
