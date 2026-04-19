@@ -212,7 +212,13 @@ interface DigestData {
   retry_waste_by_direction?: { direction_id: string; direction_text: string; retry_cost_usd: number; retry_task_count: number }[] | null;
   retry_task_count?: number | null;
   avg_retries_before_failure?: number | null;
+  retry_success_count?: number | null;
+  retry_wasted_rate?: number | null;
+  retry_recovery_cost_usd?: number | null;
   total_estimated_cost_usd?: number | null;
+  spot_cost_usd?: number | null;
+  on_demand_cost_usd?: number | null;
+  provisioning_overhead_usd?: number | null;
   daily_cost_usd?: number | null;
   daily_cost_ceiling_usd?: number | null;
   rejection_pattern_summary?: {
@@ -258,6 +264,9 @@ interface DigestData {
     overall_success_rate: number | null;
     by_path: Record<string, { attempted: number; merged: number; failed: number; success_rate: number | null }>;
   } | null;
+  pipeline_acceptance_rate?: number | null;
+  pipeline_conversion_rate?: number | null;
+  pipeline_filter_funnel?: Record<string, number> | null;
 }
 
 const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
@@ -1087,6 +1096,24 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     )}
                   </span>
                 )}
+                {digest!.pipeline_acceptance_rate != null && (() => {
+                  const pct = Math.round(digest!.pipeline_acceptance_rate! * 100);
+                  const tone = pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
+                  return (
+                    <span className={tone} title="PRs merged / PRs decided (merged + rejected)">
+                      {pct}% accepted
+                    </span>
+                  );
+                })()}
+                {digest!.pipeline_conversion_rate != null && (() => {
+                  const pct = Math.round(digest!.pipeline_conversion_rate! * 100);
+                  const tone = pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
+                  return (
+                    <span className={tone} title="PRs merged / tasks created">
+                      {pct}% conv
+                    </span>
+                  );
+                })()}
                 {digest!.pending_approval_count > 0 && (
                   <span className="flex items-center gap-1">
                     <AlertTriangle className="w-3 h-3 text-amber-400" />
@@ -1131,6 +1158,33 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     <DollarSign className="w-2.5 h-2.5" />{digest!.total_estimated_cost_usd.toFixed(2)} total
                   </span>
                 )}
+                {(digest!.spot_cost_usd != null || digest!.on_demand_cost_usd != null) && (
+                  (digest!.spot_cost_usd ?? 0) + (digest!.on_demand_cost_usd ?? 0) > 0
+                ) && (
+                  <span
+                    className="inline-flex items-center gap-0.5 text-neutral-500 font-mono"
+                    title="Spot vs on-demand compute cost split"
+                  >
+                    Spot: ${(digest!.spot_cost_usd ?? 0).toFixed(2)} / On-demand: ${(digest!.on_demand_cost_usd ?? 0).toFixed(2)}
+                  </span>
+                )}
+                {digest!.provisioning_overhead_pct != null && digest!.provisioning_overhead_pct > 0 && (() => {
+                  const pctDisplay = digest!.provisioning_overhead_pct! * 100;
+                  const tone = pctDisplay < 10
+                    ? 'text-emerald-500'
+                    : pctDisplay <= 25
+                      ? 'text-amber-500'
+                      : 'text-red-500';
+                  const overheadUsd = digest!.provisioning_overhead_usd ?? 0;
+                  return (
+                    <span
+                      className={`inline-flex items-center gap-0.5 font-mono ${tone}`}
+                      title={`Provisioning overhead: $${overheadUsd.toFixed(2)} (${pctDisplay.toFixed(1)}%)`}
+                    >
+                      Provisioning overhead: {pctDisplay.toFixed(1)}%
+                    </span>
+                  );
+                })()}
                 {digest!.daily_cost_usd != null && digest!.daily_cost_usd > 0 && (() => {
                   const spent = digest!.daily_cost_usd!;
                   const ceiling = digest!.daily_cost_ceiling_usd ?? 0;
@@ -1168,6 +1222,41 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   <span>{digest!.queued_count} queued</span>
                 )}
               </div>
+
+              {/* Pipeline filter funnel */}
+              {digest!.pipeline_filter_funnel && (digest!.pipeline_filter_funnel.findings_produced ?? 0) > 0 && (() => {
+                const ff = digest!.pipeline_filter_funnel!;
+                const produced = ff.findings_produced ?? 0;
+                const created = ff.tasks_created ?? 0;
+                const pct = produced > 0 ? Math.round((created / produced) * 100) : 0;
+                const FILTER_KEYS: { key: string; label: string }[] = [
+                  { key: 'hash_dedup', label: 'hash dedup' },
+                  { key: 'word_overlap', label: 'word overlap' },
+                  { key: 'file_overlap', label: 'file overlap' },
+                  { key: 'type_filtered', label: 'type filter' },
+                  { key: 'empty_prompt', label: 'empty prompt' },
+                  { key: 'batch_cap', label: 'batch cap' },
+                ];
+                const drops = FILTER_KEYS
+                  .map(f => ({ ...f, v: ff[f.key] ?? 0 }))
+                  .filter(f => f.v > 0)
+                  .sort((a, b) => b.v - a.v);
+                return (
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-neutral-400">
+                    <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Research yield</span>
+                    <span>
+                      <span className="font-semibold text-neutral-200">{created}</span>
+                      <span className="text-neutral-500"> / {produced} findings &rarr; tasks </span>
+                      <span className="font-semibold text-neutral-200">({pct}%)</span>
+                    </span>
+                    {drops.slice(0, 3).map(d => (
+                      <span key={d.key} className="text-neutral-500" title={d.label}>
+                        {d.label} <span className="font-mono text-neutral-400">-{d.v}</span>
+                      </span>
+                    ))}
+                  </div>
+                );
+              })()}
 
               {/* Direction progress */}
               {digest!.direction_progress && digest!.direction_progress.length > 0 && (
@@ -1814,6 +1903,28 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                         </li>
                       ))}
                     </ul>
+                  )}
+                </div>
+              )}
+
+              {/* Retry effectiveness */}
+              {((digest!.retry_success_count ?? 0) > 0 || digest!.retry_wasted_rate != null) && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Retry effectiveness</span>
+                  {(digest!.retry_success_count ?? 0) > 0 && (
+                    <span className="text-[10px] text-emerald-400">
+                      {digest!.retry_success_count} recovered
+                    </span>
+                  )}
+                  {digest!.retry_wasted_rate != null && (
+                    <span className="text-[10px] text-amber-400">
+                      · {Math.round(digest!.retry_wasted_rate * 100)}% wasted
+                    </span>
+                  )}
+                  {(digest!.retry_recovery_cost_usd ?? 0) > 0 && (
+                    <span className="text-[10px] text-neutral-500 inline-flex items-center gap-0.5">
+                      · <DollarSign className="w-2.5 h-2.5" />{(digest!.retry_recovery_cost_usd ?? 0).toFixed(2)} recovery cost
+                    </span>
                   )}
                 </div>
               )}
