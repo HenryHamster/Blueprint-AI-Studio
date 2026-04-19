@@ -1233,6 +1233,30 @@ def test_derive_failure_stage_unknown():
     assert _derive_failure_stage("AGENT_TIMEOUT", "No heartbeat for 300s") is None
 
 
+def test_derive_failure_stage_specific_before_test_keyword():
+    """Specific stage keywords must be checked before the generic 'test' keyword."""
+    from app.task_lifecycle import _derive_failure_stage
+    # Lint errors reported against test file paths → lint, not test
+    assert _derive_failure_stage(
+        "CODE_ERROR", "ruff check failed: backend/testing/test_api.py"
+    ) == "lint"
+    assert _derive_failure_stage(
+        "CODE_ERROR", "eslint error in src/components/Foo.test.tsx"
+    ) == "lint"
+    # Merge conflict in a test file → merge, not test
+    assert _derive_failure_stage(
+        "CODE_ERROR", "merge conflict in backend/testing/test_api.py"
+    ) == "merge"
+    # Review rejection mentioning test coverage → review, not test
+    assert _derive_failure_stage(
+        "CODE_ERROR", "review rejected: test coverage insufficient"
+    ) == "review"
+    # Build error importing test utilities → build, not test
+    assert _derive_failure_stage(
+        "CODE_ERROR", "build failed: cannot compile testing/helpers.ts"
+    ) == "build"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _merge_with_retry
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1827,13 +1851,14 @@ class TestBuildRetryPromptSuffix:
         )
         assert "lint/type errors" in guidance
 
-    def test_code_error_no_hint_when_no_keywords(self):
-        """No test/lint keywords → no RETRY GUIDANCE prefix from hints."""
+    def test_code_error_no_keywords_uses_default_fallback(self):
+        """No test/lint keywords → default fallback guidance is emitted."""
         guidance, _ = _build_retry_prompt_suffix(
             "CODE_ERROR", "something unexpected happened",
             attempt=1, task_scope="small", ctx={},
         )
-        assert "RETRY GUIDANCE" not in guidance
+        assert "RETRY GUIDANCE" in guidance
+        assert "unclassified" in guidance.lower()
 
     def test_code_error_attempt_one_no_scope_override(self):
         _, override = _build_retry_prompt_suffix(
@@ -1929,6 +1954,14 @@ class TestBuildRetryPromptSuffix:
         assert "Unresolved review issues" in guidance
         assert "Missing null check in foo()" in guidance
         assert "Error handling swallows exceptions" in guidance
+
+    def test_code_error_generic_message_falls_back_to_default_guidance(self):
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "something went wrong", attempt=1, task_scope="small", ctx={},
+        )
+        assert guidance
+        assert "RETRY GUIDANCE" in guidance
+        assert "compile" in guidance.lower() or "lint" in guidance.lower()
 
     def test_code_error_stage_test_guidance(self):
         guidance, _ = _build_retry_prompt_suffix(

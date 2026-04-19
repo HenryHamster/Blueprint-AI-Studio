@@ -29,16 +29,16 @@ def _derive_failure_stage(failure_class: str, status_message: str) -> "str | Non
     msg = (status_message or "").lower()
     if any(kw in msg for kw in ("checkout", "git clone", "clone")):
         return "clone"
-    if any(kw in msg for kw in ("test", "assert", "pytest", "jest", "vitest")):
-        return "test"
     if any(kw in msg for kw in ("lint", "ruff", "eslint", "tsc", "type error")):
         return "lint"
     if any(kw in msg for kw in ("build", "compile", "webpack", "bundle")):
         return "build"
-    if any(kw in msg for kw in ("pull request", "create pr", "pr creation")):
-        return "pr_creation"
     if any(kw in msg for kw in ("merge conflict", "mergeable", "dirty", "behind", "blocked")):
         return "merge"
     if any(kw in msg for kw in ("review", "rejected", "dismissed", "changes requested")):
         return "review"
+    if any(kw in msg for kw in ("pull request", "create pr", "pr creation")):
+        return "pr_creation"
+    if any(kw in msg for kw in ("test", "assert", "pytest", "jest", "vitest")):
+        return "test"
     return None

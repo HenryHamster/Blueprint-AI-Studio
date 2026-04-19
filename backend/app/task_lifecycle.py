@@ -234,6 +234,13 @@ def _build_retry_prompt_suffix(
                 hints.append("Fix lint/type errors first — run the linter before committing.")
             if hints:
                 extra_guidance = "RETRY GUIDANCE: " + " ".join(hints) + "\n"
+            else:
+                extra_guidance = (
+                    "RETRY GUIDANCE: The previous attempt failed with an unclassified code error.\n"
+                    "- Verify changes compile and pass lint locally before committing\n"
+                    "- Check for import errors or missing dependencies\n"
+                    "- If the previous approach produced errors, try a simpler alternative\n"
+                )
         failing_tests = ctx.get("_previous_failing_tests", [])
         error_files = ctx.get("_previous_error_files", [])
         current_failing = _extract_failing_tests(original_status_message or "")
