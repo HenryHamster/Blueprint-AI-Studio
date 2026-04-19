@@ -28,6 +28,87 @@ router = APIRouter(
 )
 
 
+def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]:
+    """Compute self-review effectiveness, prediction accuracy, and review accuracy
+    from a list of terminal tasks. Returns dict with three keys, each None when
+    sample sizes are too small.
+    """
+    def _fa_rate(tasks):
+        measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+        if not measured:
+            return None
+        succ = sum(1 for t in measured if t.context["_first_attempt_succeeded"])
+        return round(succ / len(measured), 2)
+
+    tasks_with_sr = [t for t in terminal_tasks if "_self_review_outcome" in (t.context or {})]
+    tasks_without_sr = [t for t in terminal_tasks if "_self_review_outcome" not in (t.context or {})]
+    sr_clean = [t for t in tasks_with_sr if not (t.context or {}).get("_self_review_outcome", {}).get("fixes_applied", False)]
+    sr_fixed = [t for t in tasks_with_sr if (t.context or {}).get("_self_review_outcome", {}).get("fixes_applied", False)]
+
+    self_review_effectiveness: Dict[str, Any] | None = None
+    if len(tasks_with_sr) >= 3:
+        self_review_effectiveness = {
+            "with_self_review_approval_rate": _fa_rate(tasks_with_sr),
+            "without_self_review_approval_rate": _fa_rate(tasks_without_sr),
+            "clean_verdict_approval_rate": _fa_rate(sr_clean),
+            "fixed_verdict_approval_rate": _fa_rate(sr_fixed),
+            "sample_size": len(tasks_with_sr),
+        }
+
+    review_tasks = [
+        t for t in terminal_tasks
+        if (t.first_payload or {}).get("type") == "review"
+        and (t.context or {}).get("blueprint_review_verdict") is not None
+    ]
+    review_accuracy: Dict[str, Any] | None = None
+    if len(review_tasks) >= 5:
+        total = len(review_tasks)
+        overrides = sum(1 for t in review_tasks if (t.context or {}).get("user_overrode_review"))
+        dismissals = sum(1 for t in review_tasks if (t.context or {}).get("review_dismissed"))
+        misses = sum(1 for t in review_tasks if (t.context or {}).get("user_caught_issues"))
+        approvals = sum(1 for t in review_tasks if (t.context or {}).get("blueprint_review_verdict") == "APPROVE")
+        review_accuracy = {
+            "total_reviews": total,
+            "overrides": overrides,
+            "dismissals": dismissals,
+            "misses": misses,
+            "total_approvals": approvals,
+            "precision": round(1 - (overrides + dismissals) / total, 2),
+            "recall": round(1 - misses / approvals, 2) if approvals > 0 else None,
+        }
+
+    tasks_with_both = [
+        t for t in terminal_tasks
+        if (t.context or {}).get("_self_review_outcome", {}).get("check_results")
+        and "_first_attempt_rejection_categories" in (t.context or {})
+    ]
+    self_review_prediction_accuracy: Dict[str, Any] | None = None
+    if len(tasks_with_both) >= 5:
+        total_human = total_overlap = total_missed = total_false = total_sr_failed = 0
+        for t in tasks_with_both:
+            ctx = t.context or {}
+            check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
+            human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+            sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+            total_human += len(human_cats)
+            total_overlap += len(human_cats & sr_failed)
+            total_missed += len(human_cats - sr_failed)
+            total_false += len(sr_failed - human_cats)
+            total_sr_failed += len(sr_failed)
+        self_review_prediction_accuracy = {
+            "prediction_hit_rate": round(total_overlap / total_human, 3) if total_human > 0 else None,
+            "miss_rate": round(total_missed / total_human, 3) if total_human > 0 else None,
+            "false_alarm_rate": round(total_false / total_sr_failed, 3) if total_sr_failed > 0 else None,
+            "sample_size": len(tasks_with_both),
+        }
+
+    return {
+        "self_review_effectiveness": self_review_effectiveness,
+        "self_review_prediction_accuracy": self_review_prediction_accuracy,
+        "review_accuracy": review_accuracy,
+    }
+
+
 async def compute_pipeline_health_summary(session: AsyncSession, project_id: uuid.UUID, lookback_hours: int = 24) -> Dict[str, Any]:
     """Compute lightweight pipeline health metrics for the specified lookback window.
 
@@ -2204,9 +2285,14 @@ async def get_digest(
         "active_investigations_detail": active_investigations_detail,
     }
 
+    _review_quality = _compute_review_quality_metrics(completed_tasks + failed_tasks)
+
     return {
         "window_hours": hours,
         "total_merge_retries_saved": total_merge_retries_saved,
+        "self_review_effectiveness": _review_quality["self_review_effectiveness"],
+        "self_review_prediction_accuracy": _review_quality["self_review_prediction_accuracy"],
+        "review_accuracy": _review_quality["review_accuracy"],
         "merge_early_exit_count": merge_early_exit_count,
         "generated_at": _utcnow().isoformat(),
         "completed_count": len(completed_tasks),

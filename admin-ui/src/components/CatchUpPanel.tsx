@@ -111,6 +111,7 @@ interface DirectionProgress {
   estimated_cost_usd?: number | null;
   cost_by_scope?: Record<string, number> | null;
   cost_by_type?: Record<string, number> | null;
+  cost_by_status?: Record<string, number> | null;
   avg_time_to_merge_hours?: number | null;
   auto_paused?: boolean;
   paused_reason?: string | null;
@@ -279,6 +280,28 @@ interface DigestData {
     total_failed: number;
     overall_success_rate: number | null;
     by_path: Record<string, { attempted: number; merged: number; failed: number; success_rate: number | null }>;
+  } | null;
+  self_review_effectiveness?: {
+    with_self_review_approval_rate: number | null;
+    without_self_review_approval_rate: number | null;
+    clean_verdict_approval_rate: number | null;
+    fixed_verdict_approval_rate: number | null;
+    sample_size: number;
+  } | null;
+  self_review_prediction_accuracy?: {
+    prediction_hit_rate: number | null;
+    miss_rate: number | null;
+    false_alarm_rate: number | null;
+    sample_size: number;
+  } | null;
+  review_accuracy?: {
+    total_reviews: number;
+    overrides: number;
+    dismissals: number;
+    misses: number;
+    total_approvals: number;
+    precision: number | null;
+    recall: number | null;
   } | null;
   pipeline_acceptance_rate?: number | null;
   pipeline_conversion_rate?: number | null;
@@ -828,6 +851,32 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                           By type: {typeBreakdown}
                         </span>
                       )}
+                      {dp.cost_by_status && (() => {
+                        const entries = Object.entries(dp.cost_by_status)
+                          .filter(([, v]) => typeof v === 'number' && v > 0)
+                          .sort((a, b) => b[1] - a[1]);
+                        if (entries.length === 0) return null;
+                        const failedAmt = dp.cost_by_status.FAILED ?? 0;
+                        const failedHigh = total > 0 && failedAmt / total > 0.3;
+                        return (
+                          <span className="text-[9px] text-neutral-500 font-mono">
+                            By status:{' '}
+                            {entries.map(([status, v], i) => {
+                              const isFailed = status === 'FAILED';
+                              const highlight = isFailed && failedHigh;
+                              return (
+                                <span
+                                  key={status}
+                                  className={highlight ? 'text-amber-600 font-semibold' : ''}
+                                >
+                                  {i > 0 ? ' · ' : ''}
+                                  {status} ${v.toFixed(2)}
+                                </span>
+                              );
+                            })}
+                          </span>
+                        );
+                      })()}
                     </>
                   );
                 })()}
@@ -881,6 +930,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
   const [remediationExpanded, setRemediationExpanded] = useState(false);
   const [investigationsExpanded, setInvestigationsExpanded] = useState(false);
   const [cycleSummaryExpanded, setCycleSummaryExpanded] = useState(false);
+  const [reviewQualityExpanded, setReviewQualityExpanded] = useState(false);
   const [expandedSnippets, setExpandedSnippets] = useState<Set<string>>(new Set());
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [activeTaxonomyFilter, setActiveTaxonomyFilter] = useState<string | null>(null);
@@ -2362,6 +2412,82 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   </div>
                 </div>
               )}
+
+              {/* Review quality */}
+              {(() => {
+                const sre = digest!.self_review_effectiveness;
+                const spa = digest!.self_review_prediction_accuracy;
+                const ra = digest!.review_accuracy;
+                const hasSre = sre && (sre.with_self_review_approval_rate != null || sre.without_self_review_approval_rate != null);
+                const hasSpa = spa && (spa.prediction_hit_rate != null || spa.false_alarm_rate != null);
+                const hasRa = ra && (ra.precision != null || ra.recall != null);
+                if (!hasSre && !hasSpa && !hasRa) return null;
+                const pct = (v: number | null | undefined) => v == null ? null : `${Math.round(v * 100)}%`;
+                return (
+                  <div>
+                    <button
+                      onClick={() => setReviewQualityExpanded(v => !v)}
+                      aria-expanded={reviewQualityExpanded}
+                      className="flex items-center gap-1.5 text-[10px] font-bold text-neutral-500 uppercase tracking-widest hover:text-neutral-400 transition-colors"
+                    >
+                      {reviewQualityExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                      Review quality
+                    </button>
+                    {reviewQualityExpanded && (
+                      <div className="flex flex-col gap-1 mt-1 ml-1">
+                        {hasSre && (
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Self-review</span>
+                            {sre!.with_self_review_approval_rate != null && (
+                              <span className="text-[10px] text-neutral-400">
+                                with <span className="text-emerald-400">{pct(sre!.with_self_review_approval_rate)}</span>
+                              </span>
+                            )}
+                            {sre!.without_self_review_approval_rate != null && (
+                              <span className="text-[10px] text-neutral-400">
+                                · without <span className="text-neutral-300">{pct(sre!.without_self_review_approval_rate)}</span>
+                              </span>
+                            )}
+                            <span className="text-[10px] text-neutral-500">· n={sre!.sample_size}</span>
+                          </div>
+                        )}
+                        {hasSpa && (
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Prediction</span>
+                            {spa!.prediction_hit_rate != null && (
+                              <span className="text-[10px] text-neutral-400">
+                                hit <span className="text-emerald-400">{pct(spa!.prediction_hit_rate)}</span>
+                              </span>
+                            )}
+                            {spa!.false_alarm_rate != null && (
+                              <span className="text-[10px] text-neutral-400">
+                                · false alarm <span className="text-amber-400">{pct(spa!.false_alarm_rate)}</span>
+                              </span>
+                            )}
+                            <span className="text-[10px] text-neutral-500">· n={spa!.sample_size}</span>
+                          </div>
+                        )}
+                        {hasRa && (
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Review accuracy</span>
+                            {ra!.precision != null && (
+                              <span className="text-[10px] text-neutral-400">
+                                precision <span className="text-emerald-400">{pct(ra!.precision)}</span>
+                              </span>
+                            )}
+                            {ra!.recall != null && (
+                              <span className="text-[10px] text-neutral-400">
+                                · recall <span className="text-emerald-400">{pct(ra!.recall)}</span>
+                              </span>
+                            )}
+                            <span className="text-[10px] text-neutral-500">· n={ra!.total_reviews}</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
 
               {/* Recent failures grouped by classification (not in needs_attention) */}
