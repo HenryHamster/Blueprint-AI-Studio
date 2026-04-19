@@ -15,11 +15,13 @@ from app.models import Task, TaskStatus, Project
 from testing.factories import make_task, make_project, _utcnow
 
 
-def _make_session(tasks: list, project: Project):
+def _make_session(tasks: list, project: Project, all_tasks_72h: list | None = None):
     """Build a mock AsyncSession.
 
-    First execute() call (terminal tasks) uses .scalars().all().
-    Second execute() call (project) uses .scalar_one_or_none().
+    Execute call order in _compute_research_anomalies:
+      1. terminal tasks → .scalars().all()
+      2. all tasks in 72h momentum window → .scalars().all()
+      3. project → .scalar_one_or_none()
     """
     session = AsyncMock()
     # session.add is synchronous in SQLAlchemy — use MagicMock to avoid
@@ -31,10 +33,15 @@ def _make_session(tasks: list, project: Project):
     tasks_result = MagicMock()
     tasks_result.scalars.return_value = tasks_scalars
 
+    all72_scalars = MagicMock()
+    all72_scalars.all.return_value = all_tasks_72h or []
+    all72_result = MagicMock()
+    all72_result.scalars.return_value = all72_scalars
+
     project_result = MagicMock()
     project_result.scalar_one_or_none.return_value = project
 
-    session.execute = AsyncMock(side_effect=[tasks_result, project_result])
+    session.execute = AsyncMock(side_effect=[tasks_result, all72_result, project_result])
     return session
 
 
@@ -826,3 +833,91 @@ async def test_proactive_fingerprint_system_concurrent_cap(monkeypatch):
 
     assert spawned == 0
     assert not [o for o in adds if isinstance(o, _TaskModel)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Failure rate momentum
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_status_task(project_id, status, hours_ago):
+    return make_task(
+        project_id=project_id,
+        status=status,
+        latest_status_message="x" if status == TaskStatus.FAILED else "",
+        created_at=_utcnow() - timedelta(hours=hours_ago),
+    )
+
+
+@pytest.mark.asyncio
+async def test_failure_rate_momentum_detected_across_rising_windows():
+    """Strictly rising failure rate across 3x24h windows with last>=20% → medium momentum anomaly."""
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+
+    # Failures: 1 in 72-48h, 3 in 48-24h, 6 in 24-0h
+    failed = (
+        [_make_status_task(project_id, TaskStatus.FAILED, 60) for _ in range(1)]
+        + [_make_status_task(project_id, TaskStatus.FAILED, 36) for _ in range(3)]
+        + [_make_status_task(project_id, TaskStatus.FAILED, 12) for _ in range(6)]
+    )
+    # Per-window totals: 10, 10, 10 → rates 10%, 30%, 60%
+    totals = (
+        [_make_status_task(project_id, TaskStatus.COMPLETED, 60) for _ in range(9)]
+        + [_make_status_task(project_id, TaskStatus.COMPLETED, 36) for _ in range(7)]
+        + [_make_status_task(project_id, TaskStatus.COMPLETED, 12) for _ in range(4)]
+        + failed
+    )
+    session = _make_session(tasks=failed, project=project, all_tasks_72h=totals)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    momentum = [a for a in result if "FailureRateMomentum" in a["signal"]]
+    assert len(momentum) == 1
+    assert momentum[0]["severity"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_failure_rate_momentum_no_anomaly_when_flat():
+    """Flat failure rate across windows → no momentum anomaly."""
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+
+    failed = (
+        [_make_status_task(project_id, TaskStatus.FAILED, 60) for _ in range(3)]
+        + [_make_status_task(project_id, TaskStatus.FAILED, 36) for _ in range(3)]
+        + [_make_status_task(project_id, TaskStatus.FAILED, 12) for _ in range(3)]
+    )
+    totals = (
+        [_make_status_task(project_id, TaskStatus.COMPLETED, 60) for _ in range(7)]
+        + [_make_status_task(project_id, TaskStatus.COMPLETED, 36) for _ in range(7)]
+        + [_make_status_task(project_id, TaskStatus.COMPLETED, 12) for _ in range(7)]
+        + failed
+    )
+    session = _make_session(tasks=failed, project=project, all_tasks_72h=totals)
+
+    result = await _compute_research_anomalies(project_id, session)
+    assert not any("FailureRateMomentum" in a["signal"] for a in result)
+
+
+@pytest.mark.asyncio
+async def test_failure_rate_momentum_no_anomaly_when_below_threshold():
+    """Rising rates but most recent < 20% → no momentum anomaly."""
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+
+    failed = (
+        [_make_status_task(project_id, TaskStatus.FAILED, 60) for _ in range(1)]
+        + [_make_status_task(project_id, TaskStatus.FAILED, 36) for _ in range(2)]
+        + [_make_status_task(project_id, TaskStatus.FAILED, 12) for _ in range(3)]
+    )
+    # Per-window totals: 50, 50, 50 → rates 2%, 4%, 6%
+    totals = (
+        [_make_status_task(project_id, TaskStatus.COMPLETED, 60) for _ in range(49)]
+        + [_make_status_task(project_id, TaskStatus.COMPLETED, 36) for _ in range(48)]
+        + [_make_status_task(project_id, TaskStatus.COMPLETED, 12) for _ in range(47)]
+        + failed
+    )
+    session = _make_session(tasks=failed, project=project, all_tasks_72h=totals)
+
+    result = await _compute_research_anomalies(project_id, session)
+    assert not any("FailureRateMomentum" in a["signal"] for a in result)

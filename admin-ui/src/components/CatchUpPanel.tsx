@@ -176,6 +176,17 @@ interface DigestData {
     task_types: string[];
     first_task_id: string;
   }[] | null;
+  recurring_patterns?: {
+    fingerprint: string;
+    occurrence_count: number;
+    first_seen?: string | null;
+    last_seen?: string | null;
+    severity?: string | null;
+    example_message?: string | null;
+    affected_direction_count: number;
+    remediation_status: 'fix_verified' | 'fix_shipped' | 'investigating' | 'unaddressed';
+    proactive?: boolean;
+  }[] | null;
   review_cap_exhaustion_summary?: {
     count: number;
     avg_iterations: number | null;
@@ -1649,6 +1660,63 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                         );
                       });
                     })()}
+                  </div>
+                </div>
+              )}
+
+              {/* Recurring pattern detection — detection-to-fix lifecycle */}
+              {(digest!.recurring_patterns ?? []).length > 0 && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Recurring patterns</span>
+                    <span className="text-[10px] text-neutral-400">
+                      {digest!.recurring_patterns!.length} pattern{digest!.recurring_patterns!.length !== 1 ? 's' : ''}
+                    </span>
+                  </div>
+                  <div className="flex flex-col gap-1 ml-1">
+                    {digest!.recurring_patterns!.map(pattern => {
+                      const statusStyles: Record<string, string> = {
+                        fix_verified: 'bg-green-500/10 text-green-400 border-green-500/20',
+                        fix_shipped: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+                        investigating: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20',
+                        unaddressed: 'bg-red-500/10 text-red-400 border-red-500/20',
+                      };
+                      const statusClass = statusStyles[pattern.remediation_status] ?? 'bg-neutral-700/30 text-neutral-400 border-neutral-700/30';
+                      const snippet = (pattern.example_message ?? '').length > 120
+                        ? (pattern.example_message ?? '').slice(0, 120) + '…'
+                        : (pattern.example_message ?? '');
+                      return (
+                        <div
+                          key={pattern.fingerprint}
+                          className="flex flex-col gap-0.5 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded"
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className={`shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded border uppercase tracking-wider ${statusClass}`}>
+                              {pattern.remediation_status.replace('_', ' ')}
+                            </span>
+                            <span className="flex-1 truncate text-neutral-400 font-mono text-[10px]">{snippet}</span>
+                            <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-neutral-800/50 text-neutral-300 border border-neutral-700/30">
+                              ×{pattern.occurrence_count}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-1 text-[10px] text-neutral-500">
+                            {pattern.affected_direction_count > 0 && (
+                              <span>across {pattern.affected_direction_count} direction{pattern.affected_direction_count !== 1 ? 's' : ''}</span>
+                            )}
+                            {pattern.severity && (
+                              <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1 py-0.5 rounded uppercase tracking-wider">
+                                {pattern.severity}
+                              </span>
+                            )}
+                            {pattern.proactive && (
+                              <span className="text-[9px] bg-purple-500/10 text-purple-400 border border-purple-500/20 px-1 py-0.5 rounded uppercase tracking-wider">
+                                proactive
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               )}

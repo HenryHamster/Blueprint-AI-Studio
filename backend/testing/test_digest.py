@@ -4361,3 +4361,91 @@ async def test_digest_investigation_conversion_breakdown(client: AsyncClient, db
     assert drop_off.get("low_confidence") == 1
     assert drop_off.get("no_recommended_fix") == 1
     assert "no_direction" not in drop_off
+
+
+@pytest.mark.asyncio
+async def test_digest_prevention_efficacy_positive(client: AsyncClient, db_session):
+    """prevention_efficacy reports positive when preventive merge rate > overall."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    project = make_project(directions=[{
+        "id": "dir-p1",
+        "text": "D",
+        "status": "active",
+        "research_history": [{
+            "timestamp": recent_ts,
+            "tasks_created": 10,
+            "prs_merged": 3,
+            "preventive_context_tasks_created": 4,
+            "preventive_context_tasks_merged": 3,
+            "preventive_context_tasks_failed": 1,
+        }],
+    }])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    eff = response.json()["prevention_efficacy"]
+    assert eff["preventive_tasks_created"] == 4
+    assert eff["preventive_tasks_merged"] == 3
+    assert eff["preventive_tasks_failed"] == 1
+    assert eff["preventive_merge_rate"] == 0.75
+    assert eff["overall_merge_rate"] == 0.3
+    assert eff["assessment"] == "positive"
+
+
+@pytest.mark.asyncio
+async def test_digest_prevention_efficacy_neutral(client: AsyncClient, db_session):
+    """prevention_efficacy reports neutral when rates are similar."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    project = make_project(directions=[{
+        "id": "dir-p2",
+        "text": "D",
+        "status": "active",
+        "research_history": [{
+            "timestamp": recent_ts,
+            "tasks_created": 10,
+            "prs_merged": 5,
+            "preventive_context_tasks_created": 4,
+            "preventive_context_tasks_merged": 2,
+            "preventive_context_tasks_failed": 2,
+        }],
+    }])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    eff = response.json()["prevention_efficacy"]
+    assert eff["preventive_merge_rate"] == 0.5
+    assert eff["overall_merge_rate"] == 0.5
+    assert eff["assessment"] == "neutral"
+
+
+@pytest.mark.asyncio
+async def test_digest_prevention_efficacy_no_data(client: AsyncClient, db_session):
+    """prevention_efficacy returns no_data assessment when zero preventive tasks."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    project = make_project(directions=[{
+        "id": "dir-p3",
+        "text": "D",
+        "status": "active",
+        "research_history": [{
+            "timestamp": recent_ts,
+            "tasks_created": 5,
+            "prs_merged": 2,
+        }],
+    }])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    eff = response.json()["prevention_efficacy"]
+    assert eff["preventive_tasks_created"] == 0
+    assert eff["preventive_merge_rate"] is None
+    assert eff["overall_merge_rate"] == 0.4
+    assert eff["assessment"] == "no_data"

@@ -4028,3 +4028,75 @@ class TestCalibrateFindingScope:
         # 0.55 < 0.60 → escalate
         assert scope == "large"
         assert cal == "medium"
+
+
+class TestPredictSpawnSuccessExpansionRatio:
+    """Historical expansion-ratio signal (Signal 13) in predict_spawn_success."""
+
+    def _direction(self, ratios: list[float], scope: str = "medium") -> dict:
+        return {
+            "research_history": [
+                {"scope_breakdown": {scope: {"avg_expansion_ratio": r}}}
+                for r in ratios
+            ],
+        }
+
+    def test_high_ratio_penalizes_prediction(self):
+        from app.spawn_calibration import predict_spawn_success
+        p_bad = predict_spawn_success("medium", self._direction([1.6, 1.7, 1.8]))
+        p_good = predict_spawn_success("medium", self._direction([1.0, 1.0, 1.0]))
+        assert p_bad < p_good
+
+    def test_moderate_ratio_applies_softer_penalty(self):
+        from app.spawn_calibration import predict_spawn_success
+        p_mod = predict_spawn_success("medium", self._direction([1.3, 1.35]))
+        p_high = predict_spawn_success("medium", self._direction([1.6, 1.7]))
+        # Moderate (0.45) > High (0.25), averaged with other signals.
+        assert p_mod > p_high
+
+    def test_low_ratio_no_signal(self):
+        from app.spawn_calibration import predict_spawn_success
+        # avg_expansion_ratio < 1.3 → signal omitted. With no other signals
+        # and no pipeline config → falls back to neutral 0.5.
+        from app.shared_state import runtime_config
+        prev = runtime_config.get("pipeline_scope_merge_rates")
+        runtime_config["pipeline_scope_merge_rates"] = {}
+        try:
+            assert predict_spawn_success("medium", self._direction([1.0, 1.2])) == 0.5
+        finally:
+            if prev is None:
+                runtime_config.pop("pipeline_scope_merge_rates", None)
+            else:
+                runtime_config["pipeline_scope_merge_rates"] = prev
+
+    def test_insufficient_data_no_signal(self):
+        from app.spawn_calibration import predict_spawn_success
+        from app.shared_state import runtime_config
+        prev = runtime_config.get("pipeline_scope_merge_rates")
+        runtime_config["pipeline_scope_merge_rates"] = {}
+        try:
+            # Only 1 ratio data point → signal omitted.
+            assert predict_spawn_success("medium", self._direction([2.0])) == 0.5
+        finally:
+            if prev is None:
+                runtime_config.pop("pipeline_scope_merge_rates", None)
+            else:
+                runtime_config["pipeline_scope_merge_rates"] = prev
+
+    def test_graduated_threshold_boundary(self):
+        from app.spawn_calibration import predict_spawn_success
+        from app.shared_state import runtime_config
+        prev = runtime_config.get("pipeline_scope_merge_rates")
+        runtime_config["pipeline_scope_merge_rates"] = {}
+        try:
+            # Exactly 1.3 → moderate penalty (0.45) only.
+            p_moderate = predict_spawn_success("medium", self._direction([1.3, 1.3]))
+            assert p_moderate == pytest.approx(0.45)
+            # Exactly 1.5 → high penalty (0.25).
+            p_high = predict_spawn_success("medium", self._direction([1.5, 1.5]))
+            assert p_high == pytest.approx(0.25)
+        finally:
+            if prev is None:
+                runtime_config.pop("pipeline_scope_merge_rates", None)
+            else:
+                runtime_config["pipeline_scope_merge_rates"] = prev

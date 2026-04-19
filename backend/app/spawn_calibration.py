@@ -506,6 +506,26 @@ def predict_spawn_success(
             signals.append(0.4)
             weights.append(1.0)
 
+    # Signal 13: historical expansion ratio for the proposed scope. When the
+    # avg_expansion_ratio in recent scope_breakdown entries exceeds 1.3x, the
+    # agent has been touching more files than related_files declared — a direct
+    # SCOPE_OVERFLOW precursor. Graduated penalty; requires 2+ data points to
+    # avoid reacting to a single noisy cycle.
+    exp_ratios: list[float] = []
+    for entry in history3:
+        _stats = (entry.get("scope_breakdown") or {}).get(scope) or {}
+        _r = _stats.get("avg_expansion_ratio")
+        if isinstance(_r, (int, float)):
+            exp_ratios.append(float(_r))
+    if len(exp_ratios) >= 2:
+        avg_exp = sum(exp_ratios) / len(exp_ratios)
+        if avg_exp >= 1.5:
+            signals.append(0.25)
+            weights.append(1.0)
+        elif avg_exp >= 1.3:
+            signals.append(0.45)
+            weights.append(1.0)
+
     # Signal 12: composite complexity score from scope_complexity. Combines
     # file count, historical expansion, cochange density, and cross-module
     # span into a single P(merge) estimate in [0,1]. Low scores at medium

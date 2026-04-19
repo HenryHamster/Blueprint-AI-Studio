@@ -158,6 +158,7 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     now = _utcnow()
     window_48h = now - timedelta(hours=48)
     prior_window_start = now - timedelta(hours=96)
+    momentum_window_start = now - timedelta(hours=72)
 
     # Query last 50 terminal tasks for this project
     terminal_tasks = (await session.execute(
@@ -165,6 +166,16 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
             Task.project_id == project_id,
             Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
         ).order_by(Task.created_at.desc()).limit(50)
+    )).scalars().all()
+
+    # All tasks (any status) in the 72h momentum window — used as the denominator
+    # for failure-rate momentum detection. Separate from terminal_tasks because
+    # rate-based momentum needs total volume, not just failure count.
+    all_tasks_72h = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.created_at >= momentum_window_start,
+        )
     )).scalars().all()
 
     anomalies = []
@@ -231,6 +242,54 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
             if top_patterns:
                 anomaly["top_patterns"] = top_patterns
             anomalies.append(anomaly)
+
+    # --- Failure rate momentum analysis ---
+    # Catches gradual escalation that the surge check (count doubled across
+    # 48h windows) misses: a steadily rising failure rate across three
+    # consecutive 24h windows. Complementary, not a replacement.
+    momentum_buckets = [0, 0, 0]  # [72-48h, 48-24h, 24-0h] failures
+    total_buckets = [0, 0, 0]     # same windows, all-status totals
+    for t in terminal_tasks:
+        if not t.created_at or t.created_at < momentum_window_start:
+            continue
+        hours_ago = (now - t.created_at).total_seconds() / 3600
+        if hours_ago < 24:
+            momentum_buckets[2] += 1
+        elif hours_ago < 48:
+            momentum_buckets[1] += 1
+        else:
+            momentum_buckets[0] += 1
+    for t in all_tasks_72h:
+        if not t.created_at:
+            continue
+        hours_ago = (now - t.created_at).total_seconds() / 3600
+        if hours_ago < 24:
+            total_buckets[2] += 1
+        elif hours_ago < 48:
+            total_buckets[1] += 1
+        else:
+            total_buckets[0] += 1
+    if all(total_buckets[i] >= 3 for i in range(3)):
+        rates = [
+            momentum_buckets[i] / total_buckets[i] for i in range(3)
+        ]
+        if rates[0] < rates[1] < rates[2] and rates[2] >= 0.20:
+            anomalies.append({
+                "signal": (
+                    f"FailureRateMomentum: {rates[0]:.0%} → {rates[1]:.0%} → "
+                    f"{rates[2]:.0%} across last 3x24h windows"
+                ),
+                "severity": "medium",
+                "details": (
+                    f"Failure rate has risen monotonically across three "
+                    f"consecutive 24h windows (72-48h: {rates[0]:.0%} "
+                    f"[{momentum_buckets[0]}/{total_buckets[0]}], 48-24h: "
+                    f"{rates[1]:.0%} [{momentum_buckets[1]}/{total_buckets[1]}], "
+                    f"24-0h: {rates[2]:.0%} [{momentum_buckets[2]}/{total_buckets[2]}]). "
+                    "Gradual acceleration suggests an emerging systemic issue "
+                    "before the surge threshold trips."
+                ),
+            })
 
     # --- Cross-direction systemic pattern analysis ---
     # When one normalized error fingerprint recurs across multiple directions in

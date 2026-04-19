@@ -2118,6 +2118,63 @@ async def get_digest(
                 "by_path": _by_path,
             }
 
+    # --- Prevention efficacy summary ---
+    # Aggregate preventive-context outcomes across recent research_history
+    # entries so operators can see whether proactive context injection actually
+    # improves merge rates vs. the overall pipeline.
+    prevention_efficacy: Optional[Dict[str, Any]] = None
+    if project_id:
+        _proj_prev = await session.get(Project, project_id)
+        if _proj_prev:
+            _prev_created = 0
+            _prev_merged = 0
+            _prev_failed = 0
+            _all_created = 0
+            _all_merged = 0
+            for _d in (_proj_prev.directions or []):
+                for _entry in _d.get("research_history") or []:
+                    try:
+                        _ets = datetime.fromisoformat(_entry.get("timestamp", ""))
+                    except (ValueError, TypeError):
+                        continue
+                    if _ets < window_start:
+                        continue
+                    _prev_created += int(_entry.get("preventive_context_tasks_created") or 0)
+                    _prev_merged += int(_entry.get("preventive_context_tasks_merged") or 0)
+                    _prev_failed += int(_entry.get("preventive_context_tasks_failed") or 0)
+                    _all_created += int(_entry.get("tasks_created") or 0)
+                    _all_merged += int(_entry.get("prs_merged") or 0)
+            if _prev_created == 0:
+                prevention_efficacy = {
+                    "preventive_tasks_created": 0,
+                    "preventive_tasks_merged": 0,
+                    "preventive_tasks_failed": 0,
+                    "preventive_merge_rate": None,
+                    "overall_merge_rate": round(_all_merged / _all_created, 3) if _all_created else None,
+                    "assessment": "no_data",
+                }
+            else:
+                _prev_rate = _prev_merged / _prev_created
+                _overall_rate = (_all_merged / _all_created) if _all_created else None
+                if _overall_rate is None:
+                    _assessment = "no_data"
+                else:
+                    _delta = _prev_rate - _overall_rate
+                    if _delta > 0.05:
+                        _assessment = "positive"
+                    elif _delta < -0.05:
+                        _assessment = "negative"
+                    else:
+                        _assessment = "neutral"
+                prevention_efficacy = {
+                    "preventive_tasks_created": _prev_created,
+                    "preventive_tasks_merged": _prev_merged,
+                    "preventive_tasks_failed": _prev_failed,
+                    "preventive_merge_rate": round(_prev_rate, 3),
+                    "overall_merge_rate": round(_overall_rate, 3) if _overall_rate is not None else None,
+                    "assessment": _assessment,
+                }
+
     # --- Latest strategic cycle ---
     latest_cycle = None
     if project_id:
@@ -2734,6 +2791,7 @@ async def get_digest(
         "pipeline_filter_funnel": pipeline_filter_funnel or None,
         "scope_mismatch_summary": scope_mismatch_summary,
         "escalation_outcome_summary": escalation_outcome_summary,
+        "prevention_efficacy": prevention_efficacy,
         "rejection_pattern_summary": rejection_pattern_summary,
         "retry_pattern_summary": retry_pattern_summary,
         "review_cap_exhaustion_summary": review_cap_exhaustion_summary,

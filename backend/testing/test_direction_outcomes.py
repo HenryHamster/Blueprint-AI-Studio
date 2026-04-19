@@ -1941,3 +1941,60 @@ async def test_genuine_cancelled_still_counts_as_failure(db_session: AsyncSessio
     entry = project.directions[0]["research_history"][0]
     assert entry["scope_breakdown"]["small"]["failed"] == 1
     assert len(entry["failed_task_details"]) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Preventive context tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_preventive_context_counts(db_session: AsyncSession):
+    """preventive_context_tasks_{created,merged,failed} counted from child context."""
+    direction_id = "d-prev"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=5)]
+    await db_session.flush()
+
+    # 3 preventive-context: 1 merged, 1 failed, 1 in-progress/other
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"has_preventive_context": True, "pr_merged": True},
+        title="prev-merged",
+    )
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"has_preventive_context": True},
+        title="prev-failed",
+    )
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"has_preventive_context": True},  # completed, not merged
+        title="prev-completed-no-pr",
+    )
+    # Non-preventive: shouldn't count
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="no-prev-merged",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["preventive_context_tasks_created"] == 3
+    assert entry["preventive_context_tasks_merged"] == 1
+    assert entry["preventive_context_tasks_failed"] == 1

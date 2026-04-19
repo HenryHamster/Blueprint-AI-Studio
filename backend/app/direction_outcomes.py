@@ -189,6 +189,18 @@ async def _update_direction_research_outcomes(
                 1 for ct in child_tasks_rows
                 if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_rejected")
             )
+            _prev_rows = [
+                ct for ct in child_tasks_rows
+                if (ct.context or {}).get("has_preventive_context") is True
+            ]
+            entry["preventive_context_tasks_created"] = len(_prev_rows)
+            entry["preventive_context_tasks_merged"] = sum(
+                1 for ct in _prev_rows
+                if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
+            )
+            entry["preventive_context_tasks_failed"] = sum(
+                1 for ct in _prev_rows if _counts_as_failure(ct)
+            )
             # Collect changed files from merged PRs for co-change index update
             merged_files_lists = [
                 (ct.context or {}).get("_pr_changed_files", [])
