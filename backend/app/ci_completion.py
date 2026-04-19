@@ -129,6 +129,25 @@ async def _attempt_merge_with_retry_and_escalation(
                 "required status", "merge restrictions", "not allowed to merge",
                 "at least", "approving review",
             ])
+        # 'unstable': required status checks are failing or still pending.
+        # This is not a merge infrastructure failure — defer back to CI polling
+        # without burning the merge retry budget.
+        if _ms == "unstable":
+            ci_loop["ci_passed"] = False
+            ci_loop["ci_poll_interval"] = 30
+            ci_loop["ci_last_polled"] = _utcnow().isoformat()
+            ci_loop["ci_wait_started"] = _utcnow().isoformat()
+            task.context = {**(task.context or {}), "review_loop": ci_loop}
+            flag_modified(task, "context")
+            task.latest_status_message = (
+                f"PR #{ci_pr_number} mergeable_state='unstable' (checks pending/failing) "
+                f"— re-entering CI polling"
+            )
+            logger.info(
+                f"[CI] PR #{ci_pr_number} unstable — deferring to CI polling ({source})"
+            )
+            return False
+
         # 'behind': PR branch is behind the base. Use update_branch to merge
         # base into the PR branch (creates a merge commit, triggers fresh CI),
         # then re-enter CI polling instead of burning merge retries.
@@ -167,6 +186,32 @@ async def _attempt_merge_with_retry_and_escalation(
         if merge_result.get("conflict") or _ms == "dirty":
             from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
             from app.rollup_state import _is_rollup_parent_awaiting_merge  # noqa: PLC0415
+            # Dedup guard: if a fix task for this PR is already active, don't spawn another.
+            # Mirrors the CI-failure path in handle_ci_completion to prevent duplicate fixes
+            # contending on the same PR.
+            active_tasks = (await session.execute(
+                select(Task).where(
+                    Task.project_id == task.project_id,
+                    Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+                )
+            )).scalars().all()
+            existing_fix = next(
+                (t for t in active_tasks
+                 if t.id != task.id
+                 and t.first_payload.get("type") == "fix"
+                 and t.first_payload.get("pr_number") == ci_pr_number),
+                None,
+            )
+            if existing_fix:
+                if not _is_rollup_parent_awaiting_merge(task.context):
+                    task.status = TaskStatus.COMPLETED
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} merge conflict, fix already active → {existing_fix.id}"
+                )
+                logger.warning(
+                    f"[CI] PR #{ci_pr_number} merge conflict, fix already exists → {existing_fix.id} ({source})"
+                )
+                return False
             conflict_prompt = (
                 f"PR #{ci_pr_number} cannot merge into `{ci_base}` due to a merge conflict "
                 f"(GitHub mergeable_state='dirty'). The code review is already approved — "

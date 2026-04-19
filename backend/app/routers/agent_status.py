@@ -472,6 +472,9 @@ async def update_agent_status(
                     ctx = dict(task.context or {})
                     if payload.changed_files:
                         ctx['_pr_changed_files'] = payload.changed_files[:50]
+                        related = ctx.get('related_files') or task.first_payload.get('related_files') or []
+                        if related:
+                            ctx['expansion_ratio'] = round(len(payload.changed_files) / len(related), 2)
                     ctx['_pr_url'] = payload.pr_url or ''
                     if payload.diff_summary:
                         ctx['_pr_diff_summary'] = payload.diff_summary[:50]
@@ -497,6 +500,9 @@ async def update_agent_status(
                 ctx = dict(task.context or {})
                 if payload.changed_files:
                     ctx['_pr_changed_files'] = payload.changed_files[:50]
+                    related = ctx.get('related_files') or task.first_payload.get('related_files') or []
+                    if related:
+                        ctx['expansion_ratio'] = round(len(payload.changed_files) / len(related), 2)
                 if payload.diff_summary:
                     ctx['_pr_diff_summary'] = payload.diff_summary[:50]
                 if payload.test_failure_summary:
