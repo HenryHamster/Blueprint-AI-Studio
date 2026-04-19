@@ -3425,6 +3425,54 @@ async def test_low_confidence_medium_auto_escalates_to_large(db_session, mocker)
 
 
 @pytest.mark.asyncio
+async def test_exploration_floor_prevents_zero_collapse(db_session, mocker):
+    """Directions with exploration_created>0 but exploration_merged=0 still get
+    the exploration floor instead of collapsing to fraction=0 (death spiral)."""
+    direction_id = "d-floor-1"
+    direction = {
+        "id": direction_id,
+        "text": "Zero-merge medium exploration",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [{
+            "scope_breakdown": {"medium": {"exploration_created": 5, "exploration_merged": 0}},
+        }],
+    }
+    project = Project(name="Floor test", user_id="test-user-123",
+                      autonomous_enabled=True, directions=[direction])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        title="Research: floor",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    _mock_escalation_externals(mocker, direction_id)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.0)
+    # Force the random draw below the floor so the exploration path is taken
+    # iff the floor is applied; without the floor, _explore_frac would be 0
+    # and random.random() < 0 is always False regardless of the draw.
+    mocker.patch("app.research_completion.random.random", return_value=0.01)
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    children = result.scalars().all()
+    assert len(children) == 1
+    assert children[0].context["scope"] == "medium"
+
+
+@pytest.mark.asyncio
 async def test_auto_escalate_suppressed_by_poor_decomp_history(db_session, mocker):
     """Medium-scope low-confidence finding stays at medium when prior plan
     decompositions merged poorly (shares suppression with _calibrate_scope)."""

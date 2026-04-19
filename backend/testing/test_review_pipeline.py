@@ -1788,9 +1788,9 @@ def test_stuck_cycle_issue_similarity_threshold_constants():
 def test_stuck_cycle_medium_thresholds_lower_than_default():
     """Tripwire: medium-scope thresholds must sit below the defaults so that
     higher-complexity tasks bail out of stuck cycles earlier."""
-    assert STUCK_CYCLE_THRESHOLD_MEDIUM == 0.4
-    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM == 0.55
-    assert STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM == 0.6
+    assert STUCK_CYCLE_THRESHOLD_MEDIUM == 0.45
+    assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM == 0.6
+    assert STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM == 0.65
     assert STUCK_CYCLE_THRESHOLD_MEDIUM < STUCK_CYCLE_THRESHOLD_DEFAULT
     assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM < STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT
     assert STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM < STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT
@@ -1799,7 +1799,7 @@ def test_stuck_cycle_medium_thresholds_lower_than_default():
 async def _run_stuck_scope_case(
     db_session, mocker, *, scope: str, pr_number: int
 ):
-    """Drive _spawn_pipeline_task at exactly 40% exact-issue repeat.
+    """Drive _spawn_pipeline_task at ~45% exact-issue repeat.
 
     Returns the result tuple plus the reloaded original task so callers can
     assert scope-conditional stuck behaviour.
@@ -1820,8 +1820,8 @@ async def _run_stuck_scope_case(
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    # 2 of 5 current CRITICAL issues repeat → 40% exact-match, clears the
-    # 0.4 medium threshold but stays below the 0.5 default. New issues share
+    # 5 of 11 current CRITICAL issues repeat → ~45.5% exact-match, clears the
+    # 0.45 medium threshold but stays below the 0.5 default. New issues share
     # no tokens with prior, keeping Jaccard below both rephrased thresholds.
     prior_issues = [_issue(f"alpha issue {i}", "CRITICAL") for i in range(5)]
     branch = f"b-{scope}"
@@ -1851,9 +1851,15 @@ async def _run_stuck_scope_case(
     current_issues = [
         _issue("alpha issue 0", "CRITICAL"),  # repeats
         _issue("alpha issue 1", "CRITICAL"),  # repeats
+        _issue("alpha issue 2", "CRITICAL"),  # repeats
+        _issue("alpha issue 3", "CRITICAL"),  # repeats
+        _issue("alpha issue 4", "CRITICAL"),  # repeats
         _issue("zeta fresh concern", "CRITICAL"),
         _issue("omega distinct finding", "CRITICAL"),
         _issue("kappa separate worry", "CRITICAL"),
+        _issue("theta new worry", "CRITICAL"),
+        _issue("sigma other concern", "CRITICAL"),
+        _issue("delta different problem", "CRITICAL"),
     ]
     result, _ = await _spawn_pipeline_task(
         source_task, "fix", db_session,
@@ -1868,23 +1874,23 @@ async def _run_stuck_scope_case(
 
 
 @pytest.mark.asyncio
-async def test_stuck_cycle_medium_scope_triggers_at_40pct(db_session, mocker):
-    """Medium-scope tasks trigger the stuck cycle at 40% exact-match repeat."""
+async def test_stuck_cycle_medium_scope_triggers_at_45pct(db_session, mocker):
+    """Medium-scope tasks trigger the stuck cycle at ~45% exact-match repeat."""
     result, original_task = await _run_stuck_scope_case(
         db_session, mocker, scope="medium", pr_number=701
     )
-    assert result is None, "Medium scope must stuck-detect at the lower 0.4 threshold"
+    assert result is None, "Medium scope must stuck-detect at the lower 0.45 threshold"
     assert original_task.requires_approval is True
 
 
 @pytest.mark.asyncio
-async def test_stuck_cycle_small_scope_unaffected_at_40pct(db_session, mocker):
-    """Small-scope tasks keep the 0.5 default threshold and pass through at 40%."""
+async def test_stuck_cycle_small_scope_unaffected_at_45pct(db_session, mocker):
+    """Small-scope tasks keep the 0.5 default threshold and pass through at ~45%."""
     result, original_task = await _run_stuck_scope_case(
         db_session, mocker, scope="small", pr_number=702
     )
     assert result is not None, (
-        "Small scope must not trigger at 40% — default threshold remains 0.5"
+        "Small scope must not trigger at ~45% — default threshold remains 0.5"
     )
     assert result.status == TaskStatus.QUEUED
     assert original_task.requires_approval is not True

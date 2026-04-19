@@ -30,7 +30,7 @@ STUCK_CYCLE_THRESHOLD_REFACTOR = 0.65
 # Medium-scope tasks juggle more complexity and are more likely to produce
 # repeating CRITICAL/MAJOR issues across iterations. Detect the stuck cycle
 # 1-2 iterations earlier than the default to save the remaining budget.
-STUCK_CYCLE_THRESHOLD_MEDIUM = 0.4
+STUCK_CYCLE_THRESHOLD_MEDIUM = 0.45
 
 # Token-level Jaccard thresholds used by the feedback-text fallback when one or
 # both review_history entries lack a structured `issues` list (e.g. verdict
@@ -38,7 +38,7 @@ STUCK_CYCLE_THRESHOLD_MEDIUM = 0.4
 # thresholds because text comparison is noisier.
 STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT = 0.7
 STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR = 0.75
-STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM = 0.6
+STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM = 0.65
 
 # Secondary Jaccard thresholds for the rephrased-issue fallback: both sides
 # have structured CRITICAL/MAJOR issues but the exact-match proportion falls
@@ -48,7 +48,7 @@ STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM = 0.6
 # trigger a false positive.
 STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT = 0.65
 STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR = 0.7
-STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM = 0.55
+STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM = 0.6
 
 
 def _stuck_thresholds(scope: str, is_refactor: bool) -> tuple[float, float, float]:

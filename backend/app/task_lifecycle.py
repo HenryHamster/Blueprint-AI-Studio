@@ -151,8 +151,12 @@ def _build_retry_prompt_suffix(
     different scope string when the failure mode should route through a
     different scope on retry:
       - AGENT_TIMEOUT with attempt ≥ 2: downgrade large→medium or medium→small
-      - CODE_ERROR with attempt ≥ 2: downgrade large→medium or medium→small so
-        repeatedly-failing tasks retry within a smaller file budget
+      - CODE_ERROR with attempt ≥ 2: downgrade large→medium or medium→small only
+        when the previous failure stage is unknown or ctx indicates the scope
+        itself overflowed (expansion_ratio > 1.5). Pure SCOPE_OVERFLOW is handled
+        by its own branch above.
+        Failures at identified code-defect stages (test/lint/build/review/merge)
+        preserve the original scope since a tighter budget won't fix bugs.
       - SCOPE_OVERFLOW on a medium task: escalate medium→large so the plan
         agent decomposes the work into multiple small subtasks
     Otherwise None. Reads ``_previous_failing_tests`` and ``_previous_error_files``
@@ -255,10 +259,19 @@ def _build_retry_prompt_suffix(
             extra_guidance += "Previously failing tests:\n" + "".join(f"  {t}\n" for t in failing_tests)
         if error_files:
             extra_guidance += "Error file locations:\n" + "".join(f"  {f}\n" for f in error_files)
-        if attempt >= 2 and task_scope == "large":
-            scope_override = "medium"
-        elif attempt >= 2 and task_scope == "medium":
-            scope_override = "small"
+        if attempt >= 2 and task_scope in ("large", "medium"):
+            prev_stage = ctx.get("_previous_failure_stage")
+            prev_expansion = ctx.get("expansion_ratio")
+            scope_related = (
+                isinstance(prev_expansion, (int, float)) and prev_expansion > 1.5
+            )
+            # Downgrade only when the stage is unknown (no diagnostic signal that
+            # points at a code defect) or when context indicates the scope itself
+            # was the problem. Code-defect stages (test, lint, build, review, merge)
+            # are not remedied by a tighter file budget — preserve original scope
+            # and rely on stage-specific guidance instead.
+            if scope_related or not prev_stage:
+                scope_override = "medium" if task_scope == "large" else "small"
 
     elif failure_class == "EXTERNAL_API":
         error_text = (original_status_message or "")

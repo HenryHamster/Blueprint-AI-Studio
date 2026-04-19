@@ -65,6 +65,11 @@ logger = logging.getLogger(__name__)
 # research/security_audit/qa keep their type-level effort regardless of scope.
 _SCOPE_AWARE_EFFORT_TYPES = frozenset({"create", "fix", "refactor", "plan"})
 
+# Minimum medium-scope exploration fraction. Prevents the adaptive formula from
+# collapsing to 0 for a direction with no successful medium merges, which would
+# permanently shut down medium exploration and prevent data collection.
+MEDIUM_EXPLORATION_FLOOR = 0.05
+
 from app.direction_metrics import (  # noqa: F401 — re-exported for callers/tests
     _HISTORY_AGG_DEFAULTS,
     _DECOMP_AGG_DEFAULTS,
@@ -706,6 +711,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # data. Without this, medium rates stay low because no medium tasks ever run,
             # which keeps P(success) below threshold in a self-reinforcing loop.
             _explore_frac = _runtime_config.get("medium_exploration_fraction", 0.2)
+            _explore_frac_base = _explore_frac
             # Adapt the exploration fraction from this direction's observed
             # medium-scope exploration outcomes. Directions where exploration
             # consistently merges get a boosted fraction so they accumulate
@@ -742,6 +748,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         "pipeline_medium=%.2f, frac=%.3f",
                         _pred_dir_id, float(_pipeline_medium), float(_explore_frac),
                     )
+            # Enforce a minimum exploration fraction so directions with zero
+            # observed exploration merges still occasionally attempt medium scope —
+            # otherwise the fraction locks at 0 and no new data is ever collected.
+            # Skip the floor when the operator has explicitly disabled exploration
+            # by setting the base fraction to 0.
+            if (
+                isinstance(_explore_frac, (int, float))
+                and isinstance(_explore_frac_base, (int, float))
+                and float(_explore_frac_base) > 0
+                and 0 <= float(_explore_frac) < MEDIUM_EXPLORATION_FLOOR
+            ):
+                _explore_frac = MEDIUM_EXPLORATION_FLOOR
             if isinstance(_explore_frac, (int, float)) and _explore_frac > 0 and random.random() < float(_explore_frac):
                 _medium_exploration = True
                 logger.info("[RESEARCH] Exploration bypass keeping medium scope for '%s' (P=%.2f, explore_frac=%.2f)",

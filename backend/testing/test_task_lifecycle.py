@@ -1660,6 +1660,48 @@ class TestBuildRetryPromptSuffix:
         )
         assert override == "small"
 
+    def test_code_error_test_stage_preserves_scope(self):
+        _, override = _build_retry_prompt_suffix(
+            "CODE_ERROR", "boom", attempt=2, task_scope="medium",
+            ctx={"_previous_failure_stage": "test"},
+        )
+        assert override is None
+
+    def test_code_error_lint_stage_preserves_scope(self):
+        _, override = _build_retry_prompt_suffix(
+            "CODE_ERROR", "boom", attempt=3, task_scope="large",
+            ctx={"_previous_failure_stage": "lint"},
+        )
+        assert override is None
+
+    def test_code_error_build_stage_preserves_scope(self):
+        _, override = _build_retry_prompt_suffix(
+            "CODE_ERROR", "boom", attempt=2, task_scope="medium",
+            ctx={"_previous_failure_stage": "build"},
+        )
+        assert override is None
+
+    def test_code_error_review_stage_preserves_scope(self):
+        _, override = _build_retry_prompt_suffix(
+            "CODE_ERROR", "boom", attempt=2, task_scope="medium",
+            ctx={"_previous_failure_stage": "review"},
+        )
+        assert override is None
+
+    def test_code_error_downgrades_when_expansion_ratio_indicates_scope_overflow(self):
+        _, override = _build_retry_prompt_suffix(
+            "CODE_ERROR", "boom", attempt=2, task_scope="medium",
+            ctx={"_previous_failure_stage": "test", "expansion_ratio": 2.0},
+        )
+        assert override == "small"
+
+    def test_code_error_expansion_ratio_at_threshold_does_not_force_downgrade(self):
+        _, override = _build_retry_prompt_suffix(
+            "CODE_ERROR", "boom", attempt=2, task_scope="medium",
+            ctx={"_previous_failure_stage": "test", "expansion_ratio": 1.5},
+        )
+        assert override is None
+
     def test_code_error_small_no_downgrade(self):
         _, override = _build_retry_prompt_suffix(
             "CODE_ERROR", "boom", attempt=3, task_scope="small", ctx={},
