@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.direction_metrics import _compute_direction_quality_score
 from app.models import Task, Project, TaskHistory, TaskStatus, ProjectMessage
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
@@ -515,6 +516,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
             stat_entry["tasks_failed_infra"] = total_failed_infra
         if taxonomy_totals:
             stat_entry["taxonomy_summary"] = taxonomy_totals
+        stat_entry["quality_score"] = round(_compute_direction_quality_score(d), 3)
         if total_rejected > 0:
             stat_entry["prs_rejected"] = total_rejected
         if operator_rejection_rate is not None and total_rejected > 0:

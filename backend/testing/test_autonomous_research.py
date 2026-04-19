@@ -6297,3 +6297,163 @@ async def test_anomaly_sweep_noop_without_holds(db_session, _clear_direction_str
     from app.anomaly_detection import _spawn_held_direction_investigations
     spawned = await _spawn_held_direction_investigations(db_session)
     assert spawned == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _compute_direction_quality_score — taxonomy-based direction health signal
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _history_entry(
+    *,
+    tasks_created: int = 0,
+    prs_merged: int = 0,
+    code_defect: int = 0,
+    scope_related: int = 0,
+    infra_related: int = 0,
+    review_quality: int = 0,
+) -> dict:
+    return {
+        "tasks_created": tasks_created,
+        "prs_merged": prs_merged,
+        "taxonomy_summary": {
+            "code_defect": code_defect,
+            "scope_related": scope_related,
+            "infra_related": infra_related,
+            "review_quality": review_quality,
+        },
+    }
+
+
+def _load_quality_score():
+    """Sibling cluster (cluster 1/2) adds _compute_direction_quality_score.
+    Skip until it lands so this cluster can merge independently."""
+    pytest.importorskip("app.direction_metrics")
+    import app.direction_metrics as dm
+    if not hasattr(dm, "_compute_direction_quality_score"):
+        pytest.skip("_compute_direction_quality_score not yet available (sibling cluster pending)")
+    return dm._compute_direction_quality_score
+
+
+def test_quality_score_neutral_for_new_direction():
+    """A direction with no history returns the neutral 0.5 sentinel."""
+    compute = _load_quality_score()
+    assert compute({}) == 0.5
+    assert compute({"research_history": []}) == 0.5
+
+
+def test_quality_score_high_for_actionable_taxonomy():
+    """Failures dominated by code_defect/scope_related yield a healthy score."""
+    _compute_direction_quality_score = _load_quality_score()
+    d = {
+        "research_history": [
+            _history_entry(tasks_created=3, prs_merged=2, code_defect=3),
+            _history_entry(tasks_created=3, prs_merged=2, code_defect=2, scope_related=1),
+            _history_entry(tasks_created=3, prs_merged=3, code_defect=1),
+        ],
+    }
+    score = _compute_direction_quality_score(d)
+    assert 0.0 <= score <= 1.0
+    assert score > 0.6, f"expected healthy score, got {score}"
+
+
+def test_quality_score_low_for_structural_taxonomy():
+    """Failures dominated by infra_related/review_quality yield a poor score."""
+    _compute_direction_quality_score = _load_quality_score()
+    d = {
+        "research_history": [
+            _history_entry(tasks_created=3, prs_merged=0, infra_related=3),
+            _history_entry(tasks_created=3, prs_merged=0, infra_related=2, review_quality=2),
+            _history_entry(tasks_created=3, prs_merged=0, review_quality=3),
+        ],
+    }
+    score = _compute_direction_quality_score(d)
+    assert 0.0 <= score <= 1.0
+    assert score < 0.4, f"expected poor score, got {score}"
+
+
+def test_quality_score_penalizes_wasted_cycles():
+    """Cycles where tasks are created but nothing merges reduce the score."""
+    _compute_direction_quality_score = _load_quality_score()
+    healthy = {
+        "research_history": [
+            _history_entry(tasks_created=2, prs_merged=2, code_defect=1),
+            _history_entry(tasks_created=2, prs_merged=1, code_defect=1),
+            _history_entry(tasks_created=2, prs_merged=2, code_defect=1),
+        ],
+    }
+    wasted = {
+        "research_history": [
+            _history_entry(tasks_created=2, prs_merged=0, code_defect=2),
+            _history_entry(tasks_created=2, prs_merged=0, code_defect=2),
+            _history_entry(tasks_created=2, prs_merged=0, code_defect=2),
+        ],
+    }
+    assert _compute_direction_quality_score(healthy) > _compute_direction_quality_score(wasted)
+
+
+def test_quality_score_penalizes_scope_dominated_failures():
+    """When scope_related failures dominate (>50%), the score signals mis-sizing."""
+    _compute_direction_quality_score = _load_quality_score()
+    balanced = {
+        "research_history": [
+            _history_entry(tasks_created=3, prs_merged=2, code_defect=2, scope_related=1),
+        ],
+    }
+    scope_heavy = {
+        "research_history": [
+            _history_entry(tasks_created=3, prs_merged=2, code_defect=1, scope_related=4),
+        ],
+    }
+    assert _compute_direction_quality_score(balanced) > _compute_direction_quality_score(scope_heavy)
+
+
+@pytest.mark.asyncio
+async def test_direction_score_ranks_higher_quality_first(db_session, mocker):
+    """With equivalent productivity, the direction with healthier taxonomy wins selection."""
+    _load_quality_score()  # skip unless sibling integration has landed
+    from app.shared_state import runtime_config as _runtime_config
+    old_val = _runtime_config.get("max_parallel_research_per_project", 2)
+    _runtime_config["max_parallel_research_per_project"] = 1
+
+    healthy_history = [
+        _history_entry(tasks_created=2, prs_merged=1, code_defect=2),
+        _history_entry(tasks_created=2, prs_merged=1, code_defect=2),
+        _history_entry(tasks_created=2, prs_merged=1, code_defect=2),
+    ]
+    poor_history = [
+        _history_entry(tasks_created=2, prs_merged=1, infra_related=2, review_quality=1),
+        _history_entry(tasks_created=2, prs_merged=1, infra_related=2, review_quality=1),
+        _history_entry(tasks_created=2, prs_merged=1, infra_related=2, review_quality=1),
+    ]
+    d_good = {**_active_direction("d-quality1", "Healthy"), "research_history": healthy_history,
+              "last_researched_at": "2026-01-01T00:00:00"}
+    d_bad = {**_active_direction("d-quality2", "Structural"), "research_history": poor_history,
+             "last_researched_at": "2026-01-01T00:00:00"}
+
+    project = Project(
+        name="Quality Sort",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[d_bad, d_good],  # deliberately present poor one first
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    try:
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        research = [
+            t for t in result.scalars().all()
+            if (t.payloads or [{}])[0].get("type") == "research"
+        ]
+        assert len(research) == 1, "Expected exactly one research task at max_parallel=1"
+        chosen = (research[0].payloads[0].get("directions") or [])
+        assert chosen, "Research payload should carry the chosen direction"
+        assert chosen[0].get("id") == "d-quality1", (
+            "Higher-quality direction should be selected over equivalent-productivity poor one"
+        )
+    finally:
+        _runtime_config["max_parallel_research_per_project"] = old_val

@@ -20,7 +20,7 @@ from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
 from app.direction_lifecycle import _process_direction_lifecycle
 from app.research_completion import _handle_research_completion, _calibrate_scope, predict_spawn_success, _poor_decomp_history
-from app.direction_metrics import _compute_acceptance_rate, _compute_momentum_factor, _compute_productivity_score
+from app.direction_metrics import _compute_acceptance_rate, _compute_direction_quality_score, _compute_momentum_factor, _compute_productivity_score
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -1204,6 +1204,110 @@ class TestComputeAcceptanceRate:
             "history_aggregate": {"total_prs_merged": 4, "total_prs_rejected": 1},
         }
         assert _compute_acceptance_rate(d) == pytest.approx(0.8)
+
+
+class TestComputeDirectionQualityScore:
+    """Unit tests for _compute_direction_quality_score — pure function, no DB."""
+
+    def test_no_history_returns_neutral(self):
+        assert _compute_direction_quality_score({}) == 0.5
+        assert _compute_direction_quality_score({"research_history": []}) == 0.5
+
+    def test_all_actionable_taxonomy_high_score(self):
+        """All failures actionable, tasks merging → score near 1.0."""
+        d = {
+            "research_history": [
+                {
+                    "tasks_created": 2, "prs_merged": 1,
+                    "taxonomy_summary": {"code_defect": 2, "scope_related": 1,
+                                         "infra_related": 0, "review_quality": 0},
+                }
+            ]
+        }
+        # taxonomy_health=1.0, productivity=1.0 (active and merged), scope=1.0 (33% <= 50%)
+        assert _compute_direction_quality_score(d) == pytest.approx(1.0)
+
+    def test_all_structural_failures_low_taxonomy_health(self):
+        """All failures structural (infra/review) → taxonomy_health=0, productivity=0, scope=1 → 1/3."""
+        d = {
+            "research_history": [
+                {
+                    "tasks_created": 2, "prs_merged": 0,
+                    "taxonomy_summary": {"code_defect": 0, "scope_related": 0,
+                                         "infra_related": 2, "review_quality": 1},
+                }
+            ]
+        }
+        assert _compute_direction_quality_score(d) == pytest.approx(1 / 3)
+
+    def test_scope_dominant_triggers_zero_scope_signal(self):
+        """scope_related > 50% of taxonomy → scope_signal = 0."""
+        d = {
+            "research_history": [
+                {
+                    "tasks_created": 1, "prs_merged": 1,
+                    "taxonomy_summary": {"code_defect": 1, "scope_related": 5,
+                                         "infra_related": 0, "review_quality": 0},
+                }
+            ]
+        }
+        # taxonomy_health=1.0 (all actionable), productivity=1.0, scope=0 → 2/3
+        assert _compute_direction_quality_score(d) == pytest.approx(2 / 3)
+
+    def test_recency_weighting_favors_recent(self):
+        """Recent cycle weighted 3x: new healthy cycle dominates stale unhealthy ones."""
+        d_recent_good = {
+            "research_history": [
+                {"tasks_created": 1, "prs_merged": 0,
+                 "taxonomy_summary": {"code_defect": 0, "scope_related": 0,
+                                      "infra_related": 3, "review_quality": 0}},
+                {"tasks_created": 1, "prs_merged": 1,
+                 "taxonomy_summary": {"code_defect": 1, "scope_related": 0,
+                                      "infra_related": 0, "review_quality": 0}},
+            ]
+        }
+        d_recent_bad = {
+            "research_history": [
+                {"tasks_created": 1, "prs_merged": 1,
+                 "taxonomy_summary": {"code_defect": 1, "scope_related": 0,
+                                      "infra_related": 0, "review_quality": 0}},
+                {"tasks_created": 1, "prs_merged": 0,
+                 "taxonomy_summary": {"code_defect": 0, "scope_related": 0,
+                                      "infra_related": 3, "review_quality": 0}},
+            ]
+        }
+        assert _compute_direction_quality_score(d_recent_good) > _compute_direction_quality_score(d_recent_bad)
+
+    def test_direction_sort_respects_quality_tiebreak(self):
+        """Two directions with equal productivity: higher-quality sorts first."""
+        from app.failure_classification import (
+            TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED,
+        )
+        now = "2026-01-01T00:00:00"
+        high_q = {
+            "id": "high_q", "priority": "medium", "last_researched_at": now,
+            "research_history": [
+                {"prs_merged": 1, "tasks_created": 1,
+                 "taxonomy_summary": {TAXONOMY_CODE_DEFECT: 1}},
+            ],
+        }
+        low_q = {
+            "id": "low_q", "priority": "medium", "last_researched_at": now,
+            "research_history": [
+                {"prs_merged": 1, "tasks_created": 2,
+                 "taxonomy_summary": {TAXONOMY_INFRA_RELATED: 3}},
+            ],
+        }
+        # Equivalent productivity (both have prs_merged=1 over 1 cycle)
+        assert _compute_productivity_score(high_q) == pytest.approx(_compute_productivity_score(low_q))
+        # Quality score should differentiate
+        assert _compute_direction_quality_score(high_q) > _compute_direction_quality_score(low_q)
+        directions = [low_q, high_q]
+        directions.sort(key=lambda d: (
+            -_compute_productivity_score(d),
+            -_compute_direction_quality_score(d),
+        ))
+        assert directions[0]["id"] == "high_q"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

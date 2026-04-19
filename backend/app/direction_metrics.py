@@ -8,6 +8,13 @@ from typing import Any, Dict
 
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.failure_classification import (
+    TAXONOMY_CODE_DEFECT,
+    TAXONOMY_INFRA_RELATED,
+    TAXONOMY_REVIEW_QUALITY,
+    TAXONOMY_SCOPE_RELATED,
+)
+
 _HISTORY_AGG_DEFAULTS = {
     "total_cycles": 0,
     "total_tasks_created": 0,
@@ -132,6 +139,67 @@ def _compute_productivity_score(d: dict) -> float:
     recent_rejected = sum(e.get("prs_rejected", 0) for e in recent)
     recent_rate = (recent_merged - 0.5 * recent_rejected) / len(recent)
     return (recent_rate * 3 + lifetime_rate) / 4
+
+
+def _compute_direction_quality_score(d: dict) -> float:
+    """Aggregate recent taxonomy signals into a [0.0, 1.0] quality score.
+
+    Reads the last 3 research_history entries and combines three signals:
+    (a) taxonomy health — actionable failures (code_defect + scope_related) vs
+        structural (infra_related + review_quality). Higher is better.
+    (b) wasted-cycle signal — 1 - (cycles with tasks_created>0 but prs_merged==0
+        over cycles with tasks_created>0). Higher is better.
+    (c) scope calibration — 1.0 when scope_related does not dominate (>50%),
+        else 0.0.
+
+    Uses linear recency weighting within the 3-cycle window (oldest=1, newest=3),
+    mirroring the 3x recency emphasis in _compute_productivity_score. Returns
+    0.5 (neutral) when no history exists.
+    """
+    history = d.get("research_history", [])
+    recent = history[-3:]
+    if not recent:
+        return 0.5
+
+    weights = list(range(1, len(recent) + 1))  # oldest-of-window = 1x, newest = 3x
+    actionable_w = structural_w = scope_w = total_taxon_w = 0.0
+    active_w = wasted_w = 0.0
+
+    for entry, w in zip(recent, weights):
+        tx = entry.get("taxonomy_summary") or {}
+        code_defect = tx.get(TAXONOMY_CODE_DEFECT, 0) or 0
+        scope_related = tx.get(TAXONOMY_SCOPE_RELATED, 0) or 0
+        infra_related = tx.get(TAXONOMY_INFRA_RELATED, 0) or 0
+        review_quality = tx.get(TAXONOMY_REVIEW_QUALITY, 0) or 0
+        actionable_w += w * (code_defect + scope_related)
+        structural_w += w * (infra_related + review_quality)
+        scope_w += w * scope_related
+        total_taxon_w += w * (code_defect + scope_related + infra_related + review_quality)
+
+        tasks_created = entry.get("tasks_created", 0) or 0
+        prs_merged = entry.get("prs_merged", 0) or 0
+        if tasks_created > 0:
+            active_w += w
+            if prs_merged == 0:
+                wasted_w += w
+
+    if (actionable_w + structural_w) > 0:
+        taxonomy_health = actionable_w / (actionable_w + structural_w)
+    else:
+        taxonomy_health = 0.5
+
+    if active_w > 0:
+        productivity_signal = 1.0 - (wasted_w / active_w)
+    else:
+        productivity_signal = 0.5
+
+    if total_taxon_w > 0:
+        scope_signal = 0.0 if (scope_w / total_taxon_w) > 0.5 else 1.0
+    else:
+        scope_signal = 0.5
+
+    score = (taxonomy_health + productivity_signal + scope_signal) / 3.0
+    return max(0.0, min(1.0, score))
 
 
 def _update_cycle_history(project: Any, cycle_id: str, updates: Dict[str, Any]) -> None:
