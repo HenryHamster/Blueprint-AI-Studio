@@ -294,6 +294,16 @@ interface DigestData {
     false_alarm_rate: number | null;
     sample_size: number;
   } | null;
+  first_review_approval_rate?: {
+    overall: number | null;
+    sample_size: number;
+    by_type?: Record<string, number> | null;
+    by_scope?: Record<string, number> | null;
+    with_playbook?: number | null;
+    without_playbook?: number | null;
+    with_measurements?: number | null;
+    without_measurements?: number | null;
+  } | null;
   review_accuracy?: {
     total_reviews: number;
     overrides: number;
@@ -310,6 +320,10 @@ interface DigestData {
     with_arch_context: number | null;
     without_arch_context: number | null;
     sample_size: number;
+    first_attempt_by_review_category?: Record<string, number> | null;
+    trend?: string | null;
+    by_type?: Record<string, number> | null;
+    by_scope?: Record<string, number> | null;
   } | null;
   pipeline_acceptance_rate?: number | null;
   pipeline_conversion_rate?: number | null;
@@ -1359,9 +1373,12 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       {fas.overall != null && (
                         <span
                           className={`flex items-center gap-1 ${tone(fas.overall)}`}
-                          title={`First-attempt success rate (n=${fas.sample_size})`}
+                          title={`First-attempt success rate (n=${fas.sample_size})${fas.trend ? ` — trend: ${fas.trend}` : ''}`}
                         >
                           {Math.round(fas.overall * 100)}% 1st-attempt
+                          {fas.trend === 'improving' && <span className="text-emerald-400">↑</span>}
+                          {fas.trend === 'declining' && <span className="text-red-400">↓</span>}
+                          {fas.trend === 'stable' && <span className="text-neutral-500">→</span>}
                         </span>
                       )}
                       {(fas.with_playbook != null || fas.without_playbook != null) && (
@@ -1380,6 +1397,52 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           Arch context: {fmt(fas.with_arch_context)} vs {fmt(fas.without_arch_context)} without
                         </span>
                       )}
+                      {fas.by_scope && Object.keys(fas.by_scope).length > 0 && (() => {
+                        const order = ['small', 'medium', 'large'];
+                        const entries = Object.entries(fas.by_scope!)
+                          .filter(([, v]) => typeof v === 'number')
+                          .sort(([a], [b]) => {
+                            const ai = order.indexOf(a); const bi = order.indexOf(b);
+                            return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+                          });
+                        if (entries.length === 0) return null;
+                        return (
+                          <span
+                            className="flex items-center gap-1 text-neutral-400"
+                            title="First-attempt success rate by task scope"
+                          >
+                            <span>Scope:</span>
+                            {entries.map(([scope, rate], i) => (
+                              <span key={scope} className={tone(rate)}>
+                                {scope}: {Math.round(rate * 100)}%{i < entries.length - 1 ? ' |' : ''}
+                              </span>
+                            ))}
+                          </span>
+                        );
+                      })()}
+                      {fas.first_attempt_by_review_category && Object.keys(fas.first_attempt_by_review_category).length > 0 && (() => {
+                        const entries = Object.entries(fas.first_attempt_by_review_category!)
+                          .filter(([, v]) => typeof v === 'number' && v > 0)
+                          .sort((a, b) => b[1] - a[1])
+                          .slice(0, 3);
+                        if (entries.length === 0) return null;
+                        return (
+                          <span
+                            className="flex items-center gap-1 text-neutral-400"
+                            title="Top review categories responsible for first-attempt rejections"
+                          >
+                            <span>Rejections:</span>
+                            {entries.map(([cat, frac]) => (
+                              <span
+                                key={cat}
+                                className="px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-300"
+                              >
+                                {cat} {Math.round(frac * 100)}%
+                              </span>
+                            ))}
+                          </span>
+                        );
+                      })()}
                     </>
                   );
                 })()}
@@ -2462,10 +2525,15 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                 const sre = digest!.self_review_effectiveness;
                 const spa = digest!.self_review_prediction_accuracy;
                 const ra = digest!.review_accuracy;
+                const fra = digest!.first_review_approval_rate;
                 const hasSre = sre && (sre.with_self_review_approval_rate != null || sre.without_self_review_approval_rate != null);
                 const hasSpa = spa && (spa.prediction_hit_rate != null || spa.false_alarm_rate != null);
                 const hasRa = ra && (ra.precision != null || ra.recall != null);
-                if (!hasSre && !hasSpa && !hasRa) return null;
+                const hasFra = fra && fra.overall != null && fra.sample_size >= 5;
+                if (!hasSre && !hasSpa && !hasRa && !hasFra) return null;
+                const fraColor = hasFra
+                  ? (fra!.overall! >= 0.8 ? 'text-emerald-400' : fra!.overall! >= 0.5 ? 'text-amber-400' : 'text-red-400')
+                  : 'text-neutral-300';
                 const pct = (v: number | null | undefined) => v == null ? null : `${Math.round(v * 100)}%`;
                 return (
                   <div>
@@ -2525,6 +2593,15 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                               </span>
                             )}
                             <span className="text-[10px] text-neutral-500">· n={ra!.total_reviews}</span>
+                          </div>
+                        )}
+                        {hasFra && (
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">First-review approval</span>
+                            <span className="text-[10px] text-neutral-400">
+                              <span className={fraColor}>{pct(fra!.overall)}</span>
+                            </span>
+                            <span className="text-[10px] text-neutral-500">· n={fra!.sample_size}</span>
                           </div>
                         )}
                       </div>
