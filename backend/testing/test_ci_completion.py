@@ -395,6 +395,62 @@ async def test_merge_failure_escalates_at_10_failures(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_merge_failure_final_warn_at_13_failures(db_session, mocker):
+    """
+    When merge_failures reaches MERGE_FAILURE_HARD_CAP - 2 (13) and the task is
+    already escalated, a second 'hard-cap imminent' alert fires exactly once.
+    """
+    from app.ci_completion import (
+        MERGE_FAILURE_HARD_CAP,
+        _attempt_merge_with_retry_and_escalation,
+    )
+
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "server error"},
+    )
+
+    project = Project(name="Final warn at 13", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Start at HARD_CAP - 3 with merge_escalated already set; this call pushes
+    # failures to HARD_CAP - 2 (13) and should trigger the final-warn alert.
+    task = _make_task(db_session, project, ci_loop_extra={
+        "merge_failures": MERGE_FAILURE_HARD_CAP - 3,
+        "merge_escalated": True,
+    })
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_failures") == MERGE_FAILURE_HARD_CAP - 2
+    assert review_loop.get("merge_final_warn") is True
+    alert_mock.assert_called_once()
+    assert "imminent" in alert_mock.call_args[0][2].lower()
+
+    # A second failure at HARD_CAP - 1 must not fire the final-warn alert again.
+    alert_mock.reset_mock()
+    await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+    for call in alert_mock.call_args_list:
+        assert "imminent" not in call[0][2].lower()
+
+
+@pytest.mark.asyncio
 async def test_merge_failure_does_not_double_escalate(db_session, mocker):
     """
     If merge_escalated is already set, a subsequent failure must NOT create
@@ -419,9 +475,10 @@ async def test_merge_failure_does_not_double_escalate(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Already escalated with 15 failures
+    # Already escalated with 10 failures; no new alert should fire on the next
+    # transient failure (still below final-warn and hard-cap thresholds).
     task = _make_task(db_session, project, ci_loop_extra={
-        "merge_failures": 15,
+        "merge_failures": 10,
         "merge_escalated": True,
     })
     await db_session.commit()
@@ -468,6 +525,7 @@ async def test_merge_failure_hard_cap_marks_failed(db_session, mocker):
     task = _make_task(db_session, project, ci_loop_extra={
         "merge_failures": MERGE_FAILURE_HARD_CAP - 1,
         "merge_escalated": True,
+        "merge_final_warn": True,
     })
     await db_session.commit()
     await db_session.refresh(task)

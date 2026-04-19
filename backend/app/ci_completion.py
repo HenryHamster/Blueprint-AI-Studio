@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # Hard cap on merge retries — escalates at 10, but if we hit this many failures
 # the PR is clearly stuck (e.g. corrupted ci_wait_started bypassing the CI backstop
 # in services.py). Mark FAILED with requires_approval to force manual intervention.
-MERGE_FAILURE_HARD_CAP = 25
+MERGE_FAILURE_HARD_CAP = 15
 
 
 def _review_approved(review_loop: dict) -> bool:
@@ -160,6 +160,16 @@ async def _attempt_merge_with_retry_and_escalation(
                 task.context = {**(task.context or {}), "review_loop": ci_loop}
                 await _maybe_create_failure_alert(task, session,
                     f"Rollup PR #{ci_pr_number} merge failed {_merge_failures} times — still retrying")
+            if (
+                _merge_failures >= MERGE_FAILURE_HARD_CAP - 2
+                and ci_loop.get("merge_escalated")
+                and not ci_loop.get("merge_final_warn")
+            ):
+                ci_loop["merge_final_warn"] = True
+                task.context = {**(task.context or {}), "review_loop": ci_loop}
+                await _maybe_create_failure_alert(task, session,
+                    f"PR #{ci_pr_number} merge failed {_merge_failures} times — "
+                    f"hard cap imminent ({MERGE_FAILURE_HARD_CAP - _merge_failures} retries remaining)")
             if _merge_failures >= MERGE_FAILURE_HARD_CAP:
                 task.status = TaskStatus.FAILED
                 task.requires_approval = True

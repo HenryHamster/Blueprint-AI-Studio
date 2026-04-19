@@ -3188,6 +3188,121 @@ async def test_issue_churn_injects_narrow_focus_and_reduces_cap(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_first_churn_detection_uses_one_third_reduction(db_session, mocker):
+    """First churn detection reduces remaining budget by 1/3:
+    reduced_cap = iteration + (remaining * 2 // 3)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    prior_history = [
+        {"iteration": 0, "feedback": "f0",
+         "issues": [_issue("alpha widget broken"), _issue("beta gauge crash")]},
+        {"iteration": 1, "feedback": "f1",
+         "issues": [_issue("gamma router panic"), _issue("delta cache miss")]},
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 702, "branch": "b1", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(original_task.id),
+                "pr_number": 702, "branch": "b1", "base_branch": "main",
+                "review_history": prior_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    current_issues = [_issue("epsilon timer off"), _issue("zeta parser err")]
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=702, branch="b1", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Please fix.",
+        current_feedback="fb", current_issues=current_issues,
+    )
+
+    # medium scope → baseline 12; iteration = 3; remaining = 9.
+    # First detection: 3 + 9*2//3 = 9.
+    new_loop = (result.context or {}).get("review_loop", {})
+    assert new_loop.get("max_iterations") == 9
+    assert new_loop.get("churn_detections") == 1
+
+
+@pytest.mark.asyncio
+async def test_second_churn_detection_uses_one_half_reduction(db_session, mocker):
+    """Second churn detection in the same fix cycle uses a 1/2 reduction:
+    reduced_cap = iteration + (remaining // 2)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    prior_history = [
+        {"iteration": 0, "feedback": "f0",
+         "issues": [_issue("alpha widget broken"), _issue("beta gauge crash")]},
+        {"iteration": 1, "feedback": "f1",
+         "issues": [_issue("gamma router panic"), _issue("delta cache miss")]},
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 703, "branch": "b1", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(original_task.id),
+                "pr_number": 703, "branch": "b1", "base_branch": "main",
+                "review_history": prior_history,
+                "churn_detections": 1,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    current_issues = [_issue("epsilon timer off"), _issue("zeta parser err")]
+    result, _ = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=703, branch="b1", base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Please fix.",
+        current_feedback="fb", current_issues=current_issues,
+    )
+
+    # medium scope → baseline 12; iteration = 3; remaining = 9.
+    # Second detection: 3 + 9//2 = 7 (vs 9 under 1/3 rule).
+    new_loop = (result.context or {}).get("review_loop", {})
+    assert new_loop.get("max_iterations") == 7
+    assert new_loop.get("churn_detections") == 2
+
+
+@pytest.mark.asyncio
 async def test_mid_budget_injects_narrow_focus_without_cap_reduction(db_session, mocker):
     """When a fix iteration has consumed >= 50% of the per-chain cap but no
     churn has been detected, a softer narrow-focus directive should be

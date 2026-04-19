@@ -51,7 +51,7 @@ def _copy_analysis_artifacts_to_previous(ctx: dict) -> None:
 _HEARTBEAT_STALE_DEFAULTS = {
     "small": 300,
     "medium": 420,
-    "large": 600,
+    "large": 900,
 }
 
 
@@ -59,7 +59,7 @@ _HEARTBEAT_EFFORT_FLOORS = {
     "low": 300,
     "medium": 300,
     "high": 420,
-    "max": 600,
+    "max": 720,
 }
 
 

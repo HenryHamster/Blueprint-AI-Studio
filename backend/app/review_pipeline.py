@@ -682,6 +682,7 @@ async def _spawn_pipeline_task(
         else prev_review_history
     )
 
+    churn_detections = int(source_loop.get("churn_detections", 0) or 0)
     # Stuck-cycle detection: if the same CRITICAL/MAJOR issues repeat across consecutive
     # iterations, escalate for manual review instead of consuming the full iteration budget.
     if task_type == "fix" and iteration >= 2 and len(new_review_history) >= 2:
@@ -798,11 +799,16 @@ async def _spawn_pipeline_task(
         # narrow focus. The stuck-cycle detector handles harsher intervention.
         is_churn, churn_counts = _detect_issue_churn(new_review_history)
         if is_churn and task_type == "fix":
+            churn_detections += 1
             remaining = max(per_chain_cap - iteration, 0)
-            reduced_cap = iteration + (remaining * 2 // 3)
+            if churn_detections >= 2:
+                reduced_cap = iteration + (remaining // 2)
+            else:
+                reduced_cap = iteration + (remaining * 2 // 3)
             if reduced_cap < per_chain_cap:
                 logger.warning(
-                    f"[PIPELINE] Issue churn detected for PR #{pr_number}: "
+                    f"[PIPELINE] Issue churn detected for PR #{pr_number} "
+                    f"(detection #{churn_detections}): "
                     f"CRITICAL+MAJOR counts {churn_counts} non-decreasing over "
                     f"{ISSUE_CHURN_WINDOW} iterations. Reducing cap "
                     f"{per_chain_cap} → {reduced_cap}; injecting narrow-focus directive."
@@ -878,6 +884,7 @@ async def _spawn_pipeline_task(
         "max_iterations": per_chain_cap,
         **({"review_history": new_review_history} if new_review_history else {}),
         **({"fix_reason": fix_reason} if fix_reason else {}),
+        **({"churn_detections": churn_detections} if churn_detections else {}),
     }
     new_task = Task(
         project_id=source_task.project_id,

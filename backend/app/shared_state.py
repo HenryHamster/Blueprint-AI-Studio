@@ -176,7 +176,7 @@ runtime_config: Dict = {
     "heartbeat_stale_seconds_by_scope": {
         "small": 300,
         "medium": 420,
-        "large": 600,
+        "large": 900,
     },
 }
 

@@ -65,29 +65,43 @@ CODE_ERROR_STAGE_GUIDANCE: dict[str, str] = {
 async def compute_effective_max_requeues(
     parent: Task, session: AsyncSession, max_requeues: int
 ) -> int:
-    """Return the max requeue count, reduced by 1 if any failed child repeats
-    its prior non-infra failure class."""
+    """Return the max requeue count, reduced when failed children show recurring
+    failure patterns:
+
+    - Same non-infra class repeats (current == previous): reduce by 1.
+    - A non-infra class appears 2+ times in ``_failure_class_history``: reduce
+      by 1; 3+ times: reduce by 2 (root cause clearly not being addressed).
+    - SCOPE_OVERFLOW appears 2+ times in history: reduce by 1, despite being
+      in INFRA_CLASSES, since repeat scope mismatches signal that scope
+      escalation is not working.
+    """
     children = (await session.execute(
         select(Task).where(
             Task.parent_task_id == parent.id,
             Task.status == TaskStatus.FAILED,
         )
     )).scalars().all()
+    reduction = 0
     for child in children:
         ctx = child.context or {}
         current_class = classify_failure(child, logs=ctx.get("last_error") or None)
         prev_class = ctx.get("_previous_failure_class")
         if prev_class and current_class == prev_class and current_class not in INFRA_CLASSES:
-            return max_requeues - 1
+            reduction = max(reduction, 1)
         history = ctx.get("_failure_class_history") or []
         if isinstance(history, list):
             counts: dict[str, int] = {}
             for cls in history:
-                if isinstance(cls, str) and cls and cls not in INFRA_CLASSES:
+                if isinstance(cls, str) and cls:
                     counts[cls] = counts.get(cls, 0) + 1
-                    if counts[cls] >= 2:
-                        return max_requeues - 1
-    return max_requeues
+            for cls, count in counts.items():
+                if cls == SCOPE_OVERFLOW and count >= 2:
+                    reduction = max(reduction, 1)
+                elif cls not in INFRA_CLASSES and count >= 3:
+                    reduction = max(reduction, 2)
+                elif cls not in INFRA_CLASSES and count >= 2:
+                    reduction = max(reduction, 1)
+    return max_requeues - reduction
 
 
 def classify_override_reason(failure_class: str, clone_ctx: dict) -> str:

@@ -461,6 +461,71 @@ async def test_requeue_same_class_infra_exempt_from_budget_reduction(tl_db, mock
 
 
 @pytest.mark.asyncio
+async def test_requeue_history_count_three_reduces_budget_by_two(tl_db, mocker):
+    """A non-infra class appearing 3+ times in _failure_class_history reduces
+    the parent retry budget by 2 (not 1): pattern strongly suggests retries
+    are not addressing the root cause.
+    """
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    # _requeue_count=1 → with MAX=3 reduced by 2, effective=1, hit cap → FAILED.
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 1},
+    )
+    await _make_task(
+        session, project.id, status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "failure_category": "CODE_ERROR",
+            "_previous_failure_class": "AGENT_TIMEOUT",
+            "_failure_class_history": ["CODE_ERROR", "CODE_ERROR", "CODE_ERROR"],
+            "_attempt_number": 4,
+        },
+        latest_status_message="tests failed yet again",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "Re-evaluation limit reached" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_requeue_repeated_scope_overflow_reduces_budget(tl_db, mocker):
+    """SCOPE_OVERFLOW is in INFRA_CLASSES but repeated occurrences (2+) signal
+    a persistent scope mismatch, not transient infra — reduce budget by 1.
+    """
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    # _requeue_count=2 → with MAX=3 reduced by 1, effective=2, hit cap → FAILED.
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 2},
+    )
+    await _make_task(
+        session, project.id, status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "failure_category": "SCOPE_OVERFLOW",
+            "_previous_failure_class": "SCOPE_OVERFLOW",
+            "_failure_class_history": ["SCOPE_OVERFLOW", "CODE_ERROR", "SCOPE_OVERFLOW"],
+            "_attempt_number": 3,
+        },
+        latest_status_message="scope overflow again",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "Re-evaluation limit reached" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
 async def test_requeue_no_children_to_retry_records_deploy_monitoring_result(tl_db):
     """Parent with only CANCELLED children (no failed, no active) records AGENT_TIMEOUT failure.
 

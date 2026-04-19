@@ -52,23 +52,33 @@ def test_heartbeat_stale_cutoff_respects_runtime_config_override():
 
 
 def test_heartbeat_stale_cutoff_effort_floor_extends_small_scope_max_effort():
-    """Effort floor (max=600s) extends small-scope cutoff (300s) when effort is higher."""
+    """Effort floor (max=720s) extends small-scope cutoff (300s) when effort is higher."""
     class _T:
         context = {"scope": "small", "effort": "max"}
         first_payload = None
 
     now = datetime(2026, 1, 1, 12, 0, 0)
-    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=600)
+    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=720)
 
 
 def test_heartbeat_stale_cutoff_effort_floor_does_not_weaken_large_scope():
-    """Large-scope threshold (600s) wins over low-effort floor (300s)."""
+    """Large-scope threshold (900s) wins over low-effort floor (300s)."""
     class _T:
         context = {"scope": "large", "effort": "low"}
         first_payload = None
 
     now = datetime(2026, 1, 1, 12, 0, 0)
-    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=600)
+    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=900)
+
+
+def test_heartbeat_stale_cutoff_large_scope_default_is_900s():
+    """Large-scope default threshold is 900s (15 minutes) for analysis-heavy tasks."""
+    class _T:
+        context = {"scope": "large"}
+        first_payload = None
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=900)
 
 
 def test_heartbeat_stale_cutoff_effort_from_task_type_fallback():
@@ -78,8 +88,8 @@ def test_heartbeat_stale_cutoff_effort_from_task_type_fallback():
         first_payload = None
 
     now = datetime(2026, 1, 1, 12, 0, 0)
-    # strategic_review -> "max" effort -> 600s floor > 300s small scope
-    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=600)
+    # strategic_review -> "max" effort -> 720s floor > 300s small scope
+    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=720)
 
 
 def test_heartbeat_stale_cutoff_unknown_effort_uses_scope_threshold():
@@ -369,10 +379,10 @@ async def test_orphan_ignored_without_vm_instance_id(
 
 
 @pytest.mark.asyncio
-async def test_large_scope_heartbeat_within_10min_not_reaped(
+async def test_large_scope_heartbeat_within_15min_not_reaped(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
-    """Large-scope task gets a 10min heartbeat budget — 8min stale stays IN_PROGRESS."""
+    """Large-scope task gets a 15min heartbeat budget — 8min stale stays IN_PROGRESS."""
     project = await _make_project(reaper_db)
     t = Task(
         project_id=project.id,
@@ -393,10 +403,10 @@ async def test_large_scope_heartbeat_within_10min_not_reaped(
 
 
 @pytest.mark.asyncio
-async def test_large_scope_heartbeat_past_10min_reaped(
+async def test_large_scope_heartbeat_past_15min_reaped(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
-    """Large-scope task past the 10min threshold is still reaped."""
+    """Large-scope task past the 15min threshold is still reaped."""
     project = await _make_project(reaper_db)
     t = Task(
         project_id=project.id,
@@ -404,7 +414,7 @@ async def test_large_scope_heartbeat_past_10min_reaped(
         vm_instance_id="vm-large-dead",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=11),
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=16),
         context={"scope": "large"},
     )
     reaper_db.add(t)
@@ -861,7 +871,7 @@ async def test_scope_aware_budget_large_code_error_fails_immediately(
 ):
     """scope=large cuts CODE_ERROR budget to 1, so attempt_count=1 terminally fails."""
     project = await _make_project(reaper_db)
-    # scope=large has a 10min heartbeat-stale threshold — need >10min of staleness
+    # scope=large has a 15min heartbeat-stale threshold — need >15min of staleness
     # for the reaper to classify this task as orphaned and run the budget check.
     t = Task(
         project_id=project.id,
@@ -869,7 +879,7 @@ async def test_scope_aware_budget_large_code_error_fails_immediately(
         vm_instance_id="vm-large-code-error",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=11),
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=16),
         context={"scope": "large", "last_error": "NameError: foo is not defined"},
     )
     reaper_db.add(t)
