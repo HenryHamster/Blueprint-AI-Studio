@@ -116,12 +116,32 @@ interface DigestData {
   pipeline_acceptance_rate?: number | null;
   scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
   prev_scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
+  cost_by_failure_class?: Record<string, number> | null;
+  total_failed_cost_usd?: number | null;
   failure_taxonomy_distribution?: {
     categories: Record<string, { count: number; percentage: number }>;
     total_failures: number;
     dominant_category: string | null;
   } | null;
+  failure_stage_distribution?: {
+    stages: Record<string, number>;
+    total_classified: number;
+    dominant_stage: string | null;
+  } | null;
+  pipeline_filter_funnel?: Record<string, number> | null;
 }
+
+const STAGE_ORDER = ['provision', 'clone', 'test', 'lint', 'build', 'pr_creation', 'merge', 'review'] as const;
+const STAGE_COLORS: Record<string, string> = {
+  provision: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  clone: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  test: 'bg-red-500/20 text-red-400 border-red-500/30',
+  lint: 'bg-red-500/20 text-red-400 border-red-500/30',
+  build: 'bg-red-500/20 text-red-400 border-red-500/30',
+  pr_creation: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
+  merge: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
+  review: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
+};
 
 const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
 const TAXONOMY_LABELS: Record<string, string> = {
@@ -198,7 +218,7 @@ function priorityBadge(p: string) {
 
 // ---------- failure class pill ----------
 
-function FailureClassPill({ group, sparkData }: { group: FailureGroup; sparkData?: { v: number }[] }) {
+function FailureClassPill({ group, sparkData, cost }: { group: FailureGroup; sparkData?: { v: number }[]; cost?: number }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const colorClass = FAILURE_CLASS_COLORS[group.failure_class] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
@@ -224,6 +244,9 @@ function FailureClassPill({ group, sparkData }: { group: FailureGroup; sparkData
       >
         {group.label}
         <span className="font-bold">{group.count}</span>
+        {cost != null && cost > 0 && (
+          <span className="font-mono text-[9px] opacity-80">${cost.toFixed(2)}</span>
+        )}
         {hasSpark && (
           <span className="w-16 h-3 inline-block">
             <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
@@ -529,7 +552,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               <div className="flex flex-wrap gap-1.5">
                 {digest.failure_groups.map(g => {
                   const classSpark = (digest.trend_history ?? []).map(p => ({ v: p.failed_by_class?.[g.failure_class] ?? 0 }));
-                  return <FailureClassPill key={g.failure_class} group={g} sparkData={classSpark} />;
+                  const classCost = digest.cost_by_failure_class?.[g.failure_class];
+                  return <FailureClassPill key={g.failure_class} group={g} sparkData={classSpark} cost={classCost ?? undefined} />;
                 })}
               </div>
             </section>
@@ -576,6 +600,75 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               </div>
             </section>
           )}
+
+          {/* Section 1d: Failure Stage Distribution */}
+          {!loading && digest?.failure_stage_distribution && digest.failure_stage_distribution.total_classified > 0 && (
+            <section>
+              <div className="flex flex-wrap gap-1.5 items-center">
+                <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Stage</span>
+                {STAGE_ORDER.map(stage => {
+                  const count = digest.failure_stage_distribution!.stages[stage];
+                  if (!count) return null;
+                  const isDominant = digest.failure_stage_distribution!.dominant_stage === stage;
+                  const base = STAGE_COLORS[stage] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+                  const cls = isDominant ? `${base} ring-1 ring-current` : base;
+                  return (
+                    <span key={stage} className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border uppercase ${cls}`} title={`${stage}: ${count}${isDominant ? ' — dominant stage' : ''}`}>
+                      {stage}
+                      <span className="font-bold">{count}</span>
+                    </span>
+                  );
+                })}
+              </div>
+            </section>
+          )}
+
+          {/* Section 1e: Pipeline Filter Funnel */}
+          {!loading && digest?.pipeline_filter_funnel && (digest.pipeline_filter_funnel.findings_produced ?? 0) > 0 && (() => {
+            const ff = digest.pipeline_filter_funnel;
+            const produced = ff.findings_produced ?? 0;
+            const created = ff.tasks_created ?? 0;
+            const pct = produced > 0 ? Math.round((created / produced) * 100) : 0;
+            const FILTER_KEYS: { key: string; label: string }[] = [
+              { key: 'hash_dedup', label: 'hash dedup' },
+              { key: 'word_overlap', label: 'word overlap' },
+              { key: 'file_overlap', label: 'file overlap' },
+              { key: 'type_filtered', label: 'type filter' },
+              { key: 'empty_prompt', label: 'empty prompt' },
+              { key: 'batch_cap', label: 'batch cap' },
+            ];
+            const drops = FILTER_KEYS
+              .map(f => ({ ...f, v: ff[f.key] ?? 0 }))
+              .filter(f => f.v > 0)
+              .sort((a, b) => b.v - a.v);
+            const topDrop = drops[0];
+            return (
+              <section>
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-neutral-400">
+                  <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Research yield</span>
+                  <span>
+                    <span className="font-semibold text-neutral-200">{created}</span>
+                    <span className="text-neutral-500"> / {produced} findings &rarr; tasks </span>
+                    <span className="font-semibold text-neutral-200">({pct}%)</span>
+                  </span>
+                  {topDrop && (
+                    <span className="text-neutral-500">
+                      top drop: <span className="text-neutral-300">{topDrop.label}</span> <span className="font-mono text-neutral-400">-{topDrop.v}</span>
+                    </span>
+                  )}
+                  {drops.length > 1 && (
+                    <span className="flex flex-wrap gap-1">
+                      {drops.slice(1).map(d => (
+                        <span key={d.key} className="text-[10px] text-neutral-500" title={d.label}>
+                          {d.label} <span className="font-mono text-neutral-400">-{d.v}</span>
+                        </span>
+                      ))}
+                    </span>
+                  )}
+                </div>
+              </section>
+            );
+          })()}
 
           {/* Section 2: Direction Portfolio Health */}
           <section>
