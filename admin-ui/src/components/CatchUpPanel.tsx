@@ -394,6 +394,16 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                     paused
                   </span>
                 )}
+                {dp.needs_manual_intervention && (
+                  <span className="text-[9px] bg-red-500/20 text-red-400 border border-red-500/30 px-1.5 py-0.5 rounded" title="Needs manual intervention: repeated failures or remediation cap hit">
+                    needs intervention
+                  </span>
+                )}
+                {dp.priority && (
+                  <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="Direction priority">
+                    {dp.priority}
+                  </span>
+                )}
                 {typeof dp.acceptance_rate === 'number' && (
                   <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="Operator acceptance rate">
                     {Math.round(dp.acceptance_rate * 100)}% acc
@@ -1009,6 +1019,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                 {item.direction_text.length > 40 ? item.direction_text.slice(0, 40) + '…' : item.direction_text}
                               </span>
                             )}
+                            {item.scope && (
+                              <span
+                                className="shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
+                                title={`scope: ${item.scope}`}
+                              >
+                                {item.scope}
+                              </span>
+                            )}
                             <span className={`shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded ${
                               item.reason === 'failed'
                                 ? 'bg-red-500/10 text-red-400'
@@ -1181,6 +1199,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             >
                               <Compass className="w-2.5 h-2.5 shrink-0" />
                               <span className="truncate">{t.direction_text.slice(0, 30)}{t.direction_text.length > 30 ? '…' : ''}</span>
+                            </span>
+                          )}
+                          {t.scope && (
+                            <span
+                              className="shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
+                              title={`scope: ${t.scope}`}
+                            >
+                              {t.scope}
                             </span>
                           )}
                           {t.running_cost_usd != null && t.running_cost_usd > 0 && (
