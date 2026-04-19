@@ -281,7 +281,7 @@ async def _record_remediation_if_terminal(
     # pipeline exhausts its iteration cap. Recording on the PR-creating task's
     # COMPLETED would prematurely stamp merged=True before review/CI has run.
     # FAILED/CANCELLED still record immediately since no viable PR exists.
-    _REVIEW_PIPELINE_TYPES = {"create", "refactor", "docs", "qa", "deps", "migrate", "fix"}
+    _REVIEW_PIPELINE_TYPES = {"create", "refactor", "docs", "qa", "deps", "migrate", "fix", "review"}
     if status == TaskStatus.COMPLETED:
         task_type = (task.first_payload or {}).get("type")
         if task_type in _REVIEW_PIPELINE_TYPES:
@@ -1500,6 +1500,12 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
             )
 
     if report is None:
+        logger.error(
+            "[INVESTIGATION] Task %s completed but report is unparseable — "
+            "no remediation spawned. Output prefix: %r",
+            task.id,
+            logs[:200],
+        )
         task.plan_output = {"raw": logs} if logs else {}
         task.status = TaskStatus.COMPLETED
         session.add(task)

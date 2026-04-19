@@ -1441,8 +1441,9 @@ class TestRecordRemediationIfTerminal:
         assert "remediation_attempts" not in project.directions[0]
 
     @pytest.mark.asyncio
-    async def test_completed_review_type_does_record(self, db_session):
-        """Review tasks represent the PR's actual outcome — COMPLETED means merged."""
+    async def test_completed_review_type_does_not_record(self, db_session):
+        """Review COMPLETED reflects the review verdict, not a merge — outcome
+        recording is deferred until the actual PR merge success path fires."""
         project = make_project(directions=[{"id": "dir-1", "status": "active"}])
         db_session.add(project)
         await db_session.commit()
@@ -1459,8 +1460,8 @@ class TestRecordRemediationIfTerminal:
         await db_session.commit()
         await db_session.refresh(project)
         d = project.directions[0]
-        assert d["remediation_attempts"] == 1
-        assert d["last_remediation_result"] == "merged"
+        assert "last_remediation_result" not in d
+        assert not d.get("remediation_attempts")
 
     @pytest.mark.asyncio
     async def test_failed_pr_creating_type_still_records(self, db_session):
@@ -2604,7 +2605,7 @@ class TestHandleInvestigationCompletion:
         assert "diagnosis_in_progress" not in d
 
     @pytest.mark.asyncio
-    async def test_malformed_json_falls_back_gracefully(self, db_session, mocker):
+    async def test_malformed_json_falls_back_gracefully(self, db_session, mocker, caplog):
         project = await self._setup(db_session, mocker)
         task = make_task(
             project_id=project.id,
@@ -2614,7 +2615,8 @@ class TestHandleInvestigationCompletion:
         await db_session.commit()
 
         bad_logs = "this is not json at all"
-        await _handle_investigation_completion(task, self._payload(bad_logs), db_session)
+        with caplog.at_level("ERROR", logger="app.task_completion"):
+            await _handle_investigation_completion(task, self._payload(bad_logs), db_session)
         await db_session.commit()
         await db_session.refresh(task)
         await db_session.refresh(project)
@@ -2624,6 +2626,10 @@ class TestHandleInvestigationCompletion:
         d = project.directions[0]
         assert "diagnosis_in_progress" not in d
         assert "diagnosis_completed_at" in d
+        assert any(
+            "[INVESTIGATION]" in r.message and "unparseable" in r.message
+            for r in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_handles_missing_direction_gracefully(self, db_session, mocker):

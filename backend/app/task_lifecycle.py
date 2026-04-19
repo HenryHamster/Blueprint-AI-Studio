@@ -1073,6 +1073,12 @@ async def _process_post_commit(
                         if merge_result.get("merged"):
                             task.context = {**(task.context or {}), "pr_merged": True}
                             session.add(task)
+                            if (task.context or {}).get("diagnosis_task_id"):
+                                try:
+                                    from app.task_completion import _record_remediation_outcome
+                                    await _record_remediation_outcome(task, merged=True, session=session)
+                                except Exception as _rr_exc:
+                                    logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome on merge for task {task.id}: {_rr_exc!r}")
                             await session.commit()
                             await _cleanup_branches(task, session)
                             logger.info(f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)")
@@ -1645,6 +1651,12 @@ async def _process_post_commit(
                                             orig.status = TaskStatus.COMPLETED
                                             orig.latest_status_message = "Rollup PR merged"
                                         session.add(orig)
+                                        if (orig.context or {}).get("diagnosis_task_id"):
+                                            try:
+                                                from app.task_completion import _record_remediation_outcome
+                                                await _record_remediation_outcome(orig, merged=True, session=session)
+                                            except Exception as _rr_exc:
+                                                logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome on merge for task {orig.id}: {_rr_exc!r}")
                                         # Post result message for auto-remediation tasks
                                         if (orig.context or {}).get("auto_remediation") is True:
                                             try:
