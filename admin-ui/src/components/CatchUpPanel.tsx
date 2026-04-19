@@ -306,6 +306,19 @@ interface DigestData {
     investigations_by_confidence?: Record<string, number>;
     failed_remediations_by_class?: Record<string, number>;
     remediation_success_by_confidence?: Record<string, { merged: number; failed: number }>;
+    recent_investigations?: Array<{
+      task_id: string;
+      direction_id?: string | null;
+      summary?: string | null;
+      confidence?: string | null;
+      severity?: string | null;
+      completed_at?: string | null;
+    }>;
+    active_investigations_detail?: Array<{
+      task_id: string;
+      direction_id?: string | null;
+      elapsed_hours?: number | null;
+    }>;
   } | null;
 }
 
@@ -866,6 +879,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
   const [failuresExpanded, setFailuresExpanded] = useState(false);
   const [completionsExpanded, setCompletionsExpanded] = useState(false);
   const [remediationExpanded, setRemediationExpanded] = useState(false);
+  const [investigationsExpanded, setInvestigationsExpanded] = useState(false);
   const [cycleSummaryExpanded, setCycleSummaryExpanded] = useState(false);
   const [expandedSnippets, setExpandedSnippets] = useState<Set<string>>(new Set());
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
@@ -2637,6 +2651,78 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                       <span className="font-mono text-neutral-300">{count}</span>
                                     </span>
                                   ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
+                        {(() => {
+                          const recent = rf.recent_investigations ?? [];
+                          const active = rf.active_investigations_detail ?? [];
+                          if (!recent.length && !active.length) return null;
+                          const visibleRecent = investigationsExpanded || recent.length <= 2
+                            ? recent
+                            : recent.slice(0, 2);
+                          const confBadge: Record<string, string> = {
+                            high: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+                            medium: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+                            low: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
+                          };
+                          const sevBadge: Record<string, string> = {
+                            high: 'bg-red-500/20 text-red-400 border-red-500/30',
+                            medium: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+                            low: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
+                          };
+                          return (
+                            <div className="flex flex-col gap-1.5 text-[10px] border-t border-neutral-800 pt-1.5">
+                              {recent.length > 0 && (
+                                <div className="flex flex-col gap-1">
+                                  <div className="text-neutral-500">recent diagnoses:</div>
+                                  {visibleRecent.map(inv => (
+                                    <div key={inv.task_id} className="flex items-start gap-2">
+                                      <span className="flex-1 text-neutral-300 truncate">
+                                        {inv.summary || <span className="text-neutral-600 italic">(no summary)</span>}
+                                      </span>
+                                      {inv.confidence && (
+                                        <span className={`${confBadge[inv.confidence] ?? confBadge.low} border px-1 rounded uppercase text-[9px] font-semibold shrink-0`}>
+                                          {inv.confidence}
+                                        </span>
+                                      )}
+                                      {inv.severity && (
+                                        <span className={`${sevBadge[inv.severity] ?? sevBadge.low} border px-1 rounded uppercase text-[9px] font-semibold shrink-0`}>
+                                          {inv.severity}
+                                        </span>
+                                      )}
+                                      {inv.completed_at && <span className="text-neutral-600 font-mono shrink-0">{timeAgo(inv.completed_at)}</span>}
+                                    </div>
+                                  ))}
+                                  {recent.length > 2 && (
+                                    <button
+                                      onClick={() => setInvestigationsExpanded(v => !v)}
+                                      className="text-[9px] text-neutral-500 hover:text-neutral-300 self-start"
+                                    >
+                                      {investigationsExpanded ? 'show less' : `show ${recent.length - 2} more`}
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                              {active.length > 0 && (
+                                <div className="flex flex-col gap-1">
+                                  <div className="text-neutral-500">active investigations:</div>
+                                  {active.map(inv => {
+                                    const wedged = (inv.elapsed_hours ?? 0) > 4;
+                                    return (
+                                      <div key={inv.task_id} className={`flex items-center gap-2 ${wedged ? 'text-amber-400' : 'text-neutral-400'}`}>
+                                        <span className="font-mono shrink-0">
+                                          {inv.elapsed_hours != null ? `${inv.elapsed_hours.toFixed(1)}h` : '—'}
+                                        </span>
+                                        <span className="truncate text-neutral-500">
+                                          dir: {inv.direction_id ?? '—'}
+                                        </span>
+                                        {wedged && <span className="text-[9px] uppercase font-semibold shrink-0">wedged?</span>}
+                                      </div>
+                                    );
+                                  })}
                                 </div>
                               )}
                             </div>

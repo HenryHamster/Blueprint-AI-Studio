@@ -2134,6 +2134,44 @@ async def get_digest(
         else:
             bucket["failed"] += 1
 
+    _completed_inv = [
+        t for t in _inv_tasks
+        if t.status == TaskStatus.COMPLETED and isinstance(t.plan_output, dict)
+    ]
+    _completed_inv.sort(
+        key=lambda t: _derive_completed_at(t) or t.created_at or _utcnow(),
+        reverse=True,
+    )
+    recent_investigations: List[Dict[str, Any]] = []
+    for t in _completed_inv[:5]:
+        po = t.plan_output or {}
+        summary = str(po.get("summary") or "").strip()
+        if len(summary) > 200:
+            summary = summary[:200].rstrip() + "…"
+        completed_at = _derive_completed_at(t)
+        recent_investigations.append({
+            "task_id": str(t.id),
+            "direction_id": (t.context or {}).get("direction_id"),
+            "summary": summary,
+            "confidence": str(po.get("confidence") or "").strip().lower() or None,
+            "severity": str(po.get("severity") or "").strip().lower() or None,
+            "completed_at": completed_at.isoformat() if completed_at else None,
+        })
+
+    active_investigations_detail: List[Dict[str, Any]] = []
+    _now = _utcnow()
+    for t in _inv_tasks:
+        if t.status not in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING):
+            continue
+        elapsed_hours = None
+        if t.created_at:
+            elapsed_hours = round((_now - t.created_at).total_seconds() / 3600.0, 2)
+        active_investigations_detail.append({
+            "task_id": str(t.id),
+            "direction_id": (t.context or {}).get("direction_id"),
+            "elapsed_hours": elapsed_hours,
+        })
+
     remediation_funnel = {
         "investigations_spawned": investigations_spawned,
         "investigations_completed": investigations_completed,
@@ -2146,6 +2184,8 @@ async def get_digest(
         "investigations_by_confidence": investigations_by_confidence,
         "failed_remediations_by_class": failed_remediations_by_class,
         "remediation_success_by_confidence": remediation_success_by_confidence,
+        "recent_investigations": recent_investigations,
+        "active_investigations_detail": active_investigations_detail,
     }
 
     return {
