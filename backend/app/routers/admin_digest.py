@@ -1258,6 +1258,38 @@ async def get_digest(
     retry_task_count = _retry_task_count
     avg_retries_before_failure = round(_retry_attempt_sum / _retry_task_count, 2) if _retry_task_count else None
 
+    # Retry success/waste metrics by _previous_failure_class (the class that triggered the retry)
+    _retry_success_by_class: Dict[str, int] = {}
+    _retry_failure_by_class: Dict[str, int] = {}
+    _retry_success_count = 0
+    for t in completed_tasks:
+        _ctx = t.context or {}
+        if (_ctx.get("_attempt_number") or 0) > 1:
+            _retry_success_count += 1
+            _cls = _ctx.get("_previous_failure_class") or "UNKNOWN"
+            _retry_success_by_class[_cls] = _retry_success_by_class.get(_cls, 0) + 1
+    for t in failed_tasks:
+        _ctx = t.context or {}
+        if (_ctx.get("_attempt_number") or 0) > 1:
+            _cls = _ctx.get("_previous_failure_class") or "UNKNOWN"
+            _retry_failure_by_class[_cls] = _retry_failure_by_class.get(_cls, 0) + 1
+    _retry_classes = set(_retry_success_by_class) | set(_retry_failure_by_class)
+    retry_success_rate_by_class = {
+        _cls: {
+            "merged": _retry_success_by_class.get(_cls, 0),
+            "failed": _retry_failure_by_class.get(_cls, 0),
+            "success_rate": round(
+                _retry_success_by_class.get(_cls, 0)
+                / (_retry_success_by_class.get(_cls, 0) + _retry_failure_by_class.get(_cls, 0)),
+                4,
+            ),
+        }
+        for _cls in _retry_classes
+    }
+    retry_success_count = _retry_success_count
+    _total_retried = _retry_success_count + _retry_task_count
+    retry_wasted_rate = round(_retry_task_count / _total_retried, 4) if _total_retried else None
+
     # Taxonomy distribution (4-category: scope/review/infra/code_defect)
     _tax_keys = (
         TAXONOMY_SCOPE_RELATED, TAXONOMY_REVIEW_QUALITY,
@@ -1842,6 +1874,9 @@ async def get_digest(
         "retry_overhead_cost_usd": retry_overhead_cost_usd,
         "retry_task_count": retry_task_count,
         "avg_retries_before_failure": avg_retries_before_failure,
+        "retry_success_count": retry_success_count,
+        "retry_success_rate_by_class": retry_success_rate_by_class,
+        "retry_wasted_rate": retry_wasted_rate,
         "daily_cost_usd": daily_cost_usd,
         "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
         "narrative_summary": narrative_summary,

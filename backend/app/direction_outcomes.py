@@ -46,6 +46,12 @@ def _is_cascade_cancelled(task: Task) -> bool:
     )
 
 
+def _is_review_cap_exhausted(task: Task) -> bool:
+    """Review-fix pipeline hit its iteration cap — a code/review-quality failure,
+    not infrastructure, even though failure_class is AGENT_TIMEOUT (in INFRA_CLASSES)."""
+    return (task.context or {}).get("failure_detail") == "review_cap_exhausted"
+
+
 def _counts_as_failure(task: Task) -> bool:
     """Terminal status that represents a genuine failure for direction metrics."""
     if task.status == TaskStatus.FAILED:
@@ -240,7 +246,7 @@ async def _update_direction_research_outcomes(
                         "effort_attempted": effort_attempted,
                         "scope_calibrated_from": scope_calibrated_from,
                     })
-                    if category in INFRA_CLASSES:
+                    if category in INFRA_CLASSES and not _is_review_cap_exhausted(ct):
                         infra_failures += 1
             entry["failed_task_details"] = failed_details[:5]  # cap at 5 to avoid bloat
             entry["tasks_failed_infra"] = infra_failures
@@ -253,7 +259,10 @@ async def _update_direction_research_outcomes(
             for ct in child_tasks_rows:
                 if _counts_as_failure(ct):
                     fc = _classify_failure(ct)
-                    if fc == "CODE_ERROR":
+                    if _is_review_cap_exhausted(ct):
+                        sd_code_error += 1
+                        sd_code_error_ids.add(ct.id)
+                    elif fc == "CODE_ERROR":
                         sd_code_error += 1
                         sd_code_error_ids.add(ct.id)
                     elif fc in INFRA_CLASSES:
@@ -356,7 +365,7 @@ async def _update_direction_research_outcomes(
                 if _counts_as_failure(ct):
                     scope_breakdown[scope]["failed"] += 1
                     fcat = ctx_.get("failure_category") or _classify_failure(ct)
-                    if fcat in INFRA_CLASSES:
+                    if fcat in INFRA_CLASSES and not _is_review_cap_exhausted(ct):
                         scope_breakdown[scope]["failed_infra"] += 1
                     if fcat == CODE_ERROR:
                         scope_breakdown[scope]["failed_code_error"] += 1
@@ -445,7 +454,8 @@ async def _update_direction_research_outcomes(
                     failed_nc = sum(
                         1 for st in sts
                         if _counts_as_failure(st)
-                        and _classify_failure(st) not in INFRA_CLASSES
+                        and (_classify_failure(st) not in INFRA_CLASSES
+                             or _is_review_cap_exhausted(st))
                     )
                     file_counts = [
                         len((st.context or {}).get("_pr_changed_files") or [])

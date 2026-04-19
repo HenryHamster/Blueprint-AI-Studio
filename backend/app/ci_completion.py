@@ -28,10 +28,23 @@ from app.models import Task, TaskStatus, _utcnow
 
 logger = logging.getLogger(__name__)
 
-# Hard cap on merge retries — escalates at 10, but if we hit this many failures
-# the PR is clearly stuck (e.g. corrupted ci_wait_started bypassing the CI backstop
-# in services.py). Mark FAILED with requires_approval to force manual intervention.
+# Hard cap on merge retries — scope-aware. Small-scope PRs (single-file tweaks)
+# have fewer legitimate reasons for transient merge failures, so cap sooner.
+# Escalation alert fires at (cap - 5), final-warn at (cap - 2).
 MERGE_FAILURE_HARD_CAP = 15
+_SCOPE_MERGE_HARD_CAP = {"small": 8, "medium": 12, "large": 15}
+
+
+def _merge_hard_cap_for_task(task: Task) -> int:
+    """Return scope-adjusted merge hard cap, falling back to the default."""
+    ctx = task.context or {}
+    scope = ctx.get("scope")
+    if not scope:
+        payload = task.first_payload or {}
+        scope = payload.get("scope")
+    if isinstance(scope, str):
+        return _SCOPE_MERGE_HARD_CAP.get(scope.lower(), MERGE_FAILURE_HARD_CAP)
+    return MERGE_FAILURE_HARD_CAP
 
 
 _MERGE_ERR_NORMALIZE_PATTERNS = (
@@ -388,13 +401,16 @@ async def _attempt_merge_with_retry_and_escalation(
             task.context = {**(task.context or {}), "review_loop": ci_loop}
             task.latest_status_message = f"Merge attempt {_merge_failures} failed on PR #{ci_pr_number}: {merge_msg} — retrying"
             logger.warning(f"[CI] PR #{ci_pr_number} merge failed ({_merge_failures}x): {merge_msg} — will retry ({source})")
-            if _merge_failures >= 10 and not ci_loop.get("merge_escalated"):
+            _hard_cap = _merge_hard_cap_for_task(task)
+            _escalate_at = max(1, _hard_cap - 5)
+            _final_warn_at = max(1, _hard_cap - 2)
+            if _merge_failures >= _escalate_at and not ci_loop.get("merge_escalated"):
                 ci_loop["merge_escalated"] = True
                 task.context = {**(task.context or {}), "review_loop": ci_loop}
                 await _maybe_create_failure_alert(task, session,
                     f"Rollup PR #{ci_pr_number} merge failed {_merge_failures} times — still retrying")
             if (
-                _merge_failures >= MERGE_FAILURE_HARD_CAP - 2
+                _merge_failures >= _final_warn_at
                 and ci_loop.get("merge_escalated")
                 and not ci_loop.get("merge_final_warn")
             ):
@@ -402,12 +418,12 @@ async def _attempt_merge_with_retry_and_escalation(
                 task.context = {**(task.context or {}), "review_loop": ci_loop}
                 await _maybe_create_failure_alert(task, session,
                     f"PR #{ci_pr_number} merge failed {_merge_failures} times — "
-                    f"hard cap imminent ({MERGE_FAILURE_HARD_CAP - _merge_failures} retries remaining)")
+                    f"hard cap imminent ({_hard_cap - _merge_failures} retries remaining)")
             _repeated_identical = _err_streak >= 3
-            if _merge_failures >= MERGE_FAILURE_HARD_CAP or _repeated_identical:
+            if _merge_failures >= _hard_cap or _repeated_identical:
                 task.status = TaskStatus.FAILED
                 task.requires_approval = True
-                if _repeated_identical and _merge_failures < MERGE_FAILURE_HARD_CAP:
+                if _repeated_identical and _merge_failures < _hard_cap:
                     task.latest_status_message = (
                         f"PR #{ci_pr_number} merge failed with identical error "
                         f"{_err_streak} times in a row: {merge_msg[:200]} — "
@@ -416,7 +432,7 @@ async def _attempt_merge_with_retry_and_escalation(
                 else:
                     task.latest_status_message = (
                         f"PR #{ci_pr_number} merge failed {_merge_failures} times "
-                        f"(>= {MERGE_FAILURE_HARD_CAP}) — giving up, needs manual intervention"
+                        f"(>= {_hard_cap}) — giving up, needs manual intervention"
                     )
                 if ci_orig_id:
                     try:

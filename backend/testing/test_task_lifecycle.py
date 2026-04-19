@@ -1099,6 +1099,49 @@ async def test_requeue_enriches_clone_context_with_fingerprint_and_stage(tl_db, 
 
 
 @pytest.mark.asyncio
+async def test_requeue_skips_child_when_error_fingerprint_matches_prior(tl_db, mocker):
+    """Children with matching _previous_error_fingerprint are not cloned, and
+    the parent's _requeue_count is not incremented when all failed children
+    are skipped via fingerprint match."""
+    from app.anomaly_detection import _error_fingerprint
+
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    # COMPLETED sibling keeps the no-failed-to-retry branch from marking parent FAILED
+    await _make_task(
+        session, project.id, status=TaskStatus.COMPLETED, parent_task_id=parent.id,
+    )
+    error_msg = "pytest failed: assertion error on line 42"
+    prior_fp = _error_fingerprint(error_msg)
+    failed_child = await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_attempt_number": 2, "_previous_error_fingerprint": prior_fp},
+        latest_status_message=error_msg,
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    # No new QUEUED clone was created for the fingerprint-matching child
+    clones = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().all()
+    assert clones == []
+
+    # Original failed child is untouched (not cancelled)
+    await session.refresh(failed_child)
+    assert failed_child.status == TaskStatus.FAILED
+
+    # Parent requeue count was not incremented
+    await session.refresh(parent)
+    assert (parent.context or {}).get("_requeue_count", 0) == 0
+
+
+@pytest.mark.asyncio
 async def test_requeue_enriches_clone_context_provision_stage(tl_db, mocker):
     """Clone context has _previous_failure_stage=provision for PROVISION_FAILURE."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
