@@ -3868,3 +3868,60 @@ async def test_digest_ci_auto_remediation(client: AsyncClient, db_session):
     assert ci["failed"] == 1
     assert ci["by_ci_failure_type"]["test"] == {"spawned": 1, "merged": 1, "failed": 0}
     assert ci["by_ci_failure_type"]["build"] == {"spawned": 1, "merged": 0, "failed": 1}
+
+
+@pytest.mark.asyncio
+async def test_digest_prior_investigation_reuse(client: AsyncClient, db_session):
+    """CI auto-remediation tasks with prior_diagnosis_task_id surface in prior_investigation_reuse."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    with_prior_merged = make_task(
+        project_id=project.id,
+        title="ci rem with prior merged",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=3),
+        context={
+            "auto_remediation": True,
+            "prior_diagnosis_task_id": "inv-1",
+            "ci_failure_type": "test",
+        },
+    )
+    with_prior_failed = make_task(
+        project_id=project.id,
+        title="ci rem with prior failed",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=2),
+        context={
+            "auto_remediation": True,
+            "prior_diagnosis_task_id": "inv-2",
+            "ci_failure_type": "build",
+        },
+    )
+    without_prior = make_task(
+        project_id=project.id,
+        title="ci rem no prior",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=1),
+        context={
+            "auto_remediation": True,
+            "ci_failure_type": "test",
+        },
+    )
+    db_session.add_all([with_prior_merged, with_prior_failed, without_prior])
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    reuse = response.json()["remediation_funnel"]["prior_investigation_reuse"]
+
+    assert reuse["total_with_prior"] == 2
+    assert reuse["merged_with_prior"] == 1
+    assert reuse["failed_with_prior"] == 1
+    assert reuse["merge_rate"] == 0.5

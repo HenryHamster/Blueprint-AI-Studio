@@ -2317,6 +2317,18 @@ async def get_digest(
             bucket["failed"] += 1
     ci_auto_remediation["by_ci_failure_type"] = _ci_type_buckets
 
+    _prior_tasks = [t for t in _ci_rem_tasks if (t.context or {}).get("prior_diagnosis_task_id")]
+    _total_with_prior = len(_prior_tasks)
+    _merged_with_prior = sum(1 for t in _prior_tasks if t.status == TaskStatus.COMPLETED)
+    _failed_with_prior = sum(1 for t in _prior_tasks if t.status == TaskStatus.FAILED)
+    _prior_resolved = _merged_with_prior + _failed_with_prior
+    prior_investigation_reuse: Dict[str, Any] = {
+        "total_with_prior": _total_with_prior,
+        "merged_with_prior": _merged_with_prior,
+        "failed_with_prior": _failed_with_prior,
+        "merge_rate": round(_merged_with_prior / _prior_resolved, 4) if _prior_resolved else None,
+    }
+
     _cum_filters = [Task.status == TaskStatus.COMPLETED]
     if project_id:
         _cum_filters.append(Task.project_id == project_id)
@@ -2354,6 +2366,7 @@ async def get_digest(
         "recent_investigations": recent_investigations,
         "active_investigations_detail": active_investigations_detail,
         "ci_auto_remediation": ci_auto_remediation,
+        "prior_investigation_reuse": prior_investigation_reuse,
     }
 
     _review_quality = _compute_review_quality_metrics(completed_tasks + failed_tasks)

@@ -352,6 +352,13 @@ interface DigestData {
     investigations_by_confidence?: Record<string, number>;
     failed_remediations_by_class?: Record<string, number>;
     merged_remediations_by_trigger_class?: Record<string, number>;
+    cumulative_merged_by_trigger_class?: Record<string, number>;
+    ci_auto_remediation?: {
+      spawned: number;
+      merged: number;
+      failed: number;
+      by_ci_failure_type?: Record<string, { spawned: number; merged: number; failed: number }>;
+    };
     remediation_success_by_confidence?: Record<string, { merged: number; failed: number }>;
     recent_investigations?: Array<{
       task_id: string;
@@ -2783,7 +2790,11 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               })()}
 
               {/* Remediation pipeline */}
-              {digest!.remediation_funnel && digest!.remediation_funnel.investigations_spawned > 0 && (() => {
+              {digest!.remediation_funnel && (
+                digest!.remediation_funnel.investigations_spawned > 0
+                || (digest!.remediation_funnel.ci_auto_remediation?.spawned ?? 0) > 0
+                || Object.keys(digest!.remediation_funnel.cumulative_merged_by_trigger_class ?? {}).length > 0
+              ) && (() => {
                 const rf = digest!.remediation_funnel!;
                 const successRate = rf.remediations_spawned > 0
                   ? rf.remediations_merged / rf.remediations_spawned
@@ -2869,6 +2880,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           const rsbc = rf.remediation_success_by_confidence ?? {};
                           const frbc = rf.failed_remediations_by_class ?? {};
                           const mrbc = rf.merged_remediations_by_trigger_class ?? {};
+                          const cmbc = rf.cumulative_merged_by_trigger_class ?? {};
+                          const car = rf.ci_auto_remediation;
+                          const cmbcEntries = Object.entries(cmbc)
+                            .filter(([, v]) => v > 0)
+                            .sort((a, b) => b[1] - a[1]);
+                          const carTypeEntries = Object.entries(car?.by_ci_failure_type ?? {})
+                            .filter(([, v]) => (v.spawned + v.merged + v.failed) > 0)
+                            .sort((a, b) => b[1].spawned - a[1].spawned);
                           const ibcEntries = confOrder.filter(k => (ibc[k] ?? 0) > 0);
                           const rsbcEntries = confOrder.filter(k => {
                             const v = rsbc[k];
@@ -2880,7 +2899,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           const mrbcEntries = Object.entries(mrbc)
                             .filter(([, v]) => v > 0)
                             .sort((a, b) => b[1] - a[1]);
-                          if (!ibcEntries.length && !rsbcEntries.length && !frbcEntries.length && !mrbcEntries.length) return null;
+                          const hasCar = !!car && (car.spawned + car.merged + car.failed) > 0;
+                          if (!ibcEntries.length && !rsbcEntries.length && !frbcEntries.length && !mrbcEntries.length && !cmbcEntries.length && !hasCar) return null;
                           return (
                             <div className="flex flex-col gap-1 text-[10px] text-neutral-400 border-t border-neutral-800 pt-1.5">
                               {ibcEntries.length > 0 && (
@@ -2929,6 +2949,47 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                     <span key={cls} className="inline-flex items-baseline gap-1">
                                       <span className="text-emerald-400">{cls}</span>
                                       <span className="font-mono text-neutral-300">{count}</span>
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                              {cmbcEntries.length > 0 && (
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-neutral-500 w-24 shrink-0">all-time merged by class:</span>
+                                  {cmbcEntries.map(([cls, count]) => (
+                                    <span key={cls} className="inline-flex items-baseline gap-1">
+                                      <span className={count >= 3 ? 'text-emerald-400' : 'text-amber-400'}>{cls}</span>
+                                      <span className="font-mono text-neutral-300">{count}</span>
+                                      {count >= 3 && <span className="text-emerald-600 text-[9px]">✓</span>}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                              {hasCar && (
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-neutral-500 w-24 shrink-0">ci auto-remediation:</span>
+                                  <span className="inline-flex items-baseline gap-1">
+                                    <span className="text-neutral-500">spawned</span>
+                                    <span className="font-mono text-neutral-300">{car!.spawned}</span>
+                                  </span>
+                                  <span className="inline-flex items-baseline gap-1">
+                                    <span className="text-neutral-500">merged</span>
+                                    <span className="font-mono text-emerald-400">{car!.merged}</span>
+                                  </span>
+                                  <span className="inline-flex items-baseline gap-1">
+                                    <span className="text-neutral-500">failed</span>
+                                    <span className="font-mono text-red-400">{car!.failed}</span>
+                                  </span>
+                                </div>
+                              )}
+                              {carTypeEntries.length > 0 && (
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-neutral-500 w-24 shrink-0">ci by failure type:</span>
+                                  {carTypeEntries.map(([cls, v]) => (
+                                    <span key={cls} className="inline-flex items-baseline gap-1">
+                                      <span className="text-cyan-400">{cls}</span>
+                                      <span className="font-mono text-neutral-300">{v.spawned}</span>
+                                      <span className="text-neutral-600">({v.merged}✓/{v.failed}✗)</span>
                                     </span>
                                   ))}
                                 </div>

@@ -599,6 +599,69 @@ async def test_full_ci_remediation_cycle_spawn_to_trackable_outcome(db_session: 
 
 
 @pytest.mark.asyncio
+async def test_remediation_spawn_to_feedback_clears_escalation_state(db_session: AsyncSession):
+    """End-to-end: spawn → merged feedback clears per-branch failure counts and suspension."""
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.notification_dispatch import post_auto_fix_result_message
+
+    project = await _create_project(
+        db_session,
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "branch_failure_counts": {"main": 2},
+                "suspended_branches": ["main"],
+            }
+        },
+    )
+
+    # Unsuspend 'main' so spawn can proceed; prior failure count persists.
+    ar = dict(project.design_doc["_auto_remediation"])
+    ar["suspended_branches"] = []
+    project.design_doc = {**project.design_doc, "_auto_remediation": ar}
+    flag_modified(project, "design_doc")
+    await db_session.flush()
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+        mock_ctx.return_value = (["CI / tests"], "AssertionError: boom", "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    spawned = await session_tasks(db_session, project.id)
+    assert len(spawned) == 1
+    task = spawned[0]
+
+    # Re-suspend and restore the prior-failure count to simulate state at merge time.
+    ar = dict(project.design_doc["_auto_remediation"])
+    ar["branch_failure_counts"] = {"main": 2}
+    ar["suspended_branches"] = ["main"]
+    project.design_doc = {**project.design_doc, "_auto_remediation": ar}
+    flag_modified(project, "design_doc")
+    await db_session.flush()
+
+    await post_auto_fix_result_message(
+        db_session,
+        project.id,
+        branch="main",
+        result="merged",
+        pr_number=999,
+        task_id=task.id,
+    )
+    ar_after = (project.design_doc or {}).get("_auto_remediation", {})
+    assert "main" not in ar_after.get("branch_failure_counts", {})
+    assert "main" not in ar_after.get("suspended_branches", [])
+
+
+@pytest.mark.asyncio
 async def test_find_matching_prior_investigation_matches_on_file_path(db_session: AsyncSession):
     """A recent completed investigate task whose affected file appears in the error summary matches."""
     project = await _create_project(db_session)
