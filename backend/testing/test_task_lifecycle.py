@@ -1950,6 +1950,15 @@ class TestBuildRetryPromptSuffix:
         assert "backend/app=2" in guidance
         assert "agent/src=1" in guidance
 
+    def test_scope_overflow_analysis_gate_uses_analysis_guidance(self):
+        guidance, override = _build_retry_prompt_suffix(
+            "SCOPE_OVERFLOW", None, attempt=1, task_scope="medium",
+            ctx={"scope_gate_triggered": "analysis_overflow"},
+        )
+        assert "analysis plan" in guidance.lower()
+        assert "file-count budget" not in guidance.lower()
+        assert override == "large"
+
     def test_scope_overflow_raw_lowercase_label_via_failure_category(self):
         """Path matches when failure_class is missing but ctx has lowercase label."""
         _, override = _build_retry_prompt_suffix(

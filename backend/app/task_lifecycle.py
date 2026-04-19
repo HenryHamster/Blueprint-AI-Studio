@@ -210,11 +210,19 @@ def _build_retry_prompt_suffix(
     # productive decomposition pass. Matches both the canonical SCOPE_OVERFLOW class
     # and the raw lowercase 'scope_overflow' label in case normalization didn't run.
     elif failure_class == "SCOPE_OVERFLOW" or (ctx.get("failure_category") or "").lower() == "scope_overflow":
-        extra_guidance = (
-            "RETRY GUIDANCE: The previous attempt exceeded the scope's file-count budget.\n"
-            "- Focus on the single most critical change; limit production edits to 1-3 files\n"
-            "- Split unrelated concerns into follow-up work rather than bundling them here\n"
-        )
+        if ctx.get("scope_gate_triggered") == "analysis_overflow":
+            extra_guidance = (
+                "RETRY GUIDANCE: The previous attempt could not produce a valid analysis plan within the scope budget.\n"
+                "- Simplify the analysis approach; target the smallest coherent change that addresses the core issue\n"
+                "- Plan against fewer files up front rather than exploring broadly\n"
+                "- Avoid tangential code paths, speculative refactors, or unrelated cleanups\n"
+            )
+        else:
+            extra_guidance = (
+                "RETRY GUIDANCE: The previous attempt exceeded the scope's file-count budget.\n"
+                "- Focus on the single most critical change; limit production edits to 1-3 files\n"
+                "- Split unrelated concerns into follow-up work rather than bundling them here\n"
+            )
         extra_guidance += _build_scope_overflow_details(ctx, task_scope)
         if task_scope == "medium":
             scope_override = "large"

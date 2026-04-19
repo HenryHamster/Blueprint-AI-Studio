@@ -913,8 +913,12 @@ async def reaper_service():
                                 and _external_health.get("claude_api", False)
                             )
                         elif _fail_cat == "AGENT_TIMEOUT":
-                            # OOM kills, process crashes, heartbeat timeouts (exit 137/143)
-                            # are transient per-VM issues. Ready if any zone can accept a VM.
+                            # Process crashes and heartbeat timeouts are transient per-VM
+                            # issues. OOM kills are NOT transient — the task scope hasn't
+                            # changed and it will OOM again on the same VM type. Skip
+                            # resurrection for OOM; let scope reduction handle it.
+                            if _ctx.get("timeout_subtype") == "oom":
+                                continue
                             _infra_ready = any_zone_available()
 
                         if not _infra_ready:

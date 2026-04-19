@@ -237,6 +237,27 @@ interface DigestData {
     avg_iterations: number | null;
     top_directions: { direction_id: string; count: number }[];
   } | null;
+  analysis_overflow_summary?: {
+    total_count: number;
+    by_scope: Record<string, number>;
+    cost_usd: number;
+  } | null;
+  provision_waste_cost_usd?: number | null;
+  provision_waste_by_direction?: {
+    direction_id: string;
+    direction_text: string;
+    provision_cost_usd: number;
+    provision_task_count: number;
+  }[] | null;
+  provisioning_overhead_pct?: number | null;
+  retry_success_rate_by_class?: Record<string, { merged: number; failed: number; success_rate: number }> | null;
+  escalation_outcome_summary?: {
+    total_attempted: number;
+    total_merged: number;
+    total_failed: number;
+    overall_success_rate: number | null;
+    by_path: Record<string, { attempted: number; merged: number; failed: number; success_rate: number | null }>;
+  } | null;
 }
 
 const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
@@ -1821,6 +1842,121 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       ))}
                     </div>
                   )}
+                </div>
+              )}
+
+              {/* Analysis overflow summary */}
+              {digest!.analysis_overflow_summary && digest!.analysis_overflow_summary.total_count > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Analysis overflow</span>
+                  <span className="text-[10px] text-neutral-400">
+                    {digest!.analysis_overflow_summary.total_count} task{digest!.analysis_overflow_summary.total_count === 1 ? '' : 's'} hit planning gate
+                  </span>
+                  {digest!.analysis_overflow_summary.cost_usd > 0 && (
+                    <span className="text-[10px] text-amber-400 inline-flex items-center gap-0.5">
+                      <DollarSign className="w-2.5 h-2.5" />{digest!.analysis_overflow_summary.cost_usd.toFixed(2)}
+                    </span>
+                  )}
+                  {Object.entries(digest!.analysis_overflow_summary.by_scope).map(([scope, count]) => (
+                    <span key={scope} className="text-[10px] text-neutral-500">
+                      · {scope} ×{count}
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {/* Provision waste */}
+              {digest!.provision_waste_cost_usd != null && digest!.provision_waste_cost_usd > 0 && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Provision waste</span>
+                    <span className="text-[10px] text-amber-400 inline-flex items-center gap-0.5">
+                      <DollarSign className="w-2.5 h-2.5" />{digest!.provision_waste_cost_usd.toFixed(2)} burned
+                    </span>
+                    {digest!.provisioning_overhead_pct != null && (
+                      <span className="text-[10px] text-neutral-500">
+                        · {(digest!.provisioning_overhead_pct * 100).toFixed(1)}% of total compute
+                      </span>
+                    )}
+                  </div>
+                  {digest!.provision_waste_by_direction && digest!.provision_waste_by_direction.length > 0 && (
+                    <ul className="w-full flex flex-col gap-0.5 mt-0.5 ml-2">
+                      {digest!.provision_waste_by_direction.map((d) => (
+                        <li key={d.direction_id} className="text-[10px] text-neutral-400">
+                          · <span className="text-neutral-300">{d.direction_text || d.direction_id}</span>
+                          <span className="text-amber-400 ml-1">${d.provision_cost_usd.toFixed(2)}</span>
+                          <span className="text-neutral-500 ml-1">({d.provision_task_count} task{d.provision_task_count === 1 ? '' : 's'})</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+
+              {/* Provisioning overhead (standalone if no waste block) */}
+              {(digest!.provision_waste_cost_usd == null || digest!.provision_waste_cost_usd === 0) &&
+                digest!.provisioning_overhead_pct != null && digest!.provisioning_overhead_pct > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Provisioning overhead</span>
+                  <span className="text-[10px] text-neutral-400">
+                    {(digest!.provisioning_overhead_pct * 100).toFixed(1)}% of total compute
+                  </span>
+                </div>
+              )}
+
+              {/* Escalation outcomes */}
+              {digest!.escalation_outcome_summary && digest!.escalation_outcome_summary.total_attempted > 0 && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Escalation outcomes</span>
+                    <span className="text-[10px] text-neutral-400">
+                      {digest!.escalation_outcome_summary.total_attempted} attempted
+                    </span>
+                    <span className="text-[10px] text-emerald-400">
+                      · {digest!.escalation_outcome_summary.total_merged} merged
+                    </span>
+                    <span className="text-[10px] text-red-400">
+                      · {digest!.escalation_outcome_summary.total_failed} failed
+                    </span>
+                    {digest!.escalation_outcome_summary.overall_success_rate != null && (
+                      <span className="text-[10px] text-neutral-500">
+                        · {Math.round(digest!.escalation_outcome_summary.overall_success_rate * 100)}% success
+                      </span>
+                    )}
+                  </div>
+                  {Object.entries(digest!.escalation_outcome_summary.by_path).length > 0 && (
+                    <div className="flex flex-col gap-0.5 ml-1">
+                      {Object.entries(digest!.escalation_outcome_summary.by_path).map(([path, b]) => (
+                        <span key={path} className="text-[10px] text-neutral-500 truncate font-mono">
+                          · {path} <span className="text-neutral-400">{b.merged}/{b.attempted}</span>
+                          {b.success_rate != null && (
+                            <span className="text-neutral-500"> ({Math.round(b.success_rate * 100)}%)</span>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Retry success rate by class */}
+              {digest!.retry_success_rate_by_class && Object.keys(digest!.retry_success_rate_by_class).length > 0 && (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Retry success by class</span>
+                  </div>
+                  <div className="flex flex-col gap-0.5 ml-1">
+                    {Object.entries(digest!.retry_success_rate_by_class)
+                      .sort((a, b) => (b[1].merged + b[1].failed) - (a[1].merged + a[1].failed))
+                      .map(([cls, b]) => (
+                        <span key={cls} className="text-[10px] text-neutral-500 truncate font-mono">
+                          · {cls} <span className="text-emerald-400">{b.merged}</span>
+                          <span className="text-neutral-500">/</span>
+                          <span className="text-red-400">{b.failed}</span>
+                          <span className="text-neutral-400"> ({Math.round(b.success_rate * 100)}%)</span>
+                        </span>
+                      ))}
+                  </div>
                 </div>
               )}
 

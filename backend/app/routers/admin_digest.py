@@ -2031,6 +2031,24 @@ async def get_digest(
             total_merge_retries_saved += _saved
             merge_early_exit_count += 1
 
+    # Resurrection outcomes: count tasks the reaper auto-resurrected and how many
+    # of those still ended up failing (net-positive signal for operators).
+    _resurrected_completed = 0
+    _resurrected_failed = 0
+    for _t in completed_tasks:
+        if (_t.context or {}).get("_resurrection_count", 0) >= 1:
+            _resurrected_completed += 1
+    for _t in failed_tasks:
+        if (_t.context or {}).get("_resurrection_count", 0) >= 1:
+            _resurrected_failed += 1
+    _resurrected_total = _resurrected_completed + _resurrected_failed
+    resurrection_outcome_summary = {
+        "total": _resurrected_total,
+        "completed": _resurrected_completed,
+        "failed_again": _resurrected_failed,
+        "success_rate": (_resurrected_completed / _resurrected_total) if _resurrected_total else None,
+    }
+
     return {
         "window_hours": hours,
         "total_merge_retries_saved": total_merge_retries_saved,
@@ -2095,5 +2113,6 @@ async def get_digest(
         "rejection_pattern_summary": rejection_pattern_summary,
         "retry_pattern_summary": retry_pattern_summary,
         "review_cap_exhaustion_summary": review_cap_exhaustion_summary,
+        "resurrection_outcome_summary": resurrection_outcome_summary,
         "recurring_error_clusters": recurring_error_clusters,
     }
