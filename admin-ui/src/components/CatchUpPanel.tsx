@@ -181,7 +181,7 @@ interface DigestData {
   failed_delta?: number;
   success_rate_delta?: number | null;
   trend?: 'improving' | 'declining' | 'stable';
-  trend_history?: {period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_taxonomy?: Record<string, number>}[];
+  trend_history?: {period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_taxonomy?: Record<string, number>; first_attempt_success_rate?: number | null; period_cost_usd?: number | null}[];
   failure_taxonomy_distribution?: {
     categories: Record<string, { count: number; percentage: number }>;
     total_failures: number;
@@ -215,6 +215,8 @@ interface DigestData {
   retry_success_count?: number | null;
   retry_wasted_rate?: number | null;
   retry_recovery_cost_usd?: number | null;
+  total_merge_retries_saved?: number | null;
+  merge_early_exit_count?: number | null;
   total_estimated_cost_usd?: number | null;
   spot_cost_usd?: number | null;
   on_demand_cost_usd?: number | null;
@@ -266,7 +268,18 @@ interface DigestData {
   } | null;
   pipeline_acceptance_rate?: number | null;
   pipeline_conversion_rate?: number | null;
+  overall_product_ratio?: number | null;
   pipeline_filter_funnel?: Record<string, number> | null;
+  remediation_funnel?: {
+    investigations_spawned: number;
+    investigations_completed: number;
+    investigations_with_diagnosis: number;
+    remediations_spawned: number;
+    remediations_merged: number;
+    remediations_failed: number;
+    avg_time_to_remediation_hours: number | null;
+    active_investigations: number;
+  } | null;
 }
 
 const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
@@ -732,6 +745,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
   const [activeExpanded, setActiveExpanded] = useState(false);
   const [failuresExpanded, setFailuresExpanded] = useState(false);
   const [completionsExpanded, setCompletionsExpanded] = useState(false);
+  const [remediationExpanded, setRemediationExpanded] = useState(false);
   const [expandedSnippets, setExpandedSnippets] = useState<Set<string>>(new Set());
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [activeTaxonomyFilter, setActiveTaxonomyFilter] = useState<string | null>(null);
@@ -1089,7 +1103,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             return isNaN(d.getTime()) ? p.period_end : d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
                           })();
                           const ratePart = p.success_rate == null ? 'no data' : `${Math.round(p.success_rate * 100)}%`;
-                          const title = `${dateLabel}: ${ratePart} (${p.completed} done, ${p.failed} failed)`;
+                          const titleParts = [`Success: ${ratePart}`];
+                          if (p.first_attempt_success_rate != null) {
+                            titleParts.push(`1st attempt: ${Math.round(p.first_attempt_success_rate * 100)}%`);
+                          }
+                          if (p.period_cost_usd != null) {
+                            titleParts.push(`Cost: $${p.period_cost_usd.toFixed(2)}`);
+                          }
+                          const title = `${dateLabel}: ${titleParts.join(' | ')} (${p.completed} done, ${p.failed} failed)`;
                           return <div key={i} title={title} className={`w-1 rounded-sm ${p.success_rate == null ? 'bg-neutral-700' : color}`} style={{height: `${Math.max(rate * 100, 8)}%`}} />;
                         })}
                       </div>
@@ -1111,6 +1132,15 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   return (
                     <span className={tone} title="PRs merged / tasks created">
                       {pct}% conv
+                    </span>
+                  );
+                })()}
+                {digest!.overall_product_ratio != null && (() => {
+                  const pct = Math.round(digest!.overall_product_ratio! * 100);
+                  const tone = digest!.overall_product_ratio! >= 0.6 ? 'text-emerald-400' : digest!.overall_product_ratio! >= 0.4 ? 'text-amber-400' : 'text-slate-400';
+                  return (
+                    <span className={tone} title="Fraction of tasks targeting product features vs structural work">
+                      {pct}% product focus
                     </span>
                   );
                 })()}
@@ -1878,6 +1908,22 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                 </div>
               )}
 
+              {/* Merge retries saved (early-exit efficiency) */}
+              {digest!.total_merge_retries_saved != null && digest!.total_merge_retries_saved > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Early exit</span>
+                  <span className="text-[10px] text-emerald-400 inline-flex items-center gap-0.5">
+                    <CheckCircle className="w-2.5 h-2.5" />
+                    {digest!.total_merge_retries_saved} {digest!.total_merge_retries_saved === 1 ? 'retry' : 'retries'} saved
+                  </span>
+                  {digest!.merge_early_exit_count != null && digest!.merge_early_exit_count > 0 && (
+                    <span className="text-[10px] text-neutral-500">
+                      · across {digest!.merge_early_exit_count} task{digest!.merge_early_exit_count === 1 ? '' : 's'}
+                    </span>
+                  )}
+                </div>
+              )}
+
               {/* Retry overhead cost */}
               {digest!.retry_task_count != null && digest!.retry_task_count > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -2212,6 +2258,88 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </div>
                   )}
                 </div>
+                );
+              })()}
+
+              {/* Remediation pipeline */}
+              {digest!.remediation_funnel && digest!.remediation_funnel.investigations_spawned > 0 && (() => {
+                const rf = digest!.remediation_funnel!;
+                const successRate = rf.remediations_spawned > 0
+                  ? rf.remediations_merged / rf.remediations_spawned
+                  : null;
+                const stages: { label: string; value: number }[] = [
+                  { label: 'Spawned', value: rf.investigations_spawned },
+                  { label: 'Completed', value: rf.investigations_completed },
+                  { label: 'Diagnosed', value: rf.investigations_with_diagnosis },
+                  { label: 'Remediations', value: rf.remediations_spawned },
+                  { label: 'Merged', value: rf.remediations_merged },
+                ];
+                const maxVal = Math.max(1, ...stages.map(s => s.value));
+                return (
+                  <div>
+                    <button
+                      onClick={() => setRemediationExpanded(v => !v)}
+                      aria-expanded={remediationExpanded}
+                      className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
+                    >
+                      {remediationExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                      <RotateCcw className="w-3 h-3 text-cyan-500" />
+                      Remediation pipeline ({rf.investigations_spawned})
+                    </button>
+                    {remediationExpanded && (
+                      <div className="flex flex-col gap-2">
+                        <div className="flex items-center gap-3 text-[10px] text-neutral-400">
+                          {successRate != null && (
+                            <span>
+                              <span className="text-neutral-500">success:</span>{' '}
+                              <span className="text-emerald-400 font-mono">{(successRate * 100).toFixed(0)}%</span>
+                              <span className="text-neutral-600"> ({rf.remediations_merged}/{rf.remediations_spawned})</span>
+                            </span>
+                          )}
+                          {rf.avg_time_to_remediation_hours != null && (
+                            <span>
+                              <span className="text-neutral-500">avg time:</span>{' '}
+                              <span className="text-neutral-300 font-mono">{rf.avg_time_to_remediation_hours.toFixed(1)}h</span>
+                            </span>
+                          )}
+                          {rf.active_investigations > 0 && (
+                            <span>
+                              <span className="text-neutral-500">active:</span>{' '}
+                              <span className="text-cyan-400 font-mono">{rf.active_investigations}</span>
+                            </span>
+                          )}
+                          {rf.remediations_failed > 0 && (
+                            <span>
+                              <span className="text-neutral-500">failed:</span>{' '}
+                              <span className="text-red-400 font-mono">{rf.remediations_failed}</span>
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          {stages.map((s, i) => {
+                            const pct = (s.value / maxVal) * 100;
+                            return (
+                              <div key={s.label} className="flex items-center gap-2 text-[10px]">
+                                <span className="w-24 text-neutral-500 shrink-0">
+                                  {i > 0 && <span className="text-neutral-700">↓ </span>}
+                                  {s.label}
+                                </span>
+                                <div className="flex-1 bg-neutral-900 rounded h-4 relative overflow-hidden">
+                                  <div
+                                    className="absolute inset-y-0 left-0 bg-cyan-500/30 border-r border-cyan-500/50"
+                                    style={{ width: `${pct}%` }}
+                                  />
+                                  <span className="absolute inset-0 flex items-center px-1.5 font-mono text-neutral-300">
+                                    {s.value}
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 );
               })()}
 
