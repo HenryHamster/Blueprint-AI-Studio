@@ -1254,6 +1254,34 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         filtered_findings=filtered_findings,
     )
 
+    # Mark per-direction cycle productivity so direction_lifecycle can pick
+    # an adaptive cooldown: productive cycles (>=1 task spawned) get a shorter
+    # cooldown, unproductive cycles keep the standard cooldown.
+    tasks_by_dir: dict[str, int] = {}
+    for ct in child_tasks:
+        did = (ct.context or {}).get("direction_id")
+        if did:
+            tasks_by_dir[did] = tasks_by_dir.get(did, 0) + 1
+    current_direction_id = (task.context or {}).get("direction_id") or (task.first_payload).get("current_direction_id")
+    touched_dir_ids = set(tasks_by_dir.keys())
+    if current_direction_id:
+        touched_dir_ids.add(current_direction_id)
+    if touched_dir_ids:
+        project = await session.get(Project, task.project_id)
+        if project:
+            directions = list(project.directions or [])
+            changed = False
+            for d in directions:
+                did = d.get("id")
+                if did in touched_dir_ids:
+                    d["last_cycle_productive"] = tasks_by_dir.get(did, 0) > 0
+                    changed = True
+            if changed:
+                project.directions = directions
+                flag_modified(project, "directions")
+                session.add(project)
+                await session.commit()
+
 
 async def _record_research_task_failure(task: Task, session: AsyncSession) -> None:
     """Record a FAILED research task in the direction's research_history.
@@ -1301,6 +1329,7 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
         )
     target["research_history"] = new_history[-10:]
     target["last_researched_at"] = now_iso
+    target["last_cycle_productive"] = False
     project.directions = directions
     flag_modified(project, "directions")
     session.add(project)

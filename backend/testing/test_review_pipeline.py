@@ -40,6 +40,7 @@ from app.review_pipeline import (
     _is_test_file,
     _max_review_iterations,
     _spawn_pipeline_task,
+    should_auto_approve_small_diff,
 )
 from testing.factories import make_project, make_task
 
@@ -263,6 +264,110 @@ async def test_requeue_carries_forward_prior_review_iterations(db_session, mocke
     assert (clone.context or {}).get("_prior_review_iterations_consumed") == 8
     # medium cap 12, minus 8//2 = 4 → 8
     assert _max_review_iterations(clone) == 8
+
+
+# ── should_auto_approve_small_diff ────────────────────────────────────────────
+
+
+class TestShouldAutoApproveSmallDiff:
+    def _task(self, *, type_="create", scope="small", files=None, diff=None):
+        payload = {"type": type_}
+        ctx: dict = {"scope": scope}
+        if files is not None:
+            ctx["_pr_changed_files"] = files
+        if diff is not None:
+            ctx["_pr_diff_summary"] = diff
+        return make_task(payloads=[payload], context=ctx)
+
+    def test_happy_path(self):
+        t = self._task(
+            files=["app/foo.py"],
+            diff=[{"file": "app/foo.py", "added": 10, "removed": 2}],
+        )
+        skip, reason = should_auto_approve_small_diff(t, None)
+        assert skip is True
+        assert "auto-approve" in reason
+
+    def test_non_small_scope_rejected(self):
+        t = self._task(
+            scope="medium",
+            files=["app/foo.py"],
+            diff=[{"file": "app/foo.py", "added": 5, "removed": 0}],
+        )
+        skip, _ = should_auto_approve_small_diff(t, None)
+        assert skip is False
+
+    def test_non_create_refactor_rejected(self):
+        t = self._task(
+            type_="fix",
+            files=["app/foo.py"],
+            diff=[{"file": "app/foo.py", "added": 5, "removed": 0}],
+        )
+        skip, _ = should_auto_approve_small_diff(t, None)
+        assert skip is False
+
+    def test_too_many_lines_rejected(self):
+        t = self._task(
+            files=["app/foo.py"],
+            diff=[{"file": "app/foo.py", "added": 50, "removed": 0}],
+        )
+        skip, reason = should_auto_approve_small_diff(t, None)
+        assert skip is False
+        assert "lines" in reason
+
+    def test_too_many_non_test_files_rejected(self):
+        t = self._task(
+            files=["app/a.py", "app/b.py", "app/c.py"],
+            diff=[
+                {"file": "app/a.py", "added": 1, "removed": 0},
+                {"file": "app/b.py", "added": 1, "removed": 0},
+                {"file": "app/c.py", "added": 1, "removed": 0},
+            ],
+        )
+        skip, _ = should_auto_approve_small_diff(t, None)
+        assert skip is False
+
+    def test_test_files_dont_count_toward_file_budget(self):
+        t = self._task(
+            files=["app/a.py", "testing/test_a.py", "testing/test_b.py"],
+            diff=[
+                {"file": "app/a.py", "added": 5, "removed": 0},
+                {"file": "testing/test_a.py", "added": 3, "removed": 0},
+                {"file": "testing/test_b.py", "added": 3, "removed": 0},
+            ],
+        )
+        skip, _ = should_auto_approve_small_diff(t, None)
+        assert skip is True
+
+    def test_missing_diff_summary_rejected(self):
+        t = self._task(files=["app/a.py"])
+        skip, reason = should_auto_approve_small_diff(t, None)
+        assert skip is False
+        assert "diff size" in reason
+
+    def test_low_acceptance_rate_direction_rejected(self, mocker):
+        mocker.patch(
+            "app.research_completion._compute_acceptance_rate",
+            return_value=0.2,
+        )
+        t = self._task(
+            files=["app/a.py"],
+            diff=[{"file": "app/a.py", "added": 5, "removed": 0}],
+        )
+        skip, reason = should_auto_approve_small_diff(t, {"research_history": []})
+        assert skip is False
+        assert "acceptance_rate" in reason
+
+    def test_disabled_via_zero_max_lines(self, mocker):
+        from app.shared_state import runtime_config
+        mocker.patch.dict(runtime_config, {"auto_approve_max_lines": 0})
+        t = self._task(
+            files=["app/a.py"],
+            diff=[{"file": "app/a.py", "added": 1, "removed": 0}],
+        )
+        skip, reason = should_auto_approve_small_diff(t, None)
+        assert skip is False
+        assert "disabled" in reason
 
 
 # ── _spawn_pipeline_task: iteration cap ───────────────────────────────────────

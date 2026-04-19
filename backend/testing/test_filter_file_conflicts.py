@@ -131,3 +131,26 @@ class TestFilterFileConflicts:
         assert args[1] == "task_updated"
         assert args[2]["task_id"] == str(c.id)
         assert args[2]["status"] == "QUEUED"
+
+    @pytest.mark.asyncio
+    async def test_shared_test_files_not_deferred(self):
+        pid = uuid.uuid4()
+        c = _queued(pid, ["backend/testing/test_foo.py", "backend/testing/test_bar.py"])
+        ip = _in_progress(pid, ["backend/testing/test_foo.py", "backend/testing/test_bar.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == [c.id]
+        broadcast_fn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_prod_overlap_still_defers_with_mixed_files(self):
+        pid = uuid.uuid4()
+        c = _queued(pid, ["app/a.py", "app/b.py", "testing/test_a.py"])
+        ip = _in_progress(pid, ["app/a.py", "app/b.py", "testing/test_a.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == []

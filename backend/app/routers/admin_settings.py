@@ -74,7 +74,9 @@ async def get_settings(
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
         "autonomous_direction_cooldown_minutes": _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
+        "productive_direction_cooldown_minutes": _runtime_config.get("productive_direction_cooldown_minutes", 90),
         "max_parallel_research_per_project": _runtime_config.get("max_parallel_research_per_project", 3),
+        "reserved_slots_for_types": _runtime_config.get("reserved_slots_for_types", {"create": 1, "research": 1}),
         "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
         "github_account": github_account,
         "require_approval_gates": _runtime_config.get("require_approval_gates", True),
@@ -236,6 +238,14 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="autonomous_direction_cooldown_hours must be a number")
         _runtime_config["autonomous_direction_cooldown_minutes"] = val * 60
+    if "productive_direction_cooldown_minutes" in payload:
+        try:
+            val = int(payload["productive_direction_cooldown_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="productive_direction_cooldown_minutes must be a number")
+        if not (1 <= val <= 525600):
+            raise HTTPException(status_code=400, detail="productive_direction_cooldown_minutes must be between 1 and 525600")
+        _runtime_config["productive_direction_cooldown_minutes"] = val
     if "strategic_research_frequency" in payload:
         try:
             val = int(payload["strategic_research_frequency"])
@@ -297,6 +307,23 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 20):
             raise HTTPException(status_code=400, detail="max_parallel_research_per_project must be between 1 and 20")
         _runtime_config["max_parallel_research_per_project"] = val
+    if "reserved_slots_for_types" in payload:
+        val = payload["reserved_slots_for_types"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="reserved_slots_for_types must be a dict")
+        VALID_RESERVED_TYPES = {"create", "research", "plan"}
+        normalized: Dict[str, int] = {}
+        for type_key, count in val.items():
+            if type_key not in VALID_RESERVED_TYPES:
+                raise HTTPException(status_code=400, detail=f"reserved_slots_for_types: invalid task type {type_key}; must be one of {sorted(VALID_RESERVED_TYPES)}")
+            try:
+                cnt = int(count)
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"reserved_slots_for_types[{type_key}] must be a number")
+            if not (0 <= cnt <= 10):
+                raise HTTPException(status_code=400, detail=f"reserved_slots_for_types[{type_key}] must be between 0 and 10")
+            normalized[type_key] = cnt
+        _runtime_config["reserved_slots_for_types"] = normalized
     if "health_check_urls" in payload:
         val = payload["health_check_urls"]
         if not isinstance(val, list):
@@ -386,6 +413,7 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "architecture_review_frequency": _runtime_config.get("architecture_review_frequency", 3),
                     "max_active_directions": _runtime_config.get("max_active_directions", 10),
                     "max_parallel_research_per_project": _runtime_config.get("max_parallel_research_per_project", 3),
+                    "reserved_slots_for_types": _runtime_config.get("reserved_slots_for_types", {"create": 1, "research": 1}),
                     "notification_config": _runtime_config.get("notification_config", {
                         "webhook_url": "",
                         "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED"],

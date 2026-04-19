@@ -483,7 +483,7 @@ async def get_autonomy_debug(
         })
 
     # Guard 4: research_task_active — parallel-research cap (now matches spawn logic)
-    max_parallel = _runtime_config.get("max_parallel_research_per_project", 2)
+    max_parallel = _runtime_config.get("max_parallel_research_per_project", 3)
     if active_research_count >= max_parallel:
         blocking_guards.append({
             "guard": "research_task_active",

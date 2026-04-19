@@ -56,6 +56,13 @@ runtime_config_lock = asyncio.Lock()
 # --- Runtime Config (adjustable via admin API) ---
 runtime_config: Dict = {
     "max_concurrent_vms": int(os.getenv("MAX_CONCURRENT_VMS", "8")),
+    # Per-task-type slot reservations for priority inversion prevention.
+    # When the queue contains both reserved-type and non-reserved-type tasks
+    # competing for the last slots, at least N slots are held for the listed
+    # types so self-perpetuating review-fix cycles can't starve create/research.
+    # Reservations only bite under queue pressure; unused reserved slots remain
+    # available to any task type.
+    "reserved_slots_for_types": {"create": 1, "research": 1},
     "max_auto_pause_duration_seconds": int(os.getenv("MAX_AUTO_PAUSE_DURATION_SECONDS", "7200")),
     "auto_resume_grace_period_seconds": int(os.getenv("AUTO_RESUME_GRACE_PERIOD_SECONDS", "300")),
     # Flap detection: N auto-resumes inside `flap_window_seconds` escalates
@@ -123,6 +130,7 @@ runtime_config: Dict = {
         "deps": {"interval_hours": 168, "enabled": False},            # weekly
     },
     "autonomous_direction_cooldown_minutes": 240,
+    "productive_direction_cooldown_minutes": 90,
     "direction_auto_recovery_hours": 48,
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
@@ -140,6 +148,13 @@ runtime_config: Dict = {
     # where no medium tasks run → medium pipeline rate stays low → all medium
     # findings escalate. Set to 0 to disable exploration.
     "medium_exploration_fraction": 0.2,
+    # Auto-approve thresholds for trivially small diffs from create/refactor tasks.
+    # When both limits are respected (and other safety gates pass — small-scope,
+    # direction acceptance rate > 50%), the review task is skipped and the PR
+    # proceeds directly to CI-gated merge. Set auto_approve_max_lines to 0 to
+    # disable the fast-path entirely.
+    "auto_approve_max_lines": 20,
+    "auto_approve_max_files": 2,
     # TTL (days) for deferred findings carried forward by autonomous_research.
     # Findings older than this window are dropped rather than reprocessed, so
     # stale context doesn't keep surfacing work the system already declined to

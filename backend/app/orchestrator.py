@@ -1225,6 +1225,55 @@ async def orchestrator_worker():
                                 )
 
 
+                # Slot reservation: ensure high-priority task types (e.g. create,
+                # research) get a minimum share of slots when they're queued behind
+                # self-perpetuating review/fix chains. Only activates when queue
+                # pressure exists (more eligible tasks than open slots) and there
+                # are reserved-type tasks waiting beyond the dispatch cutoff.
+                _reserved_config = _runtime_config.get(
+                    "reserved_slots_for_types", {"create": 1, "research": 1}
+                ) or {}
+                if _reserved_config and len(eligible_ids) > slots_available:
+                    _types_by_id = {
+                        t.id: ((t.first_payload or {}).get("type") or "")
+                        for t in candidate_tasks
+                    }
+                    _protected = set(_reserved_config.keys())
+                    _initial = list(eligible_ids[:slots_available])
+                    _waiting = list(eligible_ids[slots_available:])
+                    for _rtype, _rn in _reserved_config.items():
+                        try:
+                            _rn = int(_rn)
+                        except (TypeError, ValueError):
+                            continue
+                        if _rn <= 0:
+                            continue
+                        _current = sum(1 for tid in _initial if _types_by_id.get(tid) == _rtype)
+                        _needed = _rn - _current
+                        if _needed <= 0:
+                            continue
+                        _promote = [tid for tid in _waiting if _types_by_id.get(tid) == _rtype][:_needed]
+                        if not _promote:
+                            continue
+                        _displaced = 0
+                        for i in range(len(_initial) - 1, -1, -1):
+                            if _displaced >= len(_promote):
+                                break
+                            if _types_by_id.get(_initial[i]) not in _protected:
+                                _initial.pop(i)
+                                _displaced += 1
+                        if _displaced == 0:
+                            continue
+                        _promote = _promote[:_displaced]
+                        _promoted_set = set(_promote)
+                        _waiting = [tid for tid in _waiting if tid not in _promoted_set]
+                        _initial.extend(_promote)
+                        logger.info(
+                            f"[ORCHESTRATOR] Slot reservation: promoted {len(_promote)} '{_rtype}' "
+                            f"task(s) (reserved={_rn}, displaced {_displaced} non-reserved)"
+                        )
+                    eligible_ids = _initial + _waiting
+
                 # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]
 

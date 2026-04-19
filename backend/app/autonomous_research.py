@@ -141,7 +141,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 busy_direction_ids.add(current_did)
 
     active_directions = await _process_direction_lifecycle(
-        project, session, cooldown_minutes, busy_direction_ids, now
+        project, session, cooldown_minutes, busy_direction_ids, now,
     )
     # Allow strategic cycles to proceed even without active directions (they create directions).
     # Stop forcing after 3 consecutive strategic failures to prevent infinite loops.
@@ -263,7 +263,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             )
             return
 
-        max_parallel = _runtime_config.get("max_parallel_research_per_project", 2)
+        max_parallel = _runtime_config.get("max_parallel_research_per_project", 3)
         for d in sorted_eligible:
             did = d.get("id")
             if did in blocked_ids:
@@ -369,7 +369,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.
-    max_parallel = _runtime_config.get("max_parallel_research_per_project", 2)
+    max_parallel = _runtime_config.get("max_parallel_research_per_project", 3)
     active_tasks = (await session.execute(
         select(Task).where(
             Task.project_id == project.id,

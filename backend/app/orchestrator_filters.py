@@ -22,6 +22,31 @@ from app.shared_state import is_direction_held, DEFAULT_TASK_SCOPE
 logger = logging.getLogger("blueprint")
 
 
+def _is_test_file(path: str) -> bool:
+    """Return True if *path* looks like a test file.
+
+    Test files are additive — concurrent edits rarely cause merge conflicts —
+    so the dispatch filters exclude them from overlap calculations.
+    """
+    if not path:
+        return False
+    p = path.replace("\\", "/")
+    if "/testing/" in p or "/__tests__/" in p or "/tests/" in p:
+        return True
+    name = p.rsplit("/", 1)[-1]
+    if name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    if ".test." in name or ".spec." in name:
+        return True
+    if "_spec." in name:
+        return True
+    return False
+
+
+def _prod_files(files) -> set[str]:
+    return {f for f in (files or []) if not _is_test_file(f)}
+
+
 async def filter_file_conflicts(
     eligible_ids: list[uuid.UUID],
     candidate_tasks: list[Task],
@@ -42,7 +67,7 @@ async def filter_file_conflicts(
     in_progress_files_by_project: dict[uuid.UUID, set[str]] = {}
     for t in active_tasks:
         if t.status == TaskStatus.IN_PROGRESS:
-            files = (t.context or {}).get("related_files", [])
+            files = _prod_files((t.context or {}).get("related_files", []))
             if files:
                 in_progress_files_by_project.setdefault(t.project_id, set()).update(files)
 
@@ -60,7 +85,7 @@ async def filter_file_conflicts(
         if not project_files:
             non_conflicting.append(eid)
             continue
-        candidate_files = set((candidate.context or {}).get("related_files", []))
+        candidate_files = _prod_files((candidate.context or {}).get("related_files", []))
         if not candidate_files:
             non_conflicting.append(eid)
             continue
@@ -138,7 +163,7 @@ async def filter_rollup_conflicts(
         pc_type = (pc.first_payload).get("type", "")
         if pc_scope == "large" or pc_type in ("refactor", "plan"):
             rollup_files = pending_rollup_by_project.setdefault(pc.project_id, {})
-            for f in (pc.context or {}).get("related_files", []):
+            for f in _prod_files((pc.context or {}).get("related_files", [])):
                 rollup_files[f] = pc.title or str(pc.id)
 
     if not pending_rollup_by_project:
@@ -164,7 +189,7 @@ async def filter_rollup_conflicts(
         if not project_rollup_files:
             non_rollup_conflicting.append(eid)
             continue
-        cfiles = set((candidate.context or {}).get("related_files", []))
+        cfiles = _prod_files((candidate.context or {}).get("related_files", []))
         if not cfiles:
             non_rollup_conflicting.append(eid)
             continue

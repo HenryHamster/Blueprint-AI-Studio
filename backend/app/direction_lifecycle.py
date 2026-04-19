@@ -556,11 +556,18 @@ async def _process_direction_lifecycle(
         last_researched = d.get("last_researched_at")
         if last_researched:
             minutes_ago = (now - datetime.fromisoformat(last_researched)).total_seconds() / 60
-            effective_cooldown = cooldown_minutes
+            # Adaptive cooldown: shorter after productive cycles (findings spawned tasks),
+            # standard after unproductive cycles. Saturation still doubles whichever base applies.
+            if d.get("last_cycle_productive"):
+                effective_cooldown = float(
+                    _runtime_config.get("productive_direction_cooldown_minutes", 90)
+                )
+            else:
+                effective_cooldown = cooldown_minutes
             if d.get("possibly_saturated"):
-                effective_cooldown = cooldown_minutes * 2.0
+                effective_cooldown = effective_cooldown * 2.0
                 logger.debug(
-                    f"[RESEARCH] Direction {did} saturated — applying 2x cooldown ({cooldown_minutes*2}m)"
+                    f"[RESEARCH] Direction {did} saturated — applying 2x cooldown ({effective_cooldown}m)"
                 )
             if minutes_ago < effective_cooldown:
                 logger.debug(

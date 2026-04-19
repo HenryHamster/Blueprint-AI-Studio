@@ -972,7 +972,46 @@ async def _process_post_commit(
                 is_intermediate = base_branch.startswith("research/") or base_branch.startswith("plan/")
                 scope = (task.context or {}).get("scope", "unknown")
 
-                if is_intermediate and scope in ("small", "medium"):
+                # Auto-approve trivially small main-branch diffs: skip review and route
+                # through the same security-scan + auto-merge path used for intermediate
+                # small/medium scope. Gated by scope, direction acceptance history, and
+                # diff size; CI still gates the merge.
+                auto_approve_small = False
+                if (
+                    not is_intermediate
+                    and scope == "small"
+                    and _runtime_config.get("auto_approve_small_diff_enabled", True)
+                ):
+                    try:
+                        max_lines = int(_runtime_config.get("auto_approve_max_lines", 20))
+                        max_files = int(_runtime_config.get("auto_approve_max_files", 2))
+                        _aa_tok, _aa_owner, _aa_repo = await get_github_token_for_task(task.id, session)
+                        _aa_pr = await get_pull_request(_aa_tok, _aa_owner, _aa_repo, pr_number, project_id=str(task.project_id))
+                        lines_changed = int(_aa_pr.get("additions", 0) or 0) + int(_aa_pr.get("deletions", 0) or 0)
+                        files_changed = int(_aa_pr.get("changed_files", 0) or 0)
+                        direction_id = (task.context or {}).get("direction_id")
+                        acceptance = None
+                        if direction_id:
+                            _aa_proj = (await session.execute(select(Project).where(Project.id == task.project_id))).scalars().first()
+                            _aa_dir = next((d for d in (getattr(_aa_proj, "directions", None) or []) if d.get("id") == direction_id), None)
+                            if _aa_dir:
+                                from app.direction_metrics import _compute_acceptance_rate  # noqa: PLC0415
+                                acceptance = _compute_acceptance_rate(_aa_dir)
+                        if (
+                            0 < lines_changed <= max_lines
+                            and 0 < files_changed <= max_files
+                            and acceptance is not None
+                            and acceptance > 0.5
+                        ):
+                            auto_approve_small = True
+                            logger.info(
+                                f"[PIPELINE] PR #{pr_number} auto-approved for merge "
+                                f"({lines_changed} lines, {files_changed} files, acceptance={acceptance:.2f}) — skipping review"
+                            )
+                    except Exception as _aa_exc:
+                        logger.info(f"[PIPELINE] Auto-approve eligibility check failed for PR #{pr_number}: {_aa_exc!r} — defaulting to review")
+
+                if (is_intermediate and scope in ("small", "medium")) or auto_approve_small:
                     # Small/medium scope on intermediate branch → security scan then auto-merge, skip review
                     # The rollup PR to main gets the full review — intermediate merges don't need it
                     try:

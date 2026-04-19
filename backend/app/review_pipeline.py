@@ -225,6 +225,91 @@ def _compute_scope_budget_utilization(
     }
 
 
+# Minimum direction acceptance rate required to auto-approve a small diff.
+# Directions with poor merge history still get a full review regardless of
+# diff size — the acceptance gate is independent of the line/file thresholds.
+AUTO_APPROVE_MIN_ACCEPTANCE_RATE = 0.5
+
+
+def _diff_lines_changed(diff_summary: list | None) -> int | None:
+    """Sum added+removed across a diff summary list.
+
+    Returns None when the summary is missing or malformed, so callers can
+    fall through to the full review path when diff size is unknown.
+    """
+    if not diff_summary or not isinstance(diff_summary, list):
+        return None
+    total = 0
+    for entry in diff_summary:
+        if not isinstance(entry, dict):
+            return None
+        total += int(entry.get("added") or 0) + int(entry.get("removed") or 0)
+    return total
+
+
+def should_auto_approve_small_diff(
+    source_task: Task, direction_data: dict | None
+) -> tuple[bool, str]:
+    """Decide whether to skip the review task for a trivially small diff.
+
+    Returns (skip, reason). Reason is always populated — a short human-
+    readable string suitable for task status messages and operator logs.
+
+    Gates (all must pass):
+    - source task type is create or refactor
+    - scope is 'small' (medium/large always get full review)
+    - diff size known and <= runtime_config auto_approve_max_lines
+    - non-test file count <= runtime_config auto_approve_max_files
+    - direction acceptance_rate > AUTO_APPROVE_MIN_ACCEPTANCE_RATE when
+      direction history is available (new directions pass by default)
+    """
+    max_lines = _runtime_config.get("auto_approve_max_lines", 20)
+    max_files = _runtime_config.get("auto_approve_max_files", 2)
+    if not max_lines or max_lines <= 0:
+        return (False, "auto-approve disabled (auto_approve_max_lines=0)")
+
+    source_type = (source_task.first_payload or {}).get("type", "")
+    if source_type not in ("create", "refactor"):
+        return (False, f"source type {source_type!r} not eligible")
+
+    ctx = source_task.context or {}
+    scope = ctx.get("scope", "medium")
+    if scope != "small":
+        return (False, f"scope {scope!r} not eligible (small only)")
+
+    changed_files = ctx.get("_pr_changed_files") or []
+    if not changed_files:
+        return (False, "changed files unknown")
+    non_test_count = sum(1 for f in changed_files if not _is_test_file(f))
+    if non_test_count > max_files:
+        return (False, f"{non_test_count} non-test files > {max_files}")
+
+    lines_changed = _diff_lines_changed(ctx.get("_pr_diff_summary"))
+    if lines_changed is None:
+        return (False, "diff size unknown")
+    if lines_changed > max_lines:
+        return (False, f"{lines_changed} lines > {max_lines}")
+
+    if direction_data is not None:
+        from app.research_completion import _compute_acceptance_rate  # noqa: PLC0415
+        acceptance_rate = _compute_acceptance_rate(direction_data)
+        if (
+            acceptance_rate is not None
+            and acceptance_rate <= AUTO_APPROVE_MIN_ACCEPTANCE_RATE
+        ):
+            return (
+                False,
+                f"direction acceptance_rate {acceptance_rate:.0%} "
+                f"≤ {AUTO_APPROVE_MIN_ACCEPTANCE_RATE:.0%}",
+            )
+
+    return (
+        True,
+        f"auto-approve: {lines_changed} lines across {non_test_count} non-test "
+        f"file(s) (≤ {max_lines}/{max_files})",
+    )
+
+
 def _feedback_token_set(text: str) -> set[str]:
     return {t for t in _FEEDBACK_TOKEN_RE.findall(text.lower()) if len(t) >= 3}
 
