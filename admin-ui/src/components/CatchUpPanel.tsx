@@ -186,7 +186,7 @@ interface DigestData {
   failed_delta?: number;
   success_rate_delta?: number | null;
   trend?: 'improving' | 'declining' | 'stable';
-  trend_history?: {period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_taxonomy?: Record<string, number>; first_attempt_success_rate?: number | null; period_cost_usd?: number | null}[];
+  trend_history?: {period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_taxonomy?: Record<string, number>; failed_by_class?: Record<string, number>; first_attempt_success_rate?: number | null; period_cost_usd?: number | null}[];
   failure_taxonomy_distribution?: {
     categories: Record<string, { count: number; percentage: number }>;
     total_failures: number;
@@ -1284,6 +1284,23 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                 {digest!.total_estimated_cost_usd != null && digest!.total_estimated_cost_usd > 0 && (
                   <span className="inline-flex items-center gap-0.5 text-neutral-500 font-mono" title="Total estimated spend">
                     <DollarSign className="w-2.5 h-2.5" />{digest!.total_estimated_cost_usd.toFixed(2)} total
+                    {(() => {
+                      const costs = (digest!.trend_history ?? []).filter(p => p.period_cost_usd != null).map(p => p.period_cost_usd as number);
+                      if (costs.length < 2) return null;
+                      const curr = costs[costs.length - 1];
+                      const prev = costs[costs.length - 2];
+                      const delta = curr - prev;
+                      if (Math.abs(delta) < 0.01) return null;
+                      const up = delta > 0;
+                      return (
+                        <span
+                          className={up ? "text-amber-600" : "text-emerald-600"}
+                          title={`Period cost change: $${prev.toFixed(2)} → $${curr.toFixed(2)}`}
+                        >
+                          {up ? "↑" : "↓"}${Math.abs(delta).toFixed(2)}
+                        </span>
+                      );
+                    })()}
                   </span>
                 )}
                 {(digest!.spot_cost_usd != null || digest!.on_demand_cost_usd != null) && (
@@ -1296,6 +1313,32 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     Spot: ${(digest!.spot_cost_usd ?? 0).toFixed(2)} / On-demand: ${(digest!.on_demand_cost_usd ?? 0).toFixed(2)}
                   </span>
                 )}
+                {(() => {
+                  const dps = digest!.direction_progress;
+                  if (!dps || dps.length === 0) return null;
+                  const totals: Record<string, number> = {};
+                  for (const dp of dps) {
+                    if (!dp.cost_by_scope) continue;
+                    for (const [scope, usd] of Object.entries(dp.cost_by_scope)) {
+                      if (typeof usd === 'number' && usd > 0) {
+                        totals[scope] = (totals[scope] ?? 0) + usd;
+                      }
+                    }
+                  }
+                  const order = ['small', 'medium', 'large'];
+                  const entries = order.filter(s => totals[s] != null);
+                  if (entries.length === 0) return null;
+                  const title = `Cost by scope: ${entries.map(s => `${s} $${totals[s].toFixed(2)}`).join(' · ')}`;
+                  return (
+                    <span className="inline-flex items-center gap-1 font-mono text-neutral-500" title={title}>
+                      {entries.map(s => (
+                        <span key={s} className="inline-flex items-center gap-0.5 rounded bg-neutral-100 px-1 py-0.5 text-[10px]">
+                          {s} ${totals[s].toFixed(2)}
+                        </span>
+                      ))}
+                    </span>
+                  );
+                })()}
                 {digest!.provisioning_overhead_pct != null && digest!.provisioning_overhead_pct > 0 && (() => {
                   const pctDisplay = digest!.provisioning_overhead_pct! * 100;
                   const tone = pctDisplay < 10
@@ -2287,6 +2330,15 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           : group.failure_class === 'RATE_LIMIT' || group.failure_class === 'EXTERNAL_API'
                           ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
                           : 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30';
+                        const classHistory = digest!.trend_history ?? [];
+                        let classTrend: {arrow: string; color: string} = {arrow: '–', color: 'text-neutral-500'};
+                        if (classHistory.length >= 4) {
+                          const sumAt = (arr: typeof classHistory) => arr.reduce((a, p) => a + (p.failed_by_class?.[group.failure_class] ?? 0), 0);
+                          const recent = sumAt(classHistory.slice(-2));
+                          const prior = sumAt(classHistory.slice(-4, -2));
+                          if (recent > prior) classTrend = {arrow: '↑', color: 'text-red-400'};
+                          else if (recent < prior) classTrend = {arrow: '↓', color: 'text-emerald-400'};
+                        }
                         return (
                           <div key={group.failure_class}>
                             <button
@@ -2304,6 +2356,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                 {group.label}
                               </span>
                               <span className="text-[11px] text-neutral-500">× {group.tasks.length}</span>
+                              <span className={`text-[11px] font-bold ${classTrend.color}`} title="Trend: recent 2 periods vs prior 2 periods">{classTrend.arrow}</span>
                               {digest!.cost_by_failure_class?.[group.failure_class] != null && digest!.cost_by_failure_class[group.failure_class] > 0 && (
                                 <span className="text-[10px] text-red-400/70 font-mono" title={`Cost of ${group.label} failures`}>
                                   ${digest!.cost_by_failure_class[group.failure_class].toFixed(2)}
