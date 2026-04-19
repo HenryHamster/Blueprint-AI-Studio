@@ -158,6 +158,7 @@ async def test_happy_path_spawns_task(db_session: AsyncSession):
     assert task.context["ci_failure_sha"] == "deadbeef"
     assert task.context["ci_failure_branch"] == "main"
     assert task.context["ci_failure_type"] == "test"
+    assert task.context["trigger_failure_class"] == "CODE_ERROR"
     assert task.first_payload["type"] == "create"
     assert task.first_payload["base_branch"] == "main"
     assert "deadbeef" in task.first_payload["prompt"]

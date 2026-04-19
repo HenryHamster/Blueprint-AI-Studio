@@ -204,6 +204,7 @@ async def _handle_main_branch_ci_failure_inner(
         "ci_failure_branch": head_branch,
         "ci_failure_checks": failed_checks,
         "ci_failure_type": failure_type,
+        "trigger_failure_class": "CODE_ERROR",
     }
     if prior_investigation is not None:
         task_context["prior_diagnosis_task_id"] = str(prior_investigation.id)

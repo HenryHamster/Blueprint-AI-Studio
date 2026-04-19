@@ -3669,9 +3669,22 @@ async def test_digest_remediation_funnel(client: AsyncClient, db_session):
         created_at=now - timedelta(hours=4),
         plan_output={"raw": "logs"},
     )
-    db_session.add_all([inv_done, inv_active, inv_no_summary])
+    # Investigation used to validate the fallback path (rem_merged2 has no
+    # trigger_failure_class in its own context, so digest should fall back to
+    # this investigation's context.last_failure_class).
+    inv_fallback = make_task(
+        project_id=project.id,
+        title="investigate D",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=3),
+        plan_output={"summary": "root cause Y"},
+        context={"last_failure_class": "LINT_ERROR"},
+    )
+    db_session.add_all([inv_done, inv_active, inv_no_summary, inv_fallback])
     await db_session.commit()
     await db_session.refresh(inv_done)
+    await db_session.refresh(inv_fallback)
 
     rem_merged = make_task(
         project_id=project.id,
@@ -3679,7 +3692,22 @@ async def test_digest_remediation_funnel(client: AsyncClient, db_session):
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "create"}],
         created_at=now - timedelta(hours=2),
-        context={"diagnosis_task_id": str(inv_done.id), "direction_id": "d1"},
+        context={
+            "diagnosis_task_id": str(inv_done.id),
+            "direction_id": "d1",
+            "trigger_failure_class": "CODE_ERROR",
+        },
+        status_log=[{"t": rem_completed.isoformat(), "status": "completed"}],
+    )
+    # Second merged remediation: no trigger_failure_class in its own context,
+    # but its linked investigation has last_failure_class — exercises fallback.
+    rem_merged_fallback = make_task(
+        project_id=project.id,
+        title="remediation C",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=2),
+        context={"diagnosis_task_id": str(inv_fallback.id), "direction_id": "d1"},
         status_log=[{"t": rem_completed.isoformat(), "status": "completed"}],
     )
     rem_failed = make_task(
@@ -3690,20 +3718,27 @@ async def test_digest_remediation_funnel(client: AsyncClient, db_session):
         created_at=now - timedelta(hours=1),
         context={"diagnosis_task_id": str(inv_done.id), "direction_id": "d1"},
     )
-    db_session.add_all([rem_merged, rem_failed])
+    db_session.add_all([rem_merged, rem_merged_fallback, rem_failed])
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
     assert response.status_code == 200
     funnel = response.json()["remediation_funnel"]
 
-    assert funnel["investigations_spawned"] == 3
-    assert funnel["investigations_completed"] == 2
-    assert funnel["investigations_with_diagnosis"] == 1
+    assert funnel["investigations_spawned"] == 4
+    assert funnel["investigations_completed"] == 3
+    assert funnel["investigations_with_diagnosis"] == 2
     assert funnel["active_investigations"] == 1
-    assert funnel["remediations_spawned"] == 2
-    assert funnel["remediations_merged"] == 1
+    assert funnel["remediations_spawned"] == 3
+    assert funnel["remediations_merged"] == 2
     assert funnel["remediations_failed"] == 1
     # inv_done created 3h ago, rem_merged completed 1h ago → ~2h
     assert funnel["avg_time_to_remediation_hours"] is not None
     assert 1.5 <= funnel["avg_time_to_remediation_hours"] <= 2.5
+    # rem_merged has trigger_failure_class=CODE_ERROR directly;
+    # rem_merged_fallback has no trigger_failure_class but its linked
+    # investigation has context.last_failure_class=LINT_ERROR.
+    assert funnel["merged_remediations_by_trigger_class"] == {
+        "CODE_ERROR": 1,
+        "LINT_ERROR": 1,
+    }
