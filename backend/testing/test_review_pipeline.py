@@ -673,14 +673,14 @@ async def test_cap_exhaustion_records_task_and_direction_result(db_session, mock
     )
     _, outcome, fclass, ttype = results[0]
     assert outcome == "failure", f"Expected failure outcome, got {outcome!r}"
-    assert fclass == "AGENT_TIMEOUT", f"Expected AGENT_TIMEOUT failure_class, got {fclass!r}"
+    assert fclass == "CODE_ERROR", f"Expected CODE_ERROR failure_class, got {fclass!r}"
     assert ttype == "create", f"Expected task_type=create, got {ttype!r}"
 
     streak = ss.direction_failure_streaks.get(direction_id)
     assert streak is not None, "Cap exhaustion must register a direction failure streak"
-    assert streak["consecutive_infra_failures"] == 1
-    assert streak["consecutive_failures"] == 0
-    assert streak["last_failure_class"] == "AGENT_TIMEOUT"
+    assert streak["consecutive_infra_failures"] == 0
+    assert streak["consecutive_failures"] == 1
+    assert streak["last_failure_class"] == "CODE_ERROR"
 
 
 @pytest.mark.asyncio

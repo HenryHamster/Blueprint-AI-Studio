@@ -316,7 +316,7 @@ async def _handle_cap_exhaustion(
     ``scope`` is either "global" (cross-chain) or "per-chain" — used only for
     human-readable messages.
     """
-    from app.failure_classification import AGENT_TIMEOUT, persist_failure_category  # noqa: PLC0415
+    from app.failure_classification import CODE_ERROR, persist_failure_category  # noqa: PLC0415
     from app.main import _maybe_create_failure_alert  # noqa: PLC0415
     from app.github import close_pull_request, create_pr_comment  # noqa: PLC0415
     from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
@@ -357,7 +357,7 @@ async def _handle_cap_exhaustion(
         f"Review-fix cycle reached limit ({iterations} iterations, {cap_label}) — "
         f"PR #{pr_number} auto-closed, manual review required"
     )
-    persist_failure_category(orig, AGENT_TIMEOUT)
+    persist_failure_category(orig, CODE_ERROR)
     ctx = dict(orig.context or {})
     ctx["failure_detail"] = "review_cap_exhausted"
     ctx["review_cap_iterations"] = iterations
@@ -377,13 +377,13 @@ async def _handle_cap_exhaustion(
     # Surface cap-exhaustion to deploy_monitoring + direction health tracking.
     # Without this, cap failures bypass per-type failure gates and anomaly detection.
     record_task_result(
-        success=False, failure_class=AGENT_TIMEOUT,
+        success=False, failure_class=CODE_ERROR,
         task_id=str(orig.id), task_type=(orig.first_payload or {}).get("type", ""),
     )
     _direction_id = str((orig.context or {}).get("direction_id") or "")
     if _direction_id:
         record_direction_result(
-            _direction_id, success=False, failure_class=AGENT_TIMEOUT,
+            _direction_id, success=False, failure_class=CODE_ERROR,
             project_id=str(orig.project_id) if orig.project_id else "",
         )
 

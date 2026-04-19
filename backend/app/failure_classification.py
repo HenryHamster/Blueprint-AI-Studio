@@ -75,6 +75,9 @@ def classify_failure_taxonomy(task: "Task") -> str:
     status_msg = (task.latest_status_message or "").lower()
     ctx = task.context or {}
 
+    if ctx.get("failure_detail") == "review_cap_exhausted":
+        return TAXONOMY_REVIEW_QUALITY
+
     if any(kw in status_msg for kw in _REVIEW_QUALITY_KEYWORDS):
         return TAXONOMY_REVIEW_QUALITY
 

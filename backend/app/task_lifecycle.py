@@ -159,6 +159,8 @@ def _build_retry_prompt_suffix(
         preserve the original scope since a tighter budget won't fix bugs.
       - SCOPE_OVERFLOW on a medium task: escalate medium→large so the plan
         agent decomposes the work into multiple small subtasks
+      - SCOPE_OVERFLOW on a small task: escalate small→medium so the retry
+        gets a 10-file budget instead of 6
     Otherwise None. Reads ``_previous_failing_tests`` and ``_previous_error_files``
     from ctx for CODE_ERROR hints.
     """
@@ -231,6 +233,8 @@ def _build_retry_prompt_suffix(
         extra_guidance += _build_scope_overflow_details(ctx, task_scope)
         if task_scope == "medium":
             scope_override = "large"
+        elif task_scope == "small":
+            scope_override = "medium"
 
     elif failure_class == "CODE_ERROR":
         stage_guidance = _CODE_ERROR_STAGE_GUIDANCE.get(ctx.get("_previous_failure_stage") or "")
@@ -259,6 +263,12 @@ def _build_retry_prompt_suffix(
             extra_guidance += "Previously failing tests:\n" + "".join(f"  {t}\n" for t in failing_tests)
         if error_files:
             extra_guidance += "Error file locations:\n" + "".join(f"  {f}\n" for f in error_files)
+        prev_review_issues = ctx.get("_previous_review_issues") or []
+        if prev_review_issues:
+            extra_guidance += (
+                "Unresolved review issues from previous attempt (address these proactively):\n"
+                + "".join(f"  - {str(d)[:300]}\n" for d in prev_review_issues[:5])
+            )
         if attempt >= 2 and task_scope in ("large", "medium"):
             prev_stage = ctx.get("_previous_failure_stage")
             prev_expansion = ctx.get("expansion_ratio")
@@ -567,6 +577,27 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             clone_ctx["_previous_self_review_outcome"] = prev_self_review_outcome
         if prev_analysis_plan:
             clone_ctx["_previous_analysis_plan"] = prev_analysis_plan
+
+        # Extract last review iteration's unresolved CRITICAL/MAJOR issues so the
+        # retry can address structured reviewer feedback that truncated status
+        # messages often miss.
+        try:
+            review_history = (
+                (child_ctx.get("review_loop") or {}).get("review_history") or []
+            )
+            if review_history:
+                last_issues = (review_history[-1] or {}).get("issues") or []
+                filtered = [
+                    str(iss.get("description") or "").strip()
+                    for iss in last_issues
+                    if isinstance(iss, dict)
+                    and str(iss.get("severity") or "").upper() in ("CRITICAL", "MAJOR")
+                    and (iss.get("description") or "")
+                ]
+                if filtered:
+                    clone_ctx["_previous_review_issues"] = filtered[:5]
+        except Exception:
+            logger.exception("[REQUEUE] Failed to extract review issues for task %s", child.id)
 
         if new_payloads and isinstance(new_payloads[0], dict):
             existing_suffix = new_payloads[0].get("prompt_suffix", "") or ""

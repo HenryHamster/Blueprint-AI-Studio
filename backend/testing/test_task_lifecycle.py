@@ -581,8 +581,8 @@ async def test_requeue_scope_overflow_medium_escalates_to_large(tl_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_requeue_scope_overflow_small_does_not_escalate(tl_db, mocker):
-    """SCOPE_OVERFLOW on a small task keeps the same scope — only medium escalates to large."""
+async def test_requeue_scope_overflow_small_escalates_to_medium(tl_db, mocker):
+    """SCOPE_OVERFLOW on a small task escalates to medium for a 10-file budget."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle.classify_failure", return_value="SCOPE_OVERFLOW")
     session, _ = tl_db
@@ -602,8 +602,8 @@ async def test_requeue_scope_overflow_small_does_not_escalate(tl_db, mocker):
         select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
     )).scalars().first()
     assert clone is not None
-    # Scope stays small; guidance is still added
-    assert clone.context.get("scope") == "small"
+    # Scope escalates small→medium; guidance is still added
+    assert clone.context.get("scope") == "medium"
     prompt_suffix = clone.payloads[0].get("prompt_suffix", "") or ""
     assert "file-count budget" in prompt_suffix.lower()
 
@@ -1592,11 +1592,12 @@ class TestBuildRetryPromptSuffix:
         assert "scope's file-count budget" in guidance
         assert override == "large"
 
-    def test_scope_overflow_small_does_not_escalate(self):
-        _, override = _build_retry_prompt_suffix(
+    def test_scope_overflow_small_escalates_to_medium(self):
+        guidance, override = _build_retry_prompt_suffix(
             "SCOPE_OVERFLOW", None, attempt=1, task_scope="small", ctx={}
         )
-        assert override is None
+        assert "scope's file-count budget" in guidance
+        assert override == "medium"
 
     def test_scope_overflow_includes_overflow_details_when_changed_files_present(self):
         ctx = {
@@ -1722,6 +1723,20 @@ class TestBuildRetryPromptSuffix:
         assert "Error file locations:" in guidance
         assert "backend/app/main.py" in guidance
         assert "agent/src/index.ts" in guidance
+
+    def test_code_error_includes_previous_review_issues(self):
+        ctx = {
+            "_previous_review_issues": [
+                "Missing null check in foo()",
+                "Error handling swallows exceptions",
+            ],
+        }
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "test failure", attempt=1, task_scope="small", ctx=ctx,
+        )
+        assert "Unresolved review issues" in guidance
+        assert "Missing null check in foo()" in guidance
+        assert "Error handling swallows exceptions" in guidance
 
     def test_code_error_stage_test_guidance(self):
         guidance, _ = _build_retry_prompt_suffix(
