@@ -1120,6 +1120,17 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                 {FAILURE_CLASS_CONFIG[item.failure_class].label}
                               </span>
                             )}
+                            {item.reason === 'failed' && item.pr_url && isSafeUrl(item.pr_url) && (
+                              <a
+                                href={item.pr_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={e => e.stopPropagation()}
+                                className="shrink-0 text-[9px] text-emerald-400 hover:text-emerald-300 font-medium"
+                              >
+                                {item.pr_url.match(/\/(\d+)\/?$/)?.[1] ? `PR #${item.pr_url.match(/\/(\d+)\/?$/)?.[1]}` : 'PR'}
+                              </a>
+                            )}
                             <WaitingBadge hours={item.waiting_hours} />
                             {item.reason === 'approval_required' && onApprove && (
                               <button
@@ -1278,6 +1289,9 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                               <Compass className="w-2.5 h-2.5 shrink-0" />
                               <span className="truncate">{t.direction_text.slice(0, 30)}{t.direction_text.length > 30 ? '…' : ''}</span>
                             </span>
+                          )}
+                          {t.task_type && (
+                            <TaskTypeBadge taskType={t.task_type as TaskType} />
                           )}
                           {t.scope && (
                             <span
@@ -1600,12 +1614,21 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   </div>
                   {digest!.review_cap_exhaustion_summary.top_directions.length > 0 && (
                     <div className="flex flex-col gap-0.5 ml-1">
-                      {digest!.review_cap_exhaustion_summary.top_directions.map(d => (
-                        <span key={d.direction_id} className="text-[10px] text-neutral-500 truncate">
-                          · {d.direction_id}{' '}
-                          <span className="text-red-400">×{d.count}</span>
-                        </span>
-                      ))}
+                      {(() => {
+                        const dirTextById = new Map<string, string>(
+                          (digest!.direction_progress ?? []).map(dp => [dp.direction_id, dp.direction_text || dp.direction_id]),
+                        );
+                        return digest!.review_cap_exhaustion_summary!.top_directions.map(d => {
+                          const text = dirTextById.get(d.direction_id) ?? d.direction_id;
+                          const label = text.length > 60 ? text.slice(0, 60) + '…' : text;
+                          return (
+                            <span key={d.direction_id} className="text-[10px] text-neutral-500 truncate">
+                              · {label}{' '}
+                              <span className="text-red-400">×{d.count}</span>
+                            </span>
+                          );
+                        });
+                      })()}
                     </div>
                   )}
                 </div>
