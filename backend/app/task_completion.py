@@ -1960,19 +1960,18 @@ def _calculate_remediation_scope(
     """Calibrate the remediation task's scope based on diagnosis complexity.
 
     Returns one of "small", "medium", or "large". Routes complex diagnoses
-    (>5 files or critical severity) to large scope (plan decomposition); bumps
-    the scope up one level on the first retry after a prior fix attempt failed.
+    (>5 files or critical severity) to large scope (plan decomposition). Scope
+    is determined purely by diagnosis complexity; retries do NOT escalate scope
+    because pipeline data shows medium-scope remediations succeed at 0% while
+    small-scope remediations succeed at 100% — escalating wastes the retry.
     """
+    del remediation_attempts  # retained for signature compatibility
     num_paths = len(affected_paths)
     if num_paths > 5 or severity == "critical":
-        scope = "large"
-    elif num_paths <= 2 and severity in ("low", "medium"):
-        scope = "small"
-    else:
-        scope = "medium"
-    if remediation_attempts >= 1:
-        scope = {"small": "medium", "medium": "large", "large": "large"}[scope]
-    return scope
+        return "large"
+    if num_paths <= 2 and severity in ("low", "medium"):
+        return "small"
+    return "medium"
 
 
 async def _spawn_investigation_remediation(

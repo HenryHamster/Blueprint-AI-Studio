@@ -336,6 +336,7 @@ interface DigestData {
     active_investigations: number;
     investigations_by_confidence?: Record<string, number>;
     failed_remediations_by_class?: Record<string, number>;
+    merged_remediations_by_trigger_class?: Record<string, number>;
     remediation_success_by_confidence?: Record<string, { merged: number; failed: number }>;
     recent_investigations?: Array<{
       task_id: string;
@@ -2772,6 +2773,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           const ibc = rf.investigations_by_confidence ?? {};
                           const rsbc = rf.remediation_success_by_confidence ?? {};
                           const frbc = rf.failed_remediations_by_class ?? {};
+                          const mrbc = rf.merged_remediations_by_trigger_class ?? {};
                           const ibcEntries = confOrder.filter(k => (ibc[k] ?? 0) > 0);
                           const rsbcEntries = confOrder.filter(k => {
                             const v = rsbc[k];
@@ -2780,7 +2782,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           const frbcEntries = Object.entries(frbc)
                             .filter(([, v]) => v > 0)
                             .sort((a, b) => b[1] - a[1]);
-                          if (!ibcEntries.length && !rsbcEntries.length && !frbcEntries.length) return null;
+                          const mrbcEntries = Object.entries(mrbc)
+                            .filter(([, v]) => v > 0)
+                            .sort((a, b) => b[1] - a[1]);
+                          if (!ibcEntries.length && !rsbcEntries.length && !frbcEntries.length && !mrbcEntries.length) return null;
                           return (
                             <div className="flex flex-col gap-1 text-[10px] text-neutral-400 border-t border-neutral-800 pt-1.5">
                               {ibcEntries.length > 0 && (
@@ -2817,6 +2822,17 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                   {frbcEntries.map(([cls, count]) => (
                                     <span key={cls} className="inline-flex items-baseline gap-1">
                                       <span className="text-red-400">{cls}</span>
+                                      <span className="font-mono text-neutral-300">{count}</span>
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                              {mrbcEntries.length > 0 && (
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-neutral-500 w-24 shrink-0">merged class:</span>
+                                  {mrbcEntries.map(([cls, count]) => (
+                                    <span key={cls} className="inline-flex items-baseline gap-1">
+                                      <span className="text-emerald-400">{cls}</span>
                                       <span className="font-mono text-neutral-300">{count}</span>
                                     </span>
                                   ))}

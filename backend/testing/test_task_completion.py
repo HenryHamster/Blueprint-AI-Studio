@@ -1603,6 +1603,64 @@ class TestFollowupInvestigationOnFailure:
         assert "TypeError in drain_rollups" in prompt_text
 
     @pytest.mark.asyncio
+    async def test_follow_up_propagates_failure_class(self, db_session):
+        """Parent's trigger_failure_class becomes last_failure_class on the spawned
+        follow-up, so _spawn_investigation_remediation will set trigger_failure_class
+        correctly on the next remediation."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active", "text": "demo",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message="ImportError: boom",
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-1",
+                "diagnosis_fingerprint": "fp-A",
+                "trigger_failure_class": "CODE_ERROR",
+                "trigger_failure_taxonomy": {"kind": "import"},
+            },
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as TaskModel
+        spawned = (await db_session.execute(
+            _select(TaskModel).where(
+                TaskModel.project_id == project.id,
+                TaskModel.id != task.id,
+            )
+        )).scalars().first()
+        assert spawned is not None
+        assert spawned.context["last_failure_class"] == "CODE_ERROR"
+        assert spawned.context["failure_taxonomy"] == {"kind": "import"}
+
+        # Verify the downstream hop: a remediation spawned from this follow-up
+        # investigation carries trigger_failure_class set from last_failure_class.
+        from app.task_completion import _spawn_investigation_remediation
+        remediation = await _spawn_investigation_remediation(
+            task=spawned,
+            direction_id="dir-1",
+            summary="s", root_cause="rc", recommended_fix="rf",
+            severity="medium", confidence="high",
+            affected_paths=["a.py"], remediation_attempts=0,
+            session=db_session,
+        )
+        assert remediation is not None
+        assert remediation.context["trigger_failure_class"] == "CODE_ERROR"
+        assert remediation.context["trigger_failure_taxonomy"] == {"kind": "import"}
+
+    @pytest.mark.asyncio
     async def test_follow_up_prompt_includes_earlier_attempts(self, db_session):
         """Prior remediation_history entries surface in the follow-up prompt."""
         prior_history = [
@@ -2485,14 +2543,15 @@ class TestCalculateRemediationScope:
     def test_empty_paths_low_severity_is_small(self):
         assert _calculate_remediation_scope([], "low", 0) == "small"
 
-    def test_bumps_small_to_medium_on_first_retry(self):
-        assert _calculate_remediation_scope(["a.py"], "low", 1) == "medium"
+    def test_retry_does_not_escalate_small(self):
+        """Retries keep the same scope — medium-scope remediations fail at 0%."""
+        assert _calculate_remediation_scope(["a.py"], "low", 1) == "small"
 
-    def test_bumps_medium_to_large_on_first_retry(self):
+    def test_retry_does_not_escalate_medium(self):
         paths = ["a.py", "b.py", "c.py"]
-        assert _calculate_remediation_scope(paths, "medium", 1) == "large"
+        assert _calculate_remediation_scope(paths, "medium", 1) == "medium"
 
-    def test_large_stays_large_after_bump(self):
+    def test_large_stays_large_after_retry(self):
         paths = [f"f{i}.py" for i in range(6)]
         assert _calculate_remediation_scope(paths, "medium", 5) == "large"
 
@@ -2592,7 +2651,8 @@ class TestRemediationScopeInPayload:
         assert child.context["scope"] == "medium"
 
     @pytest.mark.asyncio
-    async def test_attempts_bump_small_to_medium(self, db_session, mocker):
+    async def test_retries_do_not_escalate_scope(self, db_session, mocker):
+        """Prior retry count should not escalate a small-scope diagnosis to medium."""
         project = await self._setup(
             db_session, mocker, direction_overrides={"remediation_attempts": 2},
         )
@@ -2605,7 +2665,7 @@ class TestRemediationScopeInPayload:
         await db_session.commit()
         child = await self._spawned_child(db_session, task.id)
         assert child is not None
-        assert child.context["scope"] == "medium"
+        assert child.context["scope"] == "small"
 
 
 # ── _handle_investigation_terminal_failure ──────────────────────────────────
