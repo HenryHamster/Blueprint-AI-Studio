@@ -1783,8 +1783,8 @@ async def test_medium_scope_with_few_related_files_stays_medium(db_session, mock
 
 
 @pytest.mark.asyncio
-async def test_medium_scope_cross_module_related_files_upgrades_to_large(db_session, mocker, monkeypatch):
-    """Medium finding whose related_files span 2+ top-level modules upgrades to large."""
+async def test_medium_scope_cross_module_related_files_auto_decomposes(db_session, mocker, monkeypatch):
+    """2-file cross-module medium finding auto-decomposes into per-file small sub-findings."""
     monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
     direction = _active_direction("d-xmod01", "Cross-module heuristic direction")
     project = Project(
@@ -1811,10 +1811,14 @@ async def test_medium_scope_cross_module_related_files_upgrades_to_large(db_sess
         select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
     )
     child_tasks = result.scalars().all()
-    assert len(child_tasks) == 1
-    assert child_tasks[0].payloads[0]["type"] == "plan"
-    assert child_tasks[0].context["scope"] == "large"
-    assert child_tasks[0].context["scope_calibrated_from"] == "medium:cross_module"
+    assert len(child_tasks) == 2
+    files_seen = set()
+    for ct in child_tasks:
+        assert ct.payloads[0]["type"] == "create"
+        assert ct.context["scope"] == "small"
+        assert ct.context["scope_calibrated_from"] == "medium"
+        files_seen.update(ct.context.get("related_files") or [])
+    assert files_seen == {"backend/app/foo.py", "agent/src/bar.ts"}
 
 
 @pytest.mark.asyncio

@@ -47,15 +47,33 @@ def _composite_complexity_score(
     modules = {"/".join(f.split("/", 2)[:2]) if "/" in f else f for f in (related_files or [])}
     # modules=1 → 1.0; modules=5+ → floor 0.5.
     f_modules = max(0.5, 1.0 - 0.125 * max(0, len(modules) - 1))
-    score = f_files * f_ratio * f_clusters * f_modules
+    neighbor_ratio = 0.0
+    f_neighbors = 1.0
+    if n > 0 and cochange_index:
+        listed = set(related_files or [])
+        unlisted = 0
+        for f in related_files or []:
+            for partner, score in (cochange_index.get(f) or {}).items():
+                if (
+                    partner not in listed
+                    and isinstance(score, (int, float))
+                    and score >= 1.0
+                ):
+                    unlisted += 1
+        neighbor_ratio = unlisted / n
+        # ratio<=0.5 → 1.0; ratio>=2.0 → 0.5; linear between.
+        f_neighbors = max(0.5, min(1.0, 1.0 - (neighbor_ratio - 0.5) / 3.0))
+    score = f_files * f_ratio * f_clusters * f_modules * f_neighbors
     return max(0.0, min(1.0, score)), {
         "files": n,
         "expansion_ratio": round(ratio, 2),
         "modules": len(modules),
+        "neighbor_ratio": round(neighbor_ratio, 2),
         "factors": {
             "files": round(f_files, 3),
             "ratio": round(f_ratio, 3),
             "clusters": round(f_clusters, 3),
             "modules": round(f_modules, 3),
+            "neighbors": round(f_neighbors, 3),
         },
     }

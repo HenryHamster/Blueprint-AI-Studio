@@ -693,7 +693,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # a stronger signal than file-count heuristics, so a freshly-applied
         # downgrade (e.g. medium→small) should not be reversed by the small→medium
         # heuristic that fires on related_files >= 3.
-        if not _history_calibration_fired:
+        # Also skip heuristics for auto-decomposed findings: the decomposition
+        # is a deliberate small-scope decision that must not be reversed by the
+        # small→medium related_files>=3 heuristic (decomposed clusters often
+        # span 3-5 files by design).
+        if not _history_calibration_fired and not finding.get("auto_decomposed"):
             _heur_dir_id = finding.get("direction_id") or _parent_direction_id
             _heur_direction = _directions_by_id.get(str(_heur_dir_id)) if _heur_dir_id else None
             scope, _heur_calibrated_from = _calibrate_finding_scope(
@@ -1012,6 +1016,31 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _cscore = finding.get("_complexity_score")
             if _cscore is not None and _cscore < 0.4 and _effort_rank.get(finding_effort, 0) < _effort_rank["high"]:
                 finding_effort = "high"
+        # Predicted file-budget utilization for medium-scope tasks: gives the
+        # implementing agent early visibility into budget pressure before it
+        # commits to a broad approach. Complements the review-pipeline's runtime
+        # pressure system (which fires at 70%/90% after changes are made).
+        _predicted_utilization: Optional[float] = None
+        _file_budget_warning: Optional[str] = None
+        if scope == "medium" and related_files:
+            _util_ratio = (
+                _avg_medium_expansion_ratio([_pred_direction]) if _pred_direction else None
+            )
+            if _util_ratio is None:
+                _util_ratio = _avg_medium_expansion_ratio(list(_directions_by_id.values()))
+            if _util_ratio is None:
+                _util_ratio = 2.0
+            _medium_budget = SCOPE_FILE_BUDGETS.get("medium", {}).get("total_files_max") or 10
+            _predicted_utilization = round(
+                len(related_files) * _util_ratio / _medium_budget, 3
+            )
+            if _predicted_utilization > 0.7:
+                _file_budget_warning = (
+                    f"Predicted file-budget utilization is {_predicted_utilization:.0%} of the "
+                    f"medium-scope limit ({_medium_budget} files). Plan conservatively: prioritize "
+                    f"the most critical files from related_files and avoid incidental edits that "
+                    f"would push the change past the budget."
+                )
         finding_payload = validate_internal_payload({
             "type": task_type,
             "prompt": full_prompt,
@@ -1044,6 +1073,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **({"low_confidence_spawn": True, "low_confidence_spawn_rate": round(_pred_p, 3)} if _low_confidence else {}),
                 **({"medium_exploration": True} if _medium_exploration else {}),
                 **({"auto_decomposed": True} if finding.get("auto_decomposed") else {}),
+                **({"_predicted_file_utilization": _predicted_utilization} if _predicted_utilization is not None else {}),
+                **({"_file_budget_warning": _file_budget_warning} if _file_budget_warning else {}),
                 **prior_retry_ctx,
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",

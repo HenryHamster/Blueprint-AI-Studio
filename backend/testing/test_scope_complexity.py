@@ -137,6 +137,57 @@ class TestCochangeFactor:
             assert m.call_count == 0
 
 
+class TestNeighborFactor:
+    def test_no_unlisted_neighbors_no_penalty(self):
+        with patch(
+            "app.scope_complexity._cluster_files_by_cochange",
+            return_value=[["pkg/sub/a.py", "pkg/sub/b.py"]],
+        ):
+            s, meta = _score(
+                ["pkg/sub/a.py", "pkg/sub/b.py"],
+                cochange_index={"pkg/sub/a.py": {"pkg/sub/b.py": 1.0}},
+            )
+        assert s == 1.0
+        assert meta["neighbor_ratio"] == 0.0
+        assert meta["factors"]["neighbors"] == 1.0
+
+    def test_unlisted_neighbors_at_ratio_one(self):
+        # 1 listed file with 1 unlisted neighbor (ratio=1.0) → f = 1 - 0.5/3 ≈ 0.833
+        with patch(
+            "app.scope_complexity._cluster_files_by_cochange", return_value=None,
+        ):
+            s, meta = _score(
+                ["a.py"],
+                cochange_index={"a.py": {"x.py": 1.0}},
+            )
+        assert meta["neighbor_ratio"] == 1.0
+        assert abs(meta["factors"]["neighbors"] - round(1.0 - 0.5 / 3.0, 3)) < 1e-9
+        assert abs(s - (1.0 - 0.5 / 3.0)) < 1e-9
+
+    def test_neighbor_factor_floors_at_half(self):
+        with patch(
+            "app.scope_complexity._cluster_files_by_cochange", return_value=None,
+        ):
+            s, meta = _score(
+                ["a.py"],
+                cochange_index={"a.py": {f"x{i}.py": 1.0 for i in range(5)}},
+            )
+        assert meta["neighbor_ratio"] == 5.0
+        assert meta["factors"]["neighbors"] == 0.5
+        assert s == 0.5
+
+    def test_low_affinity_partners_ignored(self):
+        with patch(
+            "app.scope_complexity._cluster_files_by_cochange", return_value=None,
+        ):
+            s, meta = _score(
+                ["a.py"],
+                cochange_index={"a.py": {"x.py": 0.9, "y.py": 0.5}},
+            )
+        assert meta["neighbor_ratio"] == 0.0
+        assert s == 1.0
+
+
 class TestCrossModuleFactor:
     def test_single_module_no_penalty(self):
         s, meta = _score(["backend/app/a.py", "backend/app/b.py"])

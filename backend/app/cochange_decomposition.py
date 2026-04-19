@@ -200,21 +200,31 @@ def auto_decompose_findings_by_cochange(
         )
         if (
             f_scope == "medium"
-            and len(f_files) >= 3
+            and len(f_files) >= 2
             and not f_already_calibrated
         ):
-            f_clusters = (
-                cluster_files_by_cochange(f_files, cochange_index)
-                if cochange_index
-                else None
-            )
-            cluster_source = "co-change"
-            if f_clusters is None:
-                f_clusters = cluster_files_by_toplevel_dir(f_files)
-                cluster_source = "top-level-dir"
-            if f_clusters is None:
-                f_clusters = cluster_files_by_subdir(f_files)
-                cluster_source = "subdir"
+            f_clusters: list[list[str]] | None = None
+            cluster_source = ""
+            if len(f_files) == 2:
+                tops = [
+                    f.split("/", 1)[0] if "/" in f else "" for f in f_files
+                ]
+                if tops[0] and tops[1] and tops[0] != tops[1]:
+                    f_clusters = [[f_files[0]], [f_files[1]]]
+                    cluster_source = "cross-module"
+            else:
+                f_clusters = (
+                    cluster_files_by_cochange(f_files, cochange_index)
+                    if cochange_index
+                    else None
+                )
+                cluster_source = "co-change"
+                if f_clusters is None:
+                    f_clusters = cluster_files_by_toplevel_dir(f_files)
+                    cluster_source = "top-level-dir"
+                if f_clusters is None:
+                    f_clusters = cluster_files_by_subdir(f_files)
+                    cluster_source = "subdir"
             if f_clusters and len(f_clusters) >= 2:
                 f_title = finding.get("title", f"Research finding #{orig_i+1}")
                 if all(len(c) > small_budget for c in f_clusters):
