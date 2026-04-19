@@ -3629,3 +3629,81 @@ async def test_digest_escalation_outcome_summary(client: AsyncClient, db_session
     assert by_path["small_to_large"]["attempted"] == 1
     assert by_path["small_to_large"]["success_rate"] == 1.0
     assert by_path["medium_to_large"]["success_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_digest_remediation_funnel(client: AsyncClient, db_session):
+    """investigate + remediation tasks surface in digest.remediation_funnel."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    inv_created = now - timedelta(hours=3)
+    rem_completed = now - timedelta(hours=1)
+
+    # Completed investigation with a parseable diagnosis summary
+    inv_done = make_task(
+        project_id=project.id,
+        title="investigate A",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate"}],
+        created_at=inv_created,
+        plan_output={"summary": "root cause X"},
+    )
+    # In-flight investigation (counts as active)
+    inv_active = make_task(
+        project_id=project.id,
+        title="investigate B",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=2),
+    )
+    # Completed investigation without summary (counts but not with_diagnosis)
+    inv_no_summary = make_task(
+        project_id=project.id,
+        title="investigate C",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=4),
+        plan_output={"raw": "logs"},
+    )
+    db_session.add_all([inv_done, inv_active, inv_no_summary])
+    await db_session.commit()
+    await db_session.refresh(inv_done)
+
+    rem_merged = make_task(
+        project_id=project.id,
+        title="remediation A",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=2),
+        context={"diagnosis_task_id": str(inv_done.id), "direction_id": "d1"},
+        status_log=[{"t": rem_completed.isoformat(), "status": "completed"}],
+    )
+    rem_failed = make_task(
+        project_id=project.id,
+        title="remediation B",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=1),
+        context={"diagnosis_task_id": str(inv_done.id), "direction_id": "d1"},
+    )
+    db_session.add_all([rem_merged, rem_failed])
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    funnel = response.json()["remediation_funnel"]
+
+    assert funnel["investigations_spawned"] == 3
+    assert funnel["investigations_completed"] == 2
+    assert funnel["investigations_with_diagnosis"] == 1
+    assert funnel["active_investigations"] == 1
+    assert funnel["remediations_spawned"] == 2
+    assert funnel["remediations_merged"] == 1
+    assert funnel["remediations_failed"] == 1
+    # inv_done created 3h ago, rem_merged completed 1h ago → ~2h
+    assert funnel["avg_time_to_remediation_hours"] is not None
+    assert 1.5 <= funnel["avg_time_to_remediation_hours"] <= 2.5

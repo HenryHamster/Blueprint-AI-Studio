@@ -3047,3 +3047,5 @@ class TestPlanSubtaskScopeAwareEffort:
         children = await self._child_tasks(db_session, task)
         assert len(children) == 1
         assert children[0].payloads[0]["effort"] == "max"
+
+

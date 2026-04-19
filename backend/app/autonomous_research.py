@@ -1008,6 +1008,100 @@ async def _spawn_direction_hold_investigation(project: Project, session: AsyncSe
     return spawned
 
 
+async def _spawn_task_failure_investigation(
+    task: Task, session: AsyncSession,
+) -> bool:
+    """Spawn an investigate task when a directed task exhausts retries with
+    a CODE_ERROR / code_defect failure.
+
+    Returns True when a new investigation task is created, False otherwise.
+    Canonical implementation — called by task_lifecycle post-failure processing
+    once a task has been marked FAILED and its retry budget is exhausted.
+    Gating is delegated to ``should_trigger_code_defect_investigation``; this
+    function adds 24h dedup per direction and builds the investigation prompt.
+    """
+    from app.failure_classification import (  # noqa: PLC0415
+        CODE_ERROR, TAXONOMY_CODE_DEFECT,
+        should_trigger_code_defect_investigation,
+    )
+
+    if not should_trigger_code_defect_investigation(task):
+        return False
+
+    ctx = task.context or {}
+    direction_id = ctx.get("direction_id")
+    if await _recent_investigation_exists(task.project_id, direction_id, session):
+        return False
+
+    payload = task.first_payload or {}
+    ttype = payload.get("type") or ""
+    status_msg = (task.latest_status_message or "(no message)")[:400]
+    tool_trace = (ctx.get("_tool_trace") or "")
+    if isinstance(tool_trace, list):
+        tool_trace = "\n".join(str(x) for x in tool_trace)
+    tool_trace = str(tool_trace)[:1500]
+    prev_fp = ctx.get("_previous_error_fingerprint") or ""
+    failing_tests = ctx.get("failing_tests") or ctx.get("failed_tests") or []
+    if isinstance(failing_tests, (list, tuple)):
+        failing_tests_str = ", ".join(str(x) for x in failing_tests)[:400]
+    else:
+        failing_tests_str = str(failing_tests)[:400]
+
+    prompt_lines = [
+        f"Task {str(task.id)[:8]} ({ttype}) failed with CODE_ERROR / code_defect "
+        f"after exhausting its retry budget. Diagnose the root cause.",
+        "",
+        f"Direction: {direction_id}",
+        f"Status message: {status_msg}",
+    ]
+    if prev_fp:
+        prompt_lines.append(f"Previous error fingerprint: {prev_fp}")
+    if failing_tests_str:
+        prompt_lines.append(f"Failing tests: {failing_tests_str}")
+    if tool_trace:
+        prompt_lines.append(f"\nRecent tool trace:\n{tool_trace}")
+    prompt_lines.append(
+        "\nProduce the structured diagnosis JSON report so remediation can be spawned."
+    )
+    prompt = "\n".join(prompt_lines)
+
+    inv_payload = validate_internal_payload(
+        {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+        "autonomous_research:task_failure_investigation",
+    )
+    new_task = Task(
+        project_id=task.project_id,
+        title=f"Investigate task failure: {(task.title or '?')[:80]}",
+        description=f"Auto-spawned after {ttype} task {str(task.id)[:8]} exhausted retries (CODE_ERROR/code_defect)",
+        payloads=[inv_payload],
+        context={
+            "direction_id": direction_id,
+            "spawned_by": "task_failure_investigation",
+            "source_task_id": str(task.id),
+            "last_failure_class": CODE_ERROR,
+            "failure_taxonomy": TAXONOMY_CODE_DEFECT,
+            "failure_fingerprints": [prev_fp] if prev_fp else [],
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(new_task)
+    session.add(TaskHistory(
+        task_id=new_task.id, action="SPAWNED",
+        details={
+            "spawned_by": "TASK_FAILURE_INVESTIGATION",
+            "direction_id": direction_id,
+            "source_task_id": str(task.id),
+        },
+    ))
+    logger.info(
+        f"[TASK FAILURE INVESTIGATION] Spawned investigation {new_task.id} for "
+        f"failed task {task.id} (direction {direction_id})"
+    )
+    return True
+
+
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
     from app.anomaly_detection import _expire_stale_proposals, _check_anomaly_proposals  # noqa: PLC0415

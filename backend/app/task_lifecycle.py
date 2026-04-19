@@ -920,6 +920,20 @@ async def _process_post_commit(
                 except Exception as _ar_exc:
                     logger.warning("[AUTO-REMEDIATION] Failed to post failure result message: %s", _ar_exc)
 
+            # Task-level CODE_ERROR investigation trigger: when a directed task
+            # exhausts retries with a code_defect failure, spawn an investigate
+            # task to diagnose the specific failure pattern. Direction-hold path
+            # only fires after 3 consecutive failures on a direction; this fires
+            # per-task so one-off recurring defects still get diagnosed.
+            try:
+                from app.autonomous_research import _spawn_task_failure_investigation  # noqa: PLC0415
+                await _spawn_task_failure_investigation(task, session)
+            except Exception as _inv_exc:
+                logger.error(
+                    f"[INVESTIGATION] Failed to evaluate task-level trigger for {task.id}: {_inv_exc!r}",
+                    exc_info=True,
+                )
+
         # 5. Review Pipeline — auto-spawn review/fix tasks based on completed task type
         if payload.status == TaskStatus.COMPLETED:
             task_payload = task.first_payload

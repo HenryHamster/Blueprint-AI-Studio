@@ -1563,6 +1563,89 @@ async def test_process_post_commit_completed_child_triggers_rollup_check(tl_db, 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Task-level CODE_ERROR investigation trigger
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_code_defect_failure_spawns_investigation(tl_db, mocker):
+    """A FAILED task with CODE_ERROR/code_defect and a direction_id spawns investigate."""
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    session, factory = tl_db
+    project = await _make_project(session)
+    direction_id = "d-abc123"
+    task = await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        context={"direction_id": direction_id, "failure_category": "CODE_ERROR"},
+        latest_status_message="Build failed: ReferenceError in src/foo.ts",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    result = await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != task.id,
+        )
+    )
+    spawned = result.scalars().all()
+    assert len(spawned) == 1
+    inv = spawned[0]
+    assert inv.payloads[0]["type"] == "investigate"
+    assert inv.context["direction_id"] == direction_id
+    assert inv.context["spawned_by"] == "task_failure_investigation"
+    assert inv.context["source_task_id"] == str(task.id)
+
+
+@pytest.mark.asyncio
+async def test_failure_without_direction_id_skips_investigation(tl_db, mocker):
+    """FAILED task without direction_id in context does NOT spawn investigate."""
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+        latest_status_message="Build failed: syntax error",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    result = await session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    assert result.scalars().first() is None
+
+
+@pytest.mark.asyncio
+async def test_investigate_task_failure_does_not_self_loop(tl_db, mocker):
+    """A failed investigate task does NOT spawn another investigate (self-loop guard)."""
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type="investigate",
+        status=TaskStatus.FAILED,
+        context={"direction_id": "d-xyz", "failure_category": "CODE_ERROR"},
+        latest_status_message="Build failed",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    result = await session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    assert result.scalars().first() is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # _is_transient_scan_error
 # ══════════════════════════════════════════════════════════════════════════════
 

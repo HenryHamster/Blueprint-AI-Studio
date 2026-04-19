@@ -94,6 +94,34 @@ def classify_failure_taxonomy(task: "Task") -> str:
     return TAXONOMY_CODE_DEFECT
 
 
+# Task types excluded from code_defect investigation triggers — investigate tasks
+# would recurse, and smoketests are exploratory probes whose failures don't
+# represent a code defect worth diagnosing.
+_INVESTIGATION_EXCLUDED_TYPES: frozenset[str] = frozenset({"investigate", "smoketest"})
+
+
+def should_trigger_code_defect_investigation(task: "Task") -> bool:
+    """Return True if a failed task warrants spawning a CODE_ERROR investigation.
+
+    Gates the task-level investigation trigger: only fires for CODE_ERROR
+    failures with code_defect taxonomy (review_quality and scope_related have
+    their own handling), skips investigate/smoketest tasks to prevent self-loops,
+    and requires a direction_id so the investigation can be linked.
+    """
+    payload = (task.payloads or [{}])[0] if hasattr(task, "payloads") else {}
+    task_type = (payload or {}).get("type") if isinstance(payload, dict) else None
+    if task_type in _INVESTIGATION_EXCLUDED_TYPES:
+        return False
+    ctx = task.context or {}
+    if not ctx.get("direction_id"):
+        return False
+    if classify_failure(task) != CODE_ERROR:
+        return False
+    if classify_failure_taxonomy(task) != TAXONOMY_CODE_DEFECT:
+        return False
+    return True
+
+
 _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     'clone_failed': PROVISION_FAILURE,
     'build_failed': CODE_ERROR,

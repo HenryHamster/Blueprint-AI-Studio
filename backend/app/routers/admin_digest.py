@@ -2049,6 +2049,73 @@ async def get_digest(
         "success_rate": (_resurrected_completed / _resurrected_total) if _resurrected_total else None,
     }
 
+    # Remediation funnel: investigation -> diagnosis -> remediation -> merge.
+    # Query investigate + remediation tasks in-window regardless of status (the
+    # main all_tasks query is terminal-only, so investigate tasks that are still
+    # IN_PROGRESS would otherwise be missed).
+    _funnel_filters = [Task.created_at >= window_start]
+    if project_id:
+        _funnel_filters.append(Task.project_id == project_id)
+    _inv_result = await session.execute(
+        select(Task).where(
+            *_funnel_filters,
+            Task.payloads[0]["type"].as_string() == "investigate",
+        )
+    )
+    _inv_tasks = _inv_result.scalars().all()
+    _rem_result = await session.execute(
+        select(Task).where(
+            *_funnel_filters,
+            Task.context["diagnosis_task_id"].as_string().is_not(None),
+        )
+    )
+    _rem_tasks = _rem_result.scalars().all()
+
+    investigations_spawned = len(_inv_tasks)
+    investigations_completed = sum(1 for t in _inv_tasks if t.status == TaskStatus.COMPLETED)
+    investigations_with_diagnosis = sum(
+        1 for t in _inv_tasks
+        if t.status == TaskStatus.COMPLETED
+        and isinstance(t.plan_output, dict)
+        and str((t.plan_output or {}).get("summary") or "").strip()
+    )
+    active_investigations = sum(
+        1 for t in _inv_tasks
+        if t.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
+    )
+    remediations_spawned = len(_rem_tasks)
+    remediations_merged = sum(1 for t in _rem_tasks if t.status == TaskStatus.COMPLETED)
+    remediations_failed = sum(1 for t in _rem_tasks if t.status == TaskStatus.FAILED)
+
+    _inv_by_id = {str(t.id): t for t in _inv_tasks}
+    _ttr_values: List[float] = []
+    for r in _rem_tasks:
+        if r.status != TaskStatus.COMPLETED:
+            continue
+        diag_id = (r.context or {}).get("diagnosis_task_id")
+        inv = _inv_by_id.get(str(diag_id)) if diag_id else None
+        if inv is None:
+            continue
+        completed_at = _derive_completed_at(r)
+        if completed_at and inv.created_at:
+            delta = (completed_at - inv.created_at).total_seconds() / 3600.0
+            if delta >= 0:
+                _ttr_values.append(delta)
+    avg_time_to_remediation_hours = (
+        round(sum(_ttr_values) / len(_ttr_values), 2) if _ttr_values else None
+    )
+
+    remediation_funnel = {
+        "investigations_spawned": investigations_spawned,
+        "investigations_completed": investigations_completed,
+        "investigations_with_diagnosis": investigations_with_diagnosis,
+        "remediations_spawned": remediations_spawned,
+        "remediations_merged": remediations_merged,
+        "remediations_failed": remediations_failed,
+        "avg_time_to_remediation_hours": avg_time_to_remediation_hours,
+        "active_investigations": active_investigations,
+    }
+
     return {
         "window_hours": hours,
         "total_merge_retries_saved": total_merge_retries_saved,
@@ -2115,4 +2182,5 @@ async def get_digest(
         "review_cap_exhaustion_summary": review_cap_exhaustion_summary,
         "resurrection_outcome_summary": resurrection_outcome_summary,
         "recurring_error_clusters": recurring_error_clusters,
+        "remediation_funnel": remediation_funnel,
     }

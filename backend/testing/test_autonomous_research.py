@@ -5435,6 +5435,155 @@ async def test_investigation_skipped_when_no_hold(db_session, _clear_direction_s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _spawn_task_failure_investigation
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_task_failure_investigation_spawns_for_code_defect(db_session):
+    from app.autonomous_research import _spawn_task_failure_investigation
+    direction_id = "d-tfail001"
+    project = Project(
+        name="Task Fail Inv",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(direction_id)],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    failed = Task(
+        project_id=project.id,
+        title="Broken feature",
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        context={
+            "direction_id": direction_id,
+            "_tool_trace": "Edit file.py\nRun tests → failed",
+            "_previous_error_fingerprint": "abc123",
+            "failing_tests": ["test_foo", "test_bar"],
+        },
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="AttributeError: 'NoneType' has no attribute 'x'",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+    await db_session.commit()
+    await db_session.refresh(failed)
+
+    spawned = await _spawn_task_failure_investigation(failed, db_session)
+    assert spawned is True
+    await db_session.commit()
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    investigations = [
+        t for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "investigate"
+    ]
+    assert len(investigations) == 1
+    inv = investigations[0]
+    assert inv.context["direction_id"] == direction_id
+    assert inv.context["spawned_by"] == "task_failure_investigation"
+    assert inv.context["source_task_id"] == str(failed.id)
+    prompt = inv.payloads[0]["prompt"]
+    assert "AttributeError" in prompt
+    assert "abc123" in prompt
+    assert "test_foo" in prompt
+    assert "Edit file.py" in prompt
+
+    # Dedup: second call should not spawn another
+    spawned2 = await _spawn_task_failure_investigation(failed, db_session)
+    assert spawned2 is False
+
+
+@pytest.mark.asyncio
+async def test_task_failure_investigation_skips_investigate_type(db_session):
+    from app.autonomous_research import _spawn_task_failure_investigation
+    project = Project(
+        name="Skip Inv Type",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-skip0001")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    failed = Task(
+        project_id=project.id,
+        title="Self-loop guard",
+        payloads=[{"type": "investigate", "prompt": "diag"}],
+        context={"direction_id": "d-skip0001"},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="TypeError: boom",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+    await db_session.commit()
+
+    assert await _spawn_task_failure_investigation(failed, db_session) is False
+
+
+@pytest.mark.asyncio
+async def test_task_failure_investigation_skips_without_direction(db_session):
+    from app.autonomous_research import _spawn_task_failure_investigation
+    project = Project(
+        name="No Dir",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    failed = Task(
+        project_id=project.id,
+        title="Undirected fail",
+        payloads=[{"type": "create", "prompt": "do"}],
+        context={},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="TypeError: boom",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+    await db_session.commit()
+
+    assert await _spawn_task_failure_investigation(failed, db_session) is False
+
+
+@pytest.mark.asyncio
+async def test_task_failure_investigation_skips_review_quality(db_session):
+    """review_quality taxonomy has its own handling; trigger should skip."""
+    from app.autonomous_research import _spawn_task_failure_investigation
+    project = Project(
+        name="Review Quality",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-revq0001")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    failed = Task(
+        project_id=project.id,
+        title="Review quality fail",
+        payloads=[{"type": "create", "prompt": "do"}],
+        context={"direction_id": "d-revq0001"},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="pytest failed: 3 tests failed",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+    await db_session.commit()
+
+    assert await _spawn_task_failure_investigation(failed, db_session) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # anomaly_detection._spawn_held_direction_investigations
 # (cross-project wrapper wired into anomaly_maintenance_sweep)
 # ─────────────────────────────────────────────────────────────────────────────
