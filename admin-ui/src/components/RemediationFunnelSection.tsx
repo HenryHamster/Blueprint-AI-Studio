@@ -1,3 +1,20 @@
+import { useState } from 'react';
+
+interface RecentInvestigation {
+  task_id: string;
+  direction_id?: string | null;
+  summary?: string | null;
+  confidence?: string | null;
+  severity?: string | null;
+  completed_at?: string | null;
+}
+
+interface ActiveInvestigationDetail {
+  task_id: string;
+  direction_id?: string | null;
+  elapsed_hours?: number | null;
+}
+
 interface RemediationFunnelData {
   investigations_spawned?: number;
   investigations_completed?: number;
@@ -15,6 +32,20 @@ interface RemediationFunnelData {
   remediations_spawned_by_class?: Record<string, number> | null;
   remediation_success_by_confidence?: Record<string, { merged: number; failed: number }> | null;
   diagnosis_drop_off_by_reason?: Record<string, number> | null;
+  ci_auto_remediation?: {
+    spawned?: number;
+    merged?: number;
+    failed?: number;
+    by_ci_failure_type?: Record<string, { spawned?: number; merged?: number; failed?: number }>;
+  } | null;
+  prior_investigation_reuse?: {
+    total_with_prior?: number;
+    merged_with_prior?: number;
+    failed_with_prior?: number;
+    merge_rate?: number | null;
+  } | null;
+  recent_investigations?: RecentInvestigation[] | null;
+  active_investigations_detail?: ActiveInvestigationDetail[] | null;
 }
 
 interface InvestigationConversion {
@@ -60,7 +91,38 @@ function classBadge(cls: string): string {
   return FAILURE_CLASS_COLORS[cls] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
 }
 
+const CONFIDENCE_BADGE: Record<string, string> = {
+  high: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+  medium: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  low: 'bg-red-500/20 text-red-400 border-red-500/30',
+  unknown: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
+};
+
+function confidenceBadge(conf?: string | null): string {
+  return CONFIDENCE_BADGE[conf ?? 'unknown'] ?? CONFIDENCE_BADGE.unknown;
+}
+
+function relativeTime(iso?: string | null): string {
+  if (!iso) return '';
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return '';
+  const diffSec = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (diffSec < 60) return `${diffSec}s ago`;
+  const diffMin = Math.round(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.round(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.round(diffHr / 24);
+  return `${diffDay}d ago`;
+}
+
+function truncate(s: string, n: number): string {
+  if (s.length <= n) return s;
+  return s.slice(0, n).trimEnd() + '…';
+}
+
 export function RemediationFunnelSection({ funnel, conversion, loading }: RemediationFunnelSectionProps) {
+  const [investigationsOpen, setInvestigationsOpen] = useState(false);
   if (loading) {
     return (
       <section>
@@ -118,6 +180,20 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
       return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
     });
 
+  const ciRem = funnel.ci_auto_remediation ?? null;
+  const ciSpawned = ciRem?.spawned ?? 0;
+  const ciMerged = ciRem?.merged ?? 0;
+  const ciFailed = ciRem?.failed ?? 0;
+  const ciResolved = ciMerged + ciFailed;
+  const ciSuccessRate = ciResolved > 0 ? pct(ciMerged, ciResolved) : null;
+  const ciTypeEntries = Object.entries(ciRem?.by_ci_failure_type ?? {})
+    .filter(([, v]) => (v.spawned ?? 0) > 0)
+    .sort((a, b) => (b[1].spawned ?? 0) - (a[1].spawned ?? 0));
+
+  const reuse = funnel.prior_investigation_reuse ?? null;
+  const reuseMergeRate = reuse?.merge_rate != null ? Math.round(reuse.merge_rate * 100) : null;
+  const reuseTotal = reuse?.total_with_prior ?? 0;
+
   const structuralFilterPassRate = conversion && (conversion.parseable ?? 0) > 0
     ? pct((conversion.parseable ?? 0) - (conversion.structural ?? 0), conversion.parseable ?? 0)
     : null;
@@ -170,13 +246,15 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 mb-2">
           <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">By failure class</div>
           <div className="space-y-1">
-            <div className="grid grid-cols-[minmax(110px,1fr)_repeat(5,minmax(48px,1fr))] gap-2 text-[9px] uppercase tracking-wide text-neutral-600">
+            <div className="grid grid-cols-[minmax(110px,1fr)_repeat(7,minmax(44px,1fr))] gap-2 text-[9px] uppercase tracking-wide text-neutral-600">
               <span>Class</span>
               <span className="text-right">Spawned</span>
               <span className="text-right">Completed</span>
+              <span className="text-right" title="Completed / Spawned">Compl%</span>
               <span className="text-right">Remediated</span>
               <span className="text-right">Merged</span>
               <span className="text-right">Failed</span>
+              <span className="text-right" title="Merged / Remediated">Merge%</span>
             </div>
             {classKeys.map(cls => {
               const s = funnel.investigations_spawned_by_class?.[cls] ?? 0;
@@ -184,16 +262,25 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
               const r = funnel.remediations_spawned_by_class?.[cls] ?? 0;
               const m = funnel.merged_remediations_by_trigger_class?.[cls] ?? 0;
               const f = funnel.failed_remediations_by_class?.[cls] ?? 0;
+              const complRate = s > 0 ? pct(c, s) : null;
+              const mergeRate = r > 0 ? pct(m, r) : null;
+              const rateColor = (v: number) => v >= 60 ? 'text-emerald-400' : v >= 30 ? 'text-amber-400' : 'text-red-400';
               return (
-                <div key={cls} className="grid grid-cols-[minmax(110px,1fr)_repeat(5,minmax(48px,1fr))] gap-2 text-[11px] items-center">
+                <div key={cls} className="grid grid-cols-[minmax(110px,1fr)_repeat(7,minmax(44px,1fr))] gap-2 text-[11px] items-center">
                   <span className={`inline-flex justify-center text-[9px] font-semibold px-1.5 py-0.5 rounded border ${classBadge(cls)}`}>
                     {cls}
                   </span>
                   <span className="text-right font-mono text-neutral-300">{s}</span>
                   <span className="text-right font-mono text-neutral-300">{c}</span>
+                  <span className={`text-right font-mono ${complRate == null ? 'text-neutral-600' : rateColor(complRate)}`}>
+                    {complRate == null ? '—' : `${complRate}%`}
+                  </span>
                   <span className="text-right font-mono text-neutral-300">{r}</span>
                   <span className="text-right font-mono text-emerald-400">{m}</span>
                   <span className="text-right font-mono text-red-400">{f}</span>
+                  <span className={`text-right font-mono ${mergeRate == null ? 'text-neutral-600' : rateColor(mergeRate)}`}>
+                    {mergeRate == null ? '—' : `${mergeRate}%`}
+                  </span>
                 </div>
               );
             })}
@@ -203,13 +290,25 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
 
       {/* Drop-off + confidence */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-        {(dropOff.length > 0 || structuralFilterPassRate != null) && (
+        {(dropOff.length > 0 || structuralFilterPassRate != null || reuseTotal > 0) && (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
             <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">Diagnosis drop-off</div>
             {structuralFilterPassRate != null && (
               <div className="flex justify-between text-[11px] text-neutral-400 mb-1">
                 <span>structural filter pass</span>
                 <span className="font-mono text-neutral-200">{structuralFilterPassRate}%</span>
+              </div>
+            )}
+            {reuseTotal > 0 && (
+              <div
+                className="flex justify-between text-[11px] text-neutral-400 mb-1"
+                title="Merge rate of auto-remediations that reused a prior diagnosis"
+              >
+                <span>diagnosis reuse</span>
+                <span className="font-mono text-neutral-200">
+                  {reuse?.merged_with_prior ?? 0}/{reuseTotal}
+                  {reuseMergeRate != null && <span className="text-neutral-500"> ({reuseMergeRate}%)</span>}
+                </span>
               </div>
             )}
             <div className="space-y-0.5">
@@ -243,6 +342,43 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
           </div>
         )}
 
+        {ciSpawned > 0 && (
+          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+            <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">CI auto-remediation</div>
+            <div className="flex justify-between text-[11px] text-neutral-400 mb-1">
+              <span>spawned</span>
+              <span className="font-mono text-neutral-200">{ciSpawned}</span>
+            </div>
+            <div className="flex justify-between text-[11px] text-neutral-400 mb-1">
+              <span>merged / failed</span>
+              <span>
+                <span className="font-mono text-emerald-400">{ciMerged}</span>
+                <span className="text-neutral-600"> / </span>
+                <span className="font-mono text-red-400">{ciFailed}</span>
+                {ciSuccessRate != null && (
+                  <span className="font-mono text-neutral-500"> ({ciSuccessRate}%)</span>
+                )}
+              </span>
+            </div>
+            {ciTypeEntries.length > 0 && (
+              <div className="mt-1.5 pt-1.5 border-t border-neutral-800/60 space-y-0.5">
+                {ciTypeEntries.map(([type, v]) => (
+                  <div key={type} className="flex justify-between text-[10px] text-neutral-500">
+                    <span className="truncate pr-2">{type}</span>
+                    <span className="font-mono">
+                      <span className="text-neutral-400">{v.spawned ?? 0}</span>
+                      <span className="text-neutral-700"> · </span>
+                      <span className="text-emerald-400">{v.merged ?? 0}</span>
+                      <span className="text-neutral-700">/</span>
+                      <span className="text-red-400">{v.failed ?? 0}</span>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         {successByConf.length > 0 && (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
             <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">Success by confidence</div>
@@ -265,6 +401,73 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
           </div>
         )}
       </div>
+
+      {(() => {
+        const recent = funnel.recent_investigations ?? [];
+        const activeDetails = funnel.active_investigations_detail ?? [];
+        if (recent.length === 0 && activeDetails.length === 0) return null;
+        return (
+          <div className="mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg">
+            <button
+              type="button"
+              onClick={() => setInvestigationsOpen(v => !v)}
+              className="w-full flex items-center justify-between px-3 py-2 text-left"
+              aria-expanded={investigationsOpen}
+            >
+              <span className="text-[10px] text-neutral-500 uppercase tracking-wide">
+                Recent Investigations ({recent.length}{activeDetails.length > 0 ? ` · ${activeDetails.length} active` : ''})
+              </span>
+              <span className="text-[10px] text-neutral-500">{investigationsOpen ? '▾' : '▸'}</span>
+            </button>
+            {investigationsOpen && (
+              <div className="px-3 pb-3 space-y-2">
+                {recent.length > 0 && (
+                  <div className="space-y-1">
+                    {recent.map(inv => (
+                      <div key={inv.task_id} className="flex items-start gap-2 text-[11px]">
+                        <span className={`shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded border ${confidenceBadge(inv.confidence)}`}>
+                          {inv.confidence ?? 'unknown'}
+                        </span>
+                        {inv.severity && (
+                          <span className="shrink-0 text-[9px] text-neutral-500 uppercase tracking-wide pt-0.5">
+                            {inv.severity}
+                          </span>
+                        )}
+                        <span className="flex-1 text-neutral-300 leading-snug">
+                          {truncate(inv.summary ?? '(no summary)', 80)}
+                        </span>
+                        <span className="shrink-0 text-[10px] text-neutral-500 pt-0.5" title={inv.completed_at ?? ''}>
+                          {relativeTime(inv.completed_at)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {activeDetails.length > 0 && (
+                  <div>
+                    <div className="text-[9px] uppercase tracking-wide text-neutral-600 mb-1">Active</div>
+                    <div className="space-y-0.5">
+                      {activeDetails.map(a => {
+                        const overdue = (a.elapsed_hours ?? 0) > 2;
+                        return (
+                          <div key={a.task_id} className="flex justify-between text-[11px]">
+                            <span className="font-mono text-neutral-400 truncate">
+                              {a.direction_id ?? '(no direction)'}
+                            </span>
+                            <span className={`font-mono ${overdue ? 'text-amber-400' : 'text-neutral-400'}`}>
+                              {a.elapsed_hours != null ? `${a.elapsed_hours.toFixed(1)}h` : '—'}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })()}
     </section>
   );
 }
