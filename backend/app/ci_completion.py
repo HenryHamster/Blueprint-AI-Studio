@@ -65,6 +65,8 @@ async def _attempt_merge_with_retry_and_escalation(
     ci_pr_number = ci_loop.get("pr_number")
     ci_payload = task.first_payload
     ci_orig_id = ci_loop.get("original_task_id", "") or ci_payload.get("original_task_id", "")
+    ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
+    ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
 
     merge_result = await merge_pull_request(gh_token, owner, repo, ci_pr_number)
     if not merge_result.get("merged") and not merge_result.get("conflict") and source != "webhook":
@@ -127,6 +129,84 @@ async def _attempt_merge_with_retry_and_escalation(
                 "required status", "merge restrictions", "not allowed to merge",
                 "at least", "approving review",
             ])
+        # 'behind': PR branch is behind the base. Use update_branch to merge
+        # base into the PR branch (creates a merge commit, triggers fresh CI),
+        # then re-enter CI polling instead of burning merge retries.
+        if _ms == "behind":
+            from app.github import update_branch  # noqa: PLC0415
+            try:
+                _upd = await update_branch(gh_token, owner, repo, ci_pr_number)
+            except Exception as e:
+                _upd = {"updated": False, "message": str(e)[:200]}
+                logger.warning(f"[CI] PR #{ci_pr_number} update_branch raised: {e}")
+            ci_loop["ci_passed"] = False
+            ci_loop["ci_poll_interval"] = 30
+            ci_loop["ci_last_polled"] = _utcnow().isoformat()
+            ci_loop["ci_wait_started"] = _utcnow().isoformat()
+            task.context = {**(task.context or {}), "review_loop": ci_loop}
+            flag_modified(task, "context")
+            if _upd.get("updated"):
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} branch behind base — update queued, re-entering CI polling"
+                )
+                logger.info(f"[CI] PR #{ci_pr_number} behind base — update_branch queued ({source})")
+            else:
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} branch behind base — update_branch failed: "
+                    f"{(_upd.get('message') or '')[:120]} — re-entering CI polling"
+                )
+                logger.warning(
+                    f"[CI] PR #{ci_pr_number} behind base — update_branch failed: "
+                    f"{_upd.get('message')} ({source})"
+                )
+            return False
+
+        # Real merge conflict ('dirty' state, or 409 conflict from the merge call).
+        # Cannot be resolved by retrying — spawn a fix task with rebase instructions,
+        # mirroring the CI-failure spawn path below.
+        if merge_result.get("conflict") or _ms == "dirty":
+            from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
+            from app.rollup_state import _is_rollup_parent_awaiting_merge  # noqa: PLC0415
+            conflict_prompt = (
+                f"PR #{ci_pr_number} cannot merge into `{ci_base}` due to a merge conflict "
+                f"(GitHub mergeable_state='dirty'). The code review is already approved — "
+                f"focus only on resolving the conflict.\n\n"
+                f"After cloning:\n"
+                f"  1. Run `git fetch origin {ci_base} && git rebase origin/{ci_base}`.\n"
+                f"  2. Resolve every conflict marker — preserve the intent of both branches.\n"
+                f"  3. Re-run lint/type/test suites for the affected files.\n"
+                f"  4. Commit the resolution and force-push with `--force-with-lease`.\n\n"
+                f"Original merge error: {merge_msg[:500]}"
+            )
+            fix_task, _ = await _spawn_pipeline_task(
+                task, "fix", session, ci_pr_number, ci_branch, ci_base,
+                fix_prompt=conflict_prompt,
+                original_task_id=ci_orig_id,
+                fix_reason="merge_conflict",
+            )
+            if fix_task:
+                ci_loop_ctx = dict(ci_loop)
+                ci_loop_ctx["ci_waiting"] = False
+                ci_loop_ctx["ci_fix_spawned"] = str(fix_task.id)
+                task.context = {**(task.context or {}), "review_loop": ci_loop_ctx}
+                flag_modified(task, "context")
+                if not _is_rollup_parent_awaiting_merge(task.context):
+                    task.status = TaskStatus.COMPLETED
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} merge conflict — spawned fix → {fix_task.id}"
+                )
+                logger.warning(
+                    f"[CI] PR #{ci_pr_number} merge conflict — spawned fix → {fix_task.id} ({source})"
+                )
+            else:
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} merge conflict — fix spawn suppressed (iteration cap)"
+                )
+                logger.warning(
+                    f"[CI] PR #{ci_pr_number} merge conflict — fix spawn suppressed ({source})"
+                )
+            return False
+
         if _is_rule_block:
             task.latest_status_message = (
                 f"CI passed but merge blocked on PR #{ci_pr_number}: "

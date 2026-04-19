@@ -144,10 +144,11 @@ async def reaper_service():
                     elif task.status == TaskStatus.IN_PROGRESS:
                         if task.last_heartbeat and task.last_heartbeat < hb_cutoff:
                             orphaned_ids.append(task.id)
-                        elif task.last_heartbeat is None and task.started_at and task.started_at < six_minutes_ago:
+                        elif task.last_heartbeat is None and task.started_at and task.started_at < hb_cutoff:
                             # Defensive: IN_PROGRESS without any heartbeat shouldn't happen
                             # (claim_task sets last_heartbeat at agent.py:312) but if we hit
-                            # it, treat as a post-claim crash.
+                            # it, treat as a post-claim crash. Use scope-aware cutoff so
+                            # large/high-effort tasks aren't reaped prematurely.
                             orphaned_ids.append(task.id)
                         elif task.last_heartbeat is None and task.started_at is None and task.created_at < ten_minutes_ago:
                             # Fully-degenerate IN_PROGRESS row (no heartbeat, no started_at)
@@ -233,7 +234,7 @@ async def reaper_service():
                         elif t.status == TaskStatus.IN_PROGRESS:
                             if t.last_heartbeat and t.last_heartbeat < hb_cutoff:
                                 verified.append(t)
-                            elif t.last_heartbeat is None and t.started_at and t.started_at < six_minutes_ago:
+                            elif t.last_heartbeat is None and t.started_at and t.started_at < hb_cutoff:
                                 verified.append(t)
                             elif t.last_heartbeat is None and t.started_at is None and t.created_at < ten_minutes_ago:
                                 verified.append(t)

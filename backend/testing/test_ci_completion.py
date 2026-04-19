@@ -211,10 +211,11 @@ async def test_merge_no_retry_for_webhook_source(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_merge_conflict_skips_retries(db_session, mocker):
+async def test_merge_conflict_skips_retries_and_spawns_fix(db_session, mocker):
     """
-    When merge returns conflict=True (409), the retry loop must break immediately.
-    Conflicts cannot be resolved by retrying — only by code changes.
+    When merge returns conflict=True (409), the retry loop breaks immediately
+    AND a fix task is spawned with merge_conflict reason — not silently falling
+    through to the merge-failure retry counter.
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
@@ -228,6 +229,11 @@ async def test_merge_conflict_skips_retries(db_session, mocker):
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
         return_value={"merged": False, "conflict": True, "message": "merge conflict"},
+    )
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
     )
 
     project = Project(name="Conflict no retry", user_id="test-user")
@@ -246,6 +252,106 @@ async def test_merge_conflict_skips_retries(db_session, mocker):
     assert result is False
     assert merge_mock.call_count == 1, "Conflict must not retry — exactly 1 merge call"
     sleep_mock.assert_not_called()
+    spawn_mock.assert_called_once()
+    assert spawn_mock.call_args.kwargs.get("fix_reason") == "merge_conflict"
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_failures", 0) == 0, (
+        "merge_conflict must not increment the retry counter"
+    )
+    assert review_loop.get("ci_fix_spawned") == str(fake_fix.id)
+
+
+@pytest.mark.asyncio
+async def test_mergeable_state_behind_calls_update_branch(db_session, mocker):
+    """
+    When mergeable_state='behind', update_branch is invoked and the task re-enters
+    CI polling (ci_passed=False, ci_waiting unchanged) instead of incrementing
+    the merge-failure retry counter.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "behind"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "Base branch was modified"},
+    )
+    update_mock = mocker.patch(
+        "app.github.update_branch",
+        return_value={"updated": True, "message": "Update queued"},
+    )
+
+    project = Project(name="Behind base test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project, ci_loop_extra={"ci_passed": True})
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    update_mock.assert_called_once()
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_passed") is False, "ci_passed must be reset for fresh CI run"
+    assert review_loop.get("merge_failures", 0) == 0, "behind must not increment retry counter"
+    assert task.requires_approval is not True
+
+
+@pytest.mark.asyncio
+async def test_mergeable_state_dirty_spawns_fix(db_session, mocker):
+    """
+    When mergeable_state='dirty' (real conflict per GitHub) but the merge call
+    didn't surface conflict=True, a fix task is still spawned with
+    fix_reason='merge_conflict'.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "dirty"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "merge failed"},
+    )
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(name="Dirty state test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    spawn_mock.assert_called_once()
+    assert spawn_mock.call_args.kwargs.get("fix_reason") == "merge_conflict"
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_failures", 0) == 0
+    assert review_loop.get("ci_fix_spawned") == str(fake_fix.id)
 
 
 # ---------------------------------------------------------------------------
