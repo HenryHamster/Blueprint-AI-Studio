@@ -1642,6 +1642,30 @@ class TestBuildRetryPromptSuffix:
         )
         assert "RETRY GUIDANCE" not in guidance
 
+    def test_code_error_attempt_one_no_scope_override(self):
+        _, override = _build_retry_prompt_suffix(
+            "CODE_ERROR", "boom", attempt=1, task_scope="large", ctx={},
+        )
+        assert override is None
+
+    def test_code_error_large_downgrades_to_medium_on_attempt_two(self):
+        _, override = _build_retry_prompt_suffix(
+            "CODE_ERROR", "boom", attempt=2, task_scope="large", ctx={},
+        )
+        assert override == "medium"
+
+    def test_code_error_medium_downgrades_to_small_on_attempt_two(self):
+        _, override = _build_retry_prompt_suffix(
+            "CODE_ERROR", "boom", attempt=2, task_scope="medium", ctx={},
+        )
+        assert override == "small"
+
+    def test_code_error_small_no_downgrade(self):
+        _, override = _build_retry_prompt_suffix(
+            "CODE_ERROR", "boom", attempt=3, task_scope="small", ctx={},
+        )
+        assert override is None
+
     def test_code_error_extracts_previous_failing_tests_and_error_files(self):
         ctx = {
             "_previous_failing_tests": ["tests/test_a.py::test_x", "tests/test_b.py::test_y"],

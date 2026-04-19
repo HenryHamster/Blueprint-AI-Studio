@@ -130,6 +130,8 @@ def _build_retry_prompt_suffix(
     different scope string when the failure mode should route through a
     different scope on retry:
       - AGENT_TIMEOUT with attempt ≥ 2: downgrade large→medium or medium→small
+      - CODE_ERROR with attempt ≥ 2: downgrade large→medium or medium→small so
+        repeatedly-failing tasks retry within a smaller file budget
       - SCOPE_OVERFLOW on a medium task: escalate medium→large so the plan
         agent decomposes the work into multiple small subtasks
     Otherwise None. Reads ``_previous_failing_tests`` and ``_previous_error_files``
@@ -228,6 +230,10 @@ def _build_retry_prompt_suffix(
             extra_guidance += "Previously failing tests:\n" + "".join(f"  {t}\n" for t in failing_tests)
         if error_files:
             extra_guidance += "Error file locations:\n" + "".join(f"  {f}\n" for f in error_files)
+        if attempt >= 2 and task_scope == "large":
+            scope_override = "medium"
+        elif attempt >= 2 and task_scope == "medium":
+            scope_override = "small"
 
     elif failure_class == "EXTERNAL_API":
         error_text = (original_status_message or "")
