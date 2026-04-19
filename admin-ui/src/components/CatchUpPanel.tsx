@@ -111,6 +111,7 @@ interface DirectionProgress {
   paused_reason?: string | null;
   needs_manual_intervention?: boolean;
   scope_breakdown?: Record<string, { created?: number; merged?: number; failed?: number }> | null;
+  type_breakdown?: Record<string, { created?: number; merged?: number; failed?: number }> | null;
   taxonomy_summary?: Record<string, number> | null;
   stage_dropout?: Record<string, number> | null;
   rejection_reasons?: { task_id?: string; title?: string; rejection_note?: string }[] | null;
@@ -215,6 +216,12 @@ interface DigestData {
   retry_success_count?: number | null;
   retry_wasted_rate?: number | null;
   retry_recovery_cost_usd?: number | null;
+  resurrection_outcome_summary?: {
+    total: number;
+    completed: number;
+    failed_again: number;
+    success_rate: number | null;
+  } | null;
   total_merge_retries_saved?: number | null;
   merge_early_exit_count?: number | null;
   total_estimated_cost_usd?: number | null;
@@ -243,6 +250,8 @@ interface DigestData {
   review_cap_exhaustion_summary?: {
     count: number;
     avg_iterations: number | null;
+    total_cost_usd: number;
+    avg_cost_usd: number | null;
     top_directions: { direction_id: string; count: number }[];
   } | null;
   analysis_overflow_summary?: {
@@ -582,6 +591,21 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                       return (
                         <span key={scope} className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded">
                           {scope} {merged}/{created}
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+                {dp.type_breakdown && Object.keys(dp.type_breakdown).length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1">
+                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">type:</span>
+                    {Object.entries(dp.type_breakdown).map(([ttype, stats]) => {
+                      const merged = stats?.merged ?? 0;
+                      const created = stats?.created ?? 0;
+                      if (!created && !merged) return null;
+                      return (
+                        <span key={ttype} className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded">
+                          {ttype} {merged}/{created}
                         </span>
                       );
                     })}
@@ -1885,6 +1909,16 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                         · avg {digest!.review_cap_exhaustion_summary.avg_iterations.toFixed(1)} iter
                       </span>
                     )}
+                    {digest!.review_cap_exhaustion_summary.total_cost_usd > 0 && (
+                      <span className="text-[10px] text-red-400">
+                        · ${digest!.review_cap_exhaustion_summary.total_cost_usd.toFixed(2)} wasted
+                      </span>
+                    )}
+                    {digest!.review_cap_exhaustion_summary.avg_cost_usd != null && (
+                      <span className="text-[10px] text-neutral-500">
+                        · avg ${digest!.review_cap_exhaustion_summary.avg_cost_usd.toFixed(2)}/task
+                      </span>
+                    )}
                   </div>
                   {digest!.review_cap_exhaustion_summary.top_directions.length > 0 && (
                     <div className="flex flex-col gap-0.5 ml-1">
@@ -1970,6 +2004,27 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   {(digest!.retry_recovery_cost_usd ?? 0) > 0 && (
                     <span className="text-[10px] text-neutral-500 inline-flex items-center gap-0.5">
                       · <DollarSign className="w-2.5 h-2.5" />{(digest!.retry_recovery_cost_usd ?? 0).toFixed(2)} recovery cost
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Resurrection outcomes */}
+              {digest!.resurrection_outcome_summary && digest!.resurrection_outcome_summary.total > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Resurrection outcomes</span>
+                  <span className="text-[10px] text-neutral-400">
+                    {digest!.resurrection_outcome_summary.total} attempted
+                  </span>
+                  <span className="text-[10px] text-emerald-400">
+                    · {digest!.resurrection_outcome_summary.completed} succeeded
+                  </span>
+                  <span className="text-[10px] text-amber-400">
+                    · {digest!.resurrection_outcome_summary.failed_again} failed again
+                  </span>
+                  {digest!.resurrection_outcome_summary.success_rate != null && (
+                    <span className="text-[10px] text-neutral-500">
+                      · {Math.round(digest!.resurrection_outcome_summary.success_rate * 100)}% success
                     </span>
                   )}
                 </div>
