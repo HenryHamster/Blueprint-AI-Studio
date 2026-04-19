@@ -1827,6 +1827,49 @@ class TestFollowupInvestigationOnFailure:
         assert remediation.context["diagnosis_fingerprint"] == "fp-C"
 
     @pytest.mark.asyncio
+    async def test_remediation_payload_includes_effort_from_scope(self, db_session):
+        """Spawned remediation payload carries an effort derived from scope so the
+        agent CLI receives the calibrated --effort flag (small→low, large→high)."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active", "text": "demo",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        parent = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"direction_id": "dir-1"},
+            payloads=[{"type": "investigate", "prompt": "x"}],
+        )
+        db_session.add(parent)
+        await db_session.commit()
+        await db_session.refresh(parent)
+
+        from app.task_completion import _spawn_investigation_remediation
+
+        small = await _spawn_investigation_remediation(
+            task=parent, direction_id="dir-1",
+            summary="s", root_cause="rc", recommended_fix="rf",
+            severity="medium", confidence="high",
+            affected_paths=["a.py"], remediation_attempts=0,
+            session=db_session,
+        )
+        assert small is not None
+        assert small.first_payload.get("effort") == "low"
+
+        large = await _spawn_investigation_remediation(
+            task=parent, direction_id="dir-1",
+            summary="s", root_cause="rc", recommended_fix="rf",
+            severity="medium", confidence="high",
+            affected_paths=[f"f{i}.py" for i in range(6)],
+            remediation_attempts=0,
+            session=db_session,
+        )
+        assert large is not None
+        assert large.first_payload.get("effort") == "high"
+
+    @pytest.mark.asyncio
     async def test_follow_up_prompt_includes_earlier_attempts(self, db_session):
         """Prior remediation_history entries surface in the follow-up prompt."""
         prior_history = [
@@ -2364,6 +2407,46 @@ class TestHandleInvestigationCompletion:
         assert "backend/app/shared_state.py" in child.context["related_files"]
         assert child.status == TaskStatus.QUEUED
         assert project.directions[0]["remediation_task_id"] == str(child.id)
+
+    @pytest.mark.asyncio
+    async def test_clears_direction_hold_after_spawning_remediation(
+        self, db_session, mocker
+    ):
+        from app.shared_state import (
+            direction_failure_streaks,
+            is_direction_held,
+        )
+        from app.time_utils import _utcnow
+
+        project = await self._setup(db_session, mocker)
+        direction_failure_streaks["dir-invest-1"] = {
+            "consecutive_failures": 3,
+            "consecutive_infra_failures": 0,
+            "held": True,
+            "held_at": _utcnow(),
+            "held_reason": "3 consecutive CODE_ERROR failures",
+            "held_failure_class": "CODE_ERROR",
+            "last_failure_class": "CODE_ERROR",
+            "last_failure_at": _utcnow(),
+        }
+        try:
+            assert is_direction_held("dir-invest-1")[0] is True
+            task = make_task(
+                project_id=project.id,
+                context={"direction_id": "dir-invest-1"},
+            )
+            db_session.add(task)
+            await db_session.commit()
+            await db_session.refresh(task)
+
+            await _handle_investigation_completion(
+                task, self._payload(self._report()), db_session
+            )
+            await db_session.commit()
+
+            assert is_direction_held("dir-invest-1")[0] is False
+        finally:
+            direction_failure_streaks.pop("dir-invest-1", None)
 
     @pytest.mark.asyncio
     async def test_spawns_remediation_on_medium_confidence(self, db_session, mocker):

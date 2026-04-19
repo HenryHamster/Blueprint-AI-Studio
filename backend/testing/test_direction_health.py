@@ -375,6 +375,26 @@ class TestFilterHeldDirections:
         broadcast_fn.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_investigate_task_exempt_from_hold(self):
+        """Investigation tasks must pass through — they're the escape hatch for held directions."""
+        did = _fresh_direction_id()
+        project_id = uuid.uuid4()
+        task = make_task(
+            project_id=project_id,
+            context={"direction_id": did},
+            payloads=[{"type": "investigate"}],
+        )
+        for _ in range(DIRECTION_HOLD_THRESHOLD):
+            record_direction_result(did, success=False, failure_class="CODE_ERROR")
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        eligible = [task.id]
+        result = await filter_held_directions(eligible, [task], session, broadcast_fn)
+        assert result == eligible
+        broadcast_fn.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_no_duplicate_broadcast_when_message_unchanged(self):
         """If the status message is already set to the hold reason, don't re-broadcast."""
         did = _fresh_direction_id()

@@ -43,7 +43,11 @@ from app.plan_completion import (
 )
 from app.research_context import _build_research_context
 from app.routers.agent import get_github_token_for_task
-from app.shared_state import runtime_config as _runtime_config, scope_to_effort
+from app.shared_state import (
+    clear_direction_hold,
+    runtime_config as _runtime_config,
+    scope_to_effort,
+)
 from app.payload_schemas import validate_internal_payload
 from app.broadcast import broadcast_to_project
 from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
@@ -1562,6 +1566,15 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
             remediation_attempts=int(direction.get("remediation_attempts") or 0),
             session=session,
         )
+        if spawned_child is not None:
+            clear_direction_hold(str(direction_id))
+            logger.info(
+                "[DIRECTION HEALTH] Cleared hold on direction %s after "
+                "investigation %s spawned remediation task %s",
+                direction_id,
+                task.id,
+                spawned_child.id,
+            )
 
     # Update direction state
     if direction is not None and project is not None:
@@ -1769,6 +1782,7 @@ async def _spawn_investigation_remediation(
         "type": "create",
         "prompt": full_prompt,
         "base_branch": "main",
+        "effort": scope_to_effort(scope),
     }
     if create_suffix:
         payload_dict["prompt_suffix"] = create_suffix

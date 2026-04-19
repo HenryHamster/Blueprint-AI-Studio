@@ -224,6 +224,11 @@ async def filter_held_directions(
         if not direction_id:
             non_held.append(eid)
             continue
+        # Investigation tasks are the escape hatch for held directions —
+        # blocking them would strand the hold until the 4-hour timeout.
+        if (candidate.first_payload).get("type") == "investigate":
+            non_held.append(eid)
+            continue
         held, reason = is_direction_held(str(direction_id))
         if not held:
             non_held.append(eid)
