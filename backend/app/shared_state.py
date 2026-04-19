@@ -130,7 +130,7 @@ runtime_config: Dict = {
         "deps": {"interval_hours": 168, "enabled": False},            # weekly
     },
     "autonomous_direction_cooldown_minutes": 240,
-    "productive_direction_cooldown_minutes": 90,
+    "productive_direction_cooldown_minutes": 45,
     "direction_auto_recovery_hours": 48,
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review

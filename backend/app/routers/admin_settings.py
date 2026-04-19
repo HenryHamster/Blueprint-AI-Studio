@@ -74,7 +74,7 @@ async def get_settings(
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
         "autonomous_direction_cooldown_minutes": _runtime_config.get("autonomous_direction_cooldown_minutes", 240),
-        "productive_direction_cooldown_minutes": _runtime_config.get("productive_direction_cooldown_minutes", 90),
+        "productive_direction_cooldown_minutes": _runtime_config.get("productive_direction_cooldown_minutes", 45),
         "max_parallel_research_per_project": _runtime_config.get("max_parallel_research_per_project", 3),
         "reserved_slots_for_types": _runtime_config.get("reserved_slots_for_types", {"create": 1, "research": 1}),
         "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),

@@ -560,7 +560,7 @@ async def _process_direction_lifecycle(
             # standard after unproductive cycles. Saturation still doubles whichever base applies.
             if d.get("last_cycle_productive"):
                 effective_cooldown = float(
-                    _runtime_config.get("productive_direction_cooldown_minutes", 90)
+                    _runtime_config.get("productive_direction_cooldown_minutes", 45)
                 )
             else:
                 effective_cooldown = cooldown_minutes
