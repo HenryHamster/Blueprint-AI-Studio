@@ -110,6 +110,11 @@ interface DirectionProgress {
   taxonomy_summary?: Record<string, number> | null;
   stage_dropout?: Record<string, number> | null;
   rejection_reasons?: { task_id?: string; title?: string; rejection_note?: string }[] | null;
+  lifetime_cycles?: number;
+  lifetime_prs_merged?: number;
+  lifetime_prs_rejected?: number;
+  lifetime_tasks_failed?: number;
+  lifetime_conversion_rate?: number | null;
 }
 
 interface ActiveTask {
@@ -529,6 +534,21 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                     })}
                   </div>
                 )}
+                {(() => {
+                  const cycles = dp.lifetime_cycles ?? 0;
+                  const merged = dp.lifetime_prs_merged ?? 0;
+                  const failed = dp.lifetime_tasks_failed ?? 0;
+                  const rejected = dp.lifetime_prs_rejected ?? 0;
+                  if (!cycles && !merged && !failed && !rejected) return null;
+                  const conv = typeof dp.lifetime_conversion_rate === 'number'
+                    ? `${Math.round(dp.lifetime_conversion_rate * 100)}%`
+                    : '—';
+                  return (
+                    <span className="text-[9px] text-neutral-500">
+                      Lifetime: {cycles} cycle{cycles !== 1 ? 's' : ''} · {merged} merged · {failed} failed · {conv} conversion
+                    </span>
+                  );
+                })()}
                 {dp.rejection_reasons && dp.rejection_reasons.length > 0 && (
                   <div className="flex flex-col gap-0.5">
                     <span className="text-[9px] text-neutral-600 uppercase tracking-wide">rejections:</span>
