@@ -82,11 +82,13 @@ def classify_failure_taxonomy(task: "Task") -> str:
         return TAXONOMY_REVIEW_QUALITY
 
     expansion_ratio = ctx.get("expansion_ratio")
-    if (
-        ctx.get("scope_calibrated_from")
-        or any(kw in status_msg for kw in _SCOPE_KEYWORDS)
+    has_scope_evidence = (
+        any(kw in status_msg for kw in _SCOPE_KEYWORDS)
         or (isinstance(expansion_ratio, (int, float)) and expansion_ratio > 1.5)
-    ):
+    )
+    # scope_calibrated_from alone is not evidence — a calibrated task can fail
+    # for unrelated code defects. Require corroborating scope evidence.
+    if has_scope_evidence:
         return TAXONOMY_SCOPE_RELATED
 
     return TAXONOMY_CODE_DEFECT

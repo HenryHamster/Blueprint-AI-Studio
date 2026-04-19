@@ -384,10 +384,24 @@ def test_taxonomy_expansion_ratio_at_or_below_threshold_is_code_defect():
     assert classify_failure_taxonomy(t) == TAXONOMY_CODE_DEFECT
 
 
-def test_taxonomy_scope_related_from_calibrated_from():
+def test_taxonomy_calibrated_from_without_scope_evidence_is_code_defect():
+    """scope_calibrated_from alone is NOT evidence of a scope-related failure —
+    a calibrated task can fail for unrelated code defects (e.g. NameError).
+    Without scope keywords or an expansion_ratio signal, fall through to code_defect."""
     t = _task_with_ctx("NameError: foo not defined",
                        {"scope": "small", "scope_calibrated_from": "medium"})
-    assert classify_failure_taxonomy(t) == TAXONOMY_SCOPE_RELATED
+    assert classify_failure_taxonomy(t) == TAXONOMY_CODE_DEFECT
+
+    # With corroborating expansion_ratio > 1.5, classifies as scope_related.
+    t2 = _task_with_ctx("NameError: foo not defined",
+                        {"scope": "small", "scope_calibrated_from": "medium",
+                         "expansion_ratio": 2.0})
+    assert classify_failure_taxonomy(t2) == TAXONOMY_SCOPE_RELATED
+
+    # With corroborating scope-keyword in status message, classifies as scope_related.
+    t3 = _task_with_ctx("aborted: too many files changed",
+                        {"scope": "small", "scope_calibrated_from": "medium"})
+    assert classify_failure_taxonomy(t3) == TAXONOMY_SCOPE_RELATED
 
 
 def test_taxonomy_scope_related_from_complexity_message():
@@ -423,14 +437,13 @@ def test_taxonomy_review_quality_beats_scope():
 
 # ── Cross-function: normalize_agent_failure_category + classify_failure_taxonomy ──
 
-def test_taxonomy_scope_related_from_calibrated_from_ignores_message_text():
-    """scope_calibrated_from in ctx routes to scope_related even when the status
-    message carries no scope or review-quality keywords. Base must still be
-    CODE_ERROR (not empty/infra), so use a generic non-keyword code error."""
+def test_taxonomy_calibrated_from_with_generic_message_is_code_defect():
+    """scope_calibrated_from in ctx alone (no scope keywords, no expansion_ratio)
+    is insufficient evidence — falls through to code_defect."""
     for msg in ("generic failure", "AttributeError: 'NoneType' has no attribute 'x'"):
         t = _task_with_ctx(msg, {"scope": "small", "scope_calibrated_from": "medium"})
-        assert classify_failure_taxonomy(t) == TAXONOMY_SCOPE_RELATED, (
-            f"Expected SCOPE_RELATED for calibrated-from task with msg={msg!r}"
+        assert classify_failure_taxonomy(t) == TAXONOMY_CODE_DEFECT, (
+            f"Expected CODE_DEFECT for calibrated-from task with msg={msg!r}"
         )
 
 
