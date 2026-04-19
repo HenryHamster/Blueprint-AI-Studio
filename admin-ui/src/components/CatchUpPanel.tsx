@@ -160,7 +160,10 @@ interface DigestData {
     dominant_stage: string | null;
   } | null;
   cost_by_failure_class?: Record<string, number> | null;
+  scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
+  prev_scope_conversion_rates?: Record<string, { created: number; merged: number }> | null;
   total_failed_cost_usd?: number | null;
+  total_estimated_cost_usd?: number | null;
   rejection_pattern_summary?: {
     total_rejected: number;
     top_notes: { snippet: string; count: number }[];
@@ -396,6 +399,11 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                 {typeof dp.first_attempt_success_rate === 'number' && (
                   <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="First-attempt success rate">
                     {Math.round(dp.first_attempt_success_rate * 100)}% 1st
+                  </span>
+                )}
+                {typeof dp.cost_per_merged_pr === 'number' && dp.cost_per_merged_pr > 0 && (
+                  <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded font-mono" title="Average cost per merged PR">
+                    ${dp.cost_per_merged_pr.toFixed(2)}/PR
                   </span>
                 )}
               </div>
@@ -886,6 +894,11 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     )}
                   </span>
                 )}
+                {digest!.total_estimated_cost_usd != null && digest!.total_estimated_cost_usd > 0 && (
+                  <span className="inline-flex items-center gap-0.5 text-neutral-500 font-mono" title="Total estimated spend">
+                    <DollarSign className="w-2.5 h-2.5" />{digest!.total_estimated_cost_usd.toFixed(2)} total
+                  </span>
+                )}
                 {digest!.research_cycles > 0 && (
                   <span>{digest!.research_cycles} research cycle{digest!.research_cycles !== 1 ? 's' : ''}</span>
                 )}
@@ -1260,6 +1273,39 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       clear
                     </button>
                   )}
+                </div>
+              )}
+
+              {/* Scope conversion rate pills */}
+              {digest!.scope_conversion_rates && Object.keys(digest!.scope_conversion_rates).length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Scope conversion</span>
+                  {['small', 'medium', 'large']
+                    .filter(s => digest!.scope_conversion_rates?.[s] != null)
+                    .map(scope => {
+                      const { created, merged } = digest!.scope_conversion_rates![scope];
+                      const rate = created > 0 ? merged / created : null;
+                      const prev = digest!.prev_scope_conversion_rates?.[scope];
+                      const prevRate = prev && prev.created > 0 ? prev.merged / prev.created : null;
+                      let trend: 'improving' | 'declining' | 'stable' | null = null;
+                      if (rate != null && prevRate != null) {
+                        const delta = rate - prevRate;
+                        trend = delta > 0.05 ? 'improving' : delta < -0.05 ? 'declining' : 'stable';
+                      }
+                      const arrow = trend === 'improving' ? '↑' : trend === 'declining' ? '↓' : trend === 'stable' ? '→' : '';
+                      const arrowColor = trend === 'improving' ? 'text-emerald-400' : trend === 'declining' ? 'text-red-400' : 'text-neutral-500';
+                      const color = rate == null
+                        ? 'bg-neutral-500/10 text-neutral-400 border-neutral-500/20'
+                        : rate >= 0.6 ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                        : rate >= 0.3 ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                        : 'bg-red-500/10 text-red-400 border-red-500/20';
+                      return (
+                        <span key={scope} className={`text-[10px] border px-1.5 py-0.5 rounded inline-flex items-center gap-1 ${color}`}>
+                          {scope}: {rate != null ? `${Math.round(rate * 100)}%` : '--'} ({merged}/{created})
+                          {arrow && <span className={arrowColor}>{arrow}</span>}
+                        </span>
+                      );
+                    })}
                 </div>
               )}
 
