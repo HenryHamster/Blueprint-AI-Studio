@@ -1243,6 +1243,21 @@ async def get_digest(
     cost_by_failure_class = {k: round(v, 4) for k, v in _cost_by_failure_class.items()}
     total_failed_cost_usd = round(sum(_cost_by_failure_class.values()), 4)
 
+    _retry_overhead_cost = 0.0
+    _retry_task_count = 0
+    _retry_attempt_sum = 0
+    for t in failed_tasks:
+        _attempt = ((t.context or {}).get("_attempt_number") or 0)
+        if _attempt > 1:
+            _retry_task_count += 1
+            _retry_attempt_sum += _attempt
+            if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start:
+                _rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+                _retry_overhead_cost += _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+    retry_overhead_cost_usd = round(_retry_overhead_cost, 4)
+    retry_task_count = _retry_task_count
+    avg_retries_before_failure = round(_retry_attempt_sum / _retry_task_count, 2) if _retry_task_count else None
+
     # Taxonomy distribution (4-category: scope/review/infra/code_defect)
     _tax_keys = (
         TAXONOMY_SCOPE_RELATED, TAXONOMY_REVIEW_QUALITY,
@@ -1824,6 +1839,9 @@ async def get_digest(
         "on_demand_cost_usd": total_on_demand_cost_usd,
         "cost_by_failure_class": cost_by_failure_class,
         "total_failed_cost_usd": total_failed_cost_usd,
+        "retry_overhead_cost_usd": retry_overhead_cost_usd,
+        "retry_task_count": retry_task_count,
+        "avg_retries_before_failure": avg_retries_before_failure,
         "daily_cost_usd": daily_cost_usd,
         "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
         "narrative_summary": narrative_summary,

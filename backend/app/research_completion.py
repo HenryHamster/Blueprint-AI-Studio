@@ -757,12 +757,23 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # decision (3+ attempts with 0 merges), skip the floor — the data
             # collection purpose is fulfilled and continued exploration is waste.
             _exploration_proven_unviable = _exp_created >= 3 and _exp_merged == 0
+            # Pipeline-wide evidence of unviability: if the pipeline medium merge
+            # rate is already at or below the floor, new directions shouldn't
+            # independently re-discover that medium is unviable — treat the
+            # pipeline signal as sufficient proof and skip the floor.
+            _pipeline_rates_cfg = _runtime_config.get("pipeline_scope_merge_rates") or {}
+            _pipeline_medium_cfg = _pipeline_rates_cfg.get("medium")
+            _pipeline_proven_unviable = (
+                isinstance(_pipeline_medium_cfg, (int, float))
+                and float(_pipeline_medium_cfg) <= MEDIUM_EXPLORATION_FLOOR
+            )
             if (
                 isinstance(_explore_frac, (int, float))
                 and isinstance(_explore_frac_base, (int, float))
                 and float(_explore_frac_base) > 0
                 and 0 <= float(_explore_frac) < MEDIUM_EXPLORATION_FLOOR
                 and not _exploration_proven_unviable
+                and not _pipeline_proven_unviable
             ):
                 _explore_frac = MEDIUM_EXPLORATION_FLOOR
             if isinstance(_explore_frac, (int, float)) and _explore_frac > 0 and random.random() < float(_explore_frac):

@@ -526,6 +526,37 @@ async def test_requeue_repeated_scope_overflow_reduces_budget(tl_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_requeue_repeated_agent_timeout_reduces_budget(tl_db, mocker):
+    """AGENT_TIMEOUT is in INFRA_CLASSES but repeated occurrences (2+) signal
+    a scope/complexity mismatch with the runtime budget — reduce budget by 1.
+    """
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 2},
+    )
+    await _make_task(
+        session, project.id, status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "failure_category": "AGENT_TIMEOUT",
+            "_previous_failure_class": "AGENT_TIMEOUT",
+            "_failure_class_history": ["AGENT_TIMEOUT", "CODE_ERROR", "AGENT_TIMEOUT"],
+            "_attempt_number": 3,
+        },
+        latest_status_message="agent timeout again",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "Re-evaluation limit reached" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
 async def test_requeue_no_children_to_retry_records_deploy_monitoring_result(tl_db):
     """Parent with only CANCELLED children (no failed, no active) records AGENT_TIMEOUT failure.
 

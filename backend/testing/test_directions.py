@@ -3548,6 +3548,56 @@ async def test_exploration_floor_skipped_when_proven_unviable(db_session, mocker
 
 
 @pytest.mark.asyncio
+async def test_exploration_floor_skipped_when_pipeline_unviable(db_session, mocker):
+    """When pipeline-wide medium merge rate is at/below the floor, the
+    exploration floor is skipped even for a new direction with no history —
+    pipeline evidence is sufficient proof of unviability."""
+    from app.shared_state import runtime_config
+    direction_id = "d-pipeline-unviable-1"
+    direction = {
+        "id": direction_id,
+        "text": "New direction, no exploration history",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    project = Project(name="Pipeline unviable test", user_id="test-user-123",
+                      autonomous_enabled=True, directions=[direction])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        title="Research: pipeline unviable",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    _mock_escalation_externals(mocker, direction_id)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.0)
+    mocker.patch("app.research_completion.random.random", return_value=0.01)
+    runtime_config["pipeline_scope_merge_rates"] = {"medium": 0.02}
+    try:
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        runtime_config["pipeline_scope_merge_rates"] = {}
+
+    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    children = result.scalars().all()
+    assert len(children) == 1
+    child = children[0]
+    assert child.context["scope"] == "large"
+    assert child.context["scope_calibrated_from"] == "medium"
+
+
+@pytest.mark.asyncio
 async def test_auto_escalate_suppressed_by_poor_decomp_history(db_session, mocker):
     """Medium-scope low-confidence finding stays at medium when prior plan
     decompositions merged poorly (shares suppression with _calibrate_scope)."""

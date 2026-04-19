@@ -74,6 +74,9 @@ async def compute_effective_max_requeues(
     - SCOPE_OVERFLOW appears 2+ times in history: reduce by 1, despite being
       in INFRA_CLASSES, since repeat scope mismatches signal that scope
       escalation is not working.
+    - AGENT_TIMEOUT appears 2+ times in history: reduce by 1, despite being
+      in INFRA_CLASSES, since repeat timeouts signal scope/complexity exceeds
+      the runtime budget rather than transient infrastructure.
     """
     children = (await session.execute(
         select(Task).where(
@@ -96,6 +99,8 @@ async def compute_effective_max_requeues(
                     counts[cls] = counts.get(cls, 0) + 1
             for cls, count in counts.items():
                 if cls == SCOPE_OVERFLOW and count >= 2:
+                    reduction = max(reduction, 1)
+                elif cls == AGENT_TIMEOUT and count >= 2:
                     reduction = max(reduction, 1)
                 elif cls not in INFRA_CLASSES and count >= 3:
                     reduction = max(reduction, 2)
