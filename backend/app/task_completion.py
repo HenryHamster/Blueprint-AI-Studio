@@ -731,6 +731,33 @@ async def _maybe_spawn_low_confidence_followup(
     return new_task
 
 
+def _extract_partial_diagnosis(task: Task) -> Optional[Dict[str, Any]]:
+    """Return salvageable diagnosis fields from a failed investigate task.
+
+    Inspects ``task.plan_output`` for the standard report keys (``summary``,
+    ``root_cause``, ``affected_files``). Returns ``None`` if none are present.
+    """
+    raw = task.plan_output
+    if not isinstance(raw, dict):
+        return None
+    summary = str(raw.get("summary") or "").strip()
+    root_cause = str(raw.get("root_cause") or "").strip()
+    affected_paths: List[str] = []
+    for entry in raw.get("affected_files") or []:
+        p = entry.get("path") if isinstance(entry, dict) else entry
+        if isinstance(p, str) and p.strip():
+            affected_paths.append(p.strip())
+    seen: set = set()
+    affected_paths = [p for p in affected_paths if not (p in seen or seen.add(p))]
+    if not (summary or root_cause or affected_paths):
+        return None
+    return {
+        "summary": summary[:500],
+        "root_cause": root_cause[:2000],
+        "affected_files": affected_paths[:20],
+    }
+
+
 async def _maybe_spawn_reinvestigation_after_failure(
     *,
     investigation_task: Task,
@@ -790,15 +817,29 @@ async def _maybe_spawn_reinvestigation_after_failure(
     failure_summary = (investigation_task.latest_status_message or "(no error message)")
     from app.failure_classification import classify_failure  # noqa: PLC0415
     failure_class = classify_failure(investigation_task)
+    partial_summary = (direction.get("partial_diagnosis_summary") or "").strip()
+    partial_root_cause = (direction.get("partial_diagnosis_root_cause") or "").strip()
+    partial_files = direction.get("partial_diagnosis_files") or []
+    partial_block = ""
+    if partial_summary or partial_root_cause or partial_files:
+        partial_block = "\n".join([
+            "",
+            "Partial findings from the prior (incomplete) investigation:",
+            f"- summary: {partial_summary[:500] or '(none)'}",
+            f"- root_cause: {partial_root_cause[:1000] or '(none)'}",
+            f"- affected_files: {', '.join(partial_files[:20]) or '(none)'}",
+            "Build on these findings rather than re-investigating from scratch.",
+        ])
     prompt = "\n".join([
         "A prior investigation on this direction did not complete — the "
-        "investigate task terminated due to an infrastructure failure before "
-        "producing a diagnosis. Re-run the investigation from scratch.",
+        "investigate task terminated before producing a final diagnosis. "
+        "Re-run the investigation, leveraging any partial findings below.",
         "",
         f"Direction: {(direction.get('text') or '')[:200]}",
         f"Direction id: {direction_id}",
         "",
         f"Prior diagnosis summary (if any):\n{prior_summary[:1500] or '(none recorded)'}",
+        partial_block,
         "",
         f"Previous investigation failure class: {failure_class}",
         f"Previous investigation error summary: {str(failure_summary)[:400]}",
@@ -887,6 +928,19 @@ async def _handle_investigation_terminal_failure(
         if target is None:
             return
         had_flag = bool(target.get(DIAGNOSIS_IN_PROGRESS_KEY))
+        partial = _extract_partial_diagnosis(task)
+        if partial:
+            target["partial_diagnosis_summary"] = partial["summary"]
+            target["partial_diagnosis_root_cause"] = partial["root_cause"]
+            target["partial_diagnosis_files"] = partial["affected_files"]
+            target["partial_diagnosis_task_id"] = str(task.id)
+            target["partial_diagnosis_recorded_at"] = _utcnow().isoformat()
+            logger.info(
+                f"[DIAGNOSIS] Salvaged partial diagnosis from failed investigate "
+                f"task {task.id} on direction {direction_id} "
+                f"(files={len(partial['affected_files'])}, "
+                f"has_root_cause={bool(partial['root_cause'])})"
+            )
         target.pop(DIAGNOSIS_IN_PROGRESS_KEY, None)
         target.pop(DIAGNOSIS_STARTED_AT_KEY, None)
         target.pop(DIAGNOSIS_TASK_ID_KEY, None)
@@ -903,7 +957,9 @@ async def _handle_investigation_terminal_failure(
         if status != TaskStatus.FAILED:
             return
         from app.failure_classification import classify_failure, INFRA_CLASSES  # noqa: PLC0415
-        if classify_failure(task) not in INFRA_CLASSES:
+        failure_class = classify_failure(task)
+        has_salvageable_root_cause = bool(partial and partial.get("root_cause"))
+        if failure_class not in INFRA_CLASSES and not has_salvageable_root_cause:
             return
         spawned = await _maybe_spawn_reinvestigation_after_failure(
             investigation_task=task,
@@ -1905,6 +1961,8 @@ async def _spawn_investigation_remediation(
             "diagnosis_confidence": confidence if confidence in ("high", "medium") else "high",
             "related_files": affected_paths[:25],
             "diagnosis_trigger": "investigation_completion",
+            "diagnosis_root_cause": root_cause[:2000],
+            "diagnosis_recommended_fix": recommended_fix[:2000],
             "scope": scope,
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",

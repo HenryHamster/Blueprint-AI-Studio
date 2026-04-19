@@ -5584,6 +5584,141 @@ async def test_task_failure_investigation_skips_review_quality(db_session):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _spawn_review_convergence_investigation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_review_convergence_investigation_spawns_on_cap_exhausted(db_session):
+    from app.autonomous_research import _spawn_review_convergence_investigation
+    direction_id = "d-conv0001"
+    project = Project(
+        name="Conv Cap",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(direction_id)],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig = Task(
+        project_id=project.id,
+        title="Stuck create",
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        context={
+            "direction_id": direction_id,
+            "review_loop": {"review_history": [
+                {"iteration": 0, "issues": [
+                    {"severity": "CRITICAL", "description": "Missing null check in handler"},
+                ]},
+                {"iteration": 1, "issues": [
+                    {"severity": "CRITICAL", "description": "Missing null check in handler"},
+                ]},
+            ]},
+        },
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="cap reached",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    spawned = await _spawn_review_convergence_investigation(
+        orig, db_session,
+        pr_number=4321, iterations=10,
+        detail="global", trigger="review_cap_exhausted",
+    )
+    assert spawned is True
+    await db_session.commit()
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    investigations = [
+        t for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "investigate"
+    ]
+    assert len(investigations) == 1
+    inv = investigations[0]
+    assert inv.context["direction_id"] == direction_id
+    assert inv.context["spawned_by"] == "review_convergence_investigation"
+    assert inv.context["pr_number"] == 4321
+    assert inv.context["convergence_trigger"] == "review_cap_exhausted"
+    prompt = inv.payloads[0]["prompt"]
+    assert "PR #4321" in prompt
+    assert "Missing null check" in prompt
+
+    # Dedup: second call should not spawn another
+    assert await _spawn_review_convergence_investigation(
+        orig, db_session,
+        pr_number=4321, iterations=10,
+        detail="global", trigger="review_cap_exhausted",
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_review_convergence_investigation_skips_without_direction(db_session):
+    from app.autonomous_research import _spawn_review_convergence_investigation
+    project = Project(
+        name="Conv No Dir",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig = Task(
+        project_id=project.id,
+        title="Undirected",
+        payloads=[{"type": "create", "prompt": "do"}],
+        context={},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(orig)
+    await db_session.commit()
+
+    assert await _spawn_review_convergence_investigation(
+        orig, db_session,
+        pr_number=1, iterations=5, detail="x", trigger="review_stuck_cycle",
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_review_convergence_investigation_skips_investigate_type(db_session):
+    from app.autonomous_research import _spawn_review_convergence_investigation
+    project = Project(
+        name="Conv Inv Type",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-conv0002")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig = Task(
+        project_id=project.id,
+        title="Loop guard",
+        payloads=[{"type": "investigate", "prompt": "diag"}],
+        context={"direction_id": "d-conv0002"},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(orig)
+    await db_session.commit()
+
+    assert await _spawn_review_convergence_investigation(
+        orig, db_session,
+        pr_number=1, iterations=5, detail="x", trigger="review_cap_exhausted",
+    ) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # anomaly_detection._spawn_held_direction_investigations
 # (cross-project wrapper wired into anomaly_maintenance_sweep)
 # ─────────────────────────────────────────────────────────────────────────────

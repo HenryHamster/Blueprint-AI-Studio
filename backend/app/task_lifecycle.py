@@ -152,6 +152,25 @@ def _build_retry_prompt_suffix(
     extra_guidance = ""
     scope_override: "str | None" = None
 
+    diagnosis_prefix = ""
+    if ctx.get("diagnosis_task_id"):
+        root_cause = str(ctx.get("diagnosis_root_cause") or "").strip()
+        recommended_fix = str(ctx.get("diagnosis_recommended_fix") or "").strip()
+        lines = [
+            "DIAGNOSIS CONTEXT: This task was spawned from a diagnosed failure. "
+            "Your previous attempt to implement the recommended fix failed — "
+            "try a different approach to the same root cause rather than abandoning "
+            "the diagnosis."
+        ]
+        if root_cause:
+            lines.append(f"- Root cause identified: {root_cause[:800]}")
+        if recommended_fix:
+            lines.append(f"- Originally recommended fix: {recommended_fix[:800]}")
+        affected = ctx.get("related_files") or []
+        if affected:
+            lines.append("- Affected files: " + ", ".join(str(f) for f in affected[:10]))
+        diagnosis_prefix = "\n".join(lines) + "\n"
+
     if failure_class == "AGENT_TIMEOUT":
         subtype = _timeout_subtype_from_message(original_status_message or "")
         if subtype == TIMEOUT_OOM:
@@ -326,6 +345,9 @@ def _build_retry_prompt_suffix(
         )
     if cross_attempt_lines:
         extra_guidance += "CROSS-ATTEMPT CONTEXT:\n" + "\n".join(cross_attempt_lines) + "\n"
+
+    if diagnosis_prefix:
+        extra_guidance = diagnosis_prefix + extra_guidance
 
     return extra_guidance, scope_override
 

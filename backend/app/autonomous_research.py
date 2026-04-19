@@ -1102,6 +1102,105 @@ async def _spawn_task_failure_investigation(
     return True
 
 
+async def _spawn_review_convergence_investigation(
+    orig_task: Task,
+    session: AsyncSession,
+    *,
+    pr_number: int,
+    iterations: int,
+    detail: str,
+    trigger: str,
+    review_history: list | None = None,
+) -> bool:
+    """Spawn an investigate task for review convergence failures.
+
+    Fired from ``review_pipeline._handle_cap_exhaustion`` (trigger=
+    ``review_cap_exhausted``) and the stuck-cycle path in
+    ``_spawn_pipeline_task`` (trigger=``review_stuck_cycle``).
+
+    Guards (mirroring _spawn_task_failure_investigation):
+    - Skip when orig_task has no direction_id (no direction to diagnose).
+    - Skip investigate/smoketest types to avoid self-referential loops.
+    - Respect the shared 24h per-direction investigation dedup.
+    """
+    ttype = (orig_task.first_payload or {}).get("type") or ""
+    if ttype in ("investigate", "smoketest"):
+        return False
+
+    direction_id = (orig_task.context or {}).get("direction_id")
+    if not direction_id:
+        return False
+
+    if await _recent_investigation_exists(orig_task.project_id, direction_id, session):
+        return False
+
+    history = review_history or (orig_task.context or {}).get("review_loop", {}).get("review_history") or []
+    issues_lines: list[str] = []
+    for entry in history[-3:]:
+        it = entry.get("iteration", "?")
+        issues = entry.get("issues") or []
+        for iss in issues[:5]:
+            sev = (iss.get("severity") or "").upper()
+            desc = (iss.get("description") or "").strip()[:200]
+            if desc:
+                issues_lines.append(f"  - [iter {it}] [{sev}] {desc}")
+        if not issues and entry.get("feedback"):
+            issues_lines.append(f"  - [iter {it}] {str(entry.get('feedback'))[:200]}")
+    issues_block = "\n".join(issues_lines) if issues_lines else "(no structured review issues captured)"
+
+    trigger_label = "cap exhausted" if trigger == "review_cap_exhausted" else "stuck cycle"
+    prompt = (
+        f"Review-fix convergence failure on PR #{pr_number} ({trigger_label}) after "
+        f"{iterations} iterations. Diagnose why the review loop could not converge.\n\n"
+        f"Direction: {direction_id}\n"
+        f"Source task: {str(orig_task.id)[:8]} ({ttype})\n"
+        f"Detail: {detail}\n\n"
+        f"Repeating review issues:\n{issues_block}\n\n"
+        f"Consider: scope too large for one PR, architectural mismatch, wrong approach, "
+        f"direction misalignment, or test-coverage/correctness gaps the fix agent cannot "
+        f"close in scope. Produce the structured diagnosis JSON report."
+    )
+
+    inv_payload = validate_internal_payload(
+        {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+        "autonomous_research:review_convergence_investigation",
+    )
+    new_task = Task(
+        project_id=orig_task.project_id,
+        title=f"Investigate review convergence: PR #{pr_number}",
+        description=f"Auto-spawned after review {trigger_label} on PR #{pr_number} ({iterations} iterations)",
+        payloads=[inv_payload],
+        context={
+            "direction_id": direction_id,
+            "spawned_by": "review_convergence_investigation",
+            "source_task_id": str(orig_task.id),
+            "pr_number": pr_number,
+            "review_iterations": iterations,
+            "convergence_trigger": trigger,
+            "convergence_detail": detail,
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(new_task)
+    session.add(TaskHistory(
+        task_id=new_task.id, action="SPAWNED",
+        details={
+            "spawned_by": "REVIEW_CONVERGENCE_INVESTIGATION",
+            "direction_id": direction_id,
+            "source_task_id": str(orig_task.id),
+            "pr_number": pr_number,
+            "trigger": trigger,
+        },
+    ))
+    logger.info(
+        f"[REVIEW CONVERGENCE] Spawned investigation {new_task.id} for "
+        f"PR #{pr_number} ({trigger}, direction {direction_id})"
+    )
+    return True
+
+
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
     from app.anomaly_detection import _expire_stale_proposals, _check_anomaly_proposals  # noqa: PLC0415

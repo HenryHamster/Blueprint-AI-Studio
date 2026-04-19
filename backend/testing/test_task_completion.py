@@ -28,6 +28,7 @@ from app.task_completion import (
     _record_remediation_if_terminal,
     _maybe_spawn_followup_investigation,
     _handle_investigation_completion,
+    _extract_partial_diagnosis,
     _handle_investigation_terminal_failure,
     _maybe_spawn_reinvestigation_after_failure,
     _is_structural_diagnosis,
@@ -2755,6 +2756,83 @@ class TestHandleInvestigationTerminalFailure:
             )
         )).scalars().all()
         assert siblings == []
+
+    @pytest.mark.asyncio
+    async def test_salvages_partial_diagnosis_on_failure(self, db_session):
+        """A failed investigate task with partial plan_output stamps partial_* on direction."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused",
+            "diagnosis_in_progress": True,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_investigation_task(project.id)
+        task.plan_output = {
+            "summary": "token parser dies on empty input",
+            "root_cause": "null deref in _parse_token",
+            "affected_files": [{"path": "app/x.py", "issue": "deref"}, "app/y.py"],
+        }
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["partial_diagnosis_summary"] == "token parser dies on empty input"
+        assert "null deref" in d["partial_diagnosis_root_cause"]
+        assert d["partial_diagnosis_files"] == ["app/x.py", "app/y.py"]
+        assert d["partial_diagnosis_task_id"] == str(task.id)
+
+    @pytest.mark.asyncio
+    async def test_code_error_with_partial_root_cause_respawns(self, db_session):
+        """CODE_ERROR crash is not normally retried, but partial root_cause unlocks re-spawn."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused", "text": "rollup",
+            "diagnosis_in_progress": True,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_investigation_task(
+            project.id,
+            latest_status_message="Investigate agent returned malformed JSON — parse error",
+            extra_context={"failure_category": "CODE_ERROR"},
+        )
+        task.plan_output = {
+            "summary": "race in rollup cursor",
+            "root_cause": "cursor advanced before ack",
+            "affected_files": ["app/rollup_management.py"],
+        }
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        siblings = (await db_session.execute(
+            _select(_Task).where(_Task.project_id == project.id, _Task.id != task.id)
+        )).scalars().all()
+        assert len(siblings) == 1
+        followup = siblings[0]
+        assert followup.context["diagnosis_trigger"] == "investigation_failure_followup"
+        prompt = followup.payloads[0]["prompt"]
+        assert "cursor advanced before ack" in prompt
+        assert "rollup_management.py" in prompt
+
+    def test_extract_partial_diagnosis_returns_none_when_empty(self):
+        class _T:
+            plan_output = None
+        assert _extract_partial_diagnosis(_T()) is None
+        _T.plan_output = {"summary": "", "root_cause": "", "affected_files": []}
+        assert _extract_partial_diagnosis(_T()) is None
 
     @pytest.mark.asyncio
     async def test_non_investigate_task_is_noop(self, db_session):

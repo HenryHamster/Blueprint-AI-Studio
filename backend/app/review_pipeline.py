@@ -449,6 +449,17 @@ async def _handle_cap_exhaustion(
     except Exception as e:
         logger.warning(f"[PIPELINE] Cap-exhaustion: failed to create alert for PR #{pr_number}: {e}")
 
+    try:
+        from app.autonomous_research import _spawn_review_convergence_investigation  # noqa: PLC0415
+        if await _spawn_review_convergence_investigation(
+            orig, session,
+            pr_number=pr_number, iterations=iterations,
+            detail=cap_label, trigger="review_cap_exhausted",
+        ):
+            await session.commit()
+    except Exception as e:
+        logger.warning(f"[PIPELINE] Cap-exhaustion: convergence investigation spawn failed for PR #{pr_number}: {e}", exc_info=True)
+
 
 async def _spawn_pipeline_task(
     source_task: Task, task_type: str, session: AsyncSession,
@@ -817,6 +828,20 @@ async def _spawn_pipeline_task(
                         ))
                     except Exception as _ne:
                         logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}")
+                    try:
+                        from app.autonomous_research import _spawn_review_convergence_investigation  # noqa: PLC0415
+                        if await _spawn_review_convergence_investigation(
+                            stuck_orig, session,
+                            pr_number=pr_number, iterations=iteration,
+                            detail=stuck_detail, trigger="review_stuck_cycle",
+                            review_history=new_review_history,
+                        ):
+                            await session.commit()
+                    except Exception as _ie:
+                        logger.warning(
+                            f"[PIPELINE] Stuck-cycle convergence investigation spawn failed for PR #{pr_number}: {_ie}",
+                            exc_info=True,
+                        )
             except Exception as e:
                 logger.warning(
                     f"[PIPELINE] Failed to mark stuck cycle on {resolved_original_id}: {e}",
