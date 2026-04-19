@@ -238,6 +238,25 @@ def _calibrate_scope(
             )
             return larger, proposed_scope
 
+        # Analysis-overflow dominance escalation (medium only): when the agent's
+        # analysis phase consistently cannot plan within the medium file budget,
+        # the research estimate is systematically too optimistic — hard-escalate
+        # to large rather than relying on the soft predict_spawn_success penalty.
+        if proposed_scope == "medium":
+            analysis_overflow = proposed_stats.get("failed_analysis_overflow", 0)
+            analysis_rate = analysis_overflow / proposed_stats["created"]
+            if analysis_rate >= 0.5:
+                larger = _SCOPE_ORDER[idx + 1]
+                logger.info(
+                    "[RESEARCH] Upgrading scope %s→%s for direction '%s' "
+                    "(%s analysis_overflow rate %.0f%% >= 50%%, %d/%d tasks)",
+                    proposed_scope, larger,
+                    direction.get("title", direction.get("id", "?")),
+                    source, analysis_rate * 100,
+                    analysis_overflow, proposed_stats["created"],
+                )
+                return larger, proposed_scope
+
     if rate is None or rate >= threshold:
         return proposed_scope, None
 
@@ -290,6 +309,7 @@ def predict_spawn_success(
     direction: dict,
     project: Any | None = None,
     related_files: list[str] | None = None,
+    complexity_score: float | None = None,
 ) -> float:
     """Predict P(success) for a spawned task using in-memory data only.
 
@@ -481,6 +501,15 @@ def predict_spawn_success(
         if created >= 2 and trim_count / created >= 0.5:
             signals.append(0.4)
             weights.append(1.0)
+
+    # Signal 12: composite complexity score from scope_complexity. Combines
+    # file count, historical expansion, cochange density, and cross-module
+    # span into a single P(merge) estimate in [0,1]. Low scores at medium
+    # scope indicate the finding is likely too complex for its budget, so
+    # route it through the low-confidence gate for large-scope escalation.
+    if isinstance(complexity_score, (int, float)):
+        signals.append(max(0.0, min(1.0, float(complexity_score))))
+        weights.append(1.5)
 
     if not signals:
         return 0.5  # insufficient data — neutral

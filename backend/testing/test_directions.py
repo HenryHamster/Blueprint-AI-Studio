@@ -2566,6 +2566,21 @@ class TestCalibrateScope:
         # denominator also < 3 so merge rate is None → returns unchanged.
         assert _calibrate_scope("medium", d) == ("medium", None)
 
+    def test_analysis_overflow_dominance_escalates_medium(self):
+        """50%+ analysis_overflow rate at medium → hard-escalate medium→large."""
+        # 4 medium created, 2 analysis_overflow failures (50%), merge rate 50%
+        # (acceptable), scope_overflow below 30% → only analysis signal triggers.
+        d = self._direction([
+            {"medium": {
+                "created": 4, "merged": 2, "failed": 2,
+                "failed_infra": 2, "failed_scope_overflow": 0,
+                "failed_analysis_overflow": 2,
+            }},
+        ])
+        result_scope, calibrated_from = _calibrate_scope("medium", d)
+        assert result_scope == "large"
+        assert calibrated_from == "medium"
+
     def test_overflow_escalation_skipped_for_large_scope(self):
         """Large scope has no larger scope to escalate to → no-op."""
         d = self._direction([
@@ -3389,6 +3404,19 @@ class TestPredictSpawnSuccessAcceptanceSignal:
         # Only signal 1: 0/2 = 0.0
         assert predict_spawn_success("small", d) == pytest.approx(0.0)
 
+    def test_complexity_score_signal_lowers_medium_prediction(self):
+        """A medium finding with a low complexity_score should receive a lower
+        predicted P(success) than one with a high score (weight 1.5)."""
+        low = predict_spawn_success("medium", {}, complexity_score=0.2)
+        high = predict_spawn_success("medium", {}, complexity_score=0.9)
+        assert low < high
+        # With no other signals, the weighted average equals the complexity
+        # score itself (single signal, any weight).
+        assert low == pytest.approx(0.2)
+        assert high == pytest.approx(0.9)
+        # Absent/None preserves the neutral fallback.
+        assert predict_spawn_success("medium", {}) == 0.5
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _poor_decomp_history helper unit tests (suppression signal)
@@ -3672,6 +3700,107 @@ async def test_exploration_floor_skipped_when_pipeline_unviable(db_session, mock
     child = children[0]
     assert child.context["scope"] == "large"
     assert child.context["scope_calibrated_from"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_complexity_modulates_medium_exploration_fraction(db_session, mocker):
+    """A low-complexity medium finding gets a halved exploration fraction
+    compared to a high-complexity finding from the same direction. With
+    base explore_frac=0.2 and random draw=0.15, the high-complexity finding
+    stays medium (0.15 < 0.20) while the low-complexity finding (modulated
+    to 0.10) escalates to large (0.15 >= 0.10)."""
+    direction_id = "d-complexity-mod-1"
+    direction = {
+        "id": direction_id,
+        "text": "Complexity modulation test",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    project = Project(name="Complexity mod test", user_id="test-user-123",
+                      autonomous_enabled=True, directions=[direction])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        title="Research: complexity mod",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch("app.task_completion.get_github_token_for_task",
+                 new=AsyncMock(return_value=("fake-token", "owner", "repo")))
+    mocker.patch("app.task_completion.get_branch_sha", new=AsyncMock(return_value="abc123sha"))
+    mocker.patch("app.task_completion.create_branch", new=AsyncMock(return_value=None))
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": "Low-complexity finding",
+                "description": "simple",
+                "prompt": "do it",
+                "priority": "medium",
+                "scope": "medium",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            },
+            {
+                "title": "High-complexity finding",
+                "description": "hairy",
+                "prompt": "do it",
+                "priority": "medium",
+                "scope": "medium",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            },
+        ],
+    )
+
+    def _fake_calibrate(finding, scope, direction, cochange_index, all_directions=None):
+        if "Low-complexity" in finding.get("title", ""):
+            finding["_complexity_score"] = 0.20
+        else:
+            finding["_complexity_score"] = 0.50
+        finding["_complexity_signals"] = {}
+        return "medium", None
+
+    mocker.patch(
+        "app.research_completion._calibrate_finding_scope",
+        side_effect=_fake_calibrate,
+    )
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.15)
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"medium_exploration_fraction": 0.2},
+    )
+    # Draw 0.15: passes for high-complexity (unmodulated 0.20), fails for
+    # low-complexity (modulated 0.10).
+    mocker.patch("app.research_completion.random.random", return_value=0.15)
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    children = result.scalars().all()
+    by_title = {c.title: c for c in children}
+    high = next(c for t, c in by_title.items() if "High-complexity" in t)
+    low = next(c for t, c in by_title.items() if "Low-complexity" in t)
+    assert high.context["scope"] == "medium"
+    assert low.context["scope"] == "large"
+    assert low.context["scope_calibrated_from"] == "medium"
 
 
 @pytest.mark.asyncio

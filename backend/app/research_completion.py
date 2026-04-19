@@ -759,7 +759,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _pred_dir_id = finding.get("direction_id") or _parent_direction_id
         _pred_direction = _directions_by_id.get(str(_pred_dir_id)) if _pred_dir_id else {}
         _pred_p = predict_spawn_success(
-            scope, _pred_direction or {}, _scope_cal_project, related_files=related_files
+            scope, _pred_direction or {}, _scope_cal_project, related_files=related_files,
+            complexity_score=finding.get("_complexity_score"),
         )
         _low_confidence = _pred_p < _confidence_threshold
         if _low_confidence:
@@ -850,6 +851,24 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     "escalation rate=%.2f (%d/%d) < 0.30, frac=%.3f",
                     _pred_dir_id, _esc_merged / _esc_attempted, _esc_merged,
                     _esc_attempted, float(_explore_frac),
+                )
+            # Per-finding modulation: structurally complex findings (low
+            # composite complexity score) are more likely to overflow at medium
+            # scope, so halve their exploration fraction to bias the lottery
+            # away from them without affecting simpler findings in the same
+            # direction. Applied after direction-level adaptations but before
+            # the floor so the floor can still rescue over-suppressed fractions.
+            _cs = finding.get("_complexity_score")
+            if (
+                isinstance(_cs, (int, float))
+                and float(_cs) < 0.35
+                and isinstance(_explore_frac, (int, float))
+            ):
+                _explore_frac = float(_explore_frac) * 0.5
+                logger.info(
+                    "[RESEARCH] Complexity-modulated exploration for '%s': "
+                    "complexity_score=%.2f < 0.35, frac=%.3f",
+                    title, float(_cs), float(_explore_frac),
                 )
             # Enforce a minimum exploration fraction so directions with zero
             # observed exploration merges still occasionally attempt medium scope —
