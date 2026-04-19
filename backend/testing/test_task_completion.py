@@ -2054,6 +2054,18 @@ class TestIsStructuralDiagnosis:
             "This import is out of scope for this module", ""
         )
 
+    def test_narrow_the_scope_of_code_is_not_structural(self):
+        assert not _is_structural_diagnosis(
+            "lock contention in reaper",
+            "narrow the scope of the test fixture to only include active tasks",
+        )
+
+    def test_narrow_the_scope_with_direction_context_is_structural(self):
+        assert _is_structural_diagnosis(
+            "the direction scope is unclear",
+            "narrow the scope to a single failure class",
+        )
+
 
 class TestHandleInvestigationCompletion:
     def _payload(self, logs=""):
@@ -2525,20 +2537,26 @@ class TestCalculateRemediationScope:
     def test_small_when_few_paths_and_medium_severity(self):
         assert _calculate_remediation_scope(["a.py"], "medium", 0) == "small"
 
-    def test_medium_when_few_paths_but_high_severity(self):
-        """High severity on <=2 paths falls through to medium (rule 1 needs low/medium)."""
-        assert _calculate_remediation_scope(["a.py", "b.py"], "high", 0) == "medium"
+    def test_small_when_three_paths_high_severity(self):
+        """<=4 paths route to small regardless of severity."""
+        paths = ["a.py", "b.py", "c.py"]
+        assert _calculate_remediation_scope(paths, "high", 0) == "small"
 
-    def test_medium_when_moderate_path_count(self):
+    def test_small_when_four_paths_medium_severity(self):
+        paths = ["a.py", "b.py", "c.py", "d.py"]
+        assert _calculate_remediation_scope(paths, "medium", 0) == "small"
+
+    def test_medium_when_five_paths_high_severity(self):
         paths = ["a.py", "b.py", "c.py", "d.py", "e.py"]
-        assert _calculate_remediation_scope(paths, "medium", 0) == "medium"
+        assert _calculate_remediation_scope(paths, "high", 0) == "medium"
 
-    def test_large_when_many_paths(self):
+    def test_large_when_six_paths(self):
         paths = [f"f{i}.py" for i in range(6)]
         assert _calculate_remediation_scope(paths, "medium", 0) == "large"
 
-    def test_large_when_critical_severity_regardless_of_paths(self):
-        assert _calculate_remediation_scope(["a.py"], "critical", 0) == "large"
+    def test_small_when_few_paths_critical_severity(self):
+        """Critical with <=4 files still routes to small; severity no longer escalates."""
+        assert _calculate_remediation_scope(["a.py"], "critical", 0) == "small"
 
     def test_empty_paths_low_severity_is_small(self):
         assert _calculate_remediation_scope([], "low", 0) == "small"
@@ -2548,7 +2566,7 @@ class TestCalculateRemediationScope:
         assert _calculate_remediation_scope(["a.py"], "low", 1) == "small"
 
     def test_retry_does_not_escalate_medium(self):
-        paths = ["a.py", "b.py", "c.py"]
+        paths = ["a.py", "b.py", "c.py", "d.py", "e.py"]
         assert _calculate_remediation_scope(paths, "medium", 1) == "medium"
 
     def test_large_stays_large_after_retry(self):
@@ -2618,15 +2636,16 @@ class TestRemediationScopeInPayload:
         assert child.context["scope"] == "small"
 
     @pytest.mark.asyncio
-    async def test_large_scope_for_critical_severity(self, db_session, mocker):
+    async def test_large_scope_for_many_files(self, db_session, mocker):
         project = await self._setup(db_session, mocker)
         task = make_task(project_id=project.id, context={"direction_id": "dir-scope-1"})
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
 
+        affected = [{"path": f"backend/app/mod_{i}.py"} for i in range(6)]
         await _handle_investigation_completion(
-            task, self._payload(self._report(severity="critical")), db_session,
+            task, self._payload(self._report(affected_files=affected)), db_session,
         )
         await db_session.commit()
         child = await self._spawned_child(db_session, task.id)
@@ -2641,7 +2660,7 @@ class TestRemediationScopeInPayload:
         await db_session.commit()
         await db_session.refresh(task)
 
-        affected = [{"path": f"backend/app/mod_{i}.py"} for i in range(4)]
+        affected = [{"path": f"backend/app/mod_{i}.py"} for i in range(5)]
         await _handle_investigation_completion(
             task, self._payload(self._report(affected_files=affected)), db_session,
         )

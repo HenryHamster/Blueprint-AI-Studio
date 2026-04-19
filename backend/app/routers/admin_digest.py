@@ -2403,6 +2403,33 @@ async def get_digest(
         "remediation_spawned": ic_remediation_spawned,
     }
 
+    diagnosis_drop_off_by_reason: Dict[str, int] = {}
+    for t in _inv_tasks:
+        if t.status != TaskStatus.COMPLETED:
+            continue
+        po = t.plan_output if isinstance(t.plan_output, dict) else None
+        if not po:
+            continue
+        if not str(po.get("summary") or "").strip():
+            continue
+        if str(t.id) in _inv_ids_with_remediation:
+            continue
+        root_cause = str(po.get("root_cause") or "")
+        recommended_fix = str(po.get("recommended_fix") or "").strip()
+        confidence = str(po.get("confidence") or "").strip().lower()
+        direction_id_val = (t.context or {}).get("direction_id")
+        if _is_structural_diagnosis(root_cause, recommended_fix):
+            reason = "structural"
+        elif not recommended_fix:
+            reason = "no_recommended_fix"
+        elif confidence not in ("high", "medium"):
+            reason = "low_confidence"
+        elif not direction_id_val:
+            reason = "no_direction"
+        else:
+            continue
+        diagnosis_drop_off_by_reason[reason] = diagnosis_drop_off_by_reason.get(reason, 0) + 1
+
     remediation_funnel = {
         "investigations_spawned": investigations_spawned,
         "investigations_completed": investigations_completed,
@@ -2421,6 +2448,7 @@ async def get_digest(
         "active_investigations_detail": active_investigations_detail,
         "ci_auto_remediation": ci_auto_remediation,
         "prior_investigation_reuse": prior_investigation_reuse,
+        "diagnosis_drop_off_by_reason": diagnosis_drop_off_by_reason,
     }
 
     _review_quality = _compute_review_quality_metrics(completed_tasks + failed_tasks)

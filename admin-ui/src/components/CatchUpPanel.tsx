@@ -373,6 +373,7 @@ interface DigestData {
       direction_id?: string | null;
       elapsed_hours?: number | null;
     }>;
+    diagnosis_drop_off_by_reason?: Record<string, number>;
   } | null;
 }
 
@@ -2900,7 +2901,13 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             .filter(([, v]) => v > 0)
                             .sort((a, b) => b[1] - a[1]);
                           const hasCar = !!car && (car.spawned + car.merged + car.failed) > 0;
-                          if (!ibcEntries.length && !rsbcEntries.length && !frbcEntries.length && !mrbcEntries.length && !cmbcEntries.length && !hasCar) return null;
+                          const dropOff = rf.diagnosis_drop_off_by_reason ?? {};
+                          const dropOffEntries = Object.entries(dropOff)
+                            .filter(([, v]) => v > 0)
+                            .sort((a, b) => b[1] - a[1]);
+                          const dropOffTotal = dropOffEntries.reduce((acc, [, v]) => acc + v, 0);
+                          const dropOffDominant = dropOffEntries[0]?.[0];
+                          if (!ibcEntries.length && !rsbcEntries.length && !frbcEntries.length && !mrbcEntries.length && !cmbcEntries.length && !hasCar && !dropOffEntries.length) return null;
                           return (
                             <div className="flex flex-col gap-1 text-[10px] text-neutral-400 border-t border-neutral-800 pt-1.5">
                               {ibcEntries.length > 0 && (
@@ -2980,6 +2987,24 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                     <span className="text-neutral-500">failed</span>
                                     <span className="font-mono text-red-400">{car!.failed}</span>
                                   </span>
+                                </div>
+                              )}
+                              {dropOffEntries.length > 0 && (
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-neutral-500 w-24 shrink-0">diagnosis drop-off:</span>
+                                  {dropOffEntries.map(([reason, count]) => (
+                                    <span key={reason} className="inline-flex items-baseline gap-1">
+                                      <span className={reason === dropOffDominant ? 'text-amber-400' : 'text-neutral-400'}>
+                                        {reason}
+                                      </span>
+                                      <span className="font-mono text-neutral-300">{count}</span>
+                                      {dropOffTotal > 0 && (
+                                        <span className="text-neutral-600">
+                                          ({Math.round((count / dropOffTotal) * 100)}%)
+                                        </span>
+                                      )}
+                                    </span>
+                                  ))}
                                 </div>
                               )}
                               {carTypeEntries.length > 0 && (

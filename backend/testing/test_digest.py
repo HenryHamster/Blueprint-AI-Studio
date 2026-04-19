@@ -4055,3 +4055,9 @@ async def test_digest_investigation_conversion_breakdown(client: AsyncClient, db
     assert ic["low_confidence"] == 1
     assert ic["actionable"] == 1
     assert ic["remediation_spawned"] == 1
+
+    drop_off = response.json()["remediation_funnel"]["diagnosis_drop_off_by_reason"]
+    assert drop_off.get("structural") == 1
+    assert drop_off.get("low_confidence") == 1
+    assert drop_off.get("no_recommended_fix") == 1
+    assert "no_direction" not in drop_off

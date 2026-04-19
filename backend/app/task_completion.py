@@ -1652,7 +1652,6 @@ _STRUCTURAL_STRONG_KEYWORDS = (
     "direction is too broad",
     "direction is too wide",
     "narrow the direction",
-    "narrow the scope",
     "split the direction",
     "rewrite the direction",
 )
@@ -1668,6 +1667,7 @@ _STRUCTURAL_WEAK_KEYWORDS = (
     "scope too",
     "misaligned",
     "out of scope",
+    "narrow the scope",
 )
 
 _STRUCTURAL_CONTEXT_WORDS = ("direction", "goal", "vision")
@@ -1959,19 +1959,19 @@ def _calculate_remediation_scope(
 ) -> str:
     """Calibrate the remediation task's scope based on diagnosis complexity.
 
-    Returns one of "small", "medium", or "large". Routes complex diagnoses
-    (>5 files or critical severity) to large scope (plan decomposition). Scope
-    is determined purely by diagnosis complexity; retries do NOT escalate scope
-    because pipeline data shows medium-scope remediations succeed at 0% while
-    small-scope remediations succeed at 100% — escalating wastes the retry.
+    Returns one of "small", "medium", or "large". Pipeline data shows small-scope
+    remediations merge at ~100% while medium-scope remediations near-zero, so we
+    widen the small tier: <=4 affected files route to small regardless of
+    severity. Exactly 5 files routes to medium, and >5 files routes to large.
+    Retries do NOT escalate scope — escalating wastes the retry.
     """
-    del remediation_attempts  # retained for signature compatibility
+    del remediation_attempts, severity  # retained for signature compatibility
     num_paths = len(affected_paths)
-    if num_paths > 5 or severity == "critical":
+    if num_paths > 5:
         return "large"
-    if num_paths <= 2 and severity in ("low", "medium"):
-        return "small"
-    return "medium"
+    if num_paths == 5:
+        return "medium"
+    return "small"
 
 
 async def _spawn_investigation_remediation(
