@@ -208,6 +208,8 @@ class TestClassifyFailureExternalApi:
         "failed to create branch feat/x",
         "merge blocked by branch protection",
         "merge conflicts detected",
+        "PR #42 merge failed 15 times (>= 15): server error — giving up, needs manual intervention",
+        "PR #42 merge hard-capped after 15 failures — manual action required",
         "required status check missing",
         "401 Unauthorized",
         "Bad credentials returned from GitHub",

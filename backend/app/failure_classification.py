@@ -329,6 +329,7 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     # Merge-blocking GitHub responses — branch protection, rule violations, not-mergeable states.
     # These are GitHub operation blocks, not agent code defects.
     if any(kw in combined for kw in ["merge blocked", "merge attempt", "merge conflicts",
+                                      "merge failed", "merge hard-cap", "merge hard cap",
                                       "merge check failed", "not mergeable",
                                       "repository rule", "rule violations",
                                       "required status check", "branch protection",

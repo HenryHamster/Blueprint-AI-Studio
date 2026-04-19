@@ -308,6 +308,154 @@ async def test_mergeable_state_behind_calls_update_branch(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_update_branch_failure_increments_counter(db_session, mocker):
+    """
+    When update_branch fails in the behind-state handler, update_branch_failures
+    counter increments. Under 3 failures, no fix task is spawned.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "behind"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "Base branch was modified"},
+    )
+    mocker.patch(
+        "app.github.update_branch",
+        return_value={"updated": False, "message": "422 validation failed"},
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(None, False),
+    )
+
+    project = Project(name="Update branch fail test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(
+        db_session, project,
+        ci_loop_extra={"ci_passed": True, "update_branch_failures": 1},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook",
+    )
+
+    assert result is False
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("update_branch_failures") == 2
+    spawn_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_branch_failure_threshold_spawns_fix(db_session, mocker):
+    """
+    After 3 consecutive update_branch failures, the behind-state handler spawns
+    a fix task with fix_reason='update_branch_failed' instead of looping.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "behind"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "Base branch was modified"},
+    )
+    mocker.patch(
+        "app.github.update_branch",
+        return_value={"updated": False, "message": "422 validation failed"},
+    )
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(name="Update branch escalate test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(
+        db_session, project,
+        ci_loop_extra={"ci_passed": True, "update_branch_failures": 2},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook",
+    )
+
+    assert result is False
+    spawn_mock.assert_called_once()
+    assert spawn_mock.call_args.kwargs.get("fix_reason") == "update_branch_failed"
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("update_branch_failures") == 3
+    assert review_loop.get("ci_fix_spawned") == str(fake_fix.id)
+
+
+@pytest.mark.asyncio
+async def test_update_branch_success_resets_counter(db_session, mocker):
+    """
+    A successful update_branch call resets update_branch_failures to 0, so
+    transient API failures don't accumulate across eventual successes.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "behind"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "Base branch was modified"},
+    )
+    mocker.patch(
+        "app.github.update_branch",
+        return_value={"updated": True, "message": "Update queued"},
+    )
+
+    project = Project(name="Update branch reset test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(
+        db_session, project,
+        ci_loop_extra={"ci_passed": True, "update_branch_failures": 2},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook",
+    )
+
+    assert result is False
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("update_branch_failures") == 0
+
+
+@pytest.mark.asyncio
 async def test_mergeable_state_dirty_spawns_fix(db_session, mocker):
     """
     When mergeable_state='dirty' (real conflict per GitHub) but the merge call
@@ -647,6 +795,10 @@ async def test_merge_failure_hard_cap_marks_failed(db_session, mocker):
     assert review_loop.get("merge_failures") == MERGE_FAILURE_HARD_CAP
     alert_mock.assert_called_once()
     assert "hard-capped" in alert_mock.call_args[0][2].lower()
+    # Merge hard-cap must classify as EXTERNAL_API (infra), not CODE_ERROR —
+    # the phrase "merge failed" in the status message is a keyword match.
+    from app.failure_classification import classify_failure  # noqa: PLC0415
+    assert classify_failure(task) == "EXTERNAL_API"
 
 
 @pytest.mark.asyncio
@@ -705,7 +857,10 @@ async def test_merge_failure_hard_cap_records_deploy_monitoring_result(db_sessio
     # Direction health tracking must also see this failure
     streak = direction_failure_streaks.get(direction_id)
     assert streak is not None, "record_direction_result should register a streak entry"
-    assert streak["consecutive_failures"] >= 1
+    # Merge hard-cap is classified as EXTERNAL_API (infra), not CODE_ERROR — so the
+    # failure lands on the infra counter. Either counter being non-zero proves the
+    # direction-health hook saw this failure.
+    assert (streak["consecutive_failures"] + streak.get("consecutive_infra_failures", 0)) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -1146,3 +1301,96 @@ async def test_ci_wait_started_resets_when_checks_restart(db_session, mocker):
     new_ts = review_loop.get("ci_wait_started")
     assert new_ts is not None
     assert new_ts != stale_ts, "ci_wait_started must be reset, not preserved from prior CI wait"
+
+
+@pytest.mark.asyncio
+async def test_merge_repeated_identical_error_triggers_early_exit(db_session, mocker):
+    """
+    When the merge API returns the same error message 3 times in a row, the
+    handler escalates immediately (FAILED + requires_approval) instead of
+    burning all 15 retries.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "upstream timeout"},
+    )
+
+    project = Project(name="Repeat error early exit", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Prior two attempts both returned "upstream timeout"; this call is the 3rd.
+    task = _make_task(db_session, project, ci_loop_extra={
+        "merge_failures": 2,
+        "merge_last_error": "upstream timeout",
+        "merge_error_streak": 2,
+    })
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    assert task.status == TaskStatus.FAILED
+    assert task.requires_approval is True
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_error_streak") == 3
+    assert review_loop.get("merge_failures") == 3, "must exit well before hard cap"
+    assert "identical" in (task.latest_status_message or "").lower()
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_merge_different_errors_do_not_trigger_early_exit(db_session, mocker):
+    """
+    When the merge error message changes between attempts, the streak resets
+    and the handler continues retrying (no early FAILED escalation).
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "different error"},
+    )
+
+    project = Project(name="Different errors", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project, ci_loop_extra={
+        "merge_failures": 2,
+        "merge_last_error": "upstream timeout",
+        "merge_error_streak": 2,
+    })
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    assert task.status == TaskStatus.EVALUATING, "should keep retrying on new error"
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_error_streak") == 1, "streak resets when error changes"
+    assert review_loop.get("merge_last_error") == "different error"

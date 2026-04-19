@@ -162,21 +162,96 @@ async def _attempt_merge_with_retry_and_escalation(
             ci_loop["ci_poll_interval"] = 30
             ci_loop["ci_last_polled"] = _utcnow().isoformat()
             ci_loop["ci_wait_started"] = _utcnow().isoformat()
-            task.context = {**(task.context or {}), "review_loop": ci_loop}
-            flag_modified(task, "context")
             if _upd.get("updated"):
+                ci_loop["update_branch_failures"] = 0
+                task.context = {**(task.context or {}), "review_loop": ci_loop}
+                flag_modified(task, "context")
                 task.latest_status_message = (
                     f"PR #{ci_pr_number} branch behind base — update queued, re-entering CI polling"
                 )
                 logger.info(f"[CI] PR #{ci_pr_number} behind base — update_branch queued ({source})")
-            else:
+                return False
+            _ub_failures = ci_loop.get("update_branch_failures", 0) + 1
+            ci_loop["update_branch_failures"] = _ub_failures
+            task.context = {**(task.context or {}), "review_loop": ci_loop}
+            flag_modified(task, "context")
+            if _ub_failures < 3:
                 task.latest_status_message = (
-                    f"PR #{ci_pr_number} branch behind base — update_branch failed: "
-                    f"{(_upd.get('message') or '')[:120]} — re-entering CI polling"
+                    f"PR #{ci_pr_number} branch behind base — update_branch failed "
+                    f"({_ub_failures}x): {(_upd.get('message') or '')[:120]} — re-entering CI polling"
                 )
                 logger.warning(
-                    f"[CI] PR #{ci_pr_number} behind base — update_branch failed: "
+                    f"[CI] PR #{ci_pr_number} behind base — update_branch failed ({_ub_failures}x): "
                     f"{_upd.get('message')} ({source})"
+                )
+                return False
+            # 3+ consecutive update_branch failures — escalate to fix task with rebase.
+            from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
+            from app.rollup_state import _is_rollup_parent_awaiting_merge  # noqa: PLC0415
+            active_tasks = (await session.execute(
+                select(Task).where(
+                    Task.project_id == task.project_id,
+                    Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+                )
+            )).scalars().all()
+            existing_fix = next(
+                (t for t in active_tasks
+                 if t.id != task.id
+                 and t.first_payload.get("type") == "fix"
+                 and t.first_payload.get("pr_number") == ci_pr_number),
+                None,
+            )
+            if existing_fix:
+                if not _is_rollup_parent_awaiting_merge(task.context):
+                    task.status = TaskStatus.COMPLETED
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} behind base, update_branch failed {_ub_failures}x, "
+                    f"fix already active → {existing_fix.id}"
+                )
+                logger.warning(
+                    f"[CI] PR #{ci_pr_number} behind base escalation — fix already exists → "
+                    f"{existing_fix.id} ({source})"
+                )
+                return False
+            behind_prompt = (
+                f"PR #{ci_pr_number} is behind `{ci_base}` and GitHub's update_branch API "
+                f"has failed {_ub_failures} consecutive times. The code review is already approved — "
+                f"focus only on rebasing the branch.\n\n"
+                f"After cloning:\n"
+                f"  1. Run `git fetch origin {ci_base} && git rebase origin/{ci_base}`.\n"
+                f"  2. Resolve any conflicts that surface during the rebase.\n"
+                f"  3. Re-run lint/type/test suites for the affected files.\n"
+                f"  4. Force-push with `--force-with-lease`.\n\n"
+                f"Last update_branch error: {(_upd.get('message') or '')[:500]}"
+            )
+            fix_task, _ = await _spawn_pipeline_task(
+                task, "fix", session, ci_pr_number, ci_branch, ci_base,
+                fix_prompt=behind_prompt,
+                original_task_id=ci_orig_id,
+                fix_reason="update_branch_failed",
+            )
+            if fix_task:
+                ci_loop["ci_waiting"] = False
+                ci_loop["ci_fix_spawned"] = str(fix_task.id)
+                task.context = {**(task.context or {}), "review_loop": ci_loop}
+                flag_modified(task, "context")
+                if not _is_rollup_parent_awaiting_merge(task.context):
+                    task.status = TaskStatus.COMPLETED
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} behind base, update_branch failed {_ub_failures}x "
+                    f"— spawned fix → {fix_task.id}"
+                )
+                logger.warning(
+                    f"[CI] PR #{ci_pr_number} behind base escalation — spawned fix → "
+                    f"{fix_task.id} ({source})"
+                )
+            else:
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} behind base, update_branch failed {_ub_failures}x "
+                    f"— fix spawn suppressed (iteration cap)"
+                )
+                logger.warning(
+                    f"[CI] PR #{ci_pr_number} behind base escalation — fix spawn suppressed ({source})"
                 )
             return False
 
@@ -277,6 +352,15 @@ async def _attempt_merge_with_retry_and_escalation(
             ci_loop["merge_failures"] = _merge_failures
             ci_loop["ci_poll_interval"] = min(30 * _merge_failures, 120)
             ci_loop["ci_last_polled"] = _utcnow().isoformat()
+            # Track repeated-identical-error streak for early exit: if the merge
+            # API keeps returning the same error, retrying won't change anything.
+            _prev_err = ci_loop.get("merge_last_error")
+            if _prev_err is not None and _prev_err == merge_msg:
+                _err_streak = ci_loop.get("merge_error_streak", 1) + 1
+            else:
+                _err_streak = 1
+            ci_loop["merge_last_error"] = merge_msg
+            ci_loop["merge_error_streak"] = _err_streak
             task.context = {**(task.context or {}), "review_loop": ci_loop}
             task.latest_status_message = f"Merge attempt {_merge_failures} failed on PR #{ci_pr_number}: {merge_msg} — retrying"
             logger.warning(f"[CI] PR #{ci_pr_number} merge failed ({_merge_failures}x): {merge_msg} — will retry ({source})")
@@ -295,13 +379,21 @@ async def _attempt_merge_with_retry_and_escalation(
                 await _maybe_create_failure_alert(task, session,
                     f"PR #{ci_pr_number} merge failed {_merge_failures} times — "
                     f"hard cap imminent ({MERGE_FAILURE_HARD_CAP - _merge_failures} retries remaining)")
-            if _merge_failures >= MERGE_FAILURE_HARD_CAP:
+            _repeated_identical = _err_streak >= 3
+            if _merge_failures >= MERGE_FAILURE_HARD_CAP or _repeated_identical:
                 task.status = TaskStatus.FAILED
                 task.requires_approval = True
-                task.latest_status_message = (
-                    f"PR #{ci_pr_number} merge failed {_merge_failures} times "
-                    f"(>= {MERGE_FAILURE_HARD_CAP}) — giving up, needs manual intervention"
-                )
+                if _repeated_identical and _merge_failures < MERGE_FAILURE_HARD_CAP:
+                    task.latest_status_message = (
+                        f"PR #{ci_pr_number} merge failed with identical error "
+                        f"{_err_streak} times in a row: {merge_msg[:200]} — "
+                        f"giving up, needs manual intervention"
+                    )
+                else:
+                    task.latest_status_message = (
+                        f"PR #{ci_pr_number} merge failed {_merge_failures} times "
+                        f"(>= {MERGE_FAILURE_HARD_CAP}) — giving up, needs manual intervention"
+                    )
                 if ci_orig_id:
                     try:
                         orig = await session.get(Task, uuid.UUID(ci_orig_id))
@@ -479,7 +571,7 @@ async def handle_ci_completion(
             logger.error(f"[CI] PR #{ci_pr_number} CI failed, spawned fix → {fix_task.id} ({source})")
         else:
             task.status = TaskStatus.FAILED
-            task.latest_status_message = f"CI failed on PR #{ci_pr_number}, fix not spawned (iteration cap)"
+            task.latest_status_message = f"CI failed on PR #{ci_pr_number}, fix not spawned (pipeline limit)"
             logger.error(f"[CI] PR #{ci_pr_number} CI failed, fix spawn returned None ({source})")
             from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
             from app.routers.agent_status import record_task_result  # noqa: PLC0415
@@ -497,7 +589,7 @@ async def handle_ci_completion(
     if task.status == TaskStatus.FAILED:
         await _maybe_create_failure_alert(
             task, session,
-            f"CI failed on PR #{ci_pr_number}, fix not spawned (iteration cap)"
+            f"CI failed on PR #{ci_pr_number}, fix not spawned (pipeline limit)"
         )
     session.add(task)
     await session.commit()

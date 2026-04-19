@@ -1785,6 +1785,74 @@ async def test_ci_merge_rule_block_escalates_immediately(db_session, mocker):
     )
 
 
+@pytest.mark.asyncio
+async def test_ci_fail_fix_suppressed_uses_generic_message(db_session, mocker):
+    """
+    When _spawn_pipeline_task returns None (fix suppressed for any reason:
+    iteration cap, stuck cycle, dedup, direction cap), the status message
+    must not misattribute the cause to 'iteration cap'.
+    """
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(None, False),
+    )
+
+    project = Project(name="Fix Suppressed Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="CI fix suppressed test",
+        payloads=[{
+            "type": "review",
+            "pr_number": 777,
+            "branch": "blueprint/fix-suppressed-test",
+            "base_branch": "main",
+        }],
+        context={
+            "review_loop": {
+                "pr_number": 777,
+                "branch": "blueprint/fix-suppressed-test",
+                "base_branch": "main",
+                "iteration": 1,
+                "ci_waiting": True,
+            },
+        },
+        vm_instance_id="agent-vm-fix-suppressed-001",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "failure", "failed_logs": "test failure"}
+    await handle_ci_completion(
+        task=task,
+        ci_result=ci_result,
+        gh_token="fake-token",
+        owner="test-owner",
+        repo="test-repo",
+        session=db_session,
+        source="webhook",
+    )
+
+    await db_session.flush()
+    assert task.status == TaskStatus.FAILED
+    msg = task.latest_status_message or ""
+    assert "fix not spawned" in msg
+    assert "iteration cap" not in msg, (
+        "Status message must not misattribute suppression to iteration cap"
+    )
+    assert "pipeline limit" in msg
+
+
 # ---------------------------------------------------------------------------
 # Merge gate: ci_passed AND review_approved both required
 # ---------------------------------------------------------------------------
