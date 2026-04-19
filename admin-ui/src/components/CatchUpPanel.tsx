@@ -18,6 +18,8 @@ interface NeedsAttentionItem {
   touched_critical?: string[];
   failure_class?: string | null;
   scope?: string | null;
+  direction_id?: string | null;
+  direction_text?: string | null;
 }
 
 interface RecentFailure {
@@ -28,6 +30,11 @@ interface RecentFailure {
   waiting_hours?: number;
   attempt_count?: number;
   timeout_subtype?: string | null;
+  direction_id?: string | null;
+  direction_text?: string | null;
+  task_type?: string;
+  failure_class?: string | null;
+  scope?: string | null;
 }
 
 interface FailureGroupTask {
@@ -39,6 +46,8 @@ interface FailureGroupTask {
   taxonomy?: string;
   timeout_subtype?: string | null;
   failure_stage?: string | null;
+  direction_id?: string | null;
+  direction_text?: string | null;
 }
 
 const TIMEOUT_SUBTYPE_LABELS: Record<string, string> = {
@@ -79,6 +88,15 @@ interface DirectionProgress {
   latest_insights?: string[];
   recent_finding_titles?: string[];
   latest_research_at?: string | null;
+  prs_rejected?: number;
+  acceptance_rate?: number | null;
+  first_attempt_success_rate?: number | null;
+  cost_per_merged_pr?: number | null;
+  auto_paused?: boolean;
+  needs_manual_intervention?: boolean;
+  scope_breakdown?: Record<string, { created?: number; merged?: number; failed?: number }> | null;
+  taxonomy_summary?: Record<string, number> | null;
+  rejection_reasons?: { task_id?: string; title?: string; rejection_note?: string }[] | null;
 }
 
 interface ActiveTask {
@@ -118,7 +136,7 @@ interface DigestData {
   failed_delta?: number;
   success_rate_delta?: number | null;
   trend?: 'improving' | 'declining' | 'stable';
-  trend_history?: {period_end: string; success_rate: number | null; completed: number; failed: number}[];
+  trend_history?: {period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_taxonomy?: Record<string, number>}[];
   failure_taxonomy_distribution?: {
     categories: Record<string, { count: number; percentage: number }>;
     total_failures: number;
@@ -365,6 +383,21 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                     saturated
                   </span>
                 )}
+                {dp.auto_paused && (
+                  <span className="text-[9px] bg-red-500/20 text-red-400 border border-red-500/30 px-1.5 py-0.5 rounded" title="Direction auto-paused">
+                    paused
+                  </span>
+                )}
+                {typeof dp.acceptance_rate === 'number' && (
+                  <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="Operator acceptance rate">
+                    {Math.round(dp.acceptance_rate * 100)}% acc
+                  </span>
+                )}
+                {typeof dp.first_attempt_success_rate === 'number' && (
+                  <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="First-attempt success rate">
+                    {Math.round(dp.first_attempt_success_rate * 100)}% 1st
+                  </span>
+                )}
               </div>
             </button>
             {isExpanded && (
@@ -385,6 +418,45 @@ function DirectionProgressSection({ directions }: { directions: DirectionProgres
                 )}
                 {dp.latest_research_at && (
                   <span className="text-[9px] text-neutral-600">Last researched: {timeAgo(dp.latest_research_at)}</span>
+                )}
+                {dp.scope_breakdown && Object.keys(dp.scope_breakdown).length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1">
+                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">scope:</span>
+                    {Object.entries(dp.scope_breakdown).map(([scope, stats]) => {
+                      const merged = stats?.merged ?? 0;
+                      const created = stats?.created ?? 0;
+                      if (!created && !merged) return null;
+                      return (
+                        <span key={scope} className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded">
+                          {scope} {merged}/{created}
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+                {dp.taxonomy_summary && Object.keys(dp.taxonomy_summary).length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1">
+                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">failures:</span>
+                    {TAXONOMY_ORDER.map(cat => {
+                      const cnt = dp.taxonomy_summary?.[cat];
+                      if (!cnt) return null;
+                      return (
+                        <span key={cat} className={`text-[9px] px-1.5 py-0.5 rounded border ${TAXONOMY_COLORS[cat]}`} title={TAXONOMY_LABELS[cat]}>
+                          {TAXONOMY_LABELS[cat]} {cnt}
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+                {dp.rejection_reasons && dp.rejection_reasons.length > 0 && (
+                  <div className="flex flex-col gap-0.5">
+                    <span className="text-[9px] text-neutral-600 uppercase tracking-wide">rejections:</span>
+                    {dp.rejection_reasons.slice(0, 3).map((r, i) => (
+                      <span key={i} className="text-[10px] text-neutral-500 italic truncate" title={r.rejection_note || ''}>
+                        · {(r.rejection_note || r.title || '').slice(0, 120)}
+                      </span>
+                    ))}
+                  </div>
                 )}
               </div>
             )}
@@ -425,6 +497,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
   const [completionsExpanded, setCompletionsExpanded] = useState(false);
   const [expandedSnippets, setExpandedSnippets] = useState<Set<string>>(new Set());
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const [activeTaxonomyFilter, setActiveTaxonomyFilter] = useState<string | null>(null);
+  const [activeStageFilter, setActiveStageFilter] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState<DismissedState>(() => {
     const raw = loadDismissed();
     const now = Date.now();
@@ -876,6 +950,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: item.task_id }); } }}
                           >
                             <span className="flex-1 truncate text-neutral-300">{item.title}</span>
+                            {item.direction_text && (
+                              <span
+                                className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 truncate max-w-[12rem]"
+                                title={item.direction_text}
+                              >
+                                {item.direction_text.length > 40 ? item.direction_text.slice(0, 40) + '…' : item.direction_text}
+                              </span>
+                            )}
                             <span className={`shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded ${
                               item.reason === 'failed'
                                 ? 'bg-red-500/10 text-red-400'
@@ -1087,6 +1169,16 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     costByTaxonomy[t.taxonomy] = (costByTaxonomy[t.taxonomy] ?? 0) + perTask;
                   }
                 }
+                const history = digest!.trend_history ?? [];
+                const trendFor = (cat: string): {arrow: string; color: string} => {
+                  if (history.length < 4) return {arrow: '–', color: 'text-neutral-500'};
+                  const sumAt = (arr: typeof history) => arr.reduce((a, p) => a + (p.failed_by_taxonomy?.[cat] ?? 0), 0);
+                  const recent = sumAt(history.slice(-2));
+                  const prior = sumAt(history.slice(-4, -2));
+                  if (recent > prior) return {arrow: '↑', color: 'text-red-400'};
+                  if (recent < prior) return {arrow: '↓', color: 'text-emerald-400'};
+                  return {arrow: '–', color: 'text-neutral-500'};
+                };
                 return (
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Root cause</span>
@@ -1094,22 +1186,41 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       const entry = digest!.failure_taxonomy_distribution!.categories[cat];
                       if (!entry || entry.count === 0) return null;
                       const cost = costByTaxonomy[cat];
+                      const trend = trendFor(cat);
+                      const isActive = activeTaxonomyFilter === cat;
                       return (
-                        <span
+                        <button
                           key={cat}
-                          className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border ${TAXONOMY_COLORS[cat]}`}
-                          title={`${TAXONOMY_LABELS[cat]}: ${entry.count} (${Math.round(entry.percentage)}%)${cost ? ` · $${cost.toFixed(2)}` : ''}`}
+                          type="button"
+                          onClick={() => {
+                            setActiveTaxonomyFilter(isActive ? null : cat);
+                            setActiveStageFilter(null);
+                            setFailuresExpanded(true);
+                          }}
+                          aria-pressed={isActive}
+                          className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border transition-all ${TAXONOMY_COLORS[cat]} ${isActive ? 'ring-2 ring-white/60' : 'hover:opacity-80'}`}
+                          title={`${TAXONOMY_LABELS[cat]}: ${entry.count} (${Math.round(entry.percentage)}%)${cost ? ` · $${cost.toFixed(2)}` : ''} — click to ${isActive ? 'clear' : 'filter'}`}
                         >
                           {TAXONOMY_LABELS[cat]}
                           <span className="font-bold">{entry.count}</span>
+                          <span className={`font-bold ${trend.color}`}>{trend.arrow}</span>
                           {cost != null && cost > 0 && (
                             <span className="inline-flex items-center font-mono font-normal opacity-80">
                               ·<DollarSign className="w-2.5 h-2.5" />{cost.toFixed(2)}
                             </span>
                           )}
-                        </span>
+                        </button>
                       );
                     })}
+                    {activeTaxonomyFilter && (
+                      <button
+                        type="button"
+                        onClick={() => setActiveTaxonomyFilter(null)}
+                        className="text-[10px] text-neutral-400 hover:text-neutral-200 underline underline-offset-2"
+                      >
+                        clear
+                      </button>
+                    )}
                   </div>
                 );
               })()}
@@ -1121,17 +1232,34 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   {STAGE_ORDER.map(stage => {
                     const count = digest!.failure_stage_distribution!.stages[stage];
                     if (!count) return null;
+                    const isActive = activeStageFilter === stage;
                     return (
-                      <span
+                      <button
                         key={stage}
-                        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'}`}
-                        title={`${stage}: ${count}`}
+                        type="button"
+                        onClick={() => {
+                          setActiveStageFilter(isActive ? null : stage);
+                          setActiveTaxonomyFilter(null);
+                          setFailuresExpanded(true);
+                        }}
+                        aria-pressed={isActive}
+                        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border transition-all ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'} ${isActive ? 'ring-2 ring-white/60' : 'hover:opacity-80'}`}
+                        title={`${stage}: ${count} — click to ${isActive ? 'clear' : 'filter'}`}
                       >
                         {stage}
                         <span className="font-bold">{count}</span>
-                      </span>
+                      </button>
                     );
                   })}
+                  {activeStageFilter && (
+                    <button
+                      type="button"
+                      onClick={() => setActiveStageFilter(null)}
+                      className="text-[10px] text-neutral-400 hover:text-neutral-200 underline underline-offset-2"
+                    >
+                      clear
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -1172,9 +1300,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Rejection patterns</span>
-                    <span className="text-[10px] text-neutral-400">
+                    <button
+                      type="button"
+                      onClick={() => setFailuresExpanded(true)}
+                      className="text-[10px] text-neutral-400 hover:text-purple-300 underline decoration-dotted underline-offset-2"
+                      title="Expand recent failures to find rejected tasks"
+                    >
                       {digest!.rejection_pattern_summary.total_rejected} rejected
-                    </span>
+                    </button>
                   </div>
                   {digest!.rejection_pattern_summary.top_notes.length > 0 && (
                     <div className="flex flex-col gap-0.5 ml-1">
@@ -1199,39 +1332,60 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </span>
                   </div>
                   <div className="flex flex-col gap-1 ml-1">
-                    {digest!.recurring_error_clusters!.map(cluster => {
-                      const snippet = cluster.error_snippet.length > 120
-                        ? cluster.error_snippet.slice(0, 120) + '…'
-                        : cluster.error_snippet;
-                      const dirCount = cluster.direction_ids.length;
-                      return (
-                        <div
-                          key={cluster.fingerprint}
-                          role="button"
-                          tabIndex={0}
-                          className="flex flex-col gap-0.5 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
-                          onClick={() => onSelectTask({ id: cluster.first_task_id })}
-                          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: cluster.first_task_id }); } }}
-                        >
-                          <div className="flex items-center gap-2">
-                            <span className="flex-1 truncate text-neutral-400 font-mono text-[10px]">{snippet}</span>
-                            <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20">
-                              ×{cluster.count}
-                            </span>
-                          </div>
-                          <div className="flex flex-wrap items-center gap-1 text-[10px] text-neutral-500">
-                            {dirCount > 1 && (
-                              <span className="text-amber-400">across {dirCount} directions</span>
-                            )}
-                            {cluster.task_types.map(tt => (
-                              <span key={tt} className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1 py-0.5 rounded uppercase tracking-wider">
-                                {tt}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
+                    {(() => {
+                      const dirTextById = new Map<string, string>(
+                        (digest!.direction_progress ?? []).map(dp => [dp.direction_id, dp.direction_text || dp.direction_id]),
                       );
-                    })}
+                      return digest!.recurring_error_clusters!.map(cluster => {
+                        const snippet = cluster.error_snippet.length > 120
+                          ? cluster.error_snippet.slice(0, 120) + '…'
+                          : cluster.error_snippet;
+                        const dirCount = cluster.direction_ids.length;
+                        const dirLabels = cluster.direction_ids
+                          .map(id => dirTextById.get(id))
+                          .filter((s): s is string => !!s)
+                          .map(s => s.length > 30 ? s.slice(0, 30) + '…' : s);
+                        return (
+                          <div
+                            key={cluster.fingerprint}
+                            role="button"
+                            tabIndex={0}
+                            className="flex flex-col gap-0.5 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                            onClick={() => onSelectTask({ id: cluster.first_task_id })}
+                            onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: cluster.first_task_id }); } }}
+                          >
+                            <div className="flex items-center gap-2">
+                              <span className="flex-1 truncate text-neutral-400 font-mono text-[10px]">{snippet}</span>
+                              <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20">
+                                ×{cluster.count}
+                              </span>
+                              <span
+                                className="shrink-0 text-[10px] text-cyan-400 hover:text-cyan-300"
+                                onClick={e => { e.stopPropagation(); onSelectTask({ id: cluster.first_task_id }); }}
+                                title={`Open first task ${cluster.first_task_id}`}
+                              >
+                                view →
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-1 text-[10px] text-neutral-500">
+                              {dirCount > 1 && (
+                                <span className="text-amber-400">across {dirCount} directions</span>
+                              )}
+                              {dirLabels.slice(0, 2).map((label, i) => (
+                                <span key={i} className="text-[9px] text-neutral-500 truncate max-w-[180px]">
+                                  · {label}
+                                </span>
+                              ))}
+                              {cluster.task_types.map(tt => (
+                                <span key={tt} className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1 py-0.5 rounded uppercase tracking-wider">
+                                  {tt}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      });
+                    })()}
                   </div>
                 </div>
               )}
@@ -1292,7 +1446,23 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
 
 
               {/* Recent failures grouped by classification (not in needs_attention) */}
-              {extraFailureGroups.length > 0 && (
+              {extraFailureGroups.length > 0 && (() => {
+                const filteredGroups = (activeTaxonomyFilter || activeStageFilter)
+                  ? extraFailureGroups
+                      .map(g => ({
+                        ...g,
+                        tasks: g.tasks.filter(t =>
+                          (!activeTaxonomyFilter || t.taxonomy === activeTaxonomyFilter) &&
+                          (!activeStageFilter || t.failure_stage === activeStageFilter)
+                        ),
+                      }))
+                      .filter(g => g.tasks.length > 0)
+                  : extraFailureGroups;
+                const totalCount = filteredGroups.reduce((s, g) => s + g.tasks.length, 0);
+                const filterLabel = activeTaxonomyFilter
+                  ? `${TAXONOMY_LABELS[activeTaxonomyFilter] ?? activeTaxonomyFilter}`
+                  : activeStageFilter ?? null;
+                return (
                 <div>
                   <button
                     onClick={() => setFailuresExpanded(v => !v)}
@@ -1301,11 +1471,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   >
                     {failuresExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                     <XCircle className="w-3 h-3 text-red-500" />
-                    Recent failures ({extraFailureGroups.reduce((s, g) => s + g.tasks.length, 0)})
+                    Recent failures ({totalCount}{filterLabel ? ` filtered: ${filterLabel}` : ''})
                   </button>
                   {failuresExpanded && (
                     <div className="flex flex-col gap-2">
-                      {extraFailureGroups.map(group => {
+                      {filteredGroups.length === 0 && (
+                        <div className="text-[11px] text-neutral-500 italic">No failures match the active filter.</div>
+                      )}
+                      {filteredGroups.map(group => {
                         const isGroupExpanded = expandedGroups.has(group.failure_class);
                         const badgeClass = group.failure_class === 'CODE_ERROR'
                           ? 'bg-red-500/10 text-red-400 border-red-500/20'
@@ -1352,6 +1525,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                         </span>
                                       )}
                                       <span className="flex-1 truncate text-neutral-400">{t.title}</span>
+                                      {t.direction_text && (
+                                        <span
+                                          className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 truncate max-w-[12rem]"
+                                          title={t.direction_text}
+                                        >
+                                          {t.direction_text.length > 40 ? t.direction_text.slice(0, 40) + '…' : t.direction_text}
+                                        </span>
+                                      )}
                                       {t.failure_stage && (
                                         <span
                                           className="shrink-0 text-[9px] font-mono px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40"
@@ -1404,7 +1585,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </div>
                   )}
                 </div>
-              )}
+                );
+              })()}
 
               {/* Recent completions */}
               {(digest!.recent_completions ?? []).length > 0 && (() => {
