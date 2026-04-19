@@ -943,6 +943,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 prior_retry_ctx["_previous_self_review_outcome"] = _prior_ctx["_self_review_outcome"]
             if _prior_ctx.get("_file_change_details"):
                 prior_retry_ctx["_previous_file_change_details"] = _prior_ctx["_file_change_details"]
+            # Tighten analysis plan file limit for medium-scope retries whose
+            # prior attempt tripped a scope gate or touched ≥80% of the medium
+            # file threshold. The agent reads _analysis_plan_file_limit and
+            # overrides MEDIUM_ANALYSIS_PLAN_FILE_LIMIT (default 7) so the
+            # retry plans a narrower change set.
+            if scope == "medium":
+                _prior_scope_gate = _prior_ctx.get("scope_gate_triggered")
+                _prior_changed = _prior_ctx.get("_pr_changed_files") or []
+                _prior_file_count = len(_prior_changed) if isinstance(_prior_changed, list) else 0
+                _tight_triggers = {"scope_trim", "analysis_overflow", "post_review_overflow", "small_overflow"}
+                if _prior_scope_gate in _tight_triggers or _prior_file_count >= 8:
+                    prior_retry_ctx["_analysis_plan_file_limit"] = 5
             # Generate failure-class-specific retry guidance, mirroring
             # task_lifecycle._requeue_parent_task so re-spawned findings get the
             # same tailored prompt_suffix as directly requeued retries.

@@ -343,6 +343,7 @@ async def _update_direction_research_outcomes(
                         "created": 0, "merged": 0, "failed": 0, "failed_infra": 0,
                         "failed_code_error": 0, "failed_scope_overflow": 0,
                         "failed_analysis_overflow": 0,
+                        "scope_trim_count": 0,
                         "calibrated_in": 0, "calibrated_out": 0,
                         "exploration_created": 0, "exploration_merged": 0,
                         "exploration_failed": 0,
@@ -385,6 +386,12 @@ async def _update_direction_research_outcomes(
                     )
                     stages_bucket = scope_breakdown[scope]["failure_stages"]
                     stages_bucket[stage_name] = stages_bucket.get(stage_name, 0) + 1
+                if ctx_.get("scope_gate_triggered") == "scope_trim" and (
+                    ct.status == TaskStatus.COMPLETED or _counts_as_failure(ct)
+                ):
+                    scope_breakdown[scope]["scope_trim_count"] = (
+                        scope_breakdown[scope].get("scope_trim_count", 0) + 1
+                    )
                 if ctx_.get("medium_exploration"):
                     scope_breakdown[scope]["exploration_created"] += 1
                     if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):

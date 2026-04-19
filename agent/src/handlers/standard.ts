@@ -214,12 +214,19 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     ) as string[];
 
     const totalFileBudget = SCOPE_OVERFLOW_THRESHOLDS.medium;
+    const ctxPlanLimit = ctx._analysis_plan_file_limit;
+    const prodFileLimit = (typeof ctxPlanLimit === 'number' && ctxPlanLimit > 0 && ctxPlanLimit <= MEDIUM_ANALYSIS_PLAN_FILE_LIMIT)
+      ? Math.floor(ctxPlanLimit)
+      : MEDIUM_ANALYSIS_PLAN_FILE_LIMIT;
+    if (prodFileLimit !== MEDIUM_ANALYSIS_PLAN_FILE_LIMIT) {
+      sendLog(ws, `[Analysis Phase] Using tightened production file limit ${prodFileLimit} (from prior-attempt retry context).\n`);
+    }
     const analysisPrompt = buildAnalysisPrompt({
       rawPrompt,
       taskTitle,
       relatedFiles: analysisRelatedFiles,
       fileTree,
-      fileLimit: MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
+      fileLimit: prodFileLimit,
       totalFileBudget,
     });
 
@@ -241,23 +248,23 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       // explicit narrowing guidance. If still over budget, fail fast — the
       // implementation pass would otherwise burn ~5-10 minutes only to hit
       // scope_overflow after the agent touches both production and test files.
-      const exceedsProdLimit = plannedFiles.length > MEDIUM_ANALYSIS_PLAN_FILE_LIMIT;
+      const exceedsProdLimit = plannedFiles.length > prodFileLimit;
       const exceedsTotalBudget = totalPlanned > totalFileBudget;
       if (exceedsProdLimit || exceedsTotalBudget) {
         const reason = exceedsTotalBudget
           ? `combined plan lists ${plannedFiles.length} production + ${plannedTestFiles.length} test = ${totalPlanned} files (total budget ${totalFileBudget})`
-          : `plan lists ${plannedFiles.length} files (limit ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT})`;
+          : `plan lists ${plannedFiles.length} files (limit ${prodFileLimit})`;
         sendLog(ws, `[Analysis Phase] ${reason}; retrying with narrowing directive.\n`);
         const testFilesBlock = plannedTestFiles.length > 0
           ? `\nPreviously planned test files:\n${plannedTestFiles.map(f => `- ${f}`).join('\n')}`
           : '';
-        const narrowingGuidance = `The previous analysis pass planned ${plannedFiles.length} production files plus ${plannedTestFiles.length} test files (${totalPlanned} total). Production limit is ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT}; combined budget (production + tests) is ${totalFileBudget}. Cut the plan down to the minimum viable change set within both limits. Drop any files that are nice-to-have refactors, peripheral cleanups, or follow-on test/doc updates that could ship in a separate task. In **Implementation approach**, briefly note what was deferred so the next task can pick it up. Previously planned production files:\n${plannedFiles.map(f => `- ${f}`).join('\n')}${testFilesBlock}`;
+        const narrowingGuidance = `The previous analysis pass planned ${plannedFiles.length} production files plus ${plannedTestFiles.length} test files (${totalPlanned} total). Production limit is ${prodFileLimit}; combined budget (production + tests) is ${totalFileBudget}. Cut the plan down to the minimum viable change set within both limits. Drop any files that are nice-to-have refactors, peripheral cleanups, or follow-on test/doc updates that could ship in a separate task. In **Implementation approach**, briefly note what was deferred so the next task can pick it up. Previously planned production files:\n${plannedFiles.map(f => `- ${f}`).join('\n')}${testFilesBlock}`;
         const retryPrompt = buildAnalysisPrompt({
           rawPrompt,
           taskTitle,
           relatedFiles: analysisRelatedFiles,
           fileTree,
-          fileLimit: MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
+          fileLimit: prodFileLimit,
           totalFileBudget,
           narrowingGuidance,
         });
@@ -273,14 +280,14 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           totalPlanned = plannedFiles.length + plannedTestFiles.length;
         }
 
-        const stillExceedsProd = plannedFiles.length > MEDIUM_ANALYSIS_PLAN_FILE_LIMIT;
+        const stillExceedsProd = plannedFiles.length > prodFileLimit;
         const stillExceedsTotal = totalPlanned > totalFileBudget;
         if (stillExceedsProd || stillExceedsTotal) {
           const fileList = plannedFiles.map(f => `- ${f}`).join('\n');
           const testList = plannedTestFiles.length > 0
             ? `\n\nPlanned test files:\n${plannedTestFiles.map(f => `- ${f}`).join('\n')}`
             : '';
-          const failureLog = `Pre-implementation analysis planned ${plannedFiles.length} production + ${plannedTestFiles.length} test = ${totalPlanned} files, exceeding the medium-scope budget (production limit ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT}, combined budget ${totalFileBudget}). The narrowing retry could not bring the plan within budget. Split this task into smaller subtasks or scope it down to a single concern before retrying.\n\nPlanned production files:\n${fileList}${testList}`;
+          const failureLog = `Pre-implementation analysis planned ${plannedFiles.length} production + ${plannedTestFiles.length} test = ${totalPlanned} files, exceeding the medium-scope budget (production limit ${prodFileLimit}, combined budget ${totalFileBudget}). The narrowing retry could not bring the plan within budget. Split this task into smaller subtasks or scope it down to a single concern before retrying.\n\nPlanned production files:\n${fileList}${testList}`;
           sendLog(ws, `[Analysis Phase] Plan still exceeds budget after retry (${plannedFiles.length} prod + ${plannedTestFiles.length} test = ${totalPlanned}) — failing fast.\n`);
           await persistAndPostStatus(taskId, {
             task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
@@ -469,6 +476,32 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         }
       } else {
         sendLog(ws, 'WARNING: Scope trim evaluation could not complete — proceeding with all files.\n');
+      }
+    }
+
+    // ── Post-trim overflow gate (medium-scope only) ───────────────────────────
+    // If scope trim was attempted but the remaining non-test file count is still
+    // above the medium threshold, fail fast — the post-self-review overflow gate
+    // would catch this anyway after ~8-10 min of wasted lint/test/self-review.
+    if (
+      taskScope === 'medium'
+      && scopeOverflowWarning
+      && scopeTrimReverted.length > 0
+      && overflowThreshold !== undefined
+    ) {
+      const postTrimNonTest = changedPaths.filter(p => !isTestFile(p));
+      if (postTrimNonTest.length > overflowThreshold) {
+        sendLog(ws, `\nScope overflow: scope trim reverted ${scopeTrimReverted.length} file(s) but ${postTrimNonTest.length} non-test files still exceed the ${overflowThreshold}-file medium threshold. Failing fast to avoid wasted lint/test/self-review cycles.\n`);
+        await persistAndPostStatus(taskId, {
+          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+          logs: `Scope overflow after trim: ${postTrimNonTest.length} non-test files remain for a medium-scope task (threshold: ${overflowThreshold}, ${changedPaths.length} total including tests). Scope trim reverted ${scopeTrimReverted.length} file(s) but could not bring the count within budget. Retry should split this task into smaller subtasks.\n\nChanged files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`,
+          failure_category: 'scope_overflow',
+          scope_gate_triggered: 'scope_trim_overflow',
+          scope_trim_reverted: scopeTrimReverted,
+          changed_files: changedPaths.slice(0, 50),
+          ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+        });
+        return;
       }
     }
 

@@ -471,6 +471,17 @@ def predict_spawn_success(
             signals.append(0.2)
             weights.append(1.5)
 
+    # Signal 11: scope_trim near-miss dominance at medium scope. When medium
+    # tasks consistently need post-implementation scope trimming to fit the
+    # budget, the direction's medium work is borderline — apply a moderate
+    # penalty so it routes to a larger scope more aggressively.
+    if scope == "medium" and scope_stats:
+        created = scope_stats.get("created", 0)
+        trim_count = scope_stats.get("scope_trim_count", 0)
+        if created >= 2 and trim_count / created >= 0.5:
+            signals.append(0.4)
+            weights.append(1.0)
+
     if not signals:
         return 0.5  # insufficient data — neutral
 
