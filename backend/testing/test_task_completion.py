@@ -1420,7 +1420,7 @@ class TestRecordRemediationIfTerminal:
         assert boom.await_count == 1
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("task_type", ["create", "refactor", "docs", "qa", "deps", "migrate"])
+    @pytest.mark.parametrize("task_type", ["create", "refactor", "docs", "qa", "deps", "migrate", "fix"])
     async def test_completed_pr_creating_type_does_not_record(self, db_session, task_type):
         """Tasks that produce a PR must not record 'merged' on their own COMPLETED —
         the review pipeline drives the real outcome."""
@@ -1760,8 +1760,44 @@ class TestFollowupInvestigationOnFailure:
             session=db_session,
         )
         assert remediation is not None
-        assert "diagnosis_fingerprint" not in remediation.context
+        # error_fingerprint now also seeds diagnosis_fingerprint so downstream
+        # dedup / sibling-propagation logic can key off a stable scalar even
+        # when the investigation context only set error_fingerprint.
         assert remediation.context["error_fingerprint"] == "ef-B"
+        assert remediation.context["diagnosis_fingerprint"] == "ef-B"
+
+    @pytest.mark.asyncio
+    async def test_remediation_fingerprint_from_failure_fingerprints(self, db_session):
+        """When parent has only failure_fingerprints list, the first element seeds
+        both error_fingerprint and diagnosis_fingerprint on the remediation."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active", "text": "demo",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        parent = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"direction_id": "dir-1", "failure_fingerprints": ["fp-C", "fp-D"]},
+            payloads=[{"type": "investigate", "prompt": "x"}],
+        )
+        db_session.add(parent)
+        await db_session.commit()
+        await db_session.refresh(parent)
+
+        from app.task_completion import _spawn_investigation_remediation
+        remediation = await _spawn_investigation_remediation(
+            task=parent,
+            direction_id="dir-1",
+            summary="s", root_cause="rc", recommended_fix="rf",
+            severity="medium", confidence="high",
+            affected_paths=["a.py"], remediation_attempts=0,
+            session=db_session,
+        )
+        assert remediation is not None
+        assert remediation.context["error_fingerprint"] == "fp-C"
+        assert remediation.context["diagnosis_fingerprint"] == "fp-C"
 
     @pytest.mark.asyncio
     async def test_follow_up_prompt_includes_earlier_attempts(self, db_session):
@@ -2650,9 +2686,10 @@ class TestCalculateRemediationScope:
         paths = ["a.py", "b.py", "c.py", "d.py"]
         assert _calculate_remediation_scope(paths, "medium", 0) == "small"
 
-    def test_medium_when_five_paths_high_severity(self):
+    def test_small_when_five_paths_high_severity(self):
+        """Medium tier eliminated — 5 paths routes to small (merge rate ~100%)."""
         paths = ["a.py", "b.py", "c.py", "d.py", "e.py"]
-        assert _calculate_remediation_scope(paths, "high", 0) == "medium"
+        assert _calculate_remediation_scope(paths, "high", 0) == "small"
 
     def test_large_when_six_paths(self):
         paths = [f"f{i}.py" for i in range(6)]
@@ -2669,9 +2706,9 @@ class TestCalculateRemediationScope:
         """Retries keep the same scope — medium-scope remediations fail at 0%."""
         assert _calculate_remediation_scope(["a.py"], "low", 1) == "small"
 
-    def test_retry_does_not_escalate_medium(self):
+    def test_retry_does_not_escalate_five_paths(self):
         paths = ["a.py", "b.py", "c.py", "d.py", "e.py"]
-        assert _calculate_remediation_scope(paths, "medium", 1) == "medium"
+        assert _calculate_remediation_scope(paths, "medium", 1) == "small"
 
     def test_large_stays_large_after_retry(self):
         paths = [f"f{i}.py" for i in range(6)]
@@ -2757,7 +2794,8 @@ class TestRemediationScopeInPayload:
         assert child.context["scope"] == "large"
 
     @pytest.mark.asyncio
-    async def test_medium_scope_for_multi_file_diagnosis(self, db_session, mocker):
+    async def test_small_scope_for_five_file_diagnosis(self, db_session, mocker):
+        """Medium tier eliminated — 5-file diagnoses route to small."""
         project = await self._setup(db_session, mocker)
         task = make_task(project_id=project.id, context={"direction_id": "dir-scope-1"})
         db_session.add(task)
@@ -2771,7 +2809,7 @@ class TestRemediationScopeInPayload:
         await db_session.commit()
         child = await self._spawned_child(db_session, task.id)
         assert child is not None
-        assert child.context["scope"] == "medium"
+        assert child.context["scope"] == "small"
 
     @pytest.mark.asyncio
     async def test_retries_do_not_escalate_scope(self, db_session, mocker):

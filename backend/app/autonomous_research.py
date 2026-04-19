@@ -892,35 +892,57 @@ async def _check_autonomous_research(owner: str, repo: str):
         logger.error(f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}", exc_info=True)
 
 
+_MAX_ACTIVE_INVESTIGATIONS_PER_DIRECTION = 3
+
+
 async def _recent_investigation_exists(
     project_id: uuid.UUID, direction_id: str, session: AsyncSession,
+    error_fingerprint: str | None = None,
 ) -> bool:
     """Return True if an investigate-type task already targets this direction.
 
     Unified dedup gate shared by ``_spawn_direction_diagnosis`` (auto-pause path)
     and ``_spawn_direction_hold_investigation`` (direction-hold path). Matches
     any investigate task for ``direction_id`` that is either in-flight
-    (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING) or was created in the last 24h,
-    regardless of which spawn path produced it. This prevents duplicate
-    investigations when both paths fire for the same direction.
+    (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING) or was created in the last 24h.
+
+    When ``error_fingerprint`` is supplied, dedup is narrowed to investigations
+    whose ``failure_fingerprints`` context array contains that fingerprint —
+    distinct failure patterns within the same direction can each be investigated.
+    Regardless of fingerprint, a per-direction concurrent cap of
+    ``_MAX_ACTIVE_INVESTIGATIONS_PER_DIRECTION`` always applies to prevent
+    resource exhaustion.
     """
     from sqlalchemy import or_  # noqa: PLC0415
+    active_statuses = (
+        TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+    )
     cutoff = _utcnow() - timedelta(hours=24)
-    result = await session.execute(
-        select(Task.id).where(
+    rows = (await session.execute(
+        select(Task.id, Task.context, Task.status).where(
             Task.project_id == project_id,
             Task.payloads[0]["type"].as_string() == "investigate",
             Task.context["direction_id"].as_string() == str(direction_id),
             or_(
-                Task.status.in_([
-                    TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                    TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
-                ]),
+                Task.status.in_(active_statuses),
                 Task.created_at >= cutoff,
             ),
-        ).limit(1)
-    )
-    return result.first() is not None
+        )
+    )).all()
+
+    active_count = sum(1 for _id, _ctx, status in rows if status in active_statuses)
+    if active_count >= _MAX_ACTIVE_INVESTIGATIONS_PER_DIRECTION:
+        return True
+
+    if error_fingerprint is None:
+        return len(rows) > 0
+
+    for _id, ctx, _status in rows:
+        fps = (ctx or {}).get("failure_fingerprints") or []
+        if error_fingerprint in fps:
+            return True
+    return False
 
 
 async def _spawn_direction_hold_investigation(project: Project, session: AsyncSession) -> int:
@@ -996,6 +1018,7 @@ async def _spawn_direction_hold_investigation(project: Project, session: AsyncSe
                 "hold_reason": hold_info.get("reason", ""),
                 "last_failure_class": fc,
                 "failure_fingerprints": fingerprints,
+                **({"error_fingerprint": fingerprints[0]} if fingerprints else {}),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
@@ -1078,10 +1101,13 @@ async def _spawn_task_failure_investigation(
         failure_taxonomy = TAXONOMY_REVIEW_QUALITY
     else:
         failure_taxonomy = TAXONOMY_INFRA_RELATED
-    if await _recent_investigation_exists(task.project_id, direction_id, session):
+    prev_fp = ctx.get("_previous_error_fingerprint") or ""
+    if await _recent_investigation_exists(
+        task.project_id, direction_id, session,
+        error_fingerprint=prev_fp or None,
+    ):
         return False
 
-    prev_fp = ctx.get("_previous_error_fingerprint") or ""
     if prev_fp:
         from app.task_completion import _find_sibling_fingerprint_investigation  # noqa: PLC0415
         sibling_cutoff = _utcnow() - timedelta(hours=24)
@@ -1193,7 +1219,7 @@ async def _spawn_task_failure_investigation(
             "last_failure_class": last_failure_class,
             "failure_taxonomy": failure_taxonomy,
             "failure_fingerprints": [prev_fp] if prev_fp else [],
-            **({"diagnosis_fingerprint": prev_fp} if prev_fp else {}),
+            **({"diagnosis_fingerprint": prev_fp, "error_fingerprint": prev_fp} if prev_fp else {}),
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,

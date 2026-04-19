@@ -277,7 +277,7 @@ async def _record_remediation_if_terminal(
     # pipeline exhausts its iteration cap. Recording on the PR-creating task's
     # COMPLETED would prematurely stamp merged=True before review/CI has run.
     # FAILED/CANCELLED still record immediately since no viable PR exists.
-    _REVIEW_PIPELINE_TYPES = {"create", "refactor", "docs", "qa", "deps", "migrate"}
+    _REVIEW_PIPELINE_TYPES = {"create", "refactor", "docs", "qa", "deps", "migrate", "fix"}
     if status == TaskStatus.COMPLETED:
         task_type = (task.first_payload or {}).get("type")
         if task_type in _REVIEW_PIPELINE_TYPES:
@@ -1701,18 +1701,14 @@ def _calculate_remediation_scope(
 ) -> str:
     """Calibrate the remediation task's scope based on diagnosis complexity.
 
-    Returns one of "small", "medium", or "large". Pipeline data shows small-scope
-    remediations merge at ~100% while medium-scope remediations near-zero, so we
-    widen the small tier: <=4 affected files route to small regardless of
-    severity. Exactly 5 files routes to medium, and >5 files routes to large.
-    Retries do NOT escalate scope — escalating wastes the retry.
+    Returns "small" or "large". Pipeline data shows the medium tier is a dead
+    zone (near-zero merge rate) — complex enough to fail but not decomposed by
+    the plan agent. Route <=5 affected files to small and >5 to large so large
+    remediations get plan-based decomposition. Retries do NOT escalate scope.
     """
     del remediation_attempts, severity  # retained for signature compatibility
-    num_paths = len(affected_paths)
-    if num_paths > 5:
+    if len(affected_paths) > 5:
         return "large"
-    if num_paths == 5:
-        return "medium"
     return "small"
 
 
@@ -1775,10 +1771,16 @@ async def _spawn_investigation_remediation(
         "diagnosis_recommended_fix": recommended_fix[:2000],
         "scope": scope,
     }
-    diagnosis_fingerprint = parent_ctx.get("diagnosis_fingerprint")
+    error_fingerprint = parent_ctx.get("error_fingerprint")
+    if not error_fingerprint:
+        fps = parent_ctx.get("failure_fingerprints") or []
+        if isinstance(fps, list) and fps:
+            error_fingerprint = fps[0]
+    diagnosis_fingerprint = (
+        parent_ctx.get("diagnosis_fingerprint") or error_fingerprint
+    )
     if diagnosis_fingerprint:
         remediation_context["diagnosis_fingerprint"] = diagnosis_fingerprint
-    error_fingerprint = parent_ctx.get("error_fingerprint")
     if error_fingerprint:
         remediation_context["error_fingerprint"] = error_fingerprint
     trigger_failure_class = parent_ctx.get("last_failure_class")

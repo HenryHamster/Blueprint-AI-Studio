@@ -5705,6 +5705,78 @@ async def test_task_failure_investigation_skipped_by_cross_direction_fingerprint
     assert investigations[0].id == sibling_inv.id
 
 
+@pytest.mark.asyncio
+async def test_recent_investigation_distinct_fingerprints_can_coexist(db_session):
+    """Different fingerprints on the same direction each get an investigation."""
+    from app.autonomous_research import _recent_investigation_exists
+    project = Project(
+        name="Distinct FP",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-fp00001")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    existing = Task(
+        project_id=project.id,
+        title="Existing investigation",
+        payloads=[{"type": "investigate", "prompt": "p", "base_branch": "main"}],
+        context={"direction_id": "d-fp00001", "failure_fingerprints": ["fp-A"]},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    # Same fingerprint → deduped.
+    assert await _recent_investigation_exists(
+        project.id, "d-fp00001", db_session, error_fingerprint="fp-A",
+    ) is True
+    # Different fingerprint → allowed.
+    assert await _recent_investigation_exists(
+        project.id, "d-fp00001", db_session, error_fingerprint="fp-B",
+    ) is False
+    # Without fingerprint → preserves direction-level dedup.
+    assert await _recent_investigation_exists(
+        project.id, "d-fp00001", db_session,
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_recent_investigation_concurrent_cap(db_session):
+    """3+ active investigations on a direction blocks further spawns even with new fingerprints."""
+    from app.autonomous_research import _recent_investigation_exists
+    project = Project(
+        name="Cap Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-cap0001")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(3):
+        db_session.add(Task(
+            project_id=project.id,
+            title=f"Active inv {i}",
+            payloads=[{"type": "investigate", "prompt": "p", "base_branch": "main"}],
+            context={"direction_id": "d-cap0001", "failure_fingerprints": [f"fp-{i}"]},
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        ))
+    await db_session.commit()
+
+    # New fingerprint still blocked when cap is reached.
+    assert await _recent_investigation_exists(
+        project.id, "d-cap0001", db_session, error_fingerprint="fp-novel",
+    ) is True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _spawn_review_convergence_investigation
 # ─────────────────────────────────────────────────────────────────────────────
