@@ -392,6 +392,46 @@ async def test_requeue_different_class_failures_preserve_full_budget(tl_db, mock
 
 
 @pytest.mark.asyncio
+async def test_requeue_alternating_pattern_in_history_reduces_budget(tl_db, mocker):
+    """Alternating non-infra failure history (e.g. CODE_ERROR/AGENT_TIMEOUT/CODE_ERROR)
+    shrinks the parent budget even when the immediately previous class differs.
+
+    Covers compute_effective_max_requeues's history-based branch: counts repeats in
+    _failure_class_history and trims max requeues by 1 once any non-infra class
+    appears 2+ times. Without this branch, oscillating failures would silently
+    consume the full budget despite being just as recurring as same-class repeats.
+    """
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session, project.id, status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 2},
+    )
+    # Current failure: CODE_ERROR. Immediately previous: AGENT_TIMEOUT (different
+    # class — would normally preserve budget). But _failure_class_history shows
+    # CODE_ERROR has already occurred twice in recent attempts → trim by 1.
+    await _make_task(
+        session, project.id, status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "failure_category": "CODE_ERROR",
+            "_previous_failure_class": "AGENT_TIMEOUT",
+            "_failure_class_history": ["CODE_ERROR", "AGENT_TIMEOUT", "CODE_ERROR"],
+            "_attempt_number": 3,
+        },
+        latest_status_message="tests failed again",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    # Reduced budget (2) reached → parent FAILED instead of requeued.
+    assert parent.status == TaskStatus.FAILED
+    assert "Re-evaluation limit reached" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
 async def test_requeue_same_class_infra_exempt_from_budget_reduction(tl_db, mocker):
     """Same-class INFRA failures (e.g., PROVISION_FAILURE) are exempt from budget shrink."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)

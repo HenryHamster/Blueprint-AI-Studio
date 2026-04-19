@@ -43,7 +43,11 @@ from app.failure_classification import (
     TIMEOUT_PROCESS_CRASH,
     TIMEOUT_EXECUTION,
 )
-from app.retry_budget import classify_override_reason, compute_effective_max_requeues
+from app.retry_budget import (
+    CODE_ERROR_STAGE_GUIDANCE,
+    classify_override_reason,
+    compute_effective_max_requeues,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,27 +121,6 @@ def _record_parent_failure(parent: Task, failure_class: str) -> None:
             failure_class=failure_class,
             project_id=str(parent.project_id) if parent.project_id else "",
         )
-
-
-_CODE_ERROR_STAGE_GUIDANCE: dict[str, str] = {
-    "test": (
-        "The previous attempt failed at the test stage. Focus on the specific failing tests "
-        "shown in the error log and consider a fundamentally different approach if the same "
-        "tests keep failing."
-    ),
-    "lint": (
-        "The previous attempt failed at the lint stage. Run the linter locally before committing "
-        "and check for type errors (ruff, eslint, tsc --noEmit)."
-    ),
-    "build": (
-        "The previous attempt failed at the build stage. Verify import paths and module resolution, "
-        "and ensure any new files are wired into the build correctly."
-    ),
-    "merge": (
-        "The previous attempt failed at the merge stage. Check for merge conflicts with the target "
-        "branch and rebase onto the latest base before retrying."
-    ),
-}
 
 
 def _build_retry_prompt_suffix(
@@ -239,7 +222,7 @@ def _build_retry_prompt_suffix(
             scope_override = "medium"
 
     elif failure_class == "CODE_ERROR":
-        stage_guidance = _CODE_ERROR_STAGE_GUIDANCE.get(ctx.get("_previous_failure_stage") or "")
+        stage_guidance = CODE_ERROR_STAGE_GUIDANCE.get(ctx.get("_previous_failure_stage") or "")
         if stage_guidance:
             extra_guidance = "RETRY GUIDANCE: " + stage_guidance + "\n"
         else:
@@ -546,6 +529,12 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         clone_ctx["_max_attempts"] = MAX_PARENT_REQUEUES + 1
         clone_ctx["_previous_error"] = (original_status_message or "")[:5000]
         clone_ctx["_previous_failure_class"] = failure_class
+        _prior_history = clone_ctx.get("_failure_class_history") or []
+        if not isinstance(_prior_history, list):
+            _prior_history = []
+        _prior_history = [str(h) for h in _prior_history if h]
+        _prior_history.append(failure_class)
+        clone_ctx["_failure_class_history"] = _prior_history[-5:]
 
         # Enriched failure diagnosis: fingerprint, stage, error summary, and recurring flag
         try:
