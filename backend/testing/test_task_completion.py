@@ -2621,8 +2621,10 @@ class TestHandleInvestigationCompletion:
         await db_session.refresh(task)
         await db_session.refresh(project)
 
-        assert task.status == TaskStatus.COMPLETED
+        assert task.status == TaskStatus.FAILED
         assert task.plan_output == {"raw": bad_logs}
+        assert (task.context or {}).get("failure_detail") == "investigation_report_unparseable"
+        assert task.latest_status_message
         d = project.directions[0]
         assert "diagnosis_in_progress" not in d
         assert "diagnosis_completed_at" in d
@@ -2666,9 +2668,115 @@ class TestHandleInvestigationCompletion:
         await db_session.refresh(task)
         await db_session.refresh(project)
 
-        assert task.status == TaskStatus.COMPLETED
+        assert task.status == TaskStatus.FAILED
         assert task.plan_output == {}
+        assert (task.context or {}).get("failure_detail") == "investigation_report_unparseable"
         assert "diagnosis_in_progress" not in project.directions[0]
+
+    @pytest.mark.asyncio
+    async def test_stamps_outcome_remediation_spawned(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(project_id=project.id, context={"direction_id": "dir-invest-1"})
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_investigation_completion(task, self._payload(self._report()), db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["last_diagnosis_outcome"] == "remediation_spawned"
+        assert d["last_diagnosis_task_id"] == str(task.id)
+
+    @pytest.mark.asyncio
+    async def test_stamps_outcome_structural(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(project_id=project.id, context={"direction_id": "dir-invest-1"})
+        db_session.add(task)
+        await db_session.commit()
+        structural_report = self._report(
+            root_cause="The direction scope is too broad — it conflates two unrelated concerns.",
+            recommended_fix="Split the direction into two narrower directions.",
+        )
+        await _handle_investigation_completion(task, self._payload(structural_report), db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["last_diagnosis_outcome"] == "structural"
+        assert d["last_diagnosis_task_id"] == str(task.id)
+
+    @pytest.mark.asyncio
+    async def test_stamps_outcome_no_actionable_fix(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(project_id=project.id, context={"direction_id": "dir-invest-1"})
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_investigation_completion(
+            task, self._payload(self._report(recommended_fix="", confidence="high")), db_session
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["last_diagnosis_outcome"] == "no_actionable_fix"
+        assert d["last_diagnosis_task_id"] == str(task.id)
+
+    @pytest.mark.asyncio
+    async def test_stamps_outcome_low_confidence_followup_spawned(self, db_session, mocker):
+        project = await self._setup(
+            db_session, mocker,
+            direction_overrides={"error_fingerprint": "fp-low"},
+        )
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-invest-1", "diagnosis_fingerprint": "fp-low"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_investigation_completion(
+            task, self._payload(self._report(confidence="low")), db_session
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["last_diagnosis_outcome"] == "low_confidence_followup_spawned"
+        assert d["last_diagnosis_task_id"] == str(task.id)
+
+    @pytest.mark.asyncio
+    async def test_stamps_outcome_low_confidence_when_followup_capped(self, db_session, mocker):
+        from app.time_utils import _utcnow
+        recent = [_utcnow().isoformat(), _utcnow().isoformat()]
+        project = await self._setup(
+            db_session, mocker,
+            direction_overrides={
+                "error_fingerprint": "fp-low",
+                "followup_investigation_attempts_by_fingerprint": {"fp-low": list(recent)},
+            },
+        )
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-invest-1", "diagnosis_fingerprint": "fp-low"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_investigation_completion(
+            task, self._payload(self._report(confidence="low")), db_session
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["last_diagnosis_outcome"] == "low_confidence"
+        assert d["last_diagnosis_task_id"] == str(task.id)
+
+    @pytest.mark.asyncio
+    async def test_stamps_outcome_report_unparseable(self, db_session, mocker):
+        project = await self._setup(db_session, mocker)
+        task = make_task(project_id=project.id, context={"direction_id": "dir-invest-1"})
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_investigation_completion(task, self._payload("not json"), db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["last_diagnosis_outcome"] == "report_unparseable"
+        assert d["last_diagnosis_task_id"] == str(task.id)
 
 
 # ── _clear_direction_diagnosis_flag ─────────────────────────────────────────

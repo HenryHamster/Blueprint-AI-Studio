@@ -5418,6 +5418,64 @@ async def test_investigation_not_duplicated_when_in_flight(db_session, _clear_di
 
 
 @pytest.mark.asyncio
+async def test_investigation_spawns_when_existing_covers_different_fingerprint(
+    db_session, _clear_direction_streaks,
+):
+    from app.autonomous_research import _spawn_direction_hold_investigation
+    direction_id = "d-heldfp01"
+    project = Project(
+        name="Hold FP Dedup",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(direction_id)],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _hold_direction(direction_id, str(project.id))
+
+    # Failed task seeds a distinct fingerprint (dominant fp for the new spawn)
+    failed = Task(
+        project_id=project.id,
+        title="Failed task",
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="KeyError: 'alpha' missing from config",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+
+    # Pre-existing in-flight investigation covers an unrelated fingerprint
+    existing = Task(
+        project_id=project.id,
+        title="Investigating different failure",
+        payloads=[{"type": "investigate", "prompt": "other"}],
+        context={
+            "direction_id": direction_id,
+            "spawned_by": "direction_hold_investigation",
+            "failure_fingerprints": ["fp_unrelated_zzzzz"],
+        },
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    spawned = await _spawn_direction_hold_investigation(project, db_session)
+    assert spawned == 1
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    investigations = [
+        t for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "investigate"
+    ]
+    assert len(investigations) == 2
+
+
+@pytest.mark.asyncio
 async def test_investigation_skipped_when_no_hold(db_session, _clear_direction_streaks):
     from app.autonomous_research import _spawn_direction_hold_investigation
     project = Project(
@@ -5710,6 +5768,72 @@ async def test_task_failure_investigation_lowered_streak_with_convergence_invest
         t for t in result.scalars().all()
         if (t.payloads or [{}])[0].get("type") == "investigate"
         and t.context.get("spawned_by") != "review_convergence_investigation"
+    ]
+    assert len(investigations) == 1
+    assert investigations[0].context["failure_taxonomy"] == "review_quality"
+
+
+@pytest.mark.asyncio
+async def test_task_failure_investigation_spawns_with_interspersed_non_review_quality(db_session):
+    """Sliding-window trigger: enough review-quality failures in the recent
+    window fire even when a non-review-quality failure is interspersed."""
+    from app.autonomous_research import _spawn_task_failure_investigation
+    from datetime import datetime, timedelta, timezone
+    direction_id = "d-revq0050"
+    project = Project(
+        name="Review Quality Window",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(direction_id)],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.now(timezone.utc)
+    # Prior failures ordered oldest -> newest: rq, rq, code_defect, rq.
+    # Sliding window over last 4 priors has 3 review_quality (>= 2 required).
+    prior_specs = [
+        (now - timedelta(hours=5), "ruff: lint in a.py"),          # rq
+        (now - timedelta(hours=4), "eslint: style in b.ts"),        # rq
+        (now - timedelta(hours=3), "AttributeError: 'NoneType'"),   # code_defect (interspersed)
+        (now - timedelta(hours=2), "ruff: lint in c.py"),           # rq
+    ]
+    for ts, msg in prior_specs:
+        db_session.add(Task(
+            project_id=project.id,
+            title=f"Prior fail {ts.isoformat()}",
+            payloads=[{"type": "create", "prompt": "do"}],
+            context={"direction_id": direction_id},
+            status=TaskStatus.FAILED,
+            created_by="ORCHESTRATOR",
+            latest_status_message=msg,
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            created_at=ts,
+        ))
+    await db_session.commit()
+
+    failed = Task(
+        project_id=project.id,
+        title="Current lint fail",
+        payloads=[{"type": "create", "prompt": "do"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="eslint: style violations in handler.ts",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+    await db_session.commit()
+    await db_session.refresh(failed)
+
+    assert await _spawn_task_failure_investigation(failed, db_session) is True
+    await db_session.commit()
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    investigations = [
+        t for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "investigate"
     ]
     assert len(investigations) == 1
     assert investigations[0].context["failure_taxonomy"] == "review_quality"

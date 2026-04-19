@@ -1507,11 +1507,24 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
             logs[:200],
         )
         task.plan_output = {"raw": logs} if logs else {}
-        task.status = TaskStatus.COMPLETED
+        task.status = TaskStatus.FAILED
+        ctx = dict(task.context or {})
+        ctx["failure_detail"] = "investigation_report_unparseable"
+        task.context = ctx
+        flag_modified(task, "context")
+        task.latest_status_message = (
+            "Investigation report unparseable — no JSON diagnosis produced "
+            f"(raw_prefix={logs[:120]!r})" if logs else
+            "Investigation produced no output — no diagnosis report available"
+        )[:500]
         session.add(task)
         # Still clear diagnosis_in_progress so a malformed report doesn't wedge
-        # the direction out of future auto-pause diagnosis.
-        await _clear_direction_diagnosis_flag(task, session, summary=None)
+        # the direction out of future auto-pause diagnosis. FAILED status lets
+        # the retry budget and _maybe_spawn_reinvestigation_after_failure path
+        # engage instead of silently swallowing the crash as a success.
+        await _clear_direction_diagnosis_flag(
+            task, session, summary=None, outcome="report_unparseable",
+        )
         return
 
     task.plan_output = report
@@ -1586,6 +1599,7 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
     if direction is not None and project is not None:
         now_iso = _utcnow().isoformat()
         direction["diagnosis_completed_at"] = now_iso
+        direction["last_diagnosis_task_id"] = str(task.id)
         if summary:
             direction["diagnosis_summary"] = summary[:STRATEGIC_RATIONALE_MAX]
         if affected_paths:
@@ -1658,6 +1672,23 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
             flag_modified(project, "directions")
             session.add(project)
 
+    if direction is not None and project is not None:
+        if spawned_child is not None:
+            outcome = "remediation_spawned"
+        elif spawned_followup is not None:
+            outcome = "low_confidence_followup_spawned"
+        elif structural:
+            outcome = "structural"
+        elif not recommended_fix:
+            outcome = "no_actionable_fix"
+        elif confidence not in ("high", "medium"):
+            outcome = "low_confidence"
+        else:
+            outcome = "no_direction"
+        direction["last_diagnosis_outcome"] = outcome
+        flag_modified(project, "directions")
+        session.add(project)
+
     session.add(task)
 
     if spawned_child is not None:
@@ -1699,7 +1730,10 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
 
 
 async def _clear_direction_diagnosis_flag(
-    task: Task, session: AsyncSession, summary: Optional[str],
+    task: Task,
+    session: AsyncSession,
+    summary: Optional[str],
+    outcome: Optional[str] = None,
 ) -> None:
     """Clear diagnosis_in_progress on the linked direction without full processing.
 
@@ -1720,6 +1754,9 @@ async def _clear_direction_diagnosis_flag(
     target.pop(DIAGNOSIS_STARTED_AT_KEY, None)
     target.pop(DIAGNOSIS_TASK_ID_KEY, None)
     target["diagnosis_completed_at"] = _utcnow().isoformat()
+    target["last_diagnosis_task_id"] = str(task.id)
+    if outcome:
+        target["last_diagnosis_outcome"] = outcome
     if summary:
         target["diagnosis_summary"] = summary[:STRATEGIC_RATIONALE_MAX]
     project.directions = directions_list

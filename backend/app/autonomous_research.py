@@ -969,9 +969,6 @@ async def _spawn_direction_hold_investigation(project: Project, session: AsyncSe
         direction = direction_map.get(direction_id)
         if not direction:
             continue
-        if await _recent_investigation_exists(project.id, direction_id, session):
-            continue
-
         recent_failed = (await session.execute(
             select(Task).where(
                 Task.project_id == project.id,
@@ -990,6 +987,12 @@ async def _spawn_direction_hold_investigation(project: Project, session: AsyncSe
             fingerprints.append(fp)
             failure_lines.append(f"- [{str(t.id)[:8]}] fp={fp} | {err}")
         failure_block = "\n".join(failure_lines) if failure_lines else "(no recent failure details available)"
+
+        dominant_fp = fingerprints[0] if fingerprints else None
+        if await _recent_investigation_exists(
+            project.id, direction_id, session, error_fingerprint=dominant_fp,
+        ):
+            continue
 
         direction_text = (direction.get("text") or "?")[:300]
         fc = hold_info.get("last_failure_class") or "CODE_ERROR"
@@ -1073,17 +1076,18 @@ async def _spawn_task_failure_investigation(
     direction_id = ctx.get("direction_id")
 
     if is_review_quality:
-        # Frequency gate: only fire once this direction has accumulated a
-        # streak of consecutive review-quality failures. Inspect the most
-        # recent FAILED tasks on the direction (excluding the current one,
-        # which the caller has just marked FAILED) and require the top
-        # (THRESHOLD - 1) to all be review_quality. One non-review-quality
-        # failure breaks the streak.
-        required_streak = REVIEW_QUALITY_STREAK_THRESHOLD - 1
+        # Frequency gate: fire once this direction shows a review-quality
+        # pattern in its recent failures. Use a sliding window over the
+        # most recent FAILED tasks on the direction (excluding the current
+        # one) and require at least (THRESHOLD - 1) of the last WINDOW_SIZE
+        # to be review_quality. This tolerates occasional non-review-quality
+        # failures interspersed in an otherwise-clear review-quality pattern.
+        WINDOW_SIZE = 5
+        required_count = REVIEW_QUALITY_STREAK_THRESHOLD - 1
         # If a convergence investigation already exists for this direction
         # within the last 7 days, that's strong independent evidence of
-        # chronic review-quality problems — lower the streak requirement
-        # by 1 so we trigger faster on repeat offenders.
+        # chronic review-quality problems — lower the count requirement by
+        # 1 so we trigger faster on repeat offenders.
         convergence_cutoff = _utcnow() - timedelta(days=7)
         convergence_recent = (await session.execute(
             select(Task).where(
@@ -1097,21 +1101,25 @@ async def _spawn_task_failure_investigation(
             for t in convergence_recent
         )
         if has_convergence:
-            required_streak = max(1, required_streak - 1)
+            required_count = max(1, required_count - 1)
 
         recent = (await session.execute(
             select(Task).where(
                 Task.project_id == task.project_id,
                 Task.status == TaskStatus.FAILED,
                 Task.id != task.id,
-            ).order_by(Task.created_at.desc()).limit(30)
+            ).order_by(Task.created_at.desc()).limit(60)
         )).scalars().all()
         dir_recent = [
             t for t in recent if (t.context or {}).get("direction_id") == direction_id
-        ][:required_streak]
-        if len(dir_recent) < required_streak:
+        ][:WINDOW_SIZE]
+        if len(dir_recent) < required_count:
             return False
-        if not all(classify_failure_taxonomy(t) == TAXONOMY_REVIEW_QUALITY for t in dir_recent):
+        review_quality_count = sum(
+            1 for t in dir_recent
+            if classify_failure_taxonomy(t) == TAXONOMY_REVIEW_QUALITY
+        )
+        if review_quality_count < required_count:
             return False
 
     last_failure_class = CODE_ERROR if (is_code_defect or is_review_quality) else AGENT_TIMEOUT
@@ -1180,8 +1188,8 @@ async def _spawn_task_failure_investigation(
     if is_review_quality:
         prompt_lines.append(
             f"\nThis is a review-quality pattern investigation: this direction has "
-            f"{REVIEW_QUALITY_STREAK_THRESHOLD}+ consecutive review-quality failures "
-            f"(lint/type-check/test-suite). Look for systemic causes — a module that "
+            f"{REVIEW_QUALITY_STREAK_THRESHOLD}+ review-quality failures in its recent "
+            f"task window (lint/type-check/test-suite). Look for systemic causes — a module that "
             f"consistently produces lint-failing code, a test configuration mismatch, "
             f"or a code pattern that always triggers type errors — rather than "
             f"diagnosing this one task's failure in isolation."
