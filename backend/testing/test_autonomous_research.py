@@ -5555,7 +5555,7 @@ async def test_task_failure_investigation_skips_without_direction(db_session):
 
 @pytest.mark.asyncio
 async def test_task_failure_investigation_skips_review_quality(db_session):
-    """review_quality taxonomy has its own handling; trigger should skip."""
+    """Single review-quality failure doesn't meet the streak threshold, skip."""
     from app.autonomous_research import _spawn_task_failure_investigation
     project = Project(
         name="Review Quality",
@@ -5581,6 +5581,128 @@ async def test_task_failure_investigation_skips_review_quality(db_session):
     await db_session.commit()
 
     assert await _spawn_task_failure_investigation(failed, db_session) is False
+
+
+@pytest.mark.asyncio
+async def test_task_failure_investigation_spawns_for_review_quality_streak(db_session):
+    """3 consecutive review-quality failures on a direction trigger investigation."""
+    from app.autonomous_research import _spawn_task_failure_investigation
+    direction_id = "d-revq0002"
+    project = Project(
+        name="Review Quality Streak",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(direction_id)],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(2):
+        prior = Task(
+            project_id=project.id,
+            title=f"Prior lint fail {i}",
+            payloads=[{"type": "create", "prompt": "do"}],
+            context={"direction_id": direction_id},
+            status=TaskStatus.FAILED,
+            created_by="ORCHESTRATOR",
+            latest_status_message="ruff: lint error in module.py",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(prior)
+    await db_session.commit()
+
+    failed = Task(
+        project_id=project.id,
+        title="Current lint fail",
+        payloads=[{"type": "create", "prompt": "do"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="eslint: style violations in handler.ts",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+    await db_session.commit()
+    await db_session.refresh(failed)
+
+    assert await _spawn_task_failure_investigation(failed, db_session) is True
+    await db_session.commit()
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    investigations = [
+        t for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "investigate"
+    ]
+    assert len(investigations) == 1
+    prompt = investigations[0].payloads[0]["prompt"]
+    assert "review-quality pattern investigation" in prompt
+    assert investigations[0].context["failure_taxonomy"] == "review_quality"
+
+
+@pytest.mark.asyncio
+async def test_task_failure_investigation_skipped_by_cross_direction_fingerprint(db_session):
+    """Existing investigate task on a sibling direction sharing the same
+    fingerprint blocks a new initial investigation spawn."""
+    from app.autonomous_research import _spawn_task_failure_investigation
+    project = Project(
+        name="Cross Dir Dedup",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            _active_direction("d-xdir0001", "Direction one"),
+            _active_direction("d-xdir0002", "Direction two"),
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Sibling direction already has an open investigate with same fingerprint.
+    sibling_inv = Task(
+        project_id=project.id,
+        title="Sibling investigation",
+        payloads=[{"type": "investigate", "prompt": "sibling", "base_branch": "main"}],
+        context={"direction_id": "d-xdir0002", "diagnosis_fingerprint": "fp-shared-xdir"},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(sibling_inv)
+    await db_session.commit()
+    await db_session.refresh(sibling_inv)
+
+    failed = Task(
+        project_id=project.id,
+        title="Broken feature",
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        context={
+            "direction_id": "d-xdir0001",
+            "_tool_trace": "Edit file.py\nRun tests → failed",
+            "_previous_error_fingerprint": "fp-shared-xdir",
+            "failing_tests": ["test_foo"],
+        },
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="AttributeError: 'NoneType' has no attribute 'x'",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+    await db_session.commit()
+    await db_session.refresh(failed)
+
+    spawned = await _spawn_task_failure_investigation(failed, db_session)
+    assert spawned is False
+    await db_session.commit()
+
+    # Verify no new investigate task was created for d-xdir0001.
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    investigations = [
+        t for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "investigate"
+    ]
+    assert len(investigations) == 1
+    assert investigations[0].id == sibling_inv.id
 
 
 # ─────────────────────────────────────────────────────────────────────────────

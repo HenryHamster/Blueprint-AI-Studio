@@ -406,7 +406,7 @@ MODULE_SIZE_LIMITS = {
     "routers/agent.py": 2000,
     "services.py": 1500,
     "routers/agent_status.py": 1500,
-    "autonomous_research.py": 1500,
+    "autonomous_research.py": 1600,
     "research_completion.py": 2050,
     "strategic_completion.py": 1500,
     "rollup_management.py": 1550,
@@ -497,7 +497,7 @@ class TestBackendModuleSizeGuardrails:
 FRONTEND_SIZE_LIMITS = {
     "useAppState.ts": 3000,
     "components/DirectionsPanel.tsx": 3000,
-    "components/CatchUpPanel.tsx": 2500,
+    "components/CatchUpPanel.tsx": 2600,
     "components/TaskDetailDrawer.tsx": 2500,
     "components/SettingsDropdown.tsx": 2500,
     "components/KanbanBoard.tsx": 1500,

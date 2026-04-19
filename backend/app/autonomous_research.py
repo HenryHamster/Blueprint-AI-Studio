@@ -1029,22 +1029,81 @@ async def _spawn_task_failure_investigation(
     function adds 24h dedup per direction and builds the investigation prompt.
     """
     from app.failure_classification import (  # noqa: PLC0415
-        AGENT_TIMEOUT, CODE_ERROR, TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED,
+        AGENT_TIMEOUT, CODE_ERROR, REVIEW_QUALITY_STREAK_THRESHOLD,
+        TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED, TAXONOMY_REVIEW_QUALITY,
+        classify_failure_taxonomy,
         should_trigger_code_defect_investigation,
+        should_trigger_review_quality_investigation,
         should_trigger_timeout_investigation,
     )
 
     is_code_defect = should_trigger_code_defect_investigation(task)
     is_timeout = (not is_code_defect) and should_trigger_timeout_investigation(task)
-    if not (is_code_defect or is_timeout):
+    is_review_quality = (
+        (not is_code_defect) and (not is_timeout)
+        and should_trigger_review_quality_investigation(task)
+    )
+    if not (is_code_defect or is_timeout or is_review_quality):
         return False
-    last_failure_class = CODE_ERROR if is_code_defect else AGENT_TIMEOUT
-    failure_taxonomy = TAXONOMY_CODE_DEFECT if is_code_defect else TAXONOMY_INFRA_RELATED
 
     ctx = task.context or {}
     direction_id = ctx.get("direction_id")
+
+    if is_review_quality:
+        # Frequency gate: only fire once this direction has accumulated a
+        # streak of consecutive review-quality failures. Inspect the most
+        # recent FAILED tasks on the direction (excluding the current one,
+        # which the caller has just marked FAILED) and require the top
+        # (THRESHOLD - 1) to all be review_quality. One non-review-quality
+        # failure breaks the streak.
+        recent = (await session.execute(
+            select(Task).where(
+                Task.project_id == task.project_id,
+                Task.status == TaskStatus.FAILED,
+                Task.id != task.id,
+            ).order_by(Task.created_at.desc()).limit(30)
+        )).scalars().all()
+        dir_recent = [
+            t for t in recent if (t.context or {}).get("direction_id") == direction_id
+        ][:REVIEW_QUALITY_STREAK_THRESHOLD - 1]
+        if len(dir_recent) < REVIEW_QUALITY_STREAK_THRESHOLD - 1:
+            return False
+        if not all(classify_failure_taxonomy(t) == TAXONOMY_REVIEW_QUALITY for t in dir_recent):
+            return False
+
+    last_failure_class = CODE_ERROR if (is_code_defect or is_review_quality) else AGENT_TIMEOUT
+    if is_code_defect:
+        failure_taxonomy = TAXONOMY_CODE_DEFECT
+    elif is_review_quality:
+        failure_taxonomy = TAXONOMY_REVIEW_QUALITY
+    else:
+        failure_taxonomy = TAXONOMY_INFRA_RELATED
     if await _recent_investigation_exists(task.project_id, direction_id, session):
         return False
+
+    prev_fp = ctx.get("_previous_error_fingerprint") or ""
+    if prev_fp:
+        from app.task_completion import _find_sibling_fingerprint_investigation  # noqa: PLC0415
+        sibling_cutoff = _utcnow() - timedelta(hours=24)
+        shared_id = await _find_sibling_fingerprint_investigation(
+            task.project_id, prev_fp, sibling_cutoff, session,
+        )
+        if shared_id is not None:
+            logger.info(
+                f"[TASK FAILURE INVESTIGATION] Skip spawn for task {task.id} "
+                f"(direction {direction_id}): shares fingerprint {prev_fp[:40]} "
+                f"with existing investigate task {shared_id}"
+            )
+            return False
+
+    direction: dict = {}
+    if direction_id:
+        project = await session.get(Project, task.project_id)
+        if project is not None:
+            direction = next(
+                (d for d in (project.directions or []) if d.get("id") == direction_id),
+                {},
+            ) or {}
 
     payload = task.first_payload or {}
     ttype = payload.get("type") or ""
@@ -1053,7 +1112,6 @@ async def _spawn_task_failure_investigation(
     if isinstance(tool_trace, list):
         tool_trace = "\n".join(str(x) for x in tool_trace)
     tool_trace = str(tool_trace)[:1500]
-    prev_fp = ctx.get("_previous_error_fingerprint") or ""
     failing_tests = ctx.get("failing_tests") or ctx.get("failed_tests") or []
     if isinstance(failing_tests, (list, tuple)):
         failing_tests_str = ", ".join(str(x) for x in failing_tests)[:400]
@@ -1073,8 +1131,49 @@ async def _spawn_task_failure_investigation(
         prompt_lines.append(f"Failing tests: {failing_tests_str}")
     if tool_trace:
         prompt_lines.append(f"\nRecent tool trace:\n{tool_trace}")
+    if is_review_quality:
+        prompt_lines.append(
+            f"\nThis is a review-quality pattern investigation: this direction has "
+            f"{REVIEW_QUALITY_STREAK_THRESHOLD}+ consecutive review-quality failures "
+            f"(lint/type-check/test-suite). Look for systemic causes — a module that "
+            f"consistently produces lint-failing code, a test configuration mismatch, "
+            f"or a code pattern that always triggers type errors — rather than "
+            f"diagnosing this one task's failure in isolation."
+        )
+
+    prior_diag = (direction.get("diagnosis_summary") or "").strip()
+    if prior_diag:
+        prompt_lines.append(f"\nPrior diagnosis summary:\n{prior_diag[:800]}")
+    partial_summary = (direction.get("partial_diagnosis_summary") or "").strip()
+    partial_root = (direction.get("partial_diagnosis_root_cause") or "").strip()
+    partial_files = direction.get("partial_diagnosis_files") or []
+    if partial_summary or partial_root or partial_files:
+        partial_lines = ["\nPartial diagnosis from prior failed investigation:"]
+        if partial_summary:
+            partial_lines.append(f"- summary: {partial_summary[:400]}")
+        if partial_root:
+            partial_lines.append(f"- root cause: {partial_root[:400]}")
+        if partial_files:
+            files_str = ", ".join(str(f) for f in partial_files[:10])[:300]
+            partial_lines.append(f"- affected files: {files_str}")
+        prompt_lines.append("\n".join(partial_lines))
+    rem_attempts = int(direction.get("remediation_attempts") or 0)
+    last_rem_result = direction.get("last_remediation_result")
+    last_rem_err = (direction.get("last_remediation_error_summary") or "")[:300]
+    last_rem_fc = direction.get("last_remediation_failure_class")
+    if rem_attempts or last_rem_result or last_rem_err:
+        rem_lines = [f"\nRemediation history ({rem_attempts} prior attempt(s)):"]
+        if last_rem_result:
+            rem_lines.append(f"- last result: {last_rem_result}")
+        if last_rem_fc:
+            rem_lines.append(f"- last failure class: {last_rem_fc}")
+        if last_rem_err:
+            rem_lines.append(f"- last error: {last_rem_err}")
+        prompt_lines.append("\n".join(rem_lines))
+
     prompt_lines.append(
-        "\nProduce the structured diagnosis JSON report so remediation can be spawned."
+        "\nProduce the structured diagnosis JSON report so remediation can be spawned. "
+        "Build on prior findings above rather than re-diagnosing what is already known."
     )
     prompt = "\n".join(prompt_lines)
 
@@ -1094,6 +1193,7 @@ async def _spawn_task_failure_investigation(
             "last_failure_class": last_failure_class,
             "failure_taxonomy": failure_taxonomy,
             "failure_fingerprints": [prev_fp] if prev_fp else [],
+            **({"diagnosis_fingerprint": prev_fp} if prev_fp else {}),
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,

@@ -27,6 +27,7 @@ from app.failure_classification import (
     classify_failure_taxonomy,
     classify_timeout_subtype,
     should_trigger_code_defect_investigation,
+    should_trigger_review_quality_investigation,
     should_trigger_timeout_investigation,
 )
 from app.models import Task
@@ -404,3 +405,36 @@ class TestShouldTriggerTimeoutInvestigation:
         t = _task("AttributeError: NoneType has no 'x'", {"direction_id": "d-1", "timeout_subtype": "oom"})
         t.payloads = [{"type": "create", "prompt": "p"}]
         assert should_trigger_timeout_investigation(t) is False
+
+
+def _review_quality_task(task_type: str = "create", direction_id: str | None = "d-1") -> Task:
+    ctx: dict = {"scope": "small"}
+    if direction_id is not None:
+        ctx["direction_id"] = direction_id
+    t = _task("pytest failures in test_foo", ctx)
+    t.payloads = [{"type": task_type, "prompt": "p"}]
+    return t
+
+
+class TestShouldTriggerReviewQualityInvestigation:
+    def test_review_quality_with_direction_triggers(self):
+        assert should_trigger_review_quality_investigation(_review_quality_task()) is True
+
+    def test_no_direction_skipped(self):
+        assert should_trigger_review_quality_investigation(_review_quality_task(direction_id=None)) is False
+
+    def test_investigate_type_skipped(self):
+        assert should_trigger_review_quality_investigation(_review_quality_task(task_type="investigate")) is False
+
+    def test_smoketest_type_skipped(self):
+        assert should_trigger_review_quality_investigation(_review_quality_task(task_type="smoketest")) is False
+
+    def test_code_defect_taxonomy_skipped(self):
+        t = _task("AttributeError: NoneType has no 'x'", {"direction_id": "d-1"})
+        t.payloads = [{"type": "create", "prompt": "p"}]
+        assert should_trigger_review_quality_investigation(t) is False
+
+    def test_infra_failure_skipped(self):
+        t = _task("No heartbeat received", {"direction_id": "d-1"})
+        t.payloads = [{"type": "create", "prompt": "p"}]
+        assert should_trigger_review_quality_investigation(t) is False
