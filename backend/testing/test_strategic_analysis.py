@@ -395,6 +395,82 @@ def test_taxonomy_summary_respects_window_filter():
     assert d["taxonomy_summary"] == {"review_quality": 2}
 
 
+# ---------------------------------------------------------------------------
+# Per-direction trend and velocity
+# ---------------------------------------------------------------------------
+
+def test_per_direction_trend_improving():
+    directions = [{
+        "id": "dir-1", "status": "active",
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "prs_merged": 0},
+            {"timestamp": "2026-01-02T00:00:00", "prs_merged": 1},
+            {"timestamp": "2026-01-03T00:00:00", "prs_merged": 4},
+            {"timestamp": "2026-01-04T00:00:00", "prs_merged": 5},
+        ],
+    }]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["trend"] == "improving"
+
+
+def test_per_direction_trend_declining():
+    directions = [{
+        "id": "dir-1", "status": "active",
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "prs_merged": 5},
+            {"timestamp": "2026-01-02T00:00:00", "prs_merged": 4},
+            {"timestamp": "2026-01-03T00:00:00", "prs_merged": 1},
+            {"timestamp": "2026-01-04T00:00:00", "prs_merged": 0},
+        ],
+    }]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["trend"] == "declining"
+
+
+def test_per_direction_trend_absent_for_fewer_than_4_cycles():
+    directions = [{
+        "id": "dir-1", "status": "active",
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1},
+            {"timestamp": "2026-01-02T00:00:00", "prs_merged": 10},
+            {"timestamp": "2026-01-03T00:00:00", "prs_merged": 10},
+        ],
+    }]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert "trend" not in d
+
+
+def test_per_direction_velocity_accelerating():
+    # Lifetime avg = 8/4 = 2.0; recent 2 avg = (1+5)/2 = 3.0; velocity = 1.5
+    directions = [{
+        "id": "dir-1", "status": "active",
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1},
+            {"timestamp": "2026-01-02T00:00:00", "prs_merged": 1},
+            {"timestamp": "2026-01-03T00:00:00", "prs_merged": 1},
+            {"timestamp": "2026-01-04T00:00:00", "prs_merged": 5},
+        ],
+    }]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["velocity"] == 1.5
+
+
+def test_per_direction_velocity_decelerating():
+    # Lifetime avg = 12/4 = 3.0; recent 2 avg = (1+1)/2 = 1.0; velocity ≈ 0.33
+    directions = [{
+        "id": "dir-1", "status": "active",
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "prs_merged": 5},
+            {"timestamp": "2026-01-02T00:00:00", "prs_merged": 5},
+            {"timestamp": "2026-01-03T00:00:00", "prs_merged": 1},
+            {"timestamp": "2026-01-04T00:00:00", "prs_merged": 1},
+        ],
+    }]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["velocity"] == 0.33
+    assert d["velocity"] < 1.0
+
+
 def test_confirmed_and_proposed_findings():
     research_ctx = (
         "## Established Findings\n"

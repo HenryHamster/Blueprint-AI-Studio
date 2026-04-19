@@ -123,6 +123,30 @@ def _build_outcome_evaluation(project) -> dict:
             outcome["type_distribution"] = type_dist
             outcome["product_ratio"] = round(product_weighted / total_typed, 2) if total_typed > 0 else None
 
+        # Per-direction trend (first-half vs second-half merge rate over window history)
+        if cycles >= 4:
+            sorted_window = sorted(window_history, key=lambda h: h.get("timestamp") or "")
+            mid_d = len(sorted_window) // 2
+            first_d = sorted_window[:mid_d]
+            second_d = sorted_window[mid_d:]
+            first_rate_d = sum(h.get("prs_merged", 0) for h in first_d) / max(len(first_d), 1)
+            second_rate_d = sum(h.get("prs_merged", 0) for h in second_d) / max(len(second_d), 1)
+            if second_rate_d > first_rate_d * 1.3:
+                outcome["trend"] = "improving"
+            elif second_rate_d < first_rate_d * 0.7:
+                outcome["trend"] = "declining"
+            else:
+                outcome["trend"] = "stable"
+
+        # Per-direction velocity: recent-2-cycle merge rate vs lifetime average
+        if lifetime_cycles >= 2 and len(window_history) >= 2:
+            sorted_full = sorted(history, key=lambda h: h.get("timestamp") or "")
+            recent = sorted_full[-2:] if len(sorted_full) >= 2 else sorted_full
+            recent_rate = sum(h.get("prs_merged", 0) for h in recent) / max(len(recent), 1)
+            lifetime_rate = lifetime_merged / lifetime_cycles if lifetime_cycles > 0 else 0
+            if lifetime_rate > 0:
+                outcome["velocity"] = round(recent_rate / lifetime_rate, 2)
+
         direction_outcomes.append(outcome)
 
     # Overall health
