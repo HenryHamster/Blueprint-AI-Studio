@@ -1655,6 +1655,49 @@ def test_refresh_pipeline_scope_merge_rates_no_directions(_reset_pipeline_scope_
     assert runtime_config["pipeline_scope_merge_rates"] == {}
 
 
+def test_pipeline_scope_expansion_ratios_fallback(_reset_pipeline_scope_rates):
+    """Pipeline-wide expansion ratio is published when samples >= 5; fallback chain
+    uses the pipeline signal only when direction and project history lack data.
+    """
+    from app.research_completion import _avg_medium_expansion_ratio
+
+    # Pipeline signal: 5 medium history entries with avg_expansion_ratio.
+    entries = [
+        {"task_id": str(uuid.uuid4()), "scope_breakdown": {
+            "medium": {"created": 1, "merged": 1, "failed": 0,
+                       "failed_infra": 0, "failed_scope_overflow": 0,
+                       "avg_expansion_ratio": 3.0,
+                       "avg_expansion_ratio_merged": 3.0},
+        }} for _ in range(5)
+    ]
+    seeded = {"id": "d-seed", "text": "t", "status": "active",
+              "priority": "medium", "paths": [], "research_history": entries}
+    # A brand-new direction with no research_history — only benefits from the
+    # pipeline-wide fallback.
+    fresh = {"id": "d-new", "text": "t", "status": "active",
+             "priority": "medium", "paths": [], "research_history": []}
+    project = Project(name="p", user_id="u", directions=[seeded, fresh])
+
+    _refresh_pipeline_scope_merge_rates(project)
+    assert runtime_config["pipeline_scope_expansion_ratios"] == {"medium": 3.0}
+
+    # Direction/project helper returns None for the fresh direction alone —
+    # confirms the fallback chain would reach the pipeline tier.
+    assert _avg_medium_expansion_ratio([fresh]) is None
+
+    # Sparse signal (< 5 samples) → no publication, fallback falls through to 2.0.
+    project_sparse = Project(name="p", user_id="u", directions=[
+        _direction_with_scope_breakdown("d1", {
+            "medium": {"created": 1, "merged": 1, "failed": 0,
+                       "failed_infra": 0, "failed_scope_overflow": 0,
+                       "avg_expansion_ratio": 3.0,
+                       "avg_expansion_ratio_merged": 3.0},
+        }),
+    ])
+    _refresh_pipeline_scope_merge_rates(project_sparse)
+    assert runtime_config["pipeline_scope_expansion_ratios"] == {}
+
+
 @pytest.mark.asyncio
 async def test_update_outcomes_publishes_pipeline_scope_rates(
     db_session: AsyncSession, _reset_pipeline_scope_rates

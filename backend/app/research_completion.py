@@ -183,6 +183,37 @@ def _avg_medium_expansion_ratio(
     return max(_candidates) if _candidates else None
 
 
+def _outcome_complexity_threshold(
+    direction: Optional[Dict[str, Any]],
+) -> Optional[float]:
+    """Derive the escalation threshold for medium-scope findings from the
+    direction's recent avg_complexity_merged / avg_complexity_failed observations
+    (last 3 research_history entries, 'medium' scope_breakdown).
+
+    Returns midpoint(merged, failed) when both exist, avg_failed when only failed
+    exists, or None when no data is available.
+    """
+    if not direction:
+        return None
+    merged_vals: list[float] = []
+    failed_vals: list[float] = []
+    for entry in (direction.get("research_history") or [])[-3:]:
+        med = (entry.get("scope_breakdown") or {}).get("medium", {}) or {}
+        m = med.get("avg_complexity_merged")
+        f = med.get("avg_complexity_failed")
+        if isinstance(m, (int, float)):
+            merged_vals.append(float(m))
+        if isinstance(f, (int, float)):
+            failed_vals.append(float(f))
+    avg_merged = sum(merged_vals) / len(merged_vals) if merged_vals else None
+    avg_failed = sum(failed_vals) / len(failed_vals) if failed_vals else None
+    if avg_merged is not None and avg_failed is not None:
+        return (avg_merged + avg_failed) / 2.0
+    if avg_failed is not None:
+        return avg_failed
+    return None
+
+
 def _calibrate_finding_scope(
     finding: Dict[str, Any],
     scope: str,
@@ -200,6 +231,17 @@ def _calibrate_finding_scope(
     """
     title = finding.get("title", "")
     scope_calibrated_from: Optional[str] = None
+
+    if scope == "small":
+        _heuristic_files = finding.get("related_files") or []
+        if len(_heuristic_files) >= 3:
+            logger.info(
+                "[RESEARCH] Upgrading scope small→medium for '%s' "
+                "(file-count heuristic: %d related_files >= 3)",
+                title, len(_heuristic_files),
+            )
+            scope = "medium"
+            scope_calibrated_from = "small"
 
     if scope == "medium":
         _heuristic_files = finding.get("related_files") or []
@@ -239,6 +281,13 @@ def _calibrate_finding_scope(
                 _avg_ratio = _avg_medium_expansion_ratio(all_directions)
                 _ratio_source = "project"
             if _avg_ratio is None:
+                _pipeline_ratio = (
+                    _runtime_config.get("pipeline_scope_expansion_ratios") or {}
+                ).get("medium")
+                if isinstance(_pipeline_ratio, (int, float)):
+                    _avg_ratio = float(_pipeline_ratio)
+                    _ratio_source = "pipeline"
+            if _avg_ratio is None:
                 # Conservative prior for brand-new projects with no expansion-ratio
                 # data anywhere — still applies the safety net rather than skipping.
                 _avg_ratio = 2.0
@@ -263,16 +312,22 @@ def _calibrate_finding_scope(
             )
             finding["_complexity_score"] = round(_cc_score, 3)
             finding["_complexity_signals"] = _cc_signals
-            # Adaptive escalation threshold: baseline 0.45, tightened when the
-            # pipeline-wide medium merge rate is below the healthy 40% band so
-            # more borderline medium findings get pre-escalated to large for
-            # plan decomposition during periods of poor medium performance.
-            _cc_threshold = 0.45
+            # Adaptive escalation threshold. Base preference order:
+            #   1. Direction outcome-derived midpoint of avg_complexity_merged /
+            #      avg_complexity_failed (last 3 cycles) — empirically calibrated.
+            #   2. Fixed 0.45 baseline when no outcome data exists yet.
+            # The pipeline-wide medium merge-rate tightening is layered on top as
+            # a secondary adjustment so poor pipeline-wide performance still
+            # raises the bar during degradation regardless of the base source.
+            _outcome_base = _outcome_complexity_threshold(direction)
+            _cc_threshold = _outcome_base if _outcome_base is not None else 0.45
             _pipeline_medium = (
                 _runtime_config.get("pipeline_scope_merge_rates") or {}
             ).get("medium")
             if isinstance(_pipeline_medium, (int, float)) and _pipeline_medium < 0.4:
-                _cc_threshold = min(0.75, 0.45 + (0.4 - float(_pipeline_medium)) * 0.5)
+                _cc_threshold = min(
+                    0.75, _cc_threshold + (0.4 - float(_pipeline_medium)) * 0.5
+                )
             if _cc_score < _cc_threshold:
                 logger.info(
                     "[RESEARCH] Upgrading scope medium→large for '%s' "
@@ -283,17 +338,6 @@ def _calibrate_finding_scope(
                 )
                 scope = "large"
                 scope_calibrated_from = "medium"
-    elif scope == "small":
-        _heuristic_files = finding.get("related_files") or []
-        if len(_heuristic_files) >= 3:
-            logger.info(
-                "[RESEARCH] Upgrading scope small→medium for '%s' "
-                "(file-count heuristic: %d related_files >= 3)",
-                title, len(_heuristic_files),
-            )
-            scope = "medium"
-            scope_calibrated_from = "small"
-
     return scope, scope_calibrated_from
 
 

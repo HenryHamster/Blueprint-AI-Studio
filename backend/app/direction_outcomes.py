@@ -679,3 +679,32 @@ def _refresh_pipeline_scope_merge_rates(project: Project) -> None:
         if effective >= 5:
             rates[scope] = round(stats["merged"] / effective, 3)
     runtime_config["pipeline_scope_merge_rates"] = rates
+
+    # Pipeline-wide expansion ratios per scope: fallback for brand-new directions
+    # with no local history. Uses max(mean_merged, mean_failed) so the failed-task
+    # overflow signal biases conservatively (same semantics as the direction-level
+    # _avg_medium_expansion_ratio helper in research_completion.py).
+    ratio_samples: dict[str, dict[str, list[float]]] = {}
+    for entry in proj_entries:
+        for scope, stats in (entry.get("scope_breakdown") or {}).items():
+            bucket = ratio_samples.setdefault(scope, {"merged": [], "failed": []})
+            _m = stats.get("avg_expansion_ratio_merged")
+            if _m is None:
+                _m = stats.get("avg_expansion_ratio")
+            if isinstance(_m, (int, float)):
+                bucket["merged"].append(float(_m))
+            _f = stats.get("avg_expansion_ratio_failed")
+            if isinstance(_f, (int, float)):
+                bucket["failed"].append(float(_f))
+    ratios: dict[str, float] = {}
+    for scope, samples in ratio_samples.items():
+        if len(samples["merged"]) + len(samples["failed"]) < 5:
+            continue
+        candidates: list[float] = []
+        if samples["merged"]:
+            candidates.append(sum(samples["merged"]) / len(samples["merged"]))
+        if samples["failed"]:
+            candidates.append(sum(samples["failed"]) / len(samples["failed"]))
+        if candidates:
+            ratios[scope] = round(max(candidates), 3)
+    runtime_config["pipeline_scope_expansion_ratios"] = ratios
