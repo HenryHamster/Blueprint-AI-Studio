@@ -2398,6 +2398,21 @@ async def get_digest(
     remediations_merged = sum(1 for t in _rem_tasks if t.status == TaskStatus.COMPLETED)
     remediations_failed = sum(1 for t in _rem_tasks if t.status == TaskStatus.FAILED)
 
+    _held_projects_q = select(Project)
+    if project_id:
+        _held_projects_q = _held_projects_q.where(Project.id == project_id)
+    _held_projects = (await session.execute(_held_projects_q)).scalars().all()
+    fixes_held = 0
+    _window_iso = window_start.isoformat()
+    for _p in _held_projects:
+        for _d in (_p.directions or []):
+            for _h in (_d.get("remediation_history") or []):
+                if (_h.get("result") or "") != "held":
+                    continue
+                _ts = _h.get("held_at") or _h.get("timestamp") or ""
+                if _ts and _ts >= _window_iso:
+                    fixes_held += 1
+
     _inv_by_id = {str(t.id): t for t in _inv_tasks}
     _ttr_values: List[float] = []
     for r in _rem_tasks:
@@ -2653,6 +2668,7 @@ async def get_digest(
         "remediations_spawned": remediations_spawned,
         "remediations_merged": remediations_merged,
         "remediations_failed": remediations_failed,
+        "fixes_held": fixes_held,
         "avg_time_to_remediation_hours": avg_time_to_remediation_hours,
         "active_investigations": active_investigations,
         "investigations_by_confidence": investigations_by_confidence,

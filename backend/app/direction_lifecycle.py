@@ -547,9 +547,22 @@ async def _process_direction_lifecycle(
             if expired:
                 d.pop("remediation_monitor_started_at", None)
                 cleared = d.pop("needs_manual_intervention", None)
+                # Stamp "held" on the remediation_history entry that started this monitor
+                # so the digest funnel can count fixes that survived the full window.
+                held_iso = _utcnow().isoformat()
+                history = list(d.get("remediation_history") or [])
+                for entry in reversed(history):
+                    if entry.get("result") in ("merged", "partial_success"):
+                        entry["result"] = "held"
+                        entry["held_at"] = held_iso
+                        d["remediation_history"] = history
+                        break
+                d["last_remediation_held_at"] = held_iso
+                if d.get("last_remediation_result") in ("merged", "partial_success"):
+                    d["last_remediation_result"] = "held"
                 logger.info(
                     f"[AUTONOMOUS] Remediation monitor expired for {did} "
-                    f"({age_desc}); "
+                    f"({age_desc}); fix held; "
                     f"{'cleared needs_manual_intervention' if cleared else 'no intervention flag to clear'}"
                 )
                 directions_modified = True

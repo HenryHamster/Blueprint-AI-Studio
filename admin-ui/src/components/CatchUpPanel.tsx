@@ -288,6 +288,7 @@ interface DigestData {
     remediations_spawned: number;
     remediations_merged: number;
     remediations_failed: number;
+    fixes_held?: number;
     avg_time_to_remediation_hours: number | null;
     active_investigations: number;
     investigations_by_confidence?: Record<string, number>;
@@ -2314,6 +2315,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   { label: 'Diagnosed', value: rf.investigations_with_diagnosis },
                   { label: 'Remediations', value: rf.remediations_spawned },
                   { label: 'Merged', value: rf.remediations_merged },
+                  ...(rf.fixes_held != null ? [{ label: 'Held', value: rf.fixes_held }] : []),
                 ];
                 const maxVal = Math.max(1, ...stages.map(s => s.value));
                 return (
@@ -2353,6 +2355,12 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             <span>
                               <span className="text-neutral-500">failed:</span>{' '}
                               <span className="text-red-400 font-mono">{rf.remediations_failed}</span>
+                            </span>
+                          )}
+                          {rf.fixes_held != null && rf.fixes_held > 0 && (
+                            <span>
+                              <span className="text-neutral-500">held:</span>{' '}
+                              <span className="text-emerald-400 font-mono">{rf.fixes_held}</span>
                             </span>
                           )}
                         </div>

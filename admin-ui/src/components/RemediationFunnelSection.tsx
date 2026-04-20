@@ -22,6 +22,7 @@ interface RemediationFunnelData {
   remediations_spawned?: number;
   remediations_merged?: number;
   remediations_failed?: number;
+  fixes_held?: number;
   avg_time_to_remediation_hours?: number | null;
   active_investigations?: number;
   investigations_by_confidence?: Record<string, number> | null;
@@ -143,6 +144,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
   const remSpawned = funnel.remediations_spawned ?? 0;
   const remMerged = funnel.remediations_merged ?? 0;
   const remFailed = funnel.remediations_failed ?? 0;
+  const fixesHeld = funnel.fixes_held ?? 0;
   const active = funnel.active_investigations ?? 0;
   const avgHours = funnel.avg_time_to_remediation_hours ?? null;
 
@@ -216,6 +218,14 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
         {remFailed > 0 && (
           <span className="text-[10px] text-red-400" title="Remediations that failed">
             {remFailed} failed
+          </span>
+        )}
+        {fixesHeld > 0 && (
+          <span
+            className="text-[10px] text-emerald-400"
+            title="Merged remediations whose error fingerprint did not recur during the 30-day monitoring window"
+          >
+            {fixesHeld} held
           </span>
         )}
       </div>
