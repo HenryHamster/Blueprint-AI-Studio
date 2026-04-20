@@ -771,6 +771,64 @@ describe('buildContextPrefix', () => {
     expect(withMissing).not.toContain('Recurring review issues in this direction');
   });
 
+  it('renders review_effectiveness per-category trends with trend indicators', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        review_effectiveness: {
+          categories: {
+            correctness: { trend: 'increasing' },
+            tests: { trend: 'decreasing' },
+            style: { trend: 'stable' },
+          },
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('**Review effectiveness trends (per category):**');
+    expect(result).toContain('- **correctness**: trending up ⚠');
+    expect(result).toContain('- **tests**: trending down');
+    expect(result).toContain('- **style**: persistent');
+  });
+
+  it('omits review_effectiveness section when categories are missing or empty', () => {
+    const empty = buildContextPrefix({
+      direction_context: { title: 'x', priority: 'medium', review_effectiveness: { categories: {} } },
+    });
+    const missing = buildContextPrefix({
+      direction_context: { title: 'x', priority: 'medium' },
+    });
+    expect(empty).not.toContain('Review effectiveness trends');
+    expect(missing).not.toContain('Review effectiveness trends');
+  });
+
+  it('renders review_quality_feedback calibration note and counts', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        review_quality_feedback: {
+          reviews_dismissed: 4,
+          reviews_overridden: 1,
+          user_issues_caught: 2,
+          note: 'Self-reviews skew toward false positives on style issues.',
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('**Self-review calibration:**');
+    expect(result).toContain('- Self-reviews skew toward false positives on style issues.');
+    expect(result).toContain('- self-review calibration — dismissed: 4, overridden: 1, user-caught: 2');
+  });
+
+  it('omits review_quality_feedback section when field is absent', () => {
+    const result = buildContextPrefix({
+      direction_context: { title: 'x', priority: 'medium' },
+    });
+    expect(result).not.toContain('Self-review calibration');
+  });
+
   it('renders complexity signals as narrative guidance with only factors below 0.8', () => {
     const task = {
       context: {

@@ -685,6 +685,45 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       dcLines.push('**Prompt quality patterns (apply when writing finding prompts):**');
       for (const note of promptQualityPatterns) dcLines.push(`- ${note}`);
     }
+    type ReviewEffectivenessCategory = { trend?: string };
+    const reviewEff = dirCtx.review_effectiveness as
+      | { categories?: Record<string, ReviewEffectivenessCategory> }
+      | null
+      | undefined;
+    const reviewEffCats = reviewEff?.categories;
+    if (reviewEffCats && Object.keys(reviewEffCats).length > 0) {
+      dcLines.push('**Review effectiveness trends (per category):**');
+      for (const [cat, info] of Object.entries(reviewEffCats)) {
+        const trend = info?.trend;
+        const trendIndicator = trend === 'decreasing' ? 'trending down'
+          : trend === 'increasing' ? 'trending up ⚠'
+          : trend === 'stable' ? 'persistent'
+          : trend ?? 'unknown';
+        dcLines.push(`- **${cat}**: ${trendIndicator}`);
+      }
+    }
+    type ReviewQualityFeedback = {
+      reviews_dismissed?: number;
+      reviews_overridden?: number;
+      user_issues_caught?: number;
+      note?: string;
+    };
+    const rqf = dirCtx.review_quality_feedback as ReviewQualityFeedback | null | undefined;
+    if (rqf && typeof rqf === 'object') {
+      const rqfLines: string[] = [];
+      if (typeof rqf.note === 'string' && rqf.note) {
+        rqfLines.push(`- ${rqf.note}`);
+      }
+      const counts: string[] = [];
+      if (typeof rqf.reviews_dismissed === 'number') counts.push(`dismissed: ${rqf.reviews_dismissed}`);
+      if (typeof rqf.reviews_overridden === 'number') counts.push(`overridden: ${rqf.reviews_overridden}`);
+      if (typeof rqf.user_issues_caught === 'number') counts.push(`user-caught: ${rqf.user_issues_caught}`);
+      if (counts.length > 0) rqfLines.push(`- self-review calibration — ${counts.join(', ')}`);
+      if (rqfLines.length > 0) {
+        dcLines.push('**Self-review calibration:**');
+        dcLines.push(...rqfLines);
+      }
+    }
     dcLines.push('');
     prefix += dcLines.join('\n') + '\n';
   }
