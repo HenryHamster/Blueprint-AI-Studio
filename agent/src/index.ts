@@ -1148,7 +1148,7 @@ export function condensedAnalysisSections(analysisContext: string): string {
     if (!headingMatch) return false;
     const h = headingMatch[1].toLowerCase();
     return (
-      (h.includes('files') && (h.includes('change') || h.includes('modify')))
+      (h.includes('files') && (h.includes('change') || h.includes('modify') || h.includes('verify')))
       || (h.includes('interfaces') && h.includes('preserve'))
       || h.includes('dependencies')
       || (h.includes('callers') && h.includes('verify'))

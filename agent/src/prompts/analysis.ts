@@ -35,7 +35,7 @@ export function buildAnalysisPrompt(opts: {
         parts.push(`  - ${a.slice(0, 500)}`);
       }
     }
-    parts.push('Scope your **Files to change** and **Callers to verify** to the diagnosed root cause. If the recommended fix would not work, note the concrete reason in **Implementation approach** before proposing an alternative that addresses the same root cause.');
+    parts.push('Scope your **Files to change**, **Files to verify (no changes expected)**, and **Callers to verify** to the diagnosed root cause. If the recommended fix would not work, note the concrete reason in **Implementation approach** before proposing an alternative that addresses the same root cause.');
     diagnosisBlock = parts.join('\n');
   }
   const filesList = opts.relatedFiles.length > 0
@@ -76,7 +76,9 @@ ${titleLine}${opts.rawPrompt.slice(0, 1500)}${diagnosisBlock}${narrowingBlock}${
 
 4. Output a compact structured implementation plan using exactly these headings:
 
-**Files to change** (list in recommended change order, one per line with brief reason).${limitClause}
+**Files to change** (list in recommended change order, one per line with brief reason. Only include files you actually plan to MODIFY. Files you need to READ to confirm compatibility but do not plan to modify belong under **Files to verify (no changes expected)** below — do not inflate this list with compatibility-only checks).${limitClause}
+
+**Files to verify (no changes expected)** (list files you need to READ to confirm correctness — e.g. consumers that import a changed type, callers whose call-site you must confirm still compiles — but do NOT plan to modify. One per line with the reason you need to verify it. These files do NOT count toward the production-file budget. Write "none" with a one-line justification if no verification-only reads are needed.)
 
 **Interfaces to preserve** (function signatures, exported types, or API contracts that must not be broken)
 
@@ -143,6 +145,20 @@ function collectFilesUnderHeadings(analysisOutput: string, headingRes: RegExp[])
  */
 export function parseAnalysisPlanFiles(analysisOutput: string): string[] {
   return collectFilesUnderHeadings(analysisOutput, [/^\s*\*\*Files to change\*\*/i]);
+}
+
+/**
+ * Parses the **Files to verify (no changes expected)** section of an analysis
+ * prompt's output and returns the list of file paths the agent needs to READ
+ * to confirm correctness but does NOT plan to modify. These files are
+ * deliberately EXCLUDED from the analysis-plan production-file budget — the
+ * parser exists so the verify list can be surfaced in logs and threaded into
+ * the post-implementation self-review context.
+ *
+ * Returns an empty array when the section is missing or unparsable.
+ */
+export function parseAnalysisPlanVerifyFiles(analysisOutput: string): string[] {
+  return collectFilesUnderHeadings(analysisOutput, [/^\s*\*\*Files to verify\b/i]);
 }
 
 /**

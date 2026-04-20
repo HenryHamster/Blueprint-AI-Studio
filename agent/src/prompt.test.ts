@@ -52,6 +52,7 @@ import {
   buildAnalysisPrompt,
   parseAnalysisPlanFiles,
   parseAnalysisPlanTestFiles,
+  parseAnalysisPlanVerifyFiles,
   getMandatoryChecks,
   extractModuleInterfaces,
   discoverAffectedConsumers,
@@ -2869,6 +2870,23 @@ describe('buildAnalysisPrompt', () => {
     expect(result).toContain('**Callers to verify after implementation**');
   });
 
+  it('includes the files-to-verify (no changes expected) section', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Do thing',
+      taskTitle: 'Title',
+      relatedFiles: ['a.ts'],
+      fileTree: '',
+    });
+    expect(result).toContain('**Files to verify (no changes expected)**');
+    // The verify section must sit between Files to change and Callers to verify.
+    const idxChange = result.indexOf('**Files to change**');
+    const idxVerify = result.indexOf('**Files to verify (no changes expected)**');
+    const idxCallers = result.indexOf('**Callers to verify after implementation**');
+    expect(idxChange).toBeGreaterThan(-1);
+    expect(idxVerify).toBeGreaterThan(idxChange);
+    expect(idxCallers).toBeGreaterThan(idxVerify);
+  });
+
   it('mentions the file limit when fileLimit is provided', () => {
     const result = buildAnalysisPrompt({
       rawPrompt: 'Do thing',
@@ -3056,6 +3074,54 @@ describe('parseAnalysisPlanFiles', () => {
       '**Files to change**\n* a.ts\n• b.ts\n',
     );
     expect(out).toEqual(['a.ts', 'b.ts']);
+  });
+});
+
+// ── parseAnalysisPlanVerifyFiles ─────────────────────────────────────────────
+describe('parseAnalysisPlanVerifyFiles', () => {
+  it('returns [] for empty input', () => {
+    expect(parseAnalysisPlanVerifyFiles('')).toEqual([]);
+  });
+
+  it('returns [] when the verify heading is missing', () => {
+    expect(parseAnalysisPlanVerifyFiles('**Files to change**\n- a.ts\n')).toEqual([]);
+  });
+
+  it('extracts bullet items under "Files to verify (no changes expected)"', () => {
+    const out = parseAnalysisPlanVerifyFiles(
+      '**Files to verify (no changes expected)**\n- consumer/foo.ts — imports changed type\n- consumer/bar.ts (reads re-exported symbol)\n',
+    );
+    expect(out).toEqual(['consumer/foo.ts', 'consumer/bar.ts']);
+  });
+
+  it('extracts numbered-list items with backticks', () => {
+    const out = parseAnalysisPlanVerifyFiles(
+      '**Files to verify (no changes expected)**\n1. `pkg/a.ts` — first\n2. `pkg/b.ts` — second\n',
+    );
+    expect(out).toEqual(['pkg/a.ts', 'pkg/b.ts']);
+  });
+
+  it('stops at the next bold heading', () => {
+    const out = parseAnalysisPlanVerifyFiles(
+      '**Files to verify (no changes expected)**\n- a.ts\n- b.ts\n\n**Interfaces to preserve**\n- not-a-file.ts',
+    );
+    expect(out).toEqual(['a.ts', 'b.ts']);
+  });
+
+  it('deduplicates repeated entries', () => {
+    const out = parseAnalysisPlanVerifyFiles(
+      '**Files to verify (no changes expected)**\n- a.ts\n- a.ts\n- b.ts\n',
+    );
+    expect(out).toEqual(['a.ts', 'b.ts']);
+  });
+
+  it('does not bleed verify entries into parseAnalysisPlanFiles output', () => {
+    const analysis =
+      '**Files to change**\n- change/one.ts\n\n' +
+      '**Files to verify (no changes expected)**\n- verify/one.ts\n- verify/two.ts\n\n' +
+      '**Interfaces to preserve**\n- nope\n';
+    expect(parseAnalysisPlanFiles(analysis)).toEqual(['change/one.ts']);
+    expect(parseAnalysisPlanVerifyFiles(analysis)).toEqual(['verify/one.ts', 'verify/two.ts']);
   });
 });
 

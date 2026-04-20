@@ -47,6 +47,7 @@ vi.mock('../prompt.js', () => ({
   buildAnalysisPrompt: vi.fn().mockReturnValue('analysis-prompt'),
   parseAnalysisPlanFiles: vi.fn().mockReturnValue([]),
   parseAnalysisPlanTestFiles: vi.fn().mockReturnValue([]),
+  parseAnalysisPlanVerifyFiles: vi.fn().mockReturnValue([]),
   extractModuleInterfaces: vi.fn().mockReturnValue(''),
   discoverAffectedConsumers: vi.fn().mockReturnValue(''),
   getMandatoryChecks: vi.fn().mockReturnValue([]),
@@ -92,7 +93,7 @@ vi.mock('ws', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote } from './standard.js';
 import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks, sendHeartbeatSync } from '../index.js';
-import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, buildAnalysisPrompt } from '../prompt.js';
+import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -1711,6 +1712,8 @@ describe('analysis-phase scope feasibility gate', () => {
     vi.mocked(parseAnalysisPlanFiles).mockReset();
     vi.mocked(parseAnalysisPlanTestFiles).mockReset();
     vi.mocked(parseAnalysisPlanTestFiles).mockReturnValue([]);
+    vi.mocked(parseAnalysisPlanVerifyFiles).mockReset();
+    vi.mocked(parseAnalysisPlanVerifyFiles).mockReturnValue([]);
   });
 
   it('proceeds to implementation when planned files are within the limit', async () => {
@@ -1807,6 +1810,25 @@ describe('analysis-phase scope feasibility gate', () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     // Exactly one analysis run + one implementation run; no narrowing retry triggered by tests.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ failure_category: 'scope_overflow' }),
+    );
+  });
+
+  it('does not count verify-only files toward the production-file budget', async () => {
+    const production = ['a.ts', 'b.ts', 'c.ts'];
+    const verify = ['v1.ts', 'v2.ts', 'v3.ts', 'v4.ts', 'v5.ts', 'v6.ts', 'v7.ts', 'v8.ts'];
+    vi.mocked(parseAnalysisPlanFiles).mockReturnValue(production);
+    vi.mocked(parseAnalysisPlanTestFiles).mockReturnValue([]);
+    vi.mocked(parseAnalysisPlanVerifyFiles).mockReturnValue(verify);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- a.ts' })
+      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    // One analysis run + one implementation run; no narrowing retry.
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
     expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
       TASK_ID,
@@ -1983,6 +2005,8 @@ describe('scope trim prompt', () => {
     vi.mocked(parseAnalysisPlanFiles).mockReset();
     vi.mocked(parseAnalysisPlanTestFiles).mockReset();
     vi.mocked(parseAnalysisPlanTestFiles).mockReturnValue([]);
+    vi.mocked(parseAnalysisPlanVerifyFiles).mockReset();
+    vi.mocked(parseAnalysisPlanVerifyFiles).mockReturnValue([]);
     vi.mocked(lintFixLoop).mockResolvedValue(true);
     vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: false, passed: true });
   });

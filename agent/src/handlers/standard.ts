@@ -10,7 +10,7 @@ import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
-  buildSelfReviewPrompt, buildAnalysisPrompt, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, extractModuleInterfaces, getMandatoryChecks,
+  buildSelfReviewPrompt, buildAnalysisPrompt, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, extractModuleInterfaces, getMandatoryChecks,
   discoverAffectedConsumers, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
@@ -336,6 +336,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       let effectiveAnalysis = analysisResult.trim();
       let plannedFiles = parseAnalysisPlanFiles(effectiveAnalysis);
       let plannedTestFiles = parseAnalysisPlanTestFiles(effectiveAnalysis);
+      let plannedVerifyFiles = parseAnalysisPlanVerifyFiles(effectiveAnalysis);
 
       // Scope feasibility gate: if the analysis plans more production files
       // than the medium-scope limit, retry the analysis once with explicit
@@ -370,6 +371,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           effectiveAnalysis = retryResult.trim();
           plannedFiles = parseAnalysisPlanFiles(effectiveAnalysis);
           plannedTestFiles = parseAnalysisPlanTestFiles(effectiveAnalysis);
+          plannedVerifyFiles = parseAnalysisPlanVerifyFiles(effectiveAnalysis);
         }
 
         if (plannedFiles.length > prodFileLimit) {
@@ -388,7 +390,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           });
           return;
         }
-        sendLog(ws, `[Analysis Phase] Plan narrowed to ${plannedFiles.length} production files (${plannedTestFiles.length} test files, uncapped).\n`);
+        sendLog(ws, `[Analysis Phase] Plan narrowed to ${plannedFiles.length} production files (${plannedTestFiles.length} test files, uncapped; ${plannedVerifyFiles.length} verify-only files, uncapped).\n`);
       }
 
       analysisContext = `## Pre-Implementation Analysis\n\n${effectiveAnalysis}\n\n`;
@@ -902,14 +904,19 @@ Return nothing — just write the files.`;
         changedPlannedTestCount: number;
         missingProduction: string[];
         missingTest: string[];
+        plannedVerifyCount?: number;
+        changedPlannedVerifyCount?: number;
+        missingVerify?: string[];
       } | undefined;
       if (selfReviewTaskScope === 'medium' && analysisContext) {
         const plannedProduction = parseAnalysisPlanFiles(analysisContext);
         const plannedTest = parseAnalysisPlanTestFiles(analysisContext);
-        if (plannedProduction.length > 0 || plannedTest.length > 0) {
+        const plannedVerify = parseAnalysisPlanVerifyFiles(analysisContext);
+        if (plannedProduction.length > 0 || plannedTest.length > 0 || plannedVerify.length > 0) {
           const changedSet = new Set(changedPaths);
           const missingProduction = plannedProduction.filter(f => !changedSet.has(f));
           const missingTest = plannedTest.filter(f => !changedSet.has(f));
+          const missingVerify = plannedVerify.filter(f => !changedSet.has(f));
           planCompletion = {
             plannedProductionCount: plannedProduction.length,
             changedPlannedProductionCount: plannedProduction.length - missingProduction.length,
@@ -917,6 +924,9 @@ Return nothing — just write the files.`;
             changedPlannedTestCount: plannedTest.length - missingTest.length,
             missingProduction,
             missingTest,
+            plannedVerifyCount: plannedVerify.length,
+            changedPlannedVerifyCount: plannedVerify.length - missingVerify.length,
+            missingVerify,
           };
         }
       }

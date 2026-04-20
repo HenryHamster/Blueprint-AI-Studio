@@ -74,6 +74,9 @@ export function buildSelfReviewPrompt(opts: {
     changedPlannedTestCount: number;
     missingProduction: string[];
     missingTest: string[];
+    plannedVerifyCount?: number;
+    changedPlannedVerifyCount?: number;
+    missingVerify?: string[];
   };
   topFirstReviewIssues?: Array<{ description: string; count: number; category: string }>;
   moduleFeedbackWarnings?: Array<{ file: string; top_categories: Record<string, number>; sample_size: number }>;
