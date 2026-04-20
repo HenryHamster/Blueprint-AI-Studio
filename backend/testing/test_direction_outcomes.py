@@ -2127,6 +2127,58 @@ async def test_preventive_context_counts(db_session: AsyncSession):
     assert entry["preventive_context_tasks_failed"] == 1
 
 
+@pytest.mark.asyncio
+async def test_remediation_task_counts(db_session: AsyncSession):
+    """remediation_tasks_{created,merged,failed} counted via diagnosis_task_id/auto_remediation."""
+    direction_id = "d-rem"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=5)]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"diagnosis_task_id": "diag-1", "pr_merged": True},
+        title="rem-diag-merged",
+    )
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.FAILED,
+        context={"auto_remediation": True},
+        title="rem-auto-failed",
+    )
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"auto_remediation": True},  # completed, not merged
+        title="rem-auto-no-pr",
+    )
+    # Non-remediation: shouldn't count
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        title="regular-merged",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["remediation_tasks_created"] == 3
+    assert entry["remediation_tasks_merged"] == 1
+    assert entry["remediation_tasks_failed"] == 1
+
+
 def test_synthesize_prompt_quality_patterns_emits_when_signal_meaningful():
     from app.direction_outcomes import synthesize_prompt_quality_patterns
     history = [

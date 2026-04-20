@@ -665,6 +665,17 @@ async def _process_direction_lifecycle(
                     # progress so the direction is not escalated to manual
                     # intervention on the next remediation cycle.
                     d["last_remediation_result"] = "partial_success"
+                    # Update the most recent merged remediation_history entry so
+                    # follow-up investigations and spawn calibration can read the
+                    # nuanced outcome ("partial" rather than "fully merged").
+                    partial_iso = _utcnow().isoformat()
+                    history = list(d.get("remediation_history") or [])
+                    for entry in reversed(history):
+                        if entry.get("result") == "merged":
+                            entry["result"] = "partial_success"
+                            entry["partial_success_at"] = partial_iso
+                            d["remediation_history"] = history
+                            break
                     logger.info(
                         f"[AUTONOMOUS] Direction {did} showed partial remediation success "
                         f"(code-failure rate dropped >= {int(_PARTIAL_SUCCESS_RATE_DROP * 100)}%); "

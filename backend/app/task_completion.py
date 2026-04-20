@@ -114,6 +114,9 @@ async def _record_remediation_outcome(
     trigger_failure_class = ctx.get("trigger_failure_class")
     if trigger_failure_class:
         history_entry["trigger_failure_class"] = trigger_failure_class
+    ci_failure_type = ctx.get("ci_failure_type")
+    if ci_failure_type:
+        history_entry["ci_failure_type"] = ci_failure_type
     if merged:
         target.pop("last_remediation_failure_class", None)
         target.pop("last_remediation_error_summary", None)
@@ -635,6 +638,7 @@ async def _maybe_spawn_followup_investigation(
 
     prior_summary = (target.get("diagnosis_summary") or "").strip()
     failure_class = target.get("last_remediation_failure_class") or "(unknown)"
+    diagnosis_confidence = ctx.get("diagnosis_confidence")
     error_summary = (target.get("last_remediation_error_summary") or "(no error message)")
     failed_prompt = (task.first_payload or {}).get("prompt", "") or ""
     prior_history = list(target.get("remediation_history") or [])
@@ -659,6 +663,30 @@ async def _maybe_spawn_followup_investigation(
         f"Failure class: {failure_class}",
         f"Error summary: {str(error_summary)[:400]}",
     ]
+    if diagnosis_confidence:
+        guidance = {
+            "low": (
+                "Prior diagnosis confidence was LOW — strongly consider "
+                "re-diagnosing the root cause from scratch rather than "
+                "iterating on the prior hypothesis."
+            ),
+            "medium": (
+                "Prior diagnosis confidence was MEDIUM — re-examine the root "
+                "cause hypothesis; a different layer or interacting cause may "
+                "be at play."
+            ),
+            "high": (
+                "Prior diagnosis confidence was HIGH — the root cause is "
+                "likely correct; focus on a materially different "
+                "implementation approach for the same root cause."
+            ),
+        }.get(str(diagnosis_confidence).lower(), "")
+        prompt_parts.extend([
+            "",
+            f"Prior diagnosis confidence: {diagnosis_confidence}",
+        ])
+        if guidance:
+            prompt_parts.append(guidance)
     if earlier_attempts:
         lines = ["", "Earlier remediation attempts on this direction (oldest first):"]
         for i, entry in enumerate(earlier_attempts, start=1):
@@ -701,6 +729,8 @@ async def _maybe_spawn_followup_investigation(
     if fingerprint:
         task_context["diagnosis_fingerprint"] = str(fingerprint)
         task_context["failure_fingerprints"] = [str(fingerprint)]
+    if diagnosis_confidence:
+        task_context["diagnosis_confidence"] = str(diagnosis_confidence)
     inherited_failure_class = ctx.get("trigger_failure_class")
     if inherited_failure_class:
         task_context["last_failure_class"] = inherited_failure_class
@@ -1745,6 +1775,10 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
         direction["last_diagnosis_task_id"] = str(task.id)
         if summary:
             direction["diagnosis_summary"] = summary[:STRATEGIC_RATIONALE_MAX]
+        if root_cause:
+            direction["diagnosis_root_cause"] = root_cause[:2000]
+        if recommended_fix:
+            direction["diagnosis_recommended_fix"] = recommended_fix[:2000]
         if affected_paths:
             direction["diagnosed_affected_files"] = affected_paths[:25]
         direction.pop(DIAGNOSIS_IN_PROGRESS_KEY, None)

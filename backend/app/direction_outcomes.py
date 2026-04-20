@@ -198,6 +198,22 @@ async def _update_direction_research_outcomes(
     entry["preventive_context_tasks_failed"] = sum(
         1 for ct in _prev_rows if _counts_as_failure(ct)
     )
+    # Remediation tasks: spawned from a diagnosis or auto-remediation. Tracked
+    # separately so research agents can see the remediation burden — a
+    # direction merging emergency fixes is not the same as one merging features.
+    _remediation_rows = [
+        ct for ct in child_tasks_rows
+        if (ct.context or {}).get("diagnosis_task_id")
+        or (ct.context or {}).get("auto_remediation") is True
+    ]
+    entry["remediation_tasks_created"] = len(_remediation_rows)
+    entry["remediation_tasks_merged"] = sum(
+        1 for ct in _remediation_rows
+        if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
+    )
+    entry["remediation_tasks_failed"] = sum(
+        1 for ct in _remediation_rows if _counts_as_failure(ct)
+    )
     # Collect changed files from merged PRs for co-change index update
     merged_files_lists = [
         (ct.context or {}).get("_pr_changed_files", [])

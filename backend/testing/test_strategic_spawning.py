@@ -1190,3 +1190,24 @@ class TestPredictSpawnSuccessQualityAndMomentum:
         }
         result = predict_spawn_success("small", direction)
         assert 0.0 <= result <= 1.0
+
+    def test_remediation_regression_penalizes_prediction(self):
+        from app.spawn_calibration import predict_spawn_success
+        base_history = [{"tasks_created": 2, "prs_merged": 1}]
+        clean = {
+            "research_history": base_history,
+            "remediation_history": [
+                {"result": "merged", "fingerprint": "fp-a"},
+                {"result": "merged", "fingerprint": "fp-b"},
+            ],
+        }
+        regressed = {
+            "research_history": base_history,
+            "remediation_history": [
+                {"result": "merged", "fingerprint": "fp-a"},
+                {"result": "merged", "fingerprint": "fp-b"},
+                {"result": "failed", "fingerprint": "fp-a"},
+                {"result": "failed", "fingerprint": "fp-b"},
+            ],
+        }
+        assert predict_spawn_success("small", regressed) < predict_spawn_success("small", clean)

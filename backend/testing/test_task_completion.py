@@ -1032,6 +1032,33 @@ class TestRecordRemediationOutcome:
         assert "failure_class" not in entry
         assert "error_summary" not in entry
 
+    @pytest.mark.asyncio
+    async def test_history_entry_includes_ci_failure_type(self, db_session):
+        """ci_failure_type from task context propagates into remediation_history."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-1",
+                "ci_failure_type": "test",
+            },
+            payloads=[{"type": "create", "prompt": "the fix", "base_branch": "main"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        entry = project.directions[0]["remediation_history"][-1]
+        assert entry["ci_failure_type"] == "test"
+
 
 class TestRemediationSuccessPropagation:
     """Propagation of merged remediation context to sibling directions via fingerprint match."""
@@ -2618,6 +2645,8 @@ class TestHandleInvestigationCompletion:
         d = project.directions[0]
         assert "diagnosis_completed_at" in d
         assert d["diagnosis_summary"].startswith("Tasks fail due to missing lock")
+        assert d["diagnosis_root_cause"].startswith("Concurrent writers")
+        assert d["diagnosis_recommended_fix"].startswith("Wrap record_direction_result")
         assert "backend/app/shared_state.py" in d["diagnosed_affected_files"]
         assert d["diagnosed_affected_files"].count("backend/app/shared_state.py") == 1
         assert "diagnosis_in_progress" not in d

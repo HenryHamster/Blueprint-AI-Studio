@@ -450,6 +450,36 @@ def predict_spawn_success(
         signals.append(diagnosis_score)
         weights.append(1.0)
 
+    # Signal 18: remediation regression rate. A regression is a 'merged'
+    # remediation entry followed by a later entry with the same fingerprint —
+    # meaning the fix did not hold and the same failure re-surfaced. When
+    # regressions are frequent relative to total merged remediations, the
+    # direction's fixes systematically don't stick; penalize future spawns so
+    # compute isn't reinvested in a direction that can't close its loops.
+    rem_history = direction.get("remediation_history") or []
+    if isinstance(rem_history, list):
+        merged_fps: list[str] = []
+        regressions = 0
+        for entry in rem_history:
+            if not isinstance(entry, dict):
+                continue
+            fp = entry.get("fingerprint")
+            if not fp:
+                continue
+            if fp in merged_fps:
+                regressions += 1
+            if entry.get("result") == "merged":
+                merged_fps.append(fp)
+        merged_total = len(merged_fps)
+        if merged_total >= 2:
+            regression_rate = regressions / merged_total
+            if regression_rate >= 0.5:
+                signals.append(0.2)
+                weights.append(1.5)
+            elif regression_rate >= 0.25:
+                signals.append(0.4)
+                weights.append(1.0)
+
     # Signal 7: operator acceptance rate (merged / (merged + rejected)) from
     # research history. Directions where the operator consistently rejects PRs
     # are wasting compute regardless of code quality, so this feedback must
