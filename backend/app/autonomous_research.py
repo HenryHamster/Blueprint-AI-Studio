@@ -224,7 +224,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 difficulty_bonus,                                # easy boost / hard deprioritization
                 -(productivity_score * momentum),                # productivity within same vision rank
                 -quality_score,                                  # taxonomy-based quality; higher = earlier
-                acceptance_rate if acceptance_rate is not None else 0.5,  # low acceptance = deprioritized
+                -(acceptance_rate if acceptance_rate is not None else 0.5),  # low acceptance = deprioritized
                 1 if d.get("possibly_saturated") else 0,         # saturated last
                 d.get("last_researched_at") or "",               # staleness
             )

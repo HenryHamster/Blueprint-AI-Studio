@@ -6522,3 +6522,57 @@ async def test_direction_score_ranks_higher_quality_first(db_session, mocker):
         assert chosen[0].get("id") in ("d-quality1", "d-quality2")
     finally:
         _runtime_config["max_parallel_research_per_project"] = old_val
+
+
+@pytest.mark.asyncio
+async def test_direction_score_prefers_higher_acceptance_rate(db_session, mocker):
+    """Higher operator acceptance rate should sort earlier (be selected first)."""
+    from app.shared_state import runtime_config as _runtime_config
+    old_val = _runtime_config.get("max_parallel_research_per_project", 2)
+    _runtime_config["max_parallel_research_per_project"] = 1
+
+    # Equivalent tasks_created and prs_merged; differ only in prs_rejected
+    # so acceptance_rate = merged / (merged + rejected) differs.
+    high_acceptance_history = [
+        {"tasks_created": 2, "prs_merged": 2, "prs_rejected": 0},
+        {"tasks_created": 2, "prs_merged": 2, "prs_rejected": 0},
+        {"tasks_created": 2, "prs_merged": 2, "prs_rejected": 0},
+    ]
+    low_acceptance_history = [
+        {"tasks_created": 2, "prs_merged": 2, "prs_rejected": 6},
+        {"tasks_created": 2, "prs_merged": 2, "prs_rejected": 6},
+        {"tasks_created": 2, "prs_merged": 2, "prs_rejected": 6},
+    ]
+    d_high = {**_active_direction("d-accept-hi", "High acceptance"),
+              "research_history": high_acceptance_history,
+              "last_researched_at": "2026-01-01T00:00:00"}
+    d_low = {**_active_direction("d-accept-lo", "Low acceptance"),
+             "research_history": low_acceptance_history,
+             "last_researched_at": "2026-01-01T00:00:00"}
+
+    project = Project(
+        name="Acceptance Sort",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[d_low, d_high],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    try:
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        research = [
+            t for t in result.scalars().all()
+            if (t.payloads or [{}])[0].get("type") == "research"
+        ]
+        assert len(research) == 1, "Expected exactly one research task at max_parallel=1"
+        current_did = research[0].payloads[0].get("current_direction_id")
+        assert current_did == "d-accept-hi", (
+            f"Higher operator acceptance rate should be preferred; got {current_did}"
+        )
+    finally:
+        _runtime_config["max_parallel_research_per_project"] = old_val
