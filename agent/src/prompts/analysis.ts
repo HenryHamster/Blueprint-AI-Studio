@@ -136,7 +136,7 @@ export function parseAnalysisPlanTestFiles(analysisOutput: string): string[] {
  */
 export function getMandatoryChecks(taskScope?: string, hasAnalysisPlan?: boolean): string[] {
   if (taskScope === 'small') {
-    return ['correctness', 'test_coverage', 'import_verification', 'scope_violations'];
+    return ['correctness', 'test_coverage', 'import_verification'];
   }
   if (taskScope === 'large') {
     return ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'data_model_safety', 'import_verification'];

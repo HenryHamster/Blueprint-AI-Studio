@@ -410,16 +410,20 @@ export function sendHeartbeatSync(taskId: string, statusMessage: string) {
 interface LogEntry { timestamp: number; content: string; }
 const logBuffer: LogEntry[] = [];
 
-function appendToLogBuffer(content: string) {
+export function appendToLogBuffer(content: string) {
   if (logBuffer.length >= MAX_LOG_BUFFER) logBuffer.shift();
   logBuffer.push({ timestamp: Date.now(), content });
 }
 
-function flushLogBuffer(ws: WebSocket) {
+export function snapshotLogBuffer(): LogEntry[] {
+  return logBuffer.slice();
+}
+
+export function flushLogBuffer(ws: WebSocket) {
   while (logBuffer.length > 0) {
-    const entry = logBuffer.shift();
-    if (!entry) break;
+    const entry = logBuffer[0];
     try { ws.send(JSON.stringify({ type: 'log', content: entry.content })); } catch { break; }
+    logBuffer.shift();
   }
 }
 

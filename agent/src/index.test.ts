@@ -48,8 +48,9 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, recordToolUse, snapshotToolTrace, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
+import type WebSocket from 'ws';
 
 // ── strVal ───────────────────────────────────────────────────────────────────
 describe('strVal', () => {
@@ -585,7 +586,6 @@ describe('testFixLoop early exit on identical errors', () => {
   it('continues when test errors differ between attempts', async () => {
     const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
     let callCount = 0;
-    // Custom spawn mock: each npm call fails with a unique error so fingerprints differ.
     vi.mocked(spawn).mockImplementation((cmd: unknown) => {
       const cmdStr = String(cmd);
       const stderrCbs: ((d: Buffer) => void)[] = [];
@@ -1028,5 +1028,45 @@ describe('recordToolUse', () => {
     const trace = snapshotToolTrace();
     const entry = trace[trace.length - 1];
     expect(entry.input_preview).toBe('raw string value');
+  });
+});
+
+// ── flushLogBuffer ───────────────────────────────────────────────────────────
+describe('flushLogBuffer', () => {
+  beforeEach(() => {
+    // Drain any entries from prior tests by flushing into a no-op sink.
+    const sink = { send: vi.fn() } as unknown as WebSocket;
+    flushLogBuffer(sink);
+  });
+
+  it('sends all buffered entries and empties the buffer on success', () => {
+    appendToLogBuffer('one');
+    appendToLogBuffer('two');
+    const ws = { send: vi.fn() } as unknown as WebSocket;
+    flushLogBuffer(ws);
+    expect((ws.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(2);
+    expect(snapshotLogBuffer().length).toBe(0);
+  });
+
+  it('retains the failing entry in the buffer when ws.send throws', () => {
+    appendToLogBuffer('will-fail');
+    appendToLogBuffer('never-attempted');
+    const ws = { send: vi.fn(() => { throw new Error('socket closed'); }) } as unknown as WebSocket;
+    flushLogBuffer(ws);
+    const remaining = snapshotLogBuffer();
+    expect(remaining.length).toBe(2);
+    expect(remaining[0].content).toBe('will-fail');
+    expect(remaining[1].content).toBe('never-attempted');
+  });
+
+  it('keeps only the unsent entries when send fails mid-flush', () => {
+    appendToLogBuffer('a');
+    appendToLogBuffer('b');
+    appendToLogBuffer('c');
+    let call = 0;
+    const ws = { send: vi.fn(() => { call += 1; if (call === 2) throw new Error('fail'); }) } as unknown as WebSocket;
+    flushLogBuffer(ws);
+    const remaining = snapshotLogBuffer();
+    expect(remaining.map(e => e.content)).toEqual(['b', 'c']);
   });
 });

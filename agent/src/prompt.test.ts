@@ -52,6 +52,7 @@ import {
   buildAnalysisPrompt,
   parseAnalysisPlanFiles,
   parseAnalysisPlanTestFiles,
+  getMandatoryChecks,
   extractModuleInterfaces,
   discoverAffectedConsumers,
   relativeTimeFromIso,
@@ -2854,6 +2855,79 @@ describe('parseAnalysisPlanTestFiles', () => {
       '**Tests to add or update**\n- none\n- a.test.ts\n',
     );
     expect(out).toEqual(['a.test.ts']);
+  });
+});
+
+// ── getMandatoryChecks ───────────────────────────────────────────────────────
+describe('getMandatoryChecks', () => {
+  it('returns correctness + test_coverage + import_verification for small scope', () => {
+    expect(getMandatoryChecks('small')).toEqual([
+      'correctness',
+      'test_coverage',
+      'import_verification',
+    ]);
+  });
+
+  it('ignores hasAnalysisPlan for small scope', () => {
+    expect(getMandatoryChecks('small', true)).toEqual([
+      'correctness',
+      'test_coverage',
+      'import_verification',
+    ]);
+  });
+
+  it('returns the full 9-item list for large scope', () => {
+    expect(getMandatoryChecks('large')).toEqual([
+      'test_coverage',
+      'type_safety',
+      'scope_violations',
+      'security',
+      'pattern_violations',
+      'cross_file_consistency',
+      'backwards_compatibility',
+      'data_model_safety',
+      'import_verification',
+    ]);
+  });
+
+  it('ignores hasAnalysisPlan for large scope', () => {
+    expect(getMandatoryChecks('large', true)).toEqual(getMandatoryChecks('large'));
+  });
+
+  it('returns the 8-item base list for medium scope without analysis plan', () => {
+    expect(getMandatoryChecks('medium')).toEqual([
+      'test_coverage',
+      'type_safety',
+      'scope_violations',
+      'security',
+      'pattern_violations',
+      'cross_file_consistency',
+      'backwards_compatibility',
+      'import_verification',
+    ]);
+  });
+
+  it('prepends plan_alignment for medium scope with analysis plan', () => {
+    expect(getMandatoryChecks('medium', true)).toEqual([
+      'plan_alignment',
+      'test_coverage',
+      'type_safety',
+      'scope_violations',
+      'security',
+      'pattern_violations',
+      'cross_file_consistency',
+      'backwards_compatibility',
+      'import_verification',
+    ]);
+  });
+
+  it('treats undefined scope like medium', () => {
+    expect(getMandatoryChecks(undefined)).toEqual(getMandatoryChecks('medium'));
+    expect(getMandatoryChecks(undefined, true)).toEqual(getMandatoryChecks('medium', true));
+  });
+
+  it('treats unknown scope like medium', () => {
+    expect(getMandatoryChecks('xl')).toEqual(getMandatoryChecks('medium'));
   });
 });
 
