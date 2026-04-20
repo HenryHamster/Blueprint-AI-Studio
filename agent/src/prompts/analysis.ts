@@ -12,7 +12,30 @@ export function buildAnalysisPrompt(opts: {
   narrowingGuidance?: string;
   fileLimit?: number;
   totalFileBudget?: number;
+  diagnosisContext?: {
+    rootCause?: string;
+    recommendedFix?: string;
+    priorFailedApproaches?: string[];
+  };
 }): string {
+  const diag = opts.diagnosisContext;
+  let diagnosisBlock = '';
+  if (diag && (diag.rootCause || diag.recommendedFix || (diag.priorFailedApproaches && diag.priorFailedApproaches.length > 0))) {
+    const parts: string[] = [
+      '\n\n## Diagnosis Context',
+      'This task is a **diagnosed remediation**, not a new feature. A prior investigation has already identified the root cause and recommended a fix. Focus your analysis narrowly on the files and call sites implicated by the diagnosis — do NOT broadly map module interfaces unrelated to the diagnosed issue.',
+    ];
+    if (diag.rootCause) parts.push(`- **Root cause:** ${diag.rootCause.slice(0, 1200)}`);
+    if (diag.recommendedFix) parts.push(`- **Recommended fix:** ${diag.recommendedFix.slice(0, 1200)}`);
+    if (diag.priorFailedApproaches && diag.priorFailedApproaches.length > 0) {
+      parts.push('- **Prior failed remediation approaches (avoid repeating):**');
+      for (const a of diag.priorFailedApproaches.slice(0, 5)) {
+        parts.push(`  - ${a.slice(0, 500)}`);
+      }
+    }
+    parts.push('Scope your **Files to change** and **Callers to verify** to the diagnosed root cause. If the recommended fix would not work, note the concrete reason in **Implementation approach** before proposing an alternative that addresses the same root cause.');
+    diagnosisBlock = parts.join('\n');
+  }
   const filesList = opts.relatedFiles.length > 0
     ? `## Files Relevant to This Task\n${opts.relatedFiles.map(f => `- ${f}`).join('\n')}\n\n`
     : '';
@@ -30,7 +53,7 @@ export function buildAnalysisPrompt(opts: {
   return `${opts.fileTree}${filesList}You are performing a pre-implementation analysis for a medium-scope task. This is a READ-ONLY pass — do not modify any files.
 
 ## Task
-${titleLine}${opts.rawPrompt.slice(0, 1500)}${narrowingBlock}
+${titleLine}${opts.rawPrompt.slice(0, 1500)}${diagnosisBlock}${narrowingBlock}
 
 ## Instructions
 

@@ -264,7 +264,7 @@ async def _handle_main_branch_ci_failure_inner(
         # Proceed anyway — better to spawn a potentially unnecessary task than miss a real failure
 
     # ── CI context extraction ──
-    failed_checks, error_summary, failure_type = await _extract_ci_context(
+    failed_checks, error_summary, failure_type, structured_signals = await _extract_ci_context(
         owner, repo, head_sha, project_id, session,
     )
 
@@ -319,6 +319,7 @@ async def _handle_main_branch_ci_failure_inner(
         failure_type=failure_type,
         prior_investigation=prior_investigation,
         regression_of=regression_of,
+        structured_signals=structured_signals,
     )
 
     task_context: dict[str, Any] = {
@@ -416,26 +417,78 @@ async def _handle_main_branch_ci_failure_inner(
     )
 
 
+# Structured-signal extraction patterns — run against full raw logs BEFORE
+# the 3000-char truncation so critical test names / file paths / error lines
+# beyond the cutoff still reach the remediation prompt.
+_FAILING_TEST_PATTERNS = (
+    re.compile(r"FAILED\s+(\S+::\S+)"),                    # pytest: FAILED tests/x.py::test_y
+    re.compile(r"^FAIL\s+(\S+)", re.MULTILINE),            # jest/generic: FAIL path/to/spec
+    re.compile(r"✗\s+(\S+)"),                              # vitest/tap-style failure marker
+)
+_FILE_LOCATION_PATTERNS = (
+    re.compile(r'File "([^"]+)", line (\d+)'),             # python traceback
+    re.compile(r"^\s*(\S+\.(?:ts|tsx|js|jsx|py)):(\d+)(?::\d+)?", re.MULTILINE),  # tsc/eslint/pytest short
+)
+_ERROR_MESSAGE_PATTERNS = (
+    re.compile(r"([A-Z][A-Za-z0-9_.]*Error:[^\n]*)"),
+    re.compile(r"^(assert [^\n]+)", re.MULTILINE),
+    re.compile(r"(error TS\d+:[^\n]+)"),
+    re.compile(r"^\s*([A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|py):\d+:\d+\s+error\s+[^\n]+)", re.MULTILINE),
+)
+
+
+def _extract_structured_signals(raw_logs: str) -> dict[str, list[str]]:
+    """Parse failing tests, file:line locations, and error messages from full logs.
+
+    Runs against the untruncated raw_logs so signals past the 3000-char cutoff
+    still reach the agent prompt via the structured-signals section.
+    """
+    signals: dict[str, list[str]] = {
+        "failing_tests": [], "error_locations": [], "error_messages": [],
+    }
+    if not raw_logs:
+        return signals
+
+    def _push(key: str, value: str, limit: int) -> None:
+        value = value.strip()
+        if value and value not in signals[key] and len(signals[key]) < limit:
+            signals[key].append(value)
+
+    for pat in _FAILING_TEST_PATTERNS:
+        for m in pat.finditer(raw_logs):
+            _push("failing_tests", m.group(1), 20)
+    for pat in _FILE_LOCATION_PATTERNS:
+        for m in pat.finditer(raw_logs):
+            _push("error_locations", f"{m.group(1)}:{m.group(2)}", 20)
+    for pat in _ERROR_MESSAGE_PATTERNS:
+        for m in pat.finditer(raw_logs):
+            _push("error_messages", m.group(1)[:300], 15)
+    return signals
+
+
 async def _extract_ci_context(
     owner: str,
     repo: str,
     head_sha: str,
     project_id: uuid.UUID,
     session: AsyncSession,
-) -> tuple[list[str], str, str]:
+) -> tuple[list[str], str, str, dict[str, list[str]]]:
     """Fetch CI details and classify the failure.
 
-    Returns (failed_checks, error_summary, failure_type).
+    Returns (failed_checks, error_summary, failure_type, structured_signals).
     """
     failed_checks: list[str] = []
     error_summary = ""
     failure_type = "unknown"
+    structured_signals: dict[str, list[str]] = {
+        "failing_tests": [], "error_locations": [], "error_messages": [],
+    }
 
     try:
         token = await get_repo_installation_token(owner, repo)
         if not token:
             logger.warning("[AUTO-REMEDIATION] No GitHub token available for %s/%s", owner, repo)
-            return failed_checks, error_summary, failure_type
+            return failed_checks, error_summary, failure_type, structured_signals
 
         ci_result = await get_check_runs_cached(token, owner, repo, head_sha, project_id=str(project_id))
         details = ci_result.get("details", [])
@@ -444,6 +497,7 @@ async def _extract_ci_context(
             if d.get("conclusion") == "failure"
         ]
         raw_logs = ci_result.get("failed_logs", "")
+        structured_signals = _extract_structured_signals(raw_logs)
         error_summary = raw_logs[:3000]
 
         # Heuristic failure type classification — check specific patterns
@@ -468,7 +522,7 @@ async def _extract_ci_context(
     except Exception as exc:
         logger.warning("[AUTO-REMEDIATION] CI context extraction failed: %s", exc)
 
-    return failed_checks, error_summary, failure_type
+    return failed_checks, error_summary, failure_type, structured_signals
 
 
 async def _find_direction_by_fingerprint(
@@ -593,6 +647,7 @@ def _build_remediation_prompt(
     failure_type: str = "unknown",
     prior_investigation: Task | None = None,
     regression_of: Task | None = None,
+    structured_signals: dict[str, list[str]] | None = None,
 ) -> str:
     """Build the agent prompt for a CI auto-remediation task."""
     checks_text = "\n".join(f"  - {name}" for name in failed_checks) if failed_checks else "  (check names not available)"
@@ -644,11 +699,27 @@ def _build_remediation_prompt(
             f"addresses the root cause rather than repeating the prior surface-level change.\n"
         )
 
+    signals_section = ""
+    if structured_signals and any(structured_signals.get(k) for k in ("failing_tests", "error_locations", "error_messages")):
+        lines = ["\n## Structured Failure Signals\n"
+                 "(Extracted from full logs before truncation — use these as authoritative even if the raw log below is cut off.)\n"]
+        if structured_signals.get("failing_tests"):
+            lines.append("Failing tests:")
+            lines.extend(f"  - {t}" for t in structured_signals["failing_tests"])
+        if structured_signals.get("error_locations"):
+            lines.append("Error locations (file:line):")
+            lines.extend(f"  - {loc}" for loc in structured_signals["error_locations"])
+        if structured_signals.get("error_messages"):
+            lines.append("Error messages:")
+            lines.extend(f"  - {msg}" for msg in structured_signals["error_messages"])
+        signals_section = "\n".join(lines) + "\n"
+
     return (
         f"CI is failing on the `{head_branch}` branch at commit {head_sha}.\n\n"
         f"{regression_section}"
         f"Failure classification: {failure_type} (test failures, build errors, lint issues, or mixed)\n\n"
-        f"Failed checks:\n{checks_text}\n\n"
+        f"Failed checks:\n{checks_text}\n"
+        f"{signals_section}\n"
         f"Error output (truncated):\n```\n{summary_text}\n```\n"
         f"{diagnosis_section}\n"
         f"IMPORTANT — CI environment differences:\n"

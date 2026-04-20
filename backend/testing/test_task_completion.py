@@ -26,6 +26,7 @@ from app.task_completion import (
     _handle_plan_completion,
     _record_remediation_outcome,
     _record_remediation_if_terminal,
+    _record_project_remediation_outcome,
     _maybe_spawn_followup_investigation,
     _handle_investigation_completion,
     _extract_partial_diagnosis,
@@ -2283,6 +2284,41 @@ class TestFollowupInvestigationOnFailure:
         assert post_mock.await_count == 0
 
     @pytest.mark.asyncio
+    async def test_cap_exhausted_notification_failure_stamps_retry(self, db_session, mocker):
+        """When the escalation notification raises, stamp retry flags for the lifecycle retry loop."""
+        from app.time_utils import _utcnow
+        mocker.patch(
+            "app.notification_dispatch.post_remediation_escalation_message",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("slack down"),
+        )
+        recent_ts = [_utcnow().isoformat(), _utcnow().isoformat()]
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active", "text": "rollup reliability",
+            "followup_investigation_attempts_by_fingerprint": {"fp-A": list(recent_ts)},
+            "remediation_history": [
+                {"task_id": "old-1", "result": "failed", "fingerprint": "fp-A",
+                 "timestamp": "2026-04-10T00:00:00"},
+            ],
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d.get("needs_manual_intervention") is True
+        assert d.get("escalation_notification_pending") is True
+        assert d.get("escalation_notification_retries") == 0
+
+    @pytest.mark.asyncio
     async def test_follow_up_skipped_by_cross_direction_fingerprint(self, db_session):
         """A recent investigate task on a sibling direction sharing the same
         fingerprint blocks a new follow-up and records a dedup note."""
@@ -2320,6 +2356,154 @@ class TestFollowupInvestigationOnFailure:
             n.get("shared_investigation_task_id") == str(sibling_inv.id)
             for n in notes
         )
+
+
+# ── unlinked (project-level) remediation sibling propagation ───────────────
+
+
+class TestUnlinkedRemediationSiblingPropagation:
+    """When a CI auto-remediation task has no direction_id but carries a
+    fingerprint, its outcome should still propagate to sibling directions
+    sharing that fingerprint — un-pause on merge, 'do not repeat' note on fail.
+    """
+
+    def _paused_sibling(self, direction_id: str, fingerprint: str, **overrides):
+        from app.time_utils import _utcnow as _now
+        sibling = {
+            "id": direction_id,
+            "status": "paused",
+            "auto_paused": True,
+            "error_fingerprint": fingerprint,
+            "paused_at": _now().isoformat(),
+        }
+        sibling.update(overrides)
+        return sibling
+
+    @pytest.mark.asyncio
+    async def test_merged_unlinked_remediation_unpauses_sibling(self, db_session):
+        project = make_project(directions=[
+            self._paused_sibling("dir-2", "fp-shared", paused_reason="CODE_ERROR"),
+        ])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "Pin pydantic", "base_branch": "main"}],
+            context={
+                "auto_remediation": True,
+                "_previous_error_fingerprint": "fp-shared",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        recorded = await _record_project_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+        assert recorded
+
+        sibling = next(d for d in project.directions if d["id"] == "dir-2")
+        assert sibling["status"] == "active"
+        assert "auto_paused" not in sibling
+        assert sibling["last_remediation_task_id"] == str(task.id)
+        assert sibling["last_remediation_result"] == "merged"
+        assert sibling["last_remediation_fingerprint"] == "fp-shared"
+        # No source direction exists for unlinked remediation.
+        assert "cross_direction_remediation_source" not in sibling
+        note = (sibling.get("notes") or [])[0]
+        assert note["source"] == "sibling_remediation_success"
+        assert "Unlinked CI remediation merged" in note["text"]
+        # Project-level tracking also recorded.
+        assert project.remediation_tracking["last_result"] == "merged"
+
+    @pytest.mark.asyncio
+    async def test_failed_unlinked_remediation_notes_sibling(self, db_session):
+        project = make_project(directions=[
+            self._paused_sibling("dir-2", "fp-shared"),
+        ])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message="ImportError: module xyz",
+            payloads=[{"type": "create", "prompt": "Bad fix", "base_branch": "main"}],
+            context={
+                "auto_remediation": True,
+                "error_fingerprint": "fp-shared",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sibling = next(d for d in project.directions if d["id"] == "dir-2")
+        # Sibling remains paused but gets a warning note.
+        assert sibling["status"] == "paused"
+        note = (sibling.get("notes") or [])[0]
+        assert note["source"] == "sibling_remediation_failure"
+        assert "Unlinked CI remediation FAILED" in note["text"]
+        assert "Do not repeat" in note["text"]
+
+    @pytest.mark.asyncio
+    async def test_unlinked_remediation_without_fingerprint_does_not_propagate(self, db_session):
+        project = make_project(directions=[
+            self._paused_sibling("dir-2", "fp-shared"),
+        ])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "no fp", "base_branch": "main"}],
+            context={"auto_remediation": True},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_project_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sibling = next(d for d in project.directions if d["id"] == "dir-2")
+        assert sibling["status"] == "paused"
+        assert not sibling.get("notes")
+
+    @pytest.mark.asyncio
+    async def test_unlinked_remediation_with_mismatched_fingerprint_leaves_sibling(self, db_session):
+        project = make_project(directions=[
+            self._paused_sibling("dir-2", "fp-other"),
+        ])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "diff fp", "base_branch": "main"}],
+            context={
+                "auto_remediation": True,
+                "_previous_error_fingerprint": "fp-shared",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_project_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sibling = next(d for d in project.directions if d["id"] == "dir-2")
+        assert sibling["status"] == "paused"
+        assert "last_remediation_task_id" not in sibling
 
 
 # ── _handle_investigation_completion ────────────────────────────────────────

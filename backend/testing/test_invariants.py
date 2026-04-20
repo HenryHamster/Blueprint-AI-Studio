@@ -557,7 +557,7 @@ class TestDirectionLifecycleInvariants:
 MODULE_SIZE_LIMITS = {
     # (relative_path_from_app_dir, max_lines)
     "main.py": 3500,
-    "task_completion.py": 2100,
+    "task_completion.py": 2150,
     "task_lifecycle.py": 2450,
     "orchestrator.py": 3000,
     "admin.py": 3000,

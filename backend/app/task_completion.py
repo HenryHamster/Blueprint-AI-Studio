@@ -167,7 +167,7 @@ def _propagate_remediation_success_to_siblings(
     project: Project,
     directions: List[Dict[str, Any]],
     fingerprint: str,
-    successful_direction_id: str,
+    successful_direction_id: Optional[str],
     task: Task,
 ) -> None:
     """Un-pause sibling directions sharing ``fingerprint`` and stamp prior-art context.
@@ -192,11 +192,17 @@ def _propagate_remediation_success_to_siblings(
         return
     prompt_snippet = (task.first_payload.get("prompt") or "").strip()[:200]
     now_iso = _utcnow().isoformat()
-    note_text = (
-        f"Sibling remediation merged ({now_iso[:10]}) for direction "
-        f"{successful_direction_id} sharing the same error fingerprint. "
-        f"Task: {task.id}."
-    )
+    if successful_direction_id:
+        note_text = (
+            f"Sibling remediation merged ({now_iso[:10]}) for direction "
+            f"{successful_direction_id} sharing the same error fingerprint. "
+            f"Task: {task.id}."
+        )
+    else:
+        note_text = (
+            f"Unlinked CI remediation merged ({now_iso[:10]}) sharing the "
+            f"same error fingerprint. Task: {task.id}."
+        )
     if prompt_snippet:
         note_text += f" Approach: {prompt_snippet}"
     note_text = note_text[:STRATEGIC_RATIONALE_MAX]
@@ -224,7 +230,8 @@ def _propagate_remediation_success_to_siblings(
         direction["last_remediation_fingerprint"] = str(fingerprint)
         direction["last_remediation_result"] = "merged"
         direction["last_remediation_at"] = now_iso
-        direction["cross_direction_remediation_source"] = str(successful_direction_id)
+        if successful_direction_id:
+            direction["cross_direction_remediation_source"] = str(successful_direction_id)
         notes = list(direction.get("notes") or [])
         notes.append({
             "text": note_text,
@@ -240,7 +247,7 @@ def _propagate_remediation_failure_to_siblings(
     project: Project,
     directions: List[Dict[str, Any]],
     fingerprint: str,
-    failed_direction_id: str,
+    failed_direction_id: Optional[str],
     task: Task,
     failure_class: Optional[str],
     error_summary: Optional[str],
@@ -263,11 +270,17 @@ def _propagate_remediation_failure_to_siblings(
         return
     prompt_snippet = (task.first_payload.get("prompt") or "").strip()[:200]
     now_iso = _utcnow().isoformat()
-    note_text = (
-        f"Sibling remediation FAILED ({now_iso[:10]}) for direction "
-        f"{failed_direction_id} sharing the same error fingerprint. "
-        f"Task: {task.id}. Do not repeat this approach."
-    )
+    if failed_direction_id:
+        note_text = (
+            f"Sibling remediation FAILED ({now_iso[:10]}) for direction "
+            f"{failed_direction_id} sharing the same error fingerprint. "
+            f"Task: {task.id}. Do not repeat this approach."
+        )
+    else:
+        note_text = (
+            f"Unlinked CI remediation FAILED ({now_iso[:10]}) sharing the "
+            f"same error fingerprint. Task: {task.id}. Do not repeat this approach."
+        )
     if failure_class:
         note_text += f" Failure: {failure_class}."
     if error_summary:
@@ -318,10 +331,14 @@ async def _record_project_remediation_outcome(
     }
     if fingerprint:
         entry["fingerprint"] = str(fingerprint)
+    failure_class: Optional[str] = None
+    error_summary: Optional[str] = None
     if not merged:
         from app.failure_classification import classify_failure  # noqa: PLC0415
-        entry["failure_class"] = classify_failure(task)
-        entry["error_summary"] = (task.latest_status_message or "")[:200]
+        failure_class = classify_failure(task)
+        error_summary = (task.latest_status_message or "")[:200]
+        entry["failure_class"] = failure_class
+        entry["error_summary"] = error_summary
     history = list(state.get("history") or [])
     history.append(entry)
     state["history"] = history[-_PROJECT_REMEDIATION_HISTORY_MAX:]
@@ -332,6 +349,40 @@ async def _record_project_remediation_outcome(
         state["last_fingerprint"] = str(fingerprint)
     project.remediation_tracking = state
     flag_modified(project, "remediation_tracking")
+
+    # Fingerprint-based sibling propagation: although this remediation is
+    # unlinked (no direction_id), other auto-paused directions may be holding
+    # on the same exact error fingerprint. Apply the same sibling notes /
+    # un-pause logic as the linked path so unlinked CI fixes don't leave
+    # siblings stuck.
+    if fingerprint:
+        directions = list(project.directions or [])
+        try:
+            if merged:
+                _propagate_remediation_success_to_siblings(
+                    project=project,
+                    directions=directions,
+                    fingerprint=str(fingerprint),
+                    successful_direction_id=None,
+                    task=task,
+                )
+            else:
+                _propagate_remediation_failure_to_siblings(
+                    project=project,
+                    directions=directions,
+                    fingerprint=str(fingerprint),
+                    failed_direction_id=None,
+                    task=task,
+                    failure_class=failure_class,
+                    error_summary=error_summary,
+                )
+            project.directions = directions
+            flag_modified(project, "directions")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[DIAGNOSIS] Failed to propagate unlinked remediation outcome "
+                f"to siblings for project {project.id}: {exc!r}"
+            )
     session.add(project)
     return True
 
@@ -742,11 +793,23 @@ async def _maybe_escalate_exhausted_followups(
         await post_remediation_escalation_message(
             session, project.id, **_build_escalation_args(direction),
         )
+        direction.pop("escalation_notification_pending", None)
+        direction.pop("escalation_notification_retries", None)
+        project.directions = directions
+        flag_modified(project, "directions")
+        session.add(project)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             f"[NOTIFY] Failed to post follow-up cap escalation for direction "
             f"{direction.get('id')}: {exc!r}"
         )
+        direction["escalation_notification_pending"] = True
+        direction["escalation_notification_retries"] = int(
+            direction.get("escalation_notification_retries", 0)
+        )
+        project.directions = directions
+        flag_modified(project, "directions")
+        session.add(project)
 
 
 async def _maybe_spawn_low_confidence_followup(

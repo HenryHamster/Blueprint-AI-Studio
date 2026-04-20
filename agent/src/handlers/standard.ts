@@ -275,6 +275,17 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       []
     ) as string[];
 
+    const diagnosisTaskId = strVal(ctx.diagnosis_task_id);
+    const diagnosisContext = diagnosisTaskId
+      ? {
+          rootCause: strVal(ctx.diagnosis_root_cause),
+          recommendedFix: strVal(ctx.diagnosis_recommended_fix),
+          priorFailedApproaches: (() => {
+            const summary = strVal(ctx._previous_error_summary);
+            return summary ? [summary] : [];
+          })(),
+        }
+      : undefined;
     const totalFileBudget = SCOPE_OVERFLOW_THRESHOLDS.medium;
     const ctxPlanLimit = ctx._analysis_plan_file_limit;
     const prodFileLimit = (typeof ctxPlanLimit === 'number' && ctxPlanLimit > 0 && ctxPlanLimit <= MEDIUM_ANALYSIS_PLAN_FILE_LIMIT)
@@ -290,6 +301,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       fileTree,
       fileLimit: prodFileLimit,
       totalFileBudget,
+      diagnosisContext,
     });
 
     const { exitCode: analysisExitCode, lastResultText: analysisResult } = await runClaudeCode(
@@ -329,6 +341,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           fileLimit: prodFileLimit,
           totalFileBudget,
           narrowingGuidance,
+          diagnosisContext,
         });
         const { exitCode: retryExitCode, lastResultText: retryResult } = await runClaudeCode(
           retryPrompt,

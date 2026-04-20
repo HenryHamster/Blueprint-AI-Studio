@@ -15,6 +15,7 @@ from app.models import Project, Task, TaskStatus
 from app.auto_remediation import (
     _handle_main_branch_ci_failure_inner,
     _extract_ci_context,
+    _extract_structured_signals,
     _build_remediation_prompt,
     _find_matching_prior_investigation,
     _find_recent_merged_remediation,
@@ -136,7 +137,7 @@ async def test_happy_path_spawns_task(db_session: AsyncSession):
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
          patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock) as mock_msg, \
          patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], "AssertionError: 1 != 2", "test")
+        mock_ctx.return_value = (["CI / tests"], "AssertionError: 1 != 2", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
 
         await _handle_main_branch_ci_failure_inner(
             owner="acme",
@@ -182,7 +183,7 @@ async def test_task_context_includes_error_fingerprint(db_session: AsyncSession)
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
          patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
          patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], error_summary, "test")
+        mock_ctx.return_value = (["CI / tests"], error_summary, "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
 
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="deadbeef",
@@ -218,7 +219,7 @@ async def test_rate_limit_rejects_third_spawn(db_session: AsyncSession):
     await db_session.flush()
 
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
-        mock_ctx.return_value = (["CI"], "error", "test")
+        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="sha3",
             head_branch="main",
@@ -243,7 +244,7 @@ async def test_duplicate_sha_rejected(db_session: AsyncSession):
     await db_session.flush()
 
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
-        mock_ctx.return_value = (["CI"], "error", "test")
+        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="deadbeef",
             head_branch="main",
@@ -271,7 +272,7 @@ async def test_concurrent_limit_blocks_spawn(db_session: AsyncSession):
     await db_session.flush()
 
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
-        mock_ctx.return_value = (["CI"], "error", "test")
+        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="sha3",
             head_branch="main",
@@ -295,7 +296,7 @@ async def test_different_sha_same_branch_blocked(db_session: AsyncSession):
     await db_session.flush()
 
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
-        mock_ctx.return_value = (["CI / build"], "SyntaxError", "build")
+        mock_ctx.return_value = (["CI / build"], "SyntaxError", "build", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="sha_new",
             head_branch="main",
@@ -384,7 +385,7 @@ async def test_completed_tasks_dont_count_concurrent(db_session: AsyncSession):
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
          patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
          patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI"], "error", "test")
+        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="sha3",
             head_branch="main",
@@ -420,13 +421,14 @@ async def test_extract_ci_context_test_failure():
         mock_token.return_value = "ghp_test_token"
         mock_runs.return_value = mock_ci_result
 
-        failed_checks, error_summary, failure_type = await _extract_ci_context(
+        failed_checks, error_summary, failure_type, signals = await _extract_ci_context(
             "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
         )
 
     assert failed_checks == ["CI / tests"]
     assert "AssertionError" in error_summary
     assert failure_type == "test"
+    assert "tests/test_main.py::test_foo" in signals["failing_tests"]
 
 
 @pytest.mark.asyncio
@@ -446,7 +448,7 @@ async def test_extract_ci_context_build_failure():
         mock_token.return_value = "ghp_test_token"
         mock_runs.return_value = mock_ci_result
 
-        failed_checks, _error_summary, failure_type = await _extract_ci_context(
+        failed_checks, _error_summary, failure_type, _signals = await _extract_ci_context(
             "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
         )
 
@@ -520,13 +522,73 @@ async def test_extract_ci_context_no_token():
     with patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
         mock_token.return_value = None
 
-        failed_checks, error_summary, failure_type = await _extract_ci_context(
+        failed_checks, error_summary, failure_type, signals = await _extract_ci_context(
             "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
         )
 
     assert failed_checks == []
     assert error_summary == ""
     assert failure_type == "unknown"
+    assert signals == {"failing_tests": [], "error_locations": [], "error_messages": []}
+
+
+def test_extract_structured_signals_pytest():
+    """Pytest FAILED lines and Python tracebacks are extracted even past truncation."""
+    logs = (
+        "collected 5 items\n"
+        "FAILED tests/test_auth.py::test_login - AssertionError: 401 != 200\n"
+        "FAILED tests/test_auth.py::test_logout - KeyError: 'session'\n"
+        'Traceback (most recent call last):\n'
+        '  File "backend/app/auth.py", line 142, in login\n'
+        '    raise AssertionError("bad creds")\n'
+        "AssertionError: bad creds\n"
+    )
+    signals = _extract_structured_signals(logs)
+    assert "tests/test_auth.py::test_login" in signals["failing_tests"]
+    assert "tests/test_auth.py::test_logout" in signals["failing_tests"]
+    assert "backend/app/auth.py:142" in signals["error_locations"]
+    assert any("AssertionError" in m for m in signals["error_messages"])
+    assert any("KeyError" in m for m in signals["error_messages"])
+
+
+def test_extract_structured_signals_tsc_eslint():
+    """TypeScript / ESLint-style file:line output is extracted."""
+    logs = (
+        "admin-ui/src/App.tsx:45:12 - error TS2304: Cannot find name 'Foo'.\n"
+        "admin-ui/src/components/Bar.tsx:10:5  error  'x' is not defined  no-undef\n"
+    )
+    signals = _extract_structured_signals(logs)
+    assert "admin-ui/src/App.tsx:45" in signals["error_locations"]
+    assert "admin-ui/src/components/Bar.tsx:10" in signals["error_locations"]
+    assert any("TS2304" in m for m in signals["error_messages"])
+
+
+def test_extract_structured_signals_survives_truncation():
+    """Signals from past the 3000-char cutoff still appear in the structured result."""
+    pad = "noise line\n" * 400  # ~4400 chars of noise
+    logs = pad + "FAILED tests/late.py::test_tail - AssertionError: boom\n"
+    signals = _extract_structured_signals(logs)
+    assert "tests/late.py::test_tail" in signals["failing_tests"]
+
+
+def test_build_remediation_prompt_includes_structured_signals():
+    """Structured signals render as a dedicated section separate from raw logs."""
+    prompt = _build_remediation_prompt(
+        head_branch="main",
+        head_sha="abc",
+        failed_checks=["CI / tests"],
+        error_summary="truncated raw output",
+        failure_type="test",
+        structured_signals={
+            "failing_tests": ["tests/test_x.py::test_y"],
+            "error_locations": ["backend/app/foo.py:42"],
+            "error_messages": ["AssertionError: nope"],
+        },
+    )
+    assert "## Structured Failure Signals" in prompt
+    assert "tests/test_x.py::test_y" in prompt
+    assert "backend/app/foo.py:42" in prompt
+    assert "AssertionError: nope" in prompt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -578,7 +640,7 @@ async def test_suspended_branch_is_blocked(db_session: AsyncSession):
     project = await _create_project(db_session)
 
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
-        mock_ctx.return_value = (["CI"], "error", "test")
+        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="deadbeef",
             head_branch="main",
@@ -601,7 +663,7 @@ async def test_skip_when_no_ci_context(db_session: AsyncSession):
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
          patch("app.main._send_webhook_notification", new_callable=AsyncMock):
         # Return the "no useful context" sentinel values
-        mock_ctx.return_value = ([], "", "unknown")
+        mock_ctx.return_value = ([], "", "unknown", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="deadbeef",
             head_branch="main",
@@ -635,7 +697,7 @@ async def test_suspended_branch_auto_recovers_after_cooldown(db_session: AsyncSe
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
          patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
          patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], "error", "test")
+        mock_ctx.return_value = (["CI / tests"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="deadbeef",
             head_branch="main",
@@ -669,7 +731,7 @@ async def test_suspended_branch_within_cooldown_stays_blocked(db_session: AsyncS
     )
 
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
-        mock_ctx.return_value = (["CI"], "error", "test")
+        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="deadbeef",
             head_branch="main",
@@ -705,7 +767,7 @@ async def test_suspended_branch_permanently_blocked_after_max_attempts(db_sessio
 
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
          patch("app.main._send_webhook_notification", new_callable=AsyncMock) as mock_webhook:
-        mock_ctx.return_value = (["CI"], "error", "test")
+        mock_ctx.return_value = (["CI"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="deadbeef",
             head_branch="main",
@@ -731,7 +793,7 @@ async def test_non_suspended_branch_spawns_normally(db_session: AsyncSession):
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
          patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
          patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], "error", "test")
+        mock_ctx.return_value = (["CI / tests"], "error", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="deadbeef",
             head_branch="main",
@@ -751,7 +813,7 @@ async def test_full_ci_remediation_cycle_spawn_to_trackable_outcome(db_session: 
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
          patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
          patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], "AssertionError: boom", "test")
+        mock_ctx.return_value = (["CI / tests"], "AssertionError: boom", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme",
             repo="webapp",
@@ -822,7 +884,7 @@ async def test_remediation_spawn_to_feedback_clears_escalation_state(db_session:
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
          patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
          patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], "AssertionError: boom", "test")
+        mock_ctx.return_value = (["CI / tests"], "AssertionError: boom", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme",
             repo="webapp",
@@ -1026,7 +1088,7 @@ async def test_prior_investigation_propagates_diagnosis_context(db_session: Asyn
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
          patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
          patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI"], "FAILED backend/app/auth.py::test_session token mismatch", "test")
+        mock_ctx.return_value = (["CI"], "FAILED backend/app/auth.py::test_session token mismatch", "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp", head_sha="deadbeef",
             head_branch="main", project_id=project.id,
@@ -1137,7 +1199,7 @@ async def test_regression_detection_injects_context_and_prompt(db_session: Async
     with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
          patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
          patch("app.main._send_webhook_notification", new_callable=AsyncMock):
-        mock_ctx.return_value = (["CI / tests"], err, "test")
+        mock_ctx.return_value = (["CI / tests"], err, "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
         await _handle_main_branch_ci_failure_inner(
             owner="acme", repo="webapp",
             head_sha="feedface", head_branch="main",

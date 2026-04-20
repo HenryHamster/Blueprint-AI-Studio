@@ -51,17 +51,18 @@ _MAX_ESCALATION_NOTIFICATION_RETRIES = 3
 _PARTIAL_SUCCESS_RATE_DROP = 0.5
 
 
-def _detect_partial_remediation_success(direction: dict) -> bool:
+def _detect_partial_remediation_success(direction: dict) -> bool | None:
     """Return True if post-remediation code-failure rate is materially lower than pre-remediation.
 
-    A remediation that reduces failures from 80% to 20% still leaves the same
-    dominant error fingerprint visible, so fingerprint-based escalation treats
-    it as total failure. Compares code-failure rate across research_history
-    entries straddling ``last_remediation_at`` and returns True when the
-    post-remediation rate dropped by at least ``_PARTIAL_SUCCESS_RATE_DROP``.
+    Returns None when research_history lacks entries on either side of
+    ``last_remediation_at`` — the data is insufficient to decide, which
+    the caller must distinguish from a confirmed failure (False) so a
+    newly-created direction or one whose cycles haven't completed yet is
+    not prematurely escalated to manual intervention.
     """
     last_rem_at = direction.get("last_remediation_at")
     if not last_rem_at:
+        # No remediation recorded — nothing to evaluate; proceed to escalation.
         return False
     try:
         boundary = datetime.fromisoformat(last_rem_at)
@@ -79,7 +80,7 @@ def _detect_partial_remediation_success(direction: dict) -> bool:
             continue
         (post if entry_at >= boundary else pre).append(entry)
     if not pre or not post:
-        return False
+        return None
 
     def _code_failure_rate(entries: list[dict]) -> float:
         created = sum(e.get("tasks_created", 0) for e in entries)
@@ -92,7 +93,7 @@ def _detect_partial_remediation_success(direction: dict) -> bool:
     pre_rate = _code_failure_rate(pre[-3:])
     post_rate = _code_failure_rate(post)
     if pre_rate <= 0:
-        return False
+        return None
     return post_rate <= pre_rate * (1.0 - _PARTIAL_SUCCESS_RATE_DROP)
 
 
@@ -523,6 +524,8 @@ async def _process_direction_lifecycle(
                 )
                 d.pop("diagnosis_in_progress", None)
                 d.pop("diagnosis_started_at", None)
+                d.pop("diagnosis_task_id", None)
+                d["diagnosis_completed_at"] = _utcnow().isoformat()
                 directions_modified = True
         # If a remediation monitor has expired while the direction stayed active,
         # the fix held — drop the monitor and clear any lingering manual-intervention
@@ -655,7 +658,8 @@ async def _process_direction_lifecycle(
                 and d.get("remediation_attempts", 0) >= 3
                 and fingerprints_match
             ):
-                if _detect_partial_remediation_success(d):
+                partial_result = _detect_partial_remediation_success(d)
+                if partial_result is True:
                     # Fix materially reduced failure rate even though the
                     # dominant fingerprint is still present — treat as partial
                     # progress so the direction is not escalated to manual
@@ -665,6 +669,11 @@ async def _process_direction_lifecycle(
                         f"[AUTONOMOUS] Direction {did} showed partial remediation success "
                         f"(code-failure rate dropped >= {int(_PARTIAL_SUCCESS_RATE_DROP * 100)}%); "
                         f"skipping manual-intervention escalation"
+                    )
+                elif partial_result is None:
+                    logger.info(
+                        f"[AUTONOMOUS] Direction {did} has insufficient research_history "
+                        f"to evaluate remediation success; deferring manual-intervention escalation"
                     )
                 else:
                     d["needs_manual_intervention"] = True

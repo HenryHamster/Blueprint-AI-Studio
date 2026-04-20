@@ -2849,6 +2849,37 @@ describe('buildAnalysisPrompt', () => {
     });
     expect(result).not.toContain('Total file budget');
   });
+
+  it('threads diagnosis context into the analysis prompt when present', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Fix the thing',
+      taskTitle: 'Title',
+      relatedFiles: [],
+      fileTree: '',
+      diagnosisContext: {
+        rootCause: 'Race condition in record_direction_result',
+        recommendedFix: 'Acquire lock before mutating dict',
+        priorFailedApproaches: ['Added retry loop — still races under load'],
+      },
+    });
+    expect(result).toContain('Diagnosis Context');
+    expect(result).toContain('diagnosed remediation');
+    expect(result).toContain('Race condition in record_direction_result');
+    expect(result).toContain('Acquire lock before mutating dict');
+    expect(result).toContain('Prior failed remediation approaches');
+    expect(result).toContain('Added retry loop');
+  });
+
+  it('omits the diagnosis context block when no diagnosis is provided', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Build feature',
+      taskTitle: 'Title',
+      relatedFiles: [],
+      fileTree: '',
+    });
+    expect(result).not.toContain('Diagnosis Context');
+    expect(result).not.toContain('diagnosed remediation');
+  });
 });
 
 // ── parseAnalysisPlanFiles ────────────────────────────────────────────────────

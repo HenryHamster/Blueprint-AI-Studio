@@ -1046,6 +1046,47 @@ async def test_structural_diagnosis_appends_note_no_remediation(db_session, mock
     assert "diagnosis_completed_at" in d
 
 
+@pytest.mark.asyncio
+async def test_stale_diagnosis_clears_all_three_fields(db_session):
+    """Stale diagnosis recovery must clear diagnosis_task_id too, not just the in-progress flag + start time."""
+    stale_iso = (datetime.utcnow() - timedelta(hours=5)).isoformat()
+    direction = {
+        "id": "d-stale-diag-1",
+        "text": "Stale diagnosis direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "diagnosis_in_progress": True,
+        "diagnosis_started_at": stale_iso,
+        "diagnosis_task_id": "task-stale-xyz",
+    }
+    project = Project(
+        name="Stale Diag",
+        user_id="u-stale",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert "diagnosis_in_progress" not in d
+    assert "diagnosis_started_at" not in d
+    assert "diagnosis_task_id" not in d
+    assert "diagnosis_completed_at" in d
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _compute_direction_error_fingerprint
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1716,17 +1757,24 @@ def test_detect_partial_success_false_when_rate_unchanged():
     assert _detect_partial_remediation_success(d) is False
 
 
-def test_detect_partial_success_false_without_post_entries():
+def test_detect_partial_success_none_without_post_entries():
     d = _partial_success_direction(pre_rate=0.8, post_rate=0.2)
-    # Drop the post-remediation entry — only pre remains.
+    # Drop the post-remediation entry — only pre remains; insufficient data.
     d["research_history"] = [d["research_history"][0]]
-    assert _detect_partial_remediation_success(d) is False
+    assert _detect_partial_remediation_success(d) is None
 
 
 def test_detect_partial_success_false_without_last_remediation_at():
     d = _partial_success_direction(pre_rate=0.8, post_rate=0.2)
     d.pop("last_remediation_at", None)
+    # No remediation recorded — treat as "no partial success", not insufficient data.
     assert _detect_partial_remediation_success(d) is False
+
+
+def test_detect_partial_success_none_with_empty_history():
+    d = _partial_success_direction(pre_rate=0.8, post_rate=0.2)
+    d["research_history"] = []
+    assert _detect_partial_remediation_success(d) is None
 
 
 @pytest.mark.asyncio
@@ -1773,6 +1821,49 @@ async def test_partial_success_skips_escalation(db_session, mocker):
     assert d.get("needs_manual_intervention") is not True
     assert d.get("last_remediation_result") == "partial_success"
     assert post_mock.await_count == 0, "escalation notification must not fire on partial success"
+
+
+@pytest.mark.asyncio
+async def test_insufficient_history_skips_escalation(db_session, mocker):
+    """Merged remediation with no pre-history => insufficient data, no manual-intervention flag."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value="fp-partial",
+    )
+    post_mock = mocker.patch(
+        "app.notification_dispatch.post_remediation_escalation_message",
+        new_callable=AsyncMock,
+    )
+    direction = _partial_success_direction(pre_rate=0.8, post_rate=0.2)
+    # Simulate newly-created direction: no pre-remediation history entries.
+    recent = [
+        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+        {"tasks_created": 4, "tasks_failed": 4, "tasks_failed_infra": 0, "prs_merged": 0},
+    ]
+    direction["research_history"] = recent
+    project = Project(
+        name="Insufficient history defers escalation",
+        user_id="u-insufficient",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("needs_manual_intervention") is not True
+    assert post_mock.await_count == 0, "escalation must not fire when history is insufficient"
 
 
 @pytest.mark.asyncio
