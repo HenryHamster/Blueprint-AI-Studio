@@ -60,6 +60,30 @@ def _compute_first_attempt_succeeded(attempt_count: int, status: "TaskStatus") -
     return attempt_count <= 1 and status == TaskStatus.COMPLETED
 
 
+def _stamp_orphan_remediation_outcome(
+    task: Task, *, merged: bool, direction_id: str,
+) -> None:
+    """Record an orphan remediation outcome on the task itself when the linked
+    direction no longer exists. Writes to ``task.context['orphan_remediation_outcome']``
+    so diagnosis/operator tooling can still locate the result."""
+    ctx = dict(task.context or {})
+    fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint")
+    outcome: Dict[str, Any] = {
+        "result": "merged" if merged else "failed",
+        "timestamp": _utcnow().isoformat(),
+        "missing_direction_id": direction_id,
+    }
+    if fingerprint:
+        outcome["fingerprint"] = str(fingerprint)
+    if not merged:
+        from app.failure_classification import classify_failure  # noqa: PLC0415
+        outcome["failure_class"] = classify_failure(task)
+        outcome["error_summary"] = (task.latest_status_message or "")[:200]
+    ctx["orphan_remediation_outcome"] = outcome
+    task.context = ctx
+    flag_modified(task, "context")
+
+
 async def _record_remediation_outcome(
     task: Task, *, merged: bool, session: AsyncSession,
 ) -> bool:
@@ -87,6 +111,13 @@ async def _record_remediation_outcome(
     directions = list(project.directions or [])
     target = next((d for d in directions if d.get("id") == direction_id), None)
     if target is None:
+        # Direction was retired or removed before the remediation task reached a
+        # terminal state. Stamp the outcome on the task itself so the fix
+        # outcome is not silently discarded — operators and the diagnosis
+        # pipeline can still find what happened via task.context.
+        _stamp_orphan_remediation_outcome(
+            task, merged=merged, direction_id=str(direction_id),
+        )
         return False
     fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint")
     prior_fingerprint = target.get("last_remediation_fingerprint")
@@ -416,10 +447,16 @@ async def _record_remediation_if_terminal(
         )
         if recorded and status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
             await _maybe_spawn_followup_investigation(task, session)
-        if not recorded and is_auto_remediation:
-            await _record_project_remediation_outcome(
-                task, merged=(status == TaskStatus.COMPLETED), session=session,
-            )
+        if not recorded:
+            # Fall back to project-level tracking whenever the direction lookup
+            # failed (either no direction_id at all on an auto_remediation, or
+            # the linked direction was retired before terminal state). This
+            # guarantees remediation outcomes are never silently discarded.
+            had_direction_linkage = bool(ctx.get("direction_id"))
+            if is_auto_remediation or had_direction_linkage:
+                await _record_project_remediation_outcome(
+                    task, merged=(status == TaskStatus.COMPLETED), session=session,
+                )
     except Exception as exc:
         logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome for task {task.id}: {exc!r}")
 

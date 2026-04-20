@@ -773,14 +773,20 @@ class TestRecordRemediationOutcome:
 
     @pytest.mark.asyncio
     async def test_no_match_when_direction_missing(self, db_session):
-        """Unknown direction_id is a no-op (returns False, no mutation)."""
+        """Retired/unknown direction_id returns False and does not mutate the
+        project's directions, but stamps an orphan outcome on the task so the
+        remediation result is not silently discarded."""
         project = make_project(directions=[{"id": "dir-other"}])
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
         task = make_task(
             project_id=project.id,
-            context={"diagnosis_task_id": "diag-1", "direction_id": "dir-missing"},
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-missing",
+                "diagnosis_fingerprint": "fp-x",
+            },
         )
         db_session.add(task)
         await db_session.commit()
@@ -788,6 +794,11 @@ class TestRecordRemediationOutcome:
         updated = await _record_remediation_outcome(task, merged=True, session=db_session)
         assert updated is False
         assert "remediation_attempts" not in project.directions[0]
+        orphan = (task.context or {}).get("orphan_remediation_outcome")
+        assert orphan is not None
+        assert orphan["result"] == "merged"
+        assert orphan["missing_direction_id"] == "dir-missing"
+        assert orphan["fingerprint"] == "fp-x"
 
     @pytest.mark.asyncio
     async def test_increments_when_fingerprint_matches(self, db_session):
