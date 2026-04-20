@@ -36,7 +36,7 @@ from app.database import AsyncSessionLocal
 from app.models import Artifact, ArtifactType, DeploymentState, Project, Task, TaskStatus
 from app.orchestrator_filters import (
     filter_file_conflicts, filter_rollup_conflicts, filter_held_directions,
-    filter_pipeline_duplicates,
+    filter_pipeline_duplicates, filter_migration_serialization,
 )
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
@@ -188,6 +188,18 @@ ORCHESTRATOR_THROTTLE_SECONDS = int(os.getenv('ORCHESTRATOR_THROTTLE_SECONDS', '
 # starving new provisions and creating a cascading failure where no VM can
 # claim its task (the reaper assigns a new vm_instance_id before the VM boots).
 _provision_coroutines: Dict[str, asyncio.Task] = {}
+
+# Columns the dispatch loop loads for active (PROVISIONING/IN_PROGRESS) tasks.
+# Heavy JSONB (status_log, depends_on, history) stays deferred. Anything a
+# downstream filter touches (e.g. filter_file_conflicts -> context/title,
+# filter_migration_serialization -> payloads via first_payload) MUST be here,
+# or attribute access triggers a sync lazy-load from async context and crashes
+# the whole dispatch cycle. Module-level so tests can mirror the exact set.
+ACTIVE_TASKS_LIGHT_COLUMNS = (
+    Task.id, Task.status, Task.last_heartbeat, Task.started_at,
+    Task.vm_instance_id, Task.project_id, Task.context, Task.title,
+    Task.payloads,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -580,15 +592,14 @@ async def orchestrator_worker():
 
                 # Fetch all active tasks once — used for both concurrency limit and counter reconciliation
                 # Light query: only load columns needed for the stale-provision scan
-                # and concurrency count. Heavy JSONB (payloads, context, status_log)
-                # is deferred — the few stale tasks are re-read with_for_update below.
+                # and concurrency count. Heavy JSONB (context, status_log) is
+                # deferred — the few stale tasks are re-read with_for_update below.
                 # context + title are needed by filter_file_conflicts (Step 2.5).
+                # payloads is needed by filter_migration_serialization (Step 2.72)
+                # via _is_migration_task -> task.first_payload.
                 # Without them, attribute access triggers a sync lazy-load from an
                 # async context and crashes the whole dispatch cycle.
-                _active_light_cols = load_only(
-                    Task.id, Task.status, Task.last_heartbeat, Task.started_at,
-                    Task.vm_instance_id, Task.project_id, Task.context, Task.title,
-                )
+                _active_light_cols = load_only(*ACTIVE_TASKS_LIGHT_COLUMNS)
                 active_tasks_result = (await session.execute(
                     select(Task)
                     .where(Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]))
@@ -1147,6 +1158,12 @@ async def orchestrator_worker():
                 # Step 2.7: Defer tasks whose direction is held due to consecutive code failures
                 eligible_ids = await filter_held_directions(
                     eligible_ids, candidate_tasks, session, broadcast_to_project
+                )
+
+                # Step 2.72: Serialize migration-producing tasks per project to avoid
+                # duplicate alembic revisions racing on the same down_revision.
+                eligible_ids = await filter_migration_serialization(
+                    eligible_ids, candidate_tasks, active_tasks_result, session, broadcast_to_project
                 )
 
                 # Step 2.75: Pre-dispatch dedup safety net for review/fix pipeline

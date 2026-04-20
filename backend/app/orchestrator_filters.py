@@ -276,6 +276,83 @@ async def filter_held_directions(
     return non_held
 
 
+def _is_migration_task(task: Task) -> bool:
+    """Return True if *task* produces an alembic migration file.
+
+    Two cases qualify: explicit ``migrate``-type tasks, and any task whose
+    ``related_files`` includes a path under ``backend/alembic/versions/``
+    (auto-generated migrations from create/refactor tasks).
+    """
+    fp = task.first_payload
+    if fp.get("type") == "migrate":
+        return True
+    files = (task.context or {}).get("related_files") or []
+    for f in files:
+        if not f:
+            continue
+        if "backend/alembic/versions/" in f.replace("\\", "/"):
+            return True
+    return False
+
+
+async def filter_migration_serialization(
+    eligible_ids: list[uuid.UUID],
+    candidate_tasks: list[Task],
+    active_tasks: list[Task],
+    session,
+    broadcast_fn: Callable[..., Coroutine[Any, Any, None]],
+) -> list[uuid.UUID]:
+    """Defer migration-producing candidates while another runs in the same project.
+
+    Two concurrent migrate tasks (or create tasks that auto-generate alembic
+    revisions) read the same latest revision and each generates the next one,
+    producing duplicate revisions with the same down_revision. Serializing
+    dispatch per project prevents that broken-chain scenario.
+    """
+    if not eligible_ids:
+        return eligible_ids
+
+    in_progress_by_project: dict[uuid.UUID, Task] = {}
+    for t in active_tasks:
+        if t.status != TaskStatus.IN_PROGRESS:
+            continue
+        if not _is_migration_task(t):
+            continue
+        in_progress_by_project.setdefault(t.project_id, t)
+
+    if not in_progress_by_project:
+        return eligible_ids
+
+    non_blocked = []
+    for eid in eligible_ids:
+        candidate = next((t for t in candidate_tasks if t.id == eid), None)
+        if candidate is None or not _is_migration_task(candidate):
+            non_blocked.append(eid)
+            continue
+        blocker = in_progress_by_project.get(candidate.project_id)
+        if blocker is None or blocker.id == candidate.id:
+            non_blocked.append(eid)
+            continue
+        defer_msg = (
+            f"Waiting: serializing migration — task {str(blocker.id)[:8]} "
+            f"is already producing a migration in this project"
+        )
+        if candidate.latest_status_message != defer_msg:
+            candidate.latest_status_message = defer_msg
+            session.add(candidate)
+            try:
+                await broadcast_fn(
+                    str(candidate.project_id), "task_updated",
+                    {"task_id": str(eid), "status": "QUEUED", "message": defer_msg},
+                )
+            except Exception:
+                logger.debug(f"Failed to broadcast migration deferral for {eid}", exc_info=True)
+        logger.info(
+            f"[DISPATCH] Deferring migration task {eid} — blocked by {blocker.id} in project {candidate.project_id}"
+        )
+    return non_blocked
+
+
 async def filter_pipeline_duplicates(
     eligible_ids: list[uuid.UUID],
     candidate_tasks: list[Task],
