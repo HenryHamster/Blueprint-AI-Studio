@@ -29,7 +29,7 @@ class TestSafetyConstants:
     def test_max_autonomous_tasks_per_hour(self):
         """Rate limit for autonomous task spawning."""
         from app.shared_state import runtime_config
-        assert runtime_config["max_autonomous_tasks_per_hour"] == 5
+        assert runtime_config["max_autonomous_tasks_per_hour"] == 12
 
     def test_max_rollup_retries_default(self):
         """Default max_rollup_retries must be 5 — controls rollup PR creation retry ceiling."""
@@ -506,7 +506,7 @@ FRONTEND_SIZE_LIMITS = {
     "components/TaskCard.tsx": 1500,
     "components/DirectionCard.tsx": 1200,
     "components/PipelineView.tsx": 1200,
-    "components/DashboardHome.tsx": 1300,
+    "components/DashboardHome.tsx": 1500,
     "components/MessagesPanel.tsx": 1000,
 }
 

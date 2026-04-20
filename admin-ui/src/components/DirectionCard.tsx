@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import type React from 'react';
 import { AlertTriangle, Check, ChevronDown, ChevronRight, ChevronUp, Loader2, Pencil, Trash2, X, Zap } from 'lucide-react';
 import { BarChart, Bar, Cell, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts';
@@ -73,7 +73,7 @@ export interface DirectionCardProps {
   onNavigateToTask?: (taskId: string) => void;
 }
 
-export function DirectionCard({
+function DirectionCardImpl({
   direction: d,
   statusKey: key,
   activeItems,
@@ -90,6 +90,50 @@ export function DirectionCard({
 }: DirectionCardProps) {
   const forceConfirmRef = useRef<HTMLDivElement | null>(null);
   const [expandedNotes, setExpandedNotes] = useState<Set<number>>(new Set());
+
+  const lifetimeMetrics = useMemo(() => {
+    const history = d.research_history;
+    if (!history || history.length === 0) return null;
+
+    const historyMerged = history.reduce((sum, e) => sum + (e.prs_merged ?? 0), 0);
+    const historyFailed = history.reduce((sum, e) => sum + (e.tasks_failed ?? 0), 0);
+    const aggMerged = d.history_aggregate?.total_prs_merged ?? 0;
+    const aggFailed = d.history_aggregate?.total_tasks_failed ?? 0;
+    const totalMerged = historyMerged + (aggMerged as number);
+    const totalFailed = historyFailed + (aggFailed as number);
+    const totalTasks = totalMerged + totalFailed;
+    const successRate = totalTasks >= 3 ? Math.round((totalMerged / totalTasks) * 100) : null;
+
+    const latestShipped = [...history].reverse().find(e => (e.prs_merged ?? 0) > 0 && e.finding_titles.length > 0);
+    const latestTitle = latestShipped?.finding_titles[0];
+    const truncatedTitle = latestTitle && latestTitle.length > 60 ? latestTitle.slice(0, 60) + '…' : latestTitle;
+
+    const sparkData = history.map((e, i) => ({
+      cycle: i,
+      prs: e.prs_merged ?? 0,
+      timestamp: e.timestamp,
+      findings: e.finding_titles,
+    }));
+    const lastEntry = history[history.length - 1];
+    const lastPrs = lastEntry.prs_merged ?? 0;
+    let recentNoMergeCount = 0;
+    for (let i = history.length - 1; i >= 0; i--) {
+      if ((history[i].prs_merged ?? 0) > 0) break;
+      recentNoMergeCount++;
+    }
+    const lastCycleLabel = lastPrs > 0
+      ? `Last cycle: ${lastPrs} PR${lastPrs !== 1 ? 's' : ''}`
+      : `No merges in last ${recentNoMergeCount} cycle${recentNoMergeCount !== 1 ? 's' : ''}`;
+
+    return {
+      totalMerged,
+      successRate,
+      latestShipped,
+      truncatedTitle,
+      sparkData,
+      lastCycleLabel,
+    };
+  }, [d.research_history, d.history_aggregate]);
 
   // Close force-confirm popover on outside click
   useEffect(() => {
@@ -703,106 +747,70 @@ export function DirectionCard({
             </div>
           )}
           {/* Lifetime outcome metrics */}
-          {d.research_history && d.research_history.length > 0 && (() => {
-            const historyMerged = d.research_history.reduce((sum, e) => sum + (e.prs_merged ?? 0), 0);
-            const historyFailed = d.research_history.reduce((sum, e) => sum + (e.tasks_failed ?? 0), 0);
-            const aggMerged = d.history_aggregate?.total_prs_merged ?? 0;
-            const aggFailed = d.history_aggregate?.total_tasks_failed ?? 0;
-            const totalMerged = historyMerged + (aggMerged as number);
-            const totalFailed = historyFailed + (aggFailed as number);
-            const totalTasks = totalMerged + totalFailed;
-            const successRate = totalTasks >= 3 ? Math.round((totalMerged / totalTasks) * 100) : null;
-
-            // Find most recent entry with prs_merged > 0 and finding_titles
-            const latestShipped = [...d.research_history].reverse().find(e => (e.prs_merged ?? 0) > 0 && e.finding_titles.length > 0);
-            const latestTitle = latestShipped?.finding_titles[0];
-            const truncatedTitle = latestTitle && latestTitle.length > 60 ? latestTitle.slice(0, 60) + '…' : latestTitle;
-
-            // Sparkline data and label
-            const sparkData = d.research_history.map((e, i) => ({
-              cycle: i,
-              prs: e.prs_merged ?? 0,
-              timestamp: e.timestamp,
-              findings: e.finding_titles,
-            }));
-            const lastEntry = d.research_history[d.research_history.length - 1];
-            const lastPrs = lastEntry.prs_merged ?? 0;
-            const recentNoMergeCount = (() => {
-              let count = 0;
-              for (let i = d.research_history.length - 1; i >= 0; i--) {
-                if ((d.research_history[i].prs_merged ?? 0) > 0) break;
-                count++;
-              }
-              return count;
-            })();
-            const lastCycleLabel = lastPrs > 0
-              ? `Last cycle: ${lastPrs} PR${lastPrs !== 1 ? 's' : ''}`
-              : `No merges in last ${recentNoMergeCount} cycle${recentNoMergeCount !== 1 ? 's' : ''}`;
-
-            return (
-              <div className="mt-1.5 space-y-0.5">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${totalMerged > 0 ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400' : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-500'}`}>
-                    {totalMerged} PRs shipped
-                  </span>
-                  {successRate !== null && (() => {
-                    const color = successRate >= 70 ? 'emerald' : successRate >= 40 ? 'amber' : 'red';
-                    return (
-                      <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
-                        {successRate}% success
-                      </span>
-                    );
-                  })()}
-                  {onViewFindings && (
-                    <button
-                      onClick={() => onViewFindings(d.id)}
-                      className="text-[10px] text-blue-400 hover:text-blue-300 cursor-pointer transition-colors"
-                    >
-                      View findings →
-                    </button>
-                  )}
-                </div>
-                {latestShipped && truncatedTitle && (
-                  <p className="text-[10px] text-neutral-600 italic leading-relaxed">
-                    Latest shipped: {truncatedTitle} <span className="not-italic">({formatRelativeTime(latestShipped.timestamp)})</span>
-                  </p>
-                )}
-                {sparkData.length >= 3 && (
-                  <div className="mt-1">
-                    <ResponsiveContainer width="100%" height={30}>
-                      <BarChart data={sparkData} barCategoryGap="15%" margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
-                        <Bar dataKey="prs" isAnimationActive={false}>
-                          {sparkData.map((entry, index) => (
-                            <Cell
-                              key={`cell-${index}`}
-                              fill={entry.prs > 0 ? '#10b981' : '#404040'}
-                            />
-                          ))}
-                        </Bar>
-                        <RechartsTooltip
-                          cursor={{ fill: 'rgba(255,255,255,0.05)' }}
-                          content={({ active, payload }) => {
-                            if (!active || !payload?.length) return null;
-                            const pt = payload[0].payload as { prs: number; timestamp: string; findings: string[] };
-                            return (
-                              <div className="text-[10px] bg-neutral-900 border border-neutral-700 rounded px-2 py-1 max-w-[180px] shadow-lg">
-                                <div className="text-neutral-400">{formatRelativeTime(pt.timestamp)}</div>
-                                <div className="text-emerald-400 font-medium">{pt.prs} PR{pt.prs !== 1 ? 's' : ''} merged</div>
-                                {pt.findings.slice(0, 2).map((f, fi) => (
-                                  <div key={fi} className="text-neutral-500 truncate">• {f.slice(0, 45)}</div>
-                                ))}
-                              </div>
-                            );
-                          }}
-                        />
-                      </BarChart>
-                    </ResponsiveContainer>
-                    <p className="text-[10px] text-neutral-600 mt-0.5">{lastCycleLabel}</p>
-                  </div>
+          {lifetimeMetrics && (
+            <div className="mt-1.5 space-y-0.5">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${lifetimeMetrics.totalMerged > 0 ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400' : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-500'}`}>
+                  {lifetimeMetrics.totalMerged} PRs shipped
+                </span>
+                {lifetimeMetrics.successRate !== null && (() => {
+                  const rate = lifetimeMetrics.successRate;
+                  const color = rate >= 70 ? 'emerald' : rate >= 40 ? 'amber' : 'red';
+                  return (
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}>
+                      {rate}% success
+                    </span>
+                  );
+                })()}
+                {onViewFindings && (
+                  <button
+                    onClick={() => onViewFindings(d.id)}
+                    className="text-[10px] text-blue-400 hover:text-blue-300 cursor-pointer transition-colors"
+                  >
+                    View findings →
+                  </button>
                 )}
               </div>
-            );
-          })()}
+              {lifetimeMetrics.latestShipped && lifetimeMetrics.truncatedTitle && (
+                <p className="text-[10px] text-neutral-600 italic leading-relaxed">
+                  Latest shipped: {lifetimeMetrics.truncatedTitle} <span className="not-italic">({formatRelativeTime(lifetimeMetrics.latestShipped.timestamp)})</span>
+                </p>
+              )}
+              {lifetimeMetrics.sparkData.length >= 3 && (
+                <div className="mt-1">
+                  <ResponsiveContainer width="100%" height={30}>
+                    <BarChart data={lifetimeMetrics.sparkData} barCategoryGap="15%" margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                      <Bar dataKey="prs" isAnimationActive={false}>
+                        {lifetimeMetrics.sparkData.map((entry, index) => (
+                          <Cell
+                            key={`cell-${index}`}
+                            fill={entry.prs > 0 ? '#10b981' : '#404040'}
+                          />
+                        ))}
+                      </Bar>
+                      <RechartsTooltip
+                        cursor={{ fill: 'rgba(255,255,255,0.05)' }}
+                        content={({ active, payload }) => {
+                          if (!active || !payload?.length) return null;
+                          const pt = payload[0].payload as { prs: number; timestamp: string; findings: string[] };
+                          return (
+                            <div className="text-[10px] bg-neutral-900 border border-neutral-700 rounded px-2 py-1 max-w-[180px] shadow-lg">
+                              <div className="text-neutral-400">{formatRelativeTime(pt.timestamp)}</div>
+                              <div className="text-emerald-400 font-medium">{pt.prs} PR{pt.prs !== 1 ? 's' : ''} merged</div>
+                              {pt.findings.slice(0, 2).map((f, fi) => (
+                                <div key={fi} className="text-neutral-500 truncate">• {f.slice(0, 45)}</div>
+                              ))}
+                            </div>
+                          );
+                        }}
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
+                  <p className="text-[10px] text-neutral-600 mt-0.5">{lifetimeMetrics.lastCycleLabel}</p>
+                </div>
+              )}
+            </div>
+          )}
           {d.research_history && d.research_history.length > 0 && (
             <div className="mt-2">
               <button
@@ -922,3 +930,5 @@ export function DirectionCard({
     </div>
   );
 }
+
+export const DirectionCard = memo(DirectionCardImpl);

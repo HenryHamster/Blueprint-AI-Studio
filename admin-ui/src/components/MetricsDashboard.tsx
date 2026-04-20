@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { parseTimestamp } from '../utils/time';
 import type { Task } from './TaskCard';
 import {
@@ -188,6 +188,17 @@ function getTaskCompletedTime(task: Task): number | null {
   return isNaN(ts) ? null : ts;
 }
 
+function getTaskFailedTime(task: Task): number | null {
+  if (task.status !== 'FAILED') return null;
+  if (task.history && task.history.length > 0) {
+    const last = task.history[task.history.length - 1];
+    const ts = parseTimestamp(last.timestamp).getTime();
+    if (!isNaN(ts)) return ts;
+  }
+  const ts = parseTimestamp(task.created_at).getTime();
+  return isNaN(ts) ? null : ts;
+}
+
 const WINDOW_OPTIONS: Array<'15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all'> = ['15m', '30m', '1h', '2h', '3h', '6h', '12h', '24h', 'all'];
 
 export default function MetricsDashboard({
@@ -202,32 +213,39 @@ export default function MetricsDashboard({
   const windowMs = WINDOW_MS[metricsWindow];
   const [now] = useState(Date.now);
 
-  const completedTasks = tasks
-    .map((t) => ({ task: t, completedAt: getTaskCompletedTime(t) }))
-    .filter((t): t is { task: Task; completedAt: number } => t.completedAt !== null);
+  const completedTasks = useMemo(
+    () =>
+      tasks
+        .map((t) => ({ task: t, completedAt: getTaskCompletedTime(t) }))
+        .filter((t): t is { task: Task; completedAt: number } => t.completedAt !== null),
+    [tasks],
+  );
 
-  const count1h = completedTasks.filter((t) => now - t.completedAt <= 3_600_000).length;
-  const count6h = completedTasks.filter((t) => now - t.completedAt <= 21_600_000).length;
-  const count24h = completedTasks.filter((t) => now - t.completedAt <= 86_400_000).length;
+  const { count1h, count6h, count24h } = useMemo(
+    () => ({
+      count1h: completedTasks.filter((t) => now - t.completedAt <= 3_600_000).length,
+      count6h: completedTasks.filter((t) => now - t.completedAt <= 21_600_000).length,
+      count24h: completedTasks.filter((t) => now - t.completedAt <= 86_400_000).length,
+    }),
+    [completedTasks, now],
+  );
 
-  function getTaskFailedTime(task: Task): number | null {
-    if (task.status !== 'FAILED') return null;
-    if (task.history && task.history.length > 0) {
-      const last = task.history[task.history.length - 1];
-      const ts = parseTimestamp(last.timestamp).getTime();
-      if (!isNaN(ts)) return ts;
-    }
-    const ts = parseTimestamp(task.created_at).getTime();
-    return isNaN(ts) ? null : ts;
-  }
+  const failedTasks = useMemo(
+    () =>
+      tasks
+        .map((t) => ({ task: t, failedAt: getTaskFailedTime(t) }))
+        .filter((t): t is { task: Task; failedAt: number } => t.failedAt !== null),
+    [tasks],
+  );
 
-  const failedTasks = tasks
-    .map((t) => ({ task: t, failedAt: getTaskFailedTime(t) }))
-    .filter((t): t is { task: Task; failedAt: number } => t.failedAt !== null);
-
-  const failed1h = failedTasks.filter((t) => now - t.failedAt <= 3_600_000).length;
-  const failed6h = failedTasks.filter((t) => now - t.failedAt <= 21_600_000).length;
-  const failed24h = failedTasks.filter((t) => now - t.failedAt <= 86_400_000).length;
+  const { failed1h, failed6h, failed24h } = useMemo(
+    () => ({
+      failed1h: failedTasks.filter((t) => now - t.failedAt <= 3_600_000).length,
+      failed6h: failedTasks.filter((t) => now - t.failedAt <= 21_600_000).length,
+      failed24h: failedTasks.filter((t) => now - t.failedAt <= 86_400_000).length,
+    }),
+    [failedTasks, now],
+  );
 
   function successRate(completed: number, failed: number): string {
     const total = completed + failed;

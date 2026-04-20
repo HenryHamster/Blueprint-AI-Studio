@@ -142,7 +142,7 @@ async def delete_project_admin(
 
     ACTIVE_STATUSES = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
     active_tasks = (await session.execute(
-        select(Task.id).where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
+        select(Task).where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
     )).scalars().all()
 
     if active_tasks and not force:
@@ -154,13 +154,11 @@ async def delete_project_admin(
     if active_tasks and force:
         # Force: cancel active tasks and delete their VMs
         from app.main import _ensure_vm_deleted
-        for task_id in active_tasks:
-            task = await session.get(Task, task_id)
-            if task:
-                task.status = TaskStatus.CANCELLED
-                task.latest_status_message = "Project force-deleted"
-                session.add(task)
-                await _ensure_vm_deleted(task, reason="project_force_delete")
+        for task in active_tasks:
+            task.status = TaskStatus.CANCELLED
+            task.latest_status_message = "Project force-deleted"
+            session.add(task)
+            await _ensure_vm_deleted(task, reason="project_force_delete")
         await session.commit()
 
     # Delete dependent records that lack ON DELETE CASCADE

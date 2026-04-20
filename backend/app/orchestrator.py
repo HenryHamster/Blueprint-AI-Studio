@@ -138,17 +138,19 @@ async def _emit_all_accounts_blocked_stall(
         logger.exception("[ORCHESTRATOR] Failed to broadcast all_accounts_blocked throttle")
     try:
         projects = (await session.execute(select(Project))).scalars().all()
+        project_ids = [p.id for p in projects]
+        existing_rows = (await session.execute(
+            select(Alert.project_id).where(
+                Alert.project_id.in_(project_ids),
+                Alert.task_id.is_(None),
+                Alert.severity == AlertSeverity.ERROR,
+                Alert.dismissed_at.is_(None),
+                Alert.title == title,
+            )
+        )).all() if project_ids else []
+        projects_with_alert = {row[0] for row in existing_rows}
         for proj in projects:
-            existing = (await session.execute(
-                select(Alert).where(
-                    Alert.project_id == proj.id,
-                    Alert.task_id.is_(None),
-                    Alert.severity == AlertSeverity.ERROR,
-                    Alert.dismissed_at.is_(None),
-                    Alert.title == title,
-                )
-            )).scalars().first()
-            if existing is None:
+            if proj.id not in projects_with_alert:
                 alert = Alert(
                     project_id=proj.id,
                     severity=AlertSeverity.ERROR,

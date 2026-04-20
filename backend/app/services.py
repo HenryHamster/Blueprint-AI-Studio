@@ -1367,26 +1367,40 @@ async def _recover_orphaned_tasks():
                 )
             )).scalars().all()
 
+            cand_ids = [t.id for t in candidates]
+            if cand_ids:
+                artifact_rows = (await session.execute(
+                    select(Artifact.task_id).where(
+                        Artifact.task_id.in_(cand_ids),
+                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    )
+                )).all()
+                tasks_with_pr = {row[0] for row in artifact_rows}
+
+                child_rows = (await session.execute(
+                    select(Task.parent_task_id, Task.payloads).where(
+                        Task.parent_task_id.in_(cand_ids)
+                    )
+                )).all()
+                children_by_parent: dict = {}
+                for parent_id, payloads in child_rows:
+                    children_by_parent.setdefault(parent_id, []).append(payloads)
+            else:
+                tasks_with_pr = set()
+                children_by_parent = {}
+
             for task in candidates:
                 task_type = task.first_payload.get("type", "")
                 if task_type not in ("create", "refactor", "fix", "docs", "deps", "migrate"):
                     continue
 
                 # Check if PR artifact exists
-                has_artifact = (await session.execute(
-                    select(Artifact.id).where(
-                        Artifact.task_id == task.id,
-                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-                    ).limit(1)
-                )).first()
-                if has_artifact:
+                if task.id in tasks_with_pr:
                     continue
 
                 # Check if review child exists
-                children = (await session.execute(
-                    select(Task).where(Task.parent_task_id == task.id)
-                )).scalars().all()
-                if any(t.first_payload.get("type") == "review" for t in children):
+                child_payloads_list = children_by_parent.get(task.id, [])
+                if any((payloads or [{}])[0].get("type") == "review" for payloads in child_payloads_list):
                     continue
 
                 # Orphan has no PR yet. Cap retries — if we've looked 3 times
@@ -1474,26 +1488,44 @@ async def _recover_orphaned_tasks():
                 )
             )).scalars().all()
 
+            reaped_ids = [t.id for t in reaped_candidates]
+            if reaped_ids:
+                pr_artifact_rows = (await session.execute(
+                    select(Artifact.task_id, Artifact.pr_url).where(
+                        Artifact.task_id.in_(reaped_ids),
+                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    )
+                )).all()
+                pr_url_by_task: dict = {}
+                for task_id, pr_url in pr_artifact_rows:
+                    if pr_url and not pr_url_by_task.get(task_id):
+                        pr_url_by_task[task_id] = pr_url
+
+                reaped_child_rows = (await session.execute(
+                    select(Task.parent_task_id, Task.payloads).where(
+                        Task.parent_task_id.in_(reaped_ids)
+                    )
+                )).all()
+                reaped_children_by_parent: dict = {}
+                for parent_id, payloads in reaped_child_rows:
+                    reaped_children_by_parent.setdefault(parent_id, []).append(payloads)
+            else:
+                pr_url_by_task = {}
+                reaped_children_by_parent = {}
+
             for task in reaped_candidates:
                 task_type = task.first_payload.get("type", "")
                 if task_type not in ("create", "refactor", "fix", "docs", "deps", "migrate"):
                     continue
 
                 # Only recover tasks that already have a PR artifact
-                pr_artifact = (await session.execute(
-                    select(Artifact).where(
-                        Artifact.task_id == task.id,
-                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-                    ).limit(1)
-                )).scalars().first()
-                if not pr_artifact or not pr_artifact.pr_url:
+                pr_url = pr_url_by_task.get(task.id)
+                if not pr_url:
                     continue
 
                 # Skip if review child already exists
-                children = (await session.execute(
-                    select(Task).where(Task.parent_task_id == task.id)
-                )).scalars().all()
-                if any(t.first_payload.get("type") == "review" for t in children):
+                child_payloads_list = reaped_children_by_parent.get(task.id, [])
+                if any((payloads or [{}])[0].get("type") == "review" for payloads in child_payloads_list):
                     continue
 
                 # Lock row to prevent race with reaper/dispatcher
@@ -1503,7 +1535,6 @@ async def _recover_orphaned_tasks():
                 if not locked or locked.status not in (TaskStatus.QUEUED, TaskStatus.PROVISIONING):
                     continue
 
-                pr_url = pr_artifact.pr_url
                 pr_number = int(pr_url.rstrip("/").split("/")[-1])
                 base_branch = locked.first_payload.get("base_branch", "main")
                 short_id = str(locked.id).replace('-', '')[:8]

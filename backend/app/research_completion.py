@@ -4,6 +4,7 @@ Extracted from app.task_completion to keep that module focused on plan/security/
 completion handlers. Contains the research findings parser, context builder,
 and the large _handle_research_completion handler.
 """
+import asyncio
 import json
 import logging
 import os
@@ -140,20 +141,24 @@ def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
     return None
 
 
-def _parse_research_insights(task_id: str) -> List[Dict[str, Any]]:
+async def _parse_research_insights(task_id: str) -> List[Dict[str, Any]]:
     """Read structured research insights from the agent's /tmp output file."""
     insights_path = f"/tmp/research_insights_{task_id}.json"
-    try:
-        if not os.path.exists(insights_path):
-            return []
-        with open(insights_path, "r") as f:
-            raw = f.read(200_000)
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return [i for i in data if isinstance(i, dict) and "summary" in i]
-    except Exception as e:
-        logger.warning(f"[RESEARCH] Failed to read insights file {insights_path}: {e}")
-    return []
+
+    def _read_sync() -> List[Dict[str, Any]]:
+        try:
+            if not os.path.exists(insights_path):
+                return []
+            with open(insights_path, "r") as f:
+                raw = f.read(200_000)
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [i for i in data if isinstance(i, dict) and "summary" in i]
+        except Exception as e:
+            logger.warning(f"[RESEARCH] Failed to read insights file {insights_path}: {e}")
+        return []
+
+    return await asyncio.to_thread(_read_sync)
 
 
 def _avg_medium_expansion_ratio(
@@ -452,7 +457,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         return
 
     findings = _parse_research_findings(logs)
-    insights = _parse_research_insights(str(task.id))
+    insights = await _parse_research_insights(str(task.id))
     if not findings:
         task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []

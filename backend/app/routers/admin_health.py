@@ -31,7 +31,7 @@ router = APIRouter(
 @router.get("/health-overview")
 async def get_health_overview(
     project_id: uuid.UUID | None = Query(None),
-    lookback_hours: int = Query(24, ge=1, le=8760),
+    lookback_hours: int = Query(24, ge=1, le=720),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
@@ -52,7 +52,9 @@ async def get_health_overview(
                 Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
                 Task.created_at >= prev_window_start,
                 Task.archived.is_(False),
-            )
+            ).options(
+                load_only(Task.id, Task.status, Task.created_at, Task.status_log)
+            ).limit(20000)
         )
         xp_tasks = xp_result.scalars().all()
 
@@ -295,7 +297,7 @@ async def get_health_overview(
         project = await session.get(Project, project_id)
         projects_for_dirs = [project] if project else []
     else:
-        all_projects_result = await session.execute(select(Project))
+        all_projects_result = await session.execute(select(Project).limit(500))
         projects_for_dirs = all_projects_result.scalars().all()
 
     for proj in projects_for_dirs:

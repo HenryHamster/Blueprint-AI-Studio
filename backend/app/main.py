@@ -583,17 +583,19 @@ async def _create_orchestrator_error_alerts(session: AsyncSession, consecutive_e
         "The pipeline may be stalled. Check logs for details."
     )
     projects = (await session.execute(select(Project))).scalars().all()
+    project_ids = [p.id for p in projects]
+    existing_rows = (await session.execute(
+        select(Alert.project_id).where(
+            Alert.project_id.in_(project_ids),
+            Alert.task_id.is_(None),
+            Alert.severity == AlertSeverity.ERROR,
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )).all() if project_ids else []
+    projects_with_alert = {row[0] for row in existing_rows}
     for project in projects:
-        existing = (await session.execute(
-            select(Alert).where(
-                Alert.project_id == project.id,
-                Alert.task_id.is_(None),
-                Alert.severity == AlertSeverity.ERROR,
-                Alert.dismissed_at.is_(None),
-                Alert.title == title,
-            )
-        )).scalars().first()
-        if existing is not None:
+        if project.id in projects_with_alert:
             continue
         alert = Alert(
             project_id=project.id,

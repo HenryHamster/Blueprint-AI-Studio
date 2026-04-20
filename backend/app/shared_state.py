@@ -75,7 +75,7 @@ runtime_config: Dict = {
     "queued_age_alert_hours": int(os.getenv("QUEUED_AGE_ALERT_HOURS", "2")),
     "retry_after_reset_alert_threshold": int(os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")),
     "retry_after_reset_fail_threshold": int(os.getenv("RETRY_AFTER_RESET_FAIL_THRESHOLD", "16")),
-    "max_autonomous_tasks_per_hour": 5,
+    "max_autonomous_tasks_per_hour": 12,
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
     # Per-task-type model/effort defaults (synced from frontend settings)
@@ -135,7 +135,7 @@ runtime_config: Dict = {
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
     "max_active_directions": 10,
-    "max_parallel_research_per_project": 3,
+    "max_parallel_research_per_project": 6,
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
     "spawn_confidence_threshold": 0.25,  # P(success) below this injects low_confidence_spawn=True into task context
@@ -665,7 +665,7 @@ DIRECTION_HOLD_THRESHOLD = 3
 # (e.g. files that consistently OOM the agent, scope that always overflows).
 DIRECTION_INFRA_HOLD_THRESHOLD = 6
 # Automatic hold expiry (safety valve so a direction doesn't stay blocked forever)
-DIRECTION_HOLD_TIMEOUT_HOURS = 4
+DIRECTION_HOLD_TIMEOUT_HOURS = 2
 
 # _DIRECTION_INFRA_CLASSES: imported from failure_classification at module top-level.
 # Failure classes that are infrastructure-level and should NOT count toward

@@ -949,8 +949,27 @@ async def get_digest(
     if project_id:
         task_filters.append(Task.project_id == project_id)
 
-    tasks_result = await session.execute(select(Task).where(*task_filters))
+    _DIGEST_TASK_ROW_CAP = 5000
+    tasks_result = await session.execute(
+        select(Task)
+        .where(*task_filters)
+        .options(load_only(
+            Task.id, Task.status, Task.project_id, Task.title,
+            Task.created_at, Task.started_at,
+            Task.payloads, Task.context, Task.status_log,
+            Task.latest_status_message, Task.attempt_count,
+            Task.requires_approval,
+            Task.vm_provisioned_at, Task.vm_started_at,
+            Task.vm_stopped_at, Task.vm_spot,
+        ))
+        .limit(_DIGEST_TASK_ROW_CAP)
+    )
     all_tasks = tasks_result.scalars().all()
+    if len(all_tasks) == _DIGEST_TASK_ROW_CAP:
+        logger.warning(
+            "admin_digest task query hit %d-row safety cap (window=%dh, project_id=%s); digest metrics may be truncated",
+            _DIGEST_TASK_ROW_CAP, hours, project_id,
+        )
 
     # Post-filter completed/failed by completion timestamp, not creation time
     completed_tasks = [

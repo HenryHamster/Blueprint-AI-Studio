@@ -990,12 +990,12 @@ async def test_delete_nonexistent_direction_returns_404(client: AsyncClient, moc
 
 @pytest.mark.asyncio
 async def test_get_settings_returns_max_parallel_default(client: AsyncClient):
-    """GET /api/admin/settings returns max_parallel_research_per_project with default 3."""
+    """GET /api/admin/settings returns max_parallel_research_per_project with default 6."""
     resp = await client.get("/api/admin/settings")
     assert resp.status_code == 200
     data = resp.json()
     assert "max_parallel_research_per_project" in data
-    assert data["max_parallel_research_per_project"] == 3
+    assert data["max_parallel_research_per_project"] == 6
 
 
 @pytest.mark.asyncio
