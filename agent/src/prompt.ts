@@ -648,6 +648,33 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         }
       }
     }
+    const ptPatterns = dirCtx.prompt_telemetry_patterns as Record<string, Record<string, unknown>> | undefined;
+    if (ptPatterns && (ptPatterns.merged || ptPatterns.failed)) {
+      const fmt = (b: Record<string, unknown> | undefined): string | null => {
+        if (!b) return null;
+        const n = Number(b.count) || 0;
+        if (n <= 0) return null;
+        const chars = Number(b.avg_char_count);
+        const rfc = Number(b.avg_related_file_count);
+        const ratio = Number(b.avg_files_to_budget_ratio);
+        const tests = Number(b.frac_mentions_tests);
+        const syms = Number(b.frac_mentions_symbols);
+        const parts: string[] = [`n=${n}`];
+        if (Number.isFinite(chars)) parts.push(`avg_chars=${Math.round(chars)}`);
+        if (Number.isFinite(rfc)) parts.push(`avg_files=${rfc.toFixed(2)}`);
+        if (Number.isFinite(ratio)) parts.push(`files/budget=${ratio.toFixed(2)}`);
+        if (Number.isFinite(tests)) parts.push(`mentions_tests=${Math.round(tests * 100)}%`);
+        if (Number.isFinite(syms)) parts.push(`mentions_symbols=${Math.round(syms * 100)}%`);
+        return parts.join(', ');
+      };
+      const mergedLine = fmt(ptPatterns.merged);
+      const failedLine = fmt(ptPatterns.failed);
+      if (mergedLine || failedLine) {
+        dcLines.push('**Prompt patterns (last 3 cycles, merged vs failed):**');
+        if (mergedLine) dcLines.push(`- merged: ${mergedLine}`);
+        if (failedLine) dcLines.push(`- failed: ${failedLine}`);
+      }
+    }
     const patterns = synthesizeSuccessPatterns(dirCtx, taskScope);
     if (patterns.length > 0) {
       dcLines.push('**What tends to work:**');

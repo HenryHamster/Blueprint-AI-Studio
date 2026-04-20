@@ -567,6 +567,35 @@ def predict_spawn_success(
         signals.append(max(0.0, min(1.0, float(complexity_score))))
         weights.append(1.5)
 
+    # Signal 15: module review-feedback history. When a finding's related_files
+    # overlap with modules that have accumulated review-issue counts in the
+    # project's module_feedback profiles, the review pipeline has historically
+    # caught many issues there — penalize the spawn proportionally. Uses the
+    # same decay-adjusted `total` counts surfaced as module_feedback_warnings
+    # via the claim endpoint (decay is applied at write time in
+    # _update_module_feedback_profiles). Requires project and related_files.
+    if project is not None and related_files:
+        design_doc = getattr(project, "design_doc", None) or {}
+        module_feedback = design_doc.get("module_feedback") or {}
+        if module_feedback:
+            aggregate_total = 0
+            for f in related_files:
+                profile = module_feedback.get(f)
+                if not isinstance(profile, dict):
+                    continue
+                t = profile.get("total", 0)
+                if isinstance(t, int) and t >= 3:
+                    aggregate_total += t
+            if aggregate_total >= 15:
+                signals.append(0.2)
+                weights.append(1.5)
+            elif aggregate_total >= 8:
+                signals.append(0.4)
+                weights.append(1.5)
+            elif aggregate_total >= 3:
+                signals.append(0.6)
+                weights.append(1.5)
+
     # Signal 14: rolling median review-iteration count. Directions whose tasks
     # consistently need many review cycles before merging are producing
     # lower-quality findings that consume disproportionate compute. Graduated

@@ -166,6 +166,15 @@ _MID_BUDGET_NARROW_FOCUS_PREFIX = (
     "cleanups and refactors to follow-up tasks.\n\n"
 )
 
+# Light-touch informational prefix injected from iteration 2 onward whenever
+# repeating CRITICAL/MAJOR issues are observed across prior review iterations.
+# No cap reduction, no narrow-focus urgency — just surfaces the pattern so fix
+# agents have early visibility before churn or mid-budget thresholds trigger.
+_EARLY_REPEATING_ISSUES_PREFIX = (
+    "Note: some issues have appeared in multiple prior review iterations. "
+    "Consider prioritizing a durable fix for these recurring patterns.\n\n"
+)
+
 # Utilization at/above this fraction of the scope file budget signals the fix
 # agent to prefer minimal fixes over expansive refactoring — gives headroom
 # before a fix iteration would tip the PR into scope-overflow territory.
@@ -1043,6 +1052,14 @@ async def _spawn_pipeline_task(
             )
             payload_data["prompt"] = mid_prefix + (payload_data.get("prompt") or "")
             fix_prompt = mid_prefix + (fix_prompt or "")
+        elif task_type == "fix" and len(new_review_history) >= 2:
+            # Early visibility: from iteration 2 onward, surface any repeating
+            # CRITICAL/MAJOR issues without the churn/mid-budget urgency signals.
+            repeating_section = _format_repeating_issues_section(new_review_history)
+            if repeating_section:
+                early_prefix = _EARLY_REPEATING_ISSUES_PREFIX + repeating_section
+                payload_data["prompt"] = early_prefix + (payload_data.get("prompt") or "")
+                fix_prompt = early_prefix + (fix_prompt or "")
 
     # Graduated scope-budget pressure cap: a medium-scope fix cycle's
     # remaining iterations are scaled down by how close the PR is to its

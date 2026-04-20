@@ -2264,9 +2264,11 @@ describe('buildSelfReviewPrompt', () => {
       analysisPlan: '**Files to change**\n- agent/src/foo.ts\n',
     });
     expect(result).toContain('Plan alignment');
-    expect(result).toContain('Bidirectional check');
+    expect(result).toContain('Tri-directional check');
     expect(result).toContain('Tests to add or update');
     expect(result).toContain('Plan Completion Status');
+    expect(result).toContain('Callers to verify after implementation');
+    expect(result).toContain('Callers verification');
   });
 
   it('JSON example blocks are internally consistent (verdict matches check_results, issues_found matches failed-check count)', () => {
