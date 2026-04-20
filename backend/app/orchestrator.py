@@ -704,6 +704,20 @@ async def orchestrator_worker():
                         'slots_available': 0,
                         'queue_depth': _shared_state.tasks_queued_gauge,
                     })
+                    _orchestrator_last_cycle = _utcnow()
+                    # Monitoring must still run when the dispatch path is idle —
+                    # otherwise an auto-pause (max_concurrent_vms=0) makes
+                    # slots_available=0 every cycle, which `continue`s past the
+                    # monitoring block at the bottom of the loop and freezes the
+                    # 3-of-5 recovery ring buffer. Without this, pause is sticky
+                    # forever because _check_external_health / _check_pause_mode
+                    # never run while paused.
+                    try:
+                        await _check_monitoring_window()
+                        await _check_external_health()
+                        await _check_pause_mode()
+                    except Exception:
+                        logger.exception("[ORCHESTRATOR] Monitoring checks failed during idle cycle")
                     await asyncio.sleep(5)
                     continue
 
