@@ -4252,3 +4252,50 @@ async def test_completion_suggestion_toggles_off_when_no_longer_complete(db_sess
     persisted = project.directions[0]
     assert "possibly_complete" not in persisted
     assert "completion_suggestion" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_tiered_unproductive_cooldown_escalates_with_consecutive_failures(db_session):
+    """1st unproductive cycle waits 0.375x base; 3rd+ waits full base."""
+    base_cooldown = 240.0
+    now = datetime.utcnow()
+
+    def _make_direction(did: str, consecutive: int, minutes_ago: float) -> dict:
+        return {
+            "id": did,
+            "text": f"dir-{did}",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            "last_researched_at": (now - timedelta(minutes=minutes_ago)).isoformat(),
+            "last_cycle_productive": False,
+            "consecutive_unproductive_cycles": consecutive,
+            "research_history": [],
+        }
+
+    # 1st consecutive (multiplier 0.375 → 90m): 100m ago passes, 80m ago does not.
+    # 3rd+ consecutive (multiplier 1.0 → 240m): 100m ago does NOT pass.
+    project = Project(
+        name="Tiered Cooldown Test",
+        user_id="u-tiered",
+        autonomous_enabled=True,
+        directions=[
+            _make_direction("d-tier-1st-pass", consecutive=1, minutes_ago=100),
+            _make_direction("d-tier-1st-fail", consecutive=1, minutes_ago=80),
+            _make_direction("d-tier-3rd-fail", consecutive=3, minutes_ago=100),
+        ],
+        vision={"purpose": "t"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    active = await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=base_cooldown,
+        busy_direction_ids=set(), now=now,
+    )
+    active_ids = {d["id"] for d in active}
+    assert "d-tier-1st-pass" in active_ids, "1 consecutive unproductive cycle should use 0.375x cooldown"
+    assert "d-tier-1st-fail" not in active_ids, "80m < 90m (0.375 * 240) — still cooling down"
+    assert "d-tier-3rd-fail" not in active_ids, "3+ consecutive unproductive cycles should use full base cooldown"

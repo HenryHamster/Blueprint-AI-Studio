@@ -63,6 +63,16 @@ runtime_config: Dict = {
     # Reservations only bite under queue pressure; unused reserved slots remain
     # available to any task type.
     "reserved_slots_for_types": {"create": 1, "research": 1},
+    # Hard cap on the total number of concurrent review+fix tasks
+    # (PROVISIONING + IN_PROGRESS) that may consume VM slots at once.
+    # Review/fix chains are self-perpetuating (a review spawns a fix, which
+    # spawns another review, up to MAX_REVIEW_FIX_ITERATIONS per PR), so
+    # without a cap a few churning PRs can fill every slot and starve
+    # research/create tasks. Default to 50% of max_concurrent_vms (4 of 8).
+    # The orchestrator dispatch loop checks this pre-dispatch and defers
+    # (keeps QUEUED) review/fix tasks above the budget — they run as soon
+    # as a pipeline slot frees up. 0 disables the cap entirely.
+    "max_pipeline_slots": int(os.getenv("MAX_PIPELINE_SLOTS", "4")),
     "max_auto_pause_duration_seconds": int(os.getenv("MAX_AUTO_PAUSE_DURATION_SECONDS", "7200")),
     "auto_resume_grace_period_seconds": int(os.getenv("AUTO_RESUME_GRACE_PERIOD_SECONDS", "300")),
     # Flap detection: N auto-resumes inside `flap_window_seconds` escalates

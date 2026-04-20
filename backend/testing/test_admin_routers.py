@@ -1132,6 +1132,19 @@ class TestNotificationConfigSettings:
     GET /api/admin/settings webhook_url masking for non-admin callers."""
 
     @pytest.mark.asyncio
+    async def test_patch_max_pipeline_slots(self, client: AsyncClient):
+        """max_pipeline_slots accepts valid ints and rejects out-of-range / non-numeric."""
+        resp = await client.patch("/api/admin/settings", json={"max_pipeline_slots": 6})
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["max_pipeline_slots"] == 6
+
+        bad = await client.patch("/api/admin/settings", json={"max_pipeline_slots": -1})
+        assert bad.status_code == 400
+        bad2 = await client.patch("/api/admin/settings", json={"max_pipeline_slots": "x"})
+        assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_patch_valid_notification_config(self, client: AsyncClient):
         """PATCH with a valid notification_config is accepted."""
         resp = await client.patch("/api/admin/settings", json={

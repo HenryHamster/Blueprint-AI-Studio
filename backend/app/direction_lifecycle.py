@@ -576,7 +576,17 @@ async def _process_direction_lifecycle(
                     _runtime_config.get("productive_direction_cooldown_minutes", 45)
                 )
             else:
-                effective_cooldown = cooldown_minutes
+                # Tiered unproductive cooldown: 1st consecutive failure waits 0.375x,
+                # 2nd waits 0.75x, 3rd+ waits full. Avoids burning hours on transient
+                # failures while still throttling persistently-broken directions.
+                consecutive = int(d.get("consecutive_unproductive_cycles", 0) or 0)
+                if consecutive <= 1:
+                    multiplier = 0.375
+                elif consecutive == 2:
+                    multiplier = 0.75
+                else:
+                    multiplier = 1.0
+                effective_cooldown = cooldown_minutes * multiplier
             if d.get("possibly_saturated"):
                 effective_cooldown = effective_cooldown * 2.0
                 logger.debug(

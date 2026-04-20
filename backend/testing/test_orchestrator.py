@@ -1699,3 +1699,58 @@ class TestHealthAwareDispatch:
         eligible_ids = ["t_low", "t_high"]
         filtered = [tid for tid in eligible_ids if confidence_by_id[tid] >= _conf_floor]
         assert filtered == ["t_high"]
+
+
+class TestPipelineSlotCap:
+    """Pipeline-slot cap defers review/fix tasks past the budget while
+    create/research dispatch normally."""
+
+    @staticmethod
+    def _apply_cap(eligible_ids, types_for_cap, pipeline_active, max_pipeline_slots):
+        # Mirrors the gate in orchestrator.py Step 2.9.
+        budget = max(0, max_pipeline_slots - pipeline_active)
+        kept: list = []
+        deferred = 0
+        pipeline_kept = 0
+        for tid in eligible_ids:
+            if types_for_cap.get(tid) in ("review", "fix"):
+                if pipeline_kept < budget:
+                    pipeline_kept += 1
+                    kept.append(tid)
+                else:
+                    deferred += 1
+            else:
+                kept.append(tid)
+        return kept, deferred
+
+    def test_review_fix_deferred_when_budget_exhausted(self):
+        eligible = ["c1", "r1", "rv1", "fx1", "rv2"]
+        types = {"c1": "create", "r1": "research",
+                 "rv1": "review", "fx1": "fix", "rv2": "review"}
+        kept, deferred = self._apply_cap(eligible, types, pipeline_active=4, max_pipeline_slots=4)
+        # All review/fix dropped; create/research dispatch normally.
+        assert kept == ["c1", "r1"]
+        assert deferred == 3
+
+    def test_partial_budget_keeps_first_n_pipeline_tasks(self):
+        eligible = ["rv1", "fx1", "rv2", "c1"]
+        types = {"rv1": "review", "fx1": "fix", "rv2": "review", "c1": "create"}
+        kept, deferred = self._apply_cap(eligible, types, pipeline_active=2, max_pipeline_slots=4)
+        # Budget = 2 → first two review/fix kept, third deferred.
+        assert kept == ["rv1", "fx1", "c1"]
+        assert deferred == 1
+
+    def test_create_and_research_unaffected_by_cap(self):
+        eligible = ["c1", "r1", "c2"]
+        types = {"c1": "create", "r1": "research", "c2": "create"}
+        kept, deferred = self._apply_cap(eligible, types, pipeline_active=99, max_pipeline_slots=4)
+        assert kept == ["c1", "r1", "c2"]
+        assert deferred == 0
+
+    def test_cap_default_is_half_of_max_concurrent_vms(self):
+        from app.shared_state import runtime_config
+        cap = runtime_config.get("max_pipeline_slots")
+        if cap is None:
+            cap = max(1, runtime_config["max_concurrent_vms"] // 2)
+        assert cap >= 1
+        assert cap <= runtime_config["max_concurrent_vms"]

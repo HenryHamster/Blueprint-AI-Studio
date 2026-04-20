@@ -1420,7 +1420,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             for d in directions:
                 did = d.get("id")
                 if did in touched_dir_ids:
-                    d["last_cycle_productive"] = tasks_by_dir.get(did, 0) > 0
+                    productive = tasks_by_dir.get(did, 0) > 0
+                    d["last_cycle_productive"] = productive
+                    if productive:
+                        d["consecutive_unproductive_cycles"] = 0
+                    else:
+                        d["consecutive_unproductive_cycles"] = int(
+                            d.get("consecutive_unproductive_cycles", 0) or 0
+                        ) + 1
                     changed = True
             if changed:
                 project.directions = directions
@@ -1477,7 +1484,14 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
     target["last_researched_at"] = now_iso
     # Infra failures are transient — use the shorter productive cooldown so the
     # direction is retried promptly instead of waiting out the full unproductive window.
-    target["last_cycle_productive"] = failure_category in INFRA_CLASSES
+    productive = failure_category in INFRA_CLASSES
+    target["last_cycle_productive"] = productive
+    if productive:
+        target["consecutive_unproductive_cycles"] = 0
+    else:
+        target["consecutive_unproductive_cycles"] = int(
+            target.get("consecutive_unproductive_cycles", 0) or 0
+        ) + 1
     project.directions = directions
     flag_modified(project, "directions")
     session.add(project)

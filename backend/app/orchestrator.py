@@ -1268,6 +1268,49 @@ async def orchestrator_worker():
                                 )
 
 
+                # Step 2.9: Pipeline-slot cap — review/fix chains are self-perpetuating
+                # (review spawns fix spawns review, up to 16 iterations per PR), so
+                # without a ceiling they can fill every VM slot and starve create/
+                # research tasks. Defer (keep QUEUED) review/fix tasks once the
+                # configured pipeline budget is exhausted.
+                _max_pipeline_slots = _runtime_config.get("max_pipeline_slots")
+                if _max_pipeline_slots is None:
+                    _max_pipeline_slots = max(1, _runtime_config["max_concurrent_vms"] // 2)
+                try:
+                    _max_pipeline_slots = int(_max_pipeline_slots)
+                except (TypeError, ValueError):
+                    _max_pipeline_slots = max(1, _runtime_config["max_concurrent_vms"] // 2)
+                if eligible_ids and _max_pipeline_slots > 0:
+                    _pipeline_active = (await session.execute(
+                        select(_func.count()).select_from(Task).where(
+                            Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+                            Task.payloads[0]["type"].as_string().in_(("review", "fix")),
+                        )
+                    )).scalar() or 0
+                    _pipeline_budget = max(0, _max_pipeline_slots - _pipeline_active)
+                    _types_for_cap = {
+                        t.id: ((t.first_payload or {}).get("type") or "")
+                        for t in candidate_tasks
+                    }
+                    _kept: list = []
+                    _deferred_pipeline = 0
+                    _pipeline_kept = 0
+                    for tid in eligible_ids:
+                        if _types_for_cap.get(tid) in ("review", "fix"):
+                            if _pipeline_kept < _pipeline_budget:
+                                _pipeline_kept += 1
+                                _kept.append(tid)
+                            else:
+                                _deferred_pipeline += 1
+                        else:
+                            _kept.append(tid)
+                    if _deferred_pipeline:
+                        logger.info(
+                            f"[ORCHESTRATOR] Pipeline-slot cap: deferred {_deferred_pipeline} "
+                            f"review/fix task(s) (active={_pipeline_active}, cap={_max_pipeline_slots})"
+                        )
+                    eligible_ids = _kept
+
                 # Slot reservation: ensure high-priority task types (e.g. create,
                 # research) get a minimum share of slots when they're queued behind
                 # self-perpetuating review/fix chains. Only activates when queue

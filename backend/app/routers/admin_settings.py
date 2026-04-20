@@ -77,6 +77,7 @@ async def get_settings(
         "productive_direction_cooldown_minutes": _runtime_config.get("productive_direction_cooldown_minutes", 45),
         "max_parallel_research_per_project": _runtime_config.get("max_parallel_research_per_project", 3),
         "reserved_slots_for_types": _runtime_config.get("reserved_slots_for_types", {"create": 1, "research": 1}),
+        "max_pipeline_slots": _runtime_config.get("max_pipeline_slots", 4),
         "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
         "github_account": github_account,
         "require_approval_gates": _runtime_config.get("require_approval_gates", True),
@@ -357,6 +358,14 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                 raise HTTPException(status_code=400, detail=f"reserved_slots_for_types[{type_key}] must be between 0 and 10")
             normalized[type_key] = cnt
         _runtime_config["reserved_slots_for_types"] = normalized
+    if "max_pipeline_slots" in payload:
+        try:
+            val = int(payload["max_pipeline_slots"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="max_pipeline_slots must be a number")
+        if not (0 <= val <= 100):
+            raise HTTPException(status_code=400, detail="max_pipeline_slots must be between 0 and 100 (0 = disabled)")
+        _runtime_config["max_pipeline_slots"] = val
     if "health_check_urls" in payload:
         val = payload["health_check_urls"]
         if not isinstance(val, list):
@@ -451,6 +460,7 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "auto_archive_max_terminal_tasks_per_project": _runtime_config.get("auto_archive_max_terminal_tasks_per_project", 200),
                     "auto_archive_interval_minutes": _runtime_config.get("auto_archive_interval_minutes", 60),
                     "reserved_slots_for_types": _runtime_config.get("reserved_slots_for_types", {"create": 1, "research": 1}),
+                    "max_pipeline_slots": _runtime_config.get("max_pipeline_slots", 4),
                     "notification_config": _runtime_config.get("notification_config", {
                         "webhook_url": "",
                         "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED"],
