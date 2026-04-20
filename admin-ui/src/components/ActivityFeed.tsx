@@ -1,5 +1,6 @@
-import { useEffect, useState, useCallback, type ReactElement } from 'react';
+import { useEffect, useState, useCallback, useMemo, type ReactElement } from 'react';
 import { X, CheckCircle, XCircle, Microscope, Rocket, ExternalLink, Loader2, Clock, ChevronDown, ChevronRight } from 'lucide-react';
+import { List, useDynamicRowHeight, type RowComponentProps } from 'react-window';
 import { apiFetch, API_BASE_URL } from '../api';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -99,6 +100,167 @@ const TIME_RANGE_PILLS: { label: string; value: TimeRangeOption }[] = [
   { label: 'All', value: 'all' },
 ];
 
+type FeedItem =
+  | { kind: 'header'; label: string }
+  | { kind: 'divider' }
+  | { kind: 'row'; event: ActivityEvent };
+
+interface FeedRowData {
+  items: FeedItem[];
+  onRowClick: (event: ActivityEvent) => void;
+  expandedErrors: Set<string>;
+  onToggleExpanded: (id: string) => void;
+}
+
+function FeedRow({
+  index,
+  style,
+  items,
+  onRowClick,
+  expandedErrors,
+  onToggleExpanded,
+}: RowComponentProps<FeedRowData>) {
+  const item = items[index];
+  if (item.kind === 'header') {
+    return (
+      <div style={style}>
+        <div className="px-6 pt-2 pb-1">
+          <span className="text-[10px] font-semibold uppercase text-neutral-600 tracking-wider">{item.label}</span>
+        </div>
+      </div>
+    );
+  }
+  if (item.kind === 'divider') {
+    return (
+      <div style={style}>
+        <div className="px-6 py-1 flex items-center gap-2">
+          <div className="flex-1 h-px bg-amber-500/30" />
+          <span className="text-[10px] font-semibold text-amber-500/80 uppercase tracking-wider whitespace-nowrap">New since your last visit</span>
+          <div className="flex-1 h-px bg-amber-500/30" />
+        </div>
+      </div>
+    );
+  }
+  const { event } = item;
+  const isExpanded = expandedErrors.has(event.id);
+  return (
+    <div style={style}>
+      <div className="px-6 pb-2">
+        <div
+          onClick={() => onRowClick(event)}
+          className={`bg-neutral-900 border border-neutral-800 border-l-2 ${EVENT_BORDER[event.type]} rounded-lg px-4 py-3 ${event.task_id ? 'hover:bg-neutral-800/50 cursor-pointer' : ''} transition-colors`}
+        >
+          <div className="flex items-start gap-3">
+            {EVENT_ICON[event.type]}
+
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-sm text-neutral-100 truncate font-medium leading-tight">
+                  {event.title}
+                </span>
+
+                {event.type === 'RESEARCH_FINDINGS' && event.finding_count != null && (
+                  <span className="shrink-0 bg-blue-500/20 text-blue-400 border border-blue-500/30 text-[10px] font-semibold px-1.5 py-0.5 rounded-full leading-none">
+                    {event.finding_count} finding{event.finding_count !== 1 ? 's' : ''}
+                  </span>
+                )}
+
+                {event.type === 'TASK_COMPLETED' && event.task_type && (
+                  <span className="shrink-0 bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded">
+                    {event.task_type}
+                  </span>
+                )}
+
+                {event.type === 'DEPLOY_EVENT' && event.deploy_status && (
+                  <span className={`shrink-0 border text-[10px] font-semibold px-1.5 py-0.5 rounded-full leading-none ${DEPLOY_STATUS_BADGE[event.deploy_status] ?? 'bg-neutral-700 text-neutral-300 border-neutral-600'}`}>
+                    {event.deploy_status}
+                  </span>
+                )}
+              </div>
+
+              {event.type === 'TASK_FAILED' && event.error_summary && (
+                isExpanded ? (
+                  <pre className="whitespace-pre-wrap text-xs text-red-400/80 mt-1 max-h-32 overflow-y-auto font-mono bg-neutral-950 rounded p-2">
+                    {event.error_summary}
+                  </pre>
+                ) : (
+                  <p className="text-xs text-neutral-500 mt-0.5 truncate" title={event.error_summary}>
+                    {event.error_summary}
+                  </p>
+                )
+              )}
+
+              {event.type === 'TASK_IN_PROGRESS' && event.latest_status_message && (
+                <p className="text-xs text-neutral-500 mt-0.5 truncate" title={event.latest_status_message}>
+                  {event.latest_status_message}
+                </p>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0 ml-auto">
+              {event.type === 'TASK_FAILED' && event.error_summary && (
+                <button
+                  onClick={e => {
+                    e.stopPropagation();
+                    onToggleExpanded(event.id);
+                  }}
+                  className="text-neutral-500 hover:text-neutral-300 transition-colors"
+                  title={isExpanded ? 'Collapse error' : 'Expand error'}
+                >
+                  {isExpanded
+                    ? <ChevronDown className="w-3.5 h-3.5" />
+                    : <ChevronRight className="w-3.5 h-3.5" />}
+                </button>
+              )}
+
+              {event.type === 'TASK_COMPLETED' && event.commit_hash && (
+                event.repo_url && isSafeUrl(event.repo_url) ? (
+                  <a
+                    href={event.repo_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={e => e.stopPropagation()}
+                    className="font-mono text-[10px] bg-neutral-800 text-neutral-400 hover:text-neutral-200 px-1.5 py-0.5 rounded transition-colors"
+                    title={event.commit_hash}
+                  >
+                    {event.commit_hash.slice(0, 7)}
+                  </a>
+                ) : (
+                  <span className="font-mono text-[10px] bg-neutral-800 text-neutral-400 px-1.5 py-0.5 rounded" title={event.commit_hash}>
+                    {event.commit_hash.slice(0, 7)}
+                  </span>
+                )
+              )}
+              {event.pr_url && isSafeUrl(event.pr_url) && (
+                <a
+                  href={event.pr_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={e => e.stopPropagation()}
+                  className="text-neutral-500 hover:text-neutral-300 transition-colors"
+                  title="Open PR"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              )}
+
+              {(event.type === 'TASK_COMPLETED' || event.type === 'TASK_FAILED') && event.duration_seconds != null && (
+                <span className="text-[10px] text-neutral-600 font-mono">ran {formatDurationSec(event.duration_seconds)}</span>
+              )}
+              <span
+                className="text-xs text-neutral-500 font-mono whitespace-nowrap"
+                title={formatFullDatetime(event.timestamp)}
+              >
+                {timeAgo(event.timestamp)}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function getTimeRangeSince(range: TimeRangeOption, lastVisitTimestamp?: number | null): string | null {
   if (range === 'all') return null;
   if (range === 'last_visit') {
@@ -158,11 +320,64 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
 
   const filteredEvents = activeFilter === 'ALL' ? events : events.filter(e => e.type === activeFilter);
 
-  const handleRowClick = (event: ActivityEvent) => {
+  const handleRowClick = useCallback((event: ActivityEvent) => {
     if (!event.task_id) return;
-    // Construct a minimal Task object to open TaskDetailDrawer
     onSelectTask({ id: event.task_id } as Task);
-  };
+  }, [onSelectTask]);
+
+  const toggleExpanded = useCallback((id: string) => {
+    setExpandedErrors(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const feedItems: FeedItem[] = useMemo(() => {
+    if (filteredEvents.length === 0) return [];
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const startOfYesterday = new Date(startOfToday.getTime() - 86400000);
+    const startOfWeek = new Date(startOfToday.getTime() - 6 * 86400000);
+
+    const groups: { label: string; events: ActivityEvent[] }[] = [
+      { label: 'Today', events: [] },
+      { label: 'Yesterday', events: [] },
+      { label: 'This Week', events: [] },
+      { label: 'Older', events: [] },
+    ];
+
+    for (const event of filteredEvents) {
+      const d = parseTimestamp(event.timestamp);
+      if (d >= startOfToday) groups[0].events.push(event);
+      else if (d >= startOfYesterday) groups[1].events.push(event);
+      else if (d >= startOfWeek) groups[2].events.push(event);
+      else groups[3].events.push(event);
+    }
+
+    const hasNewAndOld = lastVisitTimestamp != null &&
+      filteredEvents.some(e => parseTimestamp(e.timestamp).getTime() > lastVisitTimestamp) &&
+      filteredEvents.some(e => parseTimestamp(e.timestamp).getTime() <= lastVisitTimestamp);
+    let dividerInserted = false;
+
+    const items: FeedItem[] = [];
+    for (const { label, events: groupEvents } of groups) {
+      if (groupEvents.length === 0) continue;
+      items.push({ kind: 'header', label });
+      for (const event of groupEvents) {
+        const isOld = lastVisitTimestamp != null && parseTimestamp(event.timestamp).getTime() <= lastVisitTimestamp;
+        if (hasNewAndOld && isOld && !dividerInserted) {
+          items.push({ kind: 'divider' });
+          dividerInserted = true;
+        }
+        items.push({ kind: 'row', event });
+      }
+    }
+    return items;
+  }, [filteredEvents, lastVisitTimestamp]);
+
+  const rowHeight = useDynamicRowHeight({ defaultRowHeight: 68 });
 
   return (
     <div className="flex-1 overflow-hidden flex flex-col min-h-0">
@@ -289,193 +504,31 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
       )}
 
       {/* Event list */}
-      <div className="flex-1 overflow-y-auto px-6 py-4 space-y-2">
-        {loading ? (
-          Array.from({ length: 8 }).map((_, i) => <SkeletonRow key={i} />)
-        ) : filteredEvents.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
-            <Clock className="w-8 h-8 mb-3 opacity-40" />
-            <p className="text-sm">{activeFilter === 'ALL' ? 'No recent activity' : 'No matching events'}</p>
-            <p className="text-xs mt-1 opacity-70">{activeFilter === 'ALL' ? 'Events will appear here as tasks run' : 'Try a different filter'}</p>
-          </div>
-        ) : (() => {
-          const now = new Date();
-          const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-          const startOfYesterday = new Date(startOfToday.getTime() - 86400000);
-          const startOfWeek = new Date(startOfToday.getTime() - 6 * 86400000);
-
-          const groups: { label: string; events: ActivityEvent[] }[] = [
-            { label: 'Today', events: [] },
-            { label: 'Yesterday', events: [] },
-            { label: 'This Week', events: [] },
-            { label: 'Older', events: [] },
-          ];
-
-          for (const event of filteredEvents) {
-            const d = parseTimestamp(event.timestamp);
-            if (d >= startOfToday) groups[0].events.push(event);
-            else if (d >= startOfYesterday) groups[1].events.push(event);
-            else if (d >= startOfWeek) groups[2].events.push(event);
-            else groups[3].events.push(event);
-          }
-
-          // Determine if we need a last-visit divider and track whether it's been inserted
-          const hasNewAndOld = lastVisitTimestamp != null &&
-            filteredEvents.some(e => parseTimestamp(e.timestamp).getTime() > lastVisitTimestamp) &&
-            filteredEvents.some(e => parseTimestamp(e.timestamp).getTime() <= lastVisitTimestamp);
-          let dividerInserted = false;
-
-          return groups.flatMap(({ label, events: groupEvents }) => {
-            if (groupEvents.length === 0) return [];
-            return [
-              <div key={`header-${label}`} className="pt-2 pb-1 first:pt-0 sticky top-0 z-10 bg-neutral-950/90 backdrop-blur-sm">
-                <span className="text-[10px] font-semibold uppercase text-neutral-600 tracking-wider">{label}</span>
-              </div>,
-              ...groupEvents.flatMap(event => {
-              const isOld = lastVisitTimestamp != null && parseTimestamp(event.timestamp).getTime() <= lastVisitTimestamp;
-              const showDivider = hasNewAndOld && isOld && !dividerInserted;
-              if (showDivider) dividerInserted = true;
-              return [
-                ...(showDivider ? [
-                  <div key="last-visit-divider" className="flex items-center gap-2 py-1">
-                    <div className="flex-1 h-px bg-amber-500/30" />
-                    <span className="text-[10px] font-semibold text-amber-500/80 uppercase tracking-wider whitespace-nowrap">New since your last visit</span>
-                    <div className="flex-1 h-px bg-amber-500/30" />
-                  </div>
-                ] : []),
-                <div
-              key={event.id}
-              onClick={() => handleRowClick(event)}
-              className={`bg-neutral-900 border border-neutral-800 border-l-2 ${EVENT_BORDER[event.type]} rounded-lg px-4 py-3 ${event.task_id ? 'hover:bg-neutral-800/50 cursor-pointer' : ''} transition-colors`}
-            >
-              <div className="flex items-start gap-3">
-                {EVENT_ICON[event.type]}
-
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-sm text-neutral-100 truncate font-medium leading-tight">
-                      {event.title}
-                    </span>
-
-                    {/* Finding count badge */}
-                    {event.type === 'RESEARCH_FINDINGS' && event.finding_count != null && (
-                      <span className="shrink-0 bg-blue-500/20 text-blue-400 border border-blue-500/30 text-[10px] font-semibold px-1.5 py-0.5 rounded-full leading-none">
-                        {event.finding_count} finding{event.finding_count !== 1 ? 's' : ''}
-                      </span>
-                    )}
-
-                    {/* Task type badge */}
-                    {event.type === 'TASK_COMPLETED' && event.task_type && (
-                      <span className="shrink-0 bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded">
-                        {event.task_type}
-                      </span>
-                    )}
-
-                    {/* Deploy status badge */}
-                    {event.type === 'DEPLOY_EVENT' && event.deploy_status && (
-                      <span className={`shrink-0 border text-[10px] font-semibold px-1.5 py-0.5 rounded-full leading-none ${DEPLOY_STATUS_BADGE[event.deploy_status] ?? 'bg-neutral-700 text-neutral-300 border-neutral-600'}`}>
-                        {event.deploy_status}
-                      </span>
-                    )}
-                  </div>
-
-                  {/* Error summary for TASK_FAILED */}
-                  {event.type === 'TASK_FAILED' && event.error_summary && (
-                    expandedErrors.has(event.id) ? (
-                      <pre className="whitespace-pre-wrap text-xs text-red-400/80 mt-1 max-h-32 overflow-y-auto font-mono bg-neutral-950 rounded p-2">
-                        {event.error_summary}
-                      </pre>
-                    ) : (
-                      <p className="text-xs text-neutral-500 mt-0.5 truncate" title={event.error_summary}>
-                        {event.error_summary}
-                      </p>
-                    )
-                  )}
-
-                  {/* Status message for TASK_IN_PROGRESS */}
-                  {event.type === 'TASK_IN_PROGRESS' && event.latest_status_message && (
-                    <p className="text-xs text-neutral-500 mt-0.5 truncate" title={event.latest_status_message}>
-                      {event.latest_status_message}
-                    </p>
-                  )}
-                </div>
-
-                <div className="flex items-center gap-2 shrink-0 ml-auto">
-                  {/* Expand toggle for TASK_FAILED */}
-                  {event.type === 'TASK_FAILED' && event.error_summary && (
-                    <button
-                      onClick={e => {
-                        e.stopPropagation();
-                        setExpandedErrors(prev => {
-                          const next = new Set(prev);
-                          if (next.has(event.id)) next.delete(event.id);
-                          else next.add(event.id);
-                          return next;
-                        });
-                      }}
-                      className="text-neutral-500 hover:text-neutral-300 transition-colors"
-                      title={expandedErrors.has(event.id) ? 'Collapse error' : 'Expand error'}
-                    >
-                      {expandedErrors.has(event.id)
-                        ? <ChevronDown className="w-3.5 h-3.5" />
-                        : <ChevronRight className="w-3.5 h-3.5" />}
-                    </button>
-                  )}
-
-                  {/* Commit hash badge */}
-                  {event.type === 'TASK_COMPLETED' && event.commit_hash && (
-                    event.repo_url && isSafeUrl(event.repo_url) ? (
-                      <a
-                        href={event.repo_url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={e => e.stopPropagation()}
-                        className="font-mono text-[10px] bg-neutral-800 text-neutral-400 hover:text-neutral-200 px-1.5 py-0.5 rounded transition-colors"
-                        title={event.commit_hash}
-                      >
-                        {event.commit_hash.slice(0, 7)}
-                      </a>
-                    ) : (
-                      <span className="font-mono text-[10px] bg-neutral-800 text-neutral-400 px-1.5 py-0.5 rounded" title={event.commit_hash}>
-                        {event.commit_hash.slice(0, 7)}
-                      </span>
-                    )
-                  )}
-                  {/* PR link */}
-                  {event.pr_url && isSafeUrl(event.pr_url) && (
-                    <a
-                      href={event.pr_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      onClick={e => e.stopPropagation()}
-                      className="text-neutral-500 hover:text-neutral-300 transition-colors"
-                      title="Open PR"
-                    >
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
-                  )}
-
-                  {/* Duration label for completed/failed tasks */}
-                  {(event.type === 'TASK_COMPLETED' || event.type === 'TASK_FAILED') && event.duration_seconds != null && (
-                    <span className="text-[10px] text-neutral-600 font-mono">ran {formatDurationSec(event.duration_seconds)}</span>
-                  )}
-                  {/* Relative timestamp */}
-                  <span
-                    className="text-xs text-neutral-500 font-mono whitespace-nowrap"
-                    title={formatFullDatetime(event.timestamp)}
-                  >
-                    {timeAgo(event.timestamp)}
-                  </span>
-                </div>
-              </div>
-            </div>
-              ];
-            })
-            ];
-          });
-        })()
-        }
-      </div>
+      {loading ? (
+        <div className="flex-1 overflow-y-auto px-6 py-4 space-y-2">
+          {Array.from({ length: 8 }).map((_, i) => <SkeletonRow key={i} />)}
+        </div>
+      ) : filteredEvents.length === 0 ? (
+        <div className="flex-1 overflow-y-auto px-6 py-4 flex flex-col items-center justify-center text-neutral-500">
+          <Clock className="w-8 h-8 mb-3 opacity-40" />
+          <p className="text-sm">{activeFilter === 'ALL' ? 'No recent activity' : 'No matching events'}</p>
+          <p className="text-xs mt-1 opacity-70">{activeFilter === 'ALL' ? 'Events will appear here as tasks run' : 'Try a different filter'}</p>
+        </div>
+      ) : (
+        <List
+          rowCount={feedItems.length}
+          rowComponent={FeedRow}
+          rowProps={{
+            items: feedItems,
+            onRowClick: handleRowClick,
+            expandedErrors,
+            onToggleExpanded: toggleExpanded,
+          }}
+          rowHeight={rowHeight}
+          overscanCount={6}
+          className="flex-1 py-2"
+        />
+      )}
 
       {/* Loading indicator for background refresh */}
       {!loading && refreshInterval > 0 && (

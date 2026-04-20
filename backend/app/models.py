@@ -275,6 +275,10 @@ class Alert(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
     dismissed_at: Optional[datetime] = None
 
+    __table_args__ = (
+        Index("ix_alert_task_id_dismissed", "task_id", "dismissed_at"),
+    )
+
 
 class OrchestratorErrorAck(SQLModel, table=True):
     """Persistent acknowledgement of an orchestrator error bucket.

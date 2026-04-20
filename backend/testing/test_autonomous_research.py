@@ -336,6 +336,79 @@ async def test_spawn_skipped_when_research_task_in_progress(db_session):
         _runtime_config["max_parallel_research_per_project"] = old_val
 
 
+@pytest.mark.asyncio
+async def test_evaluating_blocks_direction_when_recent(db_session):
+    """A recent EVALUATING research task blocks new research on the same direction."""
+    from app.shared_state import runtime_config as _runtime_config
+    _runtime_config["evaluating_pipeline_timeout_minutes"] = 30
+    project = Project(
+        name="Recent Evaluating Blocks",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-evalblk1")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    existing = Task(
+        project_id=project.id,
+        title="Research: evaluating recent",
+        payloads=[{"type": "research", "directions": [], "base_branch": "main",
+                   "current_direction_id": "d-evalblk1"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    assert len(research) == 1, "Recent EVALUATING should block direction from new research"
+
+
+@pytest.mark.asyncio
+async def test_evaluating_releases_direction_after_timeout(db_session):
+    """An old EVALUATING research task no longer blocks new research on the direction."""
+    from app.shared_state import runtime_config as _runtime_config
+    _runtime_config["evaluating_pipeline_timeout_minutes"] = 30
+    project = Project(
+        name="Old Evaluating Pipelines",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-evalold1")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    existing = Task(
+        project_id=project.id,
+        title="Research: evaluating old",
+        payloads=[{"type": "research", "directions": [], "base_branch": "main",
+                   "current_direction_id": "d-evalold1"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+    # Backdate updated_at past the timeout via raw UPDATE so onupdate doesn't fire
+    from sqlalchemy import update as _update
+    stale = datetime.utcnow() - timedelta(minutes=90)
+    await db_session.execute(_update(Task).where(Task.id == existing.id).values(updated_at=stale))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    assert len(research) == 2, "Stale EVALUATING should allow pipelined new research"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. _spawn_research_task — Rate Limits
 # ─────────────────────────────────────────────────────────────────────────────

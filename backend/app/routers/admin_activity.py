@@ -73,7 +73,7 @@ async def get_activity(
             load_only(Task.id, Task.status, Task.title, Task.project_id,
                       Task.payloads, Task.status_log, Task.created_at, Task.started_at,
                       Task.context, Task.latest_status_message)
-        )
+        ).order_by(Task.created_at.desc()).limit(limit * 3)
     )
     recent_tasks = tasks_result.scalars().all()
 
@@ -210,7 +210,7 @@ async def get_activity(
         inprogress_filters.append(Task.created_at >= since)
 
     inprogress_result = await session.execute(
-        select(Task).where(*inprogress_filters)
+        select(Task).where(*inprogress_filters).order_by(Task.created_at.desc()).limit(limit * 3)
     )
     inprogress_tasks = inprogress_result.scalars().all()
 

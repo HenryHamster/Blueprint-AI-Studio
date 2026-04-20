@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
+from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -831,6 +832,9 @@ async def get_project_diagnostics(
 # GET /api/admin/diagnostics  (aggregated across all projects)
 # ---------------------------------------------------------------------------
 
+DIAGNOSTICS_TASK_SCAN_LIMIT = 5000
+
+
 @router.get("/diagnostics")
 async def get_global_diagnostics(
     session: AsyncSession = Depends(get_session),
@@ -844,12 +848,24 @@ async def get_global_diagnostics(
 
     active_statuses = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
     active_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .options(load_only(
+            Task.id, Task.project_id, Task.status, Task.title,
+            Task.created_at, Task.updated_at, Task.vm_instance_id,
+            Task.last_heartbeat, Task.vm_provisioned_at, Task.started_at,
+            Task.attempt_count, Task.latest_status_message,
+            Task.context, Task.status_log, Task.depends_on,
+        ))
+        .where(
             Task.status.in_(active_statuses),
             Task.archived.is_(False),
         )
+        .limit(DIAGNOSTICS_TASK_SCAN_LIMIT + 1)
     )
-    active_tasks = active_result.scalars().all()
+    active_tasks = list(active_result.scalars().all())
+    truncated = len(active_tasks) > DIAGNOSTICS_TASK_SCAN_LIMIT
+    if truncated:
+        active_tasks = active_tasks[:DIAGNOSTICS_TASK_SCAN_LIMIT]
 
     # Group tasks by project
     by_project: Dict[str, List[Task]] = {}
@@ -859,7 +875,12 @@ async def get_global_diagnostics(
 
     # Fetch project remediation state once so the aggregate can surface
     # needs_manual_intervention directions even for projects with no active tasks.
-    projects_result = await session.execute(select(Project))
+    # Skip projects with no directions — they can never contribute remediation entries.
+    projects_result = await session.execute(
+        select(Project).where(
+            func.coalesce(func.jsonb_array_length(Project.directions), 0) > 0
+        )
+    )
     remediation_by_project: Dict[str, List[DirectionRemediationInfo]] = {}
     for proj in projects_result.scalars().all():
         entries = _build_direction_remediation_state(proj)
@@ -918,4 +939,5 @@ async def get_global_diagnostics(
         "needs_manual_intervention_count": sum(
             1 for e in all_remediation if e["needs_manual_intervention"]
         ),
+        "truncated": truncated,
     }

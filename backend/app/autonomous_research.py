@@ -132,14 +132,26 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             ]),
         )
     )).scalars().all()
+    evaluating_timeout_minutes = _runtime_config.get("evaluating_pipeline_timeout_minutes", 30)
     for t in active_research:
         payload = t.first_payload
         if payload.get("type") == "research":
             # current_direction_id identifies the targeted direction; null means
             # undirected/cross-cutting analysis which doesn't block any direction.
             current_did = payload.get("current_direction_id")
-            if current_did:
-                busy_direction_ids.add(current_did)
+            if not current_did:
+                continue
+            # Pipeline new research alongside long-EVALUATING parents: once children
+            # have been merging past the timeout, allow a fresh cycle on the same
+            # direction. Dedup in research_completion handles overlapping findings.
+            if t.status == TaskStatus.EVALUATING and t.updated_at:
+                updated = t.updated_at
+                if updated.tzinfo is not None:
+                    updated = updated.replace(tzinfo=None)
+                age_minutes = (now - updated).total_seconds() / 60
+                if age_minutes >= evaluating_timeout_minutes:
+                    continue
+            busy_direction_ids.add(current_did)
 
     active_directions = await _process_direction_lifecycle(
         project, session, cooldown_minutes, busy_direction_ids, now,

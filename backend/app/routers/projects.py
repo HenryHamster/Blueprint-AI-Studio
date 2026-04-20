@@ -209,14 +209,11 @@ async def get_project_tasks(
         tasks_stmt = tasks_stmt.where(Task.status == status)
     if direction_id:
         tasks_stmt = tasks_stmt.where(Task.context["direction_id"].as_string() == direction_id)
+    if task_type:
+        tasks_stmt = tasks_stmt.where(Task.payloads[0]["type"].as_string() == task_type)
 
-    tasks_stmt = tasks_stmt.order_by(Task.created_at.asc())
-    if task_type is None:
-        tasks_stmt = tasks_stmt.offset(offset).limit(limit)
+    tasks_stmt = tasks_stmt.order_by(Task.created_at.asc()).offset(offset).limit(limit)
     tasks = (await session.execute(tasks_stmt)).scalars().all()
-    if task_type is not None:
-        tasks = [t for t in tasks if (t.first_payload or {}).get("type") == task_type]
-        tasks = tasks[offset:offset + limit]
 
     # Fetch artifacts for these tasks
     task_ids = [t.id for t in tasks]
@@ -526,6 +523,8 @@ async def cancel_project(
 async def get_project_status(
     request: Request,
     project_id: uuid.UUID,
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -543,13 +542,29 @@ async def get_project_status(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or unauthorized")
 
-    tasks_stmt = select(Task).where(Task.project_id == project_id)
-    tasks = (await session.execute(tasks_stmt)).scalars().all()
+    active_statuses = [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    ]
+    tasks_stmt = (
+        select(Task)
+        .where(Task.project_id == project_id, Task.status.in_(active_statuses))
+        .order_by(Task.created_at.desc())
+        .offset(offset)
+        .limit(limit + 1)
+    )
+    tasks = list((await session.execute(tasks_stmt)).scalars().all())
+    truncated = len(tasks) > limit
+    if truncated:
+        tasks = tasks[:limit]
 
     return {
         "project_id": project.id,
         "name": project.name,
         "status": project.status,
+        "truncated": truncated,
         "tasks": [
             {
                 "task_id": t.id,

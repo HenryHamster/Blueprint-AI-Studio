@@ -2526,11 +2526,13 @@ async def get_digest(
             "elapsed_hours": elapsed_hours,
         })
 
-    _ci_rem_result = await session.execute(select(Task).where(*_funnel_filters))
-    _ci_rem_tasks = [
-        t for t in _ci_rem_result.scalars().all()
-        if (t.context or {}).get("auto_remediation") is True
-    ]
+    _ci_rem_result = await session.execute(
+        select(Task).where(
+            *_funnel_filters,
+            Task.context["auto_remediation"].as_boolean() == True,  # noqa: E712
+        )
+    )
+    _ci_rem_tasks = list(_ci_rem_result.scalars().all())
     ci_auto_remediation: Dict[str, Any] = {
         "spawned": len(_ci_rem_tasks),
         "merged": sum(
@@ -2563,17 +2565,20 @@ async def get_digest(
         "merge_rate": round(_merged_with_prior / _prior_resolved, 4) if _prior_resolved else None,
     }
 
-    _cum_filters = [Task.status == TaskStatus.COMPLETED]
+    _cum_filters = [
+        Task.status == TaskStatus.COMPLETED,
+        or_(
+            Task.context["diagnosis_task_id"].as_string().is_not(None),
+            Task.context["auto_remediation"].as_boolean() == True,  # noqa: E712
+        ),
+        Task.context["pr_merged"].as_boolean() == True,  # noqa: E712
+    ]
     if project_id:
         _cum_filters.append(Task.project_id == project_id)
     _cum_result = await session.execute(select(Task).where(*_cum_filters))
     cumulative_merged_by_trigger_class: Dict[str, int] = {}
     for r in _cum_result.scalars().all():
         ctx = r.context or {}
-        if not (ctx.get("diagnosis_task_id") or ctx.get("auto_remediation") is True):
-            continue
-        if ctx.get("pr_merged") is not True:
-            continue
         trigger_cls = ctx.get("trigger_failure_class")
         if not trigger_cls:
             diag_id = ctx.get("diagnosis_task_id")
