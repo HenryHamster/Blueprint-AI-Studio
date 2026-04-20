@@ -1278,3 +1278,182 @@ class TestPredictSpawnSuccessQualityAndMomentum:
             ],
         }
         assert predict_spawn_success("small", regressed) < predict_spawn_success("small", clean)
+
+
+# ── anomaly_summary in _spawn_strategic_review payload ───────────────────────
+
+@pytest.mark.asyncio
+async def test_anomaly_summary_surfaces_high_occurrence_entries(db_session):
+    """Entries with occurrence_count >= 3 are surfaced; low-occurrence entries are filtered."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    _shared_state.persistent_anomalies[proj_key] = {
+        "CODE_ERROR": {
+            "occurrence_count": 5, "severity": "high",
+            "first_seen": "2026-04-01T00:00:00", "last_seen": "2026-04-10T00:00:00",
+        },
+        "LOW_SIGNAL": {
+            "occurrence_count": 2, "severity": "low",
+            "first_seen": "2026-04-01T00:00:00", "last_seen": "2026-04-05T00:00:00",
+        },
+        "CrossDirectionFingerprint_abc123": {
+            "occurrence_count": 4, "severity": "high",
+            "fingerprint": "abc123",
+            "affected_directions": ["d-1", "d-2", "d-3"],
+            "failure_count": 12,
+            "first_seen": "2026-04-01T00:00:00", "last_seen": "2026-04-10T00:00:00",
+        },
+    }
+    try:
+        spawned = await _spawn_strategic_review(project, db_session)
+        assert spawned is True
+        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        payload = result.scalars().all()[0].payloads[0]
+
+        assert "anomaly_summary" in payload
+        summary = payload["anomaly_summary"]
+        recurring_keys = [e["key"] for e in summary["recurring_anomalies"]]
+        assert "CODE_ERROR" in recurring_keys
+        assert "LOW_SIGNAL" not in recurring_keys
+
+        cross = summary["cross_direction_fingerprints"]
+        assert len(cross) == 1
+        assert cross[0]["key"] == "CrossDirectionFingerprint_abc123"
+        assert cross[0]["affected_directions"] == ["d-1", "d-2", "d-3"]
+        assert cross[0]["fingerprint"] == "abc123"
+        assert cross[0]["failure_count"] == 12
+    finally:
+        _shared_state.persistent_anomalies.pop(proj_key, None)
+
+
+@pytest.mark.asyncio
+async def test_anomaly_summary_absent_when_no_qualifying_entries(db_session):
+    """When there are no occurrence_count>=3 entries, anomaly_summary is omitted."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    _shared_state.persistent_anomalies[proj_key] = {
+        "ONE_OFF": {
+            "occurrence_count": 1, "severity": "medium",
+            "first_seen": "2026-04-01T00:00:00", "last_seen": "2026-04-01T00:00:00",
+        },
+    }
+    try:
+        await _spawn_strategic_review(project, db_session)
+        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        payload = result.scalars().all()[0].payloads[0]
+        assert "anomaly_summary" not in payload
+    finally:
+        _shared_state.persistent_anomalies.pop(proj_key, None)
+
+
+# ── playbook_summary in _spawn_strategic_review payload ──────────────────────
+
+@pytest.mark.asyncio
+async def test_playbook_summary_includes_relevant_entries(db_session, mocker):
+    """Strategy-relevant playbook entries are surfaced; irrelevant ones filtered."""
+    _patch_spawning_deps(mocker)
+    design_doc = {
+        "playbook/auto-importerror-foo": {
+            "content": "Repeated failure pattern (3x in 7d): importerror.",
+            "source": "auto-generated",
+            "updated_at": "2026-04-15T00:00:00",
+            "confirmed_count": 0,
+        },
+        "playbook/review-test-coverage": {
+            "content": "Review pattern from PR #100: test coverage issues.",
+            "source": "review-extracted",
+            "updated_at": "2026-04-18T00:00:00",
+            "hit_count": 4,
+        },
+        "playbook/first-attempt-d12345-error-handling": {
+            "content": "First-attempt rejection pattern (direction d12345).",
+            "source": "first-attempt-pattern",
+            "updated_at": "2026-04-10T00:00:00",
+            "rejection_count": 5,
+        },
+        "playbook/manual-direction-note": {
+            "content": "When working on directions, prefer auto-pause over delete.",
+            "source": "manual",
+            "updated_at": "2026-04-12T00:00:00",
+        },
+        "playbook/success-create-small": {
+            "content": "First-attempt success pattern for create tasks.",
+            "source": "success-pattern",
+            "updated_at": "2026-04-19T00:00:00",
+        },
+    }
+    project = _make_project(vision={"purpose": "test"}, design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "playbook_summary" in payload
+    keys = [e["key"] for e in payload["playbook_summary"]["entries"]]
+    assert "review-test-coverage" in keys
+    assert "auto-importerror-foo" in keys
+    assert "first-attempt-d12345-error-handling" in keys
+    assert "manual-direction-note" in keys  # keyword "directions" + "auto-pause"
+    assert "success-create-small" not in keys
+    # Sorted newest-first
+    assert keys[0] == "review-test-coverage"
+
+
+@pytest.mark.asyncio
+async def test_playbook_summary_absent_when_no_relevant_entries(db_session, mocker):
+    """Without strategy-relevant playbook entries, the key is omitted."""
+    _patch_spawning_deps(mocker)
+    design_doc = {
+        "playbook/success-create-small": {
+            "content": "First-attempt success pattern for create tasks.",
+            "source": "success-pattern",
+            "updated_at": "2026-04-19T00:00:00",
+        },
+    }
+    project = _make_project(vision={"purpose": "test"}, design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(project, db_session)
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+    assert "playbook_summary" not in payload
+
+
+@pytest.mark.asyncio
+async def test_playbook_summary_caps_at_ten_entries(db_session, mocker):
+    """Only the 10 most recent qualifying entries are included."""
+    _patch_spawning_deps(mocker)
+    design_doc = {
+        f"playbook/auto-pattern-{i:02d}": {
+            "content": f"Repeated failure pattern {i}.",
+            "source": "auto-generated",
+            "updated_at": f"2026-04-{i+1:02d}T00:00:00",
+        }
+        for i in range(15)
+    }
+    project = _make_project(vision={"purpose": "test"}, design_doc=design_doc)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(project, db_session)
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+    entries = payload["playbook_summary"]["entries"]
+    assert len(entries) == 10
+    # Newest-first ordering — entry 14 has the latest date
+    assert entries[0]["key"] == "auto-pattern-14"

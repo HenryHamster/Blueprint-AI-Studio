@@ -174,6 +174,8 @@ class StrategicReviewPayload(_SystemPopulated):
     research_mode: Optional[str] = None
     max_active_directions: Optional[int] = None
     rejected_proposals: Optional[list[dict[str, Any]]] = None
+    anomaly_summary: Optional[dict[str, Any]] = None
+    playbook_summary: Optional[dict[str, Any]] = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):

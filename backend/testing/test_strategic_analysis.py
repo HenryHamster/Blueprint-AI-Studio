@@ -655,3 +655,157 @@ def test_difficulty_index_surfaced_in_outcome_evaluation():
     project = _make_project(directions=directions)
     result = _build_outcome_evaluation(project)
     assert result["directions"][0]["difficulty_index"] == 10.0
+
+
+# ---------------------------------------------------------------------------
+# strategic_effectiveness — cycle-over-cycle decision quality
+# ---------------------------------------------------------------------------
+
+def test_strategic_effectiveness_absent_without_cycle_history():
+    project = _make_project(directions=[{"id": "d1", "status": "active",
+                                          "research_history": [{"prs_merged": 1}]}])
+    result = _build_outcome_evaluation(project)
+    assert "strategic_effectiveness" not in result
+
+
+def test_strategic_effectiveness_skips_in_progress_cycles():
+    vision = {"_strategic_cycle_history": [
+        {"cycle_id": "c1", "outcome": "in_progress"},
+    ]}
+    result = _build_outcome_evaluation(_make_project(vision=vision))
+    assert "strategic_effectiveness" not in result
+
+
+def test_strategic_effectiveness_aggregates_completed_cycles():
+    directions = [
+        {"id": "dA", "status": "active",
+         "research_history": [{"prs_merged": 2}]},  # created → merged
+        {"id": "dB", "status": "active",
+         "research_history": [{"prs_merged": 0}]},  # created → no merges
+        {"id": "dR", "status": "retired",
+         "research_history": []},  # retired, still retired
+    ]
+    vision = {
+        "_strategic_failures": 2,
+        "_strategic_cycle_history": [
+            {
+                "cycle_id": "c1", "outcome": "completed",
+                "phase2_completed_at": "2026-02-01T00:00:00",
+                "created_direction_ids": ["dA", "dB"],
+                "retired_direction_ids": ["dR"],
+                "vision_updated": True,
+            },
+        ],
+    }
+    result = _build_outcome_evaluation(_make_project(directions=directions, vision=vision))
+    eff = result["strategic_effectiveness"]
+    assert eff["cycles_evaluated"] == 1
+    assert eff["strategic_failures"] == 2
+    cycle = eff["cycles"][0]
+    assert cycle["created_with_merges"] == 1
+    assert cycle["retired_still_retired"] == 1
+    # 2 successes / 3 decisions = 0.67
+    assert cycle["decision_conversion_rate"] == 0.67
+    assert cycle["vision_updated"] is True
+    assert eff["avg_decision_conversion_rate"] == 0.67
+
+
+def test_strategic_effectiveness_trend_improving():
+    directions = [
+        {"id": f"d{i}", "status": "active",
+         "research_history": [{"prs_merged": 1}]} for i in range(5)
+    ]
+    # Early cycles: 0% conversion. Later cycles: 100%.
+    vision = {"_strategic_cycle_history": [
+        {"cycle_id": "c1", "outcome": "completed",
+         "created_direction_ids": ["missing1"], "retired_direction_ids": []},
+        {"cycle_id": "c2", "outcome": "completed",
+         "created_direction_ids": ["missing2"], "retired_direction_ids": []},
+        {"cycle_id": "c3", "outcome": "completed",
+         "created_direction_ids": ["d0", "d1"], "retired_direction_ids": []},
+        {"cycle_id": "c4", "outcome": "completed",
+         "created_direction_ids": ["d2", "d3"], "retired_direction_ids": []},
+    ]}
+    result = _build_outcome_evaluation(_make_project(directions=directions, vision=vision))
+    assert result["strategic_effectiveness"]["trend"] == "improving"
+
+
+def test_decision_accuracy_absent_without_completed_cycle():
+    project = _make_project(directions=[{"id": "d1", "status": "active",
+                                          "research_history": [{"prs_merged": 1}]}])
+    assert "decision_accuracy" not in _build_outcome_evaluation(project)
+
+
+def test_decision_accuracy_scores_created_directions():
+    directions = [
+        {"id": "dA", "status": "active",
+         "research_history": [{"prs_merged": 3}]},  # success
+        {"id": "dB", "status": "active", "auto_paused": True,
+         "research_history": [{"prs_merged": 2}]},  # auto_paused → not success
+        {"id": "dC", "status": "active",
+         "research_history": [{"prs_merged": 0}]},  # no merges → not success
+    ]
+    vision = {"_strategic_cycle_history": [
+        {"cycle_id": "c1", "outcome": "completed",
+         "phase2_completed_at": "2026-03-01T00:00:00",
+         "created_direction_ids": ["dA", "dB", "dC"],
+         "retired_direction_ids": []},
+    ]}
+    result = _build_outcome_evaluation(_make_project(directions=directions, vision=vision))
+    da = result["decision_accuracy"]
+    assert da["cycle_id"] == "c1"
+    assert da["created_count"] == 3
+    assert da["created_successful"] == 1
+    assert da["decision_accuracy_rate"] == round(1 / 3, 2)
+    by_id = {c["direction_id"]: c for c in da["created"]}
+    assert by_id["dA"]["success"] is True
+    assert by_id["dB"]["success"] is False
+    assert by_id["dB"]["auto_paused"] is True
+    assert by_id["dC"]["success"] is False
+    assert "median_quality_score" in da
+
+
+def test_decision_accuracy_retired_breakdown():
+    directions = [
+        {"id": "dKeep", "status": "retired", "research_history": []},
+        {"id": "dBack", "status": "active",
+         "research_history": [{"prs_merged": 1}]},  # was retired but is active again
+    ]
+    vision = {"_strategic_cycle_history": [
+        {"cycle_id": "c1", "outcome": "completed",
+         "created_direction_ids": [],
+         "retired_direction_ids": ["dKeep", "dBack", "dGone"]},
+    ]}
+    result = _build_outcome_evaluation(_make_project(directions=directions, vision=vision))
+    da = result["decision_accuracy"]
+    by_id = {r["direction_id"]: r for r in da["retired"]}
+    assert by_id["dKeep"]["stayed_retired"] is True
+    assert by_id["dBack"]["stayed_retired"] is False
+    assert by_id["dGone"]["stayed_retired"] is True  # missing == stayed retired
+    assert da["retired_accuracy_rate"] == round(2 / 3, 2)
+
+
+def test_decision_accuracy_handles_missing_created_direction():
+    vision = {"_strategic_cycle_history": [
+        {"cycle_id": "c1", "outcome": "completed",
+         "created_direction_ids": ["dGone"],
+         "retired_direction_ids": []},
+    ]}
+    result = _build_outcome_evaluation(_make_project(directions=[], vision=vision))
+    da = result["decision_accuracy"]
+    assert da["created"][0]["status"] == "missing"
+    assert da["created"][0]["success"] is False
+    assert da["decision_accuracy_rate"] == 0.0
+
+
+def test_strategic_effectiveness_keeps_only_last_5_cycles():
+    cycles = [
+        {"cycle_id": f"c{i}", "outcome": "completed",
+         "created_direction_ids": [], "retired_direction_ids": []}
+        for i in range(8)
+    ]
+    vision = {"_strategic_cycle_history": cycles}
+    result = _build_outcome_evaluation(_make_project(vision=vision))
+    eff = result["strategic_effectiveness"]
+    assert eff["cycles_evaluated"] == 5
+    assert [c["cycle_id"] for c in eff["cycles"]] == ["c3", "c4", "c5", "c6", "c7"]

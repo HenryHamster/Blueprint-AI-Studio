@@ -16,6 +16,7 @@ from sqlmodel import select
 from app.direction_metrics import _compute_direction_quality_score
 from app.models import Task, Project, TaskHistory, TaskStatus, ProjectMessage
 from app.payload_schemas import validate_internal_payload
+import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -389,6 +390,8 @@ def _build_previous_decision_outcomes(project: Project) -> dict[str, Any] | None
 
     created_rationales = prev_entry.get("created_rationales") or {}
     retired_rationales = prev_entry.get("retired_rationales") or {}
+    created_predictions = prev_entry.get("created_predictions") or {}
+    retired_final_metrics = prev_entry.get("retired_final_metrics") or {}
 
     def _summarize(direction_id: str, role: str, rationale: Optional[str]) -> dict[str, Any]:
         d = directions_by_id.get(direction_id)
@@ -396,6 +399,8 @@ def _build_previous_decision_outcomes(project: Project) -> dict[str, Any] | None
             entry: dict[str, Any] = {"direction_id": direction_id, "role": role, "status": "missing"}
             if rationale:
                 entry["rationale"] = rationale
+            if role == "retired" and direction_id in retired_final_metrics:
+                entry["final_metrics"] = retired_final_metrics[direction_id]
             return entry
         history = d.get("research_history") or []
         agg = d.get("history_aggregate") or {}
@@ -416,6 +421,13 @@ def _build_previous_decision_outcomes(project: Project) -> dict[str, Any] | None
         }
         if rationale:
             entry["rationale"] = rationale
+        if role == "created" and direction_id in created_predictions:
+            prediction = created_predictions[direction_id]
+            entry["prediction"] = prediction
+            expected = prediction.get("similar_past_merges", 0)
+            entry["calibration_delta"] = entry["prs_merged"] - expected
+        if role == "retired" and direction_id in retired_final_metrics:
+            entry["final_metrics"] = retired_final_metrics[direction_id]
         return entry
 
     created = [
@@ -437,6 +449,105 @@ def _build_previous_decision_outcomes(project: Project) -> dict[str, Any] | None
     if cycle_reasoning:
         result["cycle_reasoning"] = cycle_reasoning
     return result
+
+
+def _build_anomaly_summary(project: Project) -> dict[str, Any] | None:
+    """Summarize high-occurrence persistent anomalies for the strategic agent.
+
+    Surfaces entries with occurrence_count >= 3, splitting cross-direction
+    fingerprints (which span multiple directions) from other recurring
+    anomalies. Returns None when nothing qualifies so the key is omitted.
+    """
+    proj_anomalies = _shared_state.persistent_anomalies.get(str(project.id)) or {}
+    if not proj_anomalies:
+        return None
+
+    cross_direction: list[dict[str, Any]] = []
+    recurring: list[dict[str, Any]] = []
+    for key, entry in proj_anomalies.items():
+        occurrences = entry.get("occurrence_count") or 0
+        if occurrences < 3:
+            continue
+        item: dict[str, Any] = {
+            "key": key,
+            "occurrence_count": occurrences,
+            "severity": entry.get("severity"),
+            "first_seen": entry.get("first_seen"),
+            "last_seen": entry.get("last_seen"),
+        }
+        if key.startswith("CrossDirectionFingerprint_"):
+            item["fingerprint"] = entry.get("fingerprint")
+            item["affected_directions"] = list(entry.get("affected_directions") or [])
+            if entry.get("failure_count"):
+                item["failure_count"] = entry["failure_count"]
+            cross_direction.append(item)
+        else:
+            if entry.get("affected_directions"):
+                item["affected_directions"] = list(entry["affected_directions"])
+            if entry.get("direction_id"):
+                item["direction_id"] = entry["direction_id"]
+            recurring.append(item)
+
+    if not cross_direction and not recurring:
+        return None
+
+    cross_direction.sort(key=lambda e: e.get("occurrence_count") or 0, reverse=True)
+    recurring.sort(key=lambda e: e.get("occurrence_count") or 0, reverse=True)
+    return {
+        "cross_direction_fingerprints": cross_direction[:10],
+        "recurring_anomalies": recurring[:10],
+    }
+
+
+_STRATEGIC_PLAYBOOK_SOURCES = {
+    "auto-generated",      # recurring failure patterns
+    "review-extracted",    # review feedback patterns
+    "first-attempt-pattern",  # direction-level rejection patterns
+}
+_STRATEGIC_PLAYBOOK_KEYWORDS = (
+    "direction", "auto-pause", "auto_pause", "auto paused",
+    "recurring", "repeated failure", "architecture",
+)
+
+
+def _build_playbook_summary(project: Project) -> dict[str, Any] | None:
+    """Summarize playbook entries most relevant to strategic decisions.
+
+    Pulls entries from project.design_doc whose key starts with ``playbook/``
+    and either come from a strategy-relevant source (failure patterns, review
+    patterns, first-attempt rejection patterns) or whose content mentions
+    directions, auto-pause, or recurring failures. Returns the 10 most recently
+    updated, with content truncated for prompt budget. Returns None when
+    nothing qualifies so the key can be omitted from the payload.
+    """
+    doc = project.design_doc or {}
+    candidates: list[dict[str, Any]] = []
+    for key, entry in doc.items():
+        if not key.startswith("playbook/") or not isinstance(entry, dict):
+            continue
+        source = entry.get("source") or ""
+        content = entry.get("content") or ""
+        content_lower = content.lower()
+        relevant = source in _STRATEGIC_PLAYBOOK_SOURCES or any(
+            kw in content_lower for kw in _STRATEGIC_PLAYBOOK_KEYWORDS
+        )
+        if not relevant:
+            continue
+        item: dict[str, Any] = {
+            "key": key[len("playbook/"):],
+            "content": content[:400],
+            "source": source or None,
+            "updated_at": entry.get("updated_at"),
+        }
+        for opt in ("hit_count", "confirmed_count", "scope",
+                    "learned_from_direction", "rejection_count"):
+            if entry.get(opt) is not None:
+                item[opt] = entry[opt]
+        candidates.append(item)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda e: e.get("updated_at") or "", reverse=True)
+    return {"entries": candidates[:10]}
 
 
 async def _find_last_strategic_cycle_time(
@@ -689,6 +800,10 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "recent_interventions": recent_interventions,
         **({"previous_decision_outcomes": _prev_outcomes}
            if (_prev_outcomes := _build_previous_decision_outcomes(project)) else {}),
+        **({"anomaly_summary": _anomaly_summary}
+           if (_anomaly_summary := _build_anomaly_summary(project)) else {}),
+        **({"playbook_summary": _playbook_summary}
+           if (_playbook_summary := _build_playbook_summary(project)) else {}),
         "project_name": project.name,
         "open_messages": open_msgs,
         "conversation_thread": conversation_thread,

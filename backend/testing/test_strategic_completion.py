@@ -23,6 +23,10 @@ from app.strategic_completion import (
     _check_direction_starvation,
     _is_code_failure_pause_reason,
     _build_direction_failure_summary,
+    _build_creation_prediction,
+    _build_retirement_metrics,
+    _collect_creation_predictions,
+    _collect_retirement_metrics,
     _collect_rationales,
     _extract_cycle_reasoning,
     _extract_rationale_from_notes,
@@ -964,3 +968,75 @@ class TestRationalePersistence:
         assert out is not None
         assert "cycle_reasoning" not in out
         assert "rationale" not in out["created"][0]
+
+
+class TestDirectionPredictionCalibration:
+    def test_build_creation_prediction_short_text_is_high_difficulty(self):
+        p = Project(name="P", user_id="u", directions=[], vision={})
+        d = {"id": "d1", "text": "improve speed"}
+        pred = _build_creation_prediction(d, p)
+        assert pred["estimated_difficulty"] == "high"
+        assert pred["text_length"] == len("improve speed")
+        assert pred["similar_past_merges"] == 0
+
+    def test_build_creation_prediction_counts_similar_past_merges(self):
+        similar = {
+            "id": "d0", "text": "cache invalidation dashboard refresh",
+            "research_history": [{"prs_merged": 2}, {"prs_merged": 1}],
+        }
+        p = Project(name="P", user_id="u", directions=[similar],
+                    vision={"systems": [{"id": "s", "status": "functional"}]})
+        new_d = {"id": "d1", "text": "cache invalidation dashboard refresh strategy"}
+        pred = _build_creation_prediction(new_d, p)
+        assert pred["similar_past_merges"] == 3
+        assert pred["similar_direction_count"] == 1
+        assert pred["mature_system_count"] == 1
+
+    def test_build_retirement_metrics_snapshots_merges_and_cycles(self):
+        d = {
+            "id": "d1",
+            "research_history": [{"prs_merged": 2}, {"prs_merged": 1}],
+            "history_aggregate": {"total_prs_merged": 5, "total_cycles": 4},
+        }
+        m = _build_retirement_metrics(d)
+        assert m["final_prs_merged"] == 8
+        assert m["final_cycles_active"] == 6
+        assert isinstance(m["final_quality_score"], float)
+
+    def test_collect_predictions_and_metrics_skip_missing_ids(self):
+        p = Project(name="P", user_id="u",
+                    directions=[{"id": "d1", "text": "x" * 60, "research_history": []}],
+                    vision={})
+        assert _collect_creation_predictions(p, ["d1", "d-missing"]).keys() == {"d1"}
+        assert _collect_retirement_metrics(p, ["d1", "d-missing"]).keys() == {"d1"}
+
+    def test_build_previous_decision_outcomes_includes_prediction_and_delta(self):
+        from app.strategic_spawning import _build_previous_decision_outcomes
+        project = Project(
+            name="P", user_id="u1",
+            directions=[{
+                "id": "d-n", "status": "active", "text": "new",
+                "research_history": [{"prs_merged": 4}],
+            }],
+            vision={
+                "_strategic_cycle_history": [{
+                    "cycle_id": "sc-1",
+                    "outcome": "completed",
+                    "created_direction_ids": ["d-n"],
+                    "retired_direction_ids": ["d-gone"],
+                    "created_predictions": {"d-n": {
+                        "estimated_difficulty": "high", "text_length": 3,
+                        "mature_system_count": 0, "similar_direction_count": 1,
+                        "similar_past_merges": 1,
+                    }},
+                    "retired_final_metrics": {"d-gone": {
+                        "final_quality_score": 0.2, "final_prs_merged": 0,
+                        "final_cycles_active": 5,
+                    }},
+                }],
+            },
+        )
+        out = _build_previous_decision_outcomes(project)
+        assert out["created"][0]["prediction"]["estimated_difficulty"] == "high"
+        assert out["created"][0]["calibration_delta"] == 3
+        assert out["retired"][0]["final_metrics"]["final_cycles_active"] == 5

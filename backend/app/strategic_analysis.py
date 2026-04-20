@@ -291,4 +291,192 @@ def _build_outcome_evaluation(project) -> dict:
         result["systems"] = systems
     if direction_outcomes:
         result["directions"] = direction_outcomes
+    strategic_effectiveness = _build_strategic_effectiveness(directions, vision)
+    if strategic_effectiveness:
+        result["strategic_effectiveness"] = strategic_effectiveness
+    decision_accuracy = _build_decision_accuracy(directions, vision)
+    if decision_accuracy:
+        result["decision_accuracy"] = decision_accuracy
     return result
+
+
+def _build_decision_accuracy(directions: list, vision: dict) -> dict:
+    """Score the most recent completed strategic cycle's create/retire decisions.
+
+    Looks up each created direction's actual merge outcome and quality score,
+    and each retired direction's current status, then summarizes how accurate
+    the strategic agent's last set of decisions turned out to be.
+    """
+    from app.direction_metrics import _compute_direction_quality_score  # noqa: PLC0415
+    cycle_history = list((vision or {}).get("_strategic_cycle_history") or [])
+    target = None
+    for entry in reversed(cycle_history):
+        if entry.get("outcome") != "completed":
+            continue
+        if entry.get("created_direction_ids") or entry.get("retired_direction_ids"):
+            target = entry
+            break
+    if target is None:
+        return {}
+
+    dir_by_id = {d.get("id"): d for d in directions if d.get("id")}
+
+    def _lifetime_merged(d: dict) -> int:
+        history = d.get("research_history") or []
+        agg = d.get("history_aggregate") or {}
+        return sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
+
+    quality_scores = [
+        round(_compute_direction_quality_score(d), 3)
+        for d in directions if d.get("id")
+    ]
+    quality_scores_sorted = sorted(quality_scores)
+    median_quality = 0.0
+    if quality_scores_sorted:
+        n = len(quality_scores_sorted)
+        if n % 2 == 1:
+            median_quality = quality_scores_sorted[n // 2]
+        else:
+            median_quality = (quality_scores_sorted[n // 2 - 1] + quality_scores_sorted[n // 2]) / 2
+
+    created_breakdown: list = []
+    successes = 0
+    for cid in (target.get("created_direction_ids") or []):
+        d = dir_by_id.get(cid)
+        if d is None:
+            created_breakdown.append({"direction_id": cid, "status": "missing", "success": False})
+            continue
+        merged = _lifetime_merged(d)
+        auto_paused = bool(d.get("auto_paused"))
+        qscore = round(_compute_direction_quality_score(d), 3)
+        above_median = qscore > median_quality
+        success = merged >= 1 and not auto_paused
+        if success:
+            successes += 1
+        created_breakdown.append({
+            "direction_id": cid,
+            "prs_merged": merged,
+            "auto_paused": auto_paused,
+            "quality_score": qscore,
+            "above_median_quality": above_median,
+            "success": success,
+        })
+
+    retired_breakdown: list = []
+    retired_good = 0
+    retired_total = 0
+    for rid in (target.get("retired_direction_ids") or []):
+        retired_total += 1
+        d = dir_by_id.get(rid)
+        if d is None:
+            retired_breakdown.append({"direction_id": rid, "stayed_retired": True, "status": "missing"})
+            retired_good += 1
+            continue
+        status = d.get("status")
+        stayed = status in ("retired", "expired")
+        if stayed:
+            retired_good += 1
+        retired_breakdown.append({
+            "direction_id": rid,
+            "status": status,
+            "stayed_retired": stayed,
+        })
+
+    created_total = len(created_breakdown)
+    decision_accuracy_rate = (
+        round(successes / created_total, 2) if created_total else None
+    )
+    retired_accuracy_rate = (
+        round(retired_good / retired_total, 2) if retired_total else None
+    )
+
+    result: dict = {
+        "cycle_id": target.get("cycle_id"),
+        "completed_at": target.get("phase2_completed_at"),
+        "created_count": created_total,
+        "created_successful": successes,
+        "decision_accuracy_rate": decision_accuracy_rate,
+        "median_quality_score": round(median_quality, 3),
+        "created": created_breakdown,
+    }
+    if retired_breakdown:
+        result["retired"] = retired_breakdown
+        result["retired_accuracy_rate"] = retired_accuracy_rate
+    return result
+
+
+def _build_strategic_effectiveness(directions: list, vision: dict) -> dict:
+    """Aggregate per-cycle strategic decision quality from _strategic_cycle_history.
+
+    Measures whether the strategic agent's own choices (which directions to
+    create/retire) are producing better outcomes across recent cycles. Distinct
+    from per-direction trends, which measure direction performance.
+    """
+    cycle_history = list(vision.get("_strategic_cycle_history") or [])
+    completed = [
+        c for c in cycle_history
+        if c.get("outcome") not in (None, "in_progress")
+    ]
+    if not completed:
+        return {}
+
+    # Index directions by id for quick lookup of current status / merge counts.
+    dir_by_id: dict = {d.get("id"): d for d in directions if d.get("id")}
+
+    def _direction_lifetime_merged(d: dict) -> int:
+        history = d.get("research_history") or []
+        agg = d.get("history_aggregate") or {}
+        return sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
+
+    recent = completed[-5:]
+    cycle_metrics: list = []
+    for entry in recent:
+        created_ids = list(entry.get("created_direction_ids") or [])
+        retired_ids = list(entry.get("retired_direction_ids") or [])
+        created_with_merges = sum(
+            1 for cid in created_ids
+            if cid in dir_by_id and _direction_lifetime_merged(dir_by_id[cid]) > 0
+        )
+        retired_still_retired = sum(
+            1 for rid in retired_ids
+            if rid in dir_by_id and dir_by_id[rid].get("status") in ("retired", "expired")
+        )
+        decisions_total = len(created_ids) + len(retired_ids)
+        successful = created_with_merges + retired_still_retired
+        conversion_rate = round(successful / decisions_total, 2) if decisions_total else None
+        cycle_metrics.append({
+            "cycle_id": entry.get("cycle_id"),
+            "completed_at": entry.get("phase2_completed_at"),
+            "directions_created": len(created_ids),
+            "directions_retired": len(retired_ids),
+            "created_with_merges": created_with_merges,
+            "retired_still_retired": retired_still_retired,
+            "vision_updated": bool(entry.get("vision_updated")),
+            "decision_conversion_rate": conversion_rate,
+        })
+
+    # Trend across cycles: average decision_conversion_rate, first half vs second half.
+    rates = [c["decision_conversion_rate"] for c in cycle_metrics if c["decision_conversion_rate"] is not None]
+    trend = "insufficient_data"
+    if len(rates) >= 4:
+        mid = len(rates) // 2
+        first_avg = sum(rates[:mid]) / max(mid, 1)
+        second_avg = sum(rates[mid:]) / max(len(rates) - mid, 1)
+        if second_avg > first_avg * 1.3:
+            trend = "improving"
+        elif second_avg < first_avg * 0.7:
+            trend = "declining"
+        else:
+            trend = "stable"
+    elif rates:
+        trend = "stable"
+
+    avg_rate = round(sum(rates) / len(rates), 2) if rates else None
+
+    return {
+        "cycles_evaluated": len(cycle_metrics),
+        "avg_decision_conversion_rate": avg_rate,
+        "trend": trend,
+        "strategic_failures": vision.get("_strategic_failures", 0),
+        "cycles": cycle_metrics,
+    }

@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.direction_metrics import _compute_direction_quality_score
 from app.models import Project, ProjectMessage, MessageType, Task, TaskStatus
 from app.research_completion import _update_cycle_history, _compute_saturation
 from app.shared_state import runtime_config as _runtime_config
@@ -139,6 +140,92 @@ def _collect_rationales(
         rationale = _extract_rationale_from_notes(by_id.get(did), prefix)
         if rationale:
             result[did] = rationale
+    return result
+
+
+_PRED_STOPWORDS = {
+    "the", "a", "an", "to", "for", "and", "or", "in", "of", "is", "it", "this",
+    "that", "with", "by", "we", "should", "be", "are", "on", "as", "feat", "fix",
+    "refactor", "add", "update", "improve",
+}
+
+
+def _build_creation_prediction(direction: dict, project: Project) -> Dict[str, Any]:
+    """Record initial signals available at direction creation time.
+
+    Captures text-length-based difficulty proxy, project system maturity, and
+    merge history from lexically similar past directions. Used later by
+    _build_previous_decision_outcomes to compute calibration error.
+    """
+    text = direction.get("text") or ""
+    text_len = len(text)
+    if text_len < 50:
+        estimated_difficulty = "high"
+    elif text_len < 150:
+        estimated_difficulty = "medium"
+    else:
+        estimated_difficulty = "low"
+    systems = (project.vision or {}).get("systems") or []
+    mature = sum(
+        1 for s in systems
+        if isinstance(s, dict) and s.get("status") in ("functional", "mature")
+    )
+    words = set(text.lower().split()) - _PRED_STOPWORDS
+    similar_past_merges = 0
+    similar_count = 0
+    own_id = direction.get("id")
+    for d in (project.directions or []):
+        if d.get("id") == own_id:
+            continue
+        other_words = set((d.get("text") or "").lower().split()) - _PRED_STOPWORDS
+        if len(words) >= 2 and len(words & other_words) >= 3:
+            similar_count += 1
+            for h in d.get("research_history") or []:
+                similar_past_merges += h.get("prs_merged", 0)
+            agg = d.get("history_aggregate") or {}
+            similar_past_merges += agg.get("total_prs_merged") or 0
+    return {
+        "estimated_difficulty": estimated_difficulty,
+        "text_length": text_len,
+        "mature_system_count": mature,
+        "similar_direction_count": similar_count,
+        "similar_past_merges": similar_past_merges,
+    }
+
+
+def _build_retirement_metrics(direction: dict) -> Dict[str, Any]:
+    """Snapshot final merge/quality metrics at retirement time."""
+    history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+    return {
+        "final_quality_score": round(_compute_direction_quality_score(direction), 3),
+        "final_prs_merged": sum(h.get("prs_merged", 0) for h in history)
+        + (agg.get("total_prs_merged") or 0),
+        "final_cycles_active": len(history) + (agg.get("total_cycles") or 0),
+    }
+
+
+def _collect_creation_predictions(
+    project: Project, direction_ids: list
+) -> Dict[str, Dict[str, Any]]:
+    by_id = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
+    result: Dict[str, Dict[str, Any]] = {}
+    for did in direction_ids:
+        d = by_id.get(did)
+        if d is not None:
+            result[did] = _build_creation_prediction(d, project)
+    return result
+
+
+def _collect_retirement_metrics(
+    project: Project, direction_ids: list
+) -> Dict[str, Dict[str, Any]]:
+    by_id = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
+    result: Dict[str, Dict[str, Any]] = {}
+    for did in direction_ids:
+        d = by_id.get(did)
+        if d is not None:
+            result[did] = _build_retirement_metrics(d)
     return result
 
 
@@ -488,6 +575,8 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             _summary = f"rev {vision_rev}, {active_dirs} active, {dirs_created} created, {dirs_retired} retired{_spawn_suffix}"
             created_rationales = _collect_rationales(project, created_ids, _CREATED_NOTE_PREFIX)
             retired_rationales = _collect_rationales(project, retired_ids, _RETIRED_NOTE_PREFIX)
+            created_predictions = _collect_creation_predictions(project, created_ids)
+            retired_final_metrics = _collect_retirement_metrics(project, retired_ids)
             _update_cycle_history(project, cycle_id, {
                 "phase2_completed_at": _utcnow().isoformat(),
                 "vision_updated": _vision_updated,
@@ -497,6 +586,8 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 "retired_direction_ids": retired_ids,
                 "created_rationales": created_rationales,
                 "retired_rationales": retired_rationales,
+                "created_predictions": created_predictions,
+                "retired_final_metrics": retired_final_metrics,
                 "cycle_reasoning": _extract_cycle_reasoning(task),
                 "tasks_spawned": tasks_spawned,
                 "outcome": "completed",
@@ -837,6 +928,8 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             "retired_direction_ids": list(retired_ids_fb),
             "created_rationales": dict(created_rationales_fb),
             "retired_rationales": dict(retired_rationales_fb),
+            "created_predictions": _collect_creation_predictions(project, created_ids_fb),
+            "retired_final_metrics": _collect_retirement_metrics(project, retired_ids_fb),
             "cycle_reasoning": _extract_cycle_reasoning(task),
             "outcome": "completed" if vision_produced else "failed",
             "summary_text": _summary_fb,
