@@ -1225,6 +1225,20 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(f"[REAPER] Orphan direction hold sweep error: {e}", exc_info=True)
 
+                # Step 5d: Prune idle entries from long-lived in-memory state
+                # dicts. direction_failure_streaks / circuit_breakers /
+                # merge_error_occurrences / autonomous_failure_counts /
+                # user_debug_spawn_times all accumulate keys monotonically
+                # over an instance's lifetime. On Cloud Run instances that
+                # stay up for days this contributes to 4GB OOMs.
+                try:
+                    from app.shared_state import sweep_stale_in_memory_state  # noqa: PLC0415
+                    _mem_pruned = sweep_stale_in_memory_state()
+                    if any(_mem_pruned.values()):
+                        logger.info(f"[REAPER] Pruned idle in-memory state: {_mem_pruned}")
+                except Exception as e:
+                    logger.error(f"[REAPER] In-memory state sweep error: {e}", exc_info=True)
+
                 # Step 5b: Clear stale or malformed retry_after on QUEUED tasks.
                 # A far-future or unparseable value permanently blocks dispatch
                 # (orchestrator skips tasks where retry_after > now).

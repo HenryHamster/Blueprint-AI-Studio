@@ -813,6 +813,81 @@ def get_held_directions() -> Dict[str, Dict]:
     return result
 
 
+# Retention thresholds for sweep_stale_in_memory_state. Tuned so entries that
+# stopped carrying signal a while ago are reclaimed, while anything still in
+# use (recent failures, current holds, live sliding windows) is preserved.
+_STREAK_RETENTION_HOURS = 24
+_BREAKER_RETENTION_HOURS = 24
+_MERGE_ERROR_RETENTION_SECONDS = MERGE_PATTERN_WINDOW_SECONDS * 2
+_DEBUG_SPAWN_RETENTION_SECONDS = 3600 * 2
+
+
+def sweep_stale_in_memory_state() -> Dict[str, int]:
+    """Prune entries from growing module-level state dicts.
+
+    Each of these dicts gets populated by a unique key (direction_id,
+    project_id, normalized error, etc.) and was not being removed once the
+    underlying condition resolved. Over an instance's lifetime the keyspace
+    grows monotonically — on a long-lived Cloud Run instance this contributes
+    to the 4GB OOMs. Callers invoke this on a periodic cadence.
+
+    Returns a summary dict of how many entries were pruned per bucket.
+    """
+    now = _utcnow()
+    pruned = {
+        "direction_failure_streaks": 0,
+        "circuit_breakers": 0,
+        "autonomous_failure_counts": 0,
+        "merge_error_occurrences": 0,
+        "user_debug_spawn_times": 0,
+    }
+
+    streak_cutoff = now - timedelta(hours=_STREAK_RETENTION_HOURS)
+    for did, streak in list(direction_failure_streaks.items()):
+        if streak.get("held"):
+            continue
+        if streak.get("consecutive_failures", 0) or streak.get("consecutive_infra_failures", 0):
+            continue
+        last = streak.get("last_failure_at")
+        if last is None or last < streak_cutoff:
+            del direction_failure_streaks[did]
+            pruned["direction_failure_streaks"] += 1
+
+    breaker_cutoff = now - timedelta(hours=_BREAKER_RETENTION_HOURS)
+    for pid, breaker in list(circuit_breakers.items()):
+        if breaker.get("state") != "CLOSED":
+            continue
+        if breaker.get("failure_count", 0) or breaker.get("infra_failure_count", 0):
+            continue
+        opened_at = breaker.get("opened_at")
+        if opened_at is None or opened_at < breaker_cutoff:
+            del circuit_breakers[pid]
+            pruned["circuit_breakers"] += 1
+
+    for pid, count in list(autonomous_failure_counts.items()):
+        if not count:
+            del autonomous_failure_counts[pid]
+            pruned["autonomous_failure_counts"] += 1
+
+    merge_cutoff = now - timedelta(seconds=_MERGE_ERROR_RETENTION_SECONDS)
+    for key, dq in list(merge_error_occurrences.items()):
+        while dq and dq[0][1] < merge_cutoff:
+            dq.popleft()
+        if not dq:
+            del merge_error_occurrences[key]
+            pruned["merge_error_occurrences"] += 1
+
+    debug_cutoff = now - timedelta(seconds=_DEBUG_SPAWN_RETENTION_SECONDS)
+    for pid, dq in list(user_debug_spawn_times.items()):
+        while dq and dq[0] < debug_cutoff:
+            dq.popleft()
+        if not dq:
+            del user_debug_spawn_times[pid]
+            pruned["user_debug_spawn_times"] += 1
+
+    return pruned
+
+
 def get_task_type_failure_rate(task_type: str, window_minutes: int = 15) -> tuple[float, int]:
     """Compute failure rate for a specific task_type within the trailing window.
 
