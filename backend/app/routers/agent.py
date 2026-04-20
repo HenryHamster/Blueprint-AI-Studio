@@ -1397,6 +1397,16 @@ async def claim_task(
                         )
                 except Exception:
                     logger.exception("[AGENT] Failed to compute research top_first_review_issues (non-critical)")
+                research_review_effectiveness = None
+                try:
+                    from app.playbook_learning import compute_review_effectiveness
+                    research_review_effectiveness = await compute_review_effectiveness(
+                        project_id=task.project_id,
+                        session=session,
+                        all_tasks=list(high_iter_rows),
+                    )
+                except Exception:
+                    logger.exception("[AGENT] Failed to compute research review_effectiveness (non-critical)")
                 success_summary: list[str] = []
                 for scope_name, counts in research_scope_rates.items():
                     created = counts["created"]
@@ -1413,6 +1423,7 @@ async def claim_task(
                     "scope_success_rates": research_scope_rates,
                     "top_first_review_issues": research_top_review_issues,
                     "success_patterns": success_summary,
+                    "review_effectiveness": research_review_effectiveness,
                 }
 
     # Inject co-change affinity context for create/fix/refactor tasks

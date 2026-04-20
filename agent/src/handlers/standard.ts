@@ -118,6 +118,54 @@ export interface StandardHandlerOpts {
 }
 
 /**
+ * For small-scope tasks, produce a brief note listing the primary target
+ * file's top-level exports and any files that appear to import it. This is
+ * a lightweight caller/import check — NOT a full analysis pass — meant to
+ * catch import/type mismatches and missed caller updates. Returns '' when
+ * nothing useful can be derived.
+ */
+export function buildSmallScopeCallerNote(relatedFiles: string[]): string {
+  if (!relatedFiles || relatedFiles.length === 0) return '';
+  const target = relatedFiles[0];
+  if (!target || target.includes('..')) return '';
+
+  let content = '';
+  try {
+    content = execFileSync('cat', [`${WORKSPACE}/${target}`], { encoding: 'utf-8', timeout: 5_000 });
+  } catch { return ''; }
+
+  const isPy = target.endsWith('.py');
+  const re = isPy
+    ? /^(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)/gm
+    : /^export\s+(?:default\s+|async\s+)?(?:function|class|const|let|var|type|interface|enum)\s+([A-Za-z_]\w*)/gm;
+  const exports: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null && exports.length < 8) {
+    if (!m[1].startsWith('_')) exports.push(m[1]);
+  }
+
+  const basename = (target.split('/').pop() || '').replace(/\.(ts|tsx|mjs|cjs|js|jsx|py)$/, '');
+  let importers: string[] = [];
+  if (basename && /^[A-Za-z_][\w-]*$/.test(basename)) {
+    try {
+      const out = execFileSync(
+        'git',
+        ['-C', WORKSPACE, 'grep', '-lE', `^\\s*(import|from)\\b.*\\b${basename}\\b`, '--', '*.ts', '*.tsx', '*.js', '*.py'],
+        { encoding: 'utf-8', timeout: 10_000 },
+      );
+      importers = out.split('\n').filter(f => f && f !== target).slice(0, 5);
+    } catch { /* git grep returns 1 when no matches */ }
+  }
+
+  if (exports.length === 0 && importers.length === 0) return '';
+  const lines: string[] = [];
+  if (exports.length) lines.push(`Primary target \`${target}\` exposes: ${exports.join(', ')}.`);
+  if (importers.length) lines.push(`Files that reference it: ${importers.map(f => `\`${f}\``).join(', ')}.`);
+  lines.push('Preserve these exports and update any callers you change.');
+  return lines.join('\n');
+}
+
+/**
  * Extracts the structured self-review JSON object from the agent's output.
  * Looks for a ```json ... ``` code fence first, then falls back to finding
  * the first `{` that can be parsed as JSON.
@@ -321,7 +369,14 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       sendLog(ws, '[Analysis Phase] Skipped — proceeding to implementation.\n');
     }
   } else if (taskScope === 'small' && runSmallScopeAnalysis) {
-    analysisContext = `## Pre-Implementation Analysis\n\nBefore writing code: read the files relevant to this task, confirm the scope stays under ~50 lines across 1–3 files, and check for callers that import from files you will modify.\n\n`;
+    const smallRelated = (
+      (payload.related_files as string[] | undefined) ||
+      (ctx.related_files as string[] | undefined) ||
+      []
+    ) as string[];
+    const callerNote = buildSmallScopeCallerNote(smallRelated);
+    const callerSection = callerNote ? `\n\n${callerNote}` : '';
+    analysisContext = `## Pre-Implementation Analysis\n\nBefore writing code: read the files relevant to this task, confirm the scope stays under ~50 lines across 1–3 files, and check for callers that import from files you will modify.${callerSection}\n\n`;
   }
 
   const finalPromptWithTree = fileTree + analysisContext + finalPrompt;
@@ -728,6 +783,11 @@ Return nothing — just write the files.`;
       const scopeSpecificReviewIssues = selfReviewProjectCtx?.scope_specific_review_issues as
         | Array<{ description: string; count: number; category: string; scope: string }>
         | undefined;
+      const allModuleFeedbackWarnings = selfReviewProjectCtx?.module_feedback_warnings as
+        | Array<{ file: string; top_categories: Record<string, number>; sample_size: number }>
+        | undefined;
+      const changedFilesSet = new Set(changedFiles);
+      const moduleFeedbackWarnings = allModuleFeedbackWarnings?.filter(w => changedFilesSet.has(w.file));
       const selfReviewDirectionCtx = task.direction_context as Record<string, unknown> | undefined;
       const directionFirstAttemptFeedback = selfReviewDirectionCtx?.first_attempt_feedback as
         | Record<string, number>
@@ -794,6 +854,7 @@ Return nothing — just write the files.`;
         planCompletion,
         topFirstReviewIssues,
         scopeSpecificReviewIssues,
+        moduleFeedbackWarnings,
         remediationContext,
       });
 

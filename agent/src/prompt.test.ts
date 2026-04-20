@@ -2181,6 +2181,26 @@ describe('buildSelfReviewPrompt', () => {
       .not.toContain('## Specific Patterns That Cause First-Review Rejections');
   });
 
+  it('renders File-Specific Review History when moduleFeedbackWarnings is provided', () => {
+    const result = buildSelfReviewPrompt({
+      ...baseOpts,
+      moduleFeedbackWarnings: [
+        { file: 'backend/app/orchestrator.py', top_categories: { test_coverage: 0.45, error_handling: 0.30 }, sample_size: 20 },
+      ],
+    });
+    expect(result).toContain('## File-Specific Review History');
+    expect(result).toContain('`backend/app/orchestrator.py`');
+    expect(result).toContain('45% test_coverage');
+    expect(result).toContain('30% error_handling');
+    expect(result).toContain('from 20 past issues');
+  });
+
+  it('omits File-Specific Review History when moduleFeedbackWarnings is undefined or empty', () => {
+    expect(buildSelfReviewPrompt(baseOpts)).not.toContain('## File-Specific Review History');
+    expect(buildSelfReviewPrompt({ ...baseOpts, moduleFeedbackWarnings: [] }))
+      .not.toContain('## File-Specific Review History');
+  });
+
   it('renders Plan Completion Status section with counts and missing files when planCompletion is provided', () => {
     const result = buildSelfReviewPrompt({
       ...baseOpts,

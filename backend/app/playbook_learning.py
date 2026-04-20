@@ -839,14 +839,20 @@ _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS = 14
 
 _DIRECTION_FIRST_ATTEMPT_KEY = "direction_first_attempt_feedback"
 _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD = 5
+# Decay parameters for direction first-attempt tallies — mirror module feedback
+# so recent rejections dominate old, possibly-resolved patterns.
+_DIRECTION_FIRST_ATTEMPT_DECAY_AGE_DAYS = 14
+_DIRECTION_FIRST_ATTEMPT_DECAY_HALF_LIFE_DAYS = 14
 
 
-def _decay_module_feedback_entry(entry: dict, now: datetime) -> dict:
-    """Return *entry* with category counts exponentially decayed by age.
+def _decay_counts_entry(
+    entry: dict, now: datetime, grace_days: float, half_life_days: float
+) -> dict:
+    """Return *entry* with integer category counts exponentially decayed by age.
 
     No-op when ``last_updated`` is missing/unparseable or the entry is still
-    within the grace window. Otherwise multiplies each integer category count
-    (and ``total``) by ``0.5 ** (overage_days / half_life)``; categories that
+    within the grace window. Otherwise multiplies each integer count (and
+    ``total``) by ``0.5 ** (overage_days / half_life_days)``; categories that
     round to zero are dropped so resolved patterns fade out completely.
     """
     last_str = entry.get("last_updated")
@@ -858,10 +864,10 @@ def _decay_module_feedback_entry(entry: dict, now: datetime) -> dict:
         return entry
     if last_dt.tzinfo is not None:
         last_dt = last_dt.replace(tzinfo=None)
-    overage = (now - last_dt).total_seconds() / 86400.0 - _MODULE_FEEDBACK_DECAY_AGE_DAYS
+    overage = (now - last_dt).total_seconds() / 86400.0 - grace_days
     if overage <= 0:
         return entry
-    factor = 0.5 ** (overage / _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS)
+    factor = 0.5 ** (overage / half_life_days)
     decayed: dict = {}
     new_total = 0
     for k, v in entry.items():
@@ -876,6 +882,15 @@ def _decay_module_feedback_entry(entry: dict, now: datetime) -> dict:
             new_total += new_count
     decayed["total"] = new_total
     return decayed
+
+
+def _decay_module_feedback_entry(entry: dict, now: datetime) -> dict:
+    return _decay_counts_entry(
+        entry,
+        now,
+        _MODULE_FEEDBACK_DECAY_AGE_DAYS,
+        _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS,
+    )
 
 
 def _update_module_feedback_profiles(
@@ -940,9 +955,20 @@ def _accumulate_direction_first_attempt(
     """
     if not buckets:
         return
-    now_iso = _utcnow().isoformat()
+    now = _utcnow()
+    now_iso = now.isoformat()
     tally: dict = dict(doc.get(_DIRECTION_FIRST_ATTEMPT_KEY) or {})
-    entry: dict = dict(tally.get(direction_key) or {})
+    existing = tally.get(direction_key) or {}
+    entry: dict = (
+        _decay_counts_entry(
+            dict(existing),
+            now,
+            _DIRECTION_FIRST_ATTEMPT_DECAY_AGE_DAYS,
+            _DIRECTION_FIRST_ATTEMPT_DECAY_HALF_LIFE_DAYS,
+        )
+        if existing
+        else {}
+    )
     for cat, issues in buckets.items():
         if issues:
             entry[cat] = entry.get(cat, 0) + len(issues)

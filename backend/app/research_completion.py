@@ -188,6 +188,30 @@ def _avg_medium_expansion_ratio(
     return max(_candidates) if _candidates else None
 
 
+def _compute_prompt_telemetry(
+    full_prompt: str,
+    related_files: List[str],
+    scope: str,
+) -> Dict[str, Any]:
+    """Lightweight prompt characteristics for outcome correlation.
+
+    Stored in task.context['prompt_telemetry'] at spawn time and aggregated by
+    direction_outcomes to surface patterns like "prompts mentioning tests merge
+    at higher rates than those that don't".
+    """
+    import re  # noqa: PLC0415
+    text = full_prompt or ""
+    budget = SCOPE_FILE_BUDGETS.get(scope, {}).get("total_files_max") or 0
+    n_related = len(related_files or [])
+    return {
+        "char_count": len(text),
+        "related_file_count": n_related,
+        "mentions_tests": bool(re.search(r"\btest", text, re.IGNORECASE)),
+        "mentions_symbols": bool(re.search(r"\b[a-z][a-zA-Z0-9_]*[a-z][A-Z]\w*\b|\b[A-Z][a-zA-Z0-9_]*[a-z]\w*\b\(|\b[a-z_][a-z0-9_]+\(", text)),
+        "files_to_budget_ratio": round(n_related / budget, 3) if budget > 0 else None,
+    }
+
+
 def _outcome_complexity_threshold(
     direction: Optional[Dict[str, Any]],
 ) -> Optional[float]:
@@ -217,6 +241,32 @@ def _outcome_complexity_threshold(
     if avg_failed is not None:
         return avg_failed
     return None
+
+
+def _cochange_decomposition_suppressed(
+    direction: Optional[Dict[str, Any]],
+    min_sub_findings: int = 3,
+    merge_rate_threshold: float = 0.4,
+) -> bool:
+    """Return True when cochange auto-decomposition should be skipped for this
+    direction because historical sub-finding merge rate is poor.
+
+    Aggregates ``cochange_decomposition`` entries across the direction's
+    ``research_history``. When cumulative sub_findings_total >= min_sub_findings
+    and merge rate < merge_rate_threshold, callers should skip auto-splitting
+    to avoid fragmenting findings that empirically don't benefit from it.
+    """
+    if not direction:
+        return False
+    total = 0
+    merged = 0
+    for entry in (direction.get("research_history") or []):
+        cd = entry.get("cochange_decomposition") or {}
+        total += cd.get("sub_findings_total", 0) or 0
+        merged += cd.get("sub_findings_merged", 0) or 0
+    if total < min_sub_findings:
+        return False
+    return (merged / total) < merge_rate_threshold
 
 
 def _calibrate_finding_scope(
@@ -737,12 +787,39 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if _scope_cal_project
         else None
     )
-    deduplicated = auto_decompose_findings_by_cochange(
-        deduplicated,
-        _cochange_index_for_decomp,
-        task.context,
-        _finding_hash,
-    )
+    _suppressed_decomp_dirs = {
+        str(_d.get("id"))
+        for _d in _directions_by_id.values()
+        if _cochange_decomposition_suppressed(_d)
+    }
+    if _suppressed_decomp_dirs:
+        _to_decomp: list = []
+        _skip_decomp: list = []
+        for _item in deduplicated:
+            _fid = str(_item[1].get("direction_id") or _parent_direction_id or "")
+            if _fid in _suppressed_decomp_dirs:
+                _skip_decomp.append(_item)
+            else:
+                _to_decomp.append(_item)
+        if _skip_decomp:
+            logger.info(
+                "[RESEARCH] Suppressing cochange decomposition for %d finding(s) "
+                "in %d direction(s) with poor historical sub-finding merge rate",
+                len(_skip_decomp), len(_suppressed_decomp_dirs),
+            )
+        deduplicated = auto_decompose_findings_by_cochange(
+            _to_decomp,
+            _cochange_index_for_decomp,
+            task.context,
+            _finding_hash,
+        ) + _skip_decomp
+    else:
+        deduplicated = auto_decompose_findings_by_cochange(
+            deduplicated,
+            _cochange_index_for_decomp,
+            task.context,
+            _finding_hash,
+        )
     # Track auto-decomposition outcomes per direction so direction_outcomes
     # can correlate decomposition success with merge rates (parallels
     # plan-parent decomposition_quality tracking).
@@ -1287,6 +1364,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **({"_predicted_file_utilization": _predicted_utilization} if _predicted_utilization is not None else {}),
                 **({"_file_budget_warning": _file_budget_warning} if _file_budget_warning else {}),
                 **({"preventive_context": _preventive, "has_preventive_context": True} if _preventive else {}),
+                "prompt_telemetry": _compute_prompt_telemetry(full_prompt, related_files, scope),
                 **prior_retry_ctx,
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",

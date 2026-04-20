@@ -556,6 +556,38 @@ async def _update_direction_research_outcomes(
     entry["scope_breakdown"] = scope_breakdown
     entry["escalation_outcomes"] = escalation_outcomes
 
+    # Prompt-characteristic aggregation: averages per merged/failed bucket so
+    # direction-level analysis can correlate prompt shape with outcomes.
+    pt_buckets: dict = {"merged": [], "failed": []}
+    for ct in child_tasks_rows:
+        pt = (ct.context or {}).get("prompt_telemetry")
+        if not isinstance(pt, dict):
+            continue
+        if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged"):
+            pt_buckets["merged"].append(pt)
+        elif _counts_as_failure(ct):
+            pt_buckets["failed"].append(pt)
+    prompt_telemetry_summary: dict = {}
+    for bucket_name, items in pt_buckets.items():
+        if not items:
+            continue
+        n = len(items)
+        def _avg(key: str):
+            vals = [i.get(key) for i in items if isinstance(i.get(key), (int, float))]
+            return round(sum(vals) / len(vals), 2) if vals else None
+        def _frac(key: str) -> float:
+            return round(sum(1 for i in items if i.get(key)) / n, 3)
+        prompt_telemetry_summary[bucket_name] = {
+            "count": n,
+            "avg_char_count": _avg("char_count"),
+            "avg_related_file_count": _avg("related_file_count"),
+            "avg_files_to_budget_ratio": _avg("files_to_budget_ratio"),
+            "frac_mentions_tests": _frac("mentions_tests"),
+            "frac_mentions_symbols": _frac("mentions_symbols"),
+        }
+    if prompt_telemetry_summary:
+        entry["prompt_telemetry"] = prompt_telemetry_summary
+
     # Decomposition quality: per plan-parent metrics so future calibration
     # can correlate decomposition shape (breadth, file overlap, cross-module
     # coupling, dep depth) with subtask merge success.

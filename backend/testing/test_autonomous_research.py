@@ -2552,6 +2552,42 @@ def test_auto_decompose_falls_back_to_subdir_within_single_toplevel():
     }
 
 
+def test_cochange_decomposition_suppressed_triggers_on_poor_merge_rate():
+    """Suppress when cumulative sub_findings_total >= 3 and merge_rate < 40%."""
+    from app.research_completion import _cochange_decomposition_suppressed
+    direction = {
+        "research_history": [
+            {"cochange_decomposition": {"sub_findings_total": 2, "sub_findings_merged": 0}},
+            {"cochange_decomposition": {"sub_findings_total": 3, "sub_findings_merged": 1}},
+        ],
+    }
+    assert _cochange_decomposition_suppressed(direction) is True
+
+
+def test_cochange_decomposition_not_suppressed_on_healthy_merge_rate():
+    """Do not suppress when merge rate >= 40%."""
+    from app.research_completion import _cochange_decomposition_suppressed
+    direction = {
+        "research_history": [
+            {"cochange_decomposition": {"sub_findings_total": 4, "sub_findings_merged": 2}},
+        ],
+    }
+    assert _cochange_decomposition_suppressed(direction) is False
+
+
+def test_cochange_decomposition_not_suppressed_below_sample_threshold():
+    """Do not suppress when cumulative sub_findings_total < 3."""
+    from app.research_completion import _cochange_decomposition_suppressed
+    direction = {
+        "research_history": [
+            {"cochange_decomposition": {"sub_findings_total": 2, "sub_findings_merged": 0}},
+        ],
+    }
+    assert _cochange_decomposition_suppressed(direction) is False
+    assert _cochange_decomposition_suppressed({"research_history": []}) is False
+    assert _cochange_decomposition_suppressed(None) is False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. _handle_research_completion — JSONB research_history Updates
 # ─────────────────────────────────────────────────────────────────────────────

@@ -76,6 +76,7 @@ export function buildSelfReviewPrompt(opts: {
     missingTest: string[];
   };
   topFirstReviewIssues?: Array<{ description: string; count: number; category: string }>;
+  moduleFeedbackWarnings?: Array<{ file: string; top_categories: Record<string, number>; sample_size: number }>;
   scopeSpecificReviewIssues?: Array<{ description: string; count: number; category: string; scope: string }>;
   remediationContext?: {
     diagnosisTaskId?: string;
@@ -153,6 +154,20 @@ export function buildSelfReviewPrompt(opts: {
           .map(i => `- "${i.description}" (seen ${i.count}x, category: ${i.category})`)
           .join('\n');
         return `\n## Scope-Specific Review Patterns\nFor ${scope}-scope tasks in this project, these issues are most common:\n${lines}\n`;
+      })()
+    : '';
+
+  const moduleFeedbackWarnings = opts.moduleFeedbackWarnings;
+  const moduleFeedbackSection = moduleFeedbackWarnings && moduleFeedbackWarnings.length > 0
+    ? (() => {
+        const lines = moduleFeedbackWarnings.map(w => {
+          const cats = Object.entries(w.top_categories)
+            .sort(([, a], [, b]) => b - a)
+            .map(([cat, pct]) => `${Math.round(pct * 100)}% ${cat}`)
+            .join(', ');
+          return `- \`${w.file}\`: ${cats} (from ${w.sample_size} past issues)`;
+        }).join('\n');
+        return `\n## File-Specific Review History (files you changed)\nYou modified files with known review patterns. Verify your changes address these:\n${lines}\n`;
       })()
     : '';
 
@@ -238,7 +253,7 @@ export function buildSelfReviewPrompt(opts: {
   const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
 
   return `You are performing a self-review of the changes you just made for this task.
-${restrictionsSection}${remediationSection}${directionFeedbackSection}${scopeSpecificSection}${issueDistSection}${firstAttemptSection}${topIssuesSection}${playbookSection}${scopeOverflowSection}${planSection}${planCompletionSection}${diffSection}${buildVerificationSection}
+${restrictionsSection}${remediationSection}${directionFeedbackSection}${scopeSpecificSection}${issueDistSection}${firstAttemptSection}${moduleFeedbackSection}${topIssuesSection}${playbookSection}${scopeOverflowSection}${planSection}${planCompletionSection}${diffSection}${buildVerificationSection}
 ## Self-Review Instructions
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.

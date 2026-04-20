@@ -90,7 +90,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote } from './standard.js';
 import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks } from '../index.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles } from '../prompt.js';
 
@@ -2265,6 +2265,21 @@ describe('post-self-review scope overflow gate', () => {
       expect.objectContaining({ status: 'FAILED', failure_category: 'scope_overflow' }),
     );
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+  });
+});
+
+// ── buildSmallScopeCallerNote ────────────────────────────────────────────────
+describe('buildSmallScopeCallerNote', () => {
+  it('returns empty string when no related files are provided', () => {
+    expect(buildSmallScopeCallerNote([])).toBe('');
+  });
+
+  it('returns empty string when target path cannot be read', () => {
+    expect(buildSmallScopeCallerNote(['does/not/exist-xyz-99.ts'])).toBe('');
+  });
+
+  it('rejects suspicious paths containing ..', () => {
+    expect(buildSmallScopeCallerNote(['../etc/passwd'])).toBe('');
   });
 });
 

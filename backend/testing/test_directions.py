@@ -3640,6 +3640,25 @@ class TestPredictSpawnSuccessAcceptanceSignal:
         # Absent/None preserves the neutral fallback.
         assert predict_spawn_success("medium", {}) == 0.5
 
+    def test_review_iteration_signal_graduated_penalty(self):
+        """Rolling median review-iteration count applies a graduated penalty:
+        1-2 iters → no effect, 3-4 → 0.5 (moderate), 5+ → 0.2 (strong)."""
+        # No effect at 1-2 iterations (normal churn).
+        d_low = {"research_history": [{"median_review_iterations": 2}]}
+        assert predict_spawn_success("small", d_low) == 0.5
+        # Moderate penalty at 3-4 iterations: combine with complexity 0.9
+        # (weight 1.5) so the review-iter signal (0.5, weight 1.0) is observable.
+        d_mid = {"research_history": [{"median_review_iterations": 3}]}
+        # (0.9*1.5 + 0.5*1.0) / 2.5 = 1.85/2.5 = 0.74
+        assert predict_spawn_success("small", d_mid, complexity_score=0.9) == pytest.approx(0.74)
+        d_mid2 = {"research_history": [{"median_review_iterations": 4}]}
+        assert predict_spawn_success("small", d_mid2, complexity_score=0.9) == pytest.approx(0.74)
+        # Without the review-iter penalty, the same complexity would yield 0.9.
+        assert predict_spawn_success("small", d_low, complexity_score=0.9) == pytest.approx(0.9)
+        # Strong penalty at 5+ iterations.
+        d_high = {"research_history": [{"median_review_iterations": 6}]}
+        assert predict_spawn_success("small", d_high) == pytest.approx(0.2)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _poor_decomp_history helper unit tests (suppression signal)

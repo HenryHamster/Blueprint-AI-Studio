@@ -4106,6 +4106,60 @@ class TestPredictSpawnSuccessExpansionRatio:
                 runtime_config["pipeline_scope_merge_rates"] = prev
 
 
+class TestPredictSpawnSuccessFailureStageComposition:
+    """Signal 14: failure-stage composition penalty in predict_spawn_success."""
+
+    def _direction(self, stages: dict, scope: str = "small") -> dict:
+        return {
+            "research_history": [
+                {"scope_breakdown": {scope: {"failure_stages": stages}}}
+            ],
+        }
+
+    def _predict(self, direction: dict, scope: str = "small") -> float:
+        from app.shared_state import runtime_config
+        from app.spawn_calibration import predict_spawn_success
+        prev = runtime_config.get("pipeline_scope_merge_rates")
+        runtime_config["pipeline_scope_merge_rates"] = {}
+        try:
+            return predict_spawn_success(scope, direction)
+        finally:
+            if prev is None:
+                runtime_config.pop("pipeline_scope_merge_rates", None)
+            else:
+                runtime_config["pipeline_scope_merge_rates"] = prev
+
+    def test_merge_dominance_applies_strong_penalty(self):
+        p = self._predict(self._direction({"merge": 4, "test": 1}))
+        assert p == pytest.approx(0.25)
+
+    def test_review_dominance_applies_lighter_penalty(self):
+        p_review = self._predict(self._direction({"review": 4, "test": 1}))
+        p_merge = self._predict(self._direction({"merge": 4, "test": 1}))
+        assert p_review > p_merge
+        assert p_review == pytest.approx(0.5)
+
+    def test_infra_stages_excluded_from_denominator(self):
+        # 2 merge / (2 merge + 1 test) = 66% → penalty applies.
+        # Provision/clone excluded from the non-infra denominator.
+        p = self._predict(self._direction(
+            {"merge": 2, "test": 1, "provision": 10, "clone": 5}
+        ))
+        assert p == pytest.approx(0.25)
+
+    def test_insufficient_non_infra_data_no_signal(self):
+        # Only 2 non-infra failures → below 3 threshold, signal omitted.
+        p = self._predict(self._direction({"merge": 2, "provision": 10}))
+        assert p == 0.5
+
+    def test_no_dominance_no_signal(self):
+        # Evenly split across stages → no single stage >= 50%.
+        p = self._predict(self._direction(
+            {"merge": 2, "review": 2, "test": 2, "lint": 2}
+        ))
+        assert p == 0.5
+
+
 class TestPredictSpawnSuccessTaxonomyWeighting:
     """Signal 3 taxonomy-weighted failure rate in predict_spawn_success."""
 

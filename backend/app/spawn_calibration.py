@@ -14,7 +14,7 @@ import os
 from datetime import timedelta
 from typing import Any
 
-from app.direction_metrics import _compute_acceptance_rate
+from app.direction_metrics import _compute_acceptance_rate, _compute_rolling_median_review_iterations
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -532,6 +532,32 @@ def predict_spawn_success(
             signals.append(0.45)
             weights.append(1.0)
 
+    # Signal 14: failure-stage composition. When merge-stage failures dominate
+    # the non-infra failures, the scope estimate is likely too small — the
+    # implementation finishes but the resulting PR can't be merged cleanly
+    # (conflicts, behind base, blocking checks), a scope-miscalibration
+    # signature. Review-stage dominance is weaker: it indicates the review
+    # pipeline surfaced real quality issues, less correlated with scope.
+    # Infra stages (provision, clone) are excluded from the denominator.
+    stage_totals: dict[str, int] = {}
+    for _s, _stats in scope_agg.items():
+        if _s != scope:
+            continue
+        for _name, _cnt in (_stats.get("failure_stages") or {}).items():
+            stage_totals[_name] = stage_totals.get(_name, 0) + int(_cnt or 0)
+    non_infra_total = sum(
+        c for n, c in stage_totals.items() if n not in ("provision", "clone")
+    )
+    if non_infra_total >= 3:
+        merge_share = stage_totals.get("merge", 0) / non_infra_total
+        review_share = stage_totals.get("review", 0) / non_infra_total
+        if merge_share >= 0.5:
+            signals.append(0.25)
+            weights.append(1.5)
+        elif review_share >= 0.5:
+            signals.append(0.5)
+            weights.append(1.0)
+
     # Signal 12: composite complexity score from scope_complexity. Combines
     # file count, historical expansion, cochange density, and cross-module
     # span into a single P(merge) estimate in [0,1]. Low scores at medium
@@ -540,6 +566,19 @@ def predict_spawn_success(
     if isinstance(complexity_score, (int, float)):
         signals.append(max(0.0, min(1.0, float(complexity_score))))
         weights.append(1.5)
+
+    # Signal 14: rolling median review-iteration count. Directions whose tasks
+    # consistently need many review cycles before merging are producing
+    # lower-quality findings that consume disproportionate compute. Graduated
+    # penalty: no effect at 1-2 iterations (normal), moderate at 3-4, strong at 5+.
+    median_iters = _compute_rolling_median_review_iterations(direction)
+    if median_iters is not None:
+        if median_iters >= 5:
+            signals.append(0.2)
+            weights.append(1.0)
+        elif median_iters >= 3:
+            signals.append(0.5)
+            weights.append(1.0)
 
     if not signals:
         return 0.5  # insufficient data — neutral

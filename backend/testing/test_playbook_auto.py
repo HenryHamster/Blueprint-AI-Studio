@@ -1423,6 +1423,29 @@ def test_accumulate_direction_first_attempt_accumulates_across_calls():
     assert tally["total"] == 3
 
 
+def test_accumulate_direction_first_attempt_decays_old_counts():
+    """Stale counts past the grace window decay exponentially before new counts accumulate."""
+    from app.playbook_learning import _accumulate_direction_first_attempt, _DIRECTION_FIRST_ATTEMPT_KEY
+
+    stale_last = (_utcnow() - timedelta(days=60)).isoformat()
+    doc: dict = {
+        _DIRECTION_FIRST_ATTEMPT_KEY: {
+            "dir-old": {
+                "test-coverage": 20,
+                "total": 20,
+                "last_updated": stale_last,
+            }
+        }
+    }
+    buckets = {"test-coverage": [{"desc": "x", "severity": "MAJOR", "iteration": 0}]}
+    _accumulate_direction_first_attempt(doc, "dir-old", buckets)
+
+    tally = doc[_DIRECTION_FIRST_ATTEMPT_KEY]["dir-old"]
+    # 60 days old => overage 46d, factor ≈ 0.5^(46/14) ≈ 0.102 => round(20*0.102)=2, +1 = 3
+    assert tally["test-coverage"] < 20
+    assert tally["test-coverage"] >= 1
+
+
 def test_accumulate_direction_first_attempt_noop_on_empty_buckets():
     """No changes when buckets are empty."""
     from app.playbook_learning import _accumulate_direction_first_attempt, _DIRECTION_FIRST_ATTEMPT_KEY
@@ -1731,7 +1754,7 @@ async def test_extract_review_feedback_auto_playbook_at_threshold(db_session: As
             direction_id: {
                 "test-coverage": pre_count,
                 "total": pre_count,
-                "last_updated": "2026-01-01T00:00:00",
+                "last_updated": _utcnow().isoformat(),
             }
         }
     })
