@@ -1,4 +1,5 @@
 import { TrendingUp, TrendingDown, Minus } from 'lucide-react';
+import { STAGE_ORDER, STAGE_COLORS } from './taxonomyConstants';
 
 const SCOPE_ORDER = ['small', 'medium', 'large'];
 
@@ -11,6 +12,7 @@ type ScopeRate = {
   calibrated_out?: number;
   avg_expansion_ratio_merged?: number;
   avg_expansion_ratio_failed?: number;
+  failure_stages?: Record<string, number>;
 };
 
 export function ScopeConversionRatesSection({
@@ -32,7 +34,18 @@ export function ScopeConversionRatesSection({
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Scope Conversion Rates</h2>
       <div className="flex gap-2 flex-wrap">
         {scopes.map(scope => {
-          const { created, merged, merged_cross_module = 0, failed_scope_overflow = 0, calibrated_in = 0, calibrated_out = 0, avg_expansion_ratio_merged, avg_expansion_ratio_failed } = scopeRates[scope];
+          const { created, merged, merged_cross_module = 0, failed_scope_overflow = 0, calibrated_in = 0, calibrated_out = 0, avg_expansion_ratio_merged, avg_expansion_ratio_failed, failure_stages } = scopeRates[scope];
+          const topStages = failure_stages
+            ? Object.entries(failure_stages)
+                .filter(([, c]) => (c || 0) > 0)
+                .sort((a, b) => {
+                  if (b[1] !== a[1]) return b[1] - a[1];
+                  const ai = STAGE_ORDER.indexOf(a[0] as typeof STAGE_ORDER[number]);
+                  const bi = STAGE_ORDER.indexOf(b[0] as typeof STAGE_ORDER[number]);
+                  return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+                })
+                .slice(0, 2)
+            : [];
           const expansionWarn =
             typeof avg_expansion_ratio_merged === 'number' &&
             typeof avg_expansion_ratio_failed === 'number' &&
@@ -76,6 +89,18 @@ export function ScopeConversionRatesSection({
               )}
               {recalibrated > 0 && (
                 <p className="text-[10px] text-neutral-600 mt-0.5">{recalibrated} recalibrated</p>
+              )}
+              {topStages.length > 0 && (
+                <div className="flex gap-1 flex-wrap mt-1" title="Top failure stages for this scope">
+                  {topStages.map(([stage, count]) => (
+                    <span
+                      key={stage}
+                      className={`text-[9px] px-1.5 py-0.5 rounded border ${STAGE_COLORS[stage] || 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}
+                    >
+                      {stage} {count}
+                    </span>
+                  ))}
+                </div>
               )}
               {(typeof avg_expansion_ratio_merged === 'number' || typeof avg_expansion_ratio_failed === 'number') && (
                 <p

@@ -275,6 +275,16 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       []
     ) as string[];
 
+    const analysisProjectCtx = task.project_context as Record<string, unknown> | undefined;
+    const rawConcurrent = analysisProjectCtx?.direction_concurrent_files;
+    const directionConcurrentFiles = Array.isArray(rawConcurrent)
+      ? (rawConcurrent as unknown[]).filter((f): f is string => typeof f === 'string' && f.length > 0)
+      : [];
+    const rawCochange = analysisProjectCtx?.cochange_files;
+    const cochangeFiles = Array.isArray(rawCochange)
+      ? (rawCochange as unknown[]).filter((f): f is string => typeof f === 'string' && f.length > 0)
+      : [];
+
     const diagnosisTaskId = strVal(ctx.diagnosis_task_id);
     const diagnosisContext = diagnosisTaskId
       ? {
@@ -301,6 +311,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       fileTree,
       fileLimit: prodFileLimit,
       totalFileBudget,
+      directionConcurrentFiles,
+      cochangeFiles,
       diagnosisContext,
     });
 
@@ -341,6 +353,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           fileLimit: prodFileLimit,
           totalFileBudget,
           narrowingGuidance,
+          directionConcurrentFiles,
+          cochangeFiles,
           diagnosisContext,
         });
         const { exitCode: retryExitCode, lastResultText: retryResult } = await runClaudeCode(

@@ -12,6 +12,8 @@ export function buildAnalysisPrompt(opts: {
   narrowingGuidance?: string;
   fileLimit?: number;
   totalFileBudget?: number;
+  directionConcurrentFiles?: string[];
+  cochangeFiles?: string[];
   diagnosisContext?: {
     rootCause?: string;
     recommendedFix?: string;
@@ -39,6 +41,12 @@ export function buildAnalysisPrompt(opts: {
   const filesList = opts.relatedFiles.length > 0
     ? `## Files Relevant to This Task\n${opts.relatedFiles.map(f => `- ${f}`).join('\n')}\n\n`
     : '';
+  const concurrentBlock = opts.directionConcurrentFiles && opts.directionConcurrentFiles.length > 0
+    ? `\n## Files currently being modified by sibling tasks in this direction\nThese files are in-flight on parallel tasks sharing this research direction. Avoid planning changes that overlap with them to prevent merge conflicts and duplicated work. If you must touch one, note the coordination risk in **Implementation approach**.\n${opts.directionConcurrentFiles.map(f => `- ${f}`).join('\n')}\n`
+    : '';
+  const cochangeBlock = opts.cochangeFiles && opts.cochangeFiles.length > 0
+    ? `\n## Historically co-changed files (consider including in your plan if relevant to this change)\nThese files have frequently been modified together with this task's related files in past merged PRs. Use this as a hint when deciding which files belong in your **Files to change** list — include ones that genuinely need to change for this task, and deprioritize the rest so you stay within the file budget.\n${opts.cochangeFiles.map(f => `- ${f}`).join('\n')}\n`
+    : '';
   const titleLine = opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : '';
   const limitClause = typeof opts.fileLimit === 'number'
     ? ` Aim for ${opts.fileLimit} or fewer files; if you cannot stay at or below ${opts.fileLimit}, list only the smallest viable set and note in **Implementation approach** what was deferred.`
@@ -53,7 +61,7 @@ export function buildAnalysisPrompt(opts: {
   return `${opts.fileTree}${filesList}You are performing a pre-implementation analysis for a medium-scope task. This is a READ-ONLY pass — do not modify any files.
 
 ## Task
-${titleLine}${opts.rawPrompt.slice(0, 1500)}${diagnosisBlock}${narrowingBlock}
+${titleLine}${opts.rawPrompt.slice(0, 1500)}${diagnosisBlock}${narrowingBlock}${concurrentBlock}${cochangeBlock}
 
 ## Instructions
 

@@ -1,4 +1,5 @@
 import { strVal } from '../prompt.js';
+import { MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
 
 function parseResearchSummary(raw: string): string {
   try {
@@ -14,7 +15,7 @@ function parseResearchSummary(raw: string): string {
 }
 
 // ── Shared: Format project_context into a markdown section ────────────────
-export function formatProjectContext(ctx: Record<string, unknown>, taskType = '', taskScope = '', currentDirectionId = ''): string {
+export function formatProjectContext(ctx: Record<string, unknown>, taskType = '', taskScope = '', currentDirectionId = '', relatedFilesCount = 0): string {
   const CONTEXT_BUDGET = 8000;
 
   const header = [
@@ -88,6 +89,10 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     cochangeLines.push('Based on merged PRs in this project, these files are commonly modified together with your task\'s related files — review and update them if relevant:');
     for (const f of cochangeFiles) {
       cochangeLines.push(`- ${f}`);
+    }
+    if (taskScope === 'medium') {
+      const remaining = Math.max(0, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT - relatedFilesCount);
+      cochangeLines.push(`Budget note: you have ${remaining} production file slot${remaining === 1 ? '' : 's'} remaining in the ${MEDIUM_ANALYSIS_PLAN_FILE_LIMIT}-file analysis plan budget — include co-changed files only if essential to correctness.`);
     }
     cochangeLines.push('');
   }

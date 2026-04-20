@@ -154,6 +154,16 @@ interface DigestData {
     remediation_success_by_confidence?: Record<string, { merged: number; failed: number }> | null;
     diagnosis_drop_off_by_reason?: Record<string, number> | null;
   } | null;
+  recurring_patterns?: {
+    fingerprint: string;
+    occurrence_count: number;
+    severity?: string | null;
+    example_message?: string | null;
+    affected_direction_count: number;
+    affected_directions?: { direction_id: string; direction_text: string }[];
+    remediation_status: 'fix_verified' | 'fix_shipped' | 'investigating' | 'unaddressed';
+    proactive?: boolean;
+  }[] | null;
   investigation_conversion?: {
     total_completed?: number;
     parseable?: number;
@@ -162,6 +172,17 @@ interface DigestData {
     low_confidence?: number;
     actionable?: number;
     remediation_spawned?: number;
+  } | null;
+  anomaly_adjustment?: {
+    active: boolean;
+    adjusted_at?: string | null;
+    trigger_anomalies?: string[];
+    pre_adjustment_max_vms?: number | null;
+    adjusted_max_vms?: number | null;
+    failure_gate_threshold?: number | null;
+    pre_adjustment_failure_gate?: number | null;
+    forced_restoration_count?: number;
+    forced_restored_at?: string | null;
   } | null;
 }
 
@@ -564,6 +585,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
         </select>
       </div>
 
+      {/* Anomaly Throttle Banner */}
+      <AnomalyThrottleBanner digest={digest} />
+
       {/* System Status */}
       <SystemStatusCard digest={digest} loading={loading} />
 
@@ -740,6 +764,62 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               conversion={digest?.investigation_conversion ?? null}
               loading={loading}
             />
+          )}
+
+          {/* Section 1g: Recurring Patterns */}
+          {(digest?.recurring_patterns ?? []).length > 0 && (
+            <section>
+              <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+                Recurring Patterns <span className="text-neutral-600 font-normal normal-case tracking-normal">· {digest!.recurring_patterns!.length}</span>
+              </h2>
+              <div className="flex flex-col gap-1">
+                {digest!.recurring_patterns!.slice(0, 5).map(pattern => {
+                  const statusStyles: Record<string, string> = {
+                    fix_verified: 'bg-green-500/10 text-green-400 border-green-500/20',
+                    fix_shipped: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+                    investigating: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20',
+                    unaddressed: 'bg-red-500/10 text-red-400 border-red-500/20',
+                  };
+                  const statusClass = statusStyles[pattern.remediation_status] ?? 'bg-neutral-700/30 text-neutral-400 border-neutral-700/30';
+                  const snippet = (pattern.example_message ?? '').length > 120
+                    ? (pattern.example_message ?? '').slice(0, 120) + '…'
+                    : (pattern.example_message ?? '');
+                  const dirs = pattern.affected_directions ?? [];
+                  return (
+                    <div
+                      key={pattern.fingerprint}
+                      className="flex flex-col gap-0.5 text-xs bg-neutral-900/50 border border-neutral-800/50 px-2 py-1.5 rounded"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className={`shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded border uppercase tracking-wider ${statusClass}`}>
+                          {pattern.remediation_status.replace('_', ' ')}
+                        </span>
+                        <span className="flex-1 truncate text-neutral-400 font-mono text-[10px]">{snippet}</span>
+                        <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-neutral-800/50 text-neutral-300 border border-neutral-700/30">
+                          ×{pattern.occurrence_count}
+                        </span>
+                      </div>
+                      {dirs.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1 text-[10px] text-neutral-500">
+                          {dirs.slice(0, 4).map(d => (
+                            <button
+                              key={d.direction_id}
+                              type="button"
+                              onClick={() => onDirectionClick?.(d.direction_id)}
+                              className="text-[10px] px-1 py-0.5 rounded bg-neutral-800/50 text-neutral-300 border border-neutral-700/30 hover:border-neutral-600 truncate max-w-[200px]"
+                              title={d.direction_text || d.direction_id}
+                            >
+                              {(d.direction_text || d.direction_id).slice(0, 40)}
+                            </button>
+                          ))}
+                          {dirs.length > 4 && <span>+{dirs.length - 4} more</span>}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
           )}
 
           {/* Section 2: Direction Portfolio Health */}
@@ -1068,6 +1148,61 @@ function ScopeTrendsSection({
           )}
         </div>
       )}
+    </section>
+  );
+}
+
+// ---------- anomaly throttle banner ----------
+
+function AnomalyThrottleBanner({ digest }: { digest: DigestData | null }) {
+  const adj = digest?.anomaly_adjustment;
+  if (!adj || !adj.active) return null;
+  const triggers = adj.trigger_anomalies ?? [];
+  const pre = adj.pre_adjustment_max_vms;
+  const post = adj.adjusted_max_vms;
+  const gatePre = adj.pre_adjustment_failure_gate;
+  const gateNow = adj.failure_gate_threshold;
+  return (
+    <section>
+      <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 flex items-start gap-2">
+        <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+        <div className="flex-1 min-w-0">
+          <div className="text-xs font-semibold text-amber-300">
+            Pipeline auto-throttled
+            {adj.adjusted_at && (
+              <span className="ml-2 text-[10px] font-normal text-amber-400/70">
+                {timeAgo(adj.adjusted_at)}
+              </span>
+            )}
+          </div>
+          <div className="text-[11px] text-amber-200/80 mt-1 space-y-0.5">
+            {triggers.length > 0 && (
+              <div>
+                <span className="text-amber-400/60">Triggers: </span>
+                <span className="font-mono">{triggers.join(', ')}</span>
+              </div>
+            )}
+            {pre != null && post != null && (
+              <div>
+                <span className="text-amber-400/60">max_vms: </span>
+                <span className="font-mono">{pre} → {post}</span>
+              </div>
+            )}
+            {gatePre != null && gateNow != null && gatePre !== gateNow && (
+              <div>
+                <span className="text-amber-400/60">failure_gate: </span>
+                <span className="font-mono">{gatePre} → {gateNow}</span>
+              </div>
+            )}
+            {(adj.forced_restoration_count ?? 0) > 0 && (
+              <div className="text-amber-400/60">
+                Forced restorations: {adj.forced_restoration_count}
+                {adj.forced_restored_at && ` (last ${timeAgo(adj.forced_restored_at)})`}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
     </section>
   );
 }

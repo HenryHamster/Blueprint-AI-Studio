@@ -18,6 +18,7 @@ from app.auth import get_current_user, require_admin
 from app.shared_state import runtime_config as _runtime_config
 from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SPOT_RATE
 from app.direction_metrics import _compute_direction_quality_score
+from app.direction_outcomes import synthesize_prompt_quality_patterns
 
 logger = logging.getLogger(__name__)
 
@@ -1229,13 +1230,16 @@ async def get_digest(
                 # Accumulate into project-level scope rate aggregates
                 for _s, _st in dir_scope_agg.items():
                     if _s not in scope_conversion_rates:
-                        scope_conversion_rates[_s] = {"created": 0, "merged": 0, "merged_cross_module": 0, "failed_scope_overflow": 0, "calibrated_in": 0, "calibrated_out": 0}
+                        scope_conversion_rates[_s] = {"created": 0, "merged": 0, "merged_cross_module": 0, "failed_scope_overflow": 0, "calibrated_in": 0, "calibrated_out": 0, "failure_stages": {}}
                     scope_conversion_rates[_s]["created"] += _st["created"]
                     scope_conversion_rates[_s]["merged"] += _st["merged"]
                     scope_conversion_rates[_s]["merged_cross_module"] += _st.get("merged_cross_module", 0)
                     scope_conversion_rates[_s]["failed_scope_overflow"] += _st.get("failed_scope_overflow", 0)
                     scope_conversion_rates[_s]["calibrated_in"] += _st.get("calibrated_in", 0)
                     scope_conversion_rates[_s]["calibrated_out"] += _st.get("calibrated_out", 0)
+                    _stage_acc = scope_conversion_rates[_s].setdefault("failure_stages", {})
+                    for _stg, _scnt in (_st.get("failure_stages") or {}).items():
+                        _stage_acc[_stg] = _stage_acc.get(_stg, 0) + (_scnt or 0)
                     for _f in ("avg_expansion_ratio_merged", "avg_expansion_ratio_failed"):
                         _sum = _st.get(f"_{_f}_sum", 0.0)
                         _w = _st.get(f"_{_f}_w", 0)
@@ -1294,6 +1298,9 @@ async def get_digest(
                         continue
                     _dir_rejections.append((_ts, _t))
                 _dir_rejections.sort(key=lambda x: x[0], reverse=True)
+
+                _pq_notes = synthesize_prompt_quality_patterns(d.get("research_history") or [])
+                prompt_quality_hint = _pq_notes[0] if _pq_notes else None
                 rejection_reasons = [
                     {
                         "task_id": str(_t.id),
@@ -1357,6 +1364,7 @@ async def get_digest(
                         "user_issues_caught": dir_user_issues_caught,
                     },
                     "rejection_reasons": rejection_reasons or None,
+                    "prompt_quality_hint": prompt_quality_hint,
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
@@ -2706,6 +2714,20 @@ async def get_digest(
         "diagnosis_drop_off_by_reason": diagnosis_drop_off_by_reason,
     }
 
+    # --- Anomaly-driven pipeline adjustment snapshot ---
+    from app.shared_state import anomaly_adjustments as _anomaly_adjustments  # noqa: PLC0415
+    anomaly_adjustment_summary = {
+        "active": bool(_anomaly_adjustments.get("active")),
+        "adjusted_at": _anomaly_adjustments.get("adjusted_at"),
+        "trigger_anomalies": list(_anomaly_adjustments.get("trigger_anomalies") or []),
+        "pre_adjustment_max_vms": _anomaly_adjustments.get("pre_adjustment_max_vms"),
+        "adjusted_max_vms": _anomaly_adjustments.get("adjusted_max_vms"),
+        "failure_gate_threshold": _anomaly_adjustments.get("failure_gate_threshold"),
+        "pre_adjustment_failure_gate": _anomaly_adjustments.get("pre_adjustment_failure_gate"),
+        "forced_restoration_count": _anomaly_adjustments.get("forced_restoration_count", 0),
+        "forced_restored_at": _anomaly_adjustments.get("forced_restored_at"),
+    }
+
     # --- Recurring failure patterns (from persistent_anomalies) ---
     from app.shared_state import persistent_anomalies as _persistent_anomalies  # noqa: PLC0415
     _fp_48h_cutoff = _utcnow() - timedelta(hours=48)
@@ -2790,6 +2812,7 @@ async def get_digest(
                 _status = "investigating"
             else:
                 _status = "unaddressed"
+            _affected_dir_ids = sorted(_fp_dirs_48h.get(_fp_key, set()))
             recurring_patterns.append({
                 "fingerprint": _fp_key,
                 "occurrence_count": _info.get("occurrence_count", 0),
@@ -2797,7 +2820,11 @@ async def get_digest(
                 "last_seen": _info.get("last_seen"),
                 "severity": _info.get("severity"),
                 "example_message": (_info.get("latest_details") or "")[:240],
-                "affected_direction_count": len(_fp_dirs_48h.get(_fp_key, set())),
+                "affected_direction_count": len(_affected_dir_ids),
+                "affected_directions": [
+                    {"direction_id": _did, "direction_text": dir_id_to_text.get(_did, "")}
+                    for _did in _affected_dir_ids
+                ],
                 "remediation_status": _status,
                 "proactive": bool(_state.get("proactive", False)),
             })
@@ -2886,4 +2913,5 @@ async def get_digest(
         "early_warnings": early_warnings,
         "remediation_funnel": remediation_funnel,
         "investigation_conversion": investigation_conversion,
+        "anomaly_adjustment": anomaly_adjustment_summary,
     }

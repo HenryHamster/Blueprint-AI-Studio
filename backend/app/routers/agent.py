@@ -878,8 +878,20 @@ async def claim_task(
             except Exception:
                 logger.exception("[AGENT] Failed to compute review_effectiveness (non-critical)")
 
+        direction_concurrent_files: list[str] = []
+        if current_direction_id:
+            _seen_files: set[str] = set()
+            for _at in active_tasks:
+                if _at.get("direction_id") != current_direction_id:
+                    continue
+                for _f in (_at.get("related_files") or []):
+                    if isinstance(_f, str) and _f and _f not in _seen_files:
+                        _seen_files.add(_f)
+                        direction_concurrent_files.append(_f)
+
         response["project_context"] = {
             "active_tasks": active_tasks,
+            "direction_concurrent_files": direction_concurrent_files,
             "queued_tasks": queued_tasks,
             "recently_completed_tasks": recently_completed_tasks,
             "direction_recent_tasks": direction_recent_tasks if current_direction_id else [],

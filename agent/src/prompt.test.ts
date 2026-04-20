@@ -1393,6 +1393,22 @@ describe('formatProjectContext', () => {
     expect(result).toContain('error-handling');
   });
 
+  it('includes co-change budget note for medium-scope tasks', () => {
+    const ctx = { cochange_files: ['src/foo.ts', 'src/bar.ts'] };
+    const result = formatProjectContext(ctx, 'create', 'medium', '', 3);
+    expect(result).toContain('Frequently Co-Changed Files');
+    expect(result).toContain('Budget note: you have 7 production file slots remaining');
+  });
+
+  it('omits co-change budget note for non-medium scopes', () => {
+    const ctx = { cochange_files: ['src/foo.ts'] };
+    const smallResult = formatProjectContext(ctx, 'create', 'small', '', 1);
+    expect(smallResult).toContain('Frequently Co-Changed Files');
+    expect(smallResult).not.toContain('Budget note');
+    const unscoped = formatProjectContext(ctx, 'create');
+    expect(unscoped).not.toContain('Budget note');
+  });
+
   it('omits persistent review issues line when list is empty or absent', () => {
     const ctx = {
       pipeline_health: {
@@ -2838,6 +2854,56 @@ describe('buildAnalysisPrompt', () => {
     });
     expect(result).toContain('Total file budget');
     expect(result).toContain('10');
+  });
+
+  it('includes direction-concurrent file targets section when provided', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Do thing',
+      taskTitle: 'Title',
+      relatedFiles: [],
+      fileTree: '',
+      directionConcurrentFiles: ['a/b.ts', 'c/d.py'],
+    });
+    expect(result).toContain('Files currently being modified by sibling tasks in this direction');
+    expect(result).toContain('- a/b.ts');
+    expect(result).toContain('- c/d.py');
+    expect(result.indexOf('sibling tasks in this direction')).toBeLessThan(result.indexOf('## Instructions'));
+  });
+
+  it('includes cochange-files section when provided', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Do thing',
+      taskTitle: 'Title',
+      relatedFiles: [],
+      fileTree: '',
+      cochangeFiles: ['foo/bar.ts', 'baz/qux.py'],
+    });
+    expect(result).toContain('Historically co-changed files');
+    expect(result).toContain('- foo/bar.ts');
+    expect(result).toContain('- baz/qux.py');
+    expect(result.indexOf('Historically co-changed files')).toBeLessThan(result.indexOf('## Instructions'));
+  });
+
+  it('omits cochange-files section when list is empty or absent', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Do thing',
+      taskTitle: 'Title',
+      relatedFiles: [],
+      fileTree: '',
+      cochangeFiles: [],
+    });
+    expect(result).not.toContain('Historically co-changed files');
+  });
+
+  it('omits direction-concurrent section when list is empty or absent', () => {
+    const result = buildAnalysisPrompt({
+      rawPrompt: 'Do thing',
+      taskTitle: 'Title',
+      relatedFiles: [],
+      fileTree: '',
+      directionConcurrentFiles: [],
+    });
+    expect(result).not.toContain('sibling tasks in this direction');
   });
 
   it('omits the total file budget clause when totalFileBudget is absent', () => {

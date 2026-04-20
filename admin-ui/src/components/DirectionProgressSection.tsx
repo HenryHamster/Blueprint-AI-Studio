@@ -69,6 +69,7 @@ export interface DirectionProgress {
     batch_cap?: number;
     tasks_created?: number;
   } | null;
+  prompt_quality_hint?: string | null;
   decomposition_summary?: {
     plans_assessed?: number;
     avg_subtask_merge_rate?: number | null;
@@ -391,6 +392,11 @@ export function DirectionProgressSection({ directions }: { directions: Direction
                     </span>
                   );
                 })()}
+                {dp.prompt_quality_hint && (
+                  <span className="text-[10px] text-neutral-500 italic" title="Synthesized from merged vs failed prompt telemetry">
+                    Prompt quality: {dp.prompt_quality_hint}
+                  </span>
+                )}
                 {(() => {
                   const ds = dp.decomposition_summary;
                   if (!ds || !ds.plans_assessed) return null;

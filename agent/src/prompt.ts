@@ -449,7 +449,11 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     });
     if (hasData) {
       const currentDirectionId = taskContext ? strVal(taskContext.direction_id) : '';
-      prefix = formatProjectContext(projectCtx, taskType, taskScope, currentDirectionId) + '\n\n';
+      const relatedFiles =
+        (payload?.related_files as string[] | undefined) ||
+        (taskContext?.related_files as string[] | undefined) ||
+        [];
+      prefix = formatProjectContext(projectCtx, taskType, taskScope, currentDirectionId, relatedFiles.length) + '\n\n';
     }
   }
 

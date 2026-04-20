@@ -582,6 +582,9 @@ async def test_digest_recurring_patterns_from_persistent_anomalies(client: Async
         # actual_fp entry should count the matching failed task's direction.
         actual_entry = next(p for p in patterns if p["fingerprint"] == actual_fp)
         assert actual_entry["affected_direction_count"] == 1
+        assert actual_entry["affected_directions"] == [
+            {"direction_id": "dir-recur", "direction_text": ""}
+        ]
     finally:
         _ss.persistent_anomalies.pop(proj_key, None)
 
@@ -1288,6 +1291,57 @@ async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_sess
 
     assert len(data["direction_progress"]) == 1
     assert data["direction_progress"][0]["prs_merged"] == 3  # only the recent entry
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_prompt_quality_hint(client: AsyncClient, db_session):
+    """prompt_quality_hint is synthesized from research_history prompt_telemetry when available."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    telemetry_cycle = {
+        "timestamp": recent_ts,
+        "prompt_telemetry": {
+            "merged": {"avg_char_count": 800, "avg_related_file_count": 3,
+                       "frac_mentions_tests": 0.8, "frac_mentions_symbols": 0.8},
+            "failed": {"avg_char_count": 300, "avg_related_file_count": 1,
+                       "frac_mentions_tests": 0.2, "frac_mentions_symbols": 0.2},
+        },
+    }
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-pq",
+                "text": "Direction with telemetry",
+                "status": "active",
+                "research_history": [telemetry_cycle, dict(telemetry_cycle)],
+            },
+            {
+                "id": "dir-no-pq",
+                "text": "Direction without telemetry",
+                "status": "active",
+                "research_history": [{"timestamp": recent_ts, "prs_merged": 1}],
+            },
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for did in ("dir-pq", "dir-no-pq"):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Research {did}",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": did},
+        ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    by_id = {dp["direction_id"]: dp for dp in response.json()["direction_progress"]}
+    assert isinstance(by_id["dir-pq"]["prompt_quality_hint"], str)
+    assert by_id["dir-pq"]["prompt_quality_hint"]
+    assert by_id["dir-no-pq"]["prompt_quality_hint"] is None
 
 
 @pytest.mark.asyncio
@@ -4486,3 +4540,52 @@ async def test_digest_prevention_efficacy_no_data(client: AsyncClient, db_sessio
     assert eff["preventive_merge_rate"] is None
     assert eff["overall_merge_rate"] == 0.4
     assert eff["assessment"] == "no_data"
+
+
+# ---------------------------------------------------------------------------
+# Anomaly adjustment snapshot in digest
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_anomaly_adjustment_inactive_by_default(client: AsyncClient):
+    """When no anomaly throttle is active, digest exposes an inactive snapshot."""
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    adj = response.json()["anomaly_adjustment"]
+    assert adj["active"] is False
+    assert adj["trigger_anomalies"] == []
+
+
+@pytest.mark.asyncio
+async def test_digest_includes_anomaly_adjustment_when_active(client: AsyncClient):
+    """When anomaly_adjustments is active, digest reflects trigger + reduction info."""
+    from app import shared_state
+
+    prev = dict(shared_state.anomaly_adjustments)
+    try:
+        shared_state.anomaly_adjustments.update({
+            "active": True,
+            "adjusted_at": "2026-04-20T12:00:00",
+            "trigger_anomalies": ["PROVISION_FAILURE_SURGE", "EXTERNAL_API_SURGE"],
+            "pre_adjustment_max_vms": 20,
+            "adjusted_max_vms": 8,
+            "failure_gate_threshold": 0.6,
+            "pre_adjustment_failure_gate": 0.8,
+            "forced_restoration_count": 1,
+            "forced_restored_at": "2026-04-20T11:00:00",
+        })
+        response = await client.get("/api/admin/digest")
+        assert response.status_code == 200
+        adj = response.json()["anomaly_adjustment"]
+        assert adj["active"] is True
+        assert adj["adjusted_at"] == "2026-04-20T12:00:00"
+        assert adj["trigger_anomalies"] == ["PROVISION_FAILURE_SURGE", "EXTERNAL_API_SURGE"]
+        assert adj["pre_adjustment_max_vms"] == 20
+        assert adj["adjusted_max_vms"] == 8
+        assert adj["failure_gate_threshold"] == 0.6
+        assert adj["pre_adjustment_failure_gate"] == 0.8
+        assert adj["forced_restoration_count"] == 1
+    finally:
+        shared_state.anomaly_adjustments.clear()
+        shared_state.anomaly_adjustments.update(prev)

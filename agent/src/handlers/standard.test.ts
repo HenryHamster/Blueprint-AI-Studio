@@ -92,7 +92,7 @@ vi.mock('ws', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote } from './standard.js';
 import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks } from '../index.js';
-import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles } from '../prompt.js';
+import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, buildAnalysisPrompt } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -1726,6 +1726,23 @@ describe('analysis-phase scope feasibility gate', () => {
     expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
       TASK_ID,
       expect.objectContaining({ failure_category: 'scope_overflow' }),
+    );
+  });
+
+  it('passes cochange_files from project_context through to buildAnalysisPrompt', async () => {
+    vi.mocked(parseAnalysisPlanFiles).mockReturnValue(['a.ts']);
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- a.ts' })
+      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const task = {
+      title: 'Task',
+      description: '',
+      context: { scope: 'medium' },
+      project_context: { cochange_files: ['x/y.ts', 'p/q.ts'] },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(buildAnalysisPrompt)).toHaveBeenCalledWith(
+      expect.objectContaining({ cochangeFiles: ['x/y.ts', 'p/q.ts'] }),
     );
   });
 
