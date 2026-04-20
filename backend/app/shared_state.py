@@ -165,6 +165,11 @@ runtime_config: Dict = {
     # disable the fast-path entirely.
     "auto_approve_max_lines": 50,
     "auto_approve_max_files": 4,
+    # Medium-scope auto-approve uses tighter caps than small. Set
+    # auto_approve_medium_max_lines to 0 to disable medium auto-approve while
+    # keeping the small-scope fast-path enabled.
+    "auto_approve_medium_max_lines": 30,
+    "auto_approve_medium_max_files": 2,
     # TTL (days) for deferred findings carried forward by autonomous_research.
     # Findings older than this window are dropped rather than reprocessed, so
     # stale context doesn't keep surfacing work the system already declined to

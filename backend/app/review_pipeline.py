@@ -247,35 +247,42 @@ def _diff_lines_changed(diff_summary: list | None) -> int | None:
     return total
 
 
-def should_auto_approve_small_diff(
+def should_auto_approve_diff(
     source_task: Task, direction_data: dict | None
 ) -> tuple[bool, str]:
-    """Decide whether to skip the review task for a trivially small diff.
+    """Decide whether to skip the review task for a trivially small/medium diff.
 
     Returns (skip, reason). Reason is always populated — a short human-
     readable string suitable for task status messages and operator logs.
 
     Gates (all must pass):
     - source task type is create, refactor, or fix
-    - scope is 'small' (medium/large always get full review)
-    - diff size known and <= runtime_config auto_approve_max_lines
-    - non-test file count <= runtime_config auto_approve_max_files
+    - scope is 'small' or 'medium' (large always gets full review). Medium
+      uses tighter line/file thresholds than small and can be disabled
+      independently via auto_approve_medium_max_lines=0.
+    - diff size known and <= per-scope max_lines
+    - non-test file count <= per-scope max_files
     - direction acceptance_rate > AUTO_APPROVE_MIN_ACCEPTANCE_RATE when
       direction history is available (new directions pass by default)
     """
-    max_lines = _runtime_config.get("auto_approve_max_lines", 50)
-    max_files = _runtime_config.get("auto_approve_max_files", 4)
-    if not max_lines or max_lines <= 0:
-        return (False, "auto-approve disabled (auto_approve_max_lines=0)")
-
     source_type = (source_task.first_payload or {}).get("type", "")
     if source_type not in ("create", "refactor", "fix"):
         return (False, f"source type {source_type!r} not eligible")
 
     ctx = source_task.context or {}
     scope = ctx.get("scope", "medium")
-    if scope != "small":
-        return (False, f"scope {scope!r} not eligible (small only)")
+    if scope == "small":
+        max_lines = _runtime_config.get("auto_approve_max_lines", 50)
+        max_files = _runtime_config.get("auto_approve_max_files", 4)
+        if not max_lines or max_lines <= 0:
+            return (False, "auto-approve disabled (auto_approve_max_lines=0)")
+    elif scope == "medium":
+        max_lines = _runtime_config.get("auto_approve_medium_max_lines", 30)
+        max_files = _runtime_config.get("auto_approve_medium_max_files", 2)
+        if not max_lines or max_lines <= 0:
+            return (False, "medium auto-approve disabled (auto_approve_medium_max_lines=0)")
+    else:
+        return (False, f"scope {scope!r} not eligible (small/medium only)")
 
     changed_files = ctx.get("_pr_changed_files") or []
     if not changed_files:
@@ -308,6 +315,9 @@ def should_auto_approve_small_diff(
         f"auto-approve: {lines_changed} lines across {non_test_count} non-test "
         f"file(s) (≤ {max_lines}/{max_files})",
     )
+
+
+should_auto_approve_small_diff = should_auto_approve_diff
 
 
 def _feedback_token_set(text: str) -> set[str]:

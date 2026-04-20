@@ -40,7 +40,7 @@ from app.review_pipeline import (
     _is_test_file,
     _max_review_iterations,
     _spawn_pipeline_task,
-    should_auto_approve_small_diff,
+    should_auto_approve_diff,
 )
 from testing.factories import make_project, make_task
 
@@ -266,7 +266,7 @@ async def test_requeue_carries_forward_prior_review_iterations(db_session, mocke
     assert _max_review_iterations(clone) == 8
 
 
-# ── should_auto_approve_small_diff ────────────────────────────────────────────
+# ── should_auto_approve_diff ────────────────────────────────────────────
 
 
 class TestShouldAutoApproveSmallDiff:
@@ -284,17 +284,64 @@ class TestShouldAutoApproveSmallDiff:
             files=["app/foo.py"],
             diff=[{"file": "app/foo.py", "added": 10, "removed": 2}],
         )
-        skip, reason = should_auto_approve_small_diff(t, None)
+        skip, reason = should_auto_approve_diff(t, None)
         assert skip is True
         assert "auto-approve" in reason
 
-    def test_non_small_scope_rejected(self):
+    def test_medium_scope_within_limits_approved(self):
+        t = self._task(
+            scope="medium",
+            files=["app/foo.py", "app/bar.py"],
+            diff=[
+                {"file": "app/foo.py", "added": 10, "removed": 0},
+                {"file": "app/bar.py", "added": 10, "removed": 0},
+            ],
+        )
+        skip, _ = should_auto_approve_diff(t, None)
+        assert skip is True
+
+    def test_medium_scope_over_lines_rejected(self):
+        t = self._task(
+            scope="medium",
+            files=["app/foo.py"],
+            diff=[{"file": "app/foo.py", "added": 80, "removed": 0}],
+        )
+        skip, reason = should_auto_approve_diff(t, None)
+        assert skip is False
+        assert "lines" in reason
+
+    def test_medium_scope_over_files_rejected(self):
+        t = self._task(
+            scope="medium",
+            files=["app/a.py", "app/b.py", "app/c.py"],
+            diff=[
+                {"file": "app/a.py", "added": 1, "removed": 0},
+                {"file": "app/b.py", "added": 1, "removed": 0},
+                {"file": "app/c.py", "added": 1, "removed": 0},
+            ],
+        )
+        skip, _ = should_auto_approve_diff(t, None)
+        assert skip is False
+
+    def test_medium_scope_disabled_via_zero(self, mocker):
+        from app.shared_state import runtime_config
+        mocker.patch.dict(runtime_config, {"auto_approve_medium_max_lines": 0})
         t = self._task(
             scope="medium",
             files=["app/foo.py"],
             diff=[{"file": "app/foo.py", "added": 5, "removed": 0}],
         )
-        skip, _ = should_auto_approve_small_diff(t, None)
+        skip, reason = should_auto_approve_diff(t, None)
+        assert skip is False
+        assert "disabled" in reason
+
+    def test_large_scope_rejected(self):
+        t = self._task(
+            scope="large",
+            files=["app/foo.py"],
+            diff=[{"file": "app/foo.py", "added": 5, "removed": 0}],
+        )
+        skip, _ = should_auto_approve_diff(t, None)
         assert skip is False
 
     def test_non_eligible_type_rejected(self):
@@ -303,7 +350,7 @@ class TestShouldAutoApproveSmallDiff:
             files=["app/foo.py"],
             diff=[{"file": "app/foo.py", "added": 5, "removed": 0}],
         )
-        skip, _ = should_auto_approve_small_diff(t, None)
+        skip, _ = should_auto_approve_diff(t, None)
         assert skip is False
 
     def test_fix_type_eligible(self):
@@ -312,7 +359,7 @@ class TestShouldAutoApproveSmallDiff:
             files=["app/foo.py"],
             diff=[{"file": "app/foo.py", "added": 5, "removed": 0}],
         )
-        skip, _ = should_auto_approve_small_diff(t, None)
+        skip, _ = should_auto_approve_diff(t, None)
         assert skip is True
 
     def test_too_many_lines_rejected(self):
@@ -320,7 +367,7 @@ class TestShouldAutoApproveSmallDiff:
             files=["app/foo.py"],
             diff=[{"file": "app/foo.py", "added": 100, "removed": 0}],
         )
-        skip, reason = should_auto_approve_small_diff(t, None)
+        skip, reason = should_auto_approve_diff(t, None)
         assert skip is False
         assert "lines" in reason
 
@@ -335,7 +382,7 @@ class TestShouldAutoApproveSmallDiff:
                 {"file": "app/e.py", "added": 1, "removed": 0},
             ],
         )
-        skip, _ = should_auto_approve_small_diff(t, None)
+        skip, _ = should_auto_approve_diff(t, None)
         assert skip is False
 
     def test_test_files_dont_count_toward_file_budget(self):
@@ -347,12 +394,12 @@ class TestShouldAutoApproveSmallDiff:
                 {"file": "testing/test_b.py", "added": 3, "removed": 0},
             ],
         )
-        skip, _ = should_auto_approve_small_diff(t, None)
+        skip, _ = should_auto_approve_diff(t, None)
         assert skip is True
 
     def test_missing_diff_summary_rejected(self):
         t = self._task(files=["app/a.py"])
-        skip, reason = should_auto_approve_small_diff(t, None)
+        skip, reason = should_auto_approve_diff(t, None)
         assert skip is False
         assert "diff size" in reason
 
@@ -365,7 +412,7 @@ class TestShouldAutoApproveSmallDiff:
             files=["app/a.py"],
             diff=[{"file": "app/a.py", "added": 5, "removed": 0}],
         )
-        skip, reason = should_auto_approve_small_diff(t, {"research_history": []})
+        skip, reason = should_auto_approve_diff(t, {"research_history": []})
         assert skip is False
         assert "acceptance_rate" in reason
 
@@ -376,7 +423,7 @@ class TestShouldAutoApproveSmallDiff:
             files=["app/a.py"],
             diff=[{"file": "app/a.py", "added": 1, "removed": 0}],
         )
-        skip, reason = should_auto_approve_small_diff(t, None)
+        skip, reason = should_auto_approve_diff(t, None)
         assert skip is False
         assert "disabled" in reason
 

@@ -407,9 +407,19 @@ describe('detectMediumScopeSubsystemHint — medium-scope subsystem hint', () =>
     expect(hint).toContain('full security scrutiny');
   });
 
-  it('returns empty string for mixed-subsystem changes (no deprioritization)', () => {
+  it('returns cross-system guidance when changes span 2+ subsystems', () => {
     const hint = detectMediumScopeSubsystemHint('M\tagent/src/index.ts\nM\tbackend/app/main.py');
-    expect(hint).toBe('');
+    expect(hint).toContain('cross-system');
+    expect(hint).toContain('agent');
+    expect(hint).toContain('backend');
+    expect(hint).toContain('interface consistency');
+  });
+
+  it('returns cross-system guidance for backend + admin-ui changes', () => {
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/app/main.py\nM\tadmin-ui/src/App.tsx');
+    expect(hint).toContain('cross-system');
+    expect(hint).toContain('admin-ui');
+    expect(hint).toContain('backend');
   });
 
   it('returns empty string for changed files placeholder / no files', () => {
@@ -438,7 +448,7 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
     expect(prompt).toContain('deprioritize SQL injection');
   });
 
-  it('omits subsystem hint for mixed-subsystem medium-scope PRs', async () => {
+  it('injects cross-system hint for multi-subsystem medium-scope PRs', async () => {
     vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tagent/src/index.ts\nM\tbackend/app/main.py';
@@ -456,6 +466,8 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
     expect(prompt).not.toContain('confined to agent/');
     expect(prompt).not.toContain('confined to admin-ui/');
     expect(prompt).not.toContain('confined to backend/');
+    expect(prompt).toContain('cross-system');
+    expect(prompt).toContain('interface consistency');
   });
 
   it('does not emit medium-scope hint for small-scope PRs', async () => {

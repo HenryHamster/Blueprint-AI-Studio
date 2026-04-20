@@ -206,6 +206,15 @@ export function detectMediumScopeSubsystemHint(changedFiles: string): string {
     }
     return 'This is a medium-scope change confined to backend/. Apply full security scrutiny — review SQL injection, authorization checks, input validation, and server-side concerns thoroughly.\n\n';
   }
+  const topDirs = new Set(paths.map(p => p.split('/')[0]).filter(Boolean));
+  const subsystems = new Set<string>();
+  for (const d of topDirs) {
+    if (d === 'backend' || d === 'agent' || d === 'admin-ui') subsystems.add(d);
+  }
+  if (subsystems.size >= 2) {
+    const list = Array.from(subsystems).sort().join(', ');
+    return `This is a medium-scope cross-system change touching multiple subsystems (${list}). Prioritize interface consistency between subsystems over single-file style concerns: shared types, API contracts, payload shapes, and field names must match across boundaries. Verify both sides of every integration point are updated together — e.g., a backend response field has a corresponding frontend/agent reader, a new payload key is produced and consumed, schema changes are reflected in serializers and TypeScript types. Cross-file inconsistencies (mismatched names, missing updates on one side, divergent assumptions about shape/nullability) are higher severity than local style issues.\n\n`;
+  }
   return '';
 }
 
@@ -609,9 +618,22 @@ export async function handleFix(
   if (iteration >= maxIterations) {
     iterationHeader += 'This is your FINAL attempt. If this fix is not accepted, the task will require manual intervention. Address every feedback point thoroughly.\n';
   } else if (iteration * 2 >= maxIterations) {
-    iterationHeader += 'Convergence mode: you are at or past 50% of the iteration budget. Make only the minimal changes needed to address the specific issues listed below. Do NOT touch files that are not mentioned in the review feedback, do NOT refactor or clean up adjacent code, and defer any non-blocking improvements to follow-up tasks. Scope creep at this stage commonly exhausts the remaining budget and forces the PR to close unmerged.\n';
+    const fixCtx = (task.context as Record<string, unknown> | undefined) || {};
+    const fixScope = (fixCtx.scope as string | undefined) || 'medium';
+    const includeOriginalScope = fixScope !== 'small';
+    iterationHeader += includeOriginalScope
+      ? 'Convergence mode: you are at or past 50% of the iteration budget. Make only the minimal changes needed to address the specific issues listed below. You may modify files from the original task scope when fixing a flagged issue requires updating a related definition or consumer, but do NOT introduce new files outside the original scope, do NOT refactor or clean up adjacent code, and defer any non-blocking improvements to follow-up tasks. Scope creep at this stage commonly exhausts the remaining budget and forces the PR to close unmerged.\n'
+      : 'Convergence mode: you are at or past 50% of the iteration budget. Make only the minimal changes needed to address the specific issues listed below. Do NOT touch files that are not mentioned in the review feedback, do NOT refactor or clean up adjacent code, and defer any non-blocking improvements to follow-up tasks. Scope creep at this stage commonly exhausts the remaining budget and forces the PR to close unmerged.\n';
     const latestIssues = reviewHistory[reviewHistory.length - 1]?.issues || [];
-    const allowedFiles = Array.from(new Set(latestIssues.map(i => i.file).filter((f): f is string => typeof f === 'string' && f.length > 0)));
+    const issueFiles = latestIssues.map(i => i.file).filter((f): f is string => typeof f === 'string' && f.length > 0);
+    const originalScopeFiles = includeOriginalScope
+      ? [
+          ...((fixCtx._planned_files as string[] | undefined) || []),
+          ...((fixCtx.related_files as string[] | undefined) || []),
+          ...((payload.related_files as string[] | undefined) || []),
+        ].filter((f): f is string => typeof f === 'string' && f.length > 0)
+      : [];
+    const allowedFiles = Array.from(new Set([...issueFiles, ...originalScopeFiles]));
     if (allowedFiles.length > 0) {
       iterationHeader += `Files you may modify: ${allowedFiles.join(', ')}\n`;
     }
