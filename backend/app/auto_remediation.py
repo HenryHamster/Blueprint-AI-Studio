@@ -586,12 +586,27 @@ async def _find_direction_by_fingerprint(
     project = await session.get(Project, project_id)
     if not project:
         return None
+    matches: list[dict] = []
     for d in (project.directions or []):
+        if not d.get("id"):
+            continue
         if d.get("error_fingerprint") == fingerprint or d.get("last_remediation_fingerprint") == fingerprint:
-            did = d.get("id")
-            if did:
-                return str(did)
-    return None
+            matches.append(d)
+    if not matches:
+        return None
+
+    def _rank(d: dict) -> tuple[int, str]:
+        # Lower tuple sorts first. Prefer status == "active" and not auto_paused,
+        # then most recent last_remediation_at (descending via negation trick:
+        # use string compare, and invert by sorting reverse within bucket).
+        is_active = 0 if (d.get("status") == "active" and not d.get("auto_paused")) else 1
+        return (is_active, str(d.get("last_remediation_at") or ""))
+
+    matches.sort(key=lambda d: (_rank(d)[0], ))
+    top_bucket = _rank(matches[0])[0]
+    top = [d for d in matches if _rank(d)[0] == top_bucket]
+    top.sort(key=lambda d: str(d.get("last_remediation_at") or ""), reverse=True)
+    return str(top[0].get("id"))
 
 
 async def _find_recent_merged_remediation(

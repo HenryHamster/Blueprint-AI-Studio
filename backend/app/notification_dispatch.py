@@ -445,11 +445,18 @@ async def post_auto_fix_result_message(
                 suspension_meta: dict[str, dict] = dict(ar_config.get('suspension_metadata', {}))
 
                 if result == 'merged':
-                    # Reset on success
+                    # Reset on success, but preserve recovery_attempts so that
+                    # a branch which keeps failing-and-fixing eventually escalates
+                    # to permanent suspension via exponential backoff.
                     failure_counts.pop(branch, None)
                     if branch in suspended:
                         suspended.remove(branch)
-                    suspension_meta.pop(branch, None)
+                    prior = suspension_meta.get(branch) or {}
+                    prior_attempts = int(prior.get('recovery_attempts', 0) or 0)
+                    if prior_attempts > 0:
+                        suspension_meta[branch] = {'recovery_attempts': prior_attempts}
+                    else:
+                        suspension_meta.pop(branch, None)
                 else:
                     # Increment consecutive failure counter
                     failure_counts[branch] = failure_counts.get(branch, 0) + 1

@@ -1261,7 +1261,10 @@ async def _process_post_commit(
                         if merge_result.get("merged"):
                             task.context = {**(task.context or {}), "pr_merged": True}
                             session.add(task)
-                            if (task.context or {}).get("diagnosis_task_id"):
+                            _t_ctx = task.context or {}
+                            if _t_ctx.get("diagnosis_task_id") or (
+                                _t_ctx.get("auto_remediation") is True and _t_ctx.get("direction_id")
+                            ):
                                 try:
                                     from app.task_completion import _record_remediation_outcome
                                     await _record_remediation_outcome(task, merged=True, session=session)
@@ -1839,7 +1842,10 @@ async def _process_post_commit(
                                             orig.status = TaskStatus.COMPLETED
                                             orig.latest_status_message = "Rollup PR merged"
                                         session.add(orig)
-                                        if (orig.context or {}).get("diagnosis_task_id"):
+                                        _o_ctx = orig.context or {}
+                                        if _o_ctx.get("diagnosis_task_id") or (
+                                            _o_ctx.get("auto_remediation") is True and _o_ctx.get("direction_id")
+                                        ):
                                             try:
                                                 from app.task_completion import _record_remediation_outcome
                                                 await _record_remediation_outcome(orig, merged=True, session=session)

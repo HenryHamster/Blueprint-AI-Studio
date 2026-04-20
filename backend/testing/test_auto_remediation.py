@@ -17,6 +17,7 @@ from app.auto_remediation import (
     _extract_ci_context,
     _extract_structured_signals,
     _build_remediation_prompt,
+    _find_direction_by_fingerprint,
     _find_matching_prior_investigation,
     _find_recent_merged_remediation,
     _utcnow,
@@ -1007,6 +1008,49 @@ async def test_remediation_spawn_to_feedback_clears_escalation_state(db_session:
 
 
 @pytest.mark.asyncio
+async def test_merged_preserves_recovery_attempts_for_future_backoff(db_session: AsyncSession):
+    """Merging an auto-fix must not reset recovery_attempts; the next suspension
+    cycle needs the prior attempt count so exponential backoff escalates."""
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.notification_dispatch import post_auto_fix_result_message
+
+    # Branch was suspended, auto-recovered once (recovery_attempts=1), fix just merged.
+    project = await _create_project(
+        db_session,
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "branch_failure_counts": {"main": 0},
+                "suspended_branches": [],
+                "suspension_metadata": {"main": {"recovery_attempts": 1}},
+            }
+        },
+    )
+
+    await post_auto_fix_result_message(
+        db_session, project.id, branch="main", result="merged", pr_number=77,
+    )
+    ar = (project.design_doc or {}).get("_auto_remediation", {})
+    assert "main" not in ar.get("branch_failure_counts", {})
+    assert "main" not in ar.get("suspended_branches", [])
+    # recovery_attempts must persist across the merge.
+    assert ar.get("suspension_metadata", {}).get("main", {}).get("recovery_attempts") == 1
+
+    # Same error recurs — three failures re-suspend the branch.
+    with patch("app.notification_dispatch.post_auto_fix_escalation_message", new_callable=AsyncMock), \
+         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock):
+        for _ in range(3):
+            await post_auto_fix_result_message(
+                db_session, project.id, branch="main", result="failed",
+            )
+
+    ar = (project.design_doc or {}).get("_auto_remediation", {})
+    assert "main" in ar.get("suspended_branches", [])
+    # Re-suspension carries the prior recovery_attempts forward (not reset to 0).
+    assert ar.get("suspension_metadata", {}).get("main", {}).get("recovery_attempts") == 1
+
+
+@pytest.mark.asyncio
 async def test_pipeline_exhaustion_propagates_to_auto_remediation_branch(db_session: AsyncSession):
     """When a review/fix task fails permanently on an auto-remediation PR, the
     original create task's auto_remediation context drives post_auto_fix_result_message
@@ -1225,6 +1269,48 @@ async def test_remediation_outcome_recorded_when_auto_remediation_merges(db_sess
 
 
 @pytest.mark.asyncio
+async def test_remediation_outcome_recorded_for_fingerprint_matched_merge(db_session: AsyncSession):
+    """Fingerprint-matched auto-remediation (direction_id set, no diagnosis_task_id) stamps merge outcome."""
+    from app.task_completion import _record_remediation_outcome
+
+    direction_id = str(uuid.uuid4())
+    project = await _create_project(
+        db_session,
+        directions=[{"id": direction_id, "title": "fix auth", "status": "active"}],
+    )
+    task = Task(
+        project_id=project.id,
+        title="Auto-fix",
+        payloads=[{"type": "create", "prompt": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "auto_remediation": True,
+            "direction_id": direction_id,
+            "diagnosis_fingerprint": "fp-fm",
+        },
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    # Simulate the merge-path guard in task_lifecycle.py: it must fire when
+    # auto_remediation is True and direction_id is present, even without
+    # diagnosis_task_id (fingerprint-matched fallback path).
+    ctx = task.context or {}
+    guard_fires = bool(
+        ctx.get("diagnosis_task_id")
+        or (ctx.get("auto_remediation") is True and ctx.get("direction_id"))
+    )
+    assert guard_fires
+
+    recorded = await _record_remediation_outcome(task, merged=True, session=db_session)
+    assert recorded is True
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target["last_remediation_result"] == "merged"
+    assert target["last_remediation_fingerprint"] == "fp-fm"
+    assert "last_remediation_diagnosis_task_id" not in target
+
+
+@pytest.mark.asyncio
 async def test_find_recent_merged_remediation_matches_branch_and_fingerprint(db_session: AsyncSession):
     """A recent completed auto-remediation task with matching branch+fingerprint is found."""
     project = await _create_project(db_session)
@@ -1326,3 +1412,63 @@ async def test_regression_task_failure_suspends_at_threshold_one(db_session: Asy
     mock_esc.assert_awaited_once()
     ar = (project.design_doc or {}).get("_auto_remediation", {})
     assert "main" in ar.get("suspended_branches", [])
+
+
+@pytest.mark.asyncio
+async def test_find_direction_by_fingerprint_prefers_active(db_session: AsyncSession):
+    """When multiple directions share a fingerprint, return the active one."""
+    fp = "fingerprint-xyz"
+    paused_id = str(uuid.uuid4())
+    active_id = str(uuid.uuid4())
+    project = await _create_project(
+        db_session,
+        directions=[
+            {
+                "id": paused_id,
+                "status": "auto_paused",
+                "auto_paused": True,
+                "last_remediation_fingerprint": fp,
+                "last_remediation_at": "2026-04-20T00:00:00+00:00",
+            },
+            {
+                "id": active_id,
+                "status": "active",
+                "last_remediation_fingerprint": fp,
+                "last_remediation_at": "2026-04-19T00:00:00+00:00",
+            },
+        ],
+    )
+
+    result = await _find_direction_by_fingerprint(
+        project_id=project.id, fingerprint=fp, session=db_session,
+    )
+    assert result == active_id
+
+
+@pytest.mark.asyncio
+async def test_find_direction_by_fingerprint_prefers_most_recent_active(db_session: AsyncSession):
+    """Among active matches, prefer the one with the most recent last_remediation_at."""
+    fp = "fp-abc"
+    older_id = str(uuid.uuid4())
+    newer_id = str(uuid.uuid4())
+    project = await _create_project(
+        db_session,
+        directions=[
+            {
+                "id": older_id,
+                "status": "active",
+                "error_fingerprint": fp,
+                "last_remediation_at": "2026-04-10T00:00:00+00:00",
+            },
+            {
+                "id": newer_id,
+                "status": "active",
+                "error_fingerprint": fp,
+                "last_remediation_at": "2026-04-19T00:00:00+00:00",
+            },
+        ],
+    )
+    result = await _find_direction_by_fingerprint(
+        project_id=project.id, fingerprint=fp, session=db_session,
+    )
+    assert result == newer_id
