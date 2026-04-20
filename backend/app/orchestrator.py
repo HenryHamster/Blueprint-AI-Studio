@@ -33,7 +33,7 @@ from app.compute import (
     soonest_zone_recovery,
 )
 from app.database import AsyncSessionLocal
-from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+from app.models import Artifact, ArtifactType, DeploymentState, DeploymentStatus, Project, Task, TaskStatus
 from app.orchestrator_filters import (
     filter_file_conflicts, filter_rollup_conflicts, filter_held_directions,
     filter_pipeline_duplicates,
@@ -549,6 +549,30 @@ async def orchestrator_worker():
                 _last_anomaly_sweep = _utcnow()
 
             async with AsyncSessionLocal() as session:
+                # Sync runtime_config with DB each cycle. Cloud Run runs up to
+                # max_instance_count instances; admin mutations (pause, settings)
+                # only update the receiving instance's in-memory runtime_config,
+                # so other instances' orchestrators would otherwise dispatch past
+                # a pause or stale cap. DeploymentState is the authoritative source.
+                _deploy_state = await session.get(DeploymentState, 1)
+                if _deploy_state is not None:
+                    if _deploy_state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+                        if _runtime_config.get("max_concurrent_vms", 0) != 0:
+                            logger.warning(
+                                f"[ORCHESTRATOR] DB state is {_deploy_state.status} "
+                                f"but in-memory max_concurrent_vms="
+                                f"{_runtime_config.get('max_concurrent_vms')} — forcing to 0"
+                            )
+                            _runtime_config["max_concurrent_vms"] = 0
+                    elif _deploy_state.runtime_max_concurrent_vms is not None:
+                        _db_max = int(_deploy_state.runtime_max_concurrent_vms)
+                        if _runtime_config.get("max_concurrent_vms") != _db_max:
+                            logger.info(
+                                f"[ORCHESTRATOR] Syncing max_concurrent_vms from DB: "
+                                f"{_runtime_config.get('max_concurrent_vms')} → {_db_max}"
+                            )
+                            _runtime_config["max_concurrent_vms"] = _db_max
+
                 # Fetch all active tasks once — used for both concurrency limit and counter reconciliation
                 # Light query: only load columns needed for the stale-provision scan
                 # and concurrency count. Heavy JSONB (payloads, context, status_log)
