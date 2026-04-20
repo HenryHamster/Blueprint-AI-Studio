@@ -629,6 +629,9 @@ Output ONLY a JSON object in a \`\`\`json code fence:
       const selfReviewFasr = selfReviewPipelineHealth?.first_attempt_success_rate as Record<string, unknown> | undefined;
       const firstAttemptByCat = selfReviewFasr?.first_attempt_by_review_category as Record<string, number> | undefined;
       const persistentReviewIssues = selfReviewPipelineHealth?.persistent_review_issues as string[] | undefined;
+      const reviewEffectiveness = selfReviewProjectCtx?.review_effectiveness as
+        | { categories?: Record<string, { trend?: string }> }
+        | undefined;
       const topFirstReviewIssues = selfReviewProjectCtx?.top_first_review_issues as
         | Array<{ description: string; count: number; category: string }>
         | undefined;
@@ -696,6 +699,7 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         firstAttemptByCategory: firstAttemptByCat,
         directionFirstAttemptFeedback,
         persistentReviewIssues,
+        reviewEffectiveness,
         analysisPlan: selfReviewAnalysisPlan,
         planCompletion,
         topFirstReviewIssues,

@@ -62,6 +62,7 @@ export function buildSelfReviewPrompt(opts: {
   firstAttemptByCategory?: Record<string, number>;
   directionFirstAttemptFeedback?: Record<string, number>;
   persistentReviewIssues?: string[];
+  reviewEffectiveness?: { categories?: Record<string, { trend?: string }> };
   analysisPlan?: string;
   planCompletion?: {
     plannedProductionCount: number;
@@ -86,14 +87,30 @@ export function buildSelfReviewPrompt(opts: {
     : '';
 
   const reviewIssueDist = opts.reviewIssueDistribution;
+  const reviewEffCats = opts.reviewEffectiveness?.categories;
+  const trendIndicatorFor = (cat: string): string => {
+    const trend = reviewEffCats?.[cat]?.trend;
+    return trend === 'increasing' ? ', trending up ⚠'
+      : trend === 'decreasing' ? ', trending down'
+      : trend === 'stable' ? ', persistent'
+      : '';
+  };
   const issueDistSection = reviewIssueDist && Object.keys(reviewIssueDist).length > 0
     ? (() => {
         const sorted = Object.entries(reviewIssueDist)
           .sort(([, a], [, b]) => b - a)
           .slice(0, 5)
-          .map(([cat, count]) => `${cat} (${Math.round(count * 100)}%)`)
+          .map(([cat, count]) => `${cat} (${Math.round(count * 100)}%${trendIndicatorFor(cat)})`)
           .join(', ');
-        return `\n## Project-Specific Review Patterns\nIn this project, the most common review issues are: ${sorted}. Prioritize these checks.\n`;
+        const trendingUp = reviewEffCats
+          ? Object.entries(reviewEffCats)
+              .filter(([, v]) => v?.trend === 'increasing')
+              .map(([cat]) => cat)
+          : [];
+        const warning = trendingUp.length > 0
+          ? ` Categories trending up (${trendingUp.join(', ')}) are getting WORSE over recent review cycles — apply extra scrutiny to these before submitting.`
+          : '';
+        return `\n## Project-Specific Review Patterns\nIn this project, the most common review issues are: ${sorted}. Prioritize these checks.${warning}\n`;
       })()
     : '';
 
