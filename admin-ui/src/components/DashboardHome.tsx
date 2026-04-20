@@ -9,7 +9,7 @@ import {
   GitMerge,
   Minus,
 } from 'lucide-react';
-import { ResponsiveContainer, AreaChart, Area } from 'recharts';
+import { ResponsiveContainer, AreaChart, Area, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from 'recharts';
 import { apiFetch } from '../api';
 import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -415,6 +415,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
   const [measurementData, setMeasurementData] = useState<MediumScopeMeasurement | null>(null);
+  const [scopeBaselines, setScopeBaselines] = useState<ScopeBaselinesResponse | null>(null);
+  const [scopeTrendsOpen, setScopeTrendsOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
   const [lastFetchError, setLastFetchError] = useState(false);
@@ -482,6 +484,12 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           try {
             const res = await apiFetch(`/api/admin/medium-scope-measurement?project_id=${encodeURIComponent(selectedProjectId)}&lookback_days=90`);
             if (res.ok) setMeasurementData(await res.json());
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/scope-baselines?project_id=${encodeURIComponent(selectedProjectId)}&lookback_days=30`);
+            if (res.ok) setScopeBaselines(await res.json());
           } catch { /* silent */ }
         })(),
       );
@@ -657,6 +665,27 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             </section>
           )}
 
+          {/* Section 1d2: Cost of Failures */}
+          {!loading && (digest?.total_failed_cost_usd ?? 0) > 0 && (
+            <section>
+              <div className="flex flex-wrap gap-1.5 items-center">
+                <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Cost of Failures</span>
+                <span className="text-sm font-bold text-red-400">${(digest!.total_failed_cost_usd ?? 0).toFixed(2)}</span>
+                {Object.entries(digest?.cost_by_failure_class ?? {})
+                  .sort((a, b) => b[1] - a[1])
+                  .map(([cls, cost]) => {
+                    const color = FAILURE_CLASS_COLORS[cls] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+                    return (
+                      <span key={cls} className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${color}`}>
+                        {cls}
+                        <span className="font-bold">${cost.toFixed(2)}</span>
+                      </span>
+                    );
+                  })}
+              </div>
+            </section>
+          )}
+
           {/* Section 1e: Pipeline Filter Funnel */}
           {!loading && digest?.pipeline_filter_funnel && (digest.pipeline_filter_funnel.findings_produced ?? 0) > 0 && (() => {
             const ff = digest.pipeline_filter_funnel;
@@ -777,7 +806,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                             <span className="text-neutral-400" title="Cost per merged PR">${d.cost_per_merged_pr.toFixed(2)}/PR</span>
                           )}
                           {d.avg_time_to_merge_hours != null && (
-                            <span className={d.avg_time_to_merge_hours < 2 ? 'text-emerald-400' : d.avg_time_to_merge_hours <= 6 ? 'text-amber-400' : 'text-red-400'} title="Average time from task creation to PR merge">~{d.avg_time_to_merge_hours.toFixed(1)}h/PR</span>
+                            <span className={d.avg_time_to_merge_hours < 2 ? 'text-emerald-400' : d.avg_time_to_merge_hours <= 6 ? 'text-amber-400' : 'text-red-400'} title="Average time from VM start to PR merge">{d.avg_time_to_merge_hours.toFixed(1)}h avg merge</span>
                           )}
                         </div>
                         {d.taxonomy_summary && <div className="flex gap-1 mt-1 flex-wrap">{TAXONOMY_ORDER.map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return v ? <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span> : null; })}</div>}
@@ -811,6 +840,16 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               scopeRates={digest?.scope_conversion_rates}
               prevScopeRates={digest?.prev_scope_conversion_rates}
               loading={loading}
+            />
+          )}
+
+          {/* Section 2b2: Scope Trends */}
+          {!!selectedProjectId && (
+            <ScopeTrendsSection
+              data={scopeBaselines}
+              loading={loading}
+              open={scopeTrendsOpen}
+              onToggle={() => setScopeTrendsOpen(v => !v)}
             />
           )}
 
@@ -908,6 +947,128 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
         </div>
       </div>
     </div>
+  );
+}
+
+// ---------- scope trends ----------
+
+const SCOPE_ORDER = ['small', 'medium', 'large'];
+
+interface ScopeBaselinesSeriesPoint {
+  week: string;
+  scope: string;
+  created: number;
+  merged: number;
+  merge_rate: number | null;
+}
+
+interface ScopeBaselinesSummary {
+  merge_rate: number | null;
+  created: number;
+  merged: number;
+  trend: 'improving' | 'stable' | 'declining' | null;
+}
+
+interface ScopeBaselinesResponse {
+  series: ScopeBaselinesSeriesPoint[];
+  summary: Record<string, ScopeBaselinesSummary>;
+  lookback_days: number;
+}
+
+const SCOPE_LINE_COLORS: Record<string, string> = {
+  small: '#34d399',
+  medium: '#fbbf24',
+  large: '#f87171',
+};
+
+function ScopeTrendsSection({
+  data,
+  loading,
+  open,
+  onToggle,
+}: {
+  data: ScopeBaselinesResponse | null;
+  loading: boolean;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  if (loading && !data) {
+    return (
+      <section>
+        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Scope Trends</h2>
+        <Skeleton className="h-6 w-full" />
+      </section>
+    );
+  }
+  const series = data?.series ?? [];
+  const summary = data?.summary ?? {};
+  const scopes = SCOPE_ORDER.filter(s => summary[s] != null);
+
+  // Pivot into chart rows: one row per week, one key per scope.
+  const weeks = Array.from(new Set(series.map(p => p.week))).sort();
+  const chartData = weeks.map(week => {
+    const row: Record<string, string | number | null> = { week };
+    for (const scope of scopes) {
+      const pt = series.find(p => p.week === week && p.scope === scope);
+      row[scope] = pt && pt.merge_rate != null ? Math.round(pt.merge_rate * 100) : null;
+    }
+    return row;
+  });
+
+  return (
+    <section>
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2 hover:text-neutral-200"
+        aria-expanded={open}
+      >
+        <span>{open ? '▾' : '▸'}</span>
+        <span>Scope Trends</span>
+        <span className="flex gap-1 normal-case tracking-normal font-normal">
+          {scopes.map(s => {
+            const t = summary[s]?.trend;
+            const color = t === 'improving' ? 'text-emerald-400 border-emerald-700 bg-emerald-900/40' : t === 'declining' ? 'text-red-400 border-red-700 bg-red-900/40' : t === 'stable' ? 'text-neutral-400 border-neutral-700 bg-neutral-900/40' : 'text-neutral-600 border-neutral-800 bg-neutral-900/40';
+            return (
+              <span key={s} className={`text-[9px] px-1 py-0.5 rounded border ${color}`}>
+                {s} {t ?? '—'}
+              </span>
+            );
+          })}
+        </span>
+      </button>
+      {open && (
+        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+          {chartData.length === 0 || scopes.length === 0 ? (
+            <p className="text-[11px] text-neutral-500">No weekly data in the last {data?.lookback_days ?? 30} days.</p>
+          ) : (
+            <ResponsiveContainer width="100%" height={200}>
+              <LineChart data={chartData} margin={{ top: 8, right: 8, left: -12, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
+                <XAxis dataKey="week" tick={{ fontSize: 10, fill: '#737373' }} />
+                <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: '#737373' }} unit="%" />
+                <Tooltip
+                  contentStyle={{ background: '#171717', border: '1px solid #404040', fontSize: 11 }}
+                  formatter={(v) => (v == null ? '—' : `${v}%`)}
+                />
+                <Legend wrapperStyle={{ fontSize: 10 }} />
+                {scopes.map(s => (
+                  <Line
+                    key={s}
+                    type="monotone"
+                    dataKey={s}
+                    stroke={SCOPE_LINE_COLORS[s] ?? '#a3a3a3'}
+                    strokeWidth={2}
+                    dot={{ r: 2 }}
+                    connectNulls
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 

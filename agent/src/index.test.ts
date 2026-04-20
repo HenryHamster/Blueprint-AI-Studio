@@ -565,30 +565,19 @@ describe('lintFixLoop early exit on identical errors', () => {
 describe('testFixLoop early exit on identical errors', () => {
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(spawn).mockImplementation(() => {
-      const proc = {
-        pid: 123, stderr: { on: vi.fn() }, stdout: { on: vi.fn() },
-        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-          if (event === 'close') setImmediate(() => cb(0));
-        }),
-        kill: vi.fn(),
-      };
-      return proc as unknown as ReturnType<typeof spawn>;
-    });
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(spawn).mockReset();
   });
 
   it('exits early when consecutive test errors are identical', async () => {
     const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
     const errorMessage = 'FAIL test.ts > it works';
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') throw new Error(errorMessage);
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
+    configureSpawnMock({ npm: { exitCode: 1, stderr: errorMessage } });
 
     const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
     expect(result.passed).toBe(false);
     expect(result.failureSummary).toContain(errorMessage);
-    const npmCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'npm').length;
+    const npmCalls = vi.mocked(spawn).mock.calls.filter(c => c[0] === 'npm').length;
     // Early exit after the duplicate on attempt 2: at most 2 test runs
     expect(npmCalls).toBeLessThanOrEqual(2);
   });
@@ -596,16 +585,38 @@ describe('testFixLoop early exit on identical errors', () => {
   it('continues when test errors differ between attempts', async () => {
     const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
     let callCount = 0;
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') {
+    // Custom spawn mock: each npm call fails with a unique error so fingerprints differ.
+    vi.mocked(spawn).mockImplementation((cmd: unknown) => {
+      const cmdStr = String(cmd);
+      const stderrCbs: ((d: Buffer) => void)[] = [];
+      let failStderr: string | null = null;
+      if (cmdStr === 'npm') {
         callCount++;
-        throw new Error(`FAIL variant ${callCount}`);
+        failStderr = `FAIL variant ${callCount}`;
       }
-      return '' as unknown as ReturnType<typeof execFileSync>;
+      const proc = {
+        pid: 100 + callCount,
+        stderr: {
+          on: vi.fn((event: string, cb: (d: Buffer) => void) => {
+            if (event === 'data') stderrCbs.push(cb);
+          }),
+        },
+        stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') {
+            setImmediate(() => {
+              if (failStderr !== null) for (const scb of stderrCbs) scb(Buffer.from(failStderr));
+              cb(failStderr !== null ? 1 : 0);
+            });
+          }
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
     });
 
     await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
-    const npmCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'npm').length;
+    const npmCalls = vi.mocked(spawn).mock.calls.filter(c => c[0] === 'npm').length;
     // MAX_TEST_FIX_ATTEMPTS = 2, loop runs 3 times when errors differ
     expect(npmCalls).toBe(3);
   });
