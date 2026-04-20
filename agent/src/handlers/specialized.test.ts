@@ -557,6 +557,17 @@ describe('handleMigrate — stale-branch handling and workflow', () => {
     );
   });
 
+  it('migrate prompt instructs agent to bump EXPECTED_SCHEMA_REVISION', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const promptArg = vi.mocked(runClaudeCode).mock.calls[0][0] as string;
+    expect(promptArg).toContain('EXPECTED_SCHEMA_REVISION');
+    expect(promptArg).toContain('app/main.py');
+  });
+
   it('throws when no prompt is provided in payload or task', async () => {
     await expect(
       handleMigrate(

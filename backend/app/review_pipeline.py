@@ -275,7 +275,7 @@ def should_auto_approve_diff(
       direction history is available (new directions pass by default)
     """
     source_type = (source_task.first_payload or {}).get("type", "")
-    if source_type not in ("create", "refactor", "fix"):
+    if source_type not in ("create", "refactor", "fix", "migrate"):
         return (False, f"source type {source_type!r} not eligible")
 
     ctx = source_task.context or {}

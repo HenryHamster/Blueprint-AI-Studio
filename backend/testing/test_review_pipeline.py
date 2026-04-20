@@ -362,6 +362,29 @@ class TestShouldAutoApproveSmallDiff:
         skip, _ = should_auto_approve_diff(t, None)
         assert skip is True
 
+    def test_migrate_type_small_diff_eligible(self):
+        t = self._task(
+            type_="migrate",
+            files=["backend/alembic/versions/0039_x.py", "backend/app/main.py"],
+            diff=[
+                {"file": "backend/alembic/versions/0039_x.py", "added": 20, "removed": 0},
+                {"file": "backend/app/main.py", "added": 1, "removed": 1},
+            ],
+        )
+        skip, reason = should_auto_approve_diff(t, None)
+        assert skip is True
+        assert "auto-approve" in reason
+
+    def test_migrate_type_large_diff_rejected(self):
+        t = self._task(
+            type_="migrate",
+            files=["backend/alembic/versions/0039_x.py"],
+            diff=[{"file": "backend/alembic/versions/0039_x.py", "added": 200, "removed": 0}],
+        )
+        skip, reason = should_auto_approve_diff(t, None)
+        assert skip is False
+        assert "lines" in reason
+
     def test_too_many_lines_rejected(self):
         t = self._task(
             files=["app/foo.py"],

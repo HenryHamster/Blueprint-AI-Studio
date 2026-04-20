@@ -187,7 +187,9 @@ Follow these steps precisely:
 
    IMPORTANT: Do NOT hand-edit the generated migration file unless autogenerate produced clearly incorrect output (e.g., dropped the wrong table, missed an index, used wrong column type). If you must edit, add a comment explaining why.
 
-4. **Review the generated migration**: Open and carefully read the generated file. Check for:
+4. **Bump EXPECTED_SCHEMA_REVISION (MANDATORY)**: Open \`${migratePyDir}/app/main.py\` and update the \`EXPECTED_SCHEMA_REVISION\` constant to match the revision string of the migration file you just generated (e.g. \`"0039"\` for \`0039_add_user_role.py\`). This is a hard gate — CI and startup checks will fail if the constant does not match the latest migration revision. Do NOT skip this step.
+
+5. **Review the generated migration**: Open and carefully read the generated file. Check for:
    - Data loss risks (e.g., \`DROP COLUMN\`, \`DROP TABLE\`, type changes that truncate data)
    - Missing indexes on foreign keys or frequently-queried columns
    - Incorrect \`nullable\` settings
@@ -195,15 +197,15 @@ Follow these steps precisely:
    - \`op.execute()\` statements needed for data migrations
    If you find issues, fix them and document your changes with inline comments.
 
-5. **Test the migration applies cleanly**: Run \`alembic upgrade head\` to verify the migration applies without errors. If it fails:
+6. **Test the migration applies cleanly**: Run \`alembic upgrade head\` to verify the migration applies without errors. If it fails:
    - Read the error carefully
    - Fix the migration file (add a comment explaining the manual fix)
    - Run \`alembic upgrade head\` again
    - Repeat until it succeeds
 
-6. **Test downgrade** (if the migration is reversible): Run \`alembic downgrade -1\` then \`alembic upgrade head\` to confirm round-trip works. If downgrade is not possible (e.g., data loss), ensure the \`downgrade()\` function raises \`NotImplementedError\` with an explanation.
+7. **Test downgrade** (if the migration is reversible): Run \`alembic downgrade -1\` then \`alembic upgrade head\` to confirm round-trip works. If downgrade is not possible (e.g., data loss), ensure the \`downgrade()\` function raises \`NotImplementedError\` with an explanation.
 
-7. Once migration applies cleanly, the files should be modified. Do NOT commit — the agent harness will handle the commit.
+8. Once migration applies cleanly, the files should be modified. Do NOT commit — the agent harness will handle the commit.
 
 CRITICAL RULES:
 - Never delete or modify existing migration files in \`${alembicVersionsPath}\` (except the one you just generated)

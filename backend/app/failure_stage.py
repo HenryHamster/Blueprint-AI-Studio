@@ -21,14 +21,25 @@ def _is_transient_scan_error(exc: Exception) -> bool:
 def _derive_failure_stage(failure_class: str, status_message: str) -> "str | None":
     """Derive the pipeline stage at which a task failure occurred.
 
-    Returns one of: 'provision', 'clone', 'integration', 'test', 'lint', 'build',
-    'pr_creation', 'merge', 'review', or None.
+    Returns one of: 'provision', 'clone', 'migration', 'integration', 'test',
+    'lint', 'build', 'pr_creation', 'merge', 'review', or None.
     """
     if failure_class == "PROVISION_FAILURE":
         return "provision"
     msg = (status_message or "").lower()
     if any(kw in msg for kw in ("checkout", "git clone", "clone")):
         return "clone"
+    # Migration-specific keywords — kept aligned with _MIGRATION_PATTERNS in
+    # failure_classification.py. Checked before 'integration' because
+    # 'undefinedcolumnerror' would otherwise match the import-error bank.
+    if any(kw in msg for kw in (
+        "revisionerror", "can't locate revision", "cant locate revision",
+        "multiple head revisions", "only a single head supported",
+        "multiple heads are present", "undefinedcolumn", "undefinedcolumnerror",
+        "schema version mismatch", "expected_schema_revision",
+        "alembic.util.exc.commanderror", "alembic",
+    )):
+        return "migration"
     if any(kw in msg for kw in (
         "importerror", "import error", "cannot import", "no module named",
         "module not found", "has no attribute", "no exported member",

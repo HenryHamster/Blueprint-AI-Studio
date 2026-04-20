@@ -379,6 +379,107 @@ class TestSchemaRevisionSync:
             "index, or queries will silently fall back to sequential scans."
         )
 
+    def test_migration_downgrade_bodies_are_substantive(self):
+        """Each migration's downgrade() must perform real rollback work or
+        explicitly raise NotImplementedError. An empty/`pass`-only body silently
+        ships a migration with no rollback path.
+
+        Substantive = at least one of: op.drop_column, op.drop_table,
+        op.drop_index, op.alter_column, op.execute (or any op.* call paired
+        with a deliberate rollback). Intentionally irreversible migrations
+        must `raise NotImplementedError(...)`.
+        """
+        import ast
+        import glob as globmod
+
+        SUBSTANTIVE_OPS = {
+            "drop_column", "drop_table", "drop_index", "alter_column",
+            "execute", "drop_constraint", "rename_table", "create_table",
+            "create_index", "add_column", "create_foreign_key",
+            "drop_foreign_key", "create_unique_constraint",
+            "create_check_constraint", "batch_alter_table",
+        }
+
+        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
+        assert files, "No migration files found"
+
+        offenders: list[str] = []
+        for path in files:
+            with open(path) as f:
+                source = f.read()
+            tree = ast.parse(source)
+            downgrade = next(
+                (n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "downgrade"),
+                None,
+            )
+            if downgrade is None:
+                offenders.append(f"{os.path.basename(path)}: no downgrade() function")
+                continue
+
+            # Strip leading docstring/expression statements; what remains must be substantive.
+            body = downgrade.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                body = body[1:]
+
+            # Pure data-only migrations (upgrade body is only op.execute calls)
+            # are inherently one-way — accept any downgrade body for them.
+            upgrade = next(
+                (n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "upgrade"),
+                None,
+            )
+            if upgrade is not None:
+                up_calls = [
+                    n for n in ast.walk(upgrade)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name) and n.func.value.id == "op"
+                ]
+                if up_calls and all(c.func.attr == "execute" for c in up_calls):
+                    continue
+
+            # Empty or only `pass`
+            if not body or all(isinstance(n, ast.Pass) for n in body):
+                offenders.append(
+                    f"{os.path.basename(path)}: downgrade() is empty or only `pass` — "
+                    "add real rollback ops or `raise NotImplementedError(...)`"
+                )
+                continue
+
+            # Accept explicit NotImplementedError raise
+            raises_nie = any(
+                isinstance(n, ast.Raise)
+                and (
+                    (isinstance(n.exc, ast.Call) and isinstance(n.exc.func, ast.Name)
+                     and n.exc.func.id == "NotImplementedError")
+                    or (isinstance(n.exc, ast.Name) and n.exc.id == "NotImplementedError")
+                )
+                for n in ast.walk(downgrade)
+            )
+            if raises_nie:
+                continue
+
+            # Look for a substantive op.* call anywhere in the body
+            has_substantive = False
+            for node in ast.walk(downgrade):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    if node.func.attr in SUBSTANTIVE_OPS:
+                        has_substantive = True
+                        break
+            if not has_substantive:
+                offenders.append(
+                    f"{os.path.basename(path)}: downgrade() has no substantive op.* call "
+                    "and does not raise NotImplementedError"
+                )
+
+        assert not offenders, (
+            "Migrations with non-substantive downgrade() bodies:\n  "
+            + "\n  ".join(offenders)
+            + "\n\nEither implement a real rollback or `raise NotImplementedError(...)` "
+            "to mark the migration as intentionally irreversible."
+        )
+
 
 # ── Security Scanner Integrity ──────────────────────────────────────────────
 

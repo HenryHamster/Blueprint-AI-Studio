@@ -491,3 +491,39 @@ class TestShouldTriggerReviewQualityInvestigation:
         t = _task("No heartbeat received", {"direction_id": "d-1"})
         t.payloads = [{"type": "create", "prompt": "p"}]
         assert should_trigger_review_quality_investigation(t) is False
+
+
+class TestDeriveFailureStageMigration:
+    """Migration-specific keywords map to the 'migration' stage."""
+
+    def test_revision_error(self):
+        from app.failure_stage import _derive_failure_stage
+        assert _derive_failure_stage(
+            "MIGRATION_ERROR", "alembic.script.revision.RevisionError: foo"
+        ) == "migration"
+
+    def test_multiple_heads(self):
+        from app.failure_stage import _derive_failure_stage
+        assert _derive_failure_stage(
+            "MIGRATION_ERROR", "Multiple heads are present for given argument 'head'"
+        ) == "migration"
+
+    def test_undefined_column_maps_to_migration_not_integration(self):
+        from app.failure_stage import _derive_failure_stage
+        # UndefinedColumnError would match the import-error bank; migration
+        # must be checked first.
+        assert _derive_failure_stage(
+            "MIGRATION_ERROR", "psycopg.errors.UndefinedColumnError: column x does not exist"
+        ) == "migration"
+
+    def test_schema_version_mismatch(self):
+        from app.failure_stage import _derive_failure_stage
+        assert _derive_failure_stage(
+            "MIGRATION_ERROR", "schema version mismatch: expected_schema_revision=0037"
+        ) == "migration"
+
+    def test_alembic_command_error(self):
+        from app.failure_stage import _derive_failure_stage
+        assert _derive_failure_stage(
+            "MIGRATION_ERROR", "alembic.util.exc.CommandError: can't locate revision"
+        ) == "migration"
