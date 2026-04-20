@@ -1661,3 +1661,120 @@ async def test_merge_different_errors_do_not_trigger_early_exit(db_session, mock
     review_loop = (task.context or {}).get("review_loop", {})
     assert review_loop.get("merge_error_streak") == 1, "streak resets when error changes"
     assert review_loop.get("merge_last_error") == "different error"
+
+
+# ---------------------------------------------------------------------------
+# Cross-PR merge error pattern detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cross_pr_merge_pattern_pauses_retries_and_alerts(db_session, mocker):
+    """When 3 PRs in the same project fail to merge with the same normalized
+    error, the third attempt is paused (no rebase-fix spawn, no hard-cap
+    escalation) and an alert is fired once."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.shared_state import merge_error_occurrences
+
+    merge_error_occurrences.clear()
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", return_value=(None, None)
+    )
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request", return_value={"merged": False, "state": "open"}
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "base branch rule requires X"},
+    )
+
+    project = Project(name="Cross-PR pattern", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Simulate two prior PRs hitting the same error so the window is primed.
+    from app.shared_state import record_merge_error_occurrence
+    from app.ci_completion import _normalize_merge_error
+    norm = _normalize_merge_error("base branch rule requires X")
+    record_merge_error_occurrence(str(project.id), norm, 101)
+    record_merge_error_occurrence(str(project.id), norm, 102)
+
+    task = _make_task(db_session, project, pr_number=103)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    assert task.status == TaskStatus.EVALUATING, "pattern pause keeps task parked"
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_pattern_paused") is True
+    assert review_loop.get("merge_pattern_pr_count") == 3
+    assert review_loop.get("merge_pattern_alerted") is True
+    alert_mock.assert_called_once()
+    # Rebase-fix spawn must be short-circuited by the pattern pause.
+    spawn_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cross_pr_merge_pattern_alert_dedups_on_second_hit(db_session, mocker):
+    """The alert fires only once per task even if the pattern keeps matching."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.shared_state import merge_error_occurrences, record_merge_error_occurrence
+    from app.ci_completion import _normalize_merge_error
+
+    merge_error_occurrences.clear()
+    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.review_pipeline._spawn_pipeline_task", return_value=(None, None))
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request", return_value={"merged": False, "state": "open"}
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "protected branch blocks merge"},
+    )
+
+    project = Project(name="Pattern dedup", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    norm = _normalize_merge_error("protected branch blocks merge")
+    record_merge_error_occurrence(str(project.id), norm, 201)
+    record_merge_error_occurrence(str(project.id), norm, 202)
+
+    task = _make_task(db_session, project, pr_number=203)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+    await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert alert_mock.call_count == 1, "pattern alert should only fire once per task"
+
+
+def test_record_merge_error_occurrence_counts_distinct_prs():
+    from app.shared_state import (
+        merge_error_occurrences, record_merge_error_occurrence,
+        count_merge_error_pattern_prs,
+    )
+    merge_error_occurrences.clear()
+    assert record_merge_error_occurrence("proj-a", "err", 1) == 1
+    assert record_merge_error_occurrence("proj-a", "err", 1) == 1  # same PR
+    assert record_merge_error_occurrence("proj-a", "err", 2) == 2
+    assert record_merge_error_occurrence("proj-a", "err", 3) == 3
+    assert count_merge_error_pattern_prs("proj-a", "err") == 3
+    assert count_merge_error_pattern_prs("proj-b", "err") == 0
+    assert count_merge_error_pattern_prs("proj-a", "other") == 0

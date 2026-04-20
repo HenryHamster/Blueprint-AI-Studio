@@ -836,6 +836,149 @@ async def test_proactive_fingerprint_system_concurrent_cap(monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Intra-direction fingerprint detection + proactive spawning
+# ─────────────────────────────────────────────────────────────────────────────
+
+from app.anomaly_detection import (  # noqa: E402
+    _spawn_proactive_intra_direction_investigations,
+)
+
+
+@pytest.mark.asyncio
+async def test_intra_direction_fingerprint_emits_anomaly():
+    """Same fingerprint 3x within one direction → IntraDirectionFingerprint anomaly."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+    msg = "TypeError: unhashable type: 'list' at app/foo.py"
+    tasks = [
+        make_task(
+            project_id=project_id, status=TaskStatus.FAILED,
+            latest_status_message=msg, context={"direction_id": "d-only"},
+            created_at=now - timedelta(hours=i + 1),
+        )
+        for i in range(3)
+    ]
+    session = _make_session(tasks=tasks, project=project)
+    result = await _compute_research_anomalies(project_id, session)
+    intra = [a for a in result if a["signal"].startswith("IntraDirectionFingerprint_")]
+    assert len(intra) == 1
+    a = intra[0]
+    assert a["severity"] == "high"
+    assert a["direction_id"] == "d-only"
+    assert a["failure_count"] == 3
+    assert a["fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_intra_direction_suppressed_when_cross_direction_fires():
+    """Fingerprint spanning 2+ directions → only cross-direction anomaly, no intra-direction."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+    msg = "ImportError: cannot import name 'Bar'"
+    tasks = [
+        make_task(
+            project_id=project_id, status=TaskStatus.FAILED,
+            latest_status_message=msg, context={"direction_id": "d-a"},
+            created_at=now - timedelta(hours=1),
+        ),
+        make_task(
+            project_id=project_id, status=TaskStatus.FAILED,
+            latest_status_message=msg, context={"direction_id": "d-a"},
+            created_at=now - timedelta(hours=2),
+        ),
+        make_task(
+            project_id=project_id, status=TaskStatus.FAILED,
+            latest_status_message=msg, context={"direction_id": "d-a"},
+            created_at=now - timedelta(hours=3),
+        ),
+        make_task(
+            project_id=project_id, status=TaskStatus.FAILED,
+            latest_status_message=msg, context={"direction_id": "d-b"},
+            created_at=now - timedelta(hours=4),
+        ),
+    ]
+    session = _make_session(tasks=tasks, project=project)
+    result = await _compute_research_anomalies(project_id, session)
+    assert any(a["signal"].startswith("CrossDirectionFingerprint_") for a in result)
+    assert not any(a["signal"].startswith("IntraDirectionFingerprint_") for a in result)
+
+
+@pytest.mark.asyncio
+async def test_proactive_intra_direction_spawns_investigation(monkeypatch):
+    """Persistent IntraDirectionFingerprint entry → proactive investigate task spawned."""
+    project_id = uuid.uuid4()
+    fp = "1a2b3c4d5e6f"
+    did = "d-target"
+    _shared_state.persistent_anomalies.clear()
+    _shared_state.persistent_anomalies[str(project_id)] = {
+        f"IntraDirectionFingerprint_{fp}_{did}": {
+            "severity": "high",
+            "occurrence_count": 1,
+            "fingerprint": fp,
+            "direction_id": did,
+            "failure_count": 4,
+            "example_message": "TypeError: bad thing",
+        }
+    }
+
+    async def _no_recent(*args, **kwargs):
+        return False
+    monkeypatch.setattr(
+        "app.autonomous_research._recent_investigation_exists", _no_recent,
+    )
+
+    session, adds = _make_proactive_session(active_proactive_count=0)
+    try:
+        spawned = await _spawn_proactive_intra_direction_investigations(session)
+    finally:
+        _shared_state.persistent_anomalies.clear()
+
+    assert spawned == 1
+    tasks = [o for o in adds if isinstance(o, _TaskModel)]
+    assert len(tasks) == 1
+    ctx = tasks[0].context
+    assert ctx["diagnosis_trigger"] == "proactive_intra_direction"
+    assert ctx["proactive_intra_direction_fix"] is True
+    assert ctx["error_fingerprint"] == fp
+    assert ctx["direction_id"] == did
+    assert ctx["failure_count"] == 4
+    assert tasks[0].payloads[0]["type"] == "investigate"
+
+
+@pytest.mark.asyncio
+async def test_proactive_intra_direction_system_cap(monkeypatch):
+    """System cap blocks intra-direction spawns just like cross-direction."""
+    project_id = uuid.uuid4()
+    fp = "deadbeefcafe"
+    did = "d-capped"
+    _shared_state.persistent_anomalies.clear()
+    _shared_state.persistent_anomalies[str(project_id)] = {
+        f"IntraDirectionFingerprint_{fp}_{did}": {
+            "severity": "high", "occurrence_count": 1,
+            "fingerprint": fp, "direction_id": did,
+            "failure_count": 3, "example_message": "e",
+        }
+    }
+
+    async def _no_recent(*args, **kwargs):
+        return False
+    monkeypatch.setattr(
+        "app.autonomous_research._recent_investigation_exists", _no_recent,
+    )
+
+    session, adds = _make_proactive_session(active_proactive_count=2)
+    try:
+        spawned = await _spawn_proactive_intra_direction_investigations(session)
+    finally:
+        _shared_state.persistent_anomalies.clear()
+
+    assert spawned == 0
+    assert not [o for o in adds if isinstance(o, _TaskModel)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Failure rate momentum
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -249,6 +249,7 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     # consecutive 24h windows. Complementary, not a replacement.
     momentum_buckets = [0, 0, 0]  # [72-48h, 48-24h, 24-0h] failures
     total_buckets = [0, 0, 0]     # same windows, all-status totals
+    momentum_dirs: set[str] = set()
     for t in terminal_tasks:
         if not t.created_at or t.created_at < momentum_window_start:
             continue
@@ -259,6 +260,9 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
             momentum_buckets[1] += 1
         else:
             momentum_buckets[0] += 1
+        did = str((t.context or {}).get("direction_id") or "").strip()
+        if did:
+            momentum_dirs.add(did)
     for t in all_tasks_72h:
         if not t.created_at:
             continue
@@ -289,6 +293,13 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                     "Gradual acceleration suggests an emerging systemic issue "
                     "before the surge threshold trips."
                 ),
+                "rate_progression": [f"{r:.0%}" for r in rates],
+                "affected_directions": sorted(momentum_dirs),
+                "suggested_action": (
+                    "Investigate the upward trend before it trips the surge "
+                    "threshold — check recent deploys, infra health, and "
+                    "direction-level failure patterns."
+                ),
             })
 
     # --- Cross-direction systemic pattern analysis ---
@@ -312,6 +323,21 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
         fp_directions.setdefault(fp, set()).add(did)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
         fp_example.setdefault(fp, msg)
+    # Track (fingerprint, direction) counts so intra-direction recurrences can
+    # be detected below without rescanning tasks.
+    intra_fp_counts: dict[tuple[str, str], int] = {}
+    intra_fp_example: dict[tuple[str, str], str] = {}
+    for t in recent_failures:
+        msg = t.latest_status_message or ""
+        if not msg:
+            continue
+        did = str((t.context or {}).get("direction_id") or "").strip()
+        if not did:
+            continue
+        fp = _error_fingerprint(msg)
+        key = (fp, did)
+        intra_fp_counts[key] = intra_fp_counts.get(key, 0) + 1
+        intra_fp_example.setdefault(key, msg)
     for fp, dirs in fp_directions.items():
         if len(dirs) < 2 or fp_counts[fp] < 3:
             continue
@@ -331,6 +357,34 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
             ),
             "fingerprint": fp,
             "affected_directions": dir_list,
+        })
+
+    # --- Intra-direction recurring fingerprint analysis ---
+    # Same normalized fingerprint recurring 3+ times *within one direction* in
+    # the 48h window signals a persistent direction-scoped problem (stale
+    # finding, brittle test, unimplementable task). Emit a distinct signal so
+    # diagnosis fires before auto-pause does. Skip fingerprints the cross-
+    # direction branch already covered — that path spawns its own investigation.
+    for (fp, did), count in intra_fp_counts.items():
+        if count < 3:
+            continue
+        if len(fp_directions.get(fp, set())) >= 2 and fp_counts.get(fp, 0) >= 3:
+            continue
+        anomalies.append({
+            "signal": (
+                f"IntraDirectionFingerprint_{fp}_{did} "
+                f"{count} recent failures in one direction"
+            ),
+            "severity": "high",
+            "details": (
+                f"Fingerprint {fp} recurred {count} times in direction {did} "
+                f"within the last 48h. "
+                f"Example message: \"{intra_fp_example[(fp, did)][:120]}\". "
+                "Investigate the root cause before the direction auto-pauses."
+            ),
+            "fingerprint": fp,
+            "direction_id": did,
+            "failure_count": count,
         })
 
     # --- Direction merge rate and failure rate analysis ---
@@ -422,6 +476,14 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
             }
         # Stash cross-direction fingerprint metadata so the proactive spawner
         # can build an investigation prompt without re-querying tasks.
+        if anomaly_key == "FailureRateMomentum":
+            entry = proj_anomalies[anomaly_key]
+            if a.get("rate_progression"):
+                entry["rate_progression"] = list(a["rate_progression"])
+            if a.get("affected_directions") is not None:
+                entry["affected_directions"] = list(a["affected_directions"])
+            if a.get("suggested_action"):
+                entry["suggested_action"] = a["suggested_action"]
         if anomaly_key.startswith("CrossDirectionFingerprint_"):
             entry = proj_anomalies[anomaly_key]
             if a.get("fingerprint"):
@@ -432,6 +494,17 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
             if fp and fp in fp_counts:
                 entry["failure_count"] = fp_counts[fp]
                 entry["example_message"] = fp_example.get(fp, "")[:500]
+        if anomaly_key.startswith("IntraDirectionFingerprint_"):
+            entry = proj_anomalies[anomaly_key]
+            fp = a.get("fingerprint")
+            did = a.get("direction_id")
+            if fp:
+                entry["fingerprint"] = fp
+            if did:
+                entry["direction_id"] = did
+            if fp and did and (fp, did) in intra_fp_counts:
+                entry["failure_count"] = intra_fp_counts[(fp, did)]
+                entry["example_message"] = intra_fp_example.get((fp, did), "")[:500]
     # Expire anomalies not seen for 48h
     stale_cutoff = (now - timedelta(hours=48)).isoformat()
     for key in list(proj_anomalies):
@@ -990,7 +1063,9 @@ async def _count_active_proactive_investigations(session: AsyncSession) -> int:
         select(Task.id).where(
             Task.status.in_(active_statuses),
             Task.payloads[0]["type"].as_string() == "investigate",
-            Task.context["diagnosis_trigger"].as_string() == "proactive_pattern_detection",
+            Task.context["diagnosis_trigger"].as_string().in_(
+                ("proactive_pattern_detection", "proactive_intra_direction")
+            ),
         )
     )).all()
     return len(rows)
@@ -1118,6 +1193,123 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
     return spawned
 
 
+async def _spawn_proactive_intra_direction_investigations(session: AsyncSession) -> int:
+    """Spawn investigate tasks for persistent intra-direction fingerprint patterns.
+
+    Complements the cross-direction spawner by targeting fingerprints recurring
+    3+ times within a single direction. Shares the same system-wide concurrent
+    cap pool with cross-direction proactive investigations via
+    ``_count_active_proactive_investigations``.
+    """
+    from app.autonomous_research import _recent_investigation_exists  # noqa: PLC0415
+
+    if not _shared_state.persistent_anomalies:
+        return 0
+
+    system_active = await _count_active_proactive_investigations(session)
+    if system_active >= _PROACTIVE_INVESTIGATION_SYSTEM_CAP:
+        return 0
+
+    spawned = 0
+    for proj_key, proj_anomalies in list(_shared_state.persistent_anomalies.items()):
+        if system_active + spawned >= _PROACTIVE_INVESTIGATION_SYSTEM_CAP:
+            break
+        per_project_spawned = 0
+        try:
+            pid = uuid.UUID(proj_key)
+        except (TypeError, ValueError):
+            continue
+        for anomaly_key, entry in proj_anomalies.items():
+            if per_project_spawned >= _PROACTIVE_INVESTIGATION_PER_PROJECT_CAP:
+                break
+            if not anomaly_key.startswith("IntraDirectionFingerprint_"):
+                continue
+            if entry.get("proactive_investigation_spawned"):
+                continue
+            fingerprint = entry.get("fingerprint")
+            direction_id = entry.get("direction_id")
+            failure_count = int(entry.get("failure_count", 0) or 0)
+            if not fingerprint or not direction_id or failure_count < 3:
+                continue
+            try:
+                if await _recent_investigation_exists(
+                    pid, direction_id, session, error_fingerprint=fingerprint,
+                ):
+                    entry["proactive_investigation_spawned"] = True
+                    entry["proactive_investigation_spawned_at"] = _utcnow().isoformat()
+                    continue
+            except Exception:
+                logger.exception(
+                    "[ANOMALY_SWEEP] proactive intra-direction dedup check failed for %s/%s",
+                    proj_key, anomaly_key,
+                )
+                continue
+
+            example = (entry.get("example_message") or "")[:240]
+            prompt = (
+                f"A recurring error pattern (fingerprint {fingerprint}) has "
+                f"appeared {failure_count} times within direction "
+                f"{direction_id} in the last 48h.\n\n"
+                f"Example error message:\n{example}\n\n"
+                "Diagnose the root cause within this direction's scope "
+                "(stale finding, brittle test, unimplementable task, or a "
+                "direction-local code regression) and recommend a fix before "
+                "the direction auto-pauses. Produce the structured diagnosis "
+                "JSON report."
+            )
+            payload = validate_internal_payload(
+                {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+                "anomaly_detection:proactive_intra_direction_investigation",
+            )
+            new_task = Task(
+                project_id=pid,
+                title=f"Proactive investigation: fingerprint {fingerprint} "
+                      f"recurring in direction {direction_id}",
+                description=(
+                    f"Auto-spawned from intra-direction pattern "
+                    f"({failure_count} failures in direction {direction_id})"
+                )[:500],
+                payloads=[payload],
+                context={
+                    "direction_id": direction_id,
+                    "spawned_by": "proactive_intra_direction",
+                    "diagnosis_trigger": "proactive_intra_direction",
+                    "proactive_intra_direction_fix": True,
+                    "error_fingerprint": fingerprint,
+                    "failure_fingerprints": [fingerprint],
+                    "failure_count": failure_count,
+                    "example_message": example,
+                },
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+            )
+            session.add(new_task)
+            session.add(TaskHistory(
+                task_id=new_task.id, action="SPAWNED",
+                details={
+                    "spawned_by": "PROACTIVE_INTRA_DIRECTION",
+                    "fingerprint": fingerprint,
+                    "direction_id": direction_id,
+                },
+            ))
+            entry["proactive_investigation_spawned"] = True
+            entry["proactive_investigation_spawned_at"] = _utcnow().isoformat()
+            logger.info(
+                "[ANOMALY_SWEEP] Spawned proactive intra-direction investigation "
+                "for fingerprint %s (project %s, direction %s, %d failures)",
+                fingerprint, proj_key, direction_id, failure_count,
+            )
+            spawned += 1
+            per_project_spawned += 1
+            if system_active + spawned >= _PROACTIVE_INVESTIGATION_SYSTEM_CAP:
+                break
+
+    if spawned:
+        await session.commit()
+    return spawned
+
+
 async def anomaly_maintenance_sweep() -> dict:
     """Periodic maintenance independent of autonomous research.
 
@@ -1135,6 +1327,7 @@ async def anomaly_maintenance_sweep() -> dict:
     # Open a DB session when either pass has work to do.
     needs_session = bool(_shared_state.get_held_directions()) or any(
         key.startswith("CrossDirectionFingerprint_")
+        or key.startswith("IntraDirectionFingerprint_")
         for proj in _shared_state.persistent_anomalies.values()
         for key in proj
     )
@@ -1154,6 +1347,12 @@ async def anomaly_maintenance_sweep() -> dict:
                 except Exception:
                     logger.exception(
                         "[ANOMALY_SWEEP] proactive fingerprint investigation pass failed"
+                    )
+                try:
+                    proactive_spawned += await _spawn_proactive_intra_direction_investigations(session)
+                except Exception:
+                    logger.exception(
+                        "[ANOMALY_SWEEP] proactive intra-direction investigation pass failed"
                     )
         except Exception:
             logger.exception("[ANOMALY_SWEEP] maintenance session failed to open")

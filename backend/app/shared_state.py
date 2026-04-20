@@ -307,6 +307,46 @@ def count_recent_user_debug_spawns(project_id: str, now: datetime) -> int:
     cutoff = now - timedelta(hours=1)
     return sum(1 for t in dq if t >= cutoff)
 
+# --- Cross-PR Merge Error Pattern Tracking ---
+# When the same normalized merge error blocks multiple PRs in a project within a
+# sliding window, that's a systemic blocker (branch protection change, CI env
+# issue) — not a per-PR problem. Track (pr_number, ts) occurrences per
+# (project_id, normalized_error) so ci_completion can pause wasteful retries
+# and surface a shared alert.
+merge_error_occurrences: Dict[tuple, deque] = {}
+
+MERGE_PATTERN_WINDOW_SECONDS = int(os.getenv("MERGE_PATTERN_WINDOW_SECONDS", "1800"))
+MERGE_PATTERN_MIN_PRS = int(os.getenv("MERGE_PATTERN_MIN_PRS", "3"))
+
+
+def record_merge_error_occurrence(
+    project_id: str, normalized_error: str, pr_number: int
+) -> int:
+    """Record a merge-error occurrence and return the count of distinct PRs
+    hit by the same (project, normalized_error) within the sliding window."""
+    if not project_id or not normalized_error or pr_number is None:
+        return 0
+    key = (project_id, normalized_error)
+    dq = merge_error_occurrences.setdefault(key, deque(maxlen=50))
+    now = _utcnow()
+    dq.append((pr_number, now))
+    cutoff = now - timedelta(seconds=MERGE_PATTERN_WINDOW_SECONDS)
+    while dq and dq[0][1] < cutoff:
+        dq.popleft()
+    return len({pr for pr, _ in dq})
+
+
+def count_merge_error_pattern_prs(project_id: str, normalized_error: str) -> int:
+    """Distinct PRs in the sliding window for a (project, error) key."""
+    if not project_id or not normalized_error:
+        return 0
+    dq = merge_error_occurrences.get((project_id, normalized_error))
+    if not dq:
+        return 0
+    cutoff = _utcnow() - timedelta(seconds=MERGE_PATTERN_WINDOW_SECONDS)
+    return len({pr for pr, ts in dq if ts >= cutoff})
+
+
 # --- Background Tasks (populated by lifespan, used by admin restart endpoint) ---
 background_tasks: Dict[str, asyncio.Task] = {}  # name -> asyncio.Task
 

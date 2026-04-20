@@ -2686,13 +2686,41 @@ async def get_digest(
             _entry["proactive"] = True
 
     recurring_patterns: List[Dict[str, Any]] = []
+    early_warnings: List[Dict[str, Any]] = []
     _anoms_map = (
         {str(project_id): _persistent_anomalies.get(str(project_id), {})}
         if project_id else _persistent_anomalies
     )
+    import re as _re  # noqa: PLC0415
+    _momentum_rate_re = _re.compile(r"(\d+)%")
+    _recent_24h_cutoff = _utcnow() - timedelta(hours=24)
+    _dirs_last_24h = {
+        str((_t.context or {}).get("direction_id"))
+        for _t in failed_tasks
+        if (_t.context or {}).get("direction_id")
+        and _derive_completed_at(_t) >= _recent_24h_cutoff
+    }
     for _proj_anoms in _anoms_map.values():
         for _key, _info in _proj_anoms.items():
             if _info.get("occurrence_count", 0) < 2:
+                continue
+            if _key.startswith("FailureRateMomentum"):
+                _pcts = _momentum_rate_re.findall(_info.get("latest_details") or "")[:3]
+                early_warnings.append({
+                    "failure_class": _key,
+                    "rate_progression": [int(p) / 100 for p in _pcts] if len(_pcts) == 3 else [],
+                    "occurrence_count": _info.get("occurrence_count", 0),
+                    "first_seen": _info.get("first_seen"),
+                    "last_seen": _info.get("last_seen"),
+                    "severity": _info.get("severity"),
+                    "details": _info.get("latest_details") or "",
+                    "affected_direction_count": len(_dirs_last_24h),
+                    "suggested_action": (
+                        "Investigate the upward trend before it trips the surge "
+                        "threshold — check recent deploys, infra health, and "
+                        "direction-level failure patterns."
+                    ),
+                })
                 continue
             _fp_key = _key[len("CrossDirectionFingerprint_"):] if _key.startswith("CrossDirectionFingerprint_") else _key
             _state = _fp_task_states.get(_fp_key, {})
@@ -2798,6 +2826,7 @@ async def get_digest(
         "resurrection_outcome_summary": resurrection_outcome_summary,
         "recurring_error_clusters": recurring_error_clusters,
         "recurring_patterns": recurring_patterns,
+        "early_warnings": early_warnings,
         "remediation_funnel": remediation_funnel,
         "investigation_conversion": investigation_conversion,
     }

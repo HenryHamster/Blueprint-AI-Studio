@@ -421,6 +421,44 @@ async def _attempt_merge_with_retry_and_escalation(
             task.latest_status_message = f"Merge attempt {_merge_failures} failed on PR #{ci_pr_number}: {merge_msg} — retrying"
             logger.warning(f"[CI] PR #{ci_pr_number} merge failed ({_merge_failures}x): {merge_msg} — will retry ({source})")
 
+            # Cross-PR systemic merge-blocker detection. If ≥N distinct PRs in
+            # this project hit the same normalized error within the window,
+            # pause retries (they won't succeed until the shared cause clears)
+            # and raise a single alert surfacing the shared pattern. Resumes
+            # automatically once the window ages out stale occurrences.
+            from app.shared_state import (  # noqa: PLC0415
+                record_merge_error_occurrence, MERGE_PATTERN_MIN_PRS,
+            )
+            _project_key = str(task.project_id) if task.project_id else ""
+            _pattern_prs = record_merge_error_occurrence(
+                _project_key, _norm_cur, ci_pr_number
+            ) if (_project_key and _norm_cur and ci_pr_number is not None) else 0
+            if _pattern_prs >= MERGE_PATTERN_MIN_PRS:
+                ci_loop["merge_pattern_paused"] = True
+                ci_loop["merge_pattern_pr_count"] = _pattern_prs
+                ci_loop["ci_poll_interval"] = 120
+                _already_alerted = ci_loop.get("merge_pattern_alerted")
+                ci_loop["merge_pattern_alerted"] = True
+                task.context = {**(task.context or {}), "review_loop": ci_loop}
+                flag_modified(task, "context")
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} merge paused — systemic pattern: "
+                    f"{_pattern_prs} PRs blocked by same error "
+                    f"({merge_msg[:100]}) — retries deferred"
+                )
+                if not _already_alerted:
+                    await _maybe_create_failure_alert(
+                        task, session,
+                        f"Systemic merge blocker in project: {_pattern_prs} PRs "
+                        f"failing with the same error — check branch protection "
+                        f"rules and CI environment. Error: {merge_msg[:200]}"
+                    )
+                logger.warning(
+                    f"[CI] Cross-PR merge pattern detected — pausing retries "
+                    f"for PR #{ci_pr_number} ({_pattern_prs} PRs affected) ({source})"
+                )
+                return False
+
             _hard_cap = _merge_hard_cap_for_task(task)
             _escalate_at = max(1, _hard_cap - 5)
             _final_warn_at = max(1, _hard_cap - 2)
