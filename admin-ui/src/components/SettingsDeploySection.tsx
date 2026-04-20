@@ -1,6 +1,19 @@
+import { useEffect, useState } from 'react';
 import { Play, Pause, RotateCw, Wrench, CheckCircle, Zap } from 'lucide-react';
 import { parseTimestamp } from '../utils/time';
 import type { DeployState } from '../types/settings';
+
+function useHealthCountdown(lastCheckIso: string | undefined, intervalSeconds: number | undefined): number | null {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  if (!lastCheckIso || !intervalSeconds) return null;
+  const last = parseTimestamp(lastCheckIso).getTime();
+  const next = last + intervalSeconds * 1000;
+  return Math.max(0, Math.ceil((next - now) / 1000));
+}
 
 interface DeploySectionProps {
   deployState: DeployState | null;
@@ -23,6 +36,10 @@ export function DeploySection({
   onRepairState,
   zoneHealth,
 }: DeploySectionProps) {
+  const lastCheckIso = typeof deployState?.external_health?.last_check === 'string'
+    ? (deployState.external_health.last_check as string)
+    : undefined;
+  const nextCheckSeconds = useHealthCountdown(lastCheckIso, deployState?.health_check_interval_seconds);
   return (
     <div className="space-y-6">
       {/* Deploy Health */}
@@ -112,6 +129,15 @@ export function DeploySection({
                     <span className="text-[11px] text-neutral-600">Last check</span>
                     <span className="text-[11px] text-neutral-500 font-mono">
                       {parseTimestamp(deployState.external_health.last_check as string).toLocaleTimeString()}
+                    </span>
+                  </div>
+                )}
+                {nextCheckSeconds !== null && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] text-neutral-600">Next check</span>
+                    <span className="text-[11px] text-blue-400 font-mono">
+                      {nextCheckSeconds === 0 ? 'running…' : `in ${nextCheckSeconds}s`}
+                      <span className="text-neutral-600"> (every {deployState.health_check_interval_seconds ?? 60}s)</span>
                     </span>
                   </div>
                 )}

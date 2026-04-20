@@ -19,6 +19,7 @@ export interface DeployState {
   health_recovery_streak_required: number;
   health_failure_streak: number;
   health_failure_streak_threshold: number;
+  health_check_interval_seconds?: number;
   external_health?: Record<string, unknown>;
 }
 

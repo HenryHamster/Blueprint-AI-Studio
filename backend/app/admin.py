@@ -1620,6 +1620,7 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
         "health_recovery_history_size": 5,
         "health_failure_streak": getattr(_deploy_health_module, "_pause_failure_streak", 0),
         "health_failure_streak_threshold": 3,
+        "health_check_interval_seconds": 15 if runtime_config["max_concurrent_vms"] == 0 else 60,
         "max_auto_pause_duration_seconds": runtime_config.get("max_auto_pause_duration_seconds", 7200),
     }
 
