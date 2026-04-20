@@ -550,16 +550,33 @@ async def orchestrator_worker():
                     logger.exception("anomaly_maintenance_sweep failed")
                 _last_anomaly_sweep = _utcnow()
 
+            # First-cycle awaits are the most common silent-hang site: connection
+            # pool exhaustion, row-level locks from a previously OOM'd instance,
+            # or VPC/Cloud-SQL proxy hiccups all manifest as an indefinite wait
+            # here with no logs. Bound the whole session-acquire + config-sync
+            # block so a stuck cycle becomes a loud TimeoutError instead.
+            try:
+                async with asyncio.timeout(30):
+                    async with AsyncSessionLocal() as session:
+                        # Sync runtime_config with DB each cycle. Cloud Run runs up to
+                        # max_instance_count instances; admin mutations (pause, settings)
+                        # only update the receiving instance's in-memory runtime_config,
+                        # so other instances would otherwise dispatch past a pause or
+                        # stale cap. DeploymentState is the authoritative source.
+                        _deploy_state = await session.get(DeploymentState, 1)
+                        _changed_keys = await _sync_runtime_config_from_state(_deploy_state)
+                        if _changed_keys:
+                            logger.info(f"[ORCHESTRATOR] Runtime config drift corrected: {_changed_keys}")
+            except TimeoutError:
+                logger.error(
+                    "[ORCHESTRATOR] Timed out (30s) acquiring session / reading DeploymentState — "
+                    "likely DB pool contention or row-level lock from a stale transaction. "
+                    "Skipping this cycle."
+                )
+                _orchestrator_last_cycle = _utcnow()
+                await asyncio.sleep(2)
+                continue
             async with AsyncSessionLocal() as session:
-                # Sync runtime_config with DB each cycle. Cloud Run runs up to
-                # max_instance_count instances; admin mutations (pause, settings)
-                # only update the receiving instance's in-memory runtime_config,
-                # so other instances would otherwise dispatch past a pause or
-                # stale cap. DeploymentState is the authoritative source.
-                _deploy_state = await session.get(DeploymentState, 1)
-                _changed_keys = await _sync_runtime_config_from_state(_deploy_state)
-                if _changed_keys:
-                    logger.info(f"[ORCHESTRATOR] Runtime config drift corrected: {_changed_keys}")
 
                 # Fetch all active tasks once — used for both concurrency limit and counter reconciliation
                 # Light query: only load columns needed for the stale-provision scan

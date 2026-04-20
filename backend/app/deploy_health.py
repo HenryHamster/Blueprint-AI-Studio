@@ -206,9 +206,16 @@ def should_rollback() -> tuple:
 
 
 async def _get_deploy_state_for_update(session: AsyncSession) -> "DeploymentState | None":
-    """Fetch DeploymentState with FOR UPDATE to prevent concurrent overwrites."""
+    """Fetch DeploymentState with FOR UPDATE SKIP LOCKED.
+
+    skip_locked=True returns None when the row is already locked by a concurrent
+    writer instead of blocking indefinitely. Callers already tolerate None (they
+    return early and retry on the next cycle), and an unkillable FOR UPDATE wait
+    in the orchestrator cold path was silently hanging entire instances when a
+    prior OOM'd transaction left the row locked.
+    """
     return (await session.execute(
-        select(DeploymentState).where(DeploymentState.id == 1).with_for_update()
+        select(DeploymentState).where(DeploymentState.id == 1).with_for_update(skip_locked=True)
     )).scalars().first()
 
 

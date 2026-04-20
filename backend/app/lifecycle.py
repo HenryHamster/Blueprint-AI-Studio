@@ -38,6 +38,19 @@ async def _seed_initial_admin():
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan context manager — startup and shutdown hooks."""
+    # Root logger was never configured — named loggers propagated to a root with
+    # no handlers, so every [ORCHESTRATOR]/[DEPLOY]/[HEALTH]/[MONITOR] line
+    # vanished silently. Cloud Run captures stdout+stderr; force a basic
+    # formatter+handler here so app logs surface even during startup hangs.
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
+            datefmt='%Y-%m-%dT%H:%M:%S',
+            force=True,
+        )
+    logger.info("[STARTUP] Logging configured — app logs now visible in Cloud Logging")
+
     # Late imports to avoid circular dependency with app.main
     from app.main import (
         _verify_schema_version,
@@ -114,6 +127,38 @@ async def lifespan(app):
         while True:
             try:
                 await asyncio.sleep(30)
+                # Liveness watchdog for orchestrator: task may be alive (not done())
+                # yet stuck inside a cycle — `t.done()` alone misses hangs. If
+                # `_orchestrator_last_cycle` hasn't advanced in ~120s while the task
+                # is still running, cancel so the normal restart path below kicks in.
+                try:
+                    from app import orchestrator as _orch  # noqa: PLC0415
+                    orch_task = tasks.get("orchestrator")
+                    if orch_task is not None and not orch_task.done():
+                        last = _orch._orchestrator_last_cycle
+                        started = _orch._orchestrator_cycle_started
+                        stall_threshold = 120.0
+                        now = _utcnow()
+                        stalled = False
+                        reason = ""
+                        if last is None and started is not None:
+                            age = (now - started).total_seconds()
+                            if age > stall_threshold:
+                                stalled = True
+                                reason = f"first cycle never completed (started {int(age)}s ago, no completion)"
+                        elif last is not None:
+                            age = (now - last).total_seconds()
+                            if age > stall_threshold:
+                                stalled = True
+                                reason = f"no cycle completion in {int(age)}s"
+                        if stalled:
+                            logger.error(
+                                f"[MONITOR] Orchestrator appears hung — {reason}. "
+                                f"Cancelling task so restart path re-spawns it."
+                            )
+                            orch_task.cancel()
+                except Exception as wd_exc:
+                    logger.warning(f"[MONITOR] Watchdog check failed: {wd_exc}")
                 for name, t in list(tasks.items()):
                     if t.done():
                         exc = t.exception() if not t.cancelled() else None
