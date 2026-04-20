@@ -387,17 +387,23 @@ def _build_previous_decision_outcomes(project: Project) -> dict[str, Any] | None
         d.get("id"): d for d in (project.directions or []) if d.get("id")
     }
 
-    def _summarize(direction_id: str, role: str) -> dict[str, Any]:
+    created_rationales = prev_entry.get("created_rationales") or {}
+    retired_rationales = prev_entry.get("retired_rationales") or {}
+
+    def _summarize(direction_id: str, role: str, rationale: Optional[str]) -> dict[str, Any]:
         d = directions_by_id.get(direction_id)
         if d is None:
-            return {"direction_id": direction_id, "role": role, "status": "missing"}
+            entry: dict[str, Any] = {"direction_id": direction_id, "role": role, "status": "missing"}
+            if rationale:
+                entry["rationale"] = rationale
+            return entry
         history = d.get("research_history") or []
         agg = d.get("history_aggregate") or {}
         cycles_active = len(history) + (agg.get("total_cycles") or 0)
         prs_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
         is_paused = d.get("status") == "paused"
         auto_paused = bool(d.get("auto_paused"))
-        return {
+        entry = {
             "direction_id": direction_id,
             "role": role,
             "status": d.get("status"),
@@ -408,16 +414,29 @@ def _build_previous_decision_outcomes(project: Project) -> dict[str, Any] | None
             "auto_paused": auto_paused,
             "user_paused": is_paused and not auto_paused,
         }
+        if rationale:
+            entry["rationale"] = rationale
+        return entry
 
-    created = [_summarize(did, "created") for did in (prev_entry.get("created_direction_ids") or [])]
-    retired = [_summarize(did, "retired") for did in (prev_entry.get("retired_direction_ids") or [])]
-    return {
+    created = [
+        _summarize(did, "created", created_rationales.get(did))
+        for did in (prev_entry.get("created_direction_ids") or [])
+    ]
+    retired = [
+        _summarize(did, "retired", retired_rationales.get(did))
+        for did in (prev_entry.get("retired_direction_ids") or [])
+    ]
+    result: dict[str, Any] = {
         "cycle_id": prev_entry.get("cycle_id"),
         "phase2_completed_at": prev_entry.get("phase2_completed_at"),
         "summary_text": prev_entry.get("summary_text"),
         "created": created,
         "retired": retired,
     }
+    cycle_reasoning = prev_entry.get("cycle_reasoning")
+    if cycle_reasoning:
+        result["cycle_reasoning"] = cycle_reasoning
+    return result
 
 
 async def _find_last_strategic_cycle_time(
@@ -539,10 +558,15 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         logger.warning(f"[STRATEGIC] Skipping strategic review — strategic task already active for {project.id}")
         return False
 
-    # Build direction stats with rich data (same as previous strategic payload)
-    all_active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+    # Build direction stats with rich data (same as previous strategic payload).
+    # Include paused directions too — user-paused entries are a strong signal the
+    # strategic agent should respect rather than re-propose.
+    included_directions = [
+        d for d in (project.directions or [])
+        if d.get("status") in ("active", "paused")
+    ]
     direction_stats = []
-    for d in all_active_directions:
+    for d in included_directions:
         history = d.get("research_history", [])
         agg = d.get("history_aggregate", {})
         total_cycles = len(history) + (agg.get("total_cycles") or 0)
@@ -591,7 +615,27 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
             stat_entry["recent_failures"] = recent_failures[:5]
         if d.get("system_id"):
             stat_entry["system_id"] = d["system_id"]
+        if d.get("status") == "paused":
+            stat_entry["auto_paused"] = bool(d.get("auto_paused"))
+            if d.get("paused_reason"):
+                stat_entry["paused_reason"] = d.get("paused_reason")
         direction_stats.append(stat_entry)
+
+    # Recently rejected proposals (last 30 days) — surfaced so the strategic
+    # agent avoids re-proposing similar work the user already declined.
+    cutoff_iso = (_utcnow() - timedelta(days=30)).isoformat()
+    rejected_proposals = [
+        {
+            "text": (d.get("text") or "")[:300],
+            "rejected_at": d.get("rejected_at"),
+            "rationale": (d.get("rationale") or "")[:300] if d.get("rationale") else None,
+        }
+        for d in (project.directions or [])
+        if d.get("status") == "rejected"
+        and (d.get("rejected_at") or "") >= cutoff_iso
+    ]
+    rejected_proposals.sort(key=lambda r: r.get("rejected_at") or "", reverse=True)
+    rejected_proposals = rejected_proposals[:10]
 
     # Fetch unified conversation thread — last 30 messages chronologically,
     # regardless of status.  Gives the strategic agent a coherent back-and-forth
@@ -636,6 +680,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "project_name": project.name,
         "open_messages": open_msgs,
         "conversation_thread": conversation_thread,
+        **({"rejected_proposals": rejected_proposals} if rejected_proposals else {}),
         "base_branch": "main",
         **({"model": review_model} if review_model else {}),
         **({"effort": review_effort} if review_effort else {}),

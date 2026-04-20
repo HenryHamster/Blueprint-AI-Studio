@@ -17,9 +17,13 @@ import {
   classifyFailureCategory,
   buildScopeCalibrationSignal,
   buildFilteredFindingsSection,
+  buildRejectedProposalsSection,
+  buildUserPausedSection,
   formatCochangeHints,
   formatDecompositionOutcomes,
+  formatPreviousDecisionOutcomes,
   readProgressArtifact,
+  buildPortfolioComposition,
 } from './research-plan.js';
 
 describe('calcMessageAge', () => {
@@ -748,5 +752,193 @@ describe('readProgressArtifact', () => {
       throw new Error('permission denied');
     });
     expect(readProgressArtifact('task-err', 'plan')).toBeUndefined();
+  });
+});
+
+describe('buildRejectedProposalsSection', () => {
+  it('returns empty string for empty input', () => {
+    expect(buildRejectedProposalsSection([])).toBe('');
+  });
+
+  it('renders rejected proposals with date, text, and rationale', () => {
+    const out = buildRejectedProposalsSection([
+      { text: 'Add streaming uploads', rejected_at: '2026-04-10T12:00:00Z', rationale: 'Out of scope' },
+      { text: 'Migrate to gRPC', rejected_at: '2026-04-05T08:00:00Z' },
+    ]);
+    expect(out).toContain('## Recently Rejected Proposals');
+    expect(out).toContain('Do NOT re-propose');
+    expect(out).toContain('(2026-04-10) Add streaming uploads — Out of scope');
+    expect(out).toContain('(2026-04-05) Migrate to gRPC');
+  });
+
+  it('caps at 10 entries', () => {
+    const many = Array.from({ length: 15 }, (_, i) => ({
+      text: `proposal ${i}`, rejected_at: '2026-04-01T00:00:00Z',
+    }));
+    const out = buildRejectedProposalsSection(many);
+    expect(out).toContain('proposal 9');
+    expect(out).not.toContain('proposal 10');
+  });
+});
+
+describe('buildUserPausedSection', () => {
+  it('returns empty string when no directions', () => {
+    expect(buildUserPausedSection([])).toBe('');
+  });
+
+  it('returns empty when only auto-paused or active directions exist', () => {
+    const out = buildUserPausedSection([
+      { id: 'd-1', text: 'A', status: 'active' },
+      { id: 'd-2', text: 'B', status: 'paused', auto_paused: true, paused_reason: 'CODE_ERROR surge' },
+    ]);
+    expect(out).toBe('');
+  });
+
+  it('flags user-paused directions and includes paused_reason', () => {
+    const out = buildUserPausedSection([
+      { id: 'd-1', text: 'A', status: 'active' },
+      { id: 'd-2', text: 'Paused by user', status: 'paused', auto_paused: false, paused_reason: 'awaiting design review' },
+      { id: 'd-3', text: 'Auto paused', status: 'paused', auto_paused: true },
+    ]);
+    expect(out).toContain('## User-Paused Directions');
+    expect(out).toContain('Paused by user (id: d-2) — reason: awaiting design review');
+    expect(out).not.toContain('Auto paused');
+  });
+
+  it('treats missing auto_paused as user-paused', () => {
+    const out = buildUserPausedSection([
+      { id: 'd-9', text: 'Legacy paused', status: 'paused' },
+    ]);
+    expect(out).toContain('Legacy paused (id: d-9)');
+  });
+});
+
+describe('formatPreviousDecisionOutcomes', () => {
+  it('returns empty string when input is undefined', () => {
+    expect(formatPreviousDecisionOutcomes(undefined)).toBe('');
+  });
+
+  it('returns empty string when input is null', () => {
+    expect(formatPreviousDecisionOutcomes(null)).toBe('');
+  });
+
+  it('returns empty string when created and retired are both empty', () => {
+    expect(formatPreviousDecisionOutcomes({ cycle_id: 'sc-1', created: [], retired: [] })).toBe('');
+  });
+
+  it('renders created direction with status, cycles, merges, quality', () => {
+    const out = formatPreviousDecisionOutcomes({
+      cycle_id: 'sc-prev',
+      phase2_completed_at: '2026-04-19T12:00:00Z',
+      created: [
+        {
+          direction_id: 'd-abc',
+          role: 'created',
+          status: 'active',
+          text: 'Improve foo',
+          cycles_active: 3,
+          prs_merged: 2,
+          quality_score: 0.75,
+          auto_paused: false,
+          user_paused: false,
+        },
+      ],
+      retired: [],
+    });
+    expect(out).toContain('## Decision Feedback');
+    expect(out).toContain('cycle sc-prev');
+    expect(out).toContain('d-abc');
+    expect(out).toContain('"Improve foo"');
+    expect(out).toContain('status=active');
+    expect(out).toContain('3 cycles active');
+    expect(out).toContain('2 PRs merged');
+    expect(out).toContain('quality 0.75');
+    expect(out).toContain('Directions you CREATED');
+  });
+
+  it('flags auto_paused and user_paused distinctly', () => {
+    const out = formatPreviousDecisionOutcomes({
+      created: [
+        { direction_id: 'd-a', status: 'paused', auto_paused: true, user_paused: false, cycles_active: 1, prs_merged: 0, quality_score: 0 },
+        { direction_id: 'd-b', status: 'paused', auto_paused: false, user_paused: true, cycles_active: 2, prs_merged: 0, quality_score: 0 },
+      ],
+      retired: [],
+    });
+    expect(out).toMatch(/d-a:.*AUTO_PAUSED/);
+    expect(out).toMatch(/d-b:.*USER_PAUSED/);
+    expect(out).not.toMatch(/d-a:.*USER_PAUSED/);
+  });
+
+  it('distinguishes missing retired directions from still-present ones', () => {
+    const out = formatPreviousDecisionOutcomes({
+      created: [],
+      retired: [
+        { direction_id: 'd-gone', role: 'retired', status: 'missing' },
+        { direction_id: 'd-here', role: 'retired', status: 'retired', cycles_active: 5, prs_merged: 1, quality_score: 0.4 },
+      ],
+    });
+    expect(out).toContain('Directions you RETIRED');
+    expect(out).toContain('d-gone');
+    expect(out).toContain('fully removed from direction list');
+    expect(out).toContain('d-here');
+    expect(out).toContain('status=retired');
+  });
+
+  it('handles malformed entries without throwing', () => {
+    expect(() => formatPreviousDecisionOutcomes({
+      created: [{}, { direction_id: 'd-partial' }],
+      retired: [{ direction_id: null }],
+    })).not.toThrow();
+  });
+
+  it('includes reflection prompt encouraging retrospective', () => {
+    const out = formatPreviousDecisionOutcomes({
+      created: [{ direction_id: 'd-x', status: 'active', cycles_active: 1, prs_merged: 0, quality_score: 0 }],
+      retired: [],
+    });
+    expect(out.toLowerCase()).toContain('reflect');
+  });
+});
+
+describe('buildPortfolioComposition', () => {
+  it('returns empty message when no active directions', () => {
+    expect(buildPortfolioComposition([], [], {})).toBe('No active directions — portfolio is empty.');
+  });
+
+  it('reports category mix, coverage gaps, concentration, scope, and age flags', () => {
+    const dirs = [
+      { id: 'd-1', text: 'Product A', category: 'product', system_id: 'sys-a', total_cycles: 2 },
+      { id: 'd-2', text: 'Refactor A', category: 'structural', system_id: 'sys-a', total_cycles: 12 },
+      { id: 'd-3', text: 'More A', category: 'structural', system_id: 'sys-a', total_cycles: 3 },
+      { id: 'd-4', text: 'Mystery', total_cycles: 1 },
+    ];
+    const systems = [
+      { id: 'sys-a', name: 'System A' },
+      { id: 'sys-b', name: 'System B' },
+    ];
+    const out = buildPortfolioComposition(dirs, systems, { small: 2, large: 1 });
+    expect(out).toContain('product=1 (25%)');
+    expect(out).toContain('structural=2 (50%)');
+    expect(out).toContain('uncategorized=1');
+    expect(out).toContain('LOW PRODUCT RATIO');
+    expect(out).toContain('System coverage: 1/2');
+    expect(out).toContain('System B (sys-b)');
+    expect(out).toContain('CONCENTRATION RISK');
+    expect(out).toContain('sys-a=3');
+    expect(out).toContain('In-flight scope mix: small=2, large=1');
+    expect(out).toContain('Long-running (10+ cycles');
+    expect(out).toContain('d-2');
+  });
+
+  it('omits product flag when product ratio >= 30%', () => {
+    const dirs = [
+      { id: 'd-1', category: 'product', total_cycles: 1 },
+      { id: 'd-2', category: 'structural', total_cycles: 1 },
+    ];
+    const out = buildPortfolioComposition(dirs, [], undefined);
+    expect(out).not.toContain('LOW PRODUCT RATIO');
+    expect(out).not.toContain('CONCENTRATION RISK');
+    expect(out).not.toContain('In-flight scope mix');
+    expect(out).not.toContain('System coverage');
   });
 });

@@ -173,6 +173,7 @@ class StrategicReviewPayload(_SystemPopulated):
     project_name: Optional[str] = None
     research_mode: Optional[str] = None
     max_active_directions: Optional[int] = None
+    rejected_proposals: Optional[list[dict[str, Any]]] = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):

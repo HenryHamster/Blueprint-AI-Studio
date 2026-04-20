@@ -352,6 +352,36 @@ export function buildFilteredFindingsSection(history: Array<Record<string, unkno
   return `\n  Recently filtered (avoid — propose different approaches):\n${lines.join('\n')}`;
 }
 
+export function buildRejectedProposalsSection(
+  rejectedProposals: Array<Record<string, unknown>>
+): string {
+  if (!Array.isArray(rejectedProposals) || rejectedProposals.length === 0) return '';
+  const lines = rejectedProposals.slice(0, 10).map(p => {
+    const text = strVal(p.text).slice(0, 300);
+    const when = strVal(p.rejected_at).slice(0, 10) || '?';
+    const rationale = strVal(p.rationale).slice(0, 200);
+    const tail = rationale ? ` — ${rationale}` : '';
+    return `- (${when}) ${text}${tail}`;
+  });
+  return `\n## Recently Rejected Proposals (last 30 days)\nThe user explicitly rejected these direction proposals. Do NOT re-propose similar work — find a different angle or move on.\n${lines.join('\n')}\n`;
+}
+
+export function buildUserPausedSection(
+  directionsSummary: Array<Record<string, unknown>>
+): string {
+  if (!Array.isArray(directionsSummary) || directionsSummary.length === 0) return '';
+  const userPaused = directionsSummary.filter(
+    d => strVal(d.status) === 'paused' && d.auto_paused !== true
+  );
+  if (userPaused.length === 0) return '';
+  const lines = userPaused.map(d => {
+    const reason = strVal(d.paused_reason);
+    const tail = reason ? ` — reason: ${reason}` : '';
+    return `- ${strVal(d.text)} (id: ${strVal(d.id)})${tail}`;
+  });
+  return `\n## User-Paused Directions\nThese directions were paused by the user (not auto-paused by the system). Treat as an explicit user constraint — do NOT unpause, retire, or duplicate them without a strong reason backed by user intent.\n${lines.join('\n')}\n`;
+}
+
 function differentiationHintFor(reason: string): string {
   const r = reason.toLowerCase();
   if (r.includes('hash match')) {
@@ -434,6 +464,128 @@ export function formatDecompositionOutcomes(directionCtx: Record<string, unknown
     : '';
 
   return `## Prior Decomposition Outcomes\n\nMetrics from recent plan decompositions in this direction:\n${lines.join('\n')}${hintSection}\n\n`;
+}
+
+export function formatPreviousDecisionOutcomes(raw: unknown): string {
+  if (!raw || typeof raw !== 'object') return '';
+  const o = raw as Record<string, unknown>;
+  const created = Array.isArray(o.created) ? o.created as Array<Record<string, unknown>> : [];
+  const retired = Array.isArray(o.retired) ? o.retired as Array<Record<string, unknown>> : [];
+  if (created.length === 0 && retired.length === 0) return '';
+
+  const lines: string[] = ['## Decision Feedback'];
+  const cycleId = strVal(o.cycle_id);
+  const completedAt = strVal(o.phase2_completed_at);
+  const headerParts: string[] = [];
+  if (cycleId) headerParts.push(`cycle ${cycleId}`);
+  if (completedAt) headerParts.push(`completed ${completedAt}`);
+  lines.push(
+    `Outcomes of your prior strategic cycle's decisions${headerParts.length ? ` (${headerParts.join(', ')})` : ''}.`
+  );
+  const summaryText = strVal(o.summary_text);
+  if (summaryText) lines.push(`Prior summary: ${summaryText.slice(0, 500)}`);
+
+  const fmtEntry = (d: Record<string, unknown>): string => {
+    const id = strVal(d.direction_id);
+    const status = strVal(d.status, 'unknown');
+    const text = strVal(d.text).slice(0, 120);
+    const textTag = text ? ` "${text}"` : '';
+    if (status === 'missing') {
+      return `- ${id}${textTag}: fully removed from direction list`;
+    }
+    const cycles = typeof d.cycles_active === 'number' ? d.cycles_active : 0;
+    const merged = typeof d.prs_merged === 'number' ? d.prs_merged : 0;
+    const quality = typeof d.quality_score === 'number' ? d.quality_score : null;
+    const qualityStr = quality !== null ? `, quality ${quality}` : '';
+    const pauseFlags: string[] = [];
+    if (d.auto_paused === true) pauseFlags.push('AUTO_PAUSED');
+    if (d.user_paused === true) pauseFlags.push('USER_PAUSED');
+    const pauseStr = pauseFlags.length ? ` [${pauseFlags.join(', ')}]` : '';
+    return `- ${id}${textTag}: status=${status}, ${cycles} cycles active, ${merged} PRs merged${qualityStr}${pauseStr}`;
+  };
+
+  if (created.length > 0) {
+    lines.push('\nDirections you CREATED in the prior cycle:');
+    for (const d of created) lines.push(fmtEntry(d));
+  }
+  if (retired.length > 0) {
+    lines.push('\nDirections you RETIRED in the prior cycle:');
+    for (const d of retired) lines.push(fmtEntry(d));
+  }
+  lines.push(
+    '\nReflect: did the directions you created produce merges, or stall? Were any auto-paused? Use this feedback before creating similar directions again.'
+  );
+  return '\n' + lines.join('\n') + '\n';
+}
+
+// Portfolio-level view computed from per-direction data — surfaces imbalances
+// (category skew, system coverage gaps, concentration, age) as explicit
+// decision inputs for the strategic thinker.
+export function buildPortfolioComposition(
+  activeDirections: Array<Record<string, unknown>>,
+  systems: Array<Record<string, unknown>>,
+  activeByScope: Record<string, number> | undefined,
+): string {
+  const total = activeDirections.length;
+  if (total === 0) return 'No active directions — portfolio is empty.';
+
+  const catCounts: Record<string, number> = { product: 0, structural: 0, mixed: 0, uncategorized: 0 };
+  const systemCounts: Record<string, number> = {};
+  const ageFlags: string[] = [];
+  for (const d of activeDirections) {
+    const rawCat = typeof d.category === 'string' ? (d.category as string) : '';
+    const cat = ['product', 'structural', 'mixed'].includes(rawCat) ? rawCat : 'uncategorized';
+    catCounts[cat] = (catCounts[cat] || 0) + 1;
+    const sys = typeof d.system_id === 'string' ? (d.system_id as string) : '';
+    if (sys) systemCounts[sys] = (systemCounts[sys] || 0) + 1;
+    const cycles = typeof d.total_cycles === 'number' ? (d.total_cycles as number) : 0;
+    if (cycles >= 10) {
+      const id = typeof d.id === 'string' ? (d.id as string) : '?';
+      const text = typeof d.text === 'string' ? (d.text as string).slice(0, 60) : '';
+      ageFlags.push(`${id} (${cycles} cycles): ${text}`);
+    }
+  }
+
+  const pct = (n: number) => total > 0 ? Math.round((n / total) * 100) : 0;
+  const productPct = pct(catCounts.product);
+  const lines: string[] = [];
+  const catParts = (['product', 'structural', 'mixed', 'uncategorized'] as const)
+    .filter(c => catCounts[c] > 0)
+    .map(c => `${c}=${catCounts[c]} (${pct(catCounts[c])}%)`);
+  const productFlag = productPct < 30 ? ' [LOW PRODUCT RATIO — <30%]' : '';
+  lines.push(`Category mix: ${catParts.join(', ')}${productFlag}`);
+
+  const mappedSystems = new Set(Object.keys(systemCounts));
+  const allSystems = systems.filter(s => typeof s.id === 'string').map(s => ({
+    id: s.id as string,
+    name: typeof s.name === 'string' ? (s.name as string) : (s.id as string),
+  }));
+  const uncovered = allSystems.filter(s => !mappedSystems.has(s.id));
+  if (allSystems.length > 0) {
+    lines.push(`System coverage: ${mappedSystems.size}/${allSystems.length} vision systems have directions`
+      + (uncovered.length > 0 ? ` — gaps: ${uncovered.map(s => `${s.name} (${s.id})`).join(', ')}` : ''));
+  }
+
+  const concentrated = Object.entries(systemCounts).filter(([, n]) => n >= 3);
+  if (concentrated.length > 0) {
+    const parts = concentrated.map(([sid, n]) => `${sid}=${n}`);
+    lines.push(`CONCENTRATION RISK: 3+ directions on same system: ${parts.join(', ')}`);
+  }
+
+  if (activeByScope) {
+    const scopeParts: string[] = [];
+    for (const s of ['small', 'medium', 'large', 'unknown']) {
+      const n = activeByScope[s];
+      if (typeof n === 'number' && n > 0) scopeParts.push(`${s}=${n}`);
+    }
+    if (scopeParts.length > 0) lines.push(`In-flight scope mix: ${scopeParts.join(', ')}`);
+  }
+
+  if (ageFlags.length > 0) {
+    lines.push(`Long-running (10+ cycles without completion): ${ageFlags.join('; ')}`);
+  }
+
+  return lines.join('\n');
 }
 
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
@@ -1096,6 +1248,17 @@ ${hotspotsSection}
           const satNote = d.possibly_saturated ? ' [SATURATED]' : '';
           const catNote = d.category ? ` [${strVal(d.category)}]` : '';
           const sysNote = d.system_id ? ` (system: ${strVal(d.system_id)})` : '';
+          const dStatus = strVal(d.status, 'active');
+          let statusNote = '';
+          if (dStatus !== 'active') {
+            if (dStatus === 'paused') {
+              const tag = d.auto_paused === true ? 'AUTO_PAUSED' : 'USER_PAUSED';
+              const reason = strVal(d.paused_reason).slice(0, 80);
+              statusNote = reason ? ` [${tag}: ${reason}]` : ` [${tag}]`;
+            } else {
+              statusNote = ` [${dStatus.toUpperCase()}]`;
+            }
+          }
 
           // Research context: show established findings count, failed approaches, open questions
           let ctxSection = '';
@@ -1137,7 +1300,7 @@ ${hotspotsSection}
             failuresSection = `\n   Recent failures: ${failLines.join('; ')}`;
           }
 
-          return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}`;
+          return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}`;
         }).join('\n\n')
       : 'No directions exist yet.';
 
@@ -1232,6 +1395,9 @@ echo ""
       : 10;
     const activeDirections = directionsSummary.filter(d => strVal(d.status, 'active') === 'active');
     const activeCount = activeDirections.length;
+    const pausedDirections = directionsSummary.filter(d => strVal(d.status) === 'paused');
+    const autoPausedCount = pausedDirections.filter(d => d.auto_paused === true).length;
+    const userPausedCount = pausedDirections.length - autoPausedCount;
     const saturatedCount = activeDirections.filter(d => d.possibly_saturated === true).length;
     const productCount = activeDirections.filter(d => strVal(d.category) === 'product').length;
     const availableSlots = maxActiveDirections - activeCount;
@@ -1239,10 +1405,27 @@ echo ""
     if (productCount === 0) gaps.push('NO_PRODUCT_DIRECTIONS');
     if (saturatedCount === activeCount && activeCount > 0) gaps.push('ALL_SATURATED');
     if (activeCount < 3) gaps.push('BELOW_MINIMUM');
+    const pausedNote = pausedDirections.length > 0
+      ? ` Paused: ${pausedDirections.length} (${autoPausedCount} auto, ${userPausedCount} user) — listed below but not consuming active slots.`
+      : '';
     const dirHealthSummary = [
-      `Active: ${activeCount}/${maxActiveDirections} slots used (${availableSlots} available). Saturated: ${saturatedCount}/${activeCount}. Product directions: ${productCount}.`,
+      `Active: ${activeCount}/${maxActiveDirections} slots used (${availableSlots} available). Saturated: ${saturatedCount}/${activeCount}. Product directions: ${productCount}.${pausedNote}`,
       gaps.length > 0 ? `GAPS DETECTED: ${gaps.join(', ')}` : 'No critical gaps detected.',
     ].join('\n');
+
+    // Portfolio composition: category mix, system coverage gaps, concentration
+    // risk, in-flight scope, direction age — so the thinker doesn't have to
+    // re-compute these from scattered per-direction lines.
+    const outcomeSystems = outcomeEval && Array.isArray(outcomeEval.systems)
+      ? outcomeEval.systems as Array<Record<string, unknown>>
+      : (vision && Array.isArray(vision.systems) ? vision.systems as Array<Record<string, unknown>> : []);
+    const activeByScopeForPortfolio = (payload.recent_interventions as Record<string, unknown> | undefined)
+      ?.active_by_scope as Record<string, number> | undefined;
+    const portfolioCompositionText = buildPortfolioComposition(
+      activeDirections,
+      outcomeSystems,
+      activeByScopeForPortfolio,
+    );
 
     // ── Running context from prior cycles (design doc notes/strategic-context) ──
     const strategicContext = designDoc
@@ -1261,12 +1444,15 @@ ${designDocJson || 'No design document yet.'}
 
 ## Vision (current)
 ${visionJson || 'No vision set yet.'}
-${outcomeSection}
+${outcomeSection}${formatPreviousDecisionOutcomes(payload.previous_decision_outcomes)}
 ## Current research directions
 ${dirSummaryText}
 
 ## Direction Health
 ${dirHealthSummary}
+${buildUserPausedSection(directionsSummary)}${buildRejectedProposalsSection(Array.isArray(payload.rejected_proposals) ? payload.rejected_proposals as Array<Record<string, unknown>> : [])}
+## Portfolio Composition
+${portfolioCompositionText}
 ${recentWorkSection}${feedbackSection}${threadSection}
 # Your task
 
@@ -1282,6 +1468,7 @@ Think about what bold moves close that gap:
 - What would make a user say "I can't work without this"? Is anyone building it?
 - Are we stuck in a local optimum — lots of small improvements instead of one big leap?
 - Look at the outcome data honestly — are directions producing real value, or busywork?
+- If a Decision Feedback section is shown, treat it as a retrospective on your last cycle: did the directions you created produce merges? Were any auto-paused or retired already? What does that tell you about how you reasoned last time?
 - Are we defaulting to infrastructure when product features would matter more?
 - What should we STOP doing? Which directions are dead weight?
 - What are we avoiding that we shouldn't be?

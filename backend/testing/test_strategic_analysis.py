@@ -525,6 +525,64 @@ def test_difficulty_index_capped_at_thirty():
     assert _compute_difficulty_index(d) == 30.0
 
 
+def test_cost_estimate_per_direction_and_overall():
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+    directions = [
+        {
+            "id": "dir-cheap", "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 4,
+                 "tasks_created": 4, "avg_time_to_merge_hours": 1.0},
+            ],
+        },
+        {
+            "id": "dir-pricey", "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1,
+                 "tasks_created": 5, "avg_time_to_merge_hours": 4.0},
+            ],
+        },
+    ]
+    result = _build_outcome_evaluation(_make_project(directions=directions))
+    by_id = {d["id"]: d for d in result["directions"]}
+
+    cheap_cost = round(4 * 1.0 * 3600 * ON_DEMAND_RATE, 2)
+    pricey_cost = round(5 * 4.0 * 3600 * ON_DEMAND_RATE, 2)
+    assert by_id["dir-cheap"]["estimated_cost_usd"] == cheap_cost
+    assert by_id["dir-cheap"]["cost_per_merged_pr"] == round(cheap_cost / 4, 2)
+    assert by_id["dir-pricey"]["estimated_cost_usd"] == pricey_cost
+    assert by_id["dir-pricey"]["cost_per_merged_pr"] == round(pricey_cost / 1, 2)
+
+    overall = result["overall"]
+    assert overall["estimated_cost_usd"] == round(cheap_cost + pricey_cost, 2)
+    ranking = overall["cost_efficiency_ranking"]
+    assert [r["id"] for r in ranking] == ["dir-cheap", "dir-pricey"]
+
+
+def test_cost_estimate_absent_when_no_runtime_data():
+    directions = [
+        {"id": "dir-1", "status": "active", "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1, "tasks_created": 2},
+        ]}
+    ]
+    result = _build_outcome_evaluation(_make_project(directions=directions))
+    assert "estimated_cost_usd" not in result["directions"][0]
+    assert "estimated_cost_usd" not in result["overall"]
+
+
+def test_cost_per_merged_pr_omitted_when_no_merges():
+    from app.routers.admin_analytics import ON_DEMAND_RATE  # noqa: F401
+    directions = [
+        {"id": "dir-1", "status": "active", "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "prs_merged": 0,
+             "tasks_created": 3, "avg_time_to_merge_hours": 2.0},
+        ]}
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert "estimated_cost_usd" in d
+    assert "cost_per_merged_pr" not in d
+
+
 def test_difficulty_index_surfaced_in_outcome_evaluation():
     directions = [{
         "id": "dir-1",

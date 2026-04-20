@@ -14,6 +14,7 @@ def _build_outcome_evaluation(project) -> dict:
     """
     from app.research_context import _parse_research_context  # noqa: PLC0415
     from app.direction_metrics import _compute_difficulty_index  # noqa: PLC0415
+    from app.routers.admin_analytics import ON_DEMAND_RATE  # noqa: PLC0415
     vision = project.vision or {}
     directions = project.directions or []
     now_iso = _utcnow().isoformat()
@@ -93,6 +94,19 @@ def _build_outcome_evaluation(project) -> dict:
         if avg_time_to_merge_hours is not None:
             outcome["avg_time_to_merge_hours"] = avg_time_to_merge_hours
         outcome["difficulty_index"] = round(_compute_difficulty_index(d), 2)
+        # Estimated cost: sum(tasks_created * avg_time_to_merge_hours) * 3600 * ON_DEMAND_RATE
+        # avg_time_to_merge_hours is a per-cycle proxy for typical task VM runtime.
+        cost_seconds = 0.0
+        for h in window_history:
+            tcount = h.get("tasks_created", 0) or 0
+            hours = h.get("avg_time_to_merge_hours")
+            if tcount and hours:
+                cost_seconds += tcount * hours * 3600
+        estimated_cost_usd = round(cost_seconds * ON_DEMAND_RATE, 2)
+        if estimated_cost_usd > 0:
+            outcome["estimated_cost_usd"] = estimated_cost_usd
+            if merged > 0:
+                outcome["cost_per_merged_pr"] = round(estimated_cost_usd / merged, 2)
         if rejected > 0:
             total_prs = merged + rejected
             outcome["operator_rejection_rate"] = round(rejected / total_prs, 2) if total_prs > 0 else None
@@ -222,6 +236,18 @@ def _build_outcome_evaluation(project) -> dict:
         overall_summary["type_distribution"] = overall_type_dist
     if overall_product_ratio is not None:
         overall_summary["product_ratio"] = overall_product_ratio
+
+    # System-level cost summary and efficiency ranking
+    total_cost_usd = round(sum(d.get("estimated_cost_usd", 0.0) for d in direction_outcomes), 2)
+    if total_cost_usd > 0:
+        overall_summary["estimated_cost_usd"] = total_cost_usd
+        ranked = [
+            {"id": d["id"], "cost_per_merged_pr": d["cost_per_merged_pr"]}
+            for d in direction_outcomes if d.get("cost_per_merged_pr") is not None
+        ]
+        ranked.sort(key=lambda x: x["cost_per_merged_pr"])
+        if ranked:
+            overall_summary["cost_efficiency_ranking"] = ranked
 
     result: dict = {
         "window": {"from": window_from or "all_time", "to": now_iso, "vision_revision": vision_rev},

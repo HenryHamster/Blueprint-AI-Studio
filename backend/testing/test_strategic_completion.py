@@ -23,7 +23,13 @@ from app.strategic_completion import (
     _check_direction_starvation,
     _is_code_failure_pause_reason,
     _build_direction_failure_summary,
+    _collect_rationales,
+    _extract_cycle_reasoning,
+    _extract_rationale_from_notes,
+    _CREATED_NOTE_PREFIX,
+    _RETIRED_NOTE_PREFIX,
 )
+from app.strategic_spawning import _build_previous_decision_outcomes
 from app.models import Project, Task, TaskStatus
 
 
@@ -852,3 +858,109 @@ class TestCheckDirectionStarvation:
         assert len(project.directions) == 2
         assert project.vision.get("_direction_starvation_count") == 5
         alert_mock.assert_not_called()
+
+
+# ── Rationale persistence & retrieval ────────────────────────────────────────
+
+class TestRationalePersistence:
+    def test_extract_rationale_from_notes_returns_latest(self):
+        d = {
+            "notes": [
+                {"text": f"{_CREATED_NOTE_PREFIX}initial reason"},
+                {"text": "Strategic update: minor tweak"},
+                {"text": f"{_CREATED_NOTE_PREFIX}final reason"},
+            ]
+        }
+        assert _extract_rationale_from_notes(d, _CREATED_NOTE_PREFIX) == "final reason"
+
+    def test_extract_rationale_from_notes_no_match(self):
+        d = {"notes": [{"text": "unrelated"}]}
+        assert _extract_rationale_from_notes(d, _CREATED_NOTE_PREFIX) is None
+
+    def test_extract_rationale_caps_to_200(self):
+        long = "x" * 500
+        d = {"notes": [{"text": f"{_CREATED_NOTE_PREFIX}{long}"}]}
+        out = _extract_rationale_from_notes(d, _CREATED_NOTE_PREFIX)
+        assert out is not None and len(out) == 200
+
+    def test_collect_rationales_from_directions(self):
+        project = Project(
+            name="P", user_id="u1",
+            directions=[
+                {"id": "d-a", "notes": [{"text": f"{_CREATED_NOTE_PREFIX}because A"}]},
+                {"id": "d-b", "notes": [{"text": f"{_RETIRED_NOTE_PREFIX}because B"}]},
+            ],
+        )
+        created = _collect_rationales(project, ["d-a", "d-missing"], _CREATED_NOTE_PREFIX)
+        retired = _collect_rationales(project, ["d-b"], _RETIRED_NOTE_PREFIX)
+        assert created == {"d-a": "because A"}
+        assert retired == {"d-b": "because B"}
+
+    def test_extract_cycle_reasoning_prefers_plan_output(self):
+        t = MagicMock()
+        t.plan_output = {"reasoning": "top-level reason"}
+        t.latest_status_message = "ignored"
+        assert _extract_cycle_reasoning(t) == "top-level reason"
+
+    def test_extract_cycle_reasoning_falls_back_to_status_message(self):
+        t = MagicMock()
+        t.plan_output = None
+        t.latest_status_message = "from status"
+        assert _extract_cycle_reasoning(t) == "from status"
+
+    def test_extract_cycle_reasoning_truncates_to_500(self):
+        t = MagicMock()
+        t.plan_output = {"summary": "y" * 1000}
+        t.latest_status_message = ""
+        assert len(_extract_cycle_reasoning(t)) == 500
+
+    def test_build_previous_decision_outcomes_surfaces_rationales(self):
+        project = Project(
+            name="P", user_id="u1",
+            directions=[
+                {
+                    "id": "d-n", "status": "active", "text": "new dir",
+                    "research_history": [{"prs_merged": 1}],
+                },
+            ],
+            vision={
+                "_strategic_cycle_history": [
+                    {
+                        "cycle_id": "sc-1",
+                        "outcome": "completed",
+                        "created_direction_ids": ["d-n"],
+                        "retired_direction_ids": ["d-gone"],
+                        "created_rationales": {"d-n": "because new capability"},
+                        "retired_rationales": {"d-gone": "stalled for 5 cycles"},
+                        "cycle_reasoning": "focus on velocity",
+                    },
+                ],
+            },
+        )
+        out = _build_previous_decision_outcomes(project)
+        assert out is not None
+        assert out["cycle_reasoning"] == "focus on velocity"
+        assert out["created"][0]["rationale"] == "because new capability"
+        assert out["retired"][0] == {
+            "direction_id": "d-gone", "role": "retired",
+            "status": "missing", "rationale": "stalled for 5 cycles",
+        }
+
+    def test_build_previous_decision_outcomes_no_rationales_is_backward_compatible(self):
+        project = Project(
+            name="P", user_id="u1",
+            directions=[{"id": "d-n", "status": "active", "text": "t", "research_history": []}],
+            vision={
+                "_strategic_cycle_history": [
+                    {
+                        "cycle_id": "sc-1",
+                        "outcome": "completed",
+                        "created_direction_ids": ["d-n"],
+                    },
+                ],
+            },
+        )
+        out = _build_previous_decision_outcomes(project)
+        assert out is not None
+        assert "cycle_reasoning" not in out
+        assert "rationale" not in out["created"][0]

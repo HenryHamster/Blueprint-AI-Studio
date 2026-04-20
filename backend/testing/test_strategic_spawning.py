@@ -757,6 +757,155 @@ async def test_previous_decision_outcomes_absent_when_no_prior_decisions(db_sess
 
 
 @pytest.mark.asyncio
+async def test_previous_decision_outcomes_surfaces_created_rationales(db_session):
+    """created_rationales from prior cycle history appear on created direction stats."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-new01", "status": "active", "text": "new direction",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 2}],
+            },
+        ],
+        vision={
+            "purpose": "test",
+            "_strategic_cycle_history": [
+                {
+                    "cycle_id": "sc-rat0001",
+                    "outcome": "completed",
+                    "created_direction_ids": ["d-new01"],
+                    "retired_direction_ids": [],
+                    "created_rationales": {
+                        "d-new01": "Observed gap in error handling coverage; new direction targets resilience."
+                    },
+                },
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().first().payloads[0]
+    prev = payload.get("previous_decision_outcomes")
+    assert prev is not None
+    new_stat = prev["created"][0]
+    assert new_stat["direction_id"] == "d-new01"
+    assert new_stat.get("rationale") == (
+        "Observed gap in error handling coverage; new direction targets resilience."
+    )
+
+
+@pytest.mark.asyncio
+async def test_previous_decision_outcomes_surfaces_retired_rationales(db_session):
+    """retired_rationales are attached to retired direction stats (including missing ones)."""
+    project = _make_project(
+        directions=[],  # retired direction removed
+        vision={
+            "purpose": "test",
+            "_strategic_cycle_history": [
+                {
+                    "cycle_id": "sc-rat0002",
+                    "outcome": "completed",
+                    "created_direction_ids": [],
+                    "retired_direction_ids": ["d-retired01"],
+                    "retired_rationales": {
+                        "d-retired01": "Saturated; low PR merge volume for 3 cycles."
+                    },
+                },
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().first().payloads[0]
+    prev = payload.get("previous_decision_outcomes")
+    assert prev is not None
+    retired_stat = prev["retired"][0]
+    assert retired_stat["direction_id"] == "d-retired01"
+    assert retired_stat.get("rationale") == "Saturated; low PR merge volume for 3 cycles."
+
+
+@pytest.mark.asyncio
+async def test_previous_decision_outcomes_surfaces_cycle_reasoning(db_session):
+    """cycle_reasoning from prior cycle history appears at the top level of the outcome block."""
+    project = _make_project(
+        directions=[
+            {"id": "d-x", "status": "active", "text": "d", "priority": "medium"},
+        ],
+        vision={
+            "purpose": "test",
+            "_strategic_cycle_history": [
+                {
+                    "cycle_id": "sc-reason01",
+                    "outcome": "completed",
+                    "created_direction_ids": ["d-x"],
+                    "cycle_reasoning": (
+                        "Portfolio skewed toward infra; created direction to restore "
+                        "feature-work balance."
+                    ),
+                },
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().first().payloads[0]
+    prev = payload.get("previous_decision_outcomes")
+    assert prev is not None
+    assert prev.get("cycle_reasoning") == (
+        "Portfolio skewed toward infra; created direction to restore feature-work balance."
+    )
+
+
+@pytest.mark.asyncio
+async def test_previous_decision_outcomes_rationale_absent_when_not_recorded(db_session):
+    """When rationale fields are not present in the cycle entry, direction stats have no rationale key."""
+    project = _make_project(
+        directions=[
+            {"id": "d-r", "status": "active", "text": "d", "priority": "medium",
+             "research_history": []},
+        ],
+        vision={
+            "purpose": "test",
+            "_strategic_cycle_history": [
+                {
+                    "cycle_id": "sc-norat",
+                    "outcome": "completed",
+                    "created_direction_ids": ["d-r"],
+                    # no created_rationales / retired_rationales / cycle_reasoning
+                },
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().first().payloads[0]
+    prev = payload.get("previous_decision_outcomes")
+    assert prev is not None
+    assert "rationale" not in prev["created"][0]
+    assert "cycle_reasoning" not in prev
+
+
+@pytest.mark.asyncio
 async def test_previous_decision_outcomes_missing_retired_direction(db_session):
     """A retired direction id no longer in project.directions is reported as status=missing."""
     project = _make_project(

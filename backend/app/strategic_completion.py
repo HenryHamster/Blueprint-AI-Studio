@@ -109,6 +109,55 @@ async def _record_strategic_task_failure(task: Task, session: AsyncSession) -> N
     )
 
 
+_CREATED_NOTE_PREFIX = "Created by strategic review: "
+_RETIRED_NOTE_PREFIX = "Retired by strategic review: "
+_RATIONALE_PERSIST_MAX = 200
+_CYCLE_REASONING_MAX = 500
+
+
+def _extract_rationale_from_notes(direction: Optional[dict], prefix: str) -> Optional[str]:
+    """Return the latest note rationale matching prefix, or None."""
+    if not direction:
+        return None
+    notes = direction.get("notes") or []
+    for note in reversed(notes):
+        text = (note.get("text") or "") if isinstance(note, dict) else ""
+        if text.startswith(prefix):
+            rationale = text[len(prefix):].strip()
+            if rationale:
+                return rationale[:_RATIONALE_PERSIST_MAX]
+    return None
+
+
+def _collect_rationales(
+    project: Project, direction_ids: list, prefix: str
+) -> Dict[str, str]:
+    """Build a {direction_id: rationale} map by looking up each id's latest note."""
+    by_id = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
+    result: Dict[str, str] = {}
+    for did in direction_ids:
+        rationale = _extract_rationale_from_notes(by_id.get(did), prefix)
+        if rationale:
+            result[did] = rationale
+    return result
+
+
+def _extract_cycle_reasoning(task: Task) -> str:
+    """Extract a condensed reasoning summary for the completed cycle (≤500 chars).
+
+    Prefers task.plan_output's 'reasoning' or 'summary' field, falling back to
+    the task's latest_status_message. Returns empty string if nothing available.
+    """
+    raw = task.plan_output if isinstance(task.plan_output, dict) else None
+    if raw:
+        for key in ("reasoning", "summary", "rationale"):
+            val = raw.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()[:_CYCLE_REASONING_MAX]
+    msg = task.latest_status_message or ""
+    return msg.strip()[:_CYCLE_REASONING_MAX]
+
+
 def _check_direction_health(direction: dict) -> Optional[str]:
     """Return a pause reason if this direction should be auto-paused, else None."""
     history = direction.get("research_history") or []
@@ -437,6 +486,8 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             _vision_updated = (task.context or {}).get("_strategic_vision_set", False) or vision_rev > spawned_vision_rev
             _spawn_suffix = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
             _summary = f"rev {vision_rev}, {active_dirs} active, {dirs_created} created, {dirs_retired} retired{_spawn_suffix}"
+            created_rationales = _collect_rationales(project, created_ids, _CREATED_NOTE_PREFIX)
+            retired_rationales = _collect_rationales(project, retired_ids, _RETIRED_NOTE_PREFIX)
             _update_cycle_history(project, cycle_id, {
                 "phase2_completed_at": _utcnow().isoformat(),
                 "vision_updated": _vision_updated,
@@ -444,6 +495,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 "directions_retired": dirs_retired,
                 "created_direction_ids": created_ids,
                 "retired_direction_ids": retired_ids,
+                "created_rationales": created_rationales,
+                "retired_rationales": retired_rationales,
+                "cycle_reasoning": _extract_cycle_reasoning(task),
                 "tasks_spawned": tasks_spawned,
                 "outcome": "completed",
                 "summary_text": _summary,
@@ -614,6 +668,10 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     MAX_DIRECTION_CREATES = 5
     ops_applied = 0
     retires_applied = 0
+    created_ids_fb: list = []
+    retired_ids_fb: list = []
+    created_rationales_fb: Dict[str, str] = {}
+    retired_rationales_fb: Dict[str, str] = {}
     if direction_ops and isinstance(direction_ops, list):
         if len(direction_ops) > MAX_DIRECTION_OPS:
             logger.warning(f"[STRATEGIC] Task {task.id}: truncating {len(direction_ops)} direction ops to {MAX_DIRECTION_OPS}")
@@ -685,6 +743,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 directions.append(new_dir)
                 ops_applied += 1
                 creates_count += 1
+                created_ids_fb.append(new_dir["id"])
+                if rationale:
+                    created_rationales_fb[new_dir["id"]] = rationale[:_RATIONALE_PERSIST_MAX]
                 logger.info(f"[STRATEGIC] Created direction '{text[:60]}' for project {project.id}")
 
             elif op == "update":
@@ -748,6 +809,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                             d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         ops_applied += 1
                         retires_applied += 1
+                        retired_ids_fb.append(dir_id)
+                        if rationale:
+                            retired_rationales_fb[dir_id] = rationale[:_RATIONALE_PERSIST_MAX]
                         logger.info(f"[STRATEGIC] Retired direction {dir_id} for project {project.id}")
                         break
 
@@ -769,6 +833,11 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             "vision_updated": vision_produced,
             "directions_created": dirs_created,
             "directions_retired": dirs_retired,
+            "created_direction_ids": list(created_ids_fb),
+            "retired_direction_ids": list(retired_ids_fb),
+            "created_rationales": dict(created_rationales_fb),
+            "retired_rationales": dict(retired_rationales_fb),
+            "cycle_reasoning": _extract_cycle_reasoning(task),
             "outcome": "completed" if vision_produced else "failed",
             "summary_text": _summary_fb,
         })
