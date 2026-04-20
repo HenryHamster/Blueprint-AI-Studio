@@ -1,12 +1,15 @@
 """Integration tests for /api/admin/digest and /api/admin/activity endpoints."""
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
+from sqlmodel import select
 
 from app.main import app
-from app.models import TaskStatus
+from app.models import Task, TaskStatus
+from app.routers.admin_analytics import _derive_completed_at
+from app.routers.admin_digest import _stash_projected_task_fields
 from testing.factories import make_project, make_task, make_membership, _utcnow
 
 
@@ -4788,3 +4791,36 @@ async def test_digest_handles_empty_payloads_and_status_log(client: AsyncClient,
     assert response.status_code == 200
     data = response.json()
     assert data["completed_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stash_projected_task_fields_works_for_orm_loaded_tasks(db_session):
+    """Transient projection fields must attach safely to ORM-loaded SQLModel rows."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Projected task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        status_log=[],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    loaded = (
+        await db_session.execute(select(Task).where(Task.id == task.id))
+    ).scalar_one()
+    projected_completed_at = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    _stash_projected_task_fields(
+        loaded,
+        first_payload={"type": "research"},
+        completed_at_ts=projected_completed_at,
+    )
+
+    assert loaded.first_payload == {"type": "research"}
+    assert _derive_completed_at(loaded) == datetime.fromisoformat(projected_completed_at)

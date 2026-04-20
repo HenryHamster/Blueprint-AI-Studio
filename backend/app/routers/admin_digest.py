@@ -35,6 +35,25 @@ router = APIRouter(
 )
 
 
+def _stash_projected_task_fields(
+    task: Task,
+    *,
+    first_payload: Dict[str, Any] | None = None,
+    completed_at_ts: str | None = None,
+) -> None:
+    """Attach SQL-projected task fields without going through Pydantic setattr.
+
+    SQLModel ORM-loaded instances can be materialized without Pydantic private
+    state, so assigning ad hoc underscore attributes via normal setattr can
+    raise AttributeError on Pydantic v2. Store these transient projection
+    values directly on the instance dict instead.
+    """
+    if first_payload is not None:
+        object.__setattr__(task, "_projected_first_payload", first_payload)
+    if completed_at_ts is not None:
+        object.__setattr__(task, "_projected_completed_at_ts", completed_at_ts)
+
+
 def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]:
     """Compute self-review effectiveness, prediction accuracy, and review accuracy
     from a list of terminal tasks. Returns dict with three keys, each None when
@@ -1009,8 +1028,11 @@ async def _compute_digest(
         all_tasks: List[Task] = []
         for row in tasks_result.all():
             task = row[0]
-            task._projected_first_payload = row[1] or {}
-            task._projected_completed_at_ts = row[2]
+            _stash_projected_task_fields(
+                task,
+                first_payload=row[1] or {},
+                completed_at_ts=row[2],
+            )
             all_tasks.append(task)
     else:
         tasks_result = await session.execute(
@@ -1077,7 +1099,7 @@ async def _compute_digest(
         active_tasks_all: List[Task] = []
         for row in active_result.all():
             task = row[0]
-            task._projected_first_payload = row[1] or {}
+            _stash_projected_task_fields(task, first_payload=row[1] or {})
             active_tasks_all.append(task)
     else:
         active_result = await session.execute(
