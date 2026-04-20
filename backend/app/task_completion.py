@@ -311,15 +311,9 @@ _PROJECT_REMEDIATION_HISTORY_MAX = 20
 async def _record_project_remediation_outcome(
     task: Task, *, merged: bool, session: AsyncSession,
 ) -> bool:
-    """Record a CI auto-remediation outcome at the project level.
-
-    Used when a task carries ``auto_remediation=True`` but has no
-    ``direction_id`` — i.e. the error fingerprint matched no direction, so
-    the per-direction handler cannot track the attempt. Mirrors the
-    per-direction fields (result, timestamp, fingerprint, failure_class) on
-    ``Project.remediation_tracking`` so operators and downstream logic have
-    visibility into unlinked-fix effectiveness.
-    """
+    """Record a CI auto-remediation outcome at the project level when no
+    direction_id is linked, so unlinked-fix effectiveness is still trackable
+    via Project.remediation_tracking."""
     project = await session.get(Project, task.project_id)
     if not project:
         return False
@@ -428,6 +422,63 @@ async def _record_remediation_if_terminal(
             )
     except Exception as exc:
         logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome for task {task.id}: {exc!r}")
+
+
+async def _record_regression_signal_if_matching(
+    task: Task, status: "TaskStatus", session: AsyncSession,
+) -> None:
+    """Stamp remediation_regression_signal when a non-remediation failure during
+    the monitoring window matches the last-remediated fingerprint."""
+    if status != TaskStatus.FAILED:
+        return
+    ctx = task.context or {}
+    direction_id = ctx.get("direction_id")
+    if not direction_id or ctx.get("diagnosis_task_id"):
+        return
+    project = await session.get(Project, task.project_id)
+    if project is None:
+        return
+    directions = list(project.directions or [])
+    target = next((d for d in directions if d.get("id") == direction_id), None)
+    if target is None:
+        return
+    monitor_started_at = target.get("remediation_monitor_started_at")
+    last_rem_fp = target.get("last_remediation_fingerprint")
+    if not monitor_started_at or not last_rem_fp:
+        return
+    from app.direction_lifecycle import _REMEDIATION_MONITOR_EXPIRY_DAYS  # noqa: PLC0415
+    try:
+        age_days = (_utcnow() - datetime.fromisoformat(monitor_started_at)).total_seconds() / 86400
+        if age_days > _REMEDIATION_MONITOR_EXPIRY_DAYS:
+            return
+    except (TypeError, ValueError):
+        return
+    if not (task.latest_status_message or "").strip():
+        return
+    # Must mirror the stage-aware fingerprint that production paths persist
+    # (auto_remediation, _record_remediation_outcome) — a stage-less probe
+    # would never match.
+    from app.anomaly_detection import _task_error_fingerprint  # noqa: PLC0415
+    try:
+        task_fp = _task_error_fingerprint(task)
+    except Exception:
+        return
+    if not task_fp or str(task_fp) != str(last_rem_fp):
+        return
+    target["remediation_regression_signal"] = True
+    target["remediation_regression_count"] = int(
+        target.get("remediation_regression_count") or 0
+    ) + 1
+    target["remediation_regression_last_task_id"] = str(task.id)
+    target["remediation_regression_last_at"] = _utcnow().isoformat()
+    project.directions = directions
+    flag_modified(project, "directions")
+    session.add(project)
+    logger.info(
+        f"[DIAGNOSIS] Regression signal on direction {direction_id}: "
+        f"task {task.id} failed with fingerprint matching last remediation "
+        f"(count={target['remediation_regression_count']})"
+    )
 
 
 # Maximum follow-up investigations the failure-driven trigger will spawn
@@ -663,6 +714,16 @@ async def _maybe_spawn_followup_investigation(
         f"Failure class: {failure_class}",
         f"Error summary: {str(error_summary)[:400]}",
     ]
+    if target.get("remediation_regression_signal"):
+        regression_count = int(target.get("remediation_regression_count") or 0)
+        prompt_parts.extend([
+            "",
+            f"REGRESSION SIGNAL: {regression_count} task failure(s) during the "
+            f"post-merge monitoring window have fingerprints matching the prior "
+            f"remediated error. The previous fix was merged but did not hold. "
+            f"Do not propose the same approach — treat the root cause as "
+            f"unresolved.",
+        ])
     if diagnosis_confidence:
         guidance = {
             "low": (
@@ -840,6 +901,18 @@ async def _maybe_escalate_exhausted_followups(
         project.directions = directions
         flag_modified(project, "directions")
         session.add(project)
+        from app.models import Alert, AlertSeverity  # noqa: PLC0415
+        session.add(Alert(
+            project_id=project.id,
+            severity=AlertSeverity.ERROR,
+            title="Follow-up escalation notification failed",
+            message=(
+                f"Direction {direction.get('id')} ('{(direction.get('text') or '')[:80]}') "
+                f"hit the follow-up investigation cap with no merged remediation, but the "
+                f"BLOCKER notification failed: {exc!r}. Fingerprint={fp_key[:80]}, "
+                f"remediation_attempts={int(direction.get('remediation_attempts', 0))}."
+            ),
+        ))
 
 
 async def _maybe_spawn_low_confidence_followup(
@@ -1207,6 +1280,51 @@ async def _handle_investigation_terminal_failure(
         has_salvageable_root_cause = bool(partial and partial.get("root_cause"))
         if failure_class not in INFRA_CLASSES and not has_salvageable_root_cause:
             return
+
+        # If the partial diagnosis is actionable (root_cause + files) and the
+        # failure was infra (not a broken agent producing garbage), try to
+        # spawn a remediation directly from the partial findings rather than
+        # waiting for a re-investigation to complete. Confidence is capped at
+        # "medium" so _calculate_remediation_scope keeps the change small.
+        partial_spawn: Optional[Task] = None
+        partial_actionable = (
+            failure_class in INFRA_CLASSES
+            and has_salvageable_root_cause
+            and bool(partial.get("affected_files"))
+        )
+        if partial_actionable:
+            partial_spawn = await _spawn_investigation_remediation(
+                task=task,
+                direction_id=str(direction_id),
+                summary=partial.get("summary") or "",
+                root_cause=partial["root_cause"],
+                recommended_fix=partial["root_cause"],
+                severity="medium",
+                confidence="medium",
+                affected_paths=list(partial.get("affected_files") or []),
+                remediation_attempts=int(target.get("remediation_attempts") or 0),
+                session=session,
+            )
+            if partial_spawn is not None:
+                spawn_ctx = dict(partial_spawn.context or {})
+                spawn_ctx["diagnosis_source"] = "partial"
+                spawn_ctx["diagnosis_trigger"] = "partial_diagnosis_remediation"
+                partial_spawn.context = spawn_ctx
+                flag_modified(partial_spawn, "context")
+                session.add(partial_spawn)
+                target["remediation_task_id"] = str(partial_spawn.id)
+                target["last_diagnosis_outcome"] = "partial_remediation_spawned"
+                clear_direction_hold(str(direction_id))
+                flag_modified(project, "directions")
+                session.add(project)
+                logger.info(
+                    f"[DIAGNOSIS] Spawned partial-diagnosis remediation "
+                    f"{partial_spawn.id} for direction {direction_id} from "
+                    f"failed investigate task {task.id} "
+                    f"(files={len(partial['affected_files'])})"
+                )
+                return
+
         spawned = await _maybe_spawn_reinvestigation_after_failure(
             investigation_task=task,
             project=project,

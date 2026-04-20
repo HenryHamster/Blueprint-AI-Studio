@@ -846,6 +846,52 @@ async def test_non_suspended_branch_spawns_normally(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_per_fingerprint_cap_blocks_repeat_spawn(db_session: AsyncSession):
+    """Three failed auto-remediations sharing a fingerprint block a fourth spawn."""
+    from app.anomaly_detection import _error_fingerprint
+    from app.failure_stage import _derive_failure_stage
+    project = await _create_project(db_session)
+    err = "AssertionError: boom"
+    # Production stamps the stage-aware fingerprint at auto_remediation.py
+    # (stage = _derive_failure_stage("CODE_ERROR", err)). The cap probe must
+    # mirror that exactly — otherwise the test would only exercise a mode
+    # production never produces.
+    stage = _derive_failure_stage("CODE_ERROR", err)
+    fp = _error_fingerprint(err, stage)
+    for _ in range(3):
+        t = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "x"}],
+            context={
+                "auto_remediation": True,
+                "ci_failure_branch": "main",
+                "_previous_error_fingerprint": fp,
+            },
+            status=TaskStatus.FAILED,
+            created_by="SYSTEM_AUTO_REMEDIATION",
+        )
+        db_session.add(t)
+    await db_session.flush()
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+        mock_ctx.return_value = (["CI / tests"], err, "test", {"failing_tests": [], "error_locations": [], "error_messages": []})
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    # No new auto-remediation task spawned (only the 3 pre-existing FAILED tasks).
+    spawned = await session_tasks(db_session, project.id)
+    assert all(t.status == TaskStatus.FAILED for t in spawned)
+    assert len(spawned) == 3
+
+
+@pytest.mark.asyncio
 async def test_full_ci_remediation_cycle_spawn_to_trackable_outcome(db_session: AsyncSession):
     """End-to-end: CI failure spawns task → task completes → outcome is trackable by trigger class."""
     project = await _create_project(db_session)

@@ -287,6 +287,55 @@ async def _handle_main_branch_ci_failure_inner(
             logger.warning("[AUTO-REMEDIATION] Failed to send skip webhook notification: %s", exc)
         return
 
+    # ── Guard: per-fingerprint repeat-attempt cap ──
+    # Prevent the same root failure from spawning unbounded retry tasks even
+    # when branch suspension hasn't kicked in yet (suspension is governed by
+    # consecutive failures via post_auto_fix_result_message; this cap acts on
+    # the spawn side using the error fingerprint so a flapping check can't
+    # burn through quota). Must use the stage-aware fingerprint to match what
+    # gets stamped on spawned tasks (see below: stage = _derive_failure_stage(...)
+    # then fingerprint = _error_fingerprint(error_summary, stage)). A stage-less
+    # probe would never match because _derive_failure_stage classifies typical
+    # CI text into build/test/lint/etc.
+    from app.anomaly_detection import _error_fingerprint
+    from app.failure_stage import _derive_failure_stage
+    fingerprint = (
+        _error_fingerprint(error_summary, _derive_failure_stage("CODE_ERROR", error_summary))
+        if error_summary else ""
+    )
+    if fingerprint:
+        max_per_fingerprint = config.get("max_per_fingerprint", 3)
+        fp_window_start = now - timedelta(hours=24)
+        fp_recent = (await session.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.created_at >= fp_window_start,
+                Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+            )
+        )).scalars().all()
+        fp_failed_count = sum(
+            1 for t in fp_recent
+            if (t.context or {}).get("auto_remediation") is True
+            and (t.context or {}).get("_previous_error_fingerprint") == fingerprint
+        )
+        if fp_failed_count >= max_per_fingerprint:
+            logger.warning(
+                "[AUTO-REMEDIATION] Per-fingerprint cap hit (%d/%d) for branch %s "
+                "fingerprint %s — skipping repeat attempt",
+                fp_failed_count, max_per_fingerprint, head_branch, fingerprint[:16],
+            )
+            try:
+                from app.main import _send_webhook_notification
+                import asyncio
+                asyncio.ensure_future(_send_webhook_notification(
+                    "AUTO_FIX_SKIPPED",
+                    f"CI auto-remediation skipped on {head_branch}: fingerprint cap reached",
+                    f"SHA: {head_sha[:8]} — {fp_failed_count} prior failed attempts with same fingerprint",
+                ))
+            except Exception as exc:
+                logger.warning("[AUTO-REMEDIATION] Failed to send fingerprint skip webhook: %s", exc)
+            return
+
     # ── Look up prior investigation that may have diagnosed this failure ──
     prior_investigation = await _find_matching_prior_investigation(
         project_id=project_id,

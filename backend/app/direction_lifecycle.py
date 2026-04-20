@@ -432,6 +432,18 @@ async def _process_direction_lifecycle(
                     "remediation_attempts": int(d.get("remediation_attempts", 0)),
                 },
             )
+            from app.models import Alert, AlertSeverity  # noqa: PLC0415
+            session.add(Alert(
+                project_id=project.id,
+                severity=AlertSeverity.ERROR,
+                title="Escalation notification delivery failed",
+                message=(
+                    f"Direction {d.get('id')} ('{(d.get('text') or '')[:80]}') needs manual "
+                    f"intervention but the BLOCKER notification could not be delivered after "
+                    f"{retries} retries. Fingerprint={d.get('error_fingerprint') or '(unknown)'}, "
+                    f"remediation_attempts={int(d.get('remediation_attempts', 0))}."
+                ),
+            ))
             d.pop("escalation_notification_pending", None)
             directions_modified = True
             continue

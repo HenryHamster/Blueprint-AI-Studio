@@ -83,6 +83,8 @@ class DirectionRemediationInfo(TypedDict):
     error_fingerprint: Optional[str]
     remediation_monitor_active: bool
     remediation_monitor_started_at: Optional[str]
+    remediation_regression_signal: bool
+    remediation_regression_count: int
     needs_manual_intervention: bool
 
 
@@ -116,6 +118,8 @@ def _build_direction_remediation_state(project: Project) -> List[DirectionRemedi
             "error_fingerprint": d.get("error_fingerprint"),
             "remediation_monitor_active": bool(monitor_started),
             "remediation_monitor_started_at": monitor_started,
+            "remediation_regression_signal": bool(d.get("remediation_regression_signal")),
+            "remediation_regression_count": int(d.get("remediation_regression_count", 0) or 0),
             "needs_manual_intervention": needs_intervention,
         })
     return entries

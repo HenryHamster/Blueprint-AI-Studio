@@ -857,6 +857,114 @@ async def _comment_with_retry(
         f"[PIPELINE] PR #{pr_number} comment failed after {max_attempts} attempts: {last_exc!r}"
     )
 
+async def _spawn_ci_auto_remediation_followup(
+    task: Task, session: AsyncSession,
+) -> bool:
+    """Spawn an investigate task after a CI auto-remediation task fails.
+
+    CI auto-remediation tasks lack a direction_id, so the standard
+    code-defect investigation gate skips them. This trigger fires per
+    failed auto-fix and dedups by (project, ci_failure_branch, fingerprint)
+    over a 24h window to avoid runaway loops on flapping checks.
+    Returns True when an investigation is spawned.
+    """
+    from datetime import timedelta  # noqa: PLC0415
+    from app.main import _utcnow  # noqa: PLC0415
+
+    ctx = task.context or {}
+    branch = ctx.get("ci_failure_branch") or "main"
+    fingerprint = ctx.get("_previous_error_fingerprint") or ""
+    failed_checks = ctx.get("ci_failure_checks") or []
+    failure_type = ctx.get("ci_failure_type") or "(unknown)"
+    failed_prompt = (task.first_payload or {}).get("prompt", "") or ""
+    error_summary = (task.latest_status_message or "")[:400]
+
+    cutoff = _utcnow() - timedelta(hours=24)
+    dedup_q = select(Task.id).where(
+        Task.project_id == task.project_id,
+        Task.created_at >= cutoff,
+        Task.payloads[0]["type"].as_string() == "investigate",
+        Task.context["spawned_by"].as_string() == "ci_auto_remediation_failure",
+        Task.context["ci_failure_branch"].as_string() == str(branch),
+    )
+    if fingerprint:
+        dedup_q = dedup_q.where(
+            Task.context["_previous_error_fingerprint"].as_string() == str(fingerprint)
+        )
+    if (await session.execute(dedup_q.limit(1))).first() is not None:
+        logger.info(
+            f"[AUTO-REMEDIATION] Skip follow-up investigation for {task.id}: "
+            f"recent investigation exists for branch={branch} fingerprint={fingerprint[:40]}"
+        )
+        return False
+
+    if isinstance(failed_checks, (list, tuple)):
+        checks_str = ", ".join(str(c) for c in failed_checks)[:300]
+    else:
+        checks_str = str(failed_checks)[:300]
+    prompt_lines = [
+        f"A CI auto-remediation task on branch '{branch}' failed to fix the "
+        f"underlying CI failure. Diagnose why the auto-fix could not resolve it.",
+        "",
+        f"Failure type: {failure_type}",
+        f"Failed checks: {checks_str or '(none captured)'}",
+        f"Error summary: {error_summary or '(no message)'}",
+    ]
+    if fingerprint:
+        prompt_lines.append(f"Error fingerprint: {fingerprint}")
+    if failed_prompt:
+        prompt_lines.extend([
+            "",
+            f"Approach the auto-fix attempted (truncated):\n{failed_prompt[:1500]}",
+        ])
+    prompt_lines.append(
+        "\nProduce the structured diagnosis JSON report so a targeted "
+        "remediation can be spawned. Consider whether the failure is "
+        "infrastructure-related, a flaky check, or a deeper code defect "
+        "that the original auto-fix prompt mis-scoped."
+    )
+    inv_payload = validate_internal_payload(
+        {"type": "investigate", "prompt": "\n".join(prompt_lines)[:20000], "base_branch": "main"},
+        "task_lifecycle:ci_auto_remediation_followup",
+    )
+    inv_ctx = {
+        "spawned_by": "ci_auto_remediation_failure",
+        "source_task_id": str(task.id),
+        "ci_failure_branch": str(branch),
+        "ci_failure_type": failure_type,
+    }
+    if fingerprint:
+        inv_ctx["_previous_error_fingerprint"] = str(fingerprint)
+        inv_ctx["failure_fingerprints"] = [str(fingerprint)]
+    new_task = Task(
+        project_id=task.project_id,
+        title=f"Investigate CI auto-fix failure on {branch}"[:120],
+        description=(
+            f"Auto-spawned after CI auto-remediation task {str(task.id)[:8]} failed"
+        )[:500],
+        payloads=[inv_payload],
+        context=inv_ctx,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(new_task)
+    session.add(TaskHistory(
+        task_id=new_task.id, action="SPAWNED",
+        details={
+            "spawned_by": "CI_AUTO_REMEDIATION_FAILURE",
+            "source_task_id": str(task.id),
+            "ci_failure_branch": str(branch),
+        },
+    ))
+    logger.info(
+        f"[AUTO-REMEDIATION] Spawned follow-up investigation {new_task.id} "
+        f"for failed auto-fix {task.id} (branch={branch}, "
+        f"fingerprint={fingerprint[:40] if fingerprint else 'none'})"
+    )
+    return True
+
+
 async def _process_post_commit(
     task_id: uuid.UUID,
     payload: AgentStatusPayload,
@@ -881,7 +989,7 @@ async def _process_post_commit(
         _handle_plan_completion, _handle_design_doc_completion,
         _handle_security_audit_completion, _handle_perf_completion,
         _handle_investigation_completion, _record_remediation_if_terminal,
-        _handle_investigation_terminal_failure,
+        _handle_investigation_terminal_failure, _record_regression_signal_if_matching,
     )
     from app.strategic_completion import _handle_strategic_completion, _record_strategic_task_failure
     from app.research_completion import _handle_research_completion
@@ -969,6 +1077,19 @@ async def _process_post_commit(
                     await session.commit()
                 except Exception as _ar_exc:
                     logger.warning("[AUTO-REMEDIATION] Failed to post failure result message: %s", _ar_exc)
+
+                # Spawn a follow-up investigation for the failed CI auto-fix.
+                # The standard _spawn_task_failure_investigation path requires a
+                # direction_id, which CI auto-remediation tasks lack — so trigger
+                # the investigation directly here, deduped by branch+fingerprint
+                # over a 24h window so a flapping check doesn't spawn N copies.
+                try:
+                    await _spawn_ci_auto_remediation_followup(task, session)
+                except Exception as _ci_inv_exc:
+                    logger.error(
+                        f"[AUTO-REMEDIATION] Failed to spawn follow-up investigation for {task.id}: {_ci_inv_exc!r}",
+                        exc_info=True,
+                    )
 
             # Task-level CODE_ERROR investigation trigger: when a directed task
             # exhausts retries with a code_defect failure, spawn an investigate
@@ -2328,6 +2449,7 @@ async def _process_post_commit(
                 )
 
         await _record_remediation_if_terminal(task, payload.status, session)
+        await _record_regression_signal_if_matching(task, payload.status, session)
         await _handle_investigation_terminal_failure(task, payload.status, session)
 
         # 7. Project State Aggregation

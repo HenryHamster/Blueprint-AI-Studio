@@ -1661,6 +1661,46 @@ async def test_escalation_retry_max_retries_stops(db_session, mocker, caplog):
 
 
 @pytest.mark.asyncio
+async def test_escalation_retry_exhaustion_creates_alert(db_session, mocker):
+    """When retries are exhausted, an ERROR Alert is created so operators see it."""
+    mocker.patch(
+        "app.notification_dispatch.post_remediation_escalation_message",
+        new_callable=AsyncMock,
+    )
+    direction = {
+        "id": "d-alert-on-exhaust",
+        "text": "Exhausted target",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "High code failure rate: ...",
+        "paused_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "escalation_notification_pending": True,
+        "escalation_notification_retries": 3,
+        "remediation_attempts": 3,
+        "error_fingerprint": "fp-exhaust",
+    }
+    project = await _make_intervention_project(db_session, direction)
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=240.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+    await db_session.commit()
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    matching = [a for a in alerts if "Escalation notification delivery failed" in a.title]
+    assert len(matching) == 1
+    a = matching[0]
+    assert a.severity == AlertSeverity.ERROR
+    assert "d-alert-on-exhaust" in a.message
+    assert "fp-exhaust" in a.message
+
+
+@pytest.mark.asyncio
 async def test_escalation_retry_failure_increments_count(db_session, mocker):
     """When the retry itself fails, retry count increments and pending stays true."""
     mocker.patch(

@@ -35,9 +35,12 @@ from app.task_completion import (
     _is_structural_diagnosis,
     _clear_direction_diagnosis_flag,
     _calculate_remediation_scope,
+    _record_regression_signal_if_matching,
+    _maybe_escalate_exhausted_followups,
 )
 from app.strategic_constants import STRATEGIC_RATIONALE_MAX
-from app.models import TaskStatus
+from app.models import Alert, AlertSeverity, TaskStatus
+from sqlalchemy import select as _sa_select
 from testing.factories import make_project, make_task
 
 
@@ -1458,6 +1461,63 @@ class TestRecordRemediationIfTerminal:
         await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
         await db_session.refresh(project)
         assert "remediation_attempts" not in project.directions[0]
+
+    @pytest.mark.asyncio
+    async def test_auto_remediation_failure_records_project_outcome(self, db_session):
+        """Failing CI auto-remediation (no direction_id) records a project-level
+        outcome via _record_project_remediation_outcome — the CI follow-up
+        spawn itself lives in task_lifecycle.py and is exercised separately."""
+        project = make_project(directions=[])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={
+                "auto_remediation": True,
+                "ci_failure_branch": "main",
+                "_previous_error_fingerprint": "fp-ci-1",
+            },
+            latest_status_message="boom",
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        state = project.remediation_tracking or {}
+        assert state.get("attempts") == 1
+        assert state.get("last_result") == "failed"
+        assert state.get("last_fingerprint") == "fp-ci-1"
+
+    @pytest.mark.asyncio
+    async def test_auto_remediation_completed_records_project_outcome(self, db_session):
+        """COMPLETED auto-remediation (non-PR-pipeline type) records a merged
+        outcome at the project level when no direction linkage exists."""
+        project = make_project(directions=[])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={
+                "auto_remediation": True,
+                "ci_failure_branch": "main",
+                "_previous_error_fingerprint": "fp-ci-2",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        state = project.remediation_tracking or {}
+        assert state.get("attempts") == 1
+        assert state.get("last_result") == "merged"
 
     @pytest.mark.asyncio
     async def test_completed_records_merged_true(self, db_session):
@@ -3873,6 +3933,157 @@ class TestHandleInvestigationTerminalFailure:
         assert post_mock.await_count == 1
         assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-A": recent_ts}
 
+    @pytest.mark.asyncio
+    async def test_partial_remediation_spawned_when_infra_and_actionable(self, db_session):
+        """Infra-failed investigate with partial root_cause + files spawns a
+        remediation (not a reinvestigation) tagged diagnosis_source='partial'."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused", "text": "rollup",
+            "diagnosis_in_progress": True,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_investigation_task(project.id)
+        task.plan_output = {
+            "summary": "token parser dies on empty input",
+            "root_cause": "null deref in _parse_token when buffer is empty",
+            "affected_files": [{"path": "app/x.py"}, "app/y.py"],
+        }
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        siblings = (await db_session.execute(
+            _select(_Task).where(_Task.project_id == project.id, _Task.id != task.id)
+        )).scalars().all()
+        assert len(siblings) == 1
+        rem = siblings[0]
+        assert rem.payloads[0]["type"] == "create"
+        assert rem.context["diagnosis_source"] == "partial"
+        assert rem.context["diagnosis_trigger"] == "partial_diagnosis_remediation"
+        assert rem.context["diagnosis_task_id"] == str(task.id)
+        assert rem.context["direction_id"] == "dir-1"
+
+        d = project.directions[0]
+        assert d["remediation_task_id"] == str(rem.id)
+        assert d["last_diagnosis_outcome"] == "partial_remediation_spawned"
+        # Reinvestigation did NOT run, so no fingerprint attempt recorded
+        assert "followup_investigation_attempts_by_fingerprint" not in d
+
+    @pytest.mark.asyncio
+    async def test_partial_remediation_skipped_when_no_root_cause(self, db_session):
+        """Partial without root_cause falls back to reinvestigation."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused", "text": "rollup",
+            "diagnosis_in_progress": True,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_investigation_task(project.id)
+        task.plan_output = {
+            "summary": "something broke",
+            "root_cause": "",
+            "affected_files": ["app/x.py"],
+        }
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        siblings = (await db_session.execute(
+            _select(_Task).where(_Task.project_id == project.id, _Task.id != task.id)
+        )).scalars().all()
+        # Reinvestigation spawned, not a create remediation
+        assert len(siblings) == 1
+        assert siblings[0].payloads[0]["type"] == "investigate"
+        d = project.directions[0]
+        assert "remediation_task_id" not in d
+        assert d.get("last_diagnosis_outcome") != "partial_remediation_spawned"
+
+    @pytest.mark.asyncio
+    async def test_partial_remediation_skipped_when_no_files(self, db_session):
+        """Partial with root_cause but no affected_files falls back to reinvestigation."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused", "text": "rollup",
+            "diagnosis_in_progress": True,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_investigation_task(project.id)
+        task.plan_output = {
+            "summary": "cursor race",
+            "root_cause": "cursor advanced before ack",
+            "affected_files": [],
+        }
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        siblings = (await db_session.execute(
+            _select(_Task).where(_Task.project_id == project.id, _Task.id != task.id)
+        )).scalars().all()
+        assert len(siblings) == 1
+        assert siblings[0].payloads[0]["type"] == "investigate"
+
+    @pytest.mark.asyncio
+    async def test_partial_remediation_skipped_on_code_error(self, db_session):
+        """CODE_ERROR with actionable partial still falls through to reinvestigation,
+        not partial-remediation (we don't trust partial output from broken agents
+        enough to ship code changes without re-verifying)."""
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "paused", "text": "rollup",
+            "diagnosis_in_progress": True,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = self._make_investigation_task(
+            project.id,
+            latest_status_message="Investigate agent returned malformed JSON — parse error",
+            extra_context={"failure_category": "CODE_ERROR"},
+        )
+        task.plan_output = {
+            "summary": "cursor race",
+            "root_cause": "cursor advanced before ack",
+            "affected_files": ["app/rollup_management.py"],
+        }
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_terminal_failure(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+        siblings = (await db_session.execute(
+            _select(_Task).where(_Task.project_id == project.id, _Task.id != task.id)
+        )).scalars().all()
+        assert len(siblings) == 1
+        # Reinvestigation (not a create remediation) — partial path should not fire on non-infra
+        assert siblings[0].payloads[0]["type"] == "investigate"
+
 
 # ── _handle_plan_completion — scope-aware subtask effort ──────────────────────
 
@@ -3944,4 +4155,226 @@ class TestPlanSubtaskScopeAwareEffort:
         assert len(children) == 1
         assert children[0].payloads[0]["effort"] == "max"
 
+
+# ── _record_regression_signal_if_matching ──────────────────────────────────
+
+class TestRecordRegressionSignalIfMatching:
+    """Regression signals flag directions where the post-merge monitoring
+    window caught another task failure with the same root-cause fingerprint
+    as the last remediation — an early 'fix did not hold' signal."""
+
+    @staticmethod
+    def _task_fp(task) -> str:
+        """Stage-aware fingerprint matching what production paths
+        (auto_remediation, _record_remediation_outcome) persist on the
+        direction. Computed from the task itself so the test stores the same
+        value the function under test will recompute."""
+        from app.anomaly_detection import _task_error_fingerprint
+        return _task_error_fingerprint(task)
+
+    @pytest.mark.asyncio
+    async def test_matching_fingerprint_sets_signal(self, db_session):
+        from datetime import datetime, timedelta
+        err = "Segmentation fault in foo.py at bar"
+        task = make_task(
+            project_id=None,  # set after project insert
+            context={"direction_id": "dir-1"},
+            latest_status_message=err,
+        )
+        fp = self._task_fp(task)
+        project = make_project(directions=[{
+            "id": "dir-1",
+            "status": "active",
+            "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+            "last_remediation_fingerprint": fp,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task.project_id = project.id
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_regression_signal_if_matching(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["remediation_regression_signal"] is True
+        assert d["remediation_regression_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_different_fingerprint_no_signal(self, db_session):
+        from datetime import datetime, timedelta
+        project = make_project(directions=[{
+            "id": "dir-1",
+            "status": "active",
+            "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+            "last_remediation_fingerprint": "fp-other",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-1"},
+            latest_status_message="totally unrelated import error xyz",
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_regression_signal_if_matching(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert "remediation_regression_signal" not in d
+        assert "remediation_regression_count" not in d
+
+    @pytest.mark.asyncio
+    async def test_no_monitor_window_no_signal(self, db_session):
+        err = "boom"
+        task = make_task(
+            project_id=None,
+            context={"direction_id": "dir-1"},
+            latest_status_message=err,
+        )
+        project = make_project(directions=[{
+            "id": "dir-1",
+            "status": "active",
+            "last_remediation_fingerprint": self._task_fp(task),
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task.project_id = project.id
+        db_session.add(task)
+        await db_session.commit()
+
+        await _record_regression_signal_if_matching(task, TaskStatus.FAILED, db_session)
+        await db_session.refresh(project)
+        assert "remediation_regression_signal" not in project.directions[0]
+
+    @pytest.mark.asyncio
+    async def test_regression_signal_included_in_followup_prompt(self, db_session):
+        """Follow-up investigation spawned after a failed remediation surfaces
+        the regression signal so the agent avoids repeating the prior approach."""
+        from datetime import datetime, timedelta
+        project = make_project(directions=[{
+            "id": "dir-1",
+            "status": "active",
+            "last_remediation_fingerprint": "fp-x",
+            "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+            "remediation_regression_signal": True,
+            "remediation_regression_count": 2,
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "prompt": "prior approach"}],
+            context={
+                "direction_id": "dir-1",
+                "diagnosis_task_id": "diag-1",
+                "diagnosis_fingerprint": "fp-x",
+            },
+            latest_status_message="failed again",
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        new_task = await _maybe_spawn_followup_investigation(task, db_session)
+        assert new_task is not None
+        prompt = new_task.payloads[0]["prompt"]
+        assert "REGRESSION SIGNAL" in prompt
+        assert "2" in prompt
+
+
+class TestEscalateExhaustedFollowupsAlert:
+    """Followup-cap escalation must create an Alert and stamp pending on notify failure."""
+
+    @pytest.mark.asyncio
+    async def test_notification_failure_creates_alert_and_sets_pending(self, db_session, mocker):
+        mocker.patch(
+            "app.notification_dispatch.post_remediation_escalation_message",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("webhook down"),
+        )
+        direction = {
+            "id": "dir-followup",
+            "text": "Followup cap target",
+            "status": "active",
+            "remediation_attempts": 3,
+            "remediation_history": [
+                {"fingerprint": "fp-stuck", "result": "failed"},
+            ],
+        }
+        project = make_project(directions=[direction])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _maybe_escalate_exhausted_followups(
+            project=project,
+            direction=project.directions[0],
+            directions=list(project.directions),
+            fp_key="fp-stuck",
+            session=db_session,
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d.get("needs_manual_intervention") is True
+        assert d.get("escalation_notification_pending") is True
+        assert d.get("escalation_notification_retries") == 0
+
+        alerts = (await db_session.execute(
+            _sa_select(Alert).where(Alert.project_id == project.id)
+        )).scalars().all()
+        matching = [a for a in alerts if "Follow-up escalation" in a.title]
+        assert len(matching) == 1
+        a = matching[0]
+        assert a.severity == AlertSeverity.ERROR
+        assert "dir-followup" in a.message
+        assert "fp-stuck" in a.message
+
+    @pytest.mark.asyncio
+    async def test_notification_success_creates_no_alert(self, db_session, mocker):
+        mocker.patch(
+            "app.notification_dispatch.post_remediation_escalation_message",
+            new_callable=AsyncMock,
+        )
+        direction = {
+            "id": "dir-ok",
+            "text": "Followup cap target",
+            "status": "active",
+            "remediation_attempts": 3,
+            "remediation_history": [
+                {"fingerprint": "fp-ok", "result": "failed"},
+            ],
+        }
+        project = make_project(directions=[direction])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        await _maybe_escalate_exhausted_followups(
+            project=project,
+            direction=project.directions[0],
+            directions=list(project.directions),
+            fp_key="fp-ok",
+            session=db_session,
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d.get("needs_manual_intervention") is True
+        assert "escalation_notification_pending" not in d
+        alerts = (await db_session.execute(
+            _sa_select(Alert).where(Alert.project_id == project.id)
+        )).scalars().all()
+        assert not any("Follow-up escalation" in a.title for a in alerts)
 
