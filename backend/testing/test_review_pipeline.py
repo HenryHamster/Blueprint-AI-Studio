@@ -2102,15 +2102,15 @@ def test_stuck_cycle_issue_similarity_threshold_constants():
     assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR > 0.6
 
 
-def test_stuck_cycle_medium_thresholds_lower_than_default():
-    """Tripwire: medium-scope thresholds must sit below the defaults so that
-    higher-complexity tasks bail out of stuck cycles earlier."""
-    assert STUCK_CYCLE_THRESHOLD_MEDIUM == 0.50
+def test_stuck_cycle_medium_thresholds_match_default():
+    """Tripwire: medium-scope thresholds match the defaults so cross-module PRs
+    get the same patience as other scopes to converge on cross-file fixes."""
+    assert STUCK_CYCLE_THRESHOLD_MEDIUM == 0.55
     assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM == 0.68
-    assert STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM == 0.65
-    assert STUCK_CYCLE_THRESHOLD_MEDIUM < STUCK_CYCLE_THRESHOLD_DEFAULT
+    assert STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM == 0.7
+    assert STUCK_CYCLE_THRESHOLD_MEDIUM == STUCK_CYCLE_THRESHOLD_DEFAULT
     assert STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM == STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT
-    assert STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM < STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT
+    assert STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM == STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT
 
 
 async def _run_stuck_scope_case(
@@ -2137,9 +2137,9 @@ async def _run_stuck_scope_case(
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    # 6 of 11 current CRITICAL issues repeat → ~54.5% exact-match, clears the
-    # 0.50 medium threshold but stays below the 0.55 default. New issues share
-    # no tokens with prior, keeping Jaccard below both rephrased thresholds.
+    # 6 of 11 current CRITICAL issues repeat → ~54.5% exact-match, stays below
+    # the 0.55 default threshold (which now applies to all non-refactor scopes).
+    # New issues share no tokens with prior, keeping Jaccard below both rephrased thresholds.
     prior_issues = [_issue(f"alpha issue {i}", "CRITICAL") for i in range(6)]
     branch = f"b-{scope}"
     source_task = make_task(
@@ -2191,13 +2191,16 @@ async def _run_stuck_scope_case(
 
 
 @pytest.mark.asyncio
-async def test_stuck_cycle_medium_scope_triggers_at_55pct(db_session, mocker):
-    """Medium-scope tasks trigger the stuck cycle at ~54.5% exact-match repeat."""
+async def test_stuck_cycle_medium_scope_unaffected_at_55pct(db_session, mocker):
+    """Medium-scope tasks share the 0.55 default and pass through at ~54.5%."""
     result, original_task = await _run_stuck_scope_case(
         db_session, mocker, scope="medium", pr_number=701
     )
-    assert result is None, "Medium scope must stuck-detect at the lower 0.50 threshold"
-    assert original_task.requires_approval is True
+    assert result is not None, (
+        "Medium scope must not trigger at ~54.5% — threshold matches the 0.55 default"
+    )
+    assert result.status == TaskStatus.QUEUED
+    assert original_task.requires_approval is not True
 
 
 @pytest.mark.asyncio

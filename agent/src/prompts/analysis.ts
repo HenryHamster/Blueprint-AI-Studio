@@ -52,7 +52,7 @@ export function buildAnalysisPrompt(opts: {
     ? ` Aim for ${opts.fileLimit} or fewer files; if you cannot stay at or below ${opts.fileLimit}, list only the smallest viable set and note in **Implementation approach** what was deferred.`
     : '';
   const totalBudgetClause = typeof opts.totalFileBudget === 'number'
-    ? `\n\n**Total file budget:** the combined count of files under **Files to change** PLUS test files under **Tests to add or update** must not exceed ${opts.totalFileBudget}. Plans that exceed this budget will be rejected and you will be asked to narrow scope. Count test files when planning.`
+    ? `\n\n**Total file budget:** the count of production files under **Files to change** must not exceed ${opts.totalFileBudget}. Test files under **Tests to add or update** do NOT count toward this budget — plan whatever test coverage the change requires. Plans exceeding the production-file budget will be rejected and you will be asked to narrow scope.`
     : '';
   const narrowingBlock = opts.narrowingGuidance
     ? `\n\n## Narrowing Directive (from prior analysis pass)\n${opts.narrowingGuidance}\n`
@@ -148,9 +148,11 @@ export function parseAnalysisPlanFiles(analysisOutput: string): string[] {
 /**
  * Parses the **Tests to add or update** and **Tests at risk of breaking**
  * sections and returns the deduped test file paths. Same parser semantics as
- * parseAnalysisPlanFiles. Used to count test files toward the analysis-plan
- * total-file budget so a plan with 6 production + 5 test files is caught
- * before implementation rather than failing as scope_overflow afterward.
+ * parseAnalysisPlanFiles. Test files are deliberately EXCLUDED from the
+ * analysis-plan production-file budget so coverage can scale with the
+ * production change; this parser exists purely to surface the planned test
+ * files in log output and in the narrowing-retry guidance (so the LLM can
+ * see what coverage was already planned when it narrows scope).
  */
 export function parseAnalysisPlanTestFiles(analysisOutput: string): string[] {
   return collectFilesUnderHeadings(analysisOutput, [

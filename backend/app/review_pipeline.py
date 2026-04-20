@@ -27,10 +27,10 @@ MAX_REVIEW_FIX_ITERATIONS = 16
 
 STUCK_CYCLE_THRESHOLD_DEFAULT = 0.55
 STUCK_CYCLE_THRESHOLD_REFACTOR = 0.65
-# Medium-scope tasks juggle more complexity and are more likely to produce
-# repeating CRITICAL/MAJOR issues across iterations. Detect the stuck cycle
-# 1-2 iterations earlier than the default to save the remaining budget.
-STUCK_CYCLE_THRESHOLD_MEDIUM = 0.50
+# Medium-scope tasks share the default threshold: cross-module PRs legitimately
+# need a few iterations to resolve cross-file consistency issues, and bailing
+# out earlier prevented them from converging.
+STUCK_CYCLE_THRESHOLD_MEDIUM = 0.55
 
 # Token-level Jaccard thresholds used by the feedback-text fallback when one or
 # both review_history entries lack a structured `issues` list (e.g. verdict
@@ -38,7 +38,7 @@ STUCK_CYCLE_THRESHOLD_MEDIUM = 0.50
 # thresholds because text comparison is noisier.
 STUCK_CYCLE_TEXT_THRESHOLD_DEFAULT = 0.7
 STUCK_CYCLE_TEXT_THRESHOLD_REFACTOR = 0.75
-STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM = 0.65
+STUCK_CYCLE_TEXT_THRESHOLD_MEDIUM = 0.7
 
 # Secondary Jaccard thresholds for the rephrased-issue fallback: both sides
 # have structured CRITICAL/MAJOR issues but the exact-match proportion falls
@@ -55,8 +55,8 @@ def _stuck_thresholds(scope: str, is_refactor: bool) -> tuple[float, float, floa
     """Return (exact_match, issue_similarity, text_similarity) thresholds.
 
     Refactor takes priority over scope because refactor feedback structurally
-    repeats. Medium scope lowers all three thresholds so higher-complexity
-    tasks bail out 1-2 iterations earlier than the default.
+    repeats. Medium scope currently matches the default; the constants are kept
+    distinct so future tuning can diverge again without churning call sites.
     """
     if is_refactor:
         return (

@@ -1795,52 +1795,23 @@ describe('analysis-phase scope feasibility gate', () => {
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 
-  it('triggers narrowing retry when production+test total exceeds the combined budget', async () => {
-    // 6 production + 5 test = 11 > overflow threshold (10) but 6 ≤ production limit (10)
-    const productionOver = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts'];
-    const testOver = ['a.test.ts', 'b.test.ts', 'c.test.ts', 'd.test.ts', 'e.test.ts'];
-    const productionNarrowed = ['a.ts', 'b.ts'];
-    const testNarrowed = ['a.test.ts'];
-    vi.mocked(parseAnalysisPlanFiles)
-      .mockReturnValueOnce(productionOver)
-      .mockReturnValueOnce(productionNarrowed);
-    vi.mocked(parseAnalysisPlanTestFiles)
-      .mockReturnValueOnce(testOver)
-      .mockReturnValueOnce(testNarrowed);
+  it('does not count test files toward the production-file budget', async () => {
+    // 6 production files (≤ production limit 10) + many test files: should pass without narrowing.
+    const production = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts'];
+    const tests = ['a.test.ts', 'b.test.ts', 'c.test.ts', 'd.test.ts', 'e.test.ts', 'f.test.ts'];
+    vi.mocked(parseAnalysisPlanFiles).mockReturnValue(production);
+    vi.mocked(parseAnalysisPlanTestFiles).mockReturnValue(tests);
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- a.ts' })
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- a.ts\n- b.ts' })
       .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    // analysis + narrowing retry + implementation
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
+    // Exactly one analysis run + one implementation run; no narrowing retry triggered by tests.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
     expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
       TASK_ID,
       expect.objectContaining({ failure_category: 'scope_overflow' }),
     );
-  });
-
-  it('fails fast when production+test total stays over budget after narrowing', async () => {
-    const productionOver = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'];
-    const testOver = ['a.test.ts', 'b.test.ts', 'c.test.ts', 'd.test.ts', 'e.test.ts', 'f.test.ts'];
-    vi.mocked(parseAnalysisPlanFiles).mockReturnValue(productionOver);
-    vi.mocked(parseAnalysisPlanTestFiles).mockReturnValue(testOver);
-    vi.mocked(runClaudeCode)
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- a.ts' })
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- a.ts' })
-      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
-    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
-    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.objectContaining({
-        status: 'FAILED',
-        failure_category: 'scope_overflow',
-      }),
-    );
-    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 
   it('includes analysis_plan in COMPLETED payload so siblings can learn from successful plans', async () => {
