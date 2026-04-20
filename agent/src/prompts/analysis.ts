@@ -134,15 +134,16 @@ export function parseAnalysisPlanTestFiles(analysisOutput: string): string[] {
  * Returns the mandatory check IDs for the given task scope.
  * These must appear in the `checks_performed` field of the structured self-review output.
  */
-export function getMandatoryChecks(taskScope?: string, hasAnalysisPlan?: boolean): string[] {
+export function getMandatoryChecks(taskScope?: string, hasAnalysisPlan?: boolean, modelsChanged?: boolean): string[] {
+  let checks: string[];
   if (taskScope === 'small') {
-    return ['correctness', 'test_coverage', 'import_verification'];
+    checks = ['correctness', 'test_coverage', 'import_verification'];
+  } else if (taskScope === 'large') {
+    checks = ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'data_model_safety', 'import_verification'];
+  } else {
+    checks = ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'import_verification'];
+    if (hasAnalysisPlan) checks.unshift('plan_alignment');
   }
-  if (taskScope === 'large') {
-    return ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'data_model_safety', 'import_verification'];
-  }
-  // medium or unspecified
-  const base = ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'import_verification'];
-  if (hasAnalysisPlan) base.unshift('plan_alignment');
-  return base;
+  if (modelsChanged) checks.push('migration_completeness');
+  return checks;
 }

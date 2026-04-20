@@ -90,7 +90,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration } from './standard.js';
 import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks } from '../index.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles } from '../prompt.js';
 
@@ -2331,5 +2331,33 @@ describe('extractSelfReviewJson', () => {
 
   it('returns null when no JSON-like structure is present', () => {
     expect(extractSelfReviewJson('no json here at all')).toBeNull();
+  });
+});
+
+describe('needsMigrationGeneration', () => {
+  it('returns false when models.py is not in changedPaths', () => {
+    expect(needsMigrationGeneration(['admin-ui/src/App.tsx', 'backend/app/main.py'])).toBe(false);
+  });
+
+  it('returns true when models.py changed and no new alembic migration is present', () => {
+    expect(needsMigrationGeneration(['backend/app/models.py', 'backend/app/main.py'])).toBe(true);
+  });
+
+  it('returns false when models.py changed and a new migration file is present', () => {
+    expect(needsMigrationGeneration([
+      'backend/app/models.py',
+      'backend/alembic/versions/0036_add_thing.py',
+    ])).toBe(false);
+  });
+
+  it('returns true when only a non-.py file under alembic/versions/ exists (e.g. README)', () => {
+    expect(needsMigrationGeneration([
+      'backend/app/models.py',
+      'backend/alembic/versions/README.md',
+    ])).toBe(true);
+  });
+
+  it('returns false for an empty changed paths list', () => {
+    expect(needsMigrationGeneration([])).toBe(false);
   });
 });

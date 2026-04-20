@@ -1,7 +1,10 @@
 import type { BuildConfig } from '../index.js';
 import { getMandatoryChecks } from './analysis.js';
 
-function buildSelfReviewChecklist(taskScope?: string, hasAnalysisPlan?: boolean): string {
+const MIGRATION_COMPLETENESS_ITEM = `**Migration completeness (CRITICAL — HARD GATE, verdict MUST be FAIL if violated)** — \`backend/app/models.py\` is in your diff. Verify all three: (a) a new migration file exists in \`backend/alembic/versions/\` that reflects the schema change; (b) \`EXPECTED_SCHEMA_REVISION\` in \`backend/app/main.py\` was bumped to the new migration's revision id; (c) the new migration's \`down_revision\` chains from the previously-latest migration. If any is missing, create the missing migration (and bump EXPECTED_SCHEMA_REVISION) before re-checking — do not mark passed.`;
+
+function buildSelfReviewChecklist(taskScope?: string, hasAnalysisPlan?: boolean, modelsChanged?: boolean): string {
+  const migrationItem = modelsChanged ? `\n7. ${MIGRATION_COMPLETENESS_ITEM}` : '';
   if (taskScope === 'small') {
     return `Severity guide: CRITICAL = data loss / security breach / crash; MAJOR = incorrect behavior / missing coverage; MINOR = style / naming (skip).
 
@@ -11,7 +14,7 @@ Check for:
 3. **Error handling** (MAJOR) — Are async operations properly awaited, exceptions caught where needed, null checks present?
 4. **Security quick-check** (CRITICAL) — Are any user inputs passed unsanitized to queries, commands, or HTML output?
 5. **Import and type verification** (MAJOR) — Are new imports available, type annotations correct, and do modified exports match their callers?
-6. **Scope violations** (MAJOR) — Small-scope tasks have a 6-file budget for non-test production files and fail a hard gate if exceeded. Count the non-test files you changed; if over budget or any file is not essential to the task, revert it now.`;
+6. **Scope violations** (MAJOR) — Small-scope tasks have a 6-file budget for non-test production files and fail a hard gate if exceeded. Count the non-test files you changed; if over budget or any file is not essential to the task, revert it now.${migrationItem}`;
   }
   if (taskScope === 'large') {
     return `Check for:
@@ -23,7 +26,7 @@ Check for:
 6. **Cross-file consistency** — Do interfaces, types, and exports stay consistent across all changed files?
 7. **Backwards compatibility** — Are any existing callers broken by signature or behavior changes?
 8. **Data model safety** — Are schema changes (DB, JSONB, API response shapes) backwards-compatible?
-9. **Import/dependency verification** — Are new imports available and correctly referenced?`;
+9. **Import/dependency verification** — Are new imports available and correctly referenced?${modelsChanged ? `\n10. ${MIGRATION_COMPLETENESS_ITEM}` : ''}`;
   }
   // medium or unspecified: 8-item checklist (includes cross-file and import checks for multi-file changes)
   const planAlignmentItem = hasAnalysisPlan
@@ -42,7 +45,7 @@ ${scopeViolationsItem}
 5. **Pattern violations** — Does the code violate the patterns listed in Review Failure Patterns above?
 6. **Cross-file consistency** — Do interfaces, types, and exports stay consistent across all changed files?
 7. **Backwards compatibility** — Are any existing callers broken by signature or behavior changes?
-8. **Import/dependency verification** — Are new imports available and correctly referenced?`;
+8. **Import/dependency verification** — Are new imports available and correctly referenced?${modelsChanged ? `\n9. ${MIGRATION_COMPLETENESS_ITEM}` : ''}`;
 }
 
 // ── Self-review prompt builder ───────────────────────────────────────────────
@@ -230,7 +233,8 @@ export function buildSelfReviewPrompt(opts: {
     : '';
 
   const hasAnalysisPlan = !!(opts.analysisPlan && opts.analysisPlan.trim());
-  const mandatoryChecks = getMandatoryChecks(opts.taskScope, hasAnalysisPlan);
+  const modelsChanged = !!opts.changedFiles?.some(f => f === 'backend/app/models.py' || f.endsWith('/backend/app/models.py'));
+  const mandatoryChecks = getMandatoryChecks(opts.taskScope, hasAnalysisPlan, modelsChanged);
   const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
 
   return `You are performing a self-review of the changes you just made for this task.
@@ -239,7 +243,7 @@ ${restrictionsSection}${remediationSection}${directionFeedbackSection}${scopeSpe
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.
 
-${buildSelfReviewChecklist(opts.taskScope, hasAnalysisPlan)}
+${buildSelfReviewChecklist(opts.taskScope, hasAnalysisPlan, modelsChanged)}
 
 If you find CRITICAL or MAJOR issues, fix them and stage the changes with \`git add\`.
 

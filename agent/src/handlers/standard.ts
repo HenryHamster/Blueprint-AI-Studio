@@ -76,6 +76,18 @@ function isTestFile(path: string): boolean {
   return false;
 }
 
+const MODELS_PATH = 'backend/app/models.py';
+const ALEMBIC_VERSIONS_DIR = 'backend/alembic/versions/';
+
+/**
+ * Returns true when changedPaths includes backend/app/models.py but no new
+ * alembic migration file was added under backend/alembic/versions/.
+ */
+export function needsMigrationGeneration(changedPaths: string[]): boolean {
+  if (!changedPaths.some(p => p === MODELS_PATH)) return false;
+  return !changedPaths.some(p => p.startsWith(ALEMBIC_VERSIONS_DIR) && p.endsWith('.py'));
+}
+
 export interface StandardHandlerOpts {
   taskId: string;
   payload: Record<string, unknown>;
@@ -102,6 +114,7 @@ export interface StandardHandlerOpts {
   includeTaskTypeHints?: boolean;
   issueReference?: string;
   relatedFiles?: string[];
+  runMigrationCheck?: boolean;
 }
 
 /**
@@ -139,6 +152,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     includeTaskTypeHints = true,
     issueReference,
     relatedFiles,
+    runMigrationCheck = false,
   } = opts;
 
   const buildConfig = resolveBuildConfig(task);
@@ -523,6 +537,82 @@ Output ONLY a JSON object in a \`\`\`json code fence:
       return;
     }
 
+    // ── Migration Completeness Check ──────────────────────────────────────────
+    // If models.py was modified without a corresponding alembic migration file,
+    // run a focused Claude Code pass to generate it. Prevents CI failures from
+    // missing migrations (e.g. test_model_columns_covered_by_migrations).
+    if (runMigrationCheck && needsMigrationGeneration(changedPaths)) {
+      sendLog(ws, '\n[Migration Check] models.py changed without a new migration — generating.\n');
+      statusRef.value = 'Generating alembic migration...';
+
+      let modelsDiff = '';
+      try {
+        modelsDiff = git(['diff', `${baseCommit}..HEAD`, '--', MODELS_PATH]);
+        if (!modelsDiff.trim()) {
+          modelsDiff = git(['diff', 'HEAD', '--', MODELS_PATH]);
+        }
+      } catch { /* ignore */ }
+
+      let existingMigrations = '';
+      try {
+        existingMigrations = git(['ls-tree', '-r', '--name-only', 'HEAD', ALEMBIC_VERSIONS_DIR])
+          .split('\n').filter(Boolean).sort().slice(-10).join('\n');
+      } catch { /* ignore */ }
+
+      const migrationPrompt = `A code change modified ${MODELS_PATH} but did NOT add an alembic migration. Generate the missing migration and bump EXPECTED_SCHEMA_REVISION in backend/app/main.py.
+
+## Diff of ${MODELS_PATH}
+\`\`\`diff
+${modelsDiff.slice(0, 8000)}
+\`\`\`
+
+## Recent migration files (for naming convention and down_revision)
+${existingMigrations || '(none found)'}
+
+## Instructions
+1. Read the latest migration file under ${ALEMBIC_VERSIONS_DIR} to determine the highest revision number (NNNN) and confirm its \`revision\` string.
+2. Create a new file ${ALEMBIC_VERSIONS_DIR}NNNN_<short_description>.py with the next revision number (zero-padded, four digits).
+3. The new migration MUST:
+   - Set \`revision = '<NNNN>'\` and \`down_revision = '<previous_NNNN>'\` (branch_labels = None, depends_on = None).
+   - Implement \`upgrade()\` using op.add_column / op.create_table / op.create_index / op.drop_column etc. that reflects ONLY what the models.py diff changed.
+   - Implement a symmetric \`downgrade()\`.
+   - Import \`from alembic import op\` and \`import sqlalchemy as sa\` (plus \`import sqlmodel\` if needed for sa_column types used by SQLModel).
+4. Update \`EXPECTED_SCHEMA_REVISION\` in backend/app/main.py to the new revision string.
+5. Do NOT invoke alembic autogenerate — no database is available. Write the migration by reading the diff.
+6. Do NOT modify any other files. Do NOT commit. The harness handles committing.
+
+Return nothing — just write the files.`;
+
+      const { exitCode: migrationExit } = await runClaudeCode(
+        migrationPrompt, ws, statusRef, model, effort,
+      );
+
+      if (migrationExit === 0) {
+        // Re-compute changedPaths and diffSummary so downstream steps (lint,
+        // test, self-review, post-review gate) see the new migration file.
+        const newStatus = git(['status', '--porcelain']);
+        const newUncommitted = newStatus.length > 0
+          ? newStatus.split('\n').map(l => l.trim().split(/\s+/).pop() || '').filter(Boolean)
+          : [];
+        const newHead = git(['rev-parse', 'HEAD']);
+        const newCommitted = newHead !== baseCommit
+          ? git(['diff', '--name-only', `${baseCommit}..HEAD`]).split('\n').filter(Boolean)
+          : [];
+        const updatedPaths = [...new Set([...newUncommitted, ...newCommitted])];
+        const added = updatedPaths.filter(p => !changedPaths.includes(p));
+        if (added.length > 0) {
+          changedPaths.splice(0, changedPaths.length, ...updatedPaths);
+          const updatedSummary = computeFileDiffSummary(baseCommit, newHead);
+          diffSummary.splice(0, diffSummary.length, ...updatedSummary);
+          sendLog(ws, `[Migration Check] Generated ${added.length} file(s): ${added.join(', ')}\n`);
+        } else {
+          sendLog(ws, '[Migration Check] No new files produced by migration pass.\n');
+        }
+      } else {
+        sendLog(ws, `[Migration Check] Exited with code ${migrationExit} — proceeding without generated migration.\n`);
+      }
+    }
+
     if (runLintFix) {
       const lintPassed = await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
       if (!lintPassed && failOnTestFailure) {
@@ -825,7 +915,8 @@ Output ONLY a JSON object in a \`\`\`json code fence:
           }
 
           // Validate checks_performed contains all mandatory items
-          const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined, !!selfReviewAnalysisPlan);
+          const modelsChanged = !!changedFiles?.some(f => f === 'backend/app/models.py' || f.endsWith('/backend/app/models.py'));
+          const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined, !!selfReviewAnalysisPlan, modelsChanged);
           if (!parsedChecks) {
             reviewCategories.push('self_review_failed', 'validation_failed');
             parseFailed = true;
@@ -978,7 +1069,8 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         if (failOnTestFailure) {
           // Validation failure: retry once with explicit guidance about what was missing
           if (parseFailed) {
-            const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined, !!selfReviewAnalysisPlan);
+            const modelsChanged = !!changedFiles?.some(f => f === 'backend/app/models.py' || f.endsWith('/backend/app/models.py'));
+            const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined, !!selfReviewAnalysisPlan, modelsChanged);
             const missingChecks = parsedChecks
               ? mandatory.filter(m => !parsedChecks!.includes(m))
               : mandatory;
@@ -1280,6 +1372,7 @@ export async function handleCreate(
     includeTaskTypeHints: true,
     issueReference,
     relatedFiles,
+    runMigrationCheck: true,
   });
 }
 
@@ -1344,6 +1437,7 @@ ${rp}`,
     captureBaseline: true,
     runSelfReview: true,
     lintContext: 'the refactored code',
+    runMigrationCheck: true,
   });
 }
 
