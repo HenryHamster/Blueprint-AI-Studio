@@ -80,7 +80,7 @@ _FEEDBACK_TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
 # Issue-churn: fix agent keeps rotating CRITICAL+MAJOR issues without the total
 # count decreasing — evades Jaccard stuck-cycle detection but still unproductive.
-ISSUE_CHURN_WINDOW = 3
+ISSUE_CHURN_WINDOW = 2
 
 
 def _critical_major_count(entry: dict) -> int:
@@ -955,31 +955,22 @@ async def _spawn_pipeline_task(
         is_churn, churn_counts = _detect_issue_churn(new_review_history)
         if is_churn and task_type == "fix":
             churn_detections += 1
-            if churn_detections >= 2:
-                remaining = max(per_chain_cap - iteration, 0)
-                reduced_cap = iteration + (remaining // 2)
-                if reduced_cap < per_chain_cap:
-                    logger.warning(
-                        f"[PIPELINE] Issue churn detected for PR #{pr_number} "
-                        f"(detection #{churn_detections}): "
-                        f"CRITICAL+MAJOR counts {churn_counts} non-decreasing over "
-                        f"{ISSUE_CHURN_WINDOW} iterations. Reducing cap "
-                        f"{per_chain_cap} → {reduced_cap}; injecting narrow-focus directive."
-                    )
-                    per_chain_cap = reduced_cap
-                else:
-                    logger.warning(
-                        f"[PIPELINE] Issue churn detected for PR #{pr_number} "
-                        f"(detection #{churn_detections}): "
-                        f"counts {churn_counts}; injecting narrow-focus directive."
-                    )
-            else:
+            remaining = max(per_chain_cap - iteration, 0)
+            reduced_cap = iteration + (remaining // 2)
+            if reduced_cap < per_chain_cap:
                 logger.warning(
                     f"[PIPELINE] Issue churn detected for PR #{pr_number} "
                     f"(detection #{churn_detections}): "
                     f"CRITICAL+MAJOR counts {churn_counts} non-decreasing over "
-                    f"{ISSUE_CHURN_WINDOW} iterations. Injecting narrow-focus "
-                    f"directive without cap reduction to allow directive to take effect."
+                    f"{ISSUE_CHURN_WINDOW} iterations. Reducing cap "
+                    f"{per_chain_cap} → {reduced_cap}; injecting narrow-focus directive."
+                )
+                per_chain_cap = reduced_cap
+            else:
+                logger.warning(
+                    f"[PIPELINE] Issue churn detected for PR #{pr_number} "
+                    f"(detection #{churn_detections}): "
+                    f"counts {churn_counts}; injecting narrow-focus directive."
                 )
             narrow_prefix = _CHURN_NARROW_FOCUS_PREFIX.format(
                 window=ISSUE_CHURN_WINDOW, counts=churn_counts

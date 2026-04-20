@@ -3530,24 +3530,22 @@ class TestDetectIssueChurn:
         return {"iteration": 0, "feedback": "f", "issues": issues}
 
     def test_short_history_no_churn(self):
-        hist = [self._entry([_issue("a")]), self._entry([_issue("b")])]
+        hist = [self._entry([_issue("a")])]
         is_churn, counts = _detect_issue_churn(hist)
         assert is_churn is False
 
     def test_non_decreasing_distinct_issues_is_churn(self):
-        # Counts 2, 2, 2 with entirely different issues each iter → churn.
+        # Counts 2, 2 with entirely different issues each iter → churn.
         hist = [
-            self._entry([_issue("a1"), _issue("a2")]),
             self._entry([_issue("b1"), _issue("b2")]),
             self._entry([_issue("c1"), _issue("c2")]),
         ]
         is_churn, counts = _detect_issue_churn(hist)
         assert is_churn is True
-        assert counts == [2, 2, 2]
+        assert counts == [2, 2]
 
     def test_strictly_decreasing_not_churn(self):
         hist = [
-            self._entry([_issue("a1"), _issue("a2"), _issue("a3")]),
             self._entry([_issue("b1"), _issue("b2")]),
             self._entry([_issue("c1")]),
         ]
@@ -3556,7 +3554,6 @@ class TestDetectIssueChurn:
 
     def test_zero_in_window_not_churn(self):
         hist = [
-            self._entry([_issue("a1")]),
             self._entry([]),
             self._entry([_issue("c1")]),
         ]
@@ -3564,36 +3561,33 @@ class TestDetectIssueChurn:
         assert is_churn is False
 
     def test_oscillating_counts_is_churn(self):
-        # Counts 5, 3, 5 — dip then rebound to original → zero net progress.
+        # Counts 3, 5 — rebounds to higher → non-decreasing → churn.
         hist = [
-            self._entry([_issue(f"a{i}") for i in range(5)]),
             self._entry([_issue(f"b{i}") for i in range(3)]),
             self._entry([_issue(f"c{i}") for i in range(5)]),
         ]
         is_churn, counts = _detect_issue_churn(hist)
         assert is_churn is True
-        assert counts == [5, 3, 5]
+        assert counts == [3, 5]
 
-    def test_dip_then_partial_recover_not_churn(self):
-        # Counts 4, 2, 3 — final below first → net progress, not churn.
+    def test_dip_not_churn(self):
+        # Counts 4, 2 — final below first → net progress, not churn.
         hist = [
             self._entry([_issue(f"a{i}") for i in range(4)]),
             self._entry([_issue(f"b{i}") for i in range(2)]),
-            self._entry([_issue(f"c{i}") for i in range(3)]),
         ]
         is_churn, counts = _detect_issue_churn(hist)
         assert is_churn is False
-        assert counts == [4, 2, 3]
+        assert counts == [4, 2]
 
     def test_minor_issues_ignored(self):
         hist = [
-            self._entry([_issue("a", "MINOR")]),
             self._entry([_issue("b", "MINOR")]),
             self._entry([_issue("c", "MINOR")]),
         ]
         is_churn, counts = _detect_issue_churn(hist)
         assert is_churn is False
-        assert counts == [0, 0, 0]
+        assert counts == [0, 0]
 
 
 class TestRepeatingIssues:
@@ -3636,8 +3630,8 @@ class TestRepeatingIssues:
 async def test_issue_churn_injects_narrow_focus_and_reduces_cap(db_session, mocker):
     """When CRITICAL+MAJOR counts don't decrease across ISSUE_CHURN_WINDOW iterations
     (but the specific issues rotate, evading stuck-cycle detection), the spawned fix
-    task should get a narrow-focus directive prefix. On the first detection the cap
-    is not reduced so the directive has budget to take effect."""
+    task should get a narrow-focus directive prefix and the per-chain cap should be
+    reduced immediately on the first detection to curtail unproductive churn."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
@@ -3702,20 +3696,16 @@ async def test_issue_churn_injects_narrow_focus_and_reduces_cap(db_session, mock
     assert "ISSUE CHURN DETECTED" in (payload.get("prompt") or "")
     assert "Please fix." in payload["prompt"]
 
-    # First churn detection: cap unchanged so the narrow-focus directive has
-    # iteration budget to take effect.
+    # First churn detection now reduces the cap via the 1/2 rule.
+    # medium baseline=12, iteration=3 (source had 2, incremented), remaining=9 → 3+9//2=7.
     ctx_cap = (result.context or {}).get("review_loop", {}).get("max_iterations")
-    from app.review_pipeline import _max_review_iterations
-    baseline = _max_review_iterations(source_task)
-    assert ctx_cap == baseline, (
-        f"First churn detection should leave cap at baseline {baseline}, got {ctx_cap}"
-    )
+    assert ctx_cap == 7, f"First churn detection should reduce cap to 7, got {ctx_cap}"
 
 
 @pytest.mark.asyncio
-async def test_first_churn_detection_does_not_reduce_cap(db_session, mocker):
-    """First churn detection injects a narrow-focus directive but leaves the
-    per-chain cap unchanged so the directive has budget to take effect."""
+async def test_first_churn_detection_reduces_cap(db_session, mocker):
+    """First churn detection injects a narrow-focus directive and reduces the
+    per-chain cap via the 1/2 rule to curtail unproductive churn early."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
@@ -3762,11 +3752,9 @@ async def test_first_churn_detection_does_not_reduce_cap(db_session, mocker):
         current_feedback="fb", current_issues=current_issues,
     )
 
-    # medium scope → baseline 12; first detection leaves cap unchanged.
-    from app.review_pipeline import _max_review_iterations
-    baseline = _max_review_iterations(source_task)
+    # medium scope → baseline 12; iteration=3; remaining=9 → 3+9//2=7.
     new_loop = (result.context or {}).get("review_loop", {})
-    assert new_loop.get("max_iterations") == baseline
+    assert new_loop.get("max_iterations") == 7
     assert new_loop.get("churn_detections") == 1
 
 
@@ -3822,7 +3810,8 @@ async def test_second_churn_detection_uses_one_half_reduction(db_session, mocker
     )
 
     # medium scope → baseline 12; iteration = 3; remaining = 9.
-    # Second detection: 3 + 9//2 = 7 (vs 9 under 1/3 rule).
+    # Second detection applies 1/2 rule: 3 + 9//2 = 7 (cap already reduced on
+    # detection #1, so this exercises the subsequent-detection path).
     new_loop = (result.context or {}).get("review_loop", {})
     assert new_loop.get("max_iterations") == 7
     assert new_loop.get("churn_detections") == 2
@@ -3846,9 +3835,11 @@ async def test_mid_budget_injects_narrow_focus_without_cap_reduction(db_session,
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    # Only one prior entry → below ISSUE_CHURN_WINDOW, so churn cannot trigger.
+    # One prior entry with MORE issues than current → counts strictly decrease
+    # ([3, 1]) → no churn detected, so the mid-budget branch takes effect.
     prior_history = [
-        {"iteration": 0, "feedback": "f0", "issues": [_issue("alpha broken")]},
+        {"iteration": 0, "feedback": "f0",
+         "issues": [_issue("a"), _issue("b"), _issue("c")]},
     ]
     # scope=medium → baseline cap 12; iteration 6 is exactly 50% → mid-budget.
     source_task = make_task(
