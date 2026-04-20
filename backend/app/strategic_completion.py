@@ -431,6 +431,8 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         cycle_id = (task.context or {}).get("strategic_cycle_id")
         dirs_created = (task.context or {}).get("_strategic_dirs_created", 0)
         dirs_retired = (task.context or {}).get("_strategic_dirs_retired", 0)
+        created_ids = list((task.context or {}).get("_strategic_created_ids", []))
+        retired_ids = list((task.context or {}).get("_strategic_retired_ids", []))
         if cycle_id:
             _vision_updated = (task.context or {}).get("_strategic_vision_set", False) or vision_rev > spawned_vision_rev
             _spawn_suffix = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
@@ -440,6 +442,8 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 "vision_updated": _vision_updated,
                 "directions_created": dirs_created,
                 "directions_retired": dirs_retired,
+                "created_direction_ids": created_ids,
+                "retired_direction_ids": retired_ids,
                 "tasks_spawned": tasks_spawned,
                 "outcome": "completed",
                 "summary_text": _summary,

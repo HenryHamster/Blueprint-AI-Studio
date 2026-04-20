@@ -1291,6 +1291,43 @@ async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_quality_score(client: AsyncClient, db_session):
+    """quality_score appears in direction_progress for directions with research history."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-q",
+                "text": "Quality direction",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "tasks_created": 4, "prs_merged": 3},
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-q"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    assert "quality_score" in dp
+    assert isinstance(dp["quality_score"], float)
+    assert 0.0 <= dp["quality_score"] <= 1.0
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_review_quality(client: AsyncClient, db_session):
     """review_quality aggregates reviews_dismissed/overridden/user_issues_caught across in-window entries."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()

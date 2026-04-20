@@ -4444,6 +4444,63 @@ async def test_prior_deferred_findings_still_capped_if_pipeline_degraded(db_sess
 
 
 @pytest.mark.asyncio
+async def test_repeatedly_deferred_low_confidence_findings_are_decayed(db_session, mocker):
+    """Findings deferred >=4 times for ultra_low_confidence are discarded, not retried."""
+    direction_id = "d-decay0001"
+    direction = _active_direction(direction_id, "Decay test")
+    project = Project(
+        name="Decay test", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_finding = _make_finding("Stale low-conf finding", direction_id)
+    stale_finding["deferred_count"] = 4
+    stale_finding["deferred_reason"] = "ultra_low_confidence"
+    fresh_deferred = _make_finding("Viable deferred finding", direction_id)
+    fresh_deferred["deferred_count"] = 1
+    fresh_deferred["deferred_reason"] = "ultra_low_confidence"
+
+    task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text']}",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={
+            "research_depth": 0,
+            "prior_deferred_findings": [stale_finding, fresh_deferred],
+        },
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Fresh sentinel", direction_id)],
+    )
+    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    child_titles = {ct.title for ct in result.scalars().all()}
+    assert "Stale low-conf finding" not in child_titles, (
+        "Ultra-low-confidence finding with deferred_count>=4 should be decayed"
+    )
+    assert "Viable deferred finding" in child_titles, (
+        "Finding with deferred_count<4 should still be processed"
+    )
+
+
+@pytest.mark.asyncio
 async def test_undirected_cycle_recovers_unscoped_deferred_findings(db_session, mocker):
     """Undirected research cycles must recover deferred findings without a direction_id.
 

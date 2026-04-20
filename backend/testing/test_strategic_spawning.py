@@ -674,6 +674,117 @@ async def test_spawn_strategic_review_task_context_includes_cycle_id(db_session,
     assert tasks[0].context.get("strategic_cycle_id") == cycle_id
 
 
+# ── previous_decision_outcomes in _spawn_strategic_review payload ────────────
+
+@pytest.mark.asyncio
+async def test_previous_decision_outcomes_populated_from_prior_cycle(db_session):
+    """Payload surfaces current performance of directions created/retired by the prior cycle."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-new01", "status": "active", "text": "Newly created direction",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 2, "prs_rejected": 0}],
+            },
+            {
+                "id": "d-retired01", "status": "retired",
+                "text": "Direction retired last cycle", "priority": "low",
+                "research_history": [],
+            },
+        ],
+        vision={
+            "purpose": "test purpose",
+            "_strategic_cycle_history": [
+                {
+                    "cycle_id": "sc-prev0001",
+                    "outcome": "completed",
+                    "phase2_completed_at": "2026-04-19T00:00:00+00:00",
+                    "created_direction_ids": ["d-new01"],
+                    "retired_direction_ids": ["d-retired01"],
+                    "summary_text": "rev 2, 3 active, 1 created, 1 retired",
+                },
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    prev = payload.get("previous_decision_outcomes")
+    assert prev is not None, "Expected previous_decision_outcomes in payload"
+    assert prev["cycle_id"] == "sc-prev0001"
+    assert len(prev["created"]) == 1
+    assert len(prev["retired"]) == 1
+    new_stat = prev["created"][0]
+    assert new_stat["direction_id"] == "d-new01"
+    assert new_stat["role"] == "created"
+    assert new_stat["status"] == "active"
+    assert new_stat["prs_merged"] == 2
+    assert new_stat["cycles_active"] == 1
+    assert "quality_score" in new_stat
+    assert new_stat["auto_paused"] is False
+    retired_stat = prev["retired"][0]
+    assert retired_stat["role"] == "retired"
+    assert retired_stat["status"] == "retired"
+
+
+@pytest.mark.asyncio
+async def test_previous_decision_outcomes_absent_when_no_prior_decisions(db_session):
+    """No created/retired ids in prior cycles → previous_decision_outcomes omitted."""
+    project = _make_project(
+        directions=[{"id": "d-a", "status": "active", "text": "d", "priority": "medium"}],
+        vision={
+            "purpose": "test",
+            "_strategic_cycle_history": [
+                {"cycle_id": "sc-old", "outcome": "completed"},  # no created/retired ids
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(project, db_session)
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().first().payloads[0]
+    assert "previous_decision_outcomes" not in payload
+
+
+@pytest.mark.asyncio
+async def test_previous_decision_outcomes_missing_retired_direction(db_session):
+    """A retired direction id no longer in project.directions is reported as status=missing."""
+    project = _make_project(
+        directions=[],  # retired direction was removed
+        vision={
+            "purpose": "test",
+            "_strategic_cycle_history": [
+                {
+                    "cycle_id": "sc-gone",
+                    "outcome": "completed",
+                    "created_direction_ids": [],
+                    "retired_direction_ids": ["d-deleted"],
+                },
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(project, db_session)
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().first().payloads[0]
+    prev = payload.get("previous_decision_outcomes")
+    assert prev is not None
+    assert prev["retired"] == [{"direction_id": "d-deleted", "role": "retired", "status": "missing"}]
+
+
 # ── _build_shipped_changes_manifest ──────────────────────────────────────────
 
 def _make_merged_task(project_id, title="Fix bug", direction_id="d-001", changed_files=None, scope="small"):

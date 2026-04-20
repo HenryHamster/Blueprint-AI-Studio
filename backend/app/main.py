@@ -1909,7 +1909,13 @@ async def strategic_operation(
         flag_modified(project, "directions")
         session.add(project)
         ctx = task.context or {}
-        task.context = {**ctx, "_strategic_dirs_created": ctx.get("_strategic_dirs_created", 0) + 1}
+        created_ids = list(ctx.get("_strategic_created_ids", []))
+        created_ids.append(new_dir["id"])
+        task.context = {
+            **ctx,
+            "_strategic_dirs_created": ctx.get("_strategic_dirs_created", 0) + 1,
+            "_strategic_created_ids": created_ids,
+        }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
@@ -1981,7 +1987,13 @@ async def strategic_operation(
         flag_modified(project, "directions")
         session.add(project)
         ctx = task.context or {}
-        task.context = {**ctx, "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0) + 1}
+        retired_ids = list(ctx.get("_strategic_retired_ids", []))
+        retired_ids.append(dir_id)
+        task.context = {
+            **ctx,
+            "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0) + 1,
+            "_strategic_retired_ids": retired_ids,
+        }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()

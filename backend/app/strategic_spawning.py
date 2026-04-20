@@ -359,6 +359,67 @@ async def _build_recent_interventions(
     return result
 
 
+def _build_previous_decision_outcomes(project: Project) -> dict[str, Any] | None:
+    """Summarize outcomes of the most recent completed strategic cycle's
+    direction create/retire decisions so the agent can learn from them.
+
+    Walks _strategic_cycle_history newest-first for an entry with outcome
+    "completed" that also recorded created_direction_ids or
+    retired_direction_ids. For each direction id it looks up the current
+    direction in project.directions and reports cycles_active, prs_merged,
+    quality_score, and paused flags. Retired directions missing from the
+    current list are reported with status="missing".
+    """
+    cycle_history = (project.vision or {}).get("_strategic_cycle_history") or []
+    if not cycle_history:
+        return None
+    prev_entry = None
+    for entry in reversed(cycle_history):
+        if entry.get("outcome") != "completed":
+            continue
+        if entry.get("created_direction_ids") or entry.get("retired_direction_ids"):
+            prev_entry = entry
+            break
+    if prev_entry is None:
+        return None
+
+    directions_by_id: dict[str, dict] = {
+        d.get("id"): d for d in (project.directions or []) if d.get("id")
+    }
+
+    def _summarize(direction_id: str, role: str) -> dict[str, Any]:
+        d = directions_by_id.get(direction_id)
+        if d is None:
+            return {"direction_id": direction_id, "role": role, "status": "missing"}
+        history = d.get("research_history") or []
+        agg = d.get("history_aggregate") or {}
+        cycles_active = len(history) + (agg.get("total_cycles") or 0)
+        prs_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)
+        is_paused = d.get("status") == "paused"
+        auto_paused = bool(d.get("auto_paused"))
+        return {
+            "direction_id": direction_id,
+            "role": role,
+            "status": d.get("status"),
+            "text": (d.get("text") or "")[:200],
+            "cycles_active": cycles_active,
+            "prs_merged": prs_merged,
+            "quality_score": round(_compute_direction_quality_score(d), 3),
+            "auto_paused": auto_paused,
+            "user_paused": is_paused and not auto_paused,
+        }
+
+    created = [_summarize(did, "created") for did in (prev_entry.get("created_direction_ids") or [])]
+    retired = [_summarize(did, "retired") for did in (prev_entry.get("retired_direction_ids") or [])]
+    return {
+        "cycle_id": prev_entry.get("cycle_id"),
+        "phase2_completed_at": prev_entry.get("phase2_completed_at"),
+        "summary_text": prev_entry.get("summary_text"),
+        "created": created,
+        "retired": retired,
+    }
+
+
 async def _find_last_strategic_cycle_time(
     project: Project, session: AsyncSession
 ) -> datetime | None:
@@ -570,6 +631,8 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "directions_summary": direction_stats,
         "outcome_evaluation": _build_outcome_evaluation(project),
         "recent_interventions": recent_interventions,
+        **({"previous_decision_outcomes": _prev_outcomes}
+           if (_prev_outcomes := _build_previous_decision_outcomes(project)) else {}),
         "project_name": project.name,
         "open_messages": open_msgs,
         "conversation_thread": conversation_thread,

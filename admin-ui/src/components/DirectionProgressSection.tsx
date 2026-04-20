@@ -21,6 +21,7 @@ export interface DirectionProgress {
   prs_rejected?: number;
   acceptance_rate?: number | null;
   first_attempt_success_rate?: number | null;
+  quality_score?: number | null;
   cost_per_merged_pr?: number | null;
   estimated_cost_usd?: number | null;
   cost_by_scope?: Record<string, number> | null;
@@ -190,6 +191,20 @@ export function DirectionProgressSection({ directions }: { directions: Direction
                 {typeof dp.first_attempt_success_rate === 'number' && (
                   <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded" title="First-attempt success rate">
                     {Math.round(dp.first_attempt_success_rate * 100)}% 1st
+                  </span>
+                )}
+                {typeof dp.quality_score === 'number' && (
+                  <span
+                    className={`text-[9px] px-1.5 py-0.5 rounded border ${
+                      dp.quality_score >= 0.6
+                        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                        : dp.quality_score >= 0.3
+                        ? 'bg-amber-500/10 text-amber-500 border-amber-500/20'
+                        : 'bg-red-500/10 text-red-400 border-red-500/20'
+                    }`}
+                    title="Direction quality score (taxonomy health, wasted cycles, scope calibration)"
+                  >
+                    {Math.round(dp.quality_score * 100)}% q
                   </span>
                 )}
                 {typeof dp.cost_per_merged_pr === 'number' && dp.cost_per_merged_pr > 0 && (

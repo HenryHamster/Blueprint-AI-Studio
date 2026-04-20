@@ -2524,6 +2524,8 @@ async def test_strategic_completion_api_path_records_directions_created(strategi
             "_strategic_vision_set": True,
             "_strategic_dirs_created": 2,
             "_strategic_dirs_retired": 1,
+            "_strategic_created_ids": ["dir-a", "dir-b"],
+            "_strategic_retired_ids": ["dir-c"],
             "strategic_cycle_id": cycle_id,
         },
         vision_rev=1,
@@ -2537,6 +2539,8 @@ async def test_strategic_completion_api_path_records_directions_created(strategi
     assert cycle_entry is not None, "Cycle entry not found in history"
     assert cycle_entry.get("directions_created") == 2
     assert cycle_entry.get("directions_retired") == 1
+    assert cycle_entry.get("created_direction_ids") == ["dir-a", "dir-b"]
+    assert cycle_entry.get("retired_direction_ids") == ["dir-c"]
     assert cycle_entry.get("outcome") == "completed"
 
 
@@ -4100,6 +4104,45 @@ class TestPredictSpawnSuccessExpansionRatio:
                 runtime_config.pop("pipeline_scope_merge_rates", None)
             else:
                 runtime_config["pipeline_scope_merge_rates"] = prev
+
+
+class TestPredictSpawnSuccessTaxonomyWeighting:
+    """Signal 3 taxonomy-weighted failure rate in predict_spawn_success."""
+
+    def _direction(self, taxonomy: dict, tasks_failed: int) -> dict:
+        return {
+            "research_history": [
+                {
+                    "tasks_created": 10,
+                    "tasks_failed": tasks_failed,
+                    "tasks_failed_infra": 0,
+                    "taxonomy_summary": taxonomy,
+                },
+            ],
+        }
+
+    def _predict(self, direction: dict) -> float:
+        from app.shared_state import runtime_config
+        from app.spawn_calibration import predict_spawn_success
+        prev = runtime_config.get("pipeline_scope_merge_rates")
+        runtime_config["pipeline_scope_merge_rates"] = {}
+        try:
+            return predict_spawn_success("small", direction)
+        finally:
+            if prev is None:
+                runtime_config.pop("pipeline_scope_merge_rates", None)
+            else:
+                runtime_config["pipeline_scope_merge_rates"] = prev
+
+    def test_review_quality_failures_discounted(self):
+        p_review = self._predict(self._direction({"review_quality": 5}, 5))
+        p_code = self._predict(self._direction({"code_defect": 5}, 5))
+        assert p_review > p_code
+
+    def test_scope_related_failures_amplified(self):
+        p_scope = self._predict(self._direction({"scope_related": 5}, 5))
+        p_code = self._predict(self._direction({"code_defect": 5}, 5))
+        assert p_scope < p_code
 
 
 class TestPredictSpawnSuccessNoCrossModulePenalty:

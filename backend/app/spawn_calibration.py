@@ -378,13 +378,26 @@ def predict_spawn_success(
     # entries). Infra failures (provision failures, rate limits, timeouts) are
     # uncorrelated with direction quality — strategic_completion.py excludes them
     # when assessing direction health, and spawn prediction should too.
+    # When taxonomy_summary is present, weight failures by category: review_quality
+    # is a pipeline issue not a direction problem (0.3x); scope_related indicates
+    # systematic scope miscalibration (1.5x); code_defect stays at 1.0x.
     if history3:
         total_created = sum(e.get("tasks_created", 0) for e in history3)
         total_failed = sum(e.get("tasks_failed", 0) for e in history3)
         total_failed_infra = sum(e.get("tasks_failed_infra", 0) for e in history3)
-        code_failed = max(0, total_failed - total_failed_infra)
+        taxonomy_entries = [e.get("taxonomy_summary") or {} for e in history3]
+        if any(taxonomy_entries):
+            effective_failed: float = 0.0
+            for ts in taxonomy_entries:
+                effective_failed += (
+                    ts.get("code_defect", 0) * 1.0
+                    + ts.get("scope_related", 0) * 1.5
+                    + ts.get("review_quality", 0) * 0.3
+                )
+        else:
+            effective_failed = max(0, total_failed - total_failed_infra)
         if total_created >= 3:
-            failure_rate = code_failed / total_created
+            failure_rate = effective_failed / total_created
             signals.append(max(0.0, 1.0 - failure_rate))
             weights.append(1.5)
 

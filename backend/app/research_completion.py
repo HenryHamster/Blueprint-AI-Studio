@@ -509,6 +509,28 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 f"titles={[f.get('title') or f.get('description', '')[:60] for f in _stale_discarded]}"
             )
         prior_actionable = _fresh_actionable
+        # Decay: discard findings that have been deferred repeatedly for outcome-blind
+        # reasons (ultra_low_confidence / degradation_gate). Retrying them unchanged
+        # wastes a findings slot each cycle. batch_cap deferrals are pure capacity
+        # constraints and are not decayed.
+        _decayed: list[dict] = []
+        _kept: list[dict] = []
+        for f in prior_actionable:
+            _count = int(f.get("deferred_count", 0) or 0)
+            _reason = f.get("deferred_reason")
+            if _reason == "ultra_low_confidence" and _count >= 4:
+                _decayed.append(f)
+            elif _reason == "degradation_gate" and _count >= 3:
+                _decayed.append(f)
+            else:
+                _kept.append(f)
+        if _decayed:
+            logger.warning(
+                f"[RESEARCH] Discarding {len(_decayed)} repeatedly-deferred finding(s) "
+                f"from task {task.id}: "
+                f"titles={[f.get('title') or f.get('description', '')[:60] for f in _decayed]}"
+            )
+        prior_actionable = _kept
         if prior_actionable:
             logger.info(
                 f"[RESEARCH] Prepending {len(prior_actionable)} deferred finding(s) from previous cycle "

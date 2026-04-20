@@ -2542,6 +2542,75 @@ async def test_strategic_api_create_direction_skips_duplicate(db_session, mocker
         app.dependency_overrides.pop(verify_agent_token, None)
 
 
+@pytest.mark.asyncio
+async def test_strategic_api_accumulates_direction_ids(db_session, mocker):
+    """create_direction and retire_direction should append IDs to task.context lists."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    existing = [
+        {"id": "d-retire-me", "text": "Old direction", "status": "active", "priority": "medium",
+         "notes": [], "research_history": []}
+    ]
+    project = Project(
+        name="P-sapi-ids", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=existing,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, user_id="u1", task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            r1 = await ac.post("/api/agent/strategic", json={
+                "op": "create_direction", "task_id": task_id,
+                "data": {"text": "New direction alpha", "priority": "medium"}})
+            assert r1.status_code == 200, r1.text
+            new_id_1 = r1.json()["direction_id"]
+
+            r2 = await ac.post("/api/agent/strategic", json={
+                "op": "create_direction", "task_id": task_id,
+                "data": {"text": "New direction beta", "priority": "low"}})
+            assert r2.status_code == 200, r2.text
+            new_id_2 = r2.json()["direction_id"]
+
+            r3 = await ac.post("/api/agent/strategic", json={
+                "op": "retire_direction", "task_id": task_id,
+                "data": {"direction_id": "d-retire-me", "rationale": "obsolete"}})
+            assert r3.status_code == 200, r3.text
+
+        await db_session.refresh(task)
+        ctx = task.context or {}
+        assert ctx.get("_strategic_created_ids") == [new_id_1, new_id_2]
+        assert ctx.get("_strategic_retired_ids") == ["d-retire-me"]
+        assert ctx.get("_strategic_dirs_created") == 2
+        assert ctx.get("_strategic_dirs_retired") == 1
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Standalone tests for _calibrate_scope (no DB required)
 # ─────────────────────────────────────────────────────────────────────────────

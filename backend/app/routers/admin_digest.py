@@ -17,6 +17,7 @@ from app.models import (
 from app.auth import get_current_user, require_admin
 from app.shared_state import runtime_config as _runtime_config
 from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SPOT_RATE
+from app.direction_metrics import _compute_direction_quality_score
 
 logger = logging.getLogger(__name__)
 
@@ -1317,6 +1318,7 @@ async def get_digest(
                     "decomposition_summary": decomposition_summary,
                     "first_attempt_success_rate": dir_fa_rate,
                     "first_attempt_sample_size": dir_fa_sample_size,
+                    "quality_score": round(_compute_direction_quality_score(d), 3),
                     "lifetime_cycles": lifetime_cycles,
                     "lifetime_prs_merged": lifetime_prs_merged,
                     "lifetime_prs_rejected": lifetime_prs_rejected,
