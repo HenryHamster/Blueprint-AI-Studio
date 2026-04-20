@@ -859,6 +859,47 @@ async def test_cost_ceiling_includes_current_task_cost(cost_db, mocker):
     assert "Daily cost ceiling exceeded" in alerts[0].title
 
 
+@pytest.mark.asyncio
+async def test_cost_ceiling_budget_exceeded_webhook_enriched(cost_db, mocker):
+    """BUDGET_EXCEEDED webhook payload includes direction_text and cost_by_failure_class."""
+    project = await _make_project(cost_db)
+
+    dispatch_mock = AsyncMock()
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        dispatch_mock,
+    )
+
+    task = _make_cost_task(project.id, vm_secs=3600, is_spot=False)
+    task.context = {"direction_text": "Improve pipeline throughput", "direction_id": "d-x"}
+    cost_db.add(task)
+    await cost_db.commit()
+    await cost_db.refresh(task)
+
+    with patch.dict(_shared_state.runtime_config, {"daily_cost_ceiling_usd": 0.01}):
+        await _check_daily_cost_ceiling(task, cost_db)
+
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert dispatch_mock.call_count >= 1
+    args, _kwargs = dispatch_mock.call_args
+    assert args[1] == "BUDGET_EXCEEDED"
+    payload = args[2]
+    assert payload["direction_text"] == "Improve pipeline throughput"
+    assert payload["ceiling_usd"] == 0.01
+    assert "daily_total_usd" in payload
+    assert isinstance(payload["cost_by_failure_class"], dict)
+    # Pin the bucket total: 1h on-demand ≈ $0.067. If the DB query included the
+    # current task (identity map double-count), this bucket would be ~$0.134.
+    assert "COMPLETED" in payload["cost_by_failure_class"]
+    completed_cost = payload["cost_by_failure_class"]["COMPLETED"]
+    assert 0.06 < completed_cost < 0.08, (
+        f"expected ~$0.067 single-count, got {completed_cost} (possible double-count)"
+    )
+    # Internal consistency: sum of buckets should equal daily_total_usd.
+    assert abs(sum(payload["cost_by_failure_class"].values()) - payload["daily_total_usd"]) < 0.01
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _run_auto_archive_cycle — age cap + per-project count cap
 # ══════════════════════════════════════════════════════════════════════════════

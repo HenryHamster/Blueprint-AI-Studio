@@ -144,6 +144,29 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
     )
     try:
         from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+        from app.failure_classification import classify_failure  # noqa: PLC0415
+        ctx = task.context or {}
+        first_payload = task.first_payload or {}
+        direction_text = (ctx.get("direction_text") or first_payload.get("direction_text") or "")
+        # Aggregate today's cost by failure class across this project's tasks.
+        # Exclude current task (added explicitly below) to avoid double-counting via identity map.
+        cost_rows = (await session.execute(
+            select(Task).where(
+                Task.project_id == task.project_id,
+                Task.id != task.id,
+                Task.vm_stopped_at >= today_start,
+                Task.vm_provisioned_at.is_not(None),
+            )
+        )).scalars().all()
+        cost_by_failure_class: dict[str, float] = {}
+        for t in list(cost_rows) + [task]:
+            if not (t.vm_provisioned_at and t.vm_stopped_at):
+                continue
+            secs = (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+            status_val = getattr(t.status, "value", None) or (t.status if isinstance(t.status, str) else "UNKNOWN")
+            bucket = classify_failure(t) if status_val == TaskStatus.FAILED.value else status_val
+            cost_by_failure_class[bucket] = round(cost_by_failure_class.get(bucket, 0.0) + secs * rate, 4)
         asyncio.ensure_future(dispatch_external_notification(
             task.project_id,
             "BUDGET_EXCEEDED",
@@ -151,6 +174,8 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                 "task_id": str(task.id),
                 "daily_total_usd": round(daily_total, 2),
                 "ceiling_usd": round(ceiling, 2),
+                "direction_text": direction_text[:200],
+                "cost_by_failure_class": cost_by_failure_class,
             },
         ))
     except Exception as _ne:
@@ -1339,6 +1364,10 @@ async def update_agent_status(
         if payload.status == TaskStatus.COMPLETED:
             try:
                 from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+                ctx = task.context or {}
+                first_payload = task.first_payload or {}
+                changed_files = ctx.get("_pr_changed_files") or []
+                direction_text = (ctx.get("direction_text") or first_payload.get("direction_text") or "")
                 asyncio.ensure_future(dispatch_external_notification(
                     task.project_id,
                     "TASK_COMPLETED",
@@ -1346,6 +1375,12 @@ async def update_agent_status(
                         "task_id": str(task.id),
                         "task_title": task.title or str(task.id)[:8],
                         "task_type": task.first_payload.get("type", ""),
+                        "pr_url": ctx.get("_pr_url") or ctx.get("pr_url") or "",
+                        "changed_files_count": len(changed_files),
+                        "direction_id": ctx.get("direction_id") or "",
+                        "direction_text": direction_text[:200],
+                        "scope": ctx.get("scope") or first_payload.get("scope") or "",
+                        "review_iterations": int(ctx.get("review_iterations") or 0),
                     },
                 ))
             except Exception as _ne:

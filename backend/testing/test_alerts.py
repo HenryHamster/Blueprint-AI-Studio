@@ -185,6 +185,49 @@ class TestFailureAlert:
         assert "See task logs for details." in alerts[0].message
 
     @pytest.mark.asyncio
+    async def test_task_failed_dispatch_payload_is_enriched(self, db_session, mocker):
+        import asyncio
+        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        dispatch_mock = mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            title="Build widget",
+            payloads=[{"type": "create", "scope": "small"}],
+            context={
+                "direction_id": "d-abc",
+                "direction_text": "improve coverage",
+                "pr_url": "https://example.com/pr/1",
+            },
+            attempt_count=2,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _maybe_create_failure_alert(task, db_session, error_snippet="boom")
+        await asyncio.sleep(0)
+
+        dispatch_mock.assert_called_once()
+        payload = dispatch_mock.call_args.args[2]
+        assert dispatch_mock.call_args.args[1] == "TASK_FAILED"
+        assert payload["failure_class"]
+        assert "taxonomy" in payload
+        assert payload["direction_id"] == "d-abc"
+        assert payload["direction_text"] == "improve coverage"
+        assert payload["scope"] == "small"
+        assert payload["pr_url"] == "https://example.com/pr/1"
+        assert payload["attempt_count"] == 2
+
+    @pytest.mark.asyncio
     async def test_broadcasts_alert_created_event(self, db_session, mocker):
         mock_bc = mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()

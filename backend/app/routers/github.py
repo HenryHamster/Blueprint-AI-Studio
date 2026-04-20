@@ -348,6 +348,17 @@ async def github_webhook(
                         try:
                             from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
                             for at in affected_tasks:
+                                at_ctx = at.context if isinstance(at.context, dict) else {}
+                                at_payload = at.first_payload or {}
+                                raw_changed = at_ctx.get("_pr_changed_files")
+                                changed_files_count = (
+                                    len([f for f in raw_changed if isinstance(f, str)])
+                                    if isinstance(raw_changed, list) else 0
+                                )
+                                direction_text = (
+                                    at_ctx.get("direction_text")
+                                    or at_payload.get("direction_text") or ""
+                                )
                                 asyncio.ensure_future(dispatch_external_notification(
                                     at.project_id,
                                     "PR_MERGED",
@@ -356,6 +367,10 @@ async def github_webhook(
                                         "task_title": at.title or str(at.id)[:8],
                                         "pr_number": pr_number,
                                         "repo": f"{owner}/{repo}",
+                                        "direction_id": at_ctx.get("direction_id") or "",
+                                        "direction_text": direction_text[:200],
+                                        "scope": at_ctx.get("scope") or at_payload.get("scope") or "",
+                                        "changed_files": changed_files_count,
                                     },
                                 ))
                         except Exception as _ne:

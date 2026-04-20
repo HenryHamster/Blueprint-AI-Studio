@@ -492,7 +492,16 @@ async def post_auto_fix_result_message(
                         asyncio.ensure_future(dispatch_external_notification(
                             project_id,
                             'AUTO_FIX_ESCALATED',
-                            {'branch': branch, 'consecutive_failures': count},
+                            {
+                                'branch': branch,
+                                'consecutive_failures': count,
+                                'threshold': threshold,
+                                'suspended_at': suspension_meta[branch]['suspended_at'],
+                                'recovery_attempts': suspension_meta[branch]['recovery_attempts'],
+                                'severity': 'blocker',
+                                'manual_intervention_required': True,
+                                'summary': summary,
+                            },
                         ))
                         return msg
 
@@ -585,6 +594,9 @@ async def post_remediation_escalation_message(
             "failure_pattern": failure_pattern[:200],
             "attempts": attempts,
             "remediation_summary": remediation_summary[:240],
+            "severity": "blocker",
+            "manual_intervention_required": True,
+            "summary": summary,
         },
     ))
     return msg

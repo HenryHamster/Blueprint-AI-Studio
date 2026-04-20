@@ -1270,6 +1270,72 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
 
 
 @pytest.mark.asyncio
+async def test_pr_merged_dispatches_enriched_payload(client, db_session, mocker):
+    """PR_MERGED webhook payload includes direction_text, scope, direction_id, changed_files."""
+    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch("app.autonomous_research._check_autonomous_research", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock
+    )
+
+    project = Project(
+        name="Enriched Merge",
+        user_id="user1",
+        github_owner="enrichorg",
+        github_repo="enrichrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Add feature",
+        payloads=[{"type": "create", "prompt": "do it"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "direction_id": "d-abc123",
+            "direction_text": "Improve webhook payload richness",
+            "scope": "small",
+            "_pr_changed_files": ["a.py", "b.py", "c.py"],
+        },
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/enrichorg/enrichrepo/pull/77",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    payload_bytes = _make_pr_merged_payload("enrichorg", "enrichrepo", 77)
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+    assert resp.status_code == 200
+
+    # ensure_future schedules the coroutine — let event loop run it
+    import asyncio as _asyncio
+    await _asyncio.sleep(0)
+
+    assert dispatch_mock.await_count >= 1
+    args, _kwargs = dispatch_mock.await_args_list[0].args, dispatch_mock.await_args_list[0].kwargs
+    assert args[1] == "PR_MERGED"
+    body = args[2]
+    assert body["direction_id"] == "d-abc123"
+    assert body["direction_text"] == "Improve webhook payload richness"
+    assert body["scope"] == "small"
+    assert body["changed_files"] == 3
+    assert body["repo"] == "enrichorg/enrichrepo"
+
+
+@pytest.mark.asyncio
 async def test_pr_merged_unregistered_repo_ignored(client, db_session, mocker):
     """
     A closed+merged webhook for a repo that has no registered project returns

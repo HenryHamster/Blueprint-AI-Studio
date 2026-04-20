@@ -1634,6 +1634,48 @@ async def test_dispatch_rollup_approval_alert_creates_alert(rollup_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_rollup_approval_alert_enriched_payload(rollup_db, mocker):
+    """APPROVAL_NEEDED payload includes actionable context fields."""
+    from app.rollup_management import _dispatch_rollup_approval_alert
+
+    mock_dispatch = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock
+    )
+    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Enriched", user_id="user1")
+    rollup_db.add(project)
+    await rollup_db.commit()
+    await rollup_db.refresh(project)
+    parent = Task(
+        project_id=project.id,
+        title="rollup parent",
+        payloads=[{"type": "research", "scope": "medium"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "direction_id": "d-abc",
+            "direction_text": "Improve webhook payloads",
+            "rollup_pr_url": "https://github.com/o/r/pull/99",
+            "critical_files": ["backend/app/main.py", "backend/app/models.py"],
+        },
+    )
+    rollup_db.add(parent)
+    await rollup_db.commit()
+    await rollup_db.refresh(parent)
+
+    await _dispatch_rollup_approval_alert(parent, rollup_db, "stuck cycle", pr_number=99)
+    await rollup_db.commit()
+
+    payload = [c for c in mock_dispatch.call_args_list if c.args[1] == "APPROVAL_NEEDED"][0].args[2]
+    assert payload["approval_reason"] == "stuck cycle"
+    assert payload["pr_url"] == "https://github.com/o/r/pull/99"
+    assert payload["critical_files"] == ["backend/app/main.py", "backend/app/models.py"]
+    assert payload["direction_id"] == "d-abc"
+    assert payload["direction_text"] == "Improve webhook payloads"
+    assert payload["scope"] == "medium"
+
+
+@pytest.mark.asyncio
 async def test_rollup_retry_exhaustion_creates_failure_alert(rollup_db, mocker):
     """When rollup PR creation fails after exhausting retries, the parent
     transitions to FAILED *and* a failure alert is created so operators know

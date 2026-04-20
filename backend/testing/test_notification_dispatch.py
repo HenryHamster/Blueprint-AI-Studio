@@ -499,6 +499,9 @@ async def test_post_remediation_escalation_message_fires_webhook(db_session):
     assert args[2]["failure_pattern"] == "AssertionError in test_foo"
     assert args[2]["attempts"] == 3
     assert args[2]["remediation_summary"].startswith("Added retry wrapper")
+    assert args[2]["severity"] == "blocker"
+    assert args[2]["manual_intervention_required"] is True
+    assert "summary" in args[2] and args[2]["summary"]
 
 
 @pytest.mark.asyncio
@@ -673,6 +676,31 @@ async def test_escalation_at_threshold_suspends_branch(db_session):
     assert len(escalation_msgs) == 1
     assert "suspended" in escalation_msgs[0].content
     assert "main" in escalation_msgs[0].content
+
+
+@pytest.mark.asyncio
+async def test_escalation_webhook_payload_is_enriched(db_session):
+    """AUTO_FIX_ESCALATED webhook payload includes actionable context fields."""
+    project = await _create_ar_project(db_session, design_doc={
+        "_auto_remediation": {"enabled": True, "branch_failure_counts": {"main": 2}},
+    })
+    dispatch_mock = AsyncMock()
+    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+        await post_auto_fix_result_message(db_session, project.id, branch="main", result="failed")
+        import asyncio as _asyncio  # noqa: PLC0415
+        await _asyncio.sleep(0)
+    dispatch_mock.assert_called_once()
+    args, _ = dispatch_mock.call_args
+    assert args[1] == "AUTO_FIX_ESCALATED"
+    payload = args[2]
+    assert payload["branch"] == "main"
+    assert payload["consecutive_failures"] == 3
+    assert payload["threshold"] == 3
+    assert payload["suspended_at"]
+    assert payload["recovery_attempts"] == 0
+    assert payload["severity"] == "blocker"
+    assert payload["manual_intervention_required"] is True
+    assert "summary" in payload and payload["summary"]
 
 
 @pytest.mark.asyncio

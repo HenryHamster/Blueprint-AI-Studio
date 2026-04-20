@@ -744,7 +744,12 @@ async def _maybe_create_failure_alert(
     )
     try:
         from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+        from app.failure_classification import classify_failure, classify_failure_taxonomy  # noqa: PLC0415
         import asyncio as _asyncio
+        ctx = task.context or {}
+        payload = task.first_payload or {}
+        direction_text = (ctx.get("direction_text") or payload.get("direction_text") or "")
+        pr_url = ctx.get("pr_url") or ctx.get("rollup_pr_url") or payload.get("pr_url") or ""
         _asyncio.ensure_future(dispatch_external_notification(
             task.project_id,
             "TASK_FAILED",
@@ -753,6 +758,13 @@ async def _maybe_create_failure_alert(
                 "task_title": task.title or str(task.id)[:8],
                 "task_type": task_type,
                 "error_snippet": error_snippet or "",
+                "failure_class": classify_failure(task),
+                "taxonomy": classify_failure_taxonomy(task),
+                "direction_id": ctx.get("direction_id") or "",
+                "direction_text": direction_text[:200],
+                "scope": ctx.get("scope") or payload.get("scope") or "",
+                "pr_url": pr_url,
+                "attempt_count": int(task.attempt_count or 0),
             },
         ))
     except Exception as _ne:

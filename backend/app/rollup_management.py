@@ -87,6 +87,22 @@ async def _dispatch_rollup_approval_alert(
     except Exception as e:
         logger.warning(f"[NOTIFY] rollup approval alert creation failed: {e}")
     try:
+        parent_ctx = parent.context if isinstance(parent.context, dict) else {}
+        parent_payload = parent.first_payload or {}
+        pr_url = parent_ctx.get("rollup_pr_url") or ""
+        if not pr_url and pr_number:
+            repo_full = parent_ctx.get("repo_full_name") or parent_ctx.get("repo") or ""
+            if repo_full:
+                pr_url = f"https://github.com/{repo_full}/pull/{pr_number}"
+        raw_critical = parent_ctx.get("critical_files") or parent_ctx.get("_pr_changed_files") or []
+        critical_files = (
+            [f for f in raw_critical if isinstance(f, str)][:10]
+            if isinstance(raw_critical, list) else []
+        )
+        direction_text = (
+            parent_ctx.get("direction_text") or parent_payload.get("direction_text") or ""
+        )
+        scope = parent_ctx.get("scope") or parent_payload.get("scope") or ""
         _asyncio.ensure_future(dispatch_external_notification(  # noqa: RUF006
             parent.project_id,
             "APPROVAL_NEEDED",
@@ -95,6 +111,12 @@ async def _dispatch_rollup_approval_alert(
                 "task_title": parent.title or str(parent.id)[:8],
                 "pr_number": pr_number,
                 "reason": reason,
+                "approval_reason": reason,
+                "pr_url": pr_url,
+                "critical_files": critical_files,
+                "direction_id": parent_ctx.get("direction_id") or "",
+                "direction_text": direction_text[:200],
+                "scope": scope,
             },
         ))
     except Exception as e:
