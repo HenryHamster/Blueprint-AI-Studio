@@ -20,7 +20,7 @@ from typing import Any, Optional
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import MessageType, Project, ProjectMessage, _utcnow
+from app.models import MessageType, Project, ProjectMessage, Task, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -395,6 +395,7 @@ async def post_auto_fix_spawned_message(
 
 
 _AUTO_REMEDIATION_ESCALATION_THRESHOLD = 3
+_AUTO_REMEDIATION_REGRESSION_ESCALATION_THRESHOLD = 1
 
 
 async def post_auto_fix_result_message(
@@ -441,20 +442,38 @@ async def post_auto_fix_result_message(
                 ar_config = dict(design_doc.get('_auto_remediation', {}))
                 failure_counts: dict[str, int] = dict(ar_config.get('branch_failure_counts', {}))
                 suspended: list[str] = list(ar_config.get('suspended_branches', []))
+                suspension_meta: dict[str, dict] = dict(ar_config.get('suspension_metadata', {}))
 
                 if result == 'merged':
                     # Reset on success
                     failure_counts.pop(branch, None)
                     if branch in suspended:
                         suspended.remove(branch)
+                    suspension_meta.pop(branch, None)
                 else:
                     # Increment consecutive failure counter
                     failure_counts[branch] = failure_counts.get(branch, 0) + 1
                     count = failure_counts[branch]
-                    if count >= _AUTO_REMEDIATION_ESCALATION_THRESHOLD and branch not in suspended:
+                    # If the triggering task was flagged as a regression of a
+                    # recently-merged fix, suspend earlier — a straightforward
+                    # fix has already been tried and didn't hold.
+                    threshold = _AUTO_REMEDIATION_ESCALATION_THRESHOLD
+                    if task_id is not None:
+                        triggering = await session.get(Task, task_id)
+                        if triggering is not None and (triggering.context or {}).get("regression_of_task_id"):
+                            threshold = _AUTO_REMEDIATION_REGRESSION_ESCALATION_THRESHOLD
+                    if count >= threshold and branch not in suspended:
                         suspended.append(branch)
+                        # Preserve recovery_attempts across re-suspensions so
+                        # exponential backoff applies on repeated failures.
+                        prior = suspension_meta.get(branch) or {}
+                        suspension_meta[branch] = {
+                            'suspended_at': _utcnow().isoformat(),
+                            'recovery_attempts': int(prior.get('recovery_attempts', 0) or 0),
+                        }
                         ar_config['branch_failure_counts'] = failure_counts
                         ar_config['suspended_branches'] = suspended
+                        ar_config['suspension_metadata'] = suspension_meta
                         design_doc['_auto_remediation'] = ar_config
                         project.design_doc = design_doc
                         flag_modified(project, 'design_doc')
@@ -472,6 +491,7 @@ async def post_auto_fix_result_message(
 
                 ar_config['branch_failure_counts'] = failure_counts
                 ar_config['suspended_branches'] = suspended
+                ar_config['suspension_metadata'] = suspension_meta
                 design_doc['_auto_remediation'] = ar_config
                 project.design_doc = design_doc
                 flag_modified(project, 'design_doc')

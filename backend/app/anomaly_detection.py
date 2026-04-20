@@ -58,10 +58,33 @@ def _normalize_error_message(msg: str) -> str:
     return normalized.strip()
 
 
-def _error_fingerprint(msg: str) -> str:
-    """Return a short hash fingerprint of a normalized error message."""
+def _error_fingerprint(msg: str, stage: "str | None" = None) -> str:
+    """Return a short hash fingerprint of a normalized error message.
+
+    When ``stage`` is provided, it is mixed into the hash so failures at
+    different pipeline stages (test vs build vs merge) produce distinct
+    fingerprints even when their error messages normalize identically.
+    Callers that omit ``stage`` get the legacy message-only fingerprint.
+    """
     normalized = _normalize_error_message(msg or "")
-    return hashlib.sha256(normalized.encode()).hexdigest()[:12]
+    prefix = f"{stage}|" if stage else ""
+    return hashlib.sha256(f"{prefix}{normalized}".encode()).hexdigest()[:12]
+
+
+def _task_error_fingerprint(task) -> "str | None":
+    """Return the stage-aware fingerprint for ``task``, or None if no message."""
+    msg = getattr(task, "latest_status_message", None) or ""
+    if not msg:
+        return None
+    stage: str | None = None
+    try:
+        from app.failure_classification import classify_failure  # noqa: PLC0415
+        from app.failure_stage import _derive_failure_stage  # noqa: PLC0415
+        cls = classify_failure(task) or ""
+        stage = _derive_failure_stage(cls, msg)
+    except Exception:
+        stage = None
+    return _error_fingerprint(msg, stage)
 
 
 def count_matching_fingerprints(target_fingerprint: str, failed_tasks) -> int:
@@ -79,8 +102,8 @@ def count_matching_fingerprints(target_fingerprint: str, failed_tasks) -> int:
         return 0
     count = 0
     for task in failed_tasks or ():
-        msg = getattr(task, "latest_status_message", None) or ""
-        if msg and _error_fingerprint(msg) == target_fingerprint:
+        fp = _task_error_fingerprint(task)
+        if fp and fp == target_fingerprint:
             count += 1
     return count
 
@@ -939,6 +962,38 @@ def _check_fast_recovery() -> bool:
             return False
 
     return True
+
+
+async def seed_task_results_from_db(session: AsyncSession, hours: int = _FAST_RECOVERY_WINDOW_HOURS) -> int:
+    """Backfill deploy_monitoring['task_results'] from recently completed tasks.
+
+    The fast-recovery window relies on an in-memory deque that empties on pod
+    restart, leaving the throttle pinned for ~2h until enough new completions
+    accrue. This rebuilds the deque from tasks whose vm_stopped_at falls within
+    the window so fast-recovery can fire on the first sweep after restart.
+    """
+    from app.failure_classification import classify_failure  # noqa: PLC0415
+
+    cutoff = _utcnow() - timedelta(hours=hours)
+    stmt = (
+        select(Task)
+        .where(Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]))
+        .where(Task.vm_stopped_at.is_not(None))
+        .where(Task.vm_stopped_at >= cutoff)
+        .order_by(Task.vm_stopped_at)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    deque_ref = _shared_state.deploy_monitoring["task_results"]
+    seeded = 0
+    for task in rows:
+        success = task.status == TaskStatus.COMPLETED
+        failure_class = "" if success else classify_failure(task)
+        task_type = task.first_payload.get("type", "")
+        ts_iso = task.vm_stopped_at.isoformat()
+        deque_ref.append((ts_iso, "success" if success else "failure", failure_class, task_type))
+        seeded += 1
+    return seeded
 
 
 async def check_anomaly_actions() -> dict:

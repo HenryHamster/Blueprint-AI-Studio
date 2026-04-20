@@ -139,7 +139,7 @@ async def _compute_direction_error_fingerprint(
     pattern and the escalation path can compare it against the last
     remediation's fingerprint.
     """
-    from app.anomaly_detection import _error_fingerprint, count_matching_fingerprints  # noqa: PLC0415
+    from app.anomaly_detection import _task_error_fingerprint, count_matching_fingerprints  # noqa: PLC0415
 
     base_query = select(Task).where(
         Task.project_id == project_id,
@@ -156,11 +156,8 @@ async def _compute_direction_error_fingerprint(
     best_count = 0
     seen: set[str] = set()
     for t in failed_tasks:
-        msg = t.latest_status_message or ""
-        if not msg:
-            continue
-        fp = _error_fingerprint(msg)
-        if fp in seen:
+        fp = _task_error_fingerprint(t)
+        if not fp or fp in seen:
             continue
         seen.add(fp)
         count = count_matching_fingerprints(fp, failed_tasks)
@@ -702,7 +699,11 @@ async def _process_direction_lifecycle(
             except Exception as _e:
                 logger.warning(f"[NOTIFY] Failed to post auto-paused message: {_e}")
             try:
-                await _spawn_direction_diagnosis(project, d, pause_reason, session)
+                if _is_code_failure_pause_reason(pause_reason):
+                    await _spawn_direction_diagnosis(project, d, pause_reason, session)
+                else:
+                    from app.autonomous_research_diagnosis import _spawn_unproductive_diagnosis  # noqa: PLC0415
+                    await _spawn_unproductive_diagnosis(project, d, pause_reason, session)
             except Exception as _e:
                 logger.warning(f"[DIAGNOSIS] Failed to spawn investigate task for {did}: {_e}")
             MAX_AUTO_PAUSE_CYCLES = _MAX_AUTO_PAUSE_CYCLES

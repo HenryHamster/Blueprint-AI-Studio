@@ -21,6 +21,96 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
+# Auto-recovery of suspended branches: after SUSPENSION_BASE_COOLDOWN_HOURS,
+# attempt remediation again. Cooldown doubles per recovery attempt
+# (exponential backoff). After MAX_AUTO_RECOVERY_ATTEMPTS, the branch stays
+# permanently suspended and requires manual intervention.
+SUSPENSION_BASE_COOLDOWN_HOURS = 24
+MAX_AUTO_RECOVERY_ATTEMPTS = 3
+
+
+def _suspension_cooldown_elapsed(meta: dict, now: datetime) -> bool:
+    """Return True if the suspension entry's cooldown has elapsed."""
+    attempts = int(meta.get("recovery_attempts", 0) or 0)
+    if attempts >= MAX_AUTO_RECOVERY_ATTEMPTS:
+        return False
+    suspended_at_str = meta.get("suspended_at")
+    if not suspended_at_str:
+        return False
+    try:
+        suspended_at = datetime.fromisoformat(suspended_at_str)
+    except (TypeError, ValueError):
+        return False
+    cooldown = timedelta(hours=SUSPENSION_BASE_COOLDOWN_HOURS * (2 ** attempts))
+    return now >= suspended_at + cooldown
+
+
+async def _try_auto_recover_suspension(
+    *,
+    project_id: uuid.UUID,
+    branch: str,
+    config: dict[str, Any],
+    session: AsyncSession,
+) -> bool:
+    """Clear a suspended branch when its cooldown has elapsed.
+
+    Returns True if the branch was recovered (caller should proceed with
+    remediation), False if still in cooldown or permanently suspended.
+    Persists changes to the project's _auto_remediation config.
+    """
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+    meta = (config.get("suspension_metadata") or {}).get(branch) or {}
+    now = _utcnow()
+
+    if not _suspension_cooldown_elapsed(meta, now):
+        # Backfill missing timestamp so the first auto-recovery can happen
+        # after a full cooldown from this point.
+        if not meta.get("suspended_at") and int(meta.get("recovery_attempts", 0) or 0) < MAX_AUTO_RECOVERY_ATTEMPTS:
+            project = await session.get(Project, project_id)
+            if project is not None:
+                design_doc = dict(project.design_doc or {})
+                ar_config = dict(design_doc.get("_auto_remediation", {}))
+                suspension_meta = dict(ar_config.get("suspension_metadata", {}))
+                entry = dict(suspension_meta.get(branch) or {})
+                entry["suspended_at"] = now.isoformat()
+                entry.setdefault("recovery_attempts", 0)
+                suspension_meta[branch] = entry
+                ar_config["suspension_metadata"] = suspension_meta
+                design_doc["_auto_remediation"] = ar_config
+                project.design_doc = design_doc
+                flag_modified(project, "design_doc")
+                session.add(project)
+        return False
+
+    project = await session.get(Project, project_id)
+    if project is None:
+        return False
+    design_doc = dict(project.design_doc or {})
+    ar_config = dict(design_doc.get("_auto_remediation", {}))
+    suspended = [b for b in ar_config.get("suspended_branches", []) if b != branch]
+    failure_counts = dict(ar_config.get("branch_failure_counts", {}))
+    failure_counts.pop(branch, None)
+    suspension_meta = dict(ar_config.get("suspension_metadata", {}))
+    attempts = int(meta.get("recovery_attempts", 0) or 0)
+    suspension_meta[branch] = {
+        "suspended_at": meta.get("suspended_at"),
+        "recovery_attempts": attempts + 1,
+    }
+    ar_config["suspended_branches"] = suspended
+    ar_config["branch_failure_counts"] = failure_counts
+    ar_config["suspension_metadata"] = suspension_meta
+    design_doc["_auto_remediation"] = ar_config
+    project.design_doc = design_doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+    await session.flush()
+    logger.info(
+        "[AUTO-REMEDIATION] Auto-recovering suspended branch %s (attempt %d/%d)",
+        branch, attempts + 1, MAX_AUTO_RECOVERY_ATTEMPTS,
+    )
+    return True
+
 
 async def _handle_main_branch_ci_failure(
     *,
@@ -71,12 +161,28 @@ async def _handle_main_branch_ci_failure_inner(
     # ── Guard: branch suspension (escalation after repeated failures) ──
     suspended_branches = config.get("suspended_branches", [])
     if head_branch in suspended_branches:
-        logger.info(
-            "[AUTO-REMEDIATION] Branch %s is suspended after repeated failures — skipping. "
-            "Clear via PATCH /auto-remediation to re-enable.",
-            head_branch,
+        recovered = await _try_auto_recover_suspension(
+            project_id=project_id, branch=head_branch, config=config, session=session,
         )
-        return
+        if not recovered:
+            logger.info(
+                "[AUTO-REMEDIATION] Branch %s is suspended (cooldown not elapsed or "
+                "max auto-recovery attempts reached) — skipping.",
+                head_branch,
+            )
+            meta = (config.get("suspension_metadata") or {}).get(head_branch) or {}
+            if int(meta.get("recovery_attempts", 0) or 0) >= MAX_AUTO_RECOVERY_ATTEMPTS:
+                try:
+                    from app.main import _send_webhook_notification  # noqa: PLC0415
+                    import asyncio  # noqa: PLC0415
+                    asyncio.ensure_future(_send_webhook_notification(
+                        "AUTO_FIX_PERMANENT_ESCALATION",
+                        f"Branch {head_branch} permanently suspended",
+                        f"Auto-recovery exhausted after {MAX_AUTO_RECOVERY_ATTEMPTS} attempts — manual intervention required",
+                    ))
+                except Exception as exc:
+                    logger.warning("[AUTO-REMEDIATION] Failed to send permanent-escalation webhook: %s", exc)
+            return
 
     # ── Guard: rate limit ──
     one_hour_ago = now - timedelta(hours=1)
@@ -188,6 +294,22 @@ async def _handle_main_branch_ci_failure_inner(
         session=session,
     )
 
+    # ── Regression detection: recently-merged remediation for same branch+fingerprint ──
+    regression_of: Task | None = None
+    if error_summary:
+        from app.anomaly_detection import _error_fingerprint as _fp
+        from app.failure_stage import _derive_failure_stage
+        # Match the stage-aware fingerprint that new remediation tasks persist
+        # (see below) so regression lookups can actually hit on prior stored rows.
+        _probe_stage = _derive_failure_stage("CODE_ERROR", error_summary)
+        _fingerprint_probe = _fp(error_summary, _probe_stage)
+        regression_of = await _find_recent_merged_remediation(
+            project_id=project_id,
+            branch=head_branch,
+            fingerprint=_fingerprint_probe,
+            session=session,
+        )
+
     # ── Create the fix task ──
     prompt = _build_remediation_prompt(
         head_branch=head_branch,
@@ -196,6 +318,7 @@ async def _handle_main_branch_ci_failure_inner(
         error_summary=error_summary,
         failure_type=failure_type,
         prior_investigation=prior_investigation,
+        regression_of=regression_of,
     )
 
     task_context: dict[str, Any] = {
@@ -206,10 +329,20 @@ async def _handle_main_branch_ci_failure_inner(
         "ci_failure_type": failure_type,
         "trigger_failure_class": "CODE_ERROR",
     }
+    if regression_of is not None:
+        task_context["regression_of_task_id"] = str(regression_of.id)
+        prev_pr = (regression_of.context or {}).get("merged_pr_number") \
+            or (regression_of.context or {}).get("pr_number")
+        if prev_pr:
+            task_context["regression_prior_pr_number"] = prev_pr
     fingerprint: str | None = None
     if error_summary:
         from app.anomaly_detection import _error_fingerprint
-        fingerprint = _error_fingerprint(error_summary)
+        from app.failure_stage import _derive_failure_stage
+        # CI remediation tasks classify as CODE_ERROR; stage is inferred from
+        # the error text so build/test/lint failures fingerprint distinctly.
+        stage = _derive_failure_stage("CODE_ERROR", error_summary)
+        fingerprint = _error_fingerprint(error_summary, stage)
         task_context["_previous_error_fingerprint"] = fingerprint
     if prior_investigation is not None:
         task_context["prior_diagnosis_task_id"] = str(prior_investigation.id)
@@ -355,6 +488,41 @@ async def _find_direction_by_fingerprint(
     return None
 
 
+async def _find_recent_merged_remediation(
+    *,
+    project_id: uuid.UUID,
+    branch: str,
+    fingerprint: str | None,
+    session: AsyncSession,
+    window_hours: int = 48,
+) -> Task | None:
+    """Return a recently-completed auto-remediation task for the same branch+fingerprint.
+
+    Used to detect regressions: if a prior fix merged for this error fingerprint
+    and CI is failing again on the same branch with the same signature, the fix
+    did not hold.
+    """
+    if not fingerprint:
+        return None
+    cutoff = _utcnow() - timedelta(hours=window_hours)
+    rows = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+        ).order_by(Task.created_at.desc())
+    )).scalars().all()
+    for t in rows:
+        ctx = t.context or {}
+        if ctx.get("auto_remediation") is not True:
+            continue
+        if ctx.get("ci_failure_branch") != branch:
+            continue
+        if ctx.get("_previous_error_fingerprint") == fingerprint:
+            return t
+    return None
+
+
 async def _find_matching_prior_investigation(
     *,
     project_id: uuid.UUID,
@@ -421,6 +589,7 @@ def _build_remediation_prompt(
     error_summary: str,
     failure_type: str = "unknown",
     prior_investigation: Task | None = None,
+    regression_of: Task | None = None,
 ) -> str:
     """Build the agent prompt for a CI auto-remediation task."""
     checks_text = "\n".join(f"  - {name}" for name in failed_checks) if failed_checks else "  (check names not available)"
@@ -449,8 +618,23 @@ def _build_remediation_prompt(
                 f"Use this diagnosis as a starting point, but verify it still applies.\n"
             )
 
+    regression_section = ""
+    if regression_of is not None:
+        prev_ctx = regression_of.context or {}
+        prev_pr = prev_ctx.get("merged_pr_number") or prev_ctx.get("pr_number")
+        pr_text = f"PR #{prev_pr}" if prev_pr else f"task {str(regression_of.id)[:8]}"
+        regression_section = (
+            f"\n⚠️ REGRESSION DETECTED:\n"
+            f"A prior auto-remediation ({pr_text}) for the same branch recently merged\n"
+            f"with a matching error fingerprint, but CI is failing again with the same\n"
+            f"signature. The previous fix did not resolve the underlying problem.\n"
+            f"Review {pr_text} to see what was attempted, then apply a deeper fix that\n"
+            f"addresses the root cause rather than repeating the prior surface-level change.\n"
+        )
+
     return (
         f"CI is failing on the `{head_branch}` branch at commit {head_sha}.\n\n"
+        f"{regression_section}"
         f"Failure classification: {failure_type} (test failures, build errors, lint issues, or mixed)\n\n"
         f"Failed checks:\n{checks_text}\n\n"
         f"Error output (truncated):\n```\n{summary_text}\n```\n"

@@ -19,6 +19,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 import app.shared_state as _ss
 from app.anomaly_detection import _error_fingerprint
+from app.autonomous_research_diagnosis import _spawn_unproductive_diagnosis
 from app.direction_lifecycle import (
     _compute_direction_error_fingerprint,
     _process_direction_lifecycle,
@@ -98,6 +99,53 @@ async def test_skips_for_non_code_failure_pause_reason(db_session):
     )
     assert spawned is False
     assert "diagnosis_in_progress" not in direction
+
+
+@pytest.mark.asyncio
+async def test_unproductive_diagnosis_spawns_investigate_for_non_code_pause(db_session):
+    project = await _make_project(db_session)
+    direction = _direction(did="d-unprod-1")
+    reason = "Unproductive: 0 PRs merged from 5 research cycles (12 tasks created)"
+    spawned = await _spawn_unproductive_diagnosis(project, direction, reason, db_session)
+    assert spawned is True
+    assert "unproductive_diagnosis_spawned_at" in direction
+    await db_session.commit()
+    tasks = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().all()
+    assert len(tasks) == 1
+    t = tasks[0]
+    assert t.first_payload["type"] == "investigate"
+    assert t.first_payload.get("effort") == "low"
+    assert t.context["diagnosis_trigger"] == "direction_unproductive_pause"
+    assert t.context["unproductive_diagnosis_direction_id"] == "d-unprod-1"
+    assert t.priority == 60
+
+
+@pytest.mark.asyncio
+async def test_unproductive_diagnosis_skips_code_failure_pause(db_session):
+    project = await _make_project(db_session)
+    direction = _direction(did="d-unprod-skip")
+    spawned = await _spawn_unproductive_diagnosis(
+        project, direction, "High code failure rate: ...", db_session
+    )
+    assert spawned is False
+    assert "unproductive_diagnosis_spawned_at" not in direction
+
+
+@pytest.mark.asyncio
+async def test_unproductive_diagnosis_dedups_within_window(db_session):
+    project = await _make_project(db_session)
+    direction = _direction(did="d-unprod-dedup")
+    reason = "Saturated: last 5 research cycles produced no actionable findings"
+    assert await _spawn_unproductive_diagnosis(project, direction, reason, db_session) is True
+    await db_session.commit()
+    direction.pop("unproductive_diagnosis_spawned_at", None)
+    assert await _spawn_unproductive_diagnosis(project, direction, reason, db_session) is False
+    tasks = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().all()
+    assert len(tasks) == 1
 
 
 @pytest.mark.asyncio
@@ -1042,7 +1090,7 @@ async def test_fingerprint_returns_dominant_when_threshold_met(db_session):
     project = await _make_project(db_session)
     for _ in range(2):
         await _add_failed_task(db_session, project.id, "d-fp-dom", "AssertionError: values differ")
-    expected = _error_fingerprint("AssertionError: values differ")
+    expected = _error_fingerprint("AssertionError: values differ", "test")
     assert await _compute_direction_error_fingerprint(project.id, "d-fp-dom", db_session) == expected
 
 
@@ -1096,7 +1144,7 @@ async def test_fingerprint_uses_recent_failures_within_window(db_session):
             db_session, project.id, "d-fp-recency", recent_msg,
             created_at=now - timedelta(hours=1),
         )
-    expected = _error_fingerprint(recent_msg)
+    expected = _error_fingerprint(recent_msg, "integration")
     assert await _compute_direction_error_fingerprint(
         project.id, "d-fp-recency", db_session,
     ) == expected
@@ -1125,7 +1173,7 @@ async def test_fingerprint_excludes_stale_failures_outside_window(db_session):
     # the stale pattern is dominant.
     assert await _compute_direction_error_fingerprint(
         project.id, "d-fp-stale", db_session,
-    ) == _error_fingerprint(stale_msg)
+    ) == _error_fingerprint(stale_msg)  # "RateLimitError: slow down" has no stage keyword
 
 
 @pytest.mark.asyncio
@@ -1140,7 +1188,7 @@ async def test_fingerprint_falls_back_to_unfiltered_when_window_sparse(db_sessio
             db_session, project.id, "d-fp-sparse", msg,
             created_at=now - timedelta(days=30),
         )
-    expected = _error_fingerprint(msg)
+    expected = _error_fingerprint(msg, "test")
     assert await _compute_direction_error_fingerprint(
         project.id, "d-fp-sparse", db_session,
     ) == expected

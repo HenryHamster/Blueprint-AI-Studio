@@ -1064,3 +1064,52 @@ async def test_failure_rate_momentum_no_anomaly_when_below_threshold():
 
     result = await _compute_research_anomalies(project_id, session)
     assert not any("FailureRateMomentum" in a["signal"] for a in result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# seed_task_results_from_db
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_seed_task_results_from_db_populates_deque():
+    """Seeding rebuilds task_results from completed/failed tasks within window."""
+    import app.shared_state as _ss
+    from app.anomaly_detection import seed_task_results_from_db
+
+    _ss.deploy_monitoring["task_results"].clear()
+
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    in_window_ok = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        vm_stopped_at=now - timedelta(minutes=30),
+        payloads=[{"type": "create"}],
+    )
+    in_window_fail = make_task(
+        project_id=project_id,
+        status=TaskStatus.FAILED,
+        vm_stopped_at=now - timedelta(minutes=45),
+        payloads=[{"type": "fix"}],
+        latest_status_message="Build failed",
+    )
+    rows = [in_window_ok, in_window_fail]
+
+    scalars = MagicMock()
+    scalars.all.return_value = rows
+    result = MagicMock()
+    result.scalars.return_value = scalars
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=result)
+
+    seeded = await seed_task_results_from_db(session, hours=2)
+
+    assert seeded == 2
+    entries = list(_ss.deploy_monitoring["task_results"])
+    assert len(entries) == 2
+    assert entries[0][1] == "success"
+    assert entries[0][3] == "create"
+    assert entries[1][1] == "failure"
+    assert entries[1][3] == "fix"
+    assert entries[1][2] != ""  # failure_class populated

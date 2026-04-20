@@ -7,6 +7,7 @@ there) continue to work unchanged.
 """
 import logging
 import uuid
+from datetime import timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -14,8 +15,15 @@ from sqlmodel import select
 from app.models import Project, Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
+from app.strategic_completion import _is_code_failure_pause_reason
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+# Dedup window for unproductive-pause investigations. Shorter than the 48h
+# direction cooldown so a direction that bounces between saturation/unproductive
+# states within a week still gets one fresh diagnosis per pause event.
+_UNPRODUCTIVE_DIAGNOSIS_DEDUP_HOURS = 24
 
 
 async def _spawn_direction_diagnosis(
@@ -189,5 +197,105 @@ async def _spawn_direction_diagnosis(
     logger.info(
         f"[DIAGNOSIS] Spawned diagnosis research {new_task.id} for direction {did}: "
         f"{pause_reason} ({len(failed_signatures)} failed task signatures)"
+    )
+    return True
+
+
+async def _spawn_unproductive_diagnosis(
+    project: Project,
+    direction: dict,
+    pause_reason: str,
+    session: AsyncSession,
+) -> bool:
+    """Spawn a lightweight investigate task for a non-code-failure pause.
+
+    Saturation (Rule 1) and Unproductive (Rule 2) pauses won't benefit from the
+    code-failure diagnosis prompt: the question isn't "what pattern keeps
+    breaking?" but "why isn't this direction producing merged PRs?". This
+    investigation examines scope calibration, finding relevance, saturation
+    signals, and whether the direction's goal may already be met.
+
+    Guards: pause reason must be non-code-failure; dedup against any
+    unproductive-diagnosis task for this direction within the last 24h
+    (active OR recently created).
+
+    Returns True when a task was created, False when skipped.
+    """
+    if _is_code_failure_pause_reason(pause_reason):
+        return False
+    did = direction.get("id")
+    if not did:
+        return False
+
+    cutoff = _utcnow() - timedelta(hours=_UNPRODUCTIVE_DIAGNOSIS_DEDUP_HOURS)
+    existing = (await session.execute(
+        select(Task.id).where(
+            Task.project_id == project.id,
+            Task.context["unproductive_diagnosis_direction_id"].as_string() == str(did),
+            Task.created_at >= cutoff,
+        ).limit(1)
+    )).first()
+    if existing is not None:
+        logger.info(
+            f"[DIAGNOSIS] Skipping unproductive diagnosis for direction {did}: "
+            f"recent investigation already exists"
+        )
+        return False
+
+    history = direction.get("research_history") or []
+    recent_lines = "\n".join(
+        f"- created={e.get('tasks_created', 0)} completed={e.get('tasks_completed', 0)} "
+        f"failed={e.get('tasks_failed', 0)} merged={e.get('prs_merged', 0)} "
+        f"scope={e.get('scope_breakdown') or {}}"
+        for e in history[-5:]
+    ) or "- (no research history)"
+    direction_text = (direction.get("text") or "")[:200]
+    prompt = (
+        f"A research direction was auto-paused for non-code reasons.\n\n"
+        f"Direction: {direction_text}\n"
+        f"Pause reason: {pause_reason}\n"
+        f"Auto-pause count: {direction.get('auto_pause_count', 0)}\n\n"
+        f"Recent cycles (tasks_created / completed / failed / merged / scope):\n"
+        f"{recent_lines}\n\n"
+        f"Investigate why this direction is not producing merged PRs. Consider:\n"
+        f"- Is the direction's goal already substantially met by existing code?\n"
+        f"- Are spawned findings too narrow, too broad, or irrelevant to the goal?\n"
+        f"- Is scope calibration mis-sized (too small to ship value, too large to pass review)?\n"
+        f"- Is the direction saturated (all useful changes already shipped, now scraping edges)?\n"
+        f"Recommend one of: retire direction, reshape goal text, adjust scope targeting, or resume."
+    )
+    payload = validate_internal_payload(
+        {"type": "investigate", "prompt": prompt, "base_branch": "main", "effort": "low"},
+        "autonomous_research_diagnosis:unproductive",
+    )
+    new_task = Task(
+        project_id=project.id,
+        title=f"Investigate unproductive direction: {direction_text[:60]}",
+        description=f"Auto-pause reason: {pause_reason}"[:500],
+        payloads=[payload],
+        context={
+            "direction_id": str(did),
+            "pause_reason": pause_reason,
+            "diagnosis_trigger": "direction_unproductive_pause",
+            "unproductive_diagnosis_direction_id": str(did),
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        priority=60,
+    )
+    session.add(new_task)
+    session.add(TaskHistory(
+        task_id=new_task.id, action="SPAWNED",
+        details={
+            "spawned_by": "AUTONOMOUS_LOOP",
+            "trigger": "direction_unproductive_pause",
+            "pause_reason": pause_reason,
+        },
+    ))
+    direction["unproductive_diagnosis_spawned_at"] = _utcnow().isoformat()
+    logger.info(
+        f"[DIAGNOSIS] Spawned unproductive investigate {new_task.id} for direction {did}: "
+        f"{pause_reason[:60]}"
     )
     return True

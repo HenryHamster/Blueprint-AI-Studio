@@ -17,6 +17,7 @@ from app.auto_remediation import (
     _extract_ci_context,
     _build_remediation_prompt,
     _find_matching_prior_investigation,
+    _find_recent_merged_remediation,
     _utcnow,
 )
 
@@ -193,7 +194,8 @@ async def test_task_context_includes_error_fingerprint(db_session: AsyncSession)
 
     tasks = await session_tasks(db_session, project.id)
     assert len(tasks) == 1
-    assert tasks[0].context["_previous_error_fingerprint"] == _error_fingerprint(error_summary)
+    # Fingerprint is stage-aware: "AssertionError ... test_foo" → stage="test".
+    assert tasks[0].context["_previous_error_fingerprint"] == _error_fingerprint(error_summary, "test")
 
 
 async def session_tasks(session: AsyncSession, project_id: uuid.UUID) -> list[Task]:
@@ -553,6 +555,115 @@ async def test_skip_when_no_ci_context(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_suspended_branch_auto_recovers_after_cooldown(db_session: AsyncSession):
+    """Branch is auto-recovered when suspension cooldown has elapsed."""
+    suspended_at = (_utcnow() - timedelta(hours=25)).isoformat()
+    project = await _create_project(
+        db_session,
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "branch_failure_counts": {"main": 3},
+                "suspended_branches": ["main"],
+                "suspension_metadata": {
+                    "main": {"suspended_at": suspended_at, "recovery_attempts": 0},
+                },
+            }
+        },
+    )
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+        mock_ctx.return_value = (["CI / tests"], "error", "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=(project.design_doc or {}).get("_auto_remediation", {}),
+            session=db_session,
+        )
+
+    # Task should spawn and suspension should be lifted with attempts bumped
+    assert await _count_auto_tasks(db_session, project.id) == 1
+    ar = (project.design_doc or {}).get("_auto_remediation", {})
+    assert "main" not in ar.get("suspended_branches", [])
+    assert ar.get("suspension_metadata", {}).get("main", {}).get("recovery_attempts") == 1
+
+
+@pytest.mark.asyncio
+async def test_suspended_branch_within_cooldown_stays_blocked(db_session: AsyncSession):
+    """Suspension is enforced while cooldown has not elapsed."""
+    suspended_at = (_utcnow() - timedelta(hours=1)).isoformat()
+    project = await _create_project(
+        db_session,
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "suspended_branches": ["main"],
+                "suspension_metadata": {
+                    "main": {"suspended_at": suspended_at, "recovery_attempts": 0},
+                },
+            }
+        },
+    )
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx:
+        mock_ctx.return_value = (["CI"], "error", "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=(project.design_doc or {}).get("_auto_remediation", {}),
+            session=db_session,
+        )
+
+    assert await _count_auto_tasks(db_session, project.id) == 0
+    mock_ctx.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_suspended_branch_permanently_blocked_after_max_attempts(db_session: AsyncSession):
+    """After MAX_AUTO_RECOVERY_ATTEMPTS, branch stays suspended even past cooldown."""
+    from app.auto_remediation import MAX_AUTO_RECOVERY_ATTEMPTS
+    suspended_at = (_utcnow() - timedelta(days=365)).isoformat()
+    project = await _create_project(
+        db_session,
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "suspended_branches": ["main"],
+                "suspension_metadata": {
+                    "main": {
+                        "suspended_at": suspended_at,
+                        "recovery_attempts": MAX_AUTO_RECOVERY_ATTEMPTS,
+                    },
+                },
+            }
+        },
+    )
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock) as mock_webhook:
+        mock_ctx.return_value = (["CI"], "error", "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp", head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=(project.design_doc or {}).get("_auto_remediation", {}),
+            session=db_session,
+        )
+
+    assert await _count_auto_tasks(db_session, project.id) == 0
+    mock_ctx.assert_not_called()
+    # Permanent-escalation webhook should fire
+    assert any(
+        "PERMANENT" in (call.args[0] if call.args else "")
+        for call in mock_webhook.call_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_non_suspended_branch_spawns_normally(db_session: AsyncSession):
     """A branch not in suspended_branches proceeds normally."""
     project = await _create_project(db_session)
@@ -903,3 +1014,107 @@ async def test_remediation_outcome_recorded_when_auto_remediation_merges(db_sess
     assert target["remediation_attempts"] == 1
     assert target["last_remediation_fingerprint"] == "fp-abc"
     assert len(target["remediation_history"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_find_recent_merged_remediation_matches_branch_and_fingerprint(db_session: AsyncSession):
+    """A recent completed auto-remediation task with matching branch+fingerprint is found."""
+    project = await _create_project(db_session)
+    prior = Task(
+        project_id=project.id,
+        title="Auto-fix: CI failure on main",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "auto_remediation": True,
+            "ci_failure_branch": "main",
+            "_previous_error_fingerprint": "fp-xyz",
+        },
+    )
+    db_session.add(prior)
+    await db_session.flush()
+
+    match = await _find_recent_merged_remediation(
+        project_id=project.id, branch="main", fingerprint="fp-xyz", session=db_session,
+    )
+    assert match is not None and match.id == prior.id
+
+    # Different branch → no match
+    assert await _find_recent_merged_remediation(
+        project_id=project.id, branch="other", fingerprint="fp-xyz", session=db_session,
+    ) is None
+    # Different fingerprint → no match
+    assert await _find_recent_merged_remediation(
+        project_id=project.id, branch="main", fingerprint="fp-other", session=db_session,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_regression_detection_injects_context_and_prompt(db_session: AsyncSession):
+    """When a prior remediation merged for same branch+fingerprint, spawned task gets regression context."""
+    project = await _create_project(db_session)
+    from app.anomaly_detection import _error_fingerprint
+    from app.failure_stage import _derive_failure_stage
+    err = "AssertionError: boom specific pattern"
+    # Mirror production: prior remediation tasks persist the stage-aware
+    # fingerprint, so the regression probe must match that exact form.
+    fp = _error_fingerprint(err, _derive_failure_stage("CODE_ERROR", err))
+    prior = Task(
+        project_id=project.id,
+        title="Auto-fix: CI failure on main",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "auto_remediation": True,
+            "ci_failure_branch": "main",
+            "_previous_error_fingerprint": fp,
+            "merged_pr_number": 4242,
+        },
+    )
+    db_session.add(prior)
+    await db_session.flush()
+
+    with patch("app.auto_remediation._extract_ci_context", new_callable=AsyncMock) as mock_ctx, \
+         patch("app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock), \
+         patch("app.main._send_webhook_notification", new_callable=AsyncMock):
+        mock_ctx.return_value = (["CI / tests"], err, "test")
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme", repo="webapp",
+            head_sha="feedface", head_branch="main",
+            project_id=project.id, config=_default_config(),
+            session=db_session,
+        )
+
+    spawned = await session_tasks(db_session, project.id)
+    new_task = next(t for t in spawned if t.id != prior.id)
+    assert new_task.context.get("regression_of_task_id") == str(prior.id)
+    assert new_task.context.get("regression_prior_pr_number") == 4242
+    assert "REGRESSION DETECTED" in new_task.payloads[0]["prompt"]
+    assert "#4242" in new_task.payloads[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_regression_task_failure_suspends_at_threshold_one(db_session: AsyncSession):
+    """A failing task flagged as regression triggers suspension after a single failure."""
+    from app.notification_dispatch import post_auto_fix_result_message
+
+    project = await _create_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Auto-fix regression",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        context={"auto_remediation": True, "regression_of_task_id": str(uuid.uuid4())},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    with patch("app.notification_dispatch.post_auto_fix_escalation_message", new_callable=AsyncMock) as mock_esc, \
+         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock):
+        await post_auto_fix_result_message(
+            db_session, project.id, branch="main", result="failed", task_id=task.id,
+        )
+
+    mock_esc.assert_awaited_once()
+    ar = (project.design_doc or {}).get("_auto_remediation", {})
+    assert "main" in ar.get("suspended_branches", [])

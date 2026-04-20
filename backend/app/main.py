@@ -413,6 +413,16 @@ async def _init_deployment_state():
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore anomaly state: {e}", exc_info=True)
 
+        # Seed task_results from DB so fast-recovery has data after restart
+        # (in-memory deque is empty otherwise, blocking recovery for ~2h).
+        if _shared_state.anomaly_adjustments.get("active"):
+            try:
+                from app.anomaly_detection import seed_task_results_from_db  # noqa: PLC0415
+                seeded = await seed_task_results_from_db(session)
+                logger.info(f"[DEPLOY] Seeded {seeded} task_results from DB for fast-recovery")
+            except Exception as e:
+                logger.warning(f"[DEPLOY] Could not seed task_results from DB: {e}", exc_info=True)
+
         # Restore direction failure streaks — holds survive restarts silently
         try:
             dstate = getattr(state, 'direction_streak_state', None)
