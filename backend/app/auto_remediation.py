@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
+from app.direction_lifecycle import _REMEDIATION_MONITOR_EXPIRY_DAYS
 from app.github import get_check_runs_cached, get_repo_installation_token
 from app.models import Project, Task, TaskStatus
 from app.notification_dispatch import post_auto_fix_spawned_message
@@ -615,13 +616,14 @@ async def _find_recent_merged_remediation(
     branch: str,
     fingerprint: str | None,
     session: AsyncSession,
-    window_hours: int = 48,
+    window_hours: int = _REMEDIATION_MONITOR_EXPIRY_DAYS * 24,
 ) -> Task | None:
     """Return a recently-completed auto-remediation task for the same branch+fingerprint.
 
     Used to detect regressions: if a prior fix merged for this error fingerprint
     and CI is failing again on the same branch with the same signature, the fix
-    did not hold.
+    did not hold. The default window matches the remediation monitor expiry so
+    any failure within the monitored period is flagged as a regression.
     """
     if not fingerprint:
         return None
