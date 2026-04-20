@@ -614,6 +614,93 @@ async def restart_orchestrator(
     return {"status": "restarted"}
 
 
+@router.post("/memory/tracemalloc/start")
+async def memory_tracemalloc_start(
+    frames: int = Query(default=10, ge=1, le=50),
+    current_user: dict = Depends(require_admin),
+):
+    """Enable tracemalloc to diagnose the 4GB Cloud Run OOM.
+
+    Default kept off at startup (tracemalloc has ~10-25% overhead). Operator
+    turns it on, waits for RSS to climb, then calls /memory/snapshot to
+    identify the leak source. Turn off again with /memory/tracemalloc/stop.
+    """
+    import tracemalloc
+    if tracemalloc.is_tracing():
+        return {"status": "already_running", "frames": tracemalloc.get_traceback_limit()}
+    tracemalloc.start(frames)
+    logger.warning(f"[MEMORY] tracemalloc enabled with {frames} frames")
+    return {"status": "started", "frames": frames}
+
+
+@router.post("/memory/tracemalloc/stop")
+async def memory_tracemalloc_stop(
+    current_user: dict = Depends(require_admin),
+):
+    import tracemalloc
+    if not tracemalloc.is_tracing():
+        return {"status": "not_running"}
+    tracemalloc.stop()
+    logger.warning("[MEMORY] tracemalloc disabled")
+    return {"status": "stopped"}
+
+
+@router.get("/memory/snapshot")
+async def memory_snapshot(
+    top: int = Query(default=30, ge=5, le=100),
+    current_user: dict = Depends(require_admin),
+):
+    """Return top-N allocations plus RSS so we can ground the OOM debugging
+    in real data rather than guesses. Each snapshot is also emitted at
+    WARNING level so Cloud Logging preserves it even if the container OOMs
+    mid-request — that's the whole point of calling this right before the
+    limit is hit.
+    """
+    import tracemalloc
+    import os
+
+    rss_mb = None
+    try:
+        with open(f"/proc/{os.getpid()}/status", "r") as _st:
+            for _line in _st:
+                if _line.startswith("VmRSS:"):
+                    rss_mb = int(_line.split()[1]) / 1024
+                    break
+    except Exception as _rss_exc:
+        logger.debug(f"[MEMORY] RSS read failed: {_rss_exc}")
+
+    if not tracemalloc.is_tracing():
+        logger.warning(f"[MEMORY SNAPSHOT] rss_mb={rss_mb} tracemalloc=off")
+        return {
+            "rss_mb": rss_mb,
+            "tracemalloc_running": False,
+            "note": "Call /memory/tracemalloc/start first to collect allocation traces.",
+        }
+
+    snap = tracemalloc.take_snapshot()
+    stats = snap.statistics("lineno")[:top]
+    result = []
+    for s in stats:
+        frame = s.traceback[0]
+        result.append({
+            "file": frame.filename,
+            "line": frame.lineno,
+            "size_mb": round(s.size / (1024 * 1024), 3),
+            "count": s.count,
+        })
+    # Log top-10 at WARNING so Cloud Logging retains the snapshot through OOM.
+    top_log = "; ".join(
+        f"{r['file']}:{r['line']} size={r['size_mb']}MB n={r['count']}"
+        for r in result[:10]
+    )
+    logger.warning(f"[MEMORY SNAPSHOT] rss_mb={rss_mb} top10={top_log}")
+    return {
+        "rss_mb": rss_mb,
+        "tracemalloc_running": True,
+        "top": result,
+    }
+
+
 @router.post("/github-quota/refresh")
 async def refresh_github_quota(
     current_user: dict = Depends(require_admin),

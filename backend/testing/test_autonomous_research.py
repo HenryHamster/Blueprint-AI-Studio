@@ -1597,6 +1597,7 @@ async def test_medium_scope_with_many_related_files_upgrades_to_large(db_session
         direction["id"],
         scope="medium",
     )
+    # Current upgrade threshold is 8 files (file-count heuristic).
     finding["related_files"] = [f"backend/app/mod_{i}.py" for i in range(8)]
 
     _patch_research_externals(mocker)

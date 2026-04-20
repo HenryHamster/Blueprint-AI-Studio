@@ -1676,7 +1676,15 @@ async def orchestrator_worker():
                             async def _delayed_orphan_cleanup(orphan_vm_id: str):
                                 await asyncio.sleep(120)  # Wait for GCP thread to finish
                                 await _ensure_vm_deleted(orphan_vm_id, reason="cancelled_provision_orphan")
-                            _shared_state.background_tasks[f"orphan_cleanup_{vm_id}"] = asyncio.create_task(_delayed_orphan_cleanup(vm_id))
+                            _cleanup_key = f"orphan_cleanup_{vm_id}"
+                            _cleanup_task = asyncio.create_task(_delayed_orphan_cleanup(vm_id))
+                            _shared_state.background_tasks[_cleanup_key] = _cleanup_task
+                            # Drop the dict entry once the task finishes so we don't retain
+                            # completed asyncio.Task objects indefinitely (seen ~100s of these
+                            # accumulating per day of provision churn — direct memory growth).
+                            _cleanup_task.add_done_callback(
+                                lambda _t, _k=_cleanup_key: _shared_state.background_tasks.pop(_k, None)
+                            )
                             raise
                         except Exception as e:
                             logger.error(f"[ORCHESTRATOR] Provision crashed for task {t_id}: {e}", exc_info=True)

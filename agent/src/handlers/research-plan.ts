@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
-  apiPost, persistAndPostStatus, cloneWithRetry, runClaudeCode,
+  persistAndPostStatus, cloneWithRetry, runClaudeCode,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { extractJsonObject, extractJsonArray } from '../json-extract.js';
@@ -419,23 +419,6 @@ export function formatDecompositionOutcomes(directionCtx: Record<string, unknown
   return `## Prior Decomposition Outcomes\n\nMetrics from recent plan decompositions in this direction:\n${lines.join('\n')}${hintSection}\n\n`;
 }
 
-export function mapSubtaskToSpawnPayload(st: Record<string, unknown>, baseBranch: string): Record<string, unknown> {
-  return {
-    title: strVal(st.title, 'Untitled subtask'),
-    description: strVal(st.prompt),
-    prompt: strVal(st.prompt),
-    type: strVal(st.type, 'create'),
-    scope: strVal(st.scope, 'small'),
-    risk: strVal(st.risk, 'low'),
-    base_branch: baseBranch,
-    depends_on_indices: st.depends_on_indices ?? [],
-    related_files: st.related_files ?? [],
-    ...(st.model ? { model: strVal(st.model) } : {}),
-    ...(st.effort ? { effort: strVal(st.effort) } : {}),
-    ...(st.approval_reason ? { approval_reason: strVal(st.approval_reason) } : {}),
-  };
-}
-
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
 export async function handlePlan(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -560,59 +543,19 @@ ${DEFAULT_TOOL_GUIDANCE}`;
     }
   }
 
-  // Try to parse plan JSON and spawn subtasks directly from the agent
-  let spawnFailed = false;
-  if (exitCode === 0 && logs) {
-    try {
-      let planData: Record<string, unknown> | null = null;
-      try {
-        planData = JSON.parse(logs) as Record<string, unknown>;
-      } catch {
-        planData = extractJsonObject(logs, 'subtasks');
-      }
+  // Backend's _handle_plan_completion parses `logs` on COMPLETED and creates
+  // children with the correct plan branch. No agent-side spawn is needed —
+  // that path returned empty task_ids by design (deferred to post-branch
+  // creation) and misreading it as failure silently dropped valid plans.
 
-      const subtasks = planData?.subtasks;
-      if (Array.isArray(subtasks) && subtasks.length > 0 && subtasks.length <= 10) {
-        sendLog(ws, `Parsed ${subtasks.length} subtasks from plan output\n`);
-
-        const spawnPayloads = (subtasks as Record<string, unknown>[]).map((st) => mapSubtaskToSpawnPayload(st, baseBranch));
-
-        statusRef.value = 'Spawning subtasks...';
-        const spawnResult = await apiPost('/api/agent/spawn', {
-          task_id: taskId,
-          payloads: spawnPayloads,
-          requires_approval: false,
-          context: { agent_spawned: true },
-        }) as Record<string, unknown>;
-
-        const spawnedIds = Array.isArray(spawnResult.task_ids) ? spawnResult.task_ids as string[] : [];
-        if (spawnedIds.length === 0) {
-          spawnFailed = true;
-          sendLog(ws, `Spawn returned no task IDs — reporting FAILED\n`);
-        } else {
-          sendLog(ws, `Spawned ${spawnedIds.length} subtasks: ${spawnedIds.join(', ')}\n`);
-          // Include full plan data with spawn info for backend enrichment
-          logs = JSON.stringify({
-            ...planData,
-            agent_spawned: true,
-            spawned_task_ids: spawnedIds,
-          });
-        }
-      }
-    } catch (err) {
-      spawnFailed = true;
-      sendLog(ws, `Agent-side spawn failed: ${err instanceof Error ? err.message : String(err)}\n`);
-    }
-  }
-
-  const finalStatus = spawnFailed ? 'FAILED' : (exitCode === 0 ? 'COMPLETED' : 'FAILED');
+  const finalStatus = exitCode === 0 ? 'COMPLETED' : 'FAILED';
   const planProgress = readProgressArtifact(taskId, 'plan');
   try {
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: finalStatus,
       ...(finalStatus === 'FAILED' ? { artifact_type: 'ERROR_LOG' } : {}),
-      logs: spawnFailed ? `Spawn failed — subtasks not created. Plan output: ${logs}` : logs,
+      logs,
       ...(finalStatus === 'FAILED' ? { failure_category: 'claude_code_failed' } : {}),
       ...(planProgress ? { analysis_plan: planProgress.slice(0, 5000) } : {}),
     });

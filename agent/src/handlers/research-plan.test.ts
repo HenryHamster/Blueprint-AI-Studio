@@ -14,7 +14,6 @@ import {
   calcMessageAge,
   parseResearchContext,
   aggregateDirectionStats,
-  mapSubtaskToSpawnPayload,
   classifyFailureCategory,
   buildScopeCalibrationSignal,
   buildFilteredFindingsSection,
@@ -230,62 +229,6 @@ describe('aggregateDirectionStats', () => {
     const history = [{ tasks_created: 3, prs_merged: 2, scope_breakdown: { small: { created: 3, merged: 2 } } }];
     const result = aggregateDirectionStats(history, {});
     expect(result).not.toContain('by type:');
-  });
-});
-
-describe('mapSubtaskToSpawnPayload', () => {
-  it('maps minimal subtask with default type, scope, risk', () => {
-    const result = mapSubtaskToSpawnPayload({ title: 'Test task', prompt: 'Do something' }, 'main');
-    expect(result.type).toBe('create');
-    expect(result.scope).toBe('small');
-    expect(result.risk).toBe('low');
-    expect(result.base_branch).toBe('main');
-    expect(result.title).toBe('Test task');
-    expect(result.prompt).toBe('Do something');
-  });
-
-  it('maps full subtask with all provided fields', () => {
-    const st = {
-      title: 'Full task',
-      prompt: 'Full prompt',
-      type: 'refactor',
-      scope: 'large',
-      risk: 'high',
-      model: 'claude-opus-4-6',
-      effort: 'high',
-      approval_reason: 'dangerous change',
-      depends_on_indices: [0, 1],
-      related_files: ['src/main.py'],
-    };
-    const result = mapSubtaskToSpawnPayload(st, 'develop');
-    expect(result.type).toBe('refactor');
-    expect(result.scope).toBe('large');
-    expect(result.risk).toBe('high');
-    expect(result.model).toBe('claude-opus-4-6');
-    expect(result.effort).toBe('high');
-    expect(result.approval_reason).toBe('dangerous change');
-    expect(result.base_branch).toBe('develop');
-    expect(result.depends_on_indices).toEqual([0, 1]);
-    expect(result.related_files).toEqual(['src/main.py']);
-  });
-
-  it('omits model and effort keys when not present in subtask', () => {
-    const st = { title: 'Task', prompt: 'Do something' };
-    const result = mapSubtaskToSpawnPayload(st, 'main');
-    expect('model' in result).toBe(false);
-    expect('effort' in result).toBe(false);
-  });
-
-  it('includes model and effort keys when present in subtask', () => {
-    const st = { title: 'Task', prompt: 'Do something', model: 'claude-opus-4-6', effort: 'high' };
-    const result = mapSubtaskToSpawnPayload(st, 'main');
-    expect(result.model).toBe('claude-opus-4-6');
-    expect(result.effort).toBe('high');
-  });
-
-  it('uses Untitled subtask as default title when title missing', () => {
-    const result = mapSubtaskToSpawnPayload({ prompt: 'Some prompt' }, 'main');
-    expect(result.title).toBe('Untitled subtask');
   });
 });
 
