@@ -25,6 +25,7 @@ from app.failure_classification import (
     classify_failure_taxonomy as _classify_taxonomy,
 )
 from app.models import Project, Task, TaskStatus
+from app.review_pipeline import _is_test_file
 
 
 def _is_cascade_cancelled(task: Task) -> bool:
@@ -518,8 +519,12 @@ async def _update_direction_research_outcomes(
         # Leading indicator of scope overflow risk.
         related = ctx_.get("related_files") or []
         changed = ctx_.get("_pr_changed_files") or []
-        if related and changed:
-            ratio = len(changed) / len(related)
+        # Exclude test files: related_files typically declares production files
+        # only, so including test files in the numerator systematically inflates
+        # the ratio for tasks that ship proper test coverage.
+        prod_changed = [f for f in changed if not _is_test_file(f)]
+        if related and prod_changed:
+            ratio = len(prod_changed) / len(related)
             if ct.status == TaskStatus.COMPLETED:
                 expansion_sums[scope] = expansion_sums.get(scope, 0.0) + ratio
                 expansion_counts[scope] = expansion_counts.get(scope, 0) + 1

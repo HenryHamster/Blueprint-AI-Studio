@@ -126,41 +126,52 @@ export interface StandardHandlerOpts {
  */
 export function buildSmallScopeCallerNote(relatedFiles: string[]): string {
   if (!relatedFiles || relatedFiles.length === 0) return '';
-  const target = relatedFiles[0];
-  if (!target || target.includes('..')) return '';
 
-  let content = '';
-  try {
-    content = execFileSync('cat', [`${WORKSPACE}/${target}`], { encoding: 'utf-8', timeout: 5_000 });
-  } catch { return ''; }
+  const MAX_FILES = 3;
+  const targets = relatedFiles.slice(0, MAX_FILES).filter(t => t && !t.includes('..'));
+  if (targets.length === 0) return '';
 
-  const isPy = target.endsWith('.py');
-  const re = isPy
-    ? /^(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)/gm
-    : /^export\s+(?:default\s+|async\s+)?(?:function|class|const|let|var|type|interface|enum)\s+([A-Za-z_]\w*)/gm;
-  const exports: string[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(content)) !== null && exports.length < 8) {
-    if (!m[1].startsWith('_')) exports.push(m[1]);
-  }
-
-  const basename = (target.split('/').pop() || '').replace(/\.(ts|tsx|mjs|cjs|js|jsx|py)$/, '');
-  let importers: string[] = [];
-  if (basename && /^[A-Za-z_][\w-]*$/.test(basename)) {
-    try {
-      const out = execFileSync(
-        'git',
-        ['-C', WORKSPACE, 'grep', '-lE', `^\\s*(import|from)\\b.*\\b${basename}\\b`, '--', '*.ts', '*.tsx', '*.js', '*.py'],
-        { encoding: 'utf-8', timeout: 10_000 },
-      );
-      importers = out.split('\n').filter(f => f && f !== target).slice(0, 5);
-    } catch { /* git grep returns 1 when no matches */ }
-  }
-
-  if (exports.length === 0 && importers.length === 0) return '';
   const lines: string[] = [];
-  if (exports.length) lines.push(`Primary target \`${target}\` exposes: ${exports.join(', ')}.`);
-  if (importers.length) lines.push(`Files that reference it: ${importers.map(f => `\`${f}\``).join(', ')}.`);
+  let anyFindings = false;
+
+  for (let i = 0; i < targets.length; i++) {
+    const target = targets[i];
+    let content = '';
+    try {
+      content = execFileSync('cat', [`${WORKSPACE}/${target}`], { encoding: 'utf-8', timeout: 5_000 });
+    } catch { continue; }
+
+    const isPy = target.endsWith('.py');
+    const re = isPy
+      ? /^(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)/gm
+      : /^export\s+(?:default\s+|async\s+)?(?:function|class|const|let|var|type|interface|enum)\s+([A-Za-z_]\w*)/gm;
+    const exports: string[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(content)) !== null && exports.length < 8) {
+      if (!m[1].startsWith('_')) exports.push(m[1]);
+    }
+
+    const basename = (target.split('/').pop() || '').replace(/\.(ts|tsx|mjs|cjs|js|jsx|py)$/, '');
+    let importers: string[] = [];
+    if (basename && /^[A-Za-z_][\w-]*$/.test(basename)) {
+      try {
+        const out = execFileSync(
+          'git',
+          ['-C', WORKSPACE, 'grep', '-lE', `^\\s*(import|from)\\b.*\\b${basename}\\b`, '--', '*.ts', '*.tsx', '*.js', '*.py'],
+          { encoding: 'utf-8', timeout: 10_000 },
+        );
+        importers = out.split('\n').filter(f => f && !targets.includes(f)).slice(0, 5);
+      } catch { /* git grep returns 1 when no matches */ }
+    }
+
+    if (exports.length === 0 && importers.length === 0) continue;
+    anyFindings = true;
+    const label = i === 0 ? 'Primary target' : 'Related file';
+    if (exports.length) lines.push(`${label} \`${target}\` exposes: ${exports.join(', ')}.`);
+    if (importers.length) lines.push(`Files that reference \`${target}\`: ${importers.map(f => `\`${f}\``).join(', ')}.`);
+  }
+
+  if (!anyFindings) return '';
   lines.push('Preserve these exports and update any callers you change.');
   return lines.join('\n');
 }

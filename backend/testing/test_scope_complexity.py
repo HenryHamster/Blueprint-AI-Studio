@@ -302,3 +302,66 @@ class TestClampingAndEmpty:
         s, meta = _composite_complexity_score(None, None, None)  # type: ignore[arg-type]
         assert s == 1.0
         assert meta["files"] == 0
+
+
+class TestPredictSpawnSuccessCrossModuleBoost:
+    """Signal 19: cross-module merge history boosts multi-directory findings."""
+
+    def _direction(self, merged: int, cross_merged: int, scope: str = "small") -> dict:
+        return {
+            "research_history": [
+                {"scope_breakdown": {scope: {
+                    "created": merged,
+                    "merged": merged,
+                    "merged_cross_module": cross_merged,
+                }}},
+            ],
+        }
+
+    def _disable_pipeline_rates(self, monkeypatch):
+        from app.shared_state import runtime_config
+        monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {})
+
+    def test_boost_activates_for_high_cross_module_rate(self, monkeypatch):
+        from app.spawn_calibration import predict_spawn_success
+        self._disable_pipeline_rates(monkeypatch)
+        # 3 merged, all cross-module (rate=1.0); finding spans 2 top-level dirs.
+        direction = self._direction(merged=3, cross_merged=3)
+        related = ["backend/app/x.py", "admin-ui/src/y.tsx"]
+        p_with = predict_spawn_success("small", direction, related_files=related)
+        # Direction merge-rate signal alone: merged/effective = 3/3 = 1.0 (weight 2).
+        # Plus boost (0.8, weight 1) → weighted avg = (1.0*2 + 0.8*1) / 3 ≈ 0.9333.
+        # Without boost (single-dir files) → 1.0.
+        single_dir = ["backend/app/x.py", "backend/app/y.py"]
+        p_without = predict_spawn_success("small", direction, related_files=single_dir)
+        assert p_with < p_without  # boost still pulls toward 0.8 from 1.0
+        assert p_with >= 0.9
+
+    def test_no_boost_when_cross_rate_low(self, monkeypatch):
+        from app.spawn_calibration import predict_spawn_success
+        self._disable_pipeline_rates(monkeypatch)
+        # 4 merged, only 1 cross-module (rate=0.25 < 0.5 threshold).
+        direction = self._direction(merged=4, cross_merged=1)
+        related = ["backend/app/x.py", "admin-ui/src/y.tsx"]
+        p = predict_spawn_success("small", direction, related_files=related)
+        # No boost signal — only direction merge rate (1.0) contributes.
+        assert p == 1.0
+
+    def test_no_boost_with_insufficient_merged_data(self, monkeypatch):
+        from app.spawn_calibration import predict_spawn_success
+        self._disable_pipeline_rates(monkeypatch)
+        # Only 1 merged task — below 2-merge minimum to avoid noisy boosts.
+        direction = self._direction(merged=1, cross_merged=1)
+        related = ["backend/app/x.py", "admin-ui/src/y.tsx"]
+        p = predict_spawn_success("small", direction, related_files=related)
+        # Direction signal also requires effective >= 2, so falls back to neutral.
+        assert p == 0.5
+
+    def test_no_boost_for_single_directory_finding(self, monkeypatch):
+        from app.spawn_calibration import predict_spawn_success
+        self._disable_pipeline_rates(monkeypatch)
+        direction = self._direction(merged=3, cross_merged=3)
+        related = ["backend/app/x.py", "backend/testing/y.py"]  # both 'backend'
+        p = predict_spawn_success("small", direction, related_files=related)
+        # No cross-module boost; direction signal alone = 1.0.
+        assert p == 1.0

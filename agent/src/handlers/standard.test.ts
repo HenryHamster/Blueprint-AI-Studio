@@ -2298,6 +2298,68 @@ describe('buildSmallScopeCallerNote', () => {
   it('rejects suspicious paths containing ..', () => {
     expect(buildSmallScopeCallerNote(['../etc/passwd'])).toBe('');
   });
+
+  it('iterates over multiple related files and labels primary vs related', async () => {
+    const { execFileSync } = await import('child_process');
+    const mocked = vi.mocked(execFileSync);
+    mocked.mockImplementation(((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'cat') {
+        const path = args?.[0] || '';
+        if (path.endsWith('/a.ts')) return 'export function alpha() {}\n' as unknown as Buffer;
+        if (path.endsWith('/b.ts')) return 'export class Beta {}\n' as unknown as Buffer;
+        throw new Error('not found');
+      }
+      if (cmd === 'git') {
+        const pattern = (args || []).find(a => typeof a === 'string' && a.includes('import')) as string | undefined;
+        if (pattern?.includes('\\ba\\b')) return 'some/caller-a.ts\n' as unknown as Buffer;
+        if (pattern?.includes('\\bb\\b')) return 'some/caller-b.ts\n' as unknown as Buffer;
+        return '' as unknown as Buffer;
+      }
+      return '' as unknown as Buffer;
+    }) as typeof execFileSync);
+
+    const note = buildSmallScopeCallerNote(['pkg/a.ts', 'pkg/b.ts']);
+    expect(note).toContain('Primary target `pkg/a.ts` exposes: alpha.');
+    expect(note).toContain('Related file `pkg/b.ts` exposes: Beta.');
+    expect(note).toContain('Files that reference `pkg/a.ts`: `some/caller-a.ts`.');
+    expect(note).toContain('Files that reference `pkg/b.ts`: `some/caller-b.ts`.');
+    expect(note).toContain('Preserve these exports and update any callers you change.');
+    mocked.mockReturnValue(Buffer.from(''));
+  });
+
+  it('caps iteration at 3 related files', async () => {
+    const { execFileSync } = await import('child_process');
+    const mocked = vi.mocked(execFileSync);
+    const seen: string[] = [];
+    mocked.mockImplementation(((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'cat' && args?.[0]) seen.push(args[0]);
+      return '' as unknown as Buffer;
+    }) as typeof execFileSync);
+
+    buildSmallScopeCallerNote(['p/a.ts', 'p/b.ts', 'p/c.ts', 'p/d.ts']);
+    expect(seen.some(p => p.endsWith('p/d.ts'))).toBe(false);
+    expect(seen.filter(p => p.startsWith('/tmp/workspace/')).length).toBeLessThanOrEqual(3);
+    mocked.mockReturnValue(Buffer.from(''));
+  });
+
+  it('skips unreadable files but still emits note for readable ones', async () => {
+    const { execFileSync } = await import('child_process');
+    const mocked = vi.mocked(execFileSync);
+    mocked.mockImplementation(((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'cat') {
+        const path = args?.[0] || '';
+        if (path.endsWith('/missing.ts')) throw new Error('ENOENT');
+        if (path.endsWith('/real.ts')) return 'export const readable = 1;\n' as unknown as Buffer;
+      }
+      return '' as unknown as Buffer;
+    }) as typeof execFileSync);
+
+    const note = buildSmallScopeCallerNote(['p/missing.ts', 'p/real.ts']);
+    expect(note).toContain('`p/real.ts`');
+    expect(note).not.toContain('`p/missing.ts`');
+    expect(note).toContain('Preserve these exports');
+    mocked.mockReturnValue(Buffer.from(''));
+  });
 });
 
 // ── extractSelfReviewJson parsing ─────────────────────────────────────────────

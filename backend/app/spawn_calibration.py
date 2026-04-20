@@ -654,6 +654,23 @@ def predict_spawn_success(
         signals.append(_compute_direction_quality_score(direction))
         weights.append(1.0)
 
+    # Signal 19: cross-module merge boost. When the direction has a proven
+    # track record of merging cross-module work at the proposed scope, and the
+    # current finding also spans 2+ top-level directories, give a mild
+    # confidence boost to counter the file-count / expansion / module-span
+    # penalties that otherwise dominate multi-directory findings. Requires
+    # merged >= 2 at this scope to avoid noisy early-stage boosts.
+    if related_files and scope_stats:
+        merged_at_scope = scope_stats.get("merged", 0)
+        cross_merged = scope_stats.get("merged_cross_module", 0)
+        if merged_at_scope >= 2:
+            top_dirs = {f.split("/", 1)[0] for f in related_files if f}
+            if len(top_dirs) >= 2:
+                cross_rate = cross_merged / merged_at_scope
+                if cross_rate >= 0.5:
+                    signals.append(0.8)
+                    weights.append(1.0)
+
     # Signal 17: momentum factor. Hot-streak directions (last 2 cycles both
     # productive) get a confidence boost; stalled directions (last 3 cycles
     # all empty) get a penalty. Neutral momentum is omitted so it doesn't

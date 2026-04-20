@@ -1071,6 +1071,53 @@ async def test_scope_breakdown_avg_expansion_ratio(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_expansion_ratio_excludes_test_files(db_session: AsyncSession):
+    """Test files in _pr_changed_files must not inflate the expansion ratio.
+
+    Tasks that declare production files in related_files and then ship both
+    those production files plus paired test files should have an expansion
+    ratio of 1.0 (production-only), not 2.0.
+    """
+    direction_id = "d-expand-tests"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    # 2 production related_files, PR touches the same 2 plus 2 test files →
+    # production-only ratio 1.0 (not inflated to 2.0).
+    await _create_child_task(
+        db_session, research_task.id, project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "scope": "small",
+                 "related_files": ["backend/app/foo.py", "backend/app/bar.py"],
+                 "_pr_changed_files": [
+                     "backend/app/foo.py",
+                     "backend/app/bar.py",
+                     "backend/testing/test_foo.py",
+                     "backend/testing/test_bar.py",
+                 ]},
+        payloads=[{"type": "create"}],
+        title="s-with-tests",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    sb = project.directions[0]["research_history"][0]["scope_breakdown"]
+    assert sb["small"]["avg_expansion_ratio"] == 1.0
+    assert sb["small"]["avg_expansion_ratio_merged"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_scope_breakdown_failed_scope_overflow_counter(db_session: AsyncSession):
     """SCOPE_OVERFLOW failures increment both failed_infra and failed_scope_overflow.
 
