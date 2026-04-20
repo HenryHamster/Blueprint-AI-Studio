@@ -433,6 +433,73 @@ async def test_operator_rejection_rate_zero_rejected_in_history_aggregate(db_ses
 
 
 @pytest.mark.asyncio
+async def test_cost_fields_present_when_history_has_merge_data(db_session):
+    """cost_per_merged_pr and estimated_cost_usd appear when history has tasks_created + avg_time_to_merge_hours + merges."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cost01",
+                "status": "active",
+                "text": "Direction with cost data",
+                "priority": "medium",
+                "research_history": [
+                    {"prs_merged": 2, "tasks_created": 4, "avg_time_to_merge_hours": 1.5},
+                    {"prs_merged": 1, "tasks_created": 2, "avg_time_to_merge_hours": 2.0},
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cost01")
+
+    expected_cost = round((4 * 1.5 + 2 * 2.0) * 3600 * ON_DEMAND_RATE, 2)
+    assert d_stat["estimated_cost_usd"] == expected_cost
+    assert d_stat["cost_per_merged_pr"] == round(expected_cost / 3, 2)
+
+
+@pytest.mark.asyncio
+async def test_cost_fields_absent_without_history_data(db_session):
+    """Cost fields are omitted when history lacks tasks_created or avg_time_to_merge_hours."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cost02",
+                "status": "active",
+                "text": "Direction with no cost data",
+                "priority": "low",
+                "research_history": [{"prs_merged": 2}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cost02")
+
+    assert "estimated_cost_usd" not in d_stat
+    assert "cost_per_merged_pr" not in d_stat
+
+
+@pytest.mark.asyncio
 async def test_tasks_failed_infra_includes_history_aggregate(db_session):
     """tasks_failed_infra aggregates from both research_history and history_aggregate."""
     project = _make_project(
