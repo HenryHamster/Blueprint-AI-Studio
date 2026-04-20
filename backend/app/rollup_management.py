@@ -1308,6 +1308,22 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         except Exception as e:
                             logger.warning(f"[ROLLUP] Failed to fetch PR #{rollup_pr_number} file list for task {parent.id}: {e}")
                             files_list = "  (could not fetch file list)"
+                            pr_files = []
+                        has_migrations = any(
+                            (f.get("filename") or "").startswith("backend/alembic/versions/")
+                            for f in pr_files
+                        )
+                        migration_guidance = ""
+                        if has_migrations:
+                            migration_guidance = (
+                                "\n\nMigration chain guidance:\n"
+                                "This rollup contains database migrations from multiple subtasks. After resolving conflicts:\n"
+                                "- The migration chain in backend/alembic/versions/ must be linear: each migration's `down_revision` "
+                                "must point to the revision of the previous migration in the chain.\n"
+                                "- All revision numbers (e.g., 0039, 0040, ...) must be unique and sequential — no gaps, no duplicates.\n"
+                                "- Renumber/rewrite migration files as needed so the chain is contiguous from the latest pre-rollup revision.\n"
+                                "- Update `EXPECTED_SCHEMA_REVISION` in backend/app/main.py to match the final (highest) migration's revision."
+                            )
                         parent_goal = (parent.description or parent.title or "")[:500]
                         fix_prompt = (
                             f"This rollup PR (#{rollup_pr_number}) merging {staging_branch} into {target_branch} has conflicts.\n"
@@ -1321,6 +1337,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             f"   Re-apply only the changes that serve the rollup goal (described above) on top of {target_branch}'s current state.\n"
                             f"   If files were heavily rewritten on {target_branch}, adapt the rollup changes to the new structure.\n"
                             f"4. Run: git rebase --continue after resolving each file"
+                            f"{migration_guidance}"
                         )
                         fix_task, _ = await _spawn_pipeline_task(
                             parent, "fix", session, rollup_pr_number, staging_branch, target_branch,
