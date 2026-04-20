@@ -327,7 +327,7 @@ async def _handle_main_branch_ci_failure_inner(
         "ci_failure_branch": head_branch,
         "ci_failure_checks": failed_checks,
         "ci_failure_type": failure_type,
-        "trigger_failure_class": "CODE_ERROR",
+        "trigger_failure_class": "MIGRATION_ERROR" if failure_type == "migration" else "CODE_ERROR",
     }
     if regression_of is not None:
         task_context["regression_of_task_id"] = str(regression_of.id)
@@ -450,7 +450,10 @@ async def _extract_ci_context(
         # before generic ones to avoid "Build failed" matching as "test"
         if raw_logs:
             logs_lower = raw_logs.lower()
-            if "importerror" in logs_lower or "syntaxerror" in logs_lower:
+            from app.failure_classification import _MIGRATION_PATTERNS  # noqa: PLC0415
+            if any(p in logs_lower for p in _MIGRATION_PATTERNS):
+                failure_type = "migration"
+            elif "importerror" in logs_lower or "syntaxerror" in logs_lower:
                 failure_type = "build"
             elif "assertionerror" in logs_lower or "assert " in logs_lower or "pytest" in logs_lower:
                 failure_type = "test"
@@ -601,6 +604,15 @@ def _build_remediation_prompt(
         "build": "Check imports, missing dependencies, syntax errors, and module resolution — this is likely a compilation or import failure.",
         "lint": "Check style rules, formatting, and linting configuration — run the project's linter locally to identify all violations.",
         "mixed": "Multiple failure categories detected — address build/import errors first, then test failures, then lint issues.",
+        "migration": (
+            "Migration / schema failure detected. Check the alembic version chain: "
+            "the newest file in backend/alembic/versions/ must chain via down_revision "
+            "from the previous head, and backend/app/main.py's EXPECTED_SCHEMA_REVISION "
+            "must match that newest revision. Ensure there is exactly one head (no "
+            "multiple heads), UndefinedColumn errors imply a missing or misordered "
+            "migration, and re-run the backend invariant tests "
+            "(bash scripts/test-backend.sh testing/test_invariants.py) to verify."
+        ),
         "unknown": "Diagnose the failure type from the error output before applying a fix.",
     }
     type_guidance = type_guidance_map.get(failure_type, type_guidance_map["unknown"])

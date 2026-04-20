@@ -455,6 +455,66 @@ async def test_extract_ci_context_build_failure():
 
 
 @pytest.mark.asyncio
+async def test_extract_ci_context_migration_failure():
+    """Logs containing alembic/schema patterns should be classified as 'migration'."""
+    mock_ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "details": [
+            {"name": "CI / tests", "status": "completed", "conclusion": "failure"},
+        ],
+        "failed_logs": "alembic.util.exc.CommandError: Can't locate revision identified by 'abc123'\nFAILED",
+    }
+
+    with patch("app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock) as mock_runs, \
+         patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
+        mock_token.return_value = "ghp_test_token"
+        mock_runs.return_value = mock_ci_result
+
+        _failed, _summary, failure_type = await _extract_ci_context(
+            "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
+        )
+
+    assert failure_type == "migration"
+
+
+@pytest.mark.asyncio
+async def test_extract_ci_context_migration_undefined_column():
+    """UndefinedColumn errors should classify as 'migration', not 'build'."""
+    mock_ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "details": [{"name": "CI / tests", "status": "completed", "conclusion": "failure"}],
+        "failed_logs": "psycopg2.errors.UndefinedColumn: column \"foo\" does not exist\nImportError ignored",
+    }
+
+    with patch("app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock) as mock_runs, \
+         patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
+        mock_token.return_value = "ghp_test_token"
+        mock_runs.return_value = mock_ci_result
+
+        _failed, _summary, failure_type = await _extract_ci_context(
+            "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
+        )
+
+    assert failure_type == "migration"
+
+
+def test_build_remediation_prompt_migration_guidance():
+    """Migration failure_type should emit alembic/EXPECTED_SCHEMA_REVISION guidance."""
+    prompt = _build_remediation_prompt(
+        head_branch="main",
+        head_sha="abc",
+        failed_checks=["CI / tests"],
+        error_summary="alembic revision error",
+        failure_type="migration",
+    )
+    assert "alembic" in prompt.lower()
+    assert "EXPECTED_SCHEMA_REVISION" in prompt
+    assert "down_revision" in prompt
+
+
+@pytest.mark.asyncio
 async def test_extract_ci_context_no_token():
     """When no GitHub token is available, returns empty defaults."""
     with patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
