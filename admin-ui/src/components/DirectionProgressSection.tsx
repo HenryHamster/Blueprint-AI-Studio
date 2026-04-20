@@ -31,7 +31,20 @@ export interface DirectionProgress {
   auto_paused?: boolean;
   paused_reason?: string | null;
   needs_manual_intervention?: boolean;
-  scope_breakdown?: Record<string, { created?: number; merged?: number; failed?: number }> | null;
+  scope_breakdown?: Record<string, {
+    created?: number;
+    merged?: number;
+    merged_cross_module?: number;
+    failed?: number;
+    failed_infra?: number;
+    failed_code_error?: number;
+    failed_scope_overflow?: number;
+    calibrated_in?: number;
+    calibrated_out?: number;
+    failure_stages?: Record<string, number>;
+    avg_expansion_ratio_merged?: number;
+    avg_expansion_ratio_failed?: number;
+  }> | null;
   type_breakdown?: Record<string, { created?: number; merged?: number; failed?: number }> | null;
   taxonomy_summary?: Record<string, number> | null;
   stage_dropout?: Record<string, number> | null;
@@ -260,10 +273,23 @@ export function DirectionProgressSection({ directions }: { directions: Direction
                     {Object.entries(dp.scope_breakdown).map(([scope, stats]) => {
                       const merged = stats?.merged ?? 0;
                       const created = stats?.created ?? 0;
+                      const crossModule = stats?.merged_cross_module ?? 0;
+                      const scopeOverflow = stats?.failed_scope_overflow ?? 0;
                       if (!created && !merged) return null;
+                      const detail: string[] = [];
+                      if (crossModule > 0) detail.push(`${crossModule} cross-dir`);
+                      if (scopeOverflow > 0) detail.push(`${scopeOverflow} overflow`);
+                      const expMerged = stats?.avg_expansion_ratio_merged;
+                      const expFailed = stats?.avg_expansion_ratio_failed;
+                      if (typeof expMerged === 'number' || typeof expFailed === 'number') {
+                        const m = typeof expMerged === 'number' ? `${expMerged.toFixed(1)}x` : '--';
+                        const f = typeof expFailed === 'number' ? `${expFailed.toFixed(1)}x` : '--';
+                        detail.push(`exp ${m}/${f}`);
+                      }
                       return (
                         <span key={scope} className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded">
                           {scope} {merged}/{created}
+                          {detail.length > 0 && <span className="text-neutral-500"> ({detail.join(', ')})</span>}
                         </span>
                       );
                     })}

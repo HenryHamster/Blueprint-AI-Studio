@@ -1229,11 +1229,19 @@ async def get_digest(
                 # Accumulate into project-level scope rate aggregates
                 for _s, _st in dir_scope_agg.items():
                     if _s not in scope_conversion_rates:
-                        scope_conversion_rates[_s] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
+                        scope_conversion_rates[_s] = {"created": 0, "merged": 0, "merged_cross_module": 0, "failed_scope_overflow": 0, "calibrated_in": 0, "calibrated_out": 0}
                     scope_conversion_rates[_s]["created"] += _st["created"]
                     scope_conversion_rates[_s]["merged"] += _st["merged"]
+                    scope_conversion_rates[_s]["merged_cross_module"] += _st.get("merged_cross_module", 0)
+                    scope_conversion_rates[_s]["failed_scope_overflow"] += _st.get("failed_scope_overflow", 0)
                     scope_conversion_rates[_s]["calibrated_in"] += _st.get("calibrated_in", 0)
                     scope_conversion_rates[_s]["calibrated_out"] += _st.get("calibrated_out", 0)
+                    for _f in ("avg_expansion_ratio_merged", "avg_expansion_ratio_failed"):
+                        _sum = _st.get(f"_{_f}_sum", 0.0)
+                        _w = _st.get(f"_{_f}_w", 0)
+                        if _w > 0:
+                            scope_conversion_rates[_s][f"_{_f}_sum"] = scope_conversion_rates[_s].get(f"_{_f}_sum", 0.0) + _sum
+                            scope_conversion_rates[_s][f"_{_f}_w"] = scope_conversion_rates[_s].get(f"_{_f}_w", 0) + _w
                 for _s, _st in prev_dir_scope_agg.items():
                     if _s not in prev_scope_conversion_rates:
                         prev_scope_conversion_rates[_s] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
@@ -1352,6 +1360,13 @@ async def get_digest(
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
+
+            for _s, _agg in scope_conversion_rates.items():
+                for _f in ("avg_expansion_ratio_merged", "avg_expansion_ratio_failed"):
+                    _w = _agg.pop(f"_{_f}_w", 0)
+                    _sum = _agg.pop(f"_{_f}_sum", 0.0)
+                    if _w > 0:
+                        _agg[_f] = round(_sum / _w, 2)
 
     # --- Batch artifact query ---
     all_task_ids = [t.id for t in all_tasks]
