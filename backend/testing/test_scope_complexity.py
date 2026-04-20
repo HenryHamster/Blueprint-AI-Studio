@@ -289,6 +289,15 @@ class TestClampingAndEmpty:
         assert abs(s - (1.0 - 0.0625)) < 1e-9
         assert meta["expansion_ratio"] == 0.0
 
+    def test_alembic_migrations_excluded_from_factors(self):
+        s, meta = _score(
+            ["backend/app/models.py", "backend/alembic/versions/0037_x.py"],
+        )
+        assert s == 1.0
+        assert meta["files"] == 1
+        assert meta["modules"] == 1
+        assert meta["auto_generated_files"] == 1
+
     def test_none_related_files_treated_as_empty(self):
         s, meta = _composite_complexity_score(None, None, None)  # type: ignore[arg-type]
         assert s == 1.0

@@ -1371,6 +1371,10 @@ async def claim_task(
                     "top_first_review_issues": direction_top_first_review_issues,
                     "first_attempt_feedback": direction_first_attempt_feedback,
                 }
+                from app.direction_outcomes import summarize_review_quality_feedback
+                review_quality_feedback = summarize_review_quality_feedback(history)
+                if review_quality_feedback:
+                    response["direction_context"]["review_quality_feedback"] = review_quality_feedback
 
             # Surface saturation / deadlock signals to research agents so they can
             # pivot to direction_update/direction_note findings on stuck directions.
@@ -1429,7 +1433,10 @@ async def claim_task(
                         success_summary.append(
                             f"{scope_name}: {merged}/{created} merged ({round(merged / created * 100)}%)"
                         )
-                from app.direction_outcomes import synthesize_prompt_quality_patterns
+                from app.direction_outcomes import (
+                    summarize_review_quality_feedback,
+                    synthesize_prompt_quality_patterns,
+                )
                 prompt_quality_patterns = synthesize_prompt_quality_patterns(history)
                 response["direction_context"] = {
                     "possibly_saturated": bool(direction.get("possibly_saturated", False)),
@@ -1443,6 +1450,9 @@ async def claim_task(
                 }
                 if prompt_quality_patterns:
                     response["direction_context"]["prompt_quality_patterns"] = prompt_quality_patterns
+                research_review_quality_feedback = summarize_review_quality_feedback(history)
+                if research_review_quality_feedback:
+                    response["direction_context"]["review_quality_feedback"] = research_review_quality_feedback
 
     # Inject co-change affinity context for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:

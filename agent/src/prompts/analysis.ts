@@ -134,10 +134,14 @@ export function parseAnalysisPlanTestFiles(analysisOutput: string): string[] {
  * Returns the mandatory check IDs for the given task scope.
  * These must appear in the `checks_performed` field of the structured self-review output.
  */
-export function getMandatoryChecks(taskScope?: string, hasAnalysisPlan?: boolean, modelsChanged?: boolean): string[] {
+export function getMandatoryChecks(taskScope?: string, hasAnalysisPlan?: boolean, modelsChanged?: boolean, isDecomposed?: boolean): string[] {
   let checks: string[];
   if (taskScope === 'small') {
     checks = ['correctness', 'test_coverage', 'import_verification'];
+    // Decomposed small tasks (split from a larger finding) inherit cross-file
+    // consistency risk because sibling subtasks can make individually correct
+    // but mutually inconsistent changes (e.g., signature/caller mismatch).
+    if (isDecomposed) checks.push('cross_file_consistency');
   } else if (taskScope === 'large') {
     checks = ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'data_model_safety', 'import_verification'];
   } else {

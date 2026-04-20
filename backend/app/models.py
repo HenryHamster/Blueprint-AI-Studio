@@ -119,6 +119,11 @@ class Project(SQLModel, table=True):
     is_self_repo: bool = Field(default=False)
     # Build configuration: directories, commands, git identity for the agent
     build_config: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    # Project-level CI auto-remediation outcomes for fixes that could not be
+    # linked to a direction (novel failures whose fingerprint matched no
+    # direction). Shape: {"attempts": int, "last_result": str, "last_at": iso,
+    # "history": [{task_id, result, timestamp, fingerprint, failure_class}]}.
+    remediation_tracking: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
 
     tasks: List["Task"] = Relationship(
         back_populates="project",

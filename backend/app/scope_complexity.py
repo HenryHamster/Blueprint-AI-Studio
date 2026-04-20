@@ -16,6 +16,13 @@ from app.cochange_decomposition import (
 )
 
 
+def _is_auto_generated(path: str) -> bool:
+    """Auto-generated files (e.g. alembic migrations) are mechanically
+    derived from models.py changes, so they should not inflate complexity
+    scoring dimensions."""
+    return path.startswith("backend/alembic/versions/")
+
+
 def _composite_complexity_score(
     related_files: list[str], direction: dict | None, cochange_index: dict | None,
 ) -> tuple[float, dict]:
@@ -24,7 +31,10 @@ def _composite_complexity_score(
     Each dimension returns a factor in [0.5, 1.0]; the composite is the
     product. Lower = more complex / less likely to merge.
     """
-    n = len(related_files or [])
+    all_files = list(related_files or [])
+    auto_generated = [f for f in all_files if _is_auto_generated(f)]
+    related_files = [f for f in all_files if not _is_auto_generated(f)]
+    n = len(related_files)
     # File count: no penalty up to 2 files, linear down to 0.5 at n=10+.
     f_files = max(0.5, 1.0 - 0.0625 * max(0, n - 2))
     ratio = 0.0
@@ -66,6 +76,7 @@ def _composite_complexity_score(
     score = f_files * f_ratio * f_clusters * f_modules * f_neighbors
     return max(0.0, min(1.0, score)), {
         "files": n,
+        "auto_generated_files": len(auto_generated),
         "expansion_ratio": round(ratio, 2),
         "modules": len(modules),
         "neighbor_ratio": round(neighbor_ratio, 2),

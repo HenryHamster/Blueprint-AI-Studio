@@ -289,6 +289,53 @@ def _propagate_remediation_failure_to_siblings(
         direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
 
 
+_PROJECT_REMEDIATION_HISTORY_MAX = 20
+
+
+async def _record_project_remediation_outcome(
+    task: Task, *, merged: bool, session: AsyncSession,
+) -> bool:
+    """Record a CI auto-remediation outcome at the project level.
+
+    Used when a task carries ``auto_remediation=True`` but has no
+    ``direction_id`` — i.e. the error fingerprint matched no direction, so
+    the per-direction handler cannot track the attempt. Mirrors the
+    per-direction fields (result, timestamp, fingerprint, failure_class) on
+    ``Project.remediation_tracking`` so operators and downstream logic have
+    visibility into unlinked-fix effectiveness.
+    """
+    project = await session.get(Project, task.project_id)
+    if not project:
+        return False
+    ctx = task.context or {}
+    fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint") or ctx.get("_previous_error_fingerprint")
+    state = dict(project.remediation_tracking or {})
+    now_iso = _utcnow().isoformat()
+    entry: Dict[str, Any] = {
+        "task_id": str(task.id),
+        "result": "merged" if merged else "failed",
+        "timestamp": now_iso,
+    }
+    if fingerprint:
+        entry["fingerprint"] = str(fingerprint)
+    if not merged:
+        from app.failure_classification import classify_failure  # noqa: PLC0415
+        entry["failure_class"] = classify_failure(task)
+        entry["error_summary"] = (task.latest_status_message or "")[:200]
+    history = list(state.get("history") or [])
+    history.append(entry)
+    state["history"] = history[-_PROJECT_REMEDIATION_HISTORY_MAX:]
+    state["attempts"] = int(state.get("attempts") or 0) + 1
+    state["last_result"] = entry["result"]
+    state["last_at"] = now_iso
+    if fingerprint:
+        state["last_fingerprint"] = str(fingerprint)
+    project.remediation_tracking = state
+    flag_modified(project, "remediation_tracking")
+    session.add(project)
+    return True
+
+
 async def _record_remediation_if_terminal(
     task: Task, status: "TaskStatus", session: AsyncSession,
 ) -> None:
@@ -301,7 +348,9 @@ async def _record_remediation_if_terminal(
     if status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
         return
     ctx = task.context or {}
-    if not ctx.get("diagnosis_task_id") or not ctx.get("direction_id"):
+    has_direction_linkage = bool(ctx.get("diagnosis_task_id") and ctx.get("direction_id"))
+    is_auto_remediation = ctx.get("auto_remediation") is True
+    if not has_direction_linkage and not is_auto_remediation:
         return
     # Tasks that produce a PR enter the review pipeline — their true outcome
     # (merged vs. rejected) is only known after the review task completes or the
@@ -319,6 +368,10 @@ async def _record_remediation_if_terminal(
         )
         if recorded and status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
             await _maybe_spawn_followup_investigation(task, session)
+        if not recorded and is_auto_remediation:
+            await _record_project_remediation_outcome(
+                task, merged=(status == TaskStatus.COMPLETED), session=session,
+            )
     except Exception as exc:
         logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome for task {task.id}: {exc!r}")
 

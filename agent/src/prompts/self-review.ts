@@ -3,8 +3,8 @@ import { getMandatoryChecks } from './analysis.js';
 
 const MIGRATION_COMPLETENESS_ITEM = `**Migration completeness (CRITICAL — HARD GATE, verdict MUST be FAIL if violated)** — \`backend/app/models.py\` is in your diff. Verify all three: (a) a new migration file exists in \`backend/alembic/versions/\` that reflects the schema change; (b) \`EXPECTED_SCHEMA_REVISION\` in \`backend/app/main.py\` was bumped to the new migration's revision id; (c) the new migration's \`down_revision\` chains from the previously-latest migration. If any is missing, create the missing migration (and bump EXPECTED_SCHEMA_REVISION) before re-checking — do not mark passed.`;
 
-function buildSelfReviewChecklist(taskScope?: string, hasAnalysisPlan?: boolean, modelsChanged?: boolean): string {
-  const migrationItem = modelsChanged ? `\n7. ${MIGRATION_COMPLETENESS_ITEM}` : '';
+function buildSelfReviewChecklist(taskScope?: string, hasAnalysisPlan?: boolean, modelsChanged?: boolean, isDecomposed?: boolean): string {
+  const smallTail = (isDecomposed ? `\n7. **Cross-file consistency with sibling subtasks** (MAJOR) — This task was decomposed from a larger finding, so sibling subtasks are editing adjacent code. Confirm that any signatures, types, or exported symbols you touched remain consistent with the shape sibling subtasks rely on; if you changed an interface a sibling may call, flag it and prefer a non-breaking shim.` : '') + (modelsChanged ? `\n${isDecomposed ? 8 : 7}. ${MIGRATION_COMPLETENESS_ITEM}` : '');
   if (taskScope === 'small') {
     return `Severity guide: CRITICAL = data loss / security breach / crash; MAJOR = incorrect behavior / missing coverage; MINOR = style / naming (skip).
 
@@ -14,7 +14,7 @@ Check for:
 3. **Error handling** (MAJOR) — Are async operations properly awaited, exceptions caught where needed, null checks present?
 4. **Security quick-check** (CRITICAL) — Are any user inputs passed unsanitized to queries, commands, or HTML output?
 5. **Import and type verification** (MAJOR) — Are new imports available, type annotations correct, and do modified exports match their callers?
-6. **Scope violations** (MAJOR) — Small-scope tasks have a 6-file budget for non-test production files and fail a hard gate if exceeded. Count the non-test files you changed; if over budget or any file is not essential to the task, revert it now.${migrationItem}`;
+6. **Scope violations** (MAJOR) — Small-scope tasks have a 6-file budget for non-test production files and fail a hard gate if exceeded. Count the non-test files you changed; if over budget or any file is not essential to the task, revert it now.${smallTail}`;
   }
   if (taskScope === 'large') {
     return `Check for:
@@ -85,6 +85,7 @@ export function buildSelfReviewPrompt(opts: {
     severity?: string;
     confidence?: string;
   };
+  isDecomposed?: boolean;
 }): string {
   const restrictionsSection = opts.claudeMd
     ? `\n## File Restrictions (from CLAUDE.md)\n${opts.claudeMd.slice(0, 500)}\n`
@@ -249,7 +250,7 @@ export function buildSelfReviewPrompt(opts: {
 
   const hasAnalysisPlan = !!(opts.analysisPlan && opts.analysisPlan.trim());
   const modelsChanged = !!opts.changedFiles?.some(f => f === 'backend/app/models.py' || f.endsWith('/backend/app/models.py'));
-  const mandatoryChecks = getMandatoryChecks(opts.taskScope, hasAnalysisPlan, modelsChanged);
+  const mandatoryChecks = getMandatoryChecks(opts.taskScope, hasAnalysisPlan, modelsChanged, opts.isDecomposed);
   const checkIdsNote = `Use these exact IDs in checks_performed: ${mandatoryChecks.join(', ')}`;
 
   return `You are performing a self-review of the changes you just made for this task.
@@ -258,7 +259,7 @@ ${restrictionsSection}${remediationSection}${directionFeedbackSection}${scopeSpe
 
 Review ONLY for CRITICAL and MAJOR issues. Skip minor style or naming feedback.
 
-${buildSelfReviewChecklist(opts.taskScope, hasAnalysisPlan, modelsChanged)}
+${buildSelfReviewChecklist(opts.taskScope, hasAnalysisPlan, modelsChanged, opts.isDecomposed)}
 
 If you find CRITICAL or MAJOR issues, fix them and stage the changes with \`git add\`.
 

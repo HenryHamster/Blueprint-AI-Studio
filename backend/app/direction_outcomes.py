@@ -815,6 +815,53 @@ def _refresh_pipeline_scope_merge_rates(project: Project) -> None:
     runtime_config["pipeline_scope_expansion_ratios"] = ratios
 
 
+def summarize_review_quality_feedback(history: list) -> dict | None:
+    """Aggregate review quality signals across the last 3 research cycles.
+
+    Returns totals for reviews dismissed, overridden, and user-caught issues,
+    plus an optional note when a signal is elevated relative to completed
+    tasks — letting agents calibrate self-review thoroughness. Returns None
+    when no recent cycle carries any of the signals.
+    """
+    if not isinstance(history, list):
+        return None
+    recent = [h for h in history[-3:] if isinstance(h, dict)]
+    if not recent:
+        return None
+    dismissed = sum(int(h.get("reviews_dismissed") or 0) for h in recent)
+    overridden = sum(int(h.get("reviews_overridden") or 0) for h in recent)
+    user_caught = sum(int(h.get("user_issues_caught") or 0) for h in recent)
+    completed = sum(int(h.get("tasks_completed") or 0) for h in recent)
+    if dismissed == 0 and overridden == 0 and user_caught == 0:
+        return None
+    note = None
+    if completed >= 3:
+        if dismissed / completed >= 0.3:
+            note = (
+                f"User dismissed {dismissed}/{completed} reviews in last "
+                f"{len(recent)} cycles — self-review may be too strict."
+            )
+        elif user_caught / completed >= 0.3:
+            note = (
+                f"Users caught {user_caught} issues self-review missed across "
+                f"{completed} completed tasks — be more thorough."
+            )
+        elif overridden / completed >= 0.3:
+            note = (
+                f"User overrode {overridden}/{completed} review outcomes — "
+                f"self-review judgments may be miscalibrated."
+            )
+    result: dict = {
+        "reviews_dismissed": dismissed,
+        "reviews_overridden": overridden,
+        "user_issues_caught": user_caught,
+        "cycles_considered": len(recent),
+    }
+    if note:
+        result["note"] = note
+    return result
+
+
 def synthesize_prompt_quality_patterns(history: list) -> list[str]:
     """Synthesize merged-vs-failed prompt characteristic differences across
     recent research cycles into actionable guidance strings.

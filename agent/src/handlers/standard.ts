@@ -320,7 +320,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         const testFilesBlock = plannedTestFiles.length > 0
           ? `\nPreviously planned test files:\n${plannedTestFiles.map(f => `- ${f}`).join('\n')}`
           : '';
-        const narrowingGuidance = `The previous analysis pass planned ${plannedFiles.length} production files plus ${plannedTestFiles.length} test files (${totalPlanned} total). Production limit is ${prodFileLimit}; combined budget (production + tests) is ${totalFileBudget}. Cut the plan down to the minimum viable change set within both limits. Drop any files that are nice-to-have refactors, peripheral cleanups, or follow-on test/doc updates that could ship in a separate task. In **Implementation approach**, briefly note what was deferred so the next task can pick it up. Previously planned production files:\n${plannedFiles.map(f => `- ${f}`).join('\n')}${testFilesBlock}`;
+        const narrowingGuidance = `The previous analysis pass planned ${plannedFiles.length} production files plus ${plannedTestFiles.length} test files (${totalPlanned} total). Production limit is ${prodFileLimit}; combined budget (production + tests) is ${totalFileBudget}. Narrow the plan to the minimum set of files that form a **coherent change** — the files that MUST change together for the feature to work correctly (e.g. a shared type touched in backend + agent + tests is one logical unit and should stay together). Do NOT split a logical unit just to reduce file count; instead, drop files that belong to a *different* concern — peripheral cleanups, nice-to-have refactors, or independent follow-on work that can ship as a separate task without breaking this one. In **Implementation approach**, add a "Deferred" subsection explicitly listing any files/concerns you dropped so the next task can pick them up. Previously planned production files:\n${plannedFiles.map(f => `- ${f}`).join('\n')}${testFilesBlock}`;
         const retryPrompt = buildAnalysisPrompt({
           rawPrompt,
           taskTitle,
@@ -349,7 +349,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
           const testList = plannedTestFiles.length > 0
             ? `\n\nPlanned test files:\n${plannedTestFiles.map(f => `- ${f}`).join('\n')}`
             : '';
-          const failureLog = `Pre-implementation analysis planned ${plannedFiles.length} production + ${plannedTestFiles.length} test = ${totalPlanned} files, exceeding the medium-scope budget (production limit ${prodFileLimit}, combined budget ${totalFileBudget}). The narrowing retry could not bring the plan within budget. Split this task into smaller subtasks or scope it down to a single concern before retrying.\n\nPlanned production files:\n${fileList}${testList}`;
+          const failureLog = `Pre-implementation analysis planned ${plannedFiles.length} production + ${plannedTestFiles.length} test = ${totalPlanned} files, exceeding the medium-scope budget (production limit ${prodFileLimit}, combined budget ${totalFileBudget}). The narrowing retry could not bring the plan within budget. Split this task along a logical boundary — separate out any files belonging to a different concern as a follow-on task — rather than forcing a single-file solution that breaks the coherent change set.\n\nPlanned production files:\n${fileList}${testList}`;
           sendLog(ws, `[Analysis Phase] Plan still exceeds budget after retry (${plannedFiles.length} prod + ${plannedTestFiles.length} test = ${totalPlanned}) — failing fast.\n`);
           await persistAndPostStatus(taskId, {
             task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
@@ -840,6 +840,17 @@ Return nothing — just write the files.`;
         | undefined;
 
       const selfReviewTaskScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
+      const selfReviewCtxForDecomp = (task.context as Record<string, unknown> | undefined) || {};
+      // Decomposition signals as actually written by the backend:
+      //  - research auto-decomposition stamps context.auto_decomposed=True
+      //    (research_completion.py:1363)
+      //  - plan completion and agent spawn nest context.parent_context.parent_task_id
+      //    (plan_completion.py:191, routers/agent.py:1758)
+      const selfReviewParentCtx = selfReviewCtxForDecomp.parent_context as Record<string, unknown> | undefined;
+      const selfReviewIsDecomposed = !!(
+        selfReviewCtxForDecomp.auto_decomposed
+        || selfReviewParentCtx?.parent_task_id
+      );
       const selfReviewAnalysisPlan = selfReviewTaskScope === 'medium' && analysisContext
         ? condensedAnalysisSections(analysisContext)
         : undefined;
@@ -902,6 +913,7 @@ Return nothing — just write the files.`;
         scopeSpecificReviewIssues,
         moduleFeedbackWarnings,
         remediationContext,
+        isDecomposed: selfReviewIsDecomposed,
       });
 
       const headBeforeReview = git(['rev-parse', 'HEAD']);
@@ -1023,7 +1035,7 @@ Return nothing — just write the files.`;
 
           // Validate checks_performed contains all mandatory items
           const modelsChanged = !!changedFiles?.some(f => f === 'backend/app/models.py' || f.endsWith('/backend/app/models.py'));
-          const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined, !!selfReviewAnalysisPlan, modelsChanged);
+          const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined, !!selfReviewAnalysisPlan, modelsChanged, selfReviewIsDecomposed);
           if (!parsedChecks) {
             reviewCategories.push('self_review_failed', 'validation_failed');
             parseFailed = true;
@@ -1177,7 +1189,7 @@ Return nothing — just write the files.`;
           // Validation failure: retry once with explicit guidance about what was missing
           if (parseFailed) {
             const modelsChanged = !!changedFiles?.some(f => f === 'backend/app/models.py' || f.endsWith('/backend/app/models.py'));
-            const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined, !!selfReviewAnalysisPlan, modelsChanged);
+            const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined, !!selfReviewAnalysisPlan, modelsChanged, selfReviewIsDecomposed);
             const missingChecks = parsedChecks
               ? mandatory.filter(m => !parsedChecks!.includes(m))
               : mandatory;
