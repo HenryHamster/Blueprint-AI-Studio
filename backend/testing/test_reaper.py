@@ -2154,3 +2154,114 @@ def test_transient_5xx_patterns_constant():
               "502 bad gateway", "503 service", "504 gateway",
               "server error"):
         assert p in _TRANSIENT_5XX_PATTERNS
+
+
+# ── _sweep_orphan_direction_holds ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_clears_hold_when_direction_missing(reaper_db):
+    """A held direction whose id is absent from every project's directions
+    list must have its hold cleared — otherwise tasks stay stuck forever."""
+    import app.shared_state as _ss
+    from app.reaper import _sweep_orphan_direction_holds
+
+    _ss.direction_failure_streaks.clear()
+    # Project has no directions at all — all held directions are orphans.
+    await _make_project(reaper_db)
+    orphan_did = "d-" + _uuid_mod.uuid4().hex[:8]
+    _ss.direction_failure_streaks[orphan_did] = {
+        "held": True,
+        "held_at": datetime(2026, 1, 1, 12, 0, 0),
+        "held_reason": "code",
+        "held_failure_class": "CODE_ERROR",
+        "consecutive_failures": 4,
+        "consecutive_infra_failures": 0,
+        "last_failure_class": "CODE_ERROR",
+    }
+
+    cleared = await _sweep_orphan_direction_holds(reaper_db)
+    assert cleared == 1
+    assert _ss.direction_failure_streaks[orphan_did]["held"] is False
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_preserves_hold_when_direction_live(reaper_db):
+    """A held direction that still exists (status=active) must NOT be cleared."""
+    import app.shared_state as _ss
+    from app.reaper import _sweep_orphan_direction_holds
+
+    _ss.direction_failure_streaks.clear()
+    live_did = "d-" + _uuid_mod.uuid4().hex[:8]
+    project = Project(
+        name="has-live-dir", user_id="user1",
+        directions=[{"id": live_did, "status": "active", "text": "do the thing"}],
+    )
+    reaper_db.add(project)
+    await reaper_db.commit()
+
+    _ss.direction_failure_streaks[live_did] = {
+        "held": True,
+        "held_at": datetime(2026, 1, 1, 12, 0, 0),
+        "held_reason": "code",
+        "held_failure_class": "CODE_ERROR",
+        "consecutive_failures": 4,
+        "consecutive_infra_failures": 0,
+        "last_failure_class": "CODE_ERROR",
+    }
+
+    cleared = await _sweep_orphan_direction_holds(reaper_db)
+    assert cleared == 0
+    assert _ss.direction_failure_streaks[live_did]["held"] is True
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_clears_hold_when_direction_completed(reaper_db):
+    """A direction with status=completed is no longer live — hold is orphaned."""
+    import app.shared_state as _ss
+    from app.reaper import _sweep_orphan_direction_holds
+
+    _ss.direction_failure_streaks.clear()
+    completed_did = "d-" + _uuid_mod.uuid4().hex[:8]
+    project = Project(
+        name="has-completed-dir", user_id="user1",
+        directions=[{"id": completed_did, "status": "completed", "text": "done"}],
+    )
+    reaper_db.add(project)
+    await reaper_db.commit()
+
+    _ss.direction_failure_streaks[completed_did] = {
+        "held": True,
+        "held_at": datetime(2026, 1, 1, 12, 0, 0),
+        "held_reason": "code",
+        "held_failure_class": "CODE_ERROR",
+        "consecutive_failures": 4,
+        "consecutive_infra_failures": 0,
+        "last_failure_class": "CODE_ERROR",
+    }
+
+    cleared = await _sweep_orphan_direction_holds(reaper_db)
+    assert cleared == 1
+    assert _ss.direction_failure_streaks[completed_did]["held"] is False
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_ignores_unheld_streaks(reaper_db):
+    """Streaks without held=True are untouched regardless of direction state."""
+    import app.shared_state as _ss
+    from app.reaper import _sweep_orphan_direction_holds
+
+    _ss.direction_failure_streaks.clear()
+    await _make_project(reaper_db)
+    unheld_did = "d-" + _uuid_mod.uuid4().hex[:8]
+    _ss.direction_failure_streaks[unheld_did] = {
+        "held": False,
+        "consecutive_failures": 2,
+        "consecutive_infra_failures": 0,
+        "last_failure_class": "CODE_ERROR",
+    }
+
+    cleared = await _sweep_orphan_direction_holds(reaper_db)
+    assert cleared == 0
+    # Streak dict itself is untouched
+    assert _ss.direction_failure_streaks[unheld_did]["consecutive_failures"] == 2

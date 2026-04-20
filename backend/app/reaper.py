@@ -10,7 +10,7 @@ from typing import Dict
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
-from app.models import Task, TaskStatus
+from app.models import Task, TaskStatus, Project
 from app.compute import get_provision_error, record_zone_failure, _capture_serial_for_vm, get_vm_zone, INFRA_PROVISION_PATTERNS, any_zone_available, soonest_zone_recovery
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import record_pipeline_event, external_health as _external_health, resolve_retry_budget
@@ -94,6 +94,42 @@ def _heartbeat_stale_cutoff(task, now: datetime) -> datetime:
     floor = _HEARTBEAT_EFFORT_FLOORS.get(effort, 0)
     seconds = max(seconds, floor)
     return now - timedelta(seconds=seconds)
+
+
+async def _sweep_orphan_direction_holds(session) -> int:
+    """Release direction holds whose direction_id no longer maps to a live direction.
+
+    A direction is "live" if it exists in some project's directions JSONB with
+    status in (active, paused, proposed). completed/expired/rejected directions
+    shouldn't hold tasks — and archived directions that disappear entirely
+    definitely shouldn't. Returns the number of holds cleared.
+    """
+    from app.shared_state import (  # noqa: PLC0415
+        direction_failure_streaks,
+        clear_direction_hold,
+    )
+    live_dids: set[str] = set()
+    projects = (await session.execute(select(Project))).scalars().all()
+    for proj in projects:
+        for d in (proj.directions or []):
+            if d.get("status") in ("active", "paused", "proposed"):
+                did_val = d.get("id")
+                if did_val:
+                    live_dids.add(did_val)
+    cleared = 0
+    for did, streak in list(direction_failure_streaks.items()):
+        if not streak.get("held"):
+            continue
+        if did not in live_dids:
+            clear_direction_hold(did)
+            cleared += 1
+            logger.info(
+                f"[REAPER] Cleared hold on orphan direction {did} "
+                "(no longer live in any project's directions)"
+            )
+    if cleared:
+        logger.info(f"[REAPER] Cleared {cleared} orphan direction hold(s)")
+    return cleared
 
 
 async def reaper_service():
@@ -765,6 +801,45 @@ async def reaper_service():
                             except Exception as e:
                                 logger.warning(f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}", exc_info=True)
 
+                    # Close open PRs owned by terminally-failed fix tasks. When a
+                    # fix exhausts retries, its PR stays OPEN on GitHub, and
+                    # sibling tasks whose rollup waits on open PRs targeting the
+                    # same research branch block forever. Closing the dead PR
+                    # removes it from the sibling rollup-wait gate.
+                    for task in orphaned_tasks:
+                        if task.status != TaskStatus.FAILED:
+                            continue
+                        payload = task.first_payload if task.payloads else {}
+                        if payload.get("type") != "fix":
+                            continue
+                        pr_number = (
+                            (task.context or {}).get("review_loop", {}).get("pr_number")
+                            or payload.get("pr_number")
+                        )
+                        if not pr_number:
+                            continue
+                        try:
+                            from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+                            from app.github import close_pull_request, create_pr_comment  # noqa: PLC0415
+                            gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                            reason = task.latest_status_message or "review-fix retries exhausted"
+                            try:
+                                await create_pr_comment(
+                                    gh_token, owner, repo, int(pr_number),
+                                    f":warning: Abandoning this PR — automated review-fix retries exhausted.\n\n"
+                                    f"Task `{str(task.id)[:8]}` reached terminal failure: {reason[:400]}\n\n"
+                                    f"Closing so sibling rollups aren't blocked waiting for this branch.",
+                                )
+                            except Exception as ce:
+                                logger.warning(f"[PIPELINE] Failed to comment on dead PR #{pr_number}: {ce}")
+                            closed = await close_pull_request(gh_token, owner, repo, int(pr_number), project_id=str(task.project_id))
+                            if closed:
+                                logger.info(f"[PIPELINE] Closed PR #{pr_number} after fix task {task.id} terminal-failed")
+                            else:
+                                logger.warning(f"[PIPELINE] close_pull_request returned False for PR #{pr_number}")
+                        except Exception as e:
+                            logger.warning(f"[PIPELINE] Failed to close PR for failed fix task {task.id}: {e}", exc_info=True)
+
                 # Step 3: Sweep EVALUATING parents with stale unmerged children.
                 # When the initial review spawn after a child completes fails silently,
                 # no event re-triggers _check_and_trigger_rollup.  This sweep catches
@@ -1046,6 +1121,17 @@ async def reaper_service():
                         logger.info(f"[REAPER] Cleared {_cleared_holds} infra direction hold(s)")
                 except Exception as e:
                     logger.error(f"[REAPER] Infra direction hold recovery error: {e}", exc_info=True)
+
+                # Step 5c: Clear holds on directions that are no longer live.
+                # When a direction is auto-retired/completed/rejected/expired
+                # while a task is held against it, the in-memory streak entry
+                # keeps the hold set forever — the 4-hour timeout is the only
+                # escape. That strands the task behind a direction that no
+                # longer exists in any project's directions list.
+                try:
+                    await _sweep_orphan_direction_holds(session)
+                except Exception as e:
+                    logger.error(f"[REAPER] Orphan direction hold sweep error: {e}", exc_info=True)
 
                 # Step 5b: Clear stale or malformed retry_after on QUEUED tasks.
                 # A far-future or unparseable value permanently blocks dispatch

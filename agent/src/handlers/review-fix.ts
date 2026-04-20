@@ -871,11 +871,34 @@ export async function handleFix(
     const testNote = fixTestFailures
       ? `\n\nNote: test failures detected, manual review recommended${fixTestFailureSummary ? `:\n${fixTestFailureSummary.slice(0, 500)}` : ''}`
       : '';
-    // Only create a new commit if there are uncommitted changes (Claude may have already committed)
+    // Only create a new commit if there are uncommitted changes (Claude may have already committed).
+    // Two-step check: working tree has any change → stage it all → inspect the
+    // staged diff. If nothing ends up staged (e.g. the only "changes" were
+    // untracked ignored files, or pre-commit hooks in Claude's prior runs
+    // cleaned up), skip the commit instead of hitting "nothing to commit" —
+    // which, with pre-commit hooks firing on commit, previously surfaced as
+    // an opaque "Command failed: git commit" and burned all 3 retries without
+    // progress.
     const fixStaged = git(['status', '--porcelain']);
     if (fixStaged.length > 0) {
-      const committed = gitCommit(`blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})${testNote}`);
-      if (!committed) sendLog(ws, 'Nothing to commit after review fix (pre-commit hook may have reverted changes)\n');
+      // Make sure everything the agent modified is actually staged before we
+      // attempt the commit. Without this, Edit-tool changes that weren't
+      // `git add`ed by Claude would leave the index empty.
+      try { git(['add', '-A']); } catch { /* pre-commit add-failures are rare; fall through */ }
+      let hasStagedDiff = true;
+      try {
+        execFileSync('git', ['-C', WORKSPACE, 'diff', '--cached', '--quiet'], { encoding: 'utf-8' });
+        // Exit 0 = no staged diff; exit 1 = has staged diff (throws)
+        hasStagedDiff = false;
+      } catch {
+        hasStagedDiff = true;
+      }
+      if (!hasStagedDiff) {
+        sendLog(ws, 'REVIEW_FIX_NO_CHANGES: working tree has changes but nothing staged for commit — skipping (likely untracked-only or reverted by hooks)\n');
+      } else {
+        const committed = gitCommit(`blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})${testNote}`);
+        if (!committed) sendLog(ws, 'Nothing to commit after review fix (pre-commit hook may have reverted changes)\n');
+      }
     }
   }
 
