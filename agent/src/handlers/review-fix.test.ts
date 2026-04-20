@@ -1093,4 +1093,17 @@ describe('buildMigrationConflictGuidance', () => {
     expect(out).toMatch(/EXPECTED_SCHEMA_REVISION/);
     expect(out).toMatch(/0051_merged\.py/);
   });
+
+  it('includes computed next revision number, renamed file, and EXPECTED_SCHEMA_REVISION value', () => {
+    const out = buildMigrationConflictGuidance({
+      detected: true,
+      prMigrations: ['backend/alembic/versions/0050_add_foo.py'],
+      baseNewMigrations: ['backend/alembic/versions/0051_merged.py'],
+    });
+    expect(out).toMatch(/revision="0051"/);
+    expect(out).toMatch(/backend\/alembic\/versions\/0052_add_foo\.py/);
+    expect(out).toMatch(/revision = "0052"/);
+    expect(out).toMatch(/down_revision = "0051"/);
+    expect(out).toMatch(/EXPECTED_SCHEMA_REVISION = "0052"/);
+  });
 });

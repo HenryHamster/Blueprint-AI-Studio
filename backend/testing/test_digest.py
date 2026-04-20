@@ -151,6 +151,41 @@ async def test_digest_with_failed_tasks(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_digest_migration_health(client: AsyncClient, db_session):
+    """migration_health surfaces migrate-task counts, MIGRATION_ERROR failures, and auto-generated migrations."""
+    from app.main import EXPECTED_SCHEMA_REVISION
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add_all([
+        make_task(project_id=project.id, status=TaskStatus.COMPLETED, payloads=[{"type": "migrate"}]),
+        make_task(
+            project_id=project.id, status=TaskStatus.FAILED, payloads=[{"type": "migrate"}],
+            context={"failure_class": "MIGRATION_ERROR"},
+        ),
+        make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED, payloads=[{"type": "create"}],
+            context={"related_files": ["backend/alembic/versions/0099_x.py", "backend/app/models.py"]},
+        ),
+        make_task(project_id=project.id, status=TaskStatus.COMPLETED, payloads=[{"type": "create"}]),
+    ])
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    mh = response.json()["migration_health"]
+    assert mh["current_schema_revision"] == EXPECTED_SCHEMA_REVISION
+    assert mh["migration_tasks_in_window"] == 2
+    assert mh["migration_tasks_succeeded"] == 1
+    assert mh["migration_tasks_failed"] == 1
+    assert mh["migration_errors_in_window"] == 1
+    assert mh["auto_generated_migrations"] == 1
+
+
+@pytest.mark.asyncio
 async def test_digest_aggregates_merge_retries_saved(client: AsyncClient, db_session):
     """total_merge_retries_saved sums _merge_retries_saved across completed+failed tasks;
     merge_early_exit_count counts tasks with a positive saved value."""

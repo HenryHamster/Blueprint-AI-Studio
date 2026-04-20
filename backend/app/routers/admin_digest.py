@@ -2873,6 +2873,44 @@ async def get_digest(
     )
     _first_review_approval_rate = _compute_first_review_approval_breakdowns(completed_tasks + failed_tasks)
 
+    from app.main import EXPECTED_SCHEMA_REVISION
+    from app.failure_classification import classify_failure as _mig_classify
+
+    def _task_type(t: Task) -> Optional[str]:
+        return (t.first_payload or {}).get("type")
+
+    def _touched_migration(t: Task) -> bool:
+        ctx = t.context or {}
+        files = ctx.get("related_files") or []
+        if isinstance(files, list) and any(
+            isinstance(f, str) and f.startswith("backend/alembic/versions/") for f in files
+        ):
+            return True
+        payload_files = (t.first_payload or {}).get("related_files") or []
+        return isinstance(payload_files, list) and any(
+            isinstance(f, str) and f.startswith("backend/alembic/versions/") for f in payload_files
+        )
+
+    _migrate_completed = [t for t in completed_tasks if _task_type(t) == "migrate"]
+    _migrate_failed = [t for t in failed_tasks if _task_type(t) == "migrate"]
+    _migration_errors = sum(
+        1 for t in failed_tasks
+        if (t.context or {}).get("failure_class") == "MIGRATION_ERROR"
+        or _mig_classify(t, error_log_map.get(str(t.id))) == "MIGRATION_ERROR"
+    )
+    _auto_generated_migrations = sum(
+        1 for t in (completed_tasks + failed_tasks)
+        if _task_type(t) != "migrate" and _touched_migration(t)
+    )
+    migration_health = {
+        "current_schema_revision": EXPECTED_SCHEMA_REVISION,
+        "migration_tasks_in_window": len(_migrate_completed) + len(_migrate_failed),
+        "migration_tasks_succeeded": len(_migrate_completed),
+        "migration_tasks_failed": len(_migrate_failed),
+        "migration_errors_in_window": _migration_errors,
+        "auto_generated_migrations": _auto_generated_migrations,
+    }
+
     return {
         "window_hours": hours,
         "total_merge_retries_saved": total_merge_retries_saved,
@@ -2950,4 +2988,5 @@ async def get_digest(
         "remediation_funnel": remediation_funnel,
         "investigation_conversion": investigation_conversion,
         "anomaly_adjustment": anomaly_adjustment_summary,
+        "migration_health": migration_health,
     }
