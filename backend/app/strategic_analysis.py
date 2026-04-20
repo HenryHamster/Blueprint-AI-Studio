@@ -139,6 +139,40 @@ def _build_outcome_evaluation(project) -> dict:
             outcome["type_distribution"] = type_dist
             outcome["product_ratio"] = round(product_weighted / total_typed, 2) if total_typed > 0 else None
 
+        # Aggregate scope_breakdown + escalation_outcomes across window cycles.
+        # Compact form: per-scope {created, merged, failed}; escalation_outcomes
+        # merged across cycles. Skip scopes with no data so the prompt stays small.
+        scope_perf: dict = {}
+        escalations_agg: dict = {}
+        for cycle_entry in window_history:
+            for scope_name, stats in (cycle_entry.get("scope_breakdown") or {}).items():
+                if not isinstance(stats, dict):
+                    continue
+                created_n = stats.get("created", 0) or 0
+                merged_n = stats.get("merged", 0) or 0
+                failed_n = stats.get("failed", 0) or 0
+                if not (created_n or merged_n or failed_n):
+                    continue
+                bucket = scope_perf.setdefault(
+                    scope_name, {"created": 0, "merged": 0, "failed": 0}
+                )
+                bucket["created"] += created_n
+                bucket["merged"] += merged_n
+                bucket["failed"] += failed_n
+            for esc_key, esc_stats in (cycle_entry.get("escalation_outcomes") or {}).items():
+                if not isinstance(esc_stats, dict):
+                    continue
+                eb = escalations_agg.setdefault(
+                    esc_key, {"attempted": 0, "merged": 0, "failed": 0}
+                )
+                eb["attempted"] += esc_stats.get("attempted", 0) or 0
+                eb["merged"] += esc_stats.get("merged", 0) or 0
+                eb["failed"] += esc_stats.get("failed", 0) or 0
+        if scope_perf:
+            outcome["scope_performance"] = scope_perf
+        if escalations_agg:
+            outcome["escalation_outcomes"] = escalations_agg
+
         # Per-direction trend (first-half vs second-half merge rate over window history)
         if cycles >= 4:
             sorted_window = sorted(window_history, key=lambda h: h.get("timestamp") or "")

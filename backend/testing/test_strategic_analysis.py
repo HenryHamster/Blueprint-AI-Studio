@@ -583,6 +583,68 @@ def test_cost_per_merged_pr_omitted_when_no_merges():
     assert "cost_per_merged_pr" not in d
 
 
+def test_scope_performance_aggregates_across_cycles():
+    directions = [{
+        "id": "dir-1", "status": "active",
+        "research_history": [
+            {
+                "timestamp": "2026-01-01T00:00:00", "prs_merged": 2,
+                "scope_breakdown": {
+                    "small": {"created": 5, "merged": 3, "failed": 1},
+                    "medium": {"created": 2, "merged": 0, "failed": 2},
+                },
+                "escalation_outcomes": {
+                    "small_to_medium": {"attempted": 1, "merged": 1, "failed": 0},
+                },
+            },
+            {
+                "timestamp": "2026-01-02T00:00:00", "prs_merged": 1,
+                "scope_breakdown": {
+                    "small": {"created": 3, "merged": 2, "failed": 0},
+                },
+                "escalation_outcomes": {
+                    "small_to_medium": {"attempted": 2, "merged": 1, "failed": 1},
+                    "medium_to_large": {"attempted": 1, "merged": 0, "failed": 1},
+                },
+            },
+        ],
+    }]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["scope_performance"] == {
+        "small": {"created": 8, "merged": 5, "failed": 1},
+        "medium": {"created": 2, "merged": 0, "failed": 2},
+    }
+    assert d["escalation_outcomes"] == {
+        "small_to_medium": {"attempted": 3, "merged": 2, "failed": 1},
+        "medium_to_large": {"attempted": 1, "merged": 0, "failed": 1},
+    }
+
+
+def test_scope_performance_omits_empty_scopes():
+    directions = [{
+        "id": "dir-1", "status": "active",
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "prs_merged": 0,
+             "scope_breakdown": {
+                 "small": {"created": 0, "merged": 0, "failed": 0},
+                 "medium": {"created": 1, "merged": 0, "failed": 1},
+             }},
+        ],
+    }]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["scope_performance"] == {"medium": {"created": 1, "merged": 0, "failed": 1}}
+
+
+def test_scope_performance_absent_when_no_data():
+    directions = [{
+        "id": "dir-1", "status": "active",
+        "research_history": [{"timestamp": "2026-01-01T00:00:00", "prs_merged": 1}],
+    }]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert "scope_performance" not in d
+    assert "escalation_outcomes" not in d
+
+
 def test_difficulty_index_surfaced_in_outcome_evaluation():
     directions = [{
         "id": "dir-1",
