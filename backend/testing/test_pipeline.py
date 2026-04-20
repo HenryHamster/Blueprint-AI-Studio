@@ -4047,8 +4047,8 @@ class TestPredictSpawnSuccessExpansionRatio:
 
     def test_high_ratio_penalizes_prediction(self):
         from app.spawn_calibration import predict_spawn_success
-        p_bad = predict_spawn_success("medium", self._direction([1.6, 1.7, 1.8]))
-        p_good = predict_spawn_success("medium", self._direction([1.0, 1.0, 1.0]))
+        p_bad = predict_spawn_success("medium", self._direction([1.6, 1.7]))
+        p_good = predict_spawn_success("medium", self._direction([1.0, 1.0]))
         assert p_bad < p_good
 
     def test_moderate_ratio_applies_softer_penalty(self):

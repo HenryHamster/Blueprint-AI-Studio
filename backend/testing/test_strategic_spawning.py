@@ -1113,3 +1113,80 @@ async def test_build_shipped_manifest_cutoff_from_cycle_history(db_session):
 
     manifest = await _build_shipped_changes_manifest(project, db_session)
     assert manifest == []
+
+
+# ── predict_spawn_success: quality-score and momentum signals ─────────────────
+
+
+class TestPredictSpawnSuccessQualityAndMomentum:
+    """Signals 16 (quality score) and 17 (momentum factor) in predict_spawn_success."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_pipeline_rates(self):
+        from app.shared_state import runtime_config
+        prev = runtime_config.get("pipeline_scope_merge_rates")
+        runtime_config["pipeline_scope_merge_rates"] = {}
+        yield
+        if prev is None:
+            runtime_config.pop("pipeline_scope_merge_rates", None)
+        else:
+            runtime_config["pipeline_scope_merge_rates"] = prev
+
+    def test_quality_score_signal_present_with_history(self):
+        from app.spawn_calibration import predict_spawn_success
+        healthy = {
+            "research_history": [
+                {"taxonomy_summary": {"code_defect": 3}, "tasks_created": 2, "prs_merged": 2},
+            ],
+        }
+        poor = {
+            "research_history": [
+                {"taxonomy_summary": {"infra_related": 3, "review_quality": 2}, "tasks_created": 2, "prs_merged": 0},
+            ],
+        }
+        assert predict_spawn_success("small", healthy) > predict_spawn_success("small", poor)
+
+    def test_no_history_skips_quality_signal(self):
+        from app.spawn_calibration import predict_spawn_success
+        assert predict_spawn_success("small", {}) == 0.5
+
+    def test_momentum_hot_streak_boosts_prediction(self):
+        from app.spawn_calibration import predict_spawn_success
+        hot = {
+            "research_history": [
+                {"tasks_created": 2, "prs_merged": 1},
+                {"tasks_created": 2, "prs_merged": 1},
+            ],
+        }
+        neutral = {
+            "research_history": [
+                {"tasks_created": 2, "prs_merged": 1},
+            ],
+        }
+        assert predict_spawn_success("small", hot) > predict_spawn_success("small", neutral)
+
+    def test_momentum_stall_penalizes_prediction(self):
+        from app.spawn_calibration import predict_spawn_success
+        stalled = {
+            "research_history": [
+                {"tasks_created": 0, "taxonomy_summary": {"code_defect": 1}},
+                {"tasks_created": 0, "taxonomy_summary": {"code_defect": 1}},
+                {"tasks_created": 0, "taxonomy_summary": {"code_defect": 1}},
+            ],
+        }
+        neutral = {
+            "research_history": [
+                {"tasks_created": 0, "taxonomy_summary": {"code_defect": 1}},
+            ],
+        }
+        assert predict_spawn_success("small", stalled) < predict_spawn_success("small", neutral)
+
+    def test_result_within_bounds(self):
+        from app.spawn_calibration import predict_spawn_success
+        direction = {
+            "research_history": [
+                {"tasks_created": 2, "prs_merged": 1},
+            ],
+        }
+        result = predict_spawn_success("small", direction)
+        assert 0.0 <= result <= 1.0

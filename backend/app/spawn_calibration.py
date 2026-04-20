@@ -14,7 +14,12 @@ import os
 from datetime import timedelta
 from typing import Any
 
-from app.direction_metrics import _compute_acceptance_rate, _compute_rolling_median_review_iterations
+from app.direction_metrics import (
+    _compute_acceptance_rate,
+    _compute_direction_quality_score,
+    _compute_momentum_factor,
+    _compute_rolling_median_review_iterations,
+)
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -608,6 +613,28 @@ def predict_spawn_success(
         elif median_iters >= 3:
             signals.append(0.5)
             weights.append(1.0)
+
+    # Signal 16: direction quality score (taxonomy health composite). Already
+    # used in autonomous_research.py for direction selection; feeding it back
+    # into spawn prediction makes spawn gating consistent with selection. Only
+    # emitted when the last 3 cycles carry at least one taxonomy_summary so
+    # directions without taxonomy data aren't pulled toward the 0.5 neutral
+    # default that _compute_direction_quality_score returns.
+    if any((e.get("taxonomy_summary") or {}) for e in history3):
+        signals.append(_compute_direction_quality_score(direction))
+        weights.append(1.0)
+
+    # Signal 17: momentum factor. Hot-streak directions (last 2 cycles both
+    # productive) get a confidence boost; stalled directions (last 3 cycles
+    # all empty) get a penalty. Neutral momentum is omitted so it doesn't
+    # pull the weighted average toward 0.5.
+    momentum = _compute_momentum_factor(direction)
+    if momentum >= 2.0:
+        signals.append(0.8)
+        weights.append(1.0)
+    elif momentum <= 0.5:
+        signals.append(0.2)
+        weights.append(1.0)
 
     if not signals:
         return 0.5  # insufficient data — neutral
