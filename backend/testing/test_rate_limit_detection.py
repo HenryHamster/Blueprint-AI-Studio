@@ -447,15 +447,16 @@ def test_taxonomy_calibrated_from_with_generic_message_is_code_defect():
         )
 
 
-def test_taxonomy_infra_related_for_agent_reported_scope_overflow():
+def test_taxonomy_scope_related_for_agent_reported_scope_overflow():
     """End-to-end: normalize_agent_failure_category('scope_overflow', task) persists
-    SCOPE_OVERFLOW in context; classify_failure_taxonomy must then return INFRA_RELATED
-    (SCOPE_OVERFLOW is in INFRA_CLASSES)."""
+    SCOPE_OVERFLOW in context; classify_failure_taxonomy must then return SCOPE_RELATED
+    (SCOPE_OVERFLOW stays in INFRA_CLASSES for retry/budget routing, but the taxonomy
+    carve-out routes it to scope_related since the code was not at fault)."""
     t = _task_with_ctx("agent aborted", {})
     normalized = normalize_agent_failure_category("scope_overflow", t)
     assert normalized == "SCOPE_OVERFLOW"
     t.context = {"failure_category": normalized}
-    assert classify_failure_taxonomy(t) == TAXONOMY_INFRA_RELATED
+    assert classify_failure_taxonomy(t) == TAXONOMY_SCOPE_RELATED
 
 
 def test_taxonomy_infra_related_for_agent_reported_rate_limited():

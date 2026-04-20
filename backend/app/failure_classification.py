@@ -70,6 +70,11 @@ def classify_failure_taxonomy(task: "Task") -> str:
     infra_related. Reuses classify_failure() for the base class.
     """
     base = classify_failure(task)
+    # SCOPE_OVERFLOW is in INFRA_CLASSES for retry/budget routing, but it
+    # represents a scope-estimation mismatch, not an infra outage. Route it
+    # to scope_related so operators see it in the correct analytics bucket.
+    if base == SCOPE_OVERFLOW:
+        return TAXONOMY_SCOPE_RELATED
     if base in INFRA_CLASSES:
         return TAXONOMY_INFRA_RELATED
 

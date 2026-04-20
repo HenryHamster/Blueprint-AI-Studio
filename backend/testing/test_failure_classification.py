@@ -336,6 +336,13 @@ class TestClassifyFailureTaxonomyEdges:
         t = _task("AttributeError: NoneType has no 'x'", {"scope": "small"})
         assert classify_failure_taxonomy(t) == TAXONOMY_CODE_DEFECT
 
+    def test_scope_overflow_is_scope_related_not_infra(self):
+        """SCOPE_OVERFLOW is in INFRA_CLASSES for retry routing, but the
+        taxonomy must classify it as scope_related for analytics."""
+        t = _task("", {"failure_category": "SCOPE_OVERFLOW", "scope": "small"})
+        assert classify_failure(t) == SCOPE_OVERFLOW
+        assert classify_failure_taxonomy(t) == TAXONOMY_SCOPE_RELATED
+
     def test_bare_complexity_is_code_defect_not_scope(self):
         """'time complexity' / 'reduce complexity' are code-quality, not scope."""
         t = _task("reduce time complexity of implementation", {"scope": "small"})
