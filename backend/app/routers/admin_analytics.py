@@ -22,7 +22,20 @@ logger = logging.getLogger(__name__)
 
 
 def _derive_completed_at(t: "Task") -> datetime:
-    """Return the completion timestamp from the last status_log entry, or task.created_at."""
+    """Return the completion timestamp from the last status_log entry, or task.created_at.
+
+    If the caller projected `status_log[-1]->>'t'` SQL-side and stashed it on
+    `t._projected_completed_at_ts` (see admin_digest.py), use that instead of
+    materializing the heavy `status_log` JSONB column.
+    """
+    if hasattr(t, "_projected_completed_at_ts"):
+        cached_ts = t._projected_completed_at_ts
+        if cached_ts:
+            try:
+                return datetime.fromisoformat(cached_ts)
+            except (TypeError, ValueError):
+                pass
+        return t.created_at
     if t.status_log:
         try:
             return datetime.fromisoformat(t.status_log[-1]["t"])

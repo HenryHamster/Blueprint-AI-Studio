@@ -15,6 +15,7 @@ from sqlmodel import select
 from app.notification_dispatch import dispatch_external_notification
 
 from app.database import get_session
+from app.digest_cache import DigestCache, get_digest_cache
 from app.models import (
     Task, TaskStatus, Project, Artifact, ArtifactType, _utcnow,
 )
@@ -928,9 +929,31 @@ async def get_digest(
     hours: int = Query(24, ge=1, le=168),
     project_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(require_admin)
+    current_user: dict = Depends(require_admin),
+    cache: DigestCache = Depends(get_digest_cache),
 ):
-    """Return a catch-up digest of activity within the requested time window."""
+    """Return a catch-up digest of activity within the requested time window.
+
+    Wraps the compute path in a TTL cache with in-flight dedup so that a
+    stampede of concurrent admin UI polls doesn't re-execute the 5000-row
+    JSONB scan for each request. Cache key is (hours, project_id) — the
+    response does not vary per user. Default TTL 15s; tune in digest_cache.
+    """
+    cache_key = ("digest", hours, str(project_id) if project_id else None)
+    return await cache.get_or_compute(
+        cache_key,
+        lambda: _compute_digest(hours=hours, project_id=project_id, session=session),
+    )
+
+
+async def _compute_digest(
+    *,
+    hours: int,
+    project_id: uuid.UUID | None,
+    session: AsyncSession,
+) -> Dict[str, Any]:
+    """Extracted body of `get_digest` so the cache layer can call it without
+    FastAPI-dependency plumbing."""
     window_start = _utcnow() - timedelta(hours=hours)
     prev_window_start = window_start - timedelta(hours=hours)
     # Extend lookback to capture long-running tasks and 7 periods for trend history
@@ -955,21 +978,56 @@ async def get_digest(
         task_filters.append(Task.project_id == project_id)
 
     _DIGEST_TASK_ROW_CAP = 5000
-    tasks_result = await session.execute(
-        select(Task)
-        .where(*task_filters)
-        .options(load_only(
-            Task.id, Task.status, Task.project_id, Task.title,
-            Task.created_at, Task.started_at,
-            Task.payloads, Task.context, Task.status_log,
-            Task.latest_status_message, Task.attempt_count,
-            Task.requires_approval,
-            Task.vm_provisioned_at, Task.vm_started_at,
-            Task.vm_stopped_at, Task.vm_spot,
-        ))
-        .limit(_DIGEST_TASK_ROW_CAP)
-    )
-    all_tasks = tasks_result.scalars().all()
+    # Project payloads[0] and status_log[-1]->>'t' SQL-side on PostgreSQL.
+    # Loading the full JSONB arrays for 5000 rows blew a Cloud Run instance
+    # past its 4 GiB limit under concurrent polling; with projection each
+    # row carries only the first payload element plus a timestamp string.
+    # SQLite (used in tests) doesn't support negative-index JSON paths and
+    # returns json_extract results as text rather than parsed dicts, so we
+    # fall back to the heavy load path there.
+    _use_projection = session.bind.dialect.name == "postgresql"
+    if _use_projection:
+        tasks_query = (
+            select(
+                Task,
+                Task.payloads[0].label("_projected_first_payload"),
+                Task.status_log[-1]["t"].astext.label("_projected_completed_at_ts"),
+            )
+            .where(*task_filters)
+            .options(load_only(
+                Task.id, Task.status, Task.project_id, Task.title,
+                Task.created_at, Task.started_at,
+                Task.context,
+                Task.latest_status_message, Task.attempt_count,
+                Task.requires_approval,
+                Task.vm_provisioned_at, Task.vm_started_at,
+                Task.vm_stopped_at, Task.vm_spot,
+            ))
+            .limit(_DIGEST_TASK_ROW_CAP)
+        )
+        tasks_result = await session.execute(tasks_query)
+        all_tasks: List[Task] = []
+        for row in tasks_result.all():
+            task = row[0]
+            task._projected_first_payload = row[1] or {}
+            task._projected_completed_at_ts = row[2]
+            all_tasks.append(task)
+    else:
+        tasks_result = await session.execute(
+            select(Task)
+            .where(*task_filters)
+            .options(load_only(
+                Task.id, Task.status, Task.project_id, Task.title,
+                Task.created_at, Task.started_at,
+                Task.payloads, Task.context, Task.status_log,
+                Task.latest_status_message, Task.attempt_count,
+                Task.requires_approval,
+                Task.vm_provisioned_at, Task.vm_started_at,
+                Task.vm_stopped_at, Task.vm_spot,
+            ))
+            .limit(_DIGEST_TASK_ROW_CAP)
+        )
+        all_tasks = list(tasks_result.scalars().all())
     if len(all_tasks) == _DIGEST_TASK_ROW_CAP:
         logger.warning(
             "admin_digest task query hit %d-row safety cap (window=%dh, project_id=%s); digest metrics may be truncated",
@@ -1003,16 +1061,35 @@ async def get_digest(
     active_filters = [Task.status.in_(_active_statuses)]
     if project_id:
         active_filters.append(Task.project_id == project_id)
-    active_result = await session.execute(
-        select(Task).where(*active_filters)
-        .order_by(Task.started_at.asc().nullsfirst())
-        .options(load_only(
-            Task.id, Task.status, Task.title, Task.payloads,
-            Task.started_at, Task.project_id, Task.context,
-            Task.vm_provisioned_at, Task.vm_spot,
-        ))
-    )
-    active_tasks_all = active_result.scalars().all()
+    if _use_projection:
+        active_result = await session.execute(
+            select(
+                Task,
+                Task.payloads[0].label("_projected_first_payload"),
+            ).where(*active_filters)
+            .order_by(Task.started_at.asc().nullsfirst())
+            .options(load_only(
+                Task.id, Task.status, Task.title,
+                Task.started_at, Task.project_id, Task.context,
+                Task.vm_provisioned_at, Task.vm_spot,
+            ))
+        )
+        active_tasks_all: List[Task] = []
+        for row in active_result.all():
+            task = row[0]
+            task._projected_first_payload = row[1] or {}
+            active_tasks_all.append(task)
+    else:
+        active_result = await session.execute(
+            select(Task).where(*active_filters)
+            .order_by(Task.started_at.asc().nullsfirst())
+            .options(load_only(
+                Task.id, Task.status, Task.title, Task.payloads,
+                Task.started_at, Task.project_id, Task.context,
+                Task.vm_provisioned_at, Task.vm_spot,
+            ))
+        )
+        active_tasks_all = list(active_result.scalars().all())
 
     # research_cycles: completed tasks with task_type == 'research'
     research_cycles = sum(

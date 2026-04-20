@@ -205,7 +205,16 @@ class Task(SQLModel, table=True):
 
     @property
     def first_payload(self) -> Dict[str, Any]:
-        """First payload dict, defaulting to empty dict if none exist."""
+        """First payload dict, defaulting to empty dict if none exist.
+
+        When the caller projected `payloads[0]` SQL-side (admin_digest.py does
+        this to avoid loading the full JSONB array for 5000-row scans), the
+        value is stashed on `_projected_first_payload` and returned directly —
+        skipping the deferred-column round-trip that `self.payloads` would
+        trigger when `load_only()` excluded it.
+        """
+        if hasattr(self, "_projected_first_payload"):
+            return self._projected_first_payload or {}
         return (self.payloads or [{}])[0]
 
     __table_args__ = (

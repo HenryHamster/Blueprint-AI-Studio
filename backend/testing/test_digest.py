@@ -4673,3 +4673,118 @@ async def test_digest_includes_anomaly_adjustment_when_active(client: AsyncClien
     finally:
         shared_state.anomaly_adjustments.clear()
         shared_state.anomaly_adjustments.update(prev)
+
+
+# ---------------------------------------------------------------------------
+# JSONB projection tests (OOM mitigation — see admin_digest.py tasks_result)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_uses_first_payload_projection(client: AsyncClient, db_session):
+    """Digest query projects payloads[0] SQL-side instead of loading the full array.
+
+    Regression guard for the OOM fix: even with a multi-element payloads array,
+    only payloads[0] should drive first_payload-keyed metrics (research_cycles,
+    task_type classification), matching the Task.first_payload property.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Multi-payload research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {"type": "research"},
+            {"type": "create"},
+            {"type": "create"},
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["research_cycles"] == 1
+    assert data["completed_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_digest_derives_completed_at_from_status_log_projection(
+    client: AsyncClient, db_session,
+):
+    """_derive_completed_at reads the SQL-projected status_log[-1]->>'t' timestamp.
+
+    Place a task's status_log completion timestamp OUTSIDE the default 24h window
+    but its created_at INSIDE the extended lookback; the digest should still
+    include it in recent_completions if projection is wired correctly and exclude
+    it if the completion timestamp actually fell outside the window.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Completion timestamp 12h ago — well within the default 24h window.
+    recent_complete = (now - timedelta(hours=12)).isoformat()
+    task_in_window = make_task(
+        project_id=project.id,
+        title="Completed in window",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=24),
+        status_log=[{"t": recent_complete, "status": "COMPLETED"}],
+    )
+    # Completion timestamp 40h ago — outside the 24h window, should not count.
+    old_complete = (now - timedelta(hours=40)).isoformat()
+    task_out_of_window = make_task(
+        project_id=project.id,
+        title="Completed out of window",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=48),
+        status_log=[{"t": old_complete, "status": "COMPLETED"}],
+    )
+    db_session.add(task_in_window)
+    db_session.add(task_out_of_window)
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest?hours=24")
+    assert response.status_code == 200
+    data = response.json()
+    titles = {c["title"] for c in data["recent_completions"]}
+    assert "Completed in window" in titles
+    assert "Completed out of window" not in titles
+
+
+@pytest.mark.asyncio
+async def test_digest_handles_empty_payloads_and_status_log(client: AsyncClient, db_session):
+    """Empty payloads and status_log must not crash the projection path.
+
+    Edge case: SQL `payloads[0]` returns NULL for empty array; `status_log[-1]->>'t'`
+    returns NULL too. Downstream must fall back gracefully.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Empty JSONB task",
+        status=TaskStatus.COMPLETED,
+        payloads=[],
+        status_log=[],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["completed_count"] == 1

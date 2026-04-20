@@ -131,6 +131,16 @@ def override_get_current_user():
     app.dependency_overrides.pop(require_admin, None)
 
 @pytest.fixture(autouse=True)
+def reset_digest_cache():
+    """Clear the in-memory digest TTL cache between tests so a stale response
+    from one test's DB state isn't served to the next."""
+    from app.digest_cache import _default_cache
+    _default_cache.clear()
+    yield
+    _default_cache.clear()
+
+
+@pytest.fixture(autouse=True)
 def reset_rate_limiter():
     """
     Reset the slowapi in-memory rate-limit counters before every test so that
