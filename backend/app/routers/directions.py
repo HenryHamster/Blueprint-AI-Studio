@@ -50,6 +50,7 @@ class DirectionPayload(BaseModel):
     completion_criteria: Optional[str] = Field(default=None, max_length=COMPLETION_CRITERIA_MAX)
     conflicts_with: Optional[List[str]] = Field(default=None, description="Direction IDs that shouldn't run in parallel with this one")
     category: Optional[str] = Field(default=None, description="Direction category: 'product', 'structural', or 'mixed'")
+    cost_budget_usd: Optional[float] = Field(default=None, ge=0, description="Optional cost budget ceiling in USD for this direction")
 
 
 @router.get("/projects/{project_id}/directions")
@@ -101,6 +102,8 @@ async def add_direction(
         direction["completion_criteria"] = payload.completion_criteria
     else:
         logger.warning("Direction created without completion_criteria: %s", direction["id"])
+    if payload.cost_budget_usd is not None:
+        direction["cost_budget_usd"] = float(payload.cost_budget_usd)
     if payload.conflicts_with:
         # Validate referenced IDs exist
         existing_ids = {d.get("id") for d in (project.directions or [])}
@@ -149,6 +152,13 @@ async def replace_directions(
                 raise HTTPException(status_code=400, detail=f"completion_criteria must not exceed {COMPLETION_CRITERIA_MAX} characters")
         if "category" in entry and entry["category"] is not None and entry["category"] not in VALID_CATEGORIES:
             raise HTTPException(status_code=400, detail=f"category must be one of: {sorted(VALID_CATEGORIES)}")
+        if "cost_budget_usd" in entry and entry["cost_budget_usd"] is not None:
+            try:
+                entry["cost_budget_usd"] = float(entry["cost_budget_usd"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="cost_budget_usd must be a number or null")
+            if entry["cost_budget_usd"] < 0:
+                raise HTTPException(status_code=400, detail="cost_budget_usd must be non-negative")
         if "status" not in entry:
             entry["status"] = "active"
         normalized.append(entry)
@@ -281,6 +291,11 @@ async def update_direction(
             raise HTTPException(status_code=400, detail=f"Unknown direction IDs in conflicts_with: {invalid}")
     if "category" in payload and payload["category"] is not None and payload["category"] not in VALID_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"category must be one of: {sorted(VALID_CATEGORIES)}")
+    if "cost_budget_usd" in payload and payload["cost_budget_usd"] is not None:
+        if not isinstance(payload["cost_budget_usd"], (int, float)) or isinstance(payload["cost_budget_usd"], bool):
+            raise HTTPException(status_code=400, detail="cost_budget_usd must be a number or null")
+        if payload["cost_budget_usd"] < 0:
+            raise HTTPException(status_code=400, detail="cost_budget_usd must be non-negative")
 
     # Direction cap check: if reactivating, ensure we won't exceed the cap
     if payload.get("status") == "active":
@@ -359,6 +374,11 @@ async def update_direction(
                     d.pop("category", None)
                 elif payload["category"] in VALID_CATEGORIES:
                     d["category"] = payload["category"]
+            if "cost_budget_usd" in payload:
+                if payload["cost_budget_usd"] is None:
+                    d.pop("cost_budget_usd", None)
+                else:
+                    d["cost_budget_usd"] = float(payload["cost_budget_usd"])
             updated = True
             break
 

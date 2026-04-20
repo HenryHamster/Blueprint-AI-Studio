@@ -169,6 +169,69 @@ async def test_unhold_direction_not_found_returns_404(client: AsyncClient, mocke
 
 
 @pytest.mark.asyncio
+async def test_create_direction_with_cost_budget(client: AsyncClient, mocker):
+    """POST accepts and stores cost_budget_usd."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={"text": "budgeted", "priority": "low", "paths": ["src/"], "cost_budget_usd": 12.5},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["cost_budget_usd"] == 12.5
+
+
+@pytest.mark.asyncio
+async def test_create_direction_rejects_negative_cost_budget(client: AsyncClient, mocker):
+    """POST rejects negative cost_budget_usd via pydantic ge=0 validator."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={"text": "x", "priority": "low", "paths": ["src/"], "cost_budget_usd": -1},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_update_direction_cost_budget_set_and_clear(client: AsyncClient, mocker):
+    """PATCH sets cost_budget_usd and clears it when set to null."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"cost_budget_usd": 5},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["cost_budget_usd"] == 5.0
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"cost_budget_usd": None},
+    )
+    assert resp.status_code == 200
+    assert "cost_budget_usd" not in resp.json()["direction"]
+
+
+@pytest.mark.asyncio
+async def test_update_direction_rejects_invalid_cost_budget(client: AsyncClient, mocker):
+    """PATCH rejects non-numeric and negative cost_budget_usd."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"cost_budget_usd": "lots"},
+    )
+    assert resp.status_code == 400
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"cost_budget_usd": -3},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_update_direction_priority(client: AsyncClient, mocker):
     """PATCH updates direction priority."""
     project_id = await _deploy_project(client, mocker)

@@ -139,6 +139,20 @@ async def get_activity(
             duration_seconds = (completed_at - t.started_at).total_seconds()
 
         if t.status == TaskStatus.COMPLETED:
+            ctx = t.context if isinstance(t.context, dict) else {}
+            raw_changed = ctx.get("_pr_changed_files")
+            changed_files = (
+                [f for f in raw_changed if isinstance(f, str)][:10]
+                if isinstance(raw_changed, list) else None
+            )
+            scope = ctx.get("scope") if isinstance(ctx.get("scope"), str) else None
+            direction_id = ctx.get("direction_id") if isinstance(ctx.get("direction_id"), str) else None
+            review_loop = ctx.get("review_loop")
+            review_iterations = (
+                review_loop.get("iteration")
+                if isinstance(review_loop, dict) and isinstance(review_loop.get("iteration"), int)
+                else None
+            )
             events.append({
                 "id": f"task-{tid}",
                 "type": "TASK_COMPLETED",
@@ -155,6 +169,10 @@ async def get_activity(
                 "deploy_status": None,
                 "rollback_count": None,
                 "duration_seconds": duration_seconds,
+                "changed_files": changed_files,
+                "scope": scope,
+                "direction_id": direction_id,
+                "review_iterations": review_iterations,
             })
         elif t.status == TaskStatus.FAILED:
             events.append({

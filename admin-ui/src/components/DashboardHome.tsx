@@ -43,6 +43,9 @@ interface DirectionProgress {
   first_attempt_sample_size?: number | null;
   product_ratio?: number | null;
   estimated_cost_usd?: number | null;
+  cost_budget_usd?: number | null;
+  budget_utilization_pct?: number | null;
+  budget_exceeded?: boolean;
   cost_per_merged_pr?: number | null;
   avg_time_to_merge_hours?: number | null;
   cost_by_scope?: Record<string, number> | null;
@@ -890,6 +893,24 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                             <span className={d.avg_time_to_merge_hours < 2 ? 'text-emerald-400' : d.avg_time_to_merge_hours <= 6 ? 'text-amber-400' : 'text-red-400'} title="Average time from VM start to PR merge">{d.avg_time_to_merge_hours.toFixed(1)}h avg merge</span>
                           )}
                         </div>
+                        {d.cost_budget_usd != null && d.cost_budget_usd > 0 && (() => {
+                          const pct = d.budget_utilization_pct != null
+                            ? d.budget_utilization_pct
+                            : ((d.estimated_cost_usd ?? 0) / d.cost_budget_usd) * 100;
+                          const clamped = Math.min(100, Math.max(0, pct));
+                          const barColor = pct > 80 ? 'bg-red-500' : pct >= 60 ? 'bg-amber-500' : 'bg-emerald-500';
+                          return (
+                            <div className="mt-1.5" title={`$${(d.estimated_cost_usd ?? 0).toFixed(2)} / $${d.cost_budget_usd.toFixed(2)} budget (${Math.round(pct)}%)`}>
+                              <div className="h-1 w-full rounded bg-neutral-800 overflow-hidden">
+                                <div className={`h-full ${barColor}`} style={{ width: `${clamped}%` }} />
+                              </div>
+                              <div className="flex justify-between text-[9px] text-neutral-500 mt-0.5">
+                                <span>Budget</span>
+                                <span className={pct > 80 ? 'text-red-400' : pct >= 60 ? 'text-amber-400' : 'text-emerald-400'}>{Math.round(pct)}%{d.budget_exceeded ? ' · over' : ''}</span>
+                              </div>
+                            </div>
+                          );
+                        })()}
                         {d.taxonomy_summary && <div className="flex gap-1 mt-1 flex-wrap">{TAXONOMY_ORDER.map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return v ? <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span> : null; })}</div>}
                         {d.scope_breakdown && Object.keys(d.scope_breakdown).length > 0 && <div className="flex gap-1 mt-1 flex-wrap">{(['small', 'medium', 'large'] as const).map(sz => { const s = d.scope_breakdown?.[sz]; if (!s || (!s.merged && !s.failed)) return null; const total = s.merged + s.failed; const rate = total > 0 ? s.merged / total : 0; const color = rate >= 0.7 ? 'border-emerald-700 bg-emerald-900/40 text-emerald-300' : rate >= 0.4 ? 'border-amber-700 bg-amber-900/40 text-amber-300' : 'border-red-700 bg-red-900/40 text-red-300'; const subtypes = [[s.failed_code_error, 'code'], [s.failed_infra, 'infra'], [s.failed_scope_overflow, 'scope']].filter(([v]) => typeof v === 'number' && (v as number) > 0).map(([v, l]) => `${v} ${l}`).join(', '); const subtypeStr = subtypes ? ` (${subtypes})` : ''; return <span key={sz} title={`${sz}: ${s.merged} merged / ${s.failed} failed${subtypeStr} (${Math.round(rate * 100)}%)`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${color}`}>{sz[0].toUpperCase()} {s.merged}/{s.failed}</span>; })}</div>}
                         {d.review_quality && (d.review_quality.reviews_dismissed || d.review_quality.reviews_overridden || d.review_quality.user_issues_caught) ? (

@@ -1,4 +1,5 @@
 """Catch-up digest and pipeline health summary endpoints."""
+import asyncio
 import uuid
 import logging
 from typing import Dict, Any, List, Optional
@@ -8,7 +9,10 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
+
+from app.notification_dispatch import dispatch_external_notification
 
 from app.database import get_session
 from app.models import (
@@ -1022,6 +1026,7 @@ async def get_digest(
     scope_conversion_rates: Dict[str, Dict[str, int]] = {}
     prev_scope_conversion_rates: Dict[str, Dict[str, int]] = {}
 
+    _budget_alert_fired = False
     if project_id:
         project = await session.get(Project, project_id)
         if project:
@@ -1310,10 +1315,35 @@ async def get_digest(
                     for _ts, _t in _dir_rejections[:3]
                 ]
 
+                cost_budget_usd = d.get("cost_budget_usd")
+                budget_utilization_pct = None
+                budget_exceeded = False
+                if isinstance(cost_budget_usd, (int, float)) and cost_budget_usd > 0:
+                    budget_utilization_pct = round((dir_cost / cost_budget_usd) * 100, 1)
+                    budget_exceeded = dir_cost > cost_budget_usd
+                    if budget_utilization_pct >= 80 and not d.get("_budget_alerted"):
+                        d["_budget_alerted"] = True
+                        flag_modified(project, "directions")
+                        _budget_alert_fired = True
+                        asyncio.ensure_future(dispatch_external_notification(
+                            project_id,
+                            "BUDGET_EXCEEDED",
+                            {
+                                "direction_id": did,
+                                "direction_name": direction_text,
+                                "current_spend_usd": round(dir_cost, 2),
+                                "budget_limit_usd": float(cost_budget_usd),
+                                "utilization_pct": budget_utilization_pct,
+                            },
+                        ))
+
                 direction_progress_list.append({
                     "direction_id": did,
                     "direction_text": direction_text,
                     "priority": d.get("priority") or "medium",
+                    "cost_budget_usd": cost_budget_usd,
+                    "budget_utilization_pct": budget_utilization_pct,
+                    "budget_exceeded": budget_exceeded,
                     "cycles_in_window": cycles_in_window,
                     "tasks_created": tasks_created_in_window,
                     "prs_merged": prs_merged,
@@ -1368,6 +1398,12 @@ async def get_digest(
                 })
 
             direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
+
+            if _budget_alert_fired:
+                try:
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
 
             for _s, _agg in scope_conversion_rates.items():
                 for _f in ("avg_expansion_ratio_merged", "avg_expansion_ratio_failed"):

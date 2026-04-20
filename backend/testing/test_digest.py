@@ -3056,6 +3056,55 @@ async def test_digest_direction_progress_cost_by_scope_and_status(client: AsyncC
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_cost_budget_fields(client: AsyncClient, db_session, mocker):
+    """direction_progress exposes budget utilization and fires alert when >=80%."""
+    dispatch_mock = mocker.patch(
+        "app.routers.admin_digest.dispatch_external_notification",
+        new_callable=mocker.AsyncMock,
+    )
+    now = _utcnow()
+    project = make_project(
+        directions=[{
+            "id": "dir-b",
+            "text": "Budgeted dir",
+            "status": "active",
+            "cost_budget_usd": 0.01,  # 1 hour spot = $0.02 -> 200% utilization
+        }]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="t",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-b", "scope": "small"},
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),
+        vm_spot=True,
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    assert dp["cost_budget_usd"] == 0.01
+    assert dp["budget_utilization_pct"] is not None
+    assert dp["budget_utilization_pct"] >= 80
+    assert dp["budget_exceeded"] is True
+
+    # Allow the scheduled ensure_future task to run.
+    import asyncio as _a
+    await _a.sleep(0)
+    assert dispatch_mock.await_count == 1
+    args, _kwargs = dispatch_mock.call_args
+    assert args[1] == "BUDGET_EXCEEDED"
+    assert args[2]["direction_id"] == "dir-b"
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_cost_by_type(client: AsyncClient, db_session):
     """direction_progress entries include cost_by_type breakdown keyed by task type."""
     now = _utcnow()

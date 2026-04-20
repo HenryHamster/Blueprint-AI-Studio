@@ -34,6 +34,7 @@ export interface DirectionCardProps {
   editPathTags: string[];
   editPathInput: string;
   editCompletionCriteria: string;
+  editCostBudget?: string;
   setEditingId: React.Dispatch<React.SetStateAction<string | null>>;
   setEditText: React.Dispatch<React.SetStateAction<string>>;
   setEditPriority: React.Dispatch<React.SetStateAction<'high' | 'medium' | 'low'>>;
@@ -42,6 +43,7 @@ export interface DirectionCardProps {
   setEditPathTags: React.Dispatch<React.SetStateAction<string[]>>;
   setEditPathInput: React.Dispatch<React.SetStateAction<string>>;
   setEditCompletionCriteria: React.Dispatch<React.SetStateAction<string>>;
+  setEditCostBudget?: React.Dispatch<React.SetStateAction<string>>;
   startEdit: (d: Direction) => void;
   // Action handlers
   updateDirection: (id: string) => Promise<void>;
@@ -77,8 +79,8 @@ function DirectionCardImpl({
   direction: d,
   statusKey: key,
   activeItems,
-  editingId, editText, editPriority, editStatus, editCategory, editPathTags, editPathInput, editCompletionCriteria,
-  setEditingId, setEditText, setEditPriority, setEditStatus, setEditCategory, setEditPathTags, setEditPathInput, setEditCompletionCriteria,
+  editingId, editText, editPriority, editStatus, editCategory, editPathTags, editPathInput, editCompletionCriteria, editCostBudget,
+  setEditingId, setEditText, setEditPriority, setEditStatus, setEditCategory, setEditPathTags, setEditPathInput, setEditCompletionCriteria, setEditCostBudget,
   startEdit,
   updateDirection, approveProposal, rejectProposal, reviveProposal,
   reactivateDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
@@ -318,6 +320,18 @@ function DirectionCardImpl({
               <option value="mixed">Mixed</option>
             </select>
             <div className="flex-1" />
+            {setEditCostBudget && (
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                value={editCostBudget ?? ''}
+                onChange={e => setEditCostBudget(e.target.value)}
+                placeholder="Budget $"
+                title="Cost budget (USD) — alerts fire when spend exceeds 80% of this"
+                className="w-24 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+              />
+            )}
             <button onClick={() => updateDirection(d.id)} className="text-emerald-400 hover:text-emerald-300 transition-colors">
               <Check className="w-3.5 h-3.5" />
             </button>

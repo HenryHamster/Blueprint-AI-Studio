@@ -26,6 +26,10 @@ export interface ActivityEvent {
   repo_url?: string;
   status?: string;
   duration_seconds?: number;
+  changed_files?: string[] | null;
+  scope?: string | null;
+  direction_id?: string | null;
+  review_iterations?: number | null;
 }
 
 interface ActivityFeedProps {
@@ -168,6 +172,39 @@ function FeedRow({
                 {event.type === 'TASK_COMPLETED' && event.task_type && (
                   <span className="shrink-0 bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded">
                     {event.task_type}
+                  </span>
+                )}
+
+                {event.type === 'TASK_COMPLETED' && event.changed_files && event.changed_files.length > 0 && (
+                  <span
+                    className="shrink-0 bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded"
+                    title={event.changed_files.join('\n')}
+                  >
+                    {event.changed_files.length} file{event.changed_files.length !== 1 ? 's' : ''}
+                  </span>
+                )}
+
+                {event.type === 'TASK_COMPLETED' && event.scope && (
+                  <span className="shrink-0 bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 text-[10px] font-semibold px-1.5 py-0.5 rounded-full leading-none">
+                    {event.scope}
+                  </span>
+                )}
+
+                {event.type === 'TASK_COMPLETED' && event.direction_id && (
+                  <span
+                    className="shrink-0 bg-neutral-800 text-neutral-500 text-[10px] font-mono px-1.5 py-0.5 rounded"
+                    title={`Direction ${event.direction_id}`}
+                  >
+                    dir:{event.direction_id.slice(0, 6)}
+                  </span>
+                )}
+
+                {event.type === 'TASK_COMPLETED' && event.review_iterations != null && event.review_iterations > 0 && (
+                  <span
+                    className="shrink-0 bg-neutral-800 text-neutral-400 text-[10px] px-1.5 py-0.5 rounded"
+                    title="Review iterations"
+                  >
+                    {event.review_iterations} review{event.review_iterations !== 1 ? 's' : ''}
                   </span>
                 )}
 
