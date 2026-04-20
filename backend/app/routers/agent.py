@@ -4,8 +4,8 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional
+from datetime import datetime, timedelta
+from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
@@ -77,7 +77,7 @@ async def _create_review_check_run_bg(
                     session.add(task)
                     await session.commit()
                     logger.info(f"[CHECK RUN] Created check run {result['id']} for review task {task_id} PR #{pr_number}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — best-effort background task, never block claim response
         logger.warning(f"[CHECK RUN] Failed to create check run for task {task_id}: {e}")
 
 
@@ -95,6 +95,10 @@ _on_task_terminal_callbacks.append(lambda tid: _terminated_task_ids.__setitem__(
 _agent_active_cache: dict[str, float] = {}
 _AGENT_CACHE_TTL = 60.0  # seconds
 _AGENT_CACHE_MAX = 5000  # evict expired entries when cache exceeds this size
+
+# Retain strong references to fire-and-forget background tasks so the event loop
+# doesn't GC them before completion (asyncio only holds a weak reference).
+_bg_tasks: set[asyncio.Task] = set()
 
 
 async def verify_agent_token(
@@ -139,8 +143,7 @@ async def verify_agent_token(
             # Task not found in DB — fail open (may not be committed yet, or test scenario)
     except HTTPException:
         raise
-    except Exception as e:
-        # DB error — fail open to avoid blocking agents during DB issues
+    except Exception as e:  # noqa: BLE001 — fail open on DB errors so agents aren't blocked by transient DB issues
         logger.warning(f"[AUTH] DB check failed for task {task_id}, allowing request: {e}")
 
     now = time.time()
@@ -209,7 +212,7 @@ async def get_github_token_for_task(
     from app.github import get_repo_installation_token
     try:
         token = await get_repo_installation_token(project.github_owner, project.github_repo)
-    except Exception:
+    except Exception:  # noqa: BLE001 — fall through to stored-installation + PAT fallbacks
         logger.debug(f"[GITHUB] App-level discovery failed for {project.github_owner}/{project.github_repo}, trying fallbacks")
 
     if not token and integration and integration.github_installation_id:
@@ -218,7 +221,7 @@ async def get_github_token_for_task(
                 integration.github_installation_id,
                 repositories=[project.github_repo]
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — fall through to PAT fallback
             logger.debug(f"[GITHUB] Stored installation token failed for {project.github_owner}/{project.github_repo}")
 
     if not token and integration and integration.github_pat:
@@ -410,18 +413,20 @@ async def claim_task(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token)
 ):
+    vm_id = token.get("vm_instance_id")
     stmt = select(Task).where(
-        Task.vm_instance_id == token.get("vm_instance_id"),
+        Task.vm_instance_id == vm_id,
         Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING])
     ).with_for_update(skip_locked=True)
     result = await session.execute(stmt)
     task = result.scalars().first()
 
+    idempotent_replay = False
     if not task:
         # Distinguish "no task" from "task locked by another process"
         check = await session.execute(
             select(Task.id).where(
-                Task.vm_instance_id == token.get("vm_instance_id"),
+                Task.vm_instance_id == vm_id,
                 Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING])
             )
         )
@@ -434,18 +439,36 @@ async def claim_task(
                 detail="Task is temporarily locked, retry shortly",
                 headers={"Retry-After": "2"},
             )
-        raise HTTPException(status_code=404, detail="No queued task found for this VM instance.")
+        # Idempotency window: apiPost retries on network errors / 30s timeout
+        # aborts, but the first POST may have already committed PROVISIONING →
+        # IN_PROGRESS server-side before the response was lost. Without this
+        # replay, the retry hits the QUEUED/PROVISIONING filter, returns 404,
+        # and the agent dies with PRE_CLAIM_FAILED on a task that was actually
+        # claimed successfully. Match this VM's just-claimed task (last heartbeat
+        # within 3 min — longer than the agent's worst-case retry window of
+        # API_TIMEOUT * API_MAX_RETRIES with backoff) and replay the same response.
+        replay_cutoff = _utcnow() - timedelta(minutes=3)
+        replay_stmt = select(Task).where(
+            Task.vm_instance_id == vm_id,
+            Task.status == TaskStatus.IN_PROGRESS,
+            Task.last_heartbeat >= replay_cutoff,
+        )
+        task = (await session.execute(replay_stmt)).scalars().first()
+        if not task:
+            raise HTTPException(status_code=404, detail="No queued task found for this VM instance.")
+        idempotent_replay = True
 
-    task.status = TaskStatus.IN_PROGRESS
-    task.last_heartbeat = _utcnow()  # Immediate heartbeat — don't wait 30s for agent interval
-    # Record time-to-claim so we can measure the real distribution of VM cold-boot
-    # + auth validation + claim and tighten the reaper's pre-claim threshold later.
-    if task.vm_provisioned_at:
-        claim_latency = (task.last_heartbeat - task.vm_provisioned_at).total_seconds()
-        task.context = {**(task.context or {}), "claim_latency_secs": round(claim_latency, 1)}
-    session.add(task)
-    await session.commit()
-    await session.refresh(task)
+    if not idempotent_replay:
+        task.status = TaskStatus.IN_PROGRESS
+        task.last_heartbeat = _utcnow()  # Immediate heartbeat — don't wait 30s for agent interval
+        # Record time-to-claim so we can measure the real distribution of VM cold-boot
+        # + auth validation + claim and tighten the reaper's pre-claim threshold later.
+        if task.vm_provisioned_at:
+            claim_latency = (task.last_heartbeat - task.vm_provisioned_at).total_seconds()
+            task.context = {**(task.context or {}), "claim_latency_secs": round(claim_latency, 1)}
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
 
     # Broadcast status change to frontend
     await broadcast_to_project(
@@ -722,15 +745,17 @@ async def claim_task(
                     Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
                 )
             )
-            for sib in sibling_result.scalars().all():
-                sibling_tasks.append({
+            sibling_tasks.extend(
+                {
                     "id": str(sib.id),
                     "title": sib.title,
                     "status": sib.status,
                     "related_files": (sib.context or {}).get("related_files", []),
                     "task_type": (sib.first_payload).get("type", ""),
                     "active": True,
-                })
+                }
+                for sib in sibling_result.scalars().all()
+            )
 
             terminal_sibling_result = await session.execute(
                 select(Task).where(
@@ -761,10 +786,9 @@ async def claim_task(
                     "active": False,
                     "pr_url": pr_url,
                 }
-                if sib.status == TaskStatus.FAILED:
-                    if sib.latest_status_message:
-                        entry["failure_class"] = classify_failure(sib)
-                        entry["error_excerpt"] = sib.latest_status_message[:150]
+                if sib.status == TaskStatus.FAILED and sib.latest_status_message:
+                    entry["failure_class"] = classify_failure(sib)
+                    entry["error_excerpt"] = sib.latest_status_message[:150]
                 sib_changed = ((sib.context or {}).get("_pr_changed_files") or [])[:5]
                 if sib_changed:
                     entry["changed_files"] = sib_changed
@@ -1012,11 +1036,11 @@ async def claim_task(
                         doc[full_key] = entry
                 # Check file-path references against the repo root (config-driven; skipped when unset)
                 try:
-                    from app.playbook_learning import check_and_flag_stale_refs  # noqa: PLC0415
+                    from app.playbook_learning import check_and_flag_stale_refs
                     repo_root: str = _shared_state.runtime_config.get("playbook_repo_root", "") or ""
                     if repo_root:
                         doc = check_and_flag_stale_refs(doc, repo_root)
-                except Exception:
+                except Exception:  # noqa: BLE001 — stale-ref check is best-effort, never block claim
                     logger.debug("[AGENT] Stale-ref check skipped (non-critical)")
                 project_for_playbook.design_doc = doc
                 flag_modified(project_for_playbook, "design_doc")
@@ -1305,7 +1329,7 @@ async def claim_task(
                     success_chars += s_entry_len
                     direction_successful_analysis.append(s_entry)
 
-                direction_first_attempt_feedback: Optional[Dict[str, int]] = None
+                direction_first_attempt_feedback: Dict[str, int] | None = None
                 try:
                     dfa_all = (project_for_playbook.design_doc or {}).get(
                         "direction_first_attempt_feedback"
@@ -1526,9 +1550,11 @@ async def claim_task(
             _check_run_name = (project_for_playbook.build_config or {}).get(
                 "check_run_name", "Blueprint Code Review"
             )
-            asyncio.ensure_future(
+            _check_run_fut = asyncio.ensure_future(
                 _create_review_check_run_bg(task.id, _pr_number, _check_run_name)
             )
+            _bg_tasks.add(_check_run_fut)
+            _check_run_fut.add_done_callback(_bg_tasks.discard)
 
     return response
 
@@ -1687,7 +1713,7 @@ async def spawn_subtask(
         try:
             payload = validate_task_payload(payload)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         parent_payload = parent_task.first_payload
         parent_context = {
             "parent_task_id": str(parent_task.id),

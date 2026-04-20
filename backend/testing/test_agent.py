@@ -95,11 +95,13 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_concurrent_only_one_succeeds(client: AsyncClient, db_session):
+async def test_agent_claim_retry_is_idempotent(client: AsyncClient, db_session):
     """
-    Tests that two claim requests for the same task result in only one succeeding.
-    The second request should return 404 because the task is no longer QUEUED after
-    the first claim (idempotency: a task can only be claimed once).
+    A second claim from the same VM shortly after a successful first claim must
+    replay the same task payload instead of 404'ing. The agent's apiPost retries
+    on network errors / 30s timeout aborts, and if the first POST's 200 response
+    was lost after the server committed PROVISIONING -> IN_PROGRESS, the retry
+    would otherwise kill the task with PRE_CLAIM_FAILED.
     """
     project = Project(name="Concurrent Claim Test", user_id="test-user-123")
     db_session.add(project)
@@ -114,13 +116,42 @@ async def test_agent_claim_concurrent_only_one_succeeds(client: AsyncClient, db_
     token = create_agent_token(str(task.id), "agent-vm-concurrent")
     headers = {"x-agent-token": token}
 
-    # First claim succeeds: task transitions to IN_PROGRESS
     resp1 = await client.post("/api/agent/claim", headers=headers)
     assert resp1.status_code == 200
 
-    # Second claim for the same VM returns 404 because the task is no longer QUEUED
     resp2 = await client.post("/api/agent/claim", headers=headers)
-    assert resp2.status_code == 404
+    assert resp2.status_code == 200
+    assert resp2.json()["task_id"] == resp1.json()["task_id"]
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_idempotent_replay_expires(client: AsyncClient, db_session):
+    """
+    Idempotent replay only fires within ~3 min of the original claim. Beyond
+    that window a stray claim from the same VM is a real anomaly and should
+    404, not silently re-serve a task whose agent may have long since died.
+    """
+    project = Project(name="Claim Replay Expiry", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_heartbeat = datetime.utcnow() - timedelta(minutes=10)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-stale-replay",
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=stale_heartbeat,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-stale-replay")
+    headers = {"x-agent-token": token}
+    resp = await client.post("/api/agent/claim", headers=headers)
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -2774,12 +2805,14 @@ def test_agent_ws_invalid_token_closes_with_1008(mocker):
     mocker.patch.object(orchestrator_module, "orchestrator_worker", new_callable=AsyncMock)
 
     task_id = uuid.uuid4()
-    with TestClient(app=main_module.app) as tc:
-        with pytest.raises(WebSocketDisconnect) as exc_info:
-            with tc.websocket_connect(f"/api/agent/ws/{task_id}") as ws:
-                ws.send_json({"token": "not-a-valid-jwt-token"})
-                ws.receive_text()
-        assert exc_info.value.code == 1008
+    with (
+        TestClient(app=main_module.app) as tc,
+        pytest.raises(WebSocketDisconnect) as exc_info,
+        tc.websocket_connect(f"/api/agent/ws/{task_id}") as ws,
+    ):
+        ws.send_json({"token": "not-a-valid-jwt-token"})
+        ws.receive_text()
+    assert exc_info.value.code == 1008
 
 
 @pytest.mark.asyncio
@@ -2825,7 +2858,6 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
         }
         before = datetime.utcnow()
         resp = await client.post("/api/agent/status", json=payload, headers=headers)
-        after = datetime.utcnow()
         assert resp.status_code == 200
 
         await db_session.refresh(task)
@@ -4540,7 +4572,7 @@ async def test_claim_direction_first_attempt_feedback_in_direction_context(clien
     dc = resp.json().get("direction_context", {})
     fa = dc.get("first_attempt_feedback")
     assert fa == {"test-coverage": 5, "error-handling": 2}
-    assert list(fa.keys())[0] == "test-coverage"  # sorted by count desc
+    assert next(iter(fa)) == "test-coverage"  # sorted by count desc
 
 
 async def _setup_smoketest_task(db_session, vm_id: str, base_branch: str = "main"):
@@ -4576,7 +4608,7 @@ async def test_smoketest_startup_failure_spawns_plan_task_priority_90(client: As
 
     _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-startup")
 
-    import json as _json  # noqa: PLC0415
+    import json as _json
     smoketest_payload = {
         "passed": False,
         "tests": [
@@ -4615,7 +4647,7 @@ async def test_smoketest_curated_failure_spawns_plan_task_priority_70(client: As
 
     _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-curated")
 
-    import json as _json  # noqa: PLC0415
+    import json as _json
     smoketest_payload = {
         "passed": False,
         "tests": [{"name": "login_flow", "status": "fail", "message": "assertion failed"}],
@@ -4650,7 +4682,7 @@ async def test_smoketest_passing_does_not_spawn_plan_task(client: AsyncClient, d
 
     _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-ok")
 
-    import json as _json  # noqa: PLC0415
+    import json as _json
     # Even when status=FAILED is reported, a passed=true smoketest payload must not spawn.
     smoketest_payload = {
         "passed": True,
@@ -4695,7 +4727,7 @@ async def test_debug_result_high_confidence_spawns_fix_task(client: AsyncClient,
     await db_session.commit()
     await db_session.refresh(task)
 
-    import json as _json  # noqa: PLC0415
+    import json as _json
     debug_payload = {
         "confidence": "high",
         "fix_prompt": "Update login handler to normalize email before lookup",
@@ -4747,7 +4779,7 @@ async def test_debug_result_low_confidence_does_not_spawn_fix_task(client: Async
     await db_session.commit()
     await db_session.refresh(task)
 
-    import json as _json  # noqa: PLC0415
+    import json as _json
     debug_payload = {
         "confidence": "low",
         "fix_prompt": "Possibly add a retry, but unclear",

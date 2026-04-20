@@ -19,7 +19,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy import func as _func
@@ -1256,7 +1255,34 @@ async def prometheus_metrics(request: Request):
 
 # Attach the rate limiter to the app
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def _cors_aware_rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """Same as slowapi's default 429 handler, but also emits CORS headers.
+
+    Without this, a rate-limited response from a cross-origin caller lacks
+    Access-Control-Allow-Origin and the browser surfaces it as a CORS error
+    instead of a 429 — indistinguishable from a genuine CORS misconfiguration.
+    Frontend bursts (parallel initial-load fetches) are the typical trigger.
+    """
+    resp = JSONResponse(
+        status_code=429,
+        content={"error": {"code": 429, "message": f"Rate limit exceeded: {exc.detail}"}},
+        headers={"Retry-After": "5"},
+    )
+    origin = request.headers.get("origin")
+    # allowed_origins is defined further down in this module and mutated per
+    # deployment via ALLOWED_ORIGINS env; resolve at call time.
+    if origin and (origin in allowed_origins or "*" in allowed_origins):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Vary"] = "Origin"
+    elif "*" in allowed_origins:
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+app.add_exception_handler(RateLimitExceeded, _cors_aware_rate_limit_handler)
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
