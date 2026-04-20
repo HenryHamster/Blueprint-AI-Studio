@@ -343,10 +343,27 @@ export function buildFilteredFindingsSection(history: Array<Record<string, unkno
     if (items.length >= 5) break;
   }
   if (items.length === 0) return '';
-  const lines = items.map(it => it.reason
-    ? `  * "${it.title}" — ${it.reason}`
-    : `  * "${it.title}"`);
+  const lines = items.map(it => {
+    const hint = differentiationHintFor(it.reason);
+    if (it.reason && hint) return `  * "${it.title}" — ${it.reason} [hint: ${hint}]`;
+    if (it.reason) return `  * "${it.title}" — ${it.reason}`;
+    return `  * "${it.title}"`;
+  });
   return `\n  Recently filtered (avoid — propose different approaches):\n${lines.join('\n')}`;
+}
+
+function differentiationHintFor(reason: string): string {
+  const r = reason.toLowerCase();
+  if (r.includes('hash match')) {
+    return 'fundamentally different scope or approach needed';
+  }
+  if (r.includes('word overlap')) {
+    return 'target different files or subsystem, or frame the problem from a different angle';
+  }
+  if (r.includes('file overlap')) {
+    return "address a different aspect of these files or propose complementary work that doesn't overlap";
+  }
+  return '';
 }
 
 export function formatCochangeHints(directionCtx: Record<string, unknown> | undefined): string {

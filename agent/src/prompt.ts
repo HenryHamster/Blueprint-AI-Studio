@@ -523,6 +523,17 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       if (parts.length > 0) {
         dcLines.push(`Scope merge rates: ${parts.join(', ')}`);
       }
+      const expansionParts: string[] = [];
+      for (const [scope, counts] of entries) {
+        const ratio = Number(counts?.avg_expansion_ratio);
+        if (!Number.isFinite(ratio) || ratio <= 0) continue;
+        expansionParts.push(`${scope}-scope averages ${ratio.toFixed(1)}x file expansion`);
+      }
+      if (expansionParts.length > 0) {
+        dcLines.push(
+          `Direction expansion: ${expansionParts.join('; ')} — budget headroom for related files beyond what you declare upfront.`,
+        );
+      }
       const crossParts: string[] = [];
       for (const [scope, counts] of entries) {
         const merged = Number(counts?.merged ?? 0);
@@ -648,33 +659,6 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         }
       }
     }
-    const ptPatterns = dirCtx.prompt_telemetry_patterns as Record<string, Record<string, unknown>> | undefined;
-    if (ptPatterns && (ptPatterns.merged || ptPatterns.failed)) {
-      const fmt = (b: Record<string, unknown> | undefined): string | null => {
-        if (!b) return null;
-        const n = Number(b.count) || 0;
-        if (n <= 0) return null;
-        const chars = Number(b.avg_char_count);
-        const rfc = Number(b.avg_related_file_count);
-        const ratio = Number(b.avg_files_to_budget_ratio);
-        const tests = Number(b.frac_mentions_tests);
-        const syms = Number(b.frac_mentions_symbols);
-        const parts: string[] = [`n=${n}`];
-        if (Number.isFinite(chars)) parts.push(`avg_chars=${Math.round(chars)}`);
-        if (Number.isFinite(rfc)) parts.push(`avg_files=${rfc.toFixed(2)}`);
-        if (Number.isFinite(ratio)) parts.push(`files/budget=${ratio.toFixed(2)}`);
-        if (Number.isFinite(tests)) parts.push(`mentions_tests=${Math.round(tests * 100)}%`);
-        if (Number.isFinite(syms)) parts.push(`mentions_symbols=${Math.round(syms * 100)}%`);
-        return parts.join(', ');
-      };
-      const mergedLine = fmt(ptPatterns.merged);
-      const failedLine = fmt(ptPatterns.failed);
-      if (mergedLine || failedLine) {
-        dcLines.push('**Prompt patterns (last 3 cycles, merged vs failed):**');
-        if (mergedLine) dcLines.push(`- merged: ${mergedLine}`);
-        if (failedLine) dcLines.push(`- failed: ${failedLine}`);
-      }
-    }
     const patterns = synthesizeSuccessPatterns(dirCtx, taskScope);
     if (patterns.length > 0) {
       dcLines.push('**What tends to work:**');
@@ -689,6 +673,13 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       for (const issue of dirTopIssues) {
         dcLines.push(`- "${issue.description}" (seen ${issue.count}x, category: ${issue.category})`);
       }
+    }
+    const promptQualityPatterns = Array.isArray(dirCtx.prompt_quality_patterns)
+      ? (dirCtx.prompt_quality_patterns as unknown[]).filter((s): s is string => typeof s === 'string')
+      : [];
+    if (promptQualityPatterns.length > 0) {
+      dcLines.push('**Prompt quality patterns (apply when writing finding prompts):**');
+      for (const note of promptQualityPatterns) dcLines.push(`- ${note}`);
     }
     dcLines.push('');
     prefix += dcLines.join('\n') + '\n';
@@ -807,17 +798,40 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       signalLines.push(`**Complexity score:** ${pct}/100 (low merge-probability estimate).`);
       const signals = taskContext.complexity_signals as Record<string, unknown> | undefined;
       if (signals && typeof signals === 'object') {
-        const parts: string[] = [];
-        for (const [k, v] of Object.entries(signals)) {
-          if (v === null || v === undefined) continue;
-          if (typeof v === 'object') {
-            parts.push(`${k}=${JSON.stringify(v)}`);
-          } else {
-            parts.push(`${k}=${String(v)}`);
-          }
+        const files = typeof signals.files === 'number' ? signals.files : null;
+        const modules = typeof signals.modules === 'number' ? signals.modules : null;
+        const expansionRatio = typeof signals.expansion_ratio === 'number' ? signals.expansion_ratio : null;
+        const neighborRatio = typeof signals.neighbor_ratio === 'number' ? signals.neighbor_ratio : null;
+        const factors = (signals.factors && typeof signals.factors === 'object')
+          ? signals.factors as Record<string, unknown>
+          : {};
+        const f = (k: string): number | null =>
+          typeof factors[k] === 'number' ? factors[k] as number : null;
+
+        const sentences: string[] = [];
+        if (files !== null && modules !== null) {
+          sentences.push(`This task spans ${files} file${files === 1 ? '' : 's'} across ${modules} module${modules === 1 ? '' : 's'}.`);
+        } else if (files !== null) {
+          sentences.push(`This task spans ${files} file${files === 1 ? '' : 's'}.`);
         }
-        if (parts.length > 0) {
-          signalLines.push(`- Signals: ${parts.join(', ')}`);
+        const fRatio = f('ratio');
+        if (fRatio !== null && fRatio < 0.8 && expansionRatio !== null) {
+          sentences.push(`Historical expansion ratio of ${expansionRatio}x means agents working on similar tasks touched ${expansionRatio}x the listed files — constrain your initial changes aggressively.`);
+        }
+        const fNeighbors = f('neighbors');
+        if (fNeighbors !== null && fNeighbors < 0.8 && neighborRatio !== null) {
+          sentences.push(`High co-change neighbor ratio (${neighborRatio}) suggests unlisted files will likely need changes too — plan for scope pressure.`);
+        }
+        const fModules = f('modules');
+        if (fModules !== null && fModules < 0.8 && modules !== null && modules > 1) {
+          sentences.push(`Changes spanning ${modules} modules increase cross-system risk — verify each module's contract independently.`);
+        }
+        const fFiles = f('files');
+        if (fFiles !== null && fFiles < 0.8 && files !== null) {
+          sentences.push(`File count (${files}) is above the high-merge band — prefer the smallest viable subset.`);
+        }
+        if (sentences.length > 0) {
+          signalLines.push(`- ${sentences.join(' ')}`);
         }
       }
     }

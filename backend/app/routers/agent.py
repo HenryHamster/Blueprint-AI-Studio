@@ -1135,7 +1135,8 @@ async def claim_task(
                 failure_stage_pattern = _compute_failure_stage_pattern(history)
 
                 # Aggregate scope_breakdown from the last 3 productive research cycles
-                scope_success_rates: dict[str, dict[str, int]] = {}
+                scope_success_rates: dict[str, dict[str, float | int]] = {}
+                expansion_weighted: dict[str, dict[str, float]] = {}
                 productive_cycles = [
                     h for h in history if h.get("tasks_created", 0) > 0
                 ][-3:]
@@ -1150,12 +1151,23 @@ async def claim_task(
                             scope_name, {"created": 0, "merged": 0, "failed": 0, "merged_cross_module": 0}
                         )
                         agg_entry["created"] += int(counts.get("created", 0) or 0)
-                        agg_entry["merged"] += int(counts.get("merged", 0) or 0)
+                        merged_this = int(counts.get("merged", 0) or 0)
+                        agg_entry["merged"] += merged_this
                         agg_entry["failed"] += int(counts.get("failed", 0) or 0)
                         agg_entry["merged_cross_module"] += int(counts.get("merged_cross_module", 0) or 0)
+                        ratio = counts.get("avg_expansion_ratio_merged") or counts.get("avg_expansion_ratio")
+                        if isinstance(ratio, (int, float)) and ratio > 0 and merged_this > 0:
+                            ew = expansion_weighted.setdefault(scope_name, {"sum": 0.0, "weight": 0.0})
+                            ew["sum"] += float(ratio) * merged_this
+                            ew["weight"] += merged_this
                 scope_success_rates = {
                     k: v for k, v in scope_success_rates.items() if v["created"] >= 1
                 }
+                for scope_name, ew in expansion_weighted.items():
+                    if ew["weight"] > 0 and scope_name in scope_success_rates:
+                        scope_success_rates[scope_name]["avg_expansion_ratio"] = round(
+                            ew["sum"] / ew["weight"], 2
+                        )
 
                 # Pull recent failed/cancelled sibling tasks with analysis artifacts
                 prior_analysis_cutoff = _utcnow() - timedelta(days=14)
@@ -1417,55 +1429,8 @@ async def claim_task(
                         success_summary.append(
                             f"{scope_name}: {merged}/{created} merged ({round(merged / created * 100)}%)"
                         )
-                # Aggregate prompt_telemetry from last 3 productive cycles so research
-                # agents can calibrate finding-prompt construction against empirical
-                # merged-vs-failed patterns (test mentions, symbol mentions, length).
-                prompt_telemetry_patterns: dict | None = None
-                pt_agg: dict[str, dict[str, float]] = {
-                    "merged": {"count": 0, "char_count": 0.0, "related_file_count": 0.0,
-                               "files_to_budget_ratio": 0.0, "mentions_tests": 0.0,
-                               "mentions_symbols": 0.0, "_n_avg": 0},
-                    "failed": {"count": 0, "char_count": 0.0, "related_file_count": 0.0,
-                               "files_to_budget_ratio": 0.0, "mentions_tests": 0.0,
-                               "mentions_symbols": 0.0, "_n_avg": 0},
-                }
-                for cycle in [h for h in history if h.get("tasks_created", 0) > 0][-3:]:
-                    pt = cycle.get("prompt_telemetry")
-                    if not isinstance(pt, dict):
-                        continue
-                    for bucket in ("merged", "failed"):
-                        b = pt.get(bucket)
-                        if not isinstance(b, dict):
-                            continue
-                        n = int(b.get("count") or 0)
-                        if n <= 0:
-                            continue
-                        agg = pt_agg[bucket]
-                        agg["count"] += n
-                        for k_avg in ("char_count", "related_file_count", "files_to_budget_ratio"):
-                            v = b.get(f"avg_{k_avg}")
-                            if isinstance(v, (int, float)):
-                                agg[k_avg] += float(v) * n
-                        for k_frac in ("mentions_tests", "mentions_symbols"):
-                            v = b.get(f"frac_{k_frac}")
-                            if isinstance(v, (int, float)):
-                                agg[k_frac] += float(v) * n
-                        agg["_n_avg"] += n
-                pt_summary: dict[str, dict] = {}
-                for bucket, agg in pt_agg.items():
-                    n = int(agg["_n_avg"])
-                    if n <= 0:
-                        continue
-                    pt_summary[bucket] = {
-                        "count": int(agg["count"]),
-                        "avg_char_count": round(agg["char_count"] / n, 1),
-                        "avg_related_file_count": round(agg["related_file_count"] / n, 2),
-                        "avg_files_to_budget_ratio": round(agg["files_to_budget_ratio"] / n, 3),
-                        "frac_mentions_tests": round(agg["mentions_tests"] / n, 3),
-                        "frac_mentions_symbols": round(agg["mentions_symbols"] / n, 3),
-                    }
-                if pt_summary.get("merged") or pt_summary.get("failed"):
-                    prompt_telemetry_patterns = pt_summary
+                from app.direction_outcomes import synthesize_prompt_quality_patterns
+                prompt_quality_patterns = synthesize_prompt_quality_patterns(history)
                 response["direction_context"] = {
                     "possibly_saturated": bool(direction.get("possibly_saturated", False)),
                     "deadlock_detected": bool(deadlocked),
@@ -1475,8 +1440,9 @@ async def claim_task(
                     "top_first_review_issues": research_top_review_issues,
                     "success_patterns": success_summary,
                     "review_effectiveness": research_review_effectiveness,
-                    "prompt_telemetry_patterns": prompt_telemetry_patterns,
                 }
+                if prompt_quality_patterns:
+                    response["direction_context"]["prompt_quality_patterns"] = prompt_quality_patterns
 
     # Inject co-change affinity context for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:

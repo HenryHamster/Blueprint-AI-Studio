@@ -312,6 +312,24 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('empty');
   });
 
+  it('renders per-scope avg_expansion_ratio as actionable guidance in Direction Context', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        scope_success_rates: {
+          small: { created: 4, merged: 3, failed: 1, avg_expansion_ratio: 1.8 },
+          medium: { created: 2, merged: 1, failed: 1 },
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('Direction expansion: small-scope averages 1.8x file expansion');
+    expect(result).toContain('budget headroom');
+  });
+
   it('omits failed annotation in scope merge rates when failed count is zero', () => {
     const task = {
       direction_context: {
@@ -751,6 +769,44 @@ describe('buildContextPrefix', () => {
     });
     expect(withEmpty).not.toContain('Recurring review issues in this direction');
     expect(withMissing).not.toContain('Recurring review issues in this direction');
+  });
+
+  it('renders complexity signals as narrative guidance with only factors below 0.8', () => {
+    const task = {
+      context: {
+        complexity_score: 0.3,
+        complexity_signals: {
+          files: 6,
+          expansion_ratio: 2.3,
+          modules: 3,
+          neighbor_ratio: 0.8,
+          factors: { files: 0.75, ratio: 0.6, clusters: 0.9, modules: 0.85, neighbors: 0.65 },
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('**Complexity score:** 30/100');
+    expect(result).toContain('This task spans 6 files across 3 modules.');
+    expect(result).toContain('Historical expansion ratio of 2.3x');
+    expect(result).toContain('High co-change neighbor ratio (0.8)');
+    expect(result).toContain('File count (6) is above the high-merge band');
+    // modules factor 0.85 is NOT below 0.8 — should be omitted
+    expect(result).not.toContain('increase cross-system risk');
+    // Should not dump raw key=value signals
+    expect(result).not.toContain('Signals: files=6');
+    expect(result).not.toMatch(/factors=\{/);
+  });
+
+  it('omits complexity signal narrative when score >= 0.5', () => {
+    const task = {
+      context: {
+        complexity_score: 0.7,
+        complexity_signals: { files: 6, factors: { files: 0.5 } },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('Complexity score');
+    expect(result).not.toContain('This task spans');
   });
 
   it('returns empty string for relativeTimeFromIso when iso is empty or unparseable', () => {

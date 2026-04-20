@@ -2125,3 +2125,56 @@ async def test_preventive_context_counts(db_session: AsyncSession):
     assert entry["preventive_context_tasks_created"] == 3
     assert entry["preventive_context_tasks_merged"] == 1
     assert entry["preventive_context_tasks_failed"] == 1
+
+
+def test_synthesize_prompt_quality_patterns_emits_when_signal_meaningful():
+    from app.direction_outcomes import synthesize_prompt_quality_patterns
+    history = [
+        {"prompt_telemetry": {
+            "merged": {"count": 3, "avg_char_count": 1200, "avg_related_file_count": 4.0,
+                       "frac_mentions_tests": 0.8, "frac_mentions_symbols": 0.7},
+            "failed": {"count": 2, "avg_char_count": 800, "avg_related_file_count": 2.0,
+                       "frac_mentions_tests": 0.3, "frac_mentions_symbols": 0.2},
+        }},
+        {"prompt_telemetry": {
+            "merged": {"count": 2, "avg_char_count": 1300, "avg_related_file_count": 5.0,
+                       "frac_mentions_tests": 0.9, "frac_mentions_symbols": 0.8},
+            "failed": {"count": 2, "avg_char_count": 700, "avg_related_file_count": 1.5,
+                       "frac_mentions_tests": 0.2, "frac_mentions_symbols": 0.1},
+        }},
+    ]
+    notes = synthesize_prompt_quality_patterns(history)
+    assert len(notes) >= 3
+    joined = " ".join(notes)
+    assert "chars" in joined
+    assert "tests" in joined
+
+
+def test_synthesize_prompt_quality_patterns_skips_when_too_few_cycles():
+    from app.direction_outcomes import synthesize_prompt_quality_patterns
+    history = [
+        {"prompt_telemetry": {
+            "merged": {"count": 2, "avg_char_count": 1200, "frac_mentions_tests": 0.8},
+            "failed": {"count": 2, "avg_char_count": 600, "frac_mentions_tests": 0.2},
+        }},
+    ]
+    assert synthesize_prompt_quality_patterns(history) == []
+
+
+def test_synthesize_prompt_quality_patterns_skips_when_differences_are_noise():
+    from app.direction_outcomes import synthesize_prompt_quality_patterns
+    history = [
+        {"prompt_telemetry": {
+            "merged": {"count": 2, "avg_char_count": 1000, "avg_related_file_count": 3.0,
+                       "frac_mentions_tests": 0.5, "frac_mentions_symbols": 0.5},
+            "failed": {"count": 2, "avg_char_count": 1010, "avg_related_file_count": 3.1,
+                       "frac_mentions_tests": 0.55, "frac_mentions_symbols": 0.5},
+        }},
+        {"prompt_telemetry": {
+            "merged": {"count": 2, "avg_char_count": 990, "avg_related_file_count": 2.9,
+                       "frac_mentions_tests": 0.5, "frac_mentions_symbols": 0.5},
+            "failed": {"count": 2, "avg_char_count": 1000, "avg_related_file_count": 3.0,
+                       "frac_mentions_tests": 0.55, "frac_mentions_symbols": 0.5},
+        }},
+    ]
+    assert synthesize_prompt_quality_patterns(history) == []

@@ -555,6 +555,26 @@ describe('buildFilteredFindingsSection', () => {
     expect(section).not.toContain('older');
   });
 
+  it('appends differentiation hints based on reason type', () => {
+    const history = [
+      {
+        filtered_findings: [
+          { title: 'A', reason: 'hash match with prior task' },
+          { title: 'B', reason: 'word overlap with: instrument pipeline metrics' },
+          { title: 'C', reason: 'file overlap with: foo.py, bar.py' },
+          { title: 'D', reason: 'some unrecognized reason' },
+        ],
+      },
+    ];
+    const section = buildFilteredFindingsSection(history);
+    expect(section).toContain('[hint: fundamentally different scope or approach needed]');
+    expect(section).toContain('[hint: target different files or subsystem');
+    expect(section).toContain("[hint: address a different aspect of these files");
+    // Unrecognized reasons render without a hint.
+    expect(section).toContain('"D" — some unrecognized reason');
+    expect(section).not.toMatch(/"D" — some unrecognized reason \[hint:/);
+  });
+
   it('renders title without trailing separator when reason is empty', () => {
     const history = [
       { filtered_findings: [{ title: 'just a title', reason: '' }] },

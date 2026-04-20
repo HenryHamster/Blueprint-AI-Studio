@@ -813,3 +813,70 @@ def _refresh_pipeline_scope_merge_rates(project: Project) -> None:
         if candidates:
             ratios[scope] = round(max(candidates), 3)
     runtime_config["pipeline_scope_expansion_ratios"] = ratios
+
+
+def synthesize_prompt_quality_patterns(history: list) -> list[str]:
+    """Synthesize merged-vs-failed prompt characteristic differences across
+    recent research cycles into actionable guidance strings.
+
+    Returns an empty list unless at least 2 cycles have prompt_telemetry
+    with both merged and failed buckets populated, and only emits notes
+    where the difference between buckets is meaningful (not noise).
+    """
+    if not isinstance(history, list):
+        return []
+    merged_acc: dict[str, list[float]] = {}
+    failed_acc: dict[str, list[float]] = {}
+    cycles_with_both = 0
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        pt = entry.get("prompt_telemetry")
+        if not isinstance(pt, dict):
+            continue
+        m = pt.get("merged") if isinstance(pt.get("merged"), dict) else None
+        f = pt.get("failed") if isinstance(pt.get("failed"), dict) else None
+        if not (m and f):
+            continue
+        cycles_with_both += 1
+        for key in ("avg_char_count", "avg_related_file_count",
+                    "frac_mentions_tests", "frac_mentions_symbols"):
+            mv, fv = m.get(key), f.get(key)
+            if isinstance(mv, (int, float)):
+                merged_acc.setdefault(key, []).append(float(mv))
+            if isinstance(fv, (int, float)):
+                failed_acc.setdefault(key, []).append(float(fv))
+    if cycles_with_both < 2:
+        return []
+    notes: list[str] = []
+
+    def _avg(vals: list[float]) -> float | None:
+        return sum(vals) / len(vals) if vals else None
+
+    mc, fc = _avg(merged_acc.get("avg_char_count", [])), _avg(failed_acc.get("avg_char_count", []))
+    if mc is not None and fc is not None and max(mc, fc) > 0:
+        if abs(mc - fc) / max(mc, fc) >= 0.2:
+            notes.append(
+                f"Merged prompts averaged {int(mc)} chars vs {int(fc)} for failed — "
+                f"{'aim for more detail' if mc > fc else 'keep prompts tighter'}."
+            )
+    mr, fr = _avg(merged_acc.get("avg_related_file_count", [])), _avg(failed_acc.get("avg_related_file_count", []))
+    if mr is not None and fr is not None and max(mr, fr) > 0:
+        if abs(mr - fr) >= 1.0:
+            notes.append(
+                f"Merged prompts referenced {round(mr, 1)} related files on average vs {round(fr, 1)} for failed — "
+                f"{'cite more concrete files' if mr > fr else 'avoid over-listing files'}."
+            )
+    mt, ft = _avg(merged_acc.get("frac_mentions_tests", [])), _avg(failed_acc.get("frac_mentions_tests", []))
+    if mt is not None and ft is not None and abs(mt - ft) >= 0.2:
+        notes.append(
+            f"{int(mt * 100)}% of merged prompts mentioned tests vs {int(ft * 100)}% of failed — "
+            f"{'emphasize test expectations' if mt > ft else 'test mentions did not correlate with merge here'}."
+        )
+    ms, fs = _avg(merged_acc.get("frac_mentions_symbols", [])), _avg(failed_acc.get("frac_mentions_symbols", []))
+    if ms is not None and fs is not None and abs(ms - fs) >= 0.2:
+        notes.append(
+            f"{int(ms * 100)}% of merged prompts named specific symbols vs {int(fs * 100)}% of failed — "
+            f"{'name concrete functions/classes' if ms > fs else 'symbol naming did not correlate with merge here'}."
+        )
+    return notes

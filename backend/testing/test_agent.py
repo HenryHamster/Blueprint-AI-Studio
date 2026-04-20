@@ -1475,9 +1475,51 @@ async def test_claim_injects_scope_success_rates_in_direction_context(client: As
     assert resp.status_code == 200
     dc = resp.json()["direction_context"]
     rates = dc["scope_success_rates"]
-    assert rates["small"] == {"created": 4, "merged": 3, "failed": 1}
-    assert rates["medium"] == {"created": 1, "merged": 0, "failed": 1}
+    assert rates["small"] == {"created": 4, "merged": 3, "failed": 1, "merged_cross_module": 0}
+    assert rates["medium"] == {"created": 1, "merged": 0, "failed": 1, "merged_cross_module": 0}
     assert "empty" not in rates
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_injects_avg_expansion_ratio_in_scope_success_rates(client: AsyncClient, db_session):
+    """direction_context.scope_success_rates includes weighted-avg avg_expansion_ratio from scope_breakdown."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Scope Expansion Test", user_id="test-user-exp")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "d",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [
+                {"tasks_created": 2, "prs_merged": 2, "scope_breakdown": {"small": {"created": 2, "merged": 2, "failed": 0, "avg_expansion_ratio_merged": 2.0}}},
+                {"tasks_created": 2, "prs_merged": 2, "scope_breakdown": {"small": {"created": 2, "merged": 2, "failed": 0, "avg_expansion_ratio_merged": 1.0}}},
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do"}],
+        vm_instance_id="agent-vm-exp",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-exp")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    rates = resp.json()["direction_context"]["scope_success_rates"]
+    assert rates["small"]["avg_expansion_ratio"] == 1.5
 
 
 @pytest.mark.smoketest
