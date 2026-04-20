@@ -91,7 +91,7 @@ vi.mock('ws', () => ({
 
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote } from './standard.js';
-import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks } from '../index.js';
+import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks, sendHeartbeatSync } from '../index.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, buildAnalysisPrompt } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
@@ -2391,5 +2391,51 @@ describe('needsMigrationGeneration', () => {
 
   it('returns false for an empty changed paths list', () => {
     expect(needsMigrationGeneration([])).toBe(false);
+  });
+});
+
+describe('migration auto-generation heartbeat', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('sends heartbeat with migration_auto_generated:true after successful migration generation', async () => {
+    vi.mocked(git).mockImplementation((args: readonly string[]) => {
+      if (args[0] === 'status') return ' M backend/app/models.py';
+      if (args[0] === 'rev-parse') return 'basecommit';
+      return '';
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const migrationCall = vi.mocked(sendHeartbeatSync).mock.calls.find(
+      c => c[2] !== undefined && 'migration_auto_generated' in (c[2] as Record<string, unknown>),
+    );
+    expect(migrationCall).toBeDefined();
+    expect((migrationCall![2] as Record<string, unknown>).migration_auto_generated).toBe(true);
+  });
+
+  it('sends heartbeat with migration_auto_generated:false when the migration pass exits non-zero', async () => {
+    vi.mocked(git).mockImplementation((args: readonly string[]) => {
+      if (args[0] === 'status') return ' M backend/app/models.py';
+      if (args[0] === 'rev-parse') return 'basecommit';
+      return '';
+    });
+    vi.mocked(runClaudeCode).mockImplementation(async (prompt: string) => ({
+      exitCode: prompt.includes('did NOT add an alembic migration') ? 1 : 0,
+      allOutput: '',
+      lastResultText: '',
+    }));
+
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const migrationCall = vi.mocked(sendHeartbeatSync).mock.calls.find(
+      c => c[2] !== undefined && 'migration_auto_generated' in (c[2] as Record<string, unknown>),
+    );
+    expect(migrationCall).toBeDefined();
+    expect((migrationCall![2] as Record<string, unknown>).migration_auto_generated).toBe(false);
   });
 });

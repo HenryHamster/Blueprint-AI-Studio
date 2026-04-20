@@ -473,7 +473,7 @@ async def test_extract_ci_context_migration_failure():
         mock_token.return_value = "ghp_test_token"
         mock_runs.return_value = mock_ci_result
 
-        _failed, _summary, failure_type = await _extract_ci_context(
+        _failed, _summary, failure_type, _signals = await _extract_ci_context(
             "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
         )
 
@@ -495,7 +495,7 @@ async def test_extract_ci_context_migration_undefined_column():
         mock_token.return_value = "ghp_test_token"
         mock_runs.return_value = mock_ci_result
 
-        _failed, _summary, failure_type = await _extract_ci_context(
+        _failed, _summary, failure_type, _signals = await _extract_ci_context(
             "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
         )
 
@@ -514,6 +514,46 @@ def test_build_remediation_prompt_migration_guidance():
     assert "alembic" in prompt.lower()
     assert "EXPECTED_SCHEMA_REVISION" in prompt
     assert "down_revision" in prompt
+
+
+def test_build_remediation_prompt_migration_extracts_schema_mismatch():
+    """Schema version mismatch error yields concrete revision IDs in guidance."""
+    prompt = _build_remediation_prompt(
+        head_branch="main",
+        head_sha="abc",
+        failed_checks=["CI / tests"],
+        error_summary="Schema version mismatch: database at '0037', code expects '0038'",
+        failure_type="migration",
+    )
+    assert "0037" in prompt
+    assert "0038" in prompt
+    assert "EXPECTED_SCHEMA_REVISION" in prompt
+
+
+def test_build_remediation_prompt_migration_extracts_missing_revision():
+    """can't locate revision errors surface the missing revision ID."""
+    prompt = _build_remediation_prompt(
+        head_branch="main",
+        head_sha="abc",
+        failed_checks=["CI / tests"],
+        error_summary="alembic.util.exc.CommandError: Can't locate revision identified by '0042'",
+        failure_type="migration",
+    )
+    assert "0042" in prompt
+    assert "Missing revision" in prompt or "missing revision" in prompt.lower()
+
+
+def test_build_remediation_prompt_migration_extracts_multiple_heads():
+    """Multiple head revisions error notes the multi-head condition."""
+    prompt = _build_remediation_prompt(
+        head_branch="main",
+        head_sha="abc",
+        failed_checks=["CI / tests"],
+        error_summary="Multiple head revisions are present for given argument 'head'; revisions 0038 and 0039 both head",
+        failure_type="migration",
+    )
+    assert "Multiple alembic heads" in prompt
+    assert "0038" in prompt and "0039" in prompt
 
 
 @pytest.mark.asyncio

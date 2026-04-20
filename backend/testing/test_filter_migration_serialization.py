@@ -54,6 +54,24 @@ class TestFilterMigrationSerialization:
         assert result == []
 
     @pytest.mark.asyncio
+    async def test_create_task_with_models_py_serialized_behind_migrate(self):
+        pid = uuid.uuid4()
+        ip = _task(pid, TaskStatus.IN_PROGRESS, ttype="migrate")
+        c = _task(
+            pid, TaskStatus.QUEUED, ttype="create",
+            files=["backend/app/models.py"],
+        )
+        session = MagicMock()
+        broadcast = AsyncMock()
+
+        result = await filter_migration_serialization(
+            [c.id], [c], [ip], session, broadcast
+        )
+        assert result == []
+        assert "serializing migration" in (c.latest_status_message or "")
+        broadcast.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_non_migration_task_unaffected(self):
         pid = uuid.uuid4()
         ip = _task(pid, TaskStatus.IN_PROGRESS, ttype="migrate")

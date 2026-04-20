@@ -386,13 +386,14 @@ function stopHeartbeat() {
 
 /** Synchronous heartbeat — use between blocking execFileSync calls to prevent reaper from killing us.
  *  Fires curl in a child process (sync) so the event loop doesn't need to be free. */
-export function sendHeartbeatSync(taskId: string, statusMessage: string) {
+export function sendHeartbeatSync(taskId: string, statusMessage: string, extras?: Record<string, unknown>) {
   try {
     const metrics = collectMetrics();
     const payload = JSON.stringify({
       task_id: taskId,
       status_message: `[${metrics.heap_used_mb}MB] ${statusMessage}`,
       metrics,
+      ...(extras || {}),
     });
     execFileSync('curl', [
       '-sf', '-X', 'POST',

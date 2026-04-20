@@ -279,9 +279,12 @@ async def filter_held_directions(
 def _is_migration_task(task: Task) -> bool:
     """Return True if *task* produces an alembic migration file.
 
-    Two cases qualify: explicit ``migrate``-type tasks, and any task whose
-    ``related_files`` includes a path under ``backend/alembic/versions/``
-    (auto-generated migrations from create/refactor tasks).
+    Three cases qualify: explicit ``migrate``-type tasks; tasks whose
+    ``related_files`` includes a path under ``backend/alembic/versions/``;
+    and tasks whose ``related_files`` includes ``backend/app/models.py``
+    (the agent's standard handler auto-generates a migration when models.py
+    changes without a corresponding alembic file — see needsMigrationGeneration
+    in agent/src/handlers/standard.ts).
     """
     fp = task.first_payload
     if fp.get("type") == "migrate":
@@ -290,7 +293,10 @@ def _is_migration_task(task: Task) -> bool:
     for f in files:
         if not f:
             continue
-        if "backend/alembic/versions/" in f.replace("\\", "/"):
+        normalized = f.replace("\\", "/")
+        if "backend/alembic/versions/" in normalized:
+            return True
+        if normalized == "backend/app/models.py" or normalized.endswith("/backend/app/models.py"):
             return True
     return False
 

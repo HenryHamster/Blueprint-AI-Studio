@@ -638,6 +638,49 @@ async def _find_matching_prior_investigation(
     return best
 
 
+def _extract_migration_chain_signals(error_summary: str) -> str:
+    """Extract concrete alembic chain state (revisions, heads, missing IDs) from error logs.
+
+    Returns a multi-line bullet string for inclusion in remediation guidance,
+    or an empty string when no signals are found.
+    """
+    if not error_summary:
+        return ""
+    text = error_summary
+    lower = text.lower()
+    bullets: list[str] = []
+
+    # Schema version mismatch: "database at 'XXXX', code expects 'YYYY'"
+    m = re.search(r"database at ['\"]([0-9a-f_]+)['\"][^'\"]*expects ['\"]([0-9a-f_]+)['\"]", text, re.IGNORECASE)
+    if m:
+        bullets.append(f"- Schema mismatch: database revision `{m.group(1)}`, code EXPECTED_SCHEMA_REVISION `{m.group(2)}` — bump EXPECTED_SCHEMA_REVISION in backend/app/main.py or add the missing migration.")
+    else:
+        m2 = re.search(r"expected_schema_revision[^0-9a-f]*([0-9a-f_]{4,})[^0-9a-f]+([0-9a-f_]{4,})", lower)
+        if m2:
+            bullets.append(f"- EXPECTED_SCHEMA_REVISION mismatch involving `{m2.group(1)}` and `{m2.group(2)}`.")
+
+    # Multiple head revisions: alembic prints them like "Multiple head revisions are present for given argument 'head'; please specify a specific target revision, '<branchname>@head' to narrow to a specific head, or 'heads' for all heads"
+    # Try to capture explicit revision IDs mentioned nearby.
+    if "multiple head" in lower or "only a single head supported" in lower:
+        ids = re.findall(r"\b([0-9a-f]{8,12}|\d{4})\b", text)
+        unique_ids = list(dict.fromkeys(ids))[:6]
+        if unique_ids:
+            bullets.append(f"- Multiple alembic heads detected. Candidate revision IDs from logs: {', '.join('`' + i + '`' for i in unique_ids)}. Re-chain so exactly one head remains.")
+        else:
+            bullets.append("- Multiple alembic heads detected — inspect `alembic heads` and re-chain so exactly one head remains.")
+
+    # Can't locate revision: alembic message "Can't locate revision identified by 'XXXX'"
+    for m in re.finditer(r"can'?t locate revision identified by ['\"]([0-9a-f_]+)['\"]", text, re.IGNORECASE):
+        bullets.append(f"- Missing revision `{m.group(1)}` referenced as down_revision but no file defines it. Restore the file or fix the down_revision pointer.")
+
+    # UndefinedColumn: extract column name
+    for m in re.finditer(r"undefinedcolumn[^a-z]+(?:column )?['\"]?([a-zA-Z_][a-zA-Z0-9_.]*)['\"]?", text, re.IGNORECASE):
+        bullets.append(f"- UndefinedColumn on `{m.group(1)}` — a migration adding this column is missing or out of order.")
+        break
+
+    return "\n".join(bullets)
+
+
 def _build_remediation_prompt(
     *,
     head_branch: str,
@@ -654,6 +697,8 @@ def _build_remediation_prompt(
     # Truncate error summary for prompt to avoid excessive token usage
     summary_text = error_summary[:2000] if error_summary else "(no error logs available)"
 
+    migration_chain_hint = _extract_migration_chain_signals(error_summary) if failure_type == "migration" else ""
+
     type_guidance_map = {
         "test": "Focus on test assertions, fixtures, and test setup — the production code may be fine but tests may need updating to match changed behavior.",
         "build": "Check imports, missing dependencies, syntax errors, and module resolution — this is likely a compilation or import failure.",
@@ -667,6 +712,7 @@ def _build_remediation_prompt(
             "multiple heads), UndefinedColumn errors imply a missing or misordered "
             "migration, and re-run the backend invariant tests "
             "(bash scripts/test-backend.sh testing/test_invariants.py) to verify."
+            + (f"\n\nExtracted chain state from logs:\n{migration_chain_hint}" if migration_chain_hint else "")
         ),
         "unknown": "Diagnose the failure type from the error output before applying a fix.",
     }

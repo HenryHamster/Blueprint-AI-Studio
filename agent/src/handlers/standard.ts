@@ -4,7 +4,7 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, git, gitCommit, setupWorkspace, pushAndCreatePR,
   runClaudeCode, lintFixLoop, testFixLoop, captureTestBaseline, matchesRateLimit,
-  runProjectLintChecks, condensedAnalysisSections,
+  runProjectLintChecks, condensedAnalysisSections, sendHeartbeatSync,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
@@ -736,8 +736,18 @@ Return nothing — just write the files.`;
         } else {
           sendLog(ws, '[Migration Check] No new files produced by migration pass.\n');
         }
+        const migrationFilesGenerated = added.filter(
+          p => p.startsWith(ALEMBIC_VERSIONS_DIR) && p.endsWith('.py') && !p.endsWith('__init__.py'),
+        );
+        sendHeartbeatSync(taskId, 'Migration auto-generation completed', {
+          migration_auto_generated: true,
+          migration_files: migrationFilesGenerated,
+        });
       } else {
         sendLog(ws, `[Migration Check] Exited with code ${migrationExit} — proceeding without generated migration.\n`);
+        sendHeartbeatSync(taskId, `Migration auto-generation failed (exit ${migrationExit})`, {
+          migration_auto_generated: false,
+        });
       }
     }
 
