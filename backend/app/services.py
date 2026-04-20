@@ -7,8 +7,9 @@ import re
 import time
 from collections import deque
 from datetime import datetime, timedelta
+from typing import Dict
 
-from sqlalchemy import or_, cast, func
+from sqlalchemy import or_, cast, func, update, text
 from sqlalchemy.types import String
 from sqlmodel import select
 
@@ -445,6 +446,136 @@ async def stale_branch_cleanup_service():
             await asyncio.sleep(interval_minutes * 60)
         except asyncio.CancelledError:
             logger.info("[BRANCH CLEANUP] Service shutting down.")
+            break
+
+
+_AUTO_ARCHIVE_BATCH_SIZE = 500
+
+
+async def _run_auto_archive_cycle() -> Dict[str, int]:
+    """Archive terminal tasks via two caps: age threshold and per-project count.
+
+    A task is archived if EITHER:
+      - its updated_at is older than auto_archive_terminal_after_days, OR
+      - its project's unarchived-terminal backlog exceeds
+        auto_archive_max_terminal_tasks_per_project (keep the N most recent).
+
+    Both passes are batched + SKIP LOCKED so the update never blocks on rows
+    held by the orchestrator. Returns {"age": n, "count": n} for logging.
+    """
+    age_days = _shared_state.runtime_config.get("auto_archive_terminal_after_days", 7)
+    per_project_cap = int(_shared_state.runtime_config.get(
+        "auto_archive_max_terminal_tasks_per_project", 0
+    ) or 0)
+    cutoff = _utcnow() - timedelta(days=age_days)
+    # Task.updated_at is TIMESTAMP WITHOUT TIME ZONE; asyncpg rejects tz-aware
+    # comparands. See get_all_tasks's created_after handling for the same fix.
+    if cutoff.tzinfo is not None:
+        cutoff = cutoff.replace(tzinfo=None)
+
+    terminal = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+    age_total = 0
+    count_total = 0
+
+    async with AsyncSessionLocal() as session:
+        # --- Pass 1: age-based ---
+        while True:
+            select_stmt = select(Task.id).where(
+                Task.archived.is_(False),
+                Task.status.in_(terminal),
+                Task.updated_at < cutoff,
+            ).limit(_AUTO_ARCHIVE_BATCH_SIZE).with_for_update(skip_locked=True)
+            ids = (await session.execute(select_stmt)).scalars().all()
+            if not ids:
+                break
+            await session.execute(
+                update(Task).where(Task.id.in_(ids)).values(archived=True)
+            )
+            await session.commit()
+            age_total += len(ids)
+            if len(ids) < _AUTO_ARCHIVE_BATCH_SIZE:
+                break
+
+        # --- Pass 2: per-project count cap ---
+        # Window-function ranks unarchived-terminal tasks per project by
+        # updated_at DESC; anything beyond rank N is archived. Done as a single
+        # query returning all candidate IDs, then batched update with
+        # skip_locked so a concurrent writer on one row doesn't block the rest.
+        if per_project_cap > 0:
+            # Bind-param the archived=false literal so asyncpg/aiosqlite each
+            # coerce the python bool to their native representation (Postgres
+            # boolean vs SQLite integer 0/1); a raw `false` literal is not
+            # cross-dialect.
+            candidate_sql = text(
+                """
+                WITH ranked AS (
+                    SELECT id, row_number() OVER (
+                        PARTITION BY project_id ORDER BY updated_at DESC, id DESC
+                    ) AS rn
+                    FROM task
+                    WHERE archived = :archived_false
+                      AND status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                )
+                SELECT id FROM ranked WHERE rn > :cap
+                """
+            )
+            candidate_ids = [
+                row[0]
+                for row in (await session.execute(
+                    candidate_sql, {"cap": per_project_cap, "archived_false": False}
+                )).all()
+            ]
+            for i in range(0, len(candidate_ids), _AUTO_ARCHIVE_BATCH_SIZE):
+                batch = candidate_ids[i : i + _AUTO_ARCHIVE_BATCH_SIZE]
+                # Re-acquire row locks with skip_locked before updating so a
+                # row held by the orchestrator is deferred, not blocked.
+                lockable = (await session.execute(
+                    select(Task.id)
+                    .where(Task.id.in_(batch))
+                    .with_for_update(skip_locked=True)
+                )).scalars().all()
+                if not lockable:
+                    continue
+                await session.execute(
+                    update(Task).where(Task.id.in_(lockable)).values(archived=True)
+                )
+                await session.commit()
+                count_total += len(lockable)
+
+    return {"age": age_total, "count": count_total}
+
+
+async def auto_archive_service():
+    """Periodically archive stale terminal tasks to keep the admin list bounded.
+
+    Disabled when runtime_config['auto_archive_enabled'] is False. Age threshold
+    and cadence are operator-tunable (auto_archive_terminal_after_days,
+    auto_archive_interval_minutes).
+    """
+    while True:
+        try:
+            if _shared_state.runtime_config.get("auto_archive_enabled", True):
+                archived = await _run_auto_archive_cycle()
+                total = archived["age"] + archived["count"]
+                if total:
+                    age_days = _shared_state.runtime_config.get("auto_archive_terminal_after_days", 7)
+                    cap = _shared_state.runtime_config.get("auto_archive_max_terminal_tasks_per_project", 0)
+                    logger.info(
+                        f"[AUTO-ARCHIVE] Archived {total} task(s): "
+                        f"{archived['age']} older than {age_days}d, "
+                        f"{archived['count']} over per-project cap of {cap}"
+                    )
+        except asyncio.CancelledError:
+            logger.info("[AUTO-ARCHIVE] Service shutting down.")
+            break
+        except Exception as e:
+            logger.error(f"[AUTO-ARCHIVE] Error: {e}", exc_info=True)
+
+        interval_minutes = _shared_state.runtime_config.get("auto_archive_interval_minutes", 60)
+        try:
+            await asyncio.sleep(max(interval_minutes, 1) * 60)
+        except asyncio.CancelledError:
+            logger.info("[AUTO-ARCHIVE] Service shutting down.")
             break
 
 

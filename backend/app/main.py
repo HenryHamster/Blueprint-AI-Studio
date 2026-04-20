@@ -321,9 +321,14 @@ async def _init_deployment_state():
                     _runtime_config["require_approval_gates"] = bool(config_json["require_approval_gates"])
                 if "daily_cost_ceiling_usd" in config_json:
                     _runtime_config["daily_cost_ceiling_usd"] = float(config_json["daily_cost_ceiling_usd"])
+                if "auto_archive_enabled" in config_json:
+                    _runtime_config["auto_archive_enabled"] = bool(config_json["auto_archive_enabled"])
                 for int_key in ("max_provision_retries", "max_rollup_retries",
                                 "architecture_review_frequency", "max_active_directions",
-                                "max_parallel_research_per_project"):
+                                "max_parallel_research_per_project",
+                                "auto_archive_terminal_after_days",
+                                "auto_archive_max_terminal_tasks_per_project",
+                                "auto_archive_interval_minutes"):
                     if int_key in config_json:
                         _runtime_config[int_key] = int(config_json[int_key])
                 logger.info(f"[DEPLOY] Restored runtime_config_json: {list(config_json.keys())}")

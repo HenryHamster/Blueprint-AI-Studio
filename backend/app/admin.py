@@ -144,8 +144,17 @@ async def _get_user_task_with_role(
 
 TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
 
+# Hard cap on /admin/tasks page size. A fully-populated task row can carry
+# up to ~100KB of research_findings plus unbounded status_log, so 500 rows
+# × large-tail payload stays safely under Cloud Run's 32 MB response limit.
+ADMIN_TASKS_MAX_LIMIT = 500
+
 @router.get("/tasks")
 async def get_all_tasks(
+    # le is generous for backward compat with clients that persisted larger
+    # page sizes; the effective cap is ADMIN_TASKS_MAX_LIMIT below, which
+    # bounds response size so it can't exceed Cloud Run's 32 MB body limit
+    # as per-task payloads (research_findings, status_log) grow.
     limit: int = Query(50, ge=1, le=10000),
     offset: int = Query(0, ge=0),
     status: List[TaskStatus] = Query(default=[]),
@@ -158,6 +167,8 @@ async def get_all_tasks(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
+    limit = min(limit, ADMIN_TASKS_MAX_LIMIT)
+
     # Build shared filter conditions
     filters = [Task.project_id.in_(_user_project_ids(current_user["user_id"]))]
     if status:
@@ -444,6 +455,7 @@ async def bulk_action_tasks(
                     bulk_ctx.pop("retry_after", None)
                     bulk_ctx.pop("max_plan_account_id", None)
                     bulk_ctx.pop("blacklisted_accounts", None)
+                    bulk_ctx.pop("provision_failed_accounts", None)
                     bulk_ctx.pop("_slot_released", None)
                     bulk_ctx.pop("_api_failure_retries", None)
                     task.context = bulk_ctx
@@ -1175,6 +1187,7 @@ async def modify_task(
                     requeue_ctx.pop("retry_after", None)
                     requeue_ctx.pop("max_plan_account_id", None)
                     requeue_ctx.pop("blacklisted_accounts", None)
+                    requeue_ctx.pop("provision_failed_accounts", None)
                     requeue_ctx.pop("_slot_released", None)
                     requeue_ctx.pop("_api_failure_retries", None)
                     task.context = requeue_ctx

@@ -685,17 +685,28 @@ STATICENV
     # the wait loop + poweroff path, so the reaper's no-heartbeat handler sees
     # the failure with its real classification.
     sleep 30
+    AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2-)"
+    ORCH_URL="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env | cut -d= -f2-)"
     if systemctl is-active --quiet blueprint-agent; then
-      # Reads AGENT_SECRET_TOKEN from env file (written from Secret Manager above)
-      AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2-)"
-      ORCH_URL="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env | cut -d= -f2-)"
       curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \
         -H "Content-Type: application/json" \
         -H "X-Agent-Token: $AGENT_TOKEN" \
         -d '{{"task_id": "{task_id}", "status_message": "Startup script completed, agent service started"}}' \
         --connect-timeout 10 --max-time 15 && echo "PROVISION_HEALTH_OK" || echo "PROVISION_HEALTH_FAILED (agent will self-report via heartbeat)"
     else
-      echo "Agent service died within 30s of start — skipping success heartbeat"
+      # Agent service died within 30s — capture journal and report so the reaper's
+      # "Silent pre-claim death" classification gets forensic evidence.  Without this
+      # POST, the VM powers off and the orchestrator only knows that no heartbeat
+      # ever arrived.  Truncate to 3KB to fit in a reasonable status message.
+      echo "Agent service died within 30s of start — capturing journal for diagnostics"
+      SERVICE_LOG="$(journalctl -u blueprint-agent --no-pager -n 50 2>/dev/null | tr '"' "'" | tr '\\n' ' ' | head -c 3000 || echo 'no journal')"
+      EXIT_STATUS="$(systemctl show blueprint-agent --property=ExecMainStatus --value 2>/dev/null || echo '?')"
+      EXIT_CODE="$(systemctl show blueprint-agent --property=ExecMainCode --value 2>/dev/null || echo '?')"
+      curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \
+        -H "Content-Type: application/json" \
+        -H "X-Agent-Token: $AGENT_TOKEN" \
+        -d '{{"task_id": "{task_id}", "status_message": "AGENT_DIED_EARLY: exit='"$EXIT_CODE"'/'"$EXIT_STATUS"' journal='"$SERVICE_LOG"'"}}' \
+        --connect-timeout 10 --max-time 15 || true
     fi
 
     # Wait for the service to finish (with TTL guard)

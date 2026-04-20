@@ -2,7 +2,7 @@
 
 ## File Restrictions
 - Do NOT modify files in `.github/workflows/` — CI workflows are managed separately and the GitHub App token cannot push workflow changes
-- Do NOT modify `backend/alembic/` migration files — migrations are generated, not hand-edited
+- Do NOT modify **existing** migration files in `backend/alembic/versions/` — applied history is immutable. Adding a new migration file (next revision, chained from the latest `down_revision`) is fine and expected when `models.py` changes; also bump `EXPECTED_SCHEMA_REVISION` in `backend/app/main.py` to match.
 - Do NOT modify files in `scripts/` unless explicitly asked
 
 ## Code Style

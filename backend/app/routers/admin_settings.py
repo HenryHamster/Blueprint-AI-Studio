@@ -81,6 +81,10 @@ async def get_settings(
         "github_account": github_account,
         "require_approval_gates": _runtime_config.get("require_approval_gates", True),
         "daily_cost_ceiling_usd": _runtime_config.get("daily_cost_ceiling_usd", 0),
+        "auto_archive_enabled": _runtime_config.get("auto_archive_enabled", True),
+        "auto_archive_terminal_after_days": _runtime_config.get("auto_archive_terminal_after_days", 7),
+        "auto_archive_max_terminal_tasks_per_project": _runtime_config.get("auto_archive_max_terminal_tasks_per_project", 200),
+        "auto_archive_interval_minutes": _runtime_config.get("auto_archive_interval_minutes", 60),
         "webhook_url_configured": bool(os.getenv("PIPELINE_WEBHOOK_URL")),
         "notification_config": _build_notification_config_response(
             _runtime_config.get("notification_config", {
@@ -267,6 +271,35 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (0 <= val <= 100000):
             raise HTTPException(status_code=400, detail="daily_cost_ceiling_usd must be between 0 and 100000 (0 = disabled)")
         _runtime_config["daily_cost_ceiling_usd"] = val
+    if "auto_archive_enabled" in payload:
+        val = payload["auto_archive_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(status_code=400, detail="auto_archive_enabled must be a boolean")
+        _runtime_config["auto_archive_enabled"] = val
+    if "auto_archive_terminal_after_days" in payload:
+        try:
+            val = int(payload["auto_archive_terminal_after_days"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="auto_archive_terminal_after_days must be a number")
+        if not (1 <= val <= 90):
+            raise HTTPException(status_code=400, detail="auto_archive_terminal_after_days must be between 1 and 90")
+        _runtime_config["auto_archive_terminal_after_days"] = val
+    if "auto_archive_max_terminal_tasks_per_project" in payload:
+        try:
+            val = int(payload["auto_archive_max_terminal_tasks_per_project"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="auto_archive_max_terminal_tasks_per_project must be a number")
+        if not (0 <= val <= 10000):
+            raise HTTPException(status_code=400, detail="auto_archive_max_terminal_tasks_per_project must be between 0 and 10000 (0 = disabled)")
+        _runtime_config["auto_archive_max_terminal_tasks_per_project"] = val
+    if "auto_archive_interval_minutes" in payload:
+        try:
+            val = int(payload["auto_archive_interval_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="auto_archive_interval_minutes must be a number")
+        if not (5 <= val <= 1440):
+            raise HTTPException(status_code=400, detail="auto_archive_interval_minutes must be between 5 and 1440")
+        _runtime_config["auto_archive_interval_minutes"] = val
     if "max_provision_retries" in payload:
         try:
             val = int(payload["max_provision_retries"])
@@ -413,6 +446,10 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "architecture_review_frequency": _runtime_config.get("architecture_review_frequency", 3),
                     "max_active_directions": _runtime_config.get("max_active_directions", 10),
                     "max_parallel_research_per_project": _runtime_config.get("max_parallel_research_per_project", 3),
+                    "auto_archive_enabled": _runtime_config.get("auto_archive_enabled", True),
+                    "auto_archive_terminal_after_days": _runtime_config.get("auto_archive_terminal_after_days", 7),
+                    "auto_archive_max_terminal_tasks_per_project": _runtime_config.get("auto_archive_max_terminal_tasks_per_project", 200),
+                    "auto_archive_interval_minutes": _runtime_config.get("auto_archive_interval_minutes", 60),
                     "reserved_slots_for_types": _runtime_config.get("reserved_slots_for_types", {"create": 1, "research": 1}),
                     "notification_config": _runtime_config.get("notification_config", {
                         "webhook_url": "",

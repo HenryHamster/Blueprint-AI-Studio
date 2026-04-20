@@ -376,33 +376,49 @@ describe('runProjectLintChecks', () => {
   });
 });
 
+// Helper: spawn mock that emits close(code) immediately for each spawn call.
+// `failCmds` maps command names to (exitCode, stderr) for failing runners.
+function configureSpawnMock(failCmds: Record<string, { exitCode: number; stderr: string }> = {}) {
+  vi.mocked(spawn).mockImplementation((cmd: unknown) => {
+    const cmdStr = String(cmd);
+    const failure = failCmds[cmdStr];
+    const stderrCbs: ((d: Buffer) => void)[] = [];
+    const proc = {
+      pid: 100 + Math.floor(Math.random() * 1000),
+      stderr: {
+        on: vi.fn((event: string, cb: (d: Buffer) => void) => {
+          if (event === 'data') stderrCbs.push(cb);
+        }),
+      },
+      stdout: { on: vi.fn() },
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (event === 'close') {
+          setImmediate(() => {
+            if (failure) for (const scb of stderrCbs) scb(Buffer.from(failure.stderr));
+            cb(failure ? failure.exitCode : 0);
+          });
+        }
+      }),
+      kill: vi.fn(),
+    };
+    return proc as unknown as ReturnType<typeof spawn>;
+  });
+}
+
 // ── testFixLoop failureSummary ────────────────────────────────────────────────
 describe('testFixLoop failureSummary', () => {
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
-    // Make spawn immediately emit 'close' with exit code 0 so runClaudeCode resolves
-    vi.mocked(spawn).mockImplementation(() => {
-      const handlers: Record<string, ((...args: unknown[]) => void)[]> = {};
-      const proc = {
-        pid: 123,
-        stderr: { on: vi.fn() },
-        stdout: { on: vi.fn() },
-        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-          if (!handlers[event]) handlers[event] = [];
-          handlers[event].push(cb);
-          if (event === 'close') setImmediate(() => cb(0));
-        }),
-        kill: vi.fn(),
-      };
-      return proc as unknown as ReturnType<typeof spawn>;
-    });
+    // git() helper at index.ts:507 calls .trim() on the return — give it a
+    // string default so unmocked git calls (rev-parse, add -A, etc.) don't crash.
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(spawn).mockReset();
+    configureSpawnMock();
   });
 
   it('returns undefined failureSummary when tests pass', async () => {
     // Provide a buildConfig with a test_cmd so a runner is created
     const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
-    // execFileSync succeeds (tests pass)
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
 
     const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
 
@@ -414,11 +430,9 @@ describe('testFixLoop failureSummary', () => {
   it('returns failureSummary with combined failure messages when tests fail after all attempts', async () => {
     const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
     const errorMessage = 'Error: Test suite failed\n  at Object.<anonymous> (test.ts:10:5)';
-    // execFileSync throws only for 'npm' (the test runner), not for 'git'
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') throw new Error(errorMessage);
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
+    // npm (the test runner) exits non-zero with error on stderr; claude (spawn)
+    // and other commands still succeed so runClaudeCode resolves for the fix loop.
+    configureSpawnMock({ npm: { exitCode: 1, stderr: errorMessage } });
 
     const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
 
@@ -441,12 +455,17 @@ describe('testFixLoop directory scoping', () => {
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
     vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(spawn).mockReset();
+    configureSpawnMock();
   });
 
   function cwdsCalledWith(): (string | undefined)[] {
-    return vi.mocked(execFileSync).mock.calls.map(
-      (args) => (args[2] as { cwd?: string } | undefined)?.cwd,
-    );
+    // testFixLoop's runners go through execFileAsync which calls spawn with cwd
+    // in options[2].  Claude Code runs via spawn too but always cwd=WORKSPACE,
+    // so filtering on the command (npm/python3) excludes those.
+    return vi.mocked(spawn).mock.calls
+      .filter(c => c[0] === 'npm' || c[0] === 'python3')
+      .map(c => (c[2] as { cwd?: string } | undefined)?.cwd);
   }
 
   it('runs all runners when relatedFiles is not provided', async () => {
@@ -683,10 +702,15 @@ describe('RateLimitError', () => {
 });
 
 // ── captureTestBaseline timeout selection ─────────────────────────────────────
+// execFileAsync passes its timeoutMs through to spawn's options dict (Node
+// ignores it, so it doesn't affect runtime — see the comment in execFileAsync).
+// That makes the configured timeout per runner observable here.
 describe('captureTestBaseline timeout selection', () => {
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
     vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(spawn).mockReset();
+    configureSpawnMock();
   });
 
   it('uses TEST_BASELINE_DOCKER_TIMEOUT (180s) for runners containing scripts/test-backend.sh', async () => {
@@ -694,7 +718,7 @@ describe('captureTestBaseline timeout selection', () => {
       directories: [{ path: '', type: 'python', test_cmd: 'bash scripts/test-backend.sh' }],
     };
     await captureTestBaseline(null, { value: '' }, buildConfig);
-    const bashCall = vi.mocked(execFileSync).mock.calls.find(c => c[0] === 'bash');
+    const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
     expect(bashCall).toBeDefined();
     expect((bashCall![2] as { timeout: number }).timeout).toBe(180_000);
   });
@@ -704,7 +728,7 @@ describe('captureTestBaseline timeout selection', () => {
       directories: [{ path: '', type: 'python', test_cmd: 'docker run --rm myimage pytest' }],
     };
     await captureTestBaseline(null, { value: '' }, buildConfig);
-    const dockerCall = vi.mocked(execFileSync).mock.calls.find(c => c[0] === 'docker');
+    const dockerCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'docker');
     expect(dockerCall).toBeDefined();
     expect((dockerCall![2] as { timeout: number }).timeout).toBe(180_000);
   });
@@ -714,7 +738,7 @@ describe('captureTestBaseline timeout selection', () => {
       directories: [{ path: '', type: 'node', test_cmd: 'npm test' }],
     };
     await captureTestBaseline(null, { value: '' }, buildConfig);
-    const npmCall = vi.mocked(execFileSync).mock.calls.find(c => c[0] === 'npm');
+    const npmCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'npm');
     expect(npmCall).toBeDefined();
     expect((npmCall![2] as { timeout: number }).timeout).toBe(60_000);
   });

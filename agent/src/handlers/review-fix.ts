@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
-  persistAndPostStatus, apiGet, git, gitAsync, cloneWithRetry,
+  persistAndPostStatus, apiGet, git, gitAsync, gitCommit, cloneWithRetry,
   runClaudeCode, runProjectLintChecks, lintFixLoop, testFixLoop,
   captureTestBaseline, sendHeartbeatSync,
 } from '../index.js';
@@ -874,7 +874,8 @@ export async function handleFix(
     // Only create a new commit if there are uncommitted changes (Claude may have already committed)
     const fixStaged = git(['status', '--porcelain']);
     if (fixStaged.length > 0) {
-      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})${testNote}`], { encoding: 'utf-8' });
+      const committed = gitCommit(`blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})${testNote}`);
+      if (!committed) sendLog(ws, 'Nothing to commit after review fix (pre-commit hook may have reverted changes)\n');
     }
   }
 
@@ -922,9 +923,7 @@ export async function handleFix(
           ws, statusRef, model, effort
         );
         git(['add', '-A']);
-        try {
-          execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', 'blueprint: resolve remaining conflict markers'], { encoding: 'utf-8' });
-        } catch { /* nothing to commit — markers may have already been staged */ }
+        gitCommit('blueprint: resolve remaining conflict markers');
         // Final check — if markers persist after retry, fail this cycle so the
         // retry mechanism can spawn a fresh attempt. Pushing conflict markers
         // guarantees a CI failure and burns a full review-fix iteration.
@@ -963,7 +962,7 @@ export async function handleFix(
       const postLintStaged = git(['status', '--porcelain']);
       if (postLintStaged.length > 0) {
         const shortId = taskId.replace(/-/g, '').slice(0, 8);
-        execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `blueprint: fix post-rebase lint errors\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+        gitCommit(`blueprint: fix post-rebase lint errors\n\nAutomated by Blueprint Agent (task: ${shortId})`);
       }
       // Re-validate that the fix actually resolved lint. Without this, a partial
       // fix gets pushed and only surfaces as a CI failure — burning a full review

@@ -339,6 +339,14 @@ export default function App() {
         maxRetries={s.maxRetries}
         maxAutonomousTasksPerHour={s.maxAutonomousTasksPerHour}
         requireApprovalGates={s.requireApprovalGates}
+        autoArchiveEnabled={s.autoArchiveEnabled}
+        autoArchiveTerminalAfterDays={s.autoArchiveTerminalAfterDays}
+        autoArchiveMaxTerminalTasksPerProject={s.autoArchiveMaxTerminalTasksPerProject}
+        autoArchiveIntervalMinutes={s.autoArchiveIntervalMinutes}
+        onUpdateAutoArchiveEnabled={s.updateAutoArchiveEnabled}
+        onUpdateAutoArchiveTerminalAfterDays={s.updateAutoArchiveTerminalAfterDays}
+        onUpdateAutoArchiveMaxTerminalTasksPerProject={s.updateAutoArchiveMaxTerminalTasksPerProject}
+        onUpdateAutoArchiveIntervalMinutes={s.updateAutoArchiveIntervalMinutes}
         onUpdateMaxVMs={s.updateMaxVMs}
         onUpdateMaxRetries={s.updateMaxRetries}
         onUpdateRequireApprovalGates={s.updateRequireApprovalGates}

@@ -518,6 +518,89 @@ export function git(args: string[], cwd = WORKSPACE): string {
   return execFileSync('git', args, { cwd, encoding: 'utf-8', timeout: 120_000 }).trim();
 }
 
+/** Non-blocking exec that mirrors execFileSync's error shape.
+ *  Use this for long-running commands (test runners, build tools) so the
+ *  event loop stays free and the setInterval heartbeat keeps firing.
+ *  On timeout, sends SIGTERM to the whole process group, then SIGKILL 5s
+ *  later — this terminates npm/pytest worker processes that execFileSync's
+ *  default signal handling leaks (stuck children block the sync call past
+ *  its timeout, starving the heartbeat and tripping the reaper). */
+export function execFileAsync(
+  cmd: string,
+  args: string[],
+  opts: { cwd?: string; timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
+): Promise<string> {
+  const { cwd, timeoutMs = 180_000, env } = opts;
+  return new Promise((resolve, reject) => {
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    // `timeout` is not a valid option for child_process.spawn (only execFile* and
+    // spawnSync respect it), but Node silently ignores unknown options. We pass
+    // it through so tests can verify the configured timeout per runner via the
+    // spawn mock's call arguments. The actual timeout logic is handled by the
+    // termTimer setInterval below.
+    const proc = spawn(cmd, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true, timeout: timeoutMs } as Parameters<typeof spawn>[2]);
+    proc.stdout!.on('data', (d: Buffer) => stdoutChunks.push(d));
+    proc.stderr!.on('data', (d: Buffer) => stderrChunks.push(d));
+    let timedOut = false;
+    let killTimer: NodeJS.Timeout | null = null;
+    const termTimer = setTimeout(() => {
+      timedOut = true;
+      const pid = proc.pid;
+      if (pid) {
+        try { process.kill(-pid, 'SIGTERM'); } catch { /* already exited */ }
+        killTimer = setTimeout(() => {
+          try { process.kill(-pid, 'SIGKILL'); } catch { /* already dead */ }
+        }, 5000);
+      }
+    }, timeoutMs);
+    proc.on('close', (code) => {
+      clearTimeout(termTimer);
+      if (killTimer) clearTimeout(killTimer);
+      const stdout = Buffer.concat(stdoutChunks).toString('utf-8');
+      const stderr = Buffer.concat(stderrChunks).toString('utf-8');
+      if (code === 0 && !timedOut) {
+        resolve(stdout);
+        return;
+      }
+      const parts = [`Command failed: ${cmd} ${args.join(' ')}`];
+      if (stdout.trim()) parts.push(stdout);
+      if (stderr.trim()) parts.push(stderr);
+      const err: Error & {
+        stdout?: string; stderr?: string; status?: number | null; killed?: boolean; code?: string;
+      } = new Error(parts.join('\n'));
+      err.stdout = stdout;
+      err.stderr = stderr;
+      err.status = code;
+      err.killed = timedOut;
+      if (timedOut) err.code = 'ETIMEDOUT';
+      reject(err);
+    });
+    proc.on('error', (e) => { clearTimeout(termTimer); if (killTimer) clearTimeout(killTimer); reject(e); });
+  });
+}
+
+/** Commit with captured stderr. Returns true if a commit was created,
+ *  false if there was nothing to commit (pre-commit hook may have reverted
+ *  changes, or the working tree was already clean). Throws with full
+ *  stdout+stderr for any other failure — the default execFileSync error
+ *  only echoes the command, which hides the real cause. */
+export function gitCommit(message: string, cwd = WORKSPACE): boolean {
+  try {
+    execFileSync('git', ['-C', cwd, 'commit', '-m', message], { encoding: 'utf-8' });
+    return true;
+  } catch (e: unknown) {
+    const err = e as { stderr?: string | Buffer; stdout?: string | Buffer; message?: string };
+    const stderr = (err.stderr ? err.stderr.toString() : '').trim();
+    const stdout = (err.stdout ? err.stdout.toString() : '').trim();
+    const combined = [stdout, stderr].filter(Boolean).join('\n');
+    if (/nothing to commit|nothing added to commit|no changes added to commit/i.test(combined)) {
+      return false;
+    }
+    throw new Error(`git commit failed: ${combined || err.message || 'unknown error'}`);
+  }
+}
+
 /** Async git that doesn't block the event loop — use for long operations (push, clone)
  *  so the setInterval heartbeat can keep firing. */
 export function gitAsync(args: string[], cwd = WORKSPACE, timeoutMs = 300_000): Promise<string> {
@@ -1007,16 +1090,16 @@ export async function captureTestBaseline(
     try {
       sendHeartbeatSync(taskId, `Baseline test run [${runner.label}]...`);
       const runnerTimeout = isDockerRunner(runner) ? TEST_BASELINE_DOCKER_TIMEOUT : timeoutMs;
-      execFileSync(runner.cmd, runner.args, {
+      await execFileAsync(runner.cmd, runner.args, {
         cwd: runner.cwd,
-        encoding: 'utf-8',
-        timeout: runnerTimeout,
+        timeoutMs: runnerTimeout,
       });
       // Runner exited cleanly — no failures
     } catch (err: unknown) {
-      // execFileSync sets killed=true when the process is terminated due to timeout;
-      // spawnSync sets code='ETIMEDOUT' when the OS cannot start the process in time.
-      // Both are infrastructure issues — can't capture baseline, proceed without it.
+      // execFileAsync sets killed=true and code='ETIMEDOUT' when the process is
+      // terminated due to timeout; ENOENT-style errors (failure to spawn) also
+      // surface with code. Both are infrastructure issues — can't capture
+      // baseline, proceed without it.
       const isTimeout = err instanceof Error && (
         (err as Error & { killed?: boolean }).killed === true ||
         (err as NodeJS.ErrnoException).code === 'ETIMEDOUT'
@@ -1118,15 +1201,16 @@ export async function testFixLoop(
         // standalone (e.g. from the Blueprint harness) without that step having run.
         if (runner.cmd === 'npm' && !fs.existsSync(`${runner.cwd}/node_modules`)) {
           sendLog(ws, `Installing dependencies for ${runner.label}...\n`);
-          execFileSync('npm', ['ci'], { cwd: runner.cwd, encoding: 'utf-8', timeout: TEST_RUNNER_TIMEOUT });
+          await execFileAsync('npm', ['ci'], { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
         }
         sendHeartbeatSync(taskId, `Running tests [${runner.label}]...`);
-        execFileSync(runner.cmd, runner.args, { cwd: runner.cwd, encoding: 'utf-8', timeout: TEST_RUNNER_TIMEOUT });
+        await execFileAsync(runner.cmd, runner.args, { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
         sendLog(ws, `Tests passed [${runner.label}].\n`);
       } catch (testErr: unknown) {
-        // If the runner timed out (killed by Node's timeout mechanism) or the OS
-        // could not spawn the process (ETIMEDOUT), treat as indeterminate —
-        // a Docker build timeout or spawn failure is not a fixable code failure.
+        // If the runner timed out (killed by the process-group SIGTERM/SIGKILL
+        // chain in execFileAsync) or the OS could not spawn the process
+        // (ETIMEDOUT), treat as indeterminate — a Docker build timeout or
+        // spawn failure is not a fixable code failure.
         const isRunnerTimeout = testErr instanceof Error && (
           (testErr as Error & { killed?: boolean }).killed === true ||
           (testErr as NodeJS.ErrnoException).code === 'ETIMEDOUT'

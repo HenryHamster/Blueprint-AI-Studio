@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
-  apiPost, persistAndPostStatus, apiGet, git, gitAsync, cloneWithRetry, sendHeartbeatSync, runClaudeCode,
+  apiPost, persistAndPostStatus, apiGet, git, gitAsync, gitCommit, cloneWithRetry, sendHeartbeatSync, runClaudeCode,
   listOpenPullRequestsForBranch,
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
@@ -233,7 +233,8 @@ CRITICAL RULES:
     git(['add', '-A']);
     const migrateStaged = git(['status', '--porcelain']);
     if (migrateStaged.length > 0) {
-      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `migrate: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`], { encoding: 'utf-8' });
+      const committed = gitCommit(`migrate: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`);
+      if (!committed) sendLog(ws, 'Nothing to commit after staging migration (pre-commit hook may have reverted)\n');
     }
 
     // Rebase onto latest base branch before push

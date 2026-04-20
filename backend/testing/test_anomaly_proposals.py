@@ -19,11 +19,15 @@ from app.models import TaskStatus
 from testing.factories import make_task, make_project, _utcnow
 
 
-def _make_session(tasks: list, project):
+def _make_session(tasks: list, project, all_tasks_72h: list | None = None):
     """Build a mock AsyncSession for _compute_research_anomalies.
 
-    First execute() → terminal tasks via .scalars().all()
-    Second execute() → project via .scalar_one_or_none()
+    First execute()  → terminal tasks via .scalars().all()
+    Second execute() → all tasks in 72h window via .scalars().all() (denominator
+                       for failure-rate momentum). Defaults to `tasks` when not
+                       explicitly supplied — tests that don't exercise momentum
+                       don't care about the separation.
+    Third execute()  → project via .scalar_one_or_none()
     """
     session = AsyncMock()
     # session.add is synchronous in SQLAlchemy — use MagicMock to avoid
@@ -35,10 +39,15 @@ def _make_session(tasks: list, project):
     tasks_result = MagicMock()
     tasks_result.scalars.return_value = tasks_scalars
 
+    all_scalars = MagicMock()
+    all_scalars.all.return_value = tasks if all_tasks_72h is None else all_tasks_72h
+    all_result = MagicMock()
+    all_result.scalars.return_value = all_scalars
+
     project_result = MagicMock()
     project_result.scalar_one_or_none.return_value = project
 
-    session.execute = AsyncMock(side_effect=[tasks_result, project_result])
+    session.execute = AsyncMock(side_effect=[tasks_result, all_result, project_result])
     return session
 
 

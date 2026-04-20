@@ -9,7 +9,8 @@
       "Bash(grep -r alloydb.*auth.*proxy /Users/alokthakrar/Projects/blueprint/BlueprintAIStudio --include=*.py --include=*.tf --include=*.md --include=*.yml --include=*.yaml -i)",
       "Bash(grep -r proxy /Users/alokthakrar/Projects/blueprint/BlueprintAIStudio --include=*.py --include=*.tf --include=*.md --include=*.sh -i)",
       "Bash(git log:*)",
-      "Bash(gcloud compute images list *)"
+      "Bash(gcloud compute images list *)",
+      "Bash(python scripts/tasks.py list)"
     ]
   }
 }

@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
-  persistAndPostStatus, git, setupWorkspace, pushAndCreatePR,
+  persistAndPostStatus, git, gitCommit, setupWorkspace, pushAndCreatePR,
   runClaudeCode, lintFixLoop, testFixLoop, captureTestBaseline, matchesRateLimit,
   runProjectLintChecks, condensedAnalysisSections,
 } from '../index.js';
@@ -1153,7 +1153,8 @@ Output ONLY a JSON object in a \`\`\`json code fence:
     // already committed, and lint/test fix loops may not have added new changes.
     const staged = git(['status', '--porcelain']);
     if (staged.length > 0) {
-      execFileSync('git', ['-C', WORKSPACE, 'commit', '-m', `${commitPrefix}: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})${commitNote}`], { encoding: 'utf-8' });
+      const committed = gitCommit(`${commitPrefix}: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})${commitNote}`);
+      if (!committed) sendLog(ws, 'Nothing to commit after staging (pre-commit hook may have reverted changes)\n');
     }
 
     let prBody = `## Summary\n\n${lastResultText.slice(0, 2000) || `Automated changes for: ${taskTitle}`}\n\n`;

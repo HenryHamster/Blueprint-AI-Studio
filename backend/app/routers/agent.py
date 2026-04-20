@@ -394,7 +394,7 @@ def _compute_failure_stage_pattern(history: list) -> "dict | None":
 # ---------------------------------------------------------------------------
 
 @router.post("/refresh-token")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def agent_refresh_token(request: Request, token: dict = Depends(verify_agent_token)):
     """
     Accepts a valid (non-expired) agent JWT and returns a new one with a fresh 8-hour TTL.
@@ -404,7 +404,7 @@ async def agent_refresh_token(request: Request, token: dict = Depends(verify_age
 
 
 @router.post("/claim")
-@limiter.limit("60/minute")
+@limiter.limit("200/minute")
 async def claim_task(
     request: Request,
     session: AsyncSession = Depends(get_session),
@@ -1487,7 +1487,7 @@ async def claim_task(
     return response
 
 @router.post("/artifacts/upload-url")
-@limiter.limit("30/minute")
+@limiter.limit("300/minute")
 async def get_upload_url(
     request: Request,
     req: UploadUrlRequest,
@@ -1517,7 +1517,7 @@ async def get_upload_url(
     }
 
 @router.post("/heartbeat")
-@limiter.limit("120/minute")
+@limiter.limit("600/minute")
 async def agent_heartbeat(
     request: Request,
     req: HeartbeatRequest,
@@ -1597,7 +1597,7 @@ async def agent_heartbeat(
     return {"status": "ok"}
 
 @router.post("/spawn")
-@limiter.limit("60/minute")
+@limiter.limit("150/minute")
 async def spawn_subtask(
     request: Request,
     req: SpawnTaskRequest,
@@ -1694,7 +1694,7 @@ async def spawn_subtask(
 # ---------------------------------------------------------------------------
 
 @router.get("/github/token")
-@limiter.limit("30/minute")
+@limiter.limit("200/minute")
 async def agent_github_get_token(
     request: Request,
     task_id: uuid.UUID,
@@ -1718,7 +1718,7 @@ async def agent_github_get_token(
     }
 
 @router.post("/github/commit-status")
-@limiter.limit("30/minute")
+@limiter.limit("500/minute")
 async def agent_github_commit_status(
     request: Request,
     req: GitHubCommitStatusRequest,
@@ -1745,7 +1745,7 @@ async def agent_github_commit_status(
     return {"status": "success", "data": result}
 
 @router.post("/github/pr-comment")
-@limiter.limit("30/minute")
+@limiter.limit("200/minute")
 async def agent_github_pr_comment(
     request: Request,
     req: GitHubPRCommentRequest,
@@ -1769,7 +1769,7 @@ async def agent_github_pr_comment(
     return {"status": "success", "data": result}
 
 @router.post("/github/pr-review-comment")
-@limiter.limit("30/minute")
+@limiter.limit("200/minute")
 async def agent_github_pr_review_comment(
     request: Request,
     req: GitHubPRReviewCommentRequest,
@@ -1796,7 +1796,7 @@ async def agent_github_pr_review_comment(
     return {"status": "success", "data": result}
 
 @router.post("/github/pr-review")
-@limiter.limit("30/minute")
+@limiter.limit("150/minute")
 async def agent_github_submit_pr_review(
     request: Request,
     req: GitHubSubmitPRReviewRequest,
@@ -1823,7 +1823,7 @@ async def agent_github_submit_pr_review(
     return {"status": "success", "data": result}
 
 @router.post("/github/issues")
-@limiter.limit("30/minute")
+@limiter.limit("100/minute")
 async def agent_github_create_issue(
     request: Request,
     req: GitHubCreateIssueRequest,
@@ -1848,7 +1848,7 @@ async def agent_github_create_issue(
     return {"status": "success", "data": result}
 
 @router.get("/github/issues")
-@limiter.limit("30/minute")
+@limiter.limit("150/minute")
 async def agent_github_get_issues(
     request: Request,
     req: GitHubGetIssuesRequest = Depends(),
@@ -1871,7 +1871,7 @@ async def agent_github_get_issues(
     return {"status": "success", "data": result}
 
 @router.post("/github/branches")
-@limiter.limit("30/minute")
+@limiter.limit("100/minute")
 async def agent_github_create_branch(
     request: Request,
     req: GitHubCreateBranchRequest,
@@ -1895,7 +1895,7 @@ async def agent_github_create_branch(
     return {"status": "success", "data": result}
 
 @router.post("/github/pull-requests")
-@limiter.limit("30/minute")
+@limiter.limit("100/minute")
 async def agent_github_create_pr(
     request: Request,
     req: GitHubCreatePRRequest,

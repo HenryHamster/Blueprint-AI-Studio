@@ -52,6 +52,14 @@ export interface HeaderBarProps {
   maxRetries: number;
   maxAutonomousTasksPerHour: number;
   requireApprovalGates: boolean;
+  autoArchiveEnabled: boolean;
+  autoArchiveTerminalAfterDays: number;
+  autoArchiveMaxTerminalTasksPerProject: number;
+  autoArchiveIntervalMinutes: number;
+  onUpdateAutoArchiveEnabled: (value: boolean) => void;
+  onUpdateAutoArchiveTerminalAfterDays: (value: number) => void;
+  onUpdateAutoArchiveMaxTerminalTasksPerProject: (value: number) => void;
+  onUpdateAutoArchiveIntervalMinutes: (value: number) => void;
   onUpdateMaxVMs: (value: number) => void;
   onUpdateRequireApprovalGates: (value: boolean) => void;
   onUpdateMaxRetries: (value: number) => void;
@@ -158,6 +166,14 @@ export function HeaderBar(props: HeaderBarProps) {
     maxRetries,
     maxAutonomousTasksPerHour,
     requireApprovalGates,
+    autoArchiveEnabled,
+    autoArchiveTerminalAfterDays,
+    autoArchiveMaxTerminalTasksPerProject,
+    autoArchiveIntervalMinutes,
+    onUpdateAutoArchiveEnabled,
+    onUpdateAutoArchiveTerminalAfterDays,
+    onUpdateAutoArchiveMaxTerminalTasksPerProject,
+    onUpdateAutoArchiveIntervalMinutes,
     onUpdateMaxVMs,
     onUpdateMaxRetries,
     onUpdateRequireApprovalGates,
@@ -332,6 +348,14 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateMaxRetries={onUpdateMaxRetries}
           requireApprovalGates={requireApprovalGates}
           onUpdateRequireApprovalGates={onUpdateRequireApprovalGates}
+          autoArchiveEnabled={autoArchiveEnabled}
+          onUpdateAutoArchiveEnabled={onUpdateAutoArchiveEnabled}
+          autoArchiveTerminalAfterDays={autoArchiveTerminalAfterDays}
+          onUpdateAutoArchiveTerminalAfterDays={onUpdateAutoArchiveTerminalAfterDays}
+          autoArchiveMaxTerminalTasksPerProject={autoArchiveMaxTerminalTasksPerProject}
+          onUpdateAutoArchiveMaxTerminalTasksPerProject={onUpdateAutoArchiveMaxTerminalTasksPerProject}
+          autoArchiveIntervalMinutes={autoArchiveIntervalMinutes}
+          onUpdateAutoArchiveIntervalMinutes={onUpdateAutoArchiveIntervalMinutes}
           maxAutonomousTasksPerHour={maxAutonomousTasksPerHour}
           onUpdateMaxAutonomousRate={onUpdateMaxAutonomousRate}
           autonomousResearchIntervalMinutes={autonomousResearchIntervalMinutes}

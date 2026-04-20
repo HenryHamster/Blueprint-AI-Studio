@@ -1559,38 +1559,42 @@ def test_medium_scope_no_tasks_returns_null_rates():
     assert result["correlated_changes"] == []
 
 
-def test_medium_scope_recent_windows_filter_by_created_at():
-    """recent_30d / recent_7d compute over created_at; tasks older than window excluded."""
+def test_medium_scope_recent_windows_filter_by_resolved_at():
+    """recent_30d / recent_7d count terminal tasks by updated_at (resolved time).
+
+    Post-93218377: rolling windows filter by when a task reached terminal
+    state (updated_at), not when it was created, to avoid in-flight bias.
+    """
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        # Within 7d: merged
+        # Resolved within 7d: merged
         make_task(project_id=project_id, status=TaskStatus.COMPLETED,
                   context={"scope": "medium", "pr_merged": True},
-                  created_at=now - timedelta(days=2)),
-        # Within 30d but outside 7d: failed
+                  created_at=now - timedelta(days=4), updated_at=now - timedelta(days=2)),
+        # Resolved within 30d but outside 7d: failed
         make_task(project_id=project_id, status=TaskStatus.FAILED,
                   context={"scope": "medium"},
-                  created_at=now - timedelta(days=15),
+                  created_at=now - timedelta(days=18), updated_at=now - timedelta(days=15),
                   latest_status_message="e"),
-        # Within 30d but outside 7d: merged
+        # Resolved within 30d but outside 7d: merged
         make_task(project_id=project_id, status=TaskStatus.COMPLETED,
                   context={"scope": "medium", "pr_merged": True},
-                  created_at=now - timedelta(days=20)),
-        # Outside 30d: merged — excluded from both recent windows
+                  created_at=now - timedelta(days=22), updated_at=now - timedelta(days=20)),
+        # Resolved outside 30d: merged — excluded from both recent windows
         make_task(project_id=project_id, status=TaskStatus.COMPLETED,
                   context={"scope": "medium", "pr_merged": True},
-                  created_at=now - timedelta(days=60)),
+                  created_at=now - timedelta(days=65), updated_at=now - timedelta(days=60)),
     ]
     result = _compute_medium_scope_measurement(tasks, None, None, 365)
     r30 = result["recent_30d"]
     r7 = result["recent_7d"]
     assert r30 is not None
-    assert r30["created"] == 3
+    assert r30["finished"] == 3
     assert r30["merged"] == 2
     assert r30["merge_rate"] == round(2 / 3, 3)
     assert r7 is not None
-    assert r7["created"] == 1
+    assert r7["finished"] == 1
     assert r7["merged"] == 1
     assert r7["merge_rate"] == 1.0
 
@@ -1603,10 +1607,10 @@ async def test_pipeline_health_summary_exposes_recent_medium_windows():
     tasks = [
         make_task(project_id=project_id, status=TaskStatus.COMPLETED,
                   context={"scope": "medium", "pr_merged": True},
-                  created_at=now - timedelta(days=3)),
+                  created_at=now - timedelta(days=5), updated_at=now - timedelta(days=3)),
         make_task(project_id=project_id, status=TaskStatus.FAILED,
                   context={"scope": "medium"},
-                  created_at=now - timedelta(days=20),
+                  created_at=now - timedelta(days=22), updated_at=now - timedelta(days=20),
                   latest_status_message="e"),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
@@ -1617,20 +1621,20 @@ async def test_pipeline_health_summary_exposes_recent_medium_windows():
     assert "recent_30d" in ms
     assert "recent_7d" in ms
     assert ms["recent_30d"] is not None
-    assert ms["recent_30d"]["created"] == 2
+    assert ms["recent_30d"]["finished"] == 2
     assert ms["recent_7d"] is not None
-    assert ms["recent_7d"]["created"] == 1
+    assert ms["recent_7d"]["finished"] == 1
     assert ms["recent_7d"]["merged"] == 1
 
 
 def test_medium_scope_recent_windows_null_when_no_recent_tasks():
-    """recent_30d / recent_7d are None when no tasks fall within the window."""
+    """recent_30d / recent_7d are None when no tasks reached terminal in the window."""
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
         make_task(project_id=project_id, status=TaskStatus.COMPLETED,
                   context={"scope": "medium", "pr_merged": True},
-                  created_at=now - timedelta(days=120)),
+                  created_at=now - timedelta(days=125), updated_at=now - timedelta(days=120)),
     ]
     result = _compute_medium_scope_measurement(tasks, None, None, 365)
     assert result["recent_30d"] is None

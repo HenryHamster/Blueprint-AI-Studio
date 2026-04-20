@@ -3407,11 +3407,12 @@ class TestPredictSpawnSuccessAcceptanceSignal:
         assert predict_spawn_success("small", {}, related_files=files) == pytest.approx(0.3)
 
     def test_cross_module_span_penalty(self):
-        """related_files spanning 3+ top-level dirs triggers cross-module penalty."""
+        """Cross-module span is intentionally NOT a separate spawn signal — the
+        composite complexity score already folds module span into its factor.
+        Only the file-count penalty (0.6 for 3 files at small scope) fires.
+        """
         files = ["backend/app/a.py", "agent/src/b.ts", "admin-ui/src/c.ts"]
-        # 3 files triggers moderate file-count penalty (0.6) plus cross-module (0.4);
-        # combined weighted average with base 0.5 = (0.5 + 0.6 + 0.4) / 3 = 0.5
-        assert predict_spawn_success("small", {}, related_files=files) == pytest.approx(0.5)
+        assert predict_spawn_success("small", {}, related_files=files) == pytest.approx(0.6)
 
     def test_two_module_span_no_cross_module_penalty(self):
         """2-module findings stay at medium scope (per escalation threshold), so

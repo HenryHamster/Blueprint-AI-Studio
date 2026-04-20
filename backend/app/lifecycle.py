@@ -45,7 +45,7 @@ async def lifespan(app):
         _send_webhook_notification,
     )
     from app.reaper import reaper_service
-    from app.services import gcp_cleanup_service, secret_reconciliation_service, stale_branch_cleanup_service
+    from app.services import gcp_cleanup_service, secret_reconciliation_service, stale_branch_cleanup_service, auto_archive_service
     from app.max_plan_pool import load_max_plan_pool
     from app.orchestrator import orchestrator_worker
     from app.github import close_github_client
@@ -77,6 +77,9 @@ async def lifespan(app):
     # Start Stale Branch Cleanup Service (removes old blueprint/research/plan branches)
     stale_branch_task = asyncio.create_task(stale_branch_cleanup_service())
 
+    # Start Auto-Archive Service (archives terminal tasks older than N days)
+    auto_archive_task = asyncio.create_task(auto_archive_service())
+
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
@@ -87,6 +90,7 @@ async def lifespan(app):
     _bg_tasks["gcp_cleanup"] = gcp_cleanup_task
     _bg_tasks["secret_reconciliation"] = secret_recon_task
     _bg_tasks["stale_branch_cleanup"] = stale_branch_task
+    _bg_tasks["auto_archive"] = auto_archive_task
 
     # Monitor background tasks for silent crashes (with exponential backoff)
     async def _monitor_background_tasks():
@@ -98,6 +102,7 @@ async def lifespan(app):
             "gcp_cleanup": gcp_cleanup_service,
             "secret_reconciliation": secret_reconciliation_service,
             "stale_branch_cleanup": stale_branch_cleanup_service,
+            "auto_archive": auto_archive_service,
         }
         while True:
             try:

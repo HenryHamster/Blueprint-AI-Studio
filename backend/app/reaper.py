@@ -443,7 +443,16 @@ async def reaper_service():
                                     logger.exception(f"[REAPER] Failed to capture serial log for VM {vm_id}")
 
                             # Blacklist the account so retry uses a different one.
+                            # We maintain two lists:
+                            #   - blacklisted_accounts: pruned when model cooldown expires
+                            #     (correct for rate-limit blacklists)
+                            #   - provision_failed_accounts: sticky for this task's lifetime
+                            #     (silent pre-claim death isn't model-cooldown-driven, so
+                            #     pruning by _account_available_for_model wrongly reselects
+                            #     the broken account — observed on task 812fdbb9 retrying
+                            #     account 017d51cb 3x in a row in us-central1-a).
                             blacklisted = list((task.context or {}).get("blacklisted_accounts") or [])
+                            sticky = list((task.context or {}).get("provision_failed_accounts") or [])
                             if failed_acct and failed_acct not in blacklisted:
                                 blacklisted.append(failed_acct)
                                 logger.warning(
@@ -457,9 +466,12 @@ async def reaper_service():
                                     zone=prov_zone,
                                     account_id=failed_acct,
                                 )
+                            if failed_acct and failed_acct not in sticky:
+                                sticky.append(failed_acct)
                             new_ctx = {
                                 **(task.context or {}),
                                 "blacklisted_accounts": blacklisted or None,
+                                "provision_failed_accounts": sticky or None,
                             }
                             if serial_log:
                                 new_ctx["last_serial_log"] = serial_log[-500:]
@@ -673,7 +685,9 @@ async def reaper_service():
                         if is_provision_failure:
                             ctx = task.context or {}
                             provision_zone = ctx.get("provision_zone", "unknown zone")
-                            blacklisted_accounts = ctx.get("blacklisted_accounts", [])
+                            blacklisted_accounts = ctx.get("blacklisted_accounts", []) or []
+                            sticky_accounts = ctx.get("provision_failed_accounts", []) or []
+                            all_blocked = list({*blacklisted_accounts, *sticky_accounts})
                             acct_id = ctx.get("max_plan_account_id", "no account")
                             gcp_error = provision_err or "no GCP error captured"
                             gcp_error_short = gcp_error[:200]
@@ -681,8 +695,8 @@ async def reaper_service():
                             if provision_zone and provision_zone != "unknown zone":
                                 label = "Agent startup failed"
                                 detail = f"VM created in {provision_zone} but agent never claimed task"
-                                if blacklisted_accounts:
-                                    detail += f" (blacklisted {len(blacklisted_accounts)} account(s))"
+                                if all_blocked:
+                                    detail += f" (blacklisted {len(all_blocked)} account(s))"
                             else:
                                 label = "Provision failed"
                                 detail = f"GCP error: {gcp_error_short}"
@@ -937,6 +951,7 @@ async def reaper_service():
                         _new_ctx.pop("provision_failures_infra", None)
                         _new_ctx.pop("_infra_wait", None)
                         _new_ctx.pop("blacklisted_accounts", None)
+                        _new_ctx.pop("provision_failed_accounts", None)
                         _new_ctx.pop("max_plan_account_id", None)
                         _new_ctx.pop("_slot_released", None)
                         _new_ctx.pop("retry_after", None)

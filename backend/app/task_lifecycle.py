@@ -51,6 +51,14 @@ from app.retry_budget import (
 
 logger = logging.getLogger(__name__)
 
+
+class PostCommitLocked(Exception):
+    """Raised when _process_post_commit can't acquire the task row within the
+    retry budget. Distinct from DBAPIError so the caller in agent_status.py
+    can treat "row still held by peer" as a retryable pending, not an error.
+    """
+
+
 from app.failure_stage import (  # noqa: E402, F401 — re-exported for legacy callers/tests
     _TRANSIENT_SCAN_ERROR_PATTERNS,
     _derive_failure_stage,
@@ -559,6 +567,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             "provision_failures_infra",
             "_infra_wait",
             "blacklisted_accounts",
+            "provision_failed_accounts",
             "_slot_released",
         }
         clone_ctx = {k: v for k, v in child_ctx.items() if k not in _ctx_keys_to_strip}
@@ -879,11 +888,30 @@ async def _process_post_commit(
 
     factory = _session_factory or AsyncSessionLocal
     async with factory() as session:
-        task = (await session.execute(
-            select(Task).where(Task.id == task_id).with_for_update()
-        )).scalars().first()
-        if not task:
-            return {"status": "accepted"}
+        # skip_locked + bounded retry: the row is typically only held briefly
+        # (by the agent_status early-commit path that just released it, or by a
+        # concurrent post-commit for the same task). A plain FOR UPDATE would
+        # queue behind GitHub API calls (15-120s) and hit the Postgres
+        # lock_timeout as LockNotAvailableError, which tears down the session.
+        task = None
+        for _attempt in range(3):
+            task = (await session.execute(
+                select(Task).where(Task.id == task_id).with_for_update(skip_locked=True)
+            )).scalars().first()
+            if task is not None:
+                break
+            # Confirm the row still exists before retrying — if it's gone the
+            # peer holder is irrelevant.
+            exists = (await session.execute(
+                select(Task.id).where(Task.id == task_id)
+            )).first()
+            if exists is None:
+                return {"status": "accepted"}
+            await asyncio.sleep(2)
+        if task is None:
+            raise PostCommitLocked(
+                f"task {task_id} row held by peer after 3 retries"
+            )
 
         # Immediately unblock dependents when task terminally fails (retries exhausted).
         # Uses the same session (not a separate one) to avoid self-deadlock: a second
@@ -1844,46 +1872,37 @@ async def _process_post_commit(
                             logger.info(f"[REVIEW PIPELINE] PR #{pr_number} approved and merged")
                             action_taken = True
                         else:
-                            # Merge blocked — spawn fix task to rebase and resolve conflicts
+                            # Merge blocked — park in EVALUATING with ci_waiting so the
+                            # ci_completion retry-with-backoff loop handles it instead of
+                            # spawning a fix task immediately.  A first-attempt merge
+                            # failure is frequently a stale GitHub mergeability flag
+                            # (GitHub recomputes asynchronously after pushes); ci_completion
+                            # absorbs that window via its internal 5/15/45s backoff inside
+                            # a single merge attempt.  If the merge still fails after that
+                            # quiet window, it spawns a rebase fix for the moving-parent
+                            # case (sibling rollups advancing the base branch between
+                            # fetches).  Fully autonomous; no requires_approval.
                             merge_msg = merge_result.get("message", "unknown")
-                            # Fetch PR file list for conflict context
-                            try:
-                                pr_files = await get_pr_files(gh_token, owner, repo, pr_number)
-                                files_list = "\n".join(f"  - {f['filename']} ({f['status']})" for f in pr_files)
-                            except Exception as e:
-                                logger.warning(f"[REVIEW PIPELINE] Failed to fetch file list for PR #{pr_number}: {e}")
-                                files_list = "  (could not fetch file list)"
                             await create_pr_comment(gh_token, owner, repo, pr_number,
-                                f"**Blueprint Review Pipeline**: Merge blocked — {merge_msg}. Spawning fix task to rebase and resolve conflicts.")
-                            orig_goal = ""
-                            if original_task_id:
-                                try:
-                                    orig_t = await session.get(Task, uuid.UUID(original_task_id))
-                                    if orig_t:
-                                        orig_goal = (orig_t.description or orig_t.title or "")[:500]
-                                except Exception:
-                                    logger.exception(f"[REVIEW PIPELINE] Failed to fetch original task {original_task_id} for fix prompt")
-                            fix_prompt = (
-                                f"This PR (#{pr_number}) was approved but could not be merged.\n"
-                                f"Error: {merge_msg}\n"
-                                + (f"\nPR goal: {orig_goal}\n" if orig_goal else "") +
-                                f"\nFiles changed in this PR:\n{files_list}\n\n"
-                                f"Steps to resolve:\n"
-                                f"1. Run: git fetch origin {base_branch}\n"
-                                f"2. Run: git rebase origin/{base_branch}\n"
-                                f"3. If rebase conflicts occur: {base_branch} is the source of truth. Keep its refactors and restructuring.\n"
-                                f"   Re-apply only the changes that serve the PR goal (described above) on top of {base_branch}'s current state.\n"
-                                f"   If files were heavily rewritten on {base_branch}, adapt this PR's changes to the new structure.\n"
-                                f"4. Run: git rebase --continue after resolving each conflicting file\n"
-                                f"5. If rebase is too complex, abort with git rebase --abort, then use git merge origin/{base_branch} and resolve conflict markers"
-                            )
-                            fix_task, _ = await _spawn_pipeline_task(
-                                task, "fix", session, pr_number, branch, base_branch,
-                                fix_prompt=fix_prompt,
-                                original_task_id=original_task_id
-                            )
-                            if fix_task:
-                                logger.error(f"[REVIEW PIPELINE] Merge blocked for PR #{pr_number}, spawned rebase fix → task {fix_task.id}")
+                                f"**Blueprint Review Pipeline**: Merge blocked — {merge_msg}. Retrying with backoff.")
+                            merge_wait_loop = dict(review_loop)
+                            merge_wait_loop["ci_waiting"] = True
+                            merge_wait_loop["review_approved"] = True
+                            merge_wait_loop["ci_passed"] = True  # CI was already verified green above
+                            merge_wait_loop["ci_wait_started"] = _utcnow().isoformat()
+                            merge_wait_loop["ci_poll_interval"] = 30
+                            merge_wait_loop["pr_number"] = pr_number
+                            merge_wait_loop["branch"] = branch
+                            merge_wait_loop["base_branch"] = base_branch
+                            merge_wait_loop["original_task_id"] = original_task_id
+                            merge_wait_loop["head_sha"] = head_sha
+                            merge_wait_loop["merge_blocked_msg"] = merge_msg[:300]
+                            task.status = TaskStatus.EVALUATING
+                            task.context = {**(task.context or {}), "review_loop": merge_wait_loop}
+                            task.latest_status_message = f"Review approved, merge blocked on PR #{pr_number} ({merge_msg[:120]}) — retrying with backoff"
+                            session.add(task)
+                            await session.commit()
+                            logger.info(f"[REVIEW PIPELINE] PR #{pr_number} merge blocked, parked for ci_completion retry: {merge_msg[:200]}")
                             action_taken = True
                     except Exception as e:
                         # Merge/CI-check failed — park in EVALUATING with ci_waiting so

@@ -2214,9 +2214,12 @@ def test_provision_gcp_script_has_settle_window_before_success_heartbeat():
         "expected systemctl is-active re-check before success heartbeat"
     )
 
-    # And the skip-message branch must exist (fall-through to wait loop).
-    assert "skipping success heartbeat" in source, (
-        "expected an explicit skip branch when the agent died in settle window"
+    # And the skip-message branch must exist: the success heartbeat is gated
+    # behind is-active, and the else branch reports AGENT_DIED_EARLY instead.
+    assert "AGENT_DIED_EARLY" in source, (
+        "expected explicit died-early branch when agent died in settle window "
+        "(was 'skipping success heartbeat' marker, replaced with journaled "
+        "AGENT_DIED_EARLY heartbeat for better reaper classification)"
     )
 
 

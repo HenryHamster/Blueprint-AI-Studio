@@ -38,6 +38,14 @@ interface SettingsDropdownProps {
   onUpdateMaxRetries: (value: number) => void;
   requireApprovalGates: boolean;
   onUpdateRequireApprovalGates: (value: boolean) => void;
+  autoArchiveEnabled: boolean;
+  onUpdateAutoArchiveEnabled: (value: boolean) => void;
+  autoArchiveTerminalAfterDays: number;
+  onUpdateAutoArchiveTerminalAfterDays: (value: number) => void;
+  autoArchiveMaxTerminalTasksPerProject: number;
+  onUpdateAutoArchiveMaxTerminalTasksPerProject: (value: number) => void;
+  autoArchiveIntervalMinutes: number;
+  onUpdateAutoArchiveIntervalMinutes: (value: number) => void;
   maxAutonomousTasksPerHour: number;
   onUpdateMaxAutonomousRate: (value: number) => void;
   autonomousResearchIntervalMinutes: number;
@@ -118,7 +126,7 @@ const REFRESH_PRESETS = [
 ];
 
 const PAGE_PRESETS = [25, 50, 100, 200];
-const ALL_PAGE_SIZE = 10000;
+const ALL_PAGE_SIZE = 500;
 
 const TASK_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'security_audit', 'qa', 'deps', 'docs', 'smoketest', 'debug', 'perf', 'investigate', 'rollup', 'strategic_review', 'design_doc_update'] as const;
 type TaskType = typeof TASK_TYPES[number];
@@ -177,6 +185,14 @@ export function SettingsDropdown({
   onUpdateMaxRetries,
   requireApprovalGates,
   onUpdateRequireApprovalGates,
+  autoArchiveEnabled,
+  onUpdateAutoArchiveEnabled,
+  autoArchiveTerminalAfterDays,
+  onUpdateAutoArchiveTerminalAfterDays,
+  autoArchiveMaxTerminalTasksPerProject,
+  onUpdateAutoArchiveMaxTerminalTasksPerProject,
+  autoArchiveIntervalMinutes,
+  onUpdateAutoArchiveIntervalMinutes,
   maxAutonomousTasksPerHour,
   onUpdateMaxAutonomousRate,
   autonomousResearchIntervalMinutes,
@@ -453,18 +469,19 @@ export function SettingsDropdown({
                 <input
                   type="number"
                   min={1}
+                  max={ALL_PAGE_SIZE}
                   placeholder="Custom"
                   value={pageSizeInputVal}
                   onChange={e => setPageSizeInputVal(e.target.value)}
                   onBlur={() => {
                     const n = parseInt(pageSizeInputVal);
-                    if (n > 0) onUpdatePageSize(n);
+                    if (n > 0) onUpdatePageSize(Math.min(n, ALL_PAGE_SIZE));
                     setPageSizeInputVal('');
                   }}
                   onKeyDown={e => {
                     if (e.key === 'Enter') {
                       const n = parseInt(pageSizeInputVal);
-                      if (n > 0) onUpdatePageSize(n);
+                      if (n > 0) onUpdatePageSize(Math.min(n, ALL_PAGE_SIZE));
                       setPageSizeInputVal('');
                     }
                   }}
@@ -690,6 +707,56 @@ export function SettingsDropdown({
                   <span className="text-xs text-neutral-400">{requireApprovalGates ? 'Enabled' : 'Disabled'}</span>
                 </div>
               </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Auto-Archive */}
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Auto-Archive Terminal Tasks</h3>
+          <p className="text-xs text-neutral-500 mb-3">
+            Archives tasks when EITHER cap hits: age (days since terminal) or per-project count (keep most-recent N).
+          </p>
+          <div className="grid grid-cols-4 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-neutral-400 mb-1.5">Enabled</label>
+              <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2">
+                <Toggle enabled={autoArchiveEnabled} onChange={onUpdateAutoArchiveEnabled} />
+                <span className="text-xs text-neutral-400">{autoArchiveEnabled ? 'On' : 'Off'}</span>
+              </div>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-neutral-400 mb-1.5">Age Cap (1-90 days)</label>
+              <input
+                type="number"
+                min={1}
+                max={90}
+                value={autoArchiveTerminalAfterDays}
+                onChange={e => onUpdateAutoArchiveTerminalAfterDays(parseInt(e.target.value) || 7)}
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-neutral-400 mb-1.5">Per-Project Cap (0=off)</label>
+              <input
+                type="number"
+                min={0}
+                max={10000}
+                value={autoArchiveMaxTerminalTasksPerProject}
+                onChange={e => onUpdateAutoArchiveMaxTerminalTasksPerProject(parseInt(e.target.value) || 0)}
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-neutral-400 mb-1.5">Interval (5-1440 min)</label>
+              <input
+                type="number"
+                min={5}
+                max={1440}
+                value={autoArchiveIntervalMinutes}
+                onChange={e => onUpdateAutoArchiveIntervalMinutes(parseInt(e.target.value) || 60)}
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              />
             </div>
           </div>
         </div>

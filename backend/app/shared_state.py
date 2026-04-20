@@ -185,6 +185,17 @@ runtime_config: Dict = {
         "EXTERNAL_API": 4,
         "AGENT_TIMEOUT": 3,
     },
+    # Auto-archive terminal tasks (COMPLETED/FAILED/CANCELLED) via two caps:
+    #   - age: older than `auto_archive_terminal_after_days`
+    #   - count: per-project, keep the N most-recent terminal-unarchived; archive
+    #     the rest (0 disables the count cap).
+    # Either cap triggers archival. Keeps the default tasks list bounded so the
+    # admin UI response stays under Cloud Run's 32 MB body limit and analytics
+    # endpoints don't OOM loading a week of rows.
+    "auto_archive_enabled": True,
+    "auto_archive_terminal_after_days": 7,
+    "auto_archive_max_terminal_tasks_per_project": 200,
+    "auto_archive_interval_minutes": 60,
     # Per-scope heartbeat-stale thresholds (seconds). Large-scope tasks
     # legitimately run longer stretches without a heartbeat, so reaping at the
     # small-scope bar flags them as dead while they're still making progress.

@@ -23,7 +23,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
 import app.shared_state as _shared_state
-from app.services import _recover_orphaned_tasks, _persist_circuit_breakers, _persist_zone_health
+from app.services import _recover_orphaned_tasks, _persist_circuit_breakers, _persist_zone_health, _run_auto_archive_cycle
 from app.models import (
     Project, Task, TaskStatus, Artifact, ArtifactType,
     Alert, AlertSeverity, DeploymentState,
@@ -857,3 +857,142 @@ async def test_cost_ceiling_includes_current_task_cost(cost_db, mocker):
     alerts = (await cost_db.execute(select(Alert).where(Alert.project_id == project.id))).scalars().all()
     assert len(alerts) == 1
     assert "Daily cost ceiling exceeded" in alerts[0].title
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _run_auto_archive_cycle — age cap + per-project count cap
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _make_terminal_task(session, project_id, status=TaskStatus.COMPLETED, days_ago=0) -> Task:
+    """Create a terminal task with updated_at set days_ago days in the past."""
+    when = _naive_utc_ago(days=days_ago)
+    task = Task(
+        project_id=project_id,
+        payloads=[{"type": "create"}],
+        status=status,
+        created_by="ORCHESTRATOR",
+        created_at=when,
+        updated_at=when,
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_auto_archive_age_pass_archives_old_terminal(svc_db):
+    """Terminal tasks older than auto_archive_terminal_after_days get archived."""
+    project = await _make_project(svc_db)
+    old = await _make_terminal_task(svc_db, project.id, days_ago=30)
+    fresh = await _make_terminal_task(svc_db, project.id, days_ago=1)
+
+    with patch.dict(_shared_state.runtime_config, {
+        "auto_archive_terminal_after_days": 7,
+        "auto_archive_max_terminal_tasks_per_project": 0,
+    }):
+        result = await _run_auto_archive_cycle()
+
+    assert result["age"] == 1
+    assert result["count"] == 0
+    await svc_db.refresh(old)
+    await svc_db.refresh(fresh)
+    assert old.archived is True
+    assert fresh.archived is False
+
+
+@pytest.mark.asyncio
+async def test_auto_archive_count_pass_archives_beyond_cap(svc_db):
+    """Per-project cap keeps the N most-recent terminal tasks; rest archive."""
+    project = await _make_project(svc_db)
+    # days_ago=0 is newest; days_ago=4 is oldest
+    tasks = [await _make_terminal_task(svc_db, project.id, days_ago=i) for i in range(5)]
+
+    with patch.dict(_shared_state.runtime_config, {
+        "auto_archive_terminal_after_days": 90,
+        "auto_archive_max_terminal_tasks_per_project": 3,
+    }):
+        result = await _run_auto_archive_cycle()
+
+    assert result["age"] == 0
+    assert result["count"] == 2
+    for t in tasks:
+        await svc_db.refresh(t)
+    # 3 newest (index 0,1,2 = days_ago 0,1,2) stay; 2 oldest (3,4) archived.
+    # Don't re-derive age from updated_at — the UPDATE's onupdate=_utcnow hook
+    # resets updated_at on archived rows, so we check by creation order.
+    assert [t.archived for t in tasks] == [False, False, False, True, True]
+
+
+@pytest.mark.asyncio
+async def test_auto_archive_count_pass_partitions_by_project(svc_db):
+    """Cap is applied per-project independently (projects don't cross-count)."""
+    p1 = await _make_project(svc_db)
+    p2 = Project(name="P2", user_id="user1")
+    svc_db.add(p2)
+    await svc_db.commit()
+    await svc_db.refresh(p2)
+
+    for i in range(4):
+        await _make_terminal_task(svc_db, p1.id, days_ago=i)
+    await _make_terminal_task(svc_db, p2.id, days_ago=0)
+
+    with patch.dict(_shared_state.runtime_config, {
+        "auto_archive_terminal_after_days": 90,
+        "auto_archive_max_terminal_tasks_per_project": 2,
+    }):
+        result = await _run_auto_archive_cycle()
+
+    assert result["count"] == 2
+    p1_archived = (await svc_db.execute(
+        select(Task).where(Task.project_id == p1.id, Task.archived.is_(True))
+    )).scalars().all()
+    p2_archived = (await svc_db.execute(
+        select(Task).where(Task.project_id == p2.id, Task.archived.is_(True))
+    )).scalars().all()
+    assert len(p1_archived) == 2
+    assert len(p2_archived) == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_archive_count_pass_disabled_when_cap_zero(svc_db):
+    """cap=0 disables the count pass entirely."""
+    project = await _make_project(svc_db)
+    for i in range(10):
+        await _make_terminal_task(svc_db, project.id, days_ago=i)
+
+    with patch.dict(_shared_state.runtime_config, {
+        "auto_archive_terminal_after_days": 90,
+        "auto_archive_max_terminal_tasks_per_project": 0,
+    }):
+        result = await _run_auto_archive_cycle()
+
+    assert result["age"] == 0
+    assert result["count"] == 0
+    archived = (await svc_db.execute(
+        select(Task).where(Task.archived.is_(True))
+    )).scalars().all()
+    assert len(archived) == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_archive_skips_non_terminal(svc_db):
+    """Non-terminal tasks (QUEUED, IN_PROGRESS) are never archived, regardless of age."""
+    project = await _make_project(svc_db)
+    queued = Task(
+        project_id=project.id, payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED, created_by="USER",
+        created_at=_naive_utc_ago(days=60), updated_at=_naive_utc_ago(days=60),
+    )
+    svc_db.add(queued)
+    await svc_db.commit()
+    await svc_db.refresh(queued)
+
+    with patch.dict(_shared_state.runtime_config, {
+        "auto_archive_terminal_after_days": 7,
+        "auto_archive_max_terminal_tasks_per_project": 1,
+    }):
+        await _run_auto_archive_cycle()
+
+    await svc_db.refresh(queued)
+    assert queued.archived is False

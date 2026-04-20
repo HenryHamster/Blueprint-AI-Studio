@@ -109,6 +109,8 @@ export function useAppState() {
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     githubAccount, setGithubAccount,
     requireApprovalGates,
+    autoArchiveEnabled, autoArchiveTerminalAfterDays,
+    autoArchiveMaxTerminalTasksPerProject, autoArchiveIntervalMinutes,
     notificationConfig,
     buildConfig, setBuildConfig,
     fetchSettings,
@@ -117,6 +119,8 @@ export function useAppState() {
     updateAgentPromptSuffixes,
     syncTaskTypeDefaults,
     updateMaxVMs, updateMaxRetries, updateRequireApprovalGates,
+    updateAutoArchiveEnabled, updateAutoArchiveTerminalAfterDays,
+    updateAutoArchiveMaxTerminalTasksPerProject, updateAutoArchiveIntervalMinutes,
     handleUpdateMaxAutonomousRate, handleUpdateAutonomousResearchInterval,
     handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
     updateHealthCheckUrls, updateNotificationConfig, updateBuildConfig,
@@ -139,7 +143,11 @@ export function useAppState() {
   const [initialLoading, setInitialLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [page, setPage] = useState(1);
-  const [limit, setLimit] = usePersistedState<number>('pageSize', 50);
+  const [rawLimit, setLimit] = usePersistedState<number>('pageSize', 50);
+  // Backend caps /admin/tasks at 500 rows to keep response under Cloud Run's
+  // 32 MB body limit; clamp stale localStorage values so pagination offsets
+  // stay consistent with what the server actually returns.
+  const limit = Math.min(rawLimit, 500);
   const [refreshInterval, setRefreshInterval] = usePersistedState<number>('refreshInterval', 30000);
 
   const [actionLoadingMap, setActionLoadingMap] = useState<Record<string, string>>({});
@@ -1016,6 +1024,10 @@ export function useAppState() {
     autonomousResearchIntervalMinutes, directionCooldownMinutes, strategicResearchFrequency,
     updateMaxVMs, updateMaxRetries, updateRequireApprovalGates, handleUpdateMaxAutonomousRate, syncTaskTypeDefaults,
     requireApprovalGates,
+    autoArchiveEnabled, autoArchiveTerminalAfterDays,
+    autoArchiveMaxTerminalTasksPerProject, autoArchiveIntervalMinutes,
+    updateAutoArchiveEnabled, updateAutoArchiveTerminalAfterDays,
+    updateAutoArchiveMaxTerminalTasksPerProject, updateAutoArchiveIntervalMinutes,
     agentPromptSuffixes, updateAgentPromptSuffixes,
     handleUpdateAutonomousResearchInterval, handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
     healthCheckUrls, updateHealthCheckUrls,

@@ -40,7 +40,7 @@ from app.max_plan_pool import (
     disable_account_model,
     record_completion_event,
 )
-from app.task_lifecycle import _process_post_commit
+from app.task_lifecycle import _process_post_commit, PostCommitLocked
 from app.rollup_management import _check_and_trigger_rollup
 from app.payload_schemas import validate_internal_payload as _validate_internal_payload
 from app.task_completion import _compute_first_attempt_succeeded
@@ -340,6 +340,49 @@ def _get_applicable_types(tasks: list) -> list[str]:
     return sorted(types) if types else []
 
 
+async def _persist_post_commit_pending(factory, task_id, reason: str, payload_dump):
+    """Write context['_post_commit_pending'] on a fresh session with retry.
+
+    The request's original session is often unusable here — either the
+    transaction was poisoned by a LockNotAvailableError or the row is still
+    held by the peer that triggered this failure. A new session with
+    skip_locked lets the marker land as soon as the peer releases, without
+    blocking on Postgres' lock_timeout.
+    """
+    last_exc = None
+    for attempt in range(5):
+        try:
+            async with factory() as s:
+                locked = (await s.execute(
+                    select(Task).where(Task.id == task_id).with_for_update(skip_locked=True)
+                )).scalars().first()
+                if locked is None:
+                    # Row exists but held by peer; short sleep and retry.
+                    exists = (await s.execute(
+                        select(Task.id).where(Task.id == task_id)
+                    )).first()
+                    if exists is None:
+                        return
+                    await asyncio.sleep(1 + attempt)
+                    continue
+                prior = (locked.context or {}).get("_post_commit_pending") or {}
+                locked.context = {**(locked.context or {}), "_post_commit_pending": {
+                    "at": _utcnow().isoformat(),
+                    "reason": reason,
+                    "payload": payload_dump,
+                    "attempts": int(prior.get("attempts", 0)) + 1,
+                }}
+                flag_modified(locked, "context")
+                s.add(locked)
+                await s.commit()
+                return
+        except Exception as e:
+            last_exc = e
+            await asyncio.sleep(1 + attempt)
+    if last_exc is not None:
+        raise last_exc
+
+
 async def _propagate_pipeline_failure_to_original(task: Task, session: AsyncSession) -> None:
     """When a review/fix task fails permanently, cancel its original create task
     (so rollup excludes it) and, if the original was an auto-remediation task,
@@ -381,6 +424,7 @@ async def _propagate_pipeline_failure_to_original(task: Task, session: AsyncSess
                 logger.warning("[AUTO-REMEDIATION] Failed to post failure result after pipeline exhaustion: %s", _ar_exc)
     except Exception as e:
         logger.warning(f"[PIPELINE] Failed to propagate failure to {original_task_id}: {e}", exc_info=True)
+
 
 
 @router.post("/api/agent/status")
@@ -1355,30 +1399,31 @@ async def update_agent_status(
             # orphaning any PR that needed a review/fix spawn. Set a flag so
             # the guard lets the retry re-run post-commit processing.
             is_timeout = isinstance(e, asyncio.TimeoutError)
-            reason = "post_commit_timeout" if is_timeout else "post_commit_error"
+            is_locked = isinstance(e, PostCommitLocked)
+            if is_timeout:
+                reason = "post_commit_timeout"
+            elif is_locked:
+                reason = "post_commit_locked"
+            else:
+                reason = "post_commit_error"
             logger.error(
-                f"[PIPELINE] Post-commit {'timed out' if is_timeout else 'failed'} for task {task.id}: {e}",
-                exc_info=not is_timeout,
+                f"[PIPELINE] Post-commit {'timed out' if is_timeout else ('locked' if is_locked else 'failed')} for task {task.id}: {e}",
+                exc_info=not (is_timeout or is_locked),
             )
+            # The request session may be poisoned (LockNotAvailableError tears
+            # down the transaction) and the task row may still be held by a
+            # peer. Use a fresh session with skip_locked + retry so the pending
+            # marker lands even when the request session can't commit.
             try:
-                await session.rollback()
-                await session.refresh(task)
-                # Persist the payload along with the pending marker so the
-                # services.py sweeper can re-run _process_post_commit without
-                # waiting for the agent to retry (the VM has usually
-                # terminated by now).  mode="json" serializes uuid/enum safely.
-                try:
-                    _payload_dump = payload.model_dump(mode="json")
-                except Exception:
-                    _payload_dump = None
-                task.context = {**(task.context or {}), "_post_commit_pending": {
-                    "at": _utcnow().isoformat(),
-                    "reason": reason,
-                    "payload": _payload_dump,
-                    "attempts": ((task.context or {}).get("_post_commit_pending", {}) or {}).get("attempts", 0) + 1,
-                }}
-                session.add(task)
-                await session.commit()
+                _payload_dump = payload.model_dump(mode="json")
+            except Exception:
+                _payload_dump = None
+            try:
+                await _persist_post_commit_pending(
+                    _factory, task.id, reason, _payload_dump
+                )
             except Exception as ctx_err:
-                logger.exception(f"[PIPELINE] Failed to set _post_commit_pending for task {task.id}: {ctx_err}")
+                logger.exception(
+                    f"[PIPELINE] Failed to set _post_commit_pending for task {task.id}: {ctx_err}"
+                )
             raise

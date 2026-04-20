@@ -420,9 +420,70 @@ async def _attempt_merge_with_retry_and_escalation(
             task.context = {**(task.context or {}), "review_loop": ci_loop}
             task.latest_status_message = f"Merge attempt {_merge_failures} failed on PR #{ci_pr_number}: {merge_msg} — retrying"
             logger.warning(f"[CI] PR #{ci_pr_number} merge failed ({_merge_failures}x): {merge_msg} — will retry ({source})")
+
             _hard_cap = _merge_hard_cap_for_task(task)
             _escalate_at = max(1, _hard_cap - 5)
             _final_warn_at = max(1, _hard_cap - 2)
+            _deterministic = _is_deterministic_merge_error(_norm_cur)
+            _repeated_identical = _err_streak >= 2
+
+            # Spawn a rebase fix the first time a persistent merge failure appears
+            # (internal 5/15/45s backoff above has already absorbed the stale-flag
+            # window, so a failure that makes it here is either a real moving-parent
+            # conflict or a true block).  Only one fix active per PR at a time;
+            # the active-fix check is the gate — no counter, no sticky flag, so
+            # if the fix completes and the next merge still fails, a fresh fix is
+            # spawned.  Rule blocks are handled in the _is_rule_block branch above
+            # and never reach here.  Skip rebase-fix spawn when the early-exit
+            # conditions below would FAIL the task anyway (deterministic error,
+            # repeated-identical streak, or hard-cap reached) — a rebase can't
+            # recover from those and the test suite verifies those paths exit
+            # cleanly without spawning.
+            if not (_deterministic or _repeated_identical or _merge_failures >= _hard_cap):
+                from app.review_pipeline import _spawn_pipeline_task
+                active_tasks = (await session.execute(
+                    select(Task).where(
+                        Task.project_id == task.project_id,
+                        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+                    )
+                )).scalars().all()
+                already_fixing = any(
+                    t.id != task.id
+                    and t.first_payload.get("type") == "fix"
+                    and t.first_payload.get("pr_number") == ci_pr_number
+                    for t in active_tasks
+                )
+                if not already_fixing:
+                    rebase_prompt = (
+                        f"PR #{ci_pr_number} was approved and CI passed, but GitHub rejected the merge: "
+                        f"{merge_msg[:300]}\n\n"
+                        f"The base branch ({ci_base}) likely advanced since this PR's last rebase "
+                        f"(sibling PRs merging into the same parent).  Rebase onto the latest "
+                        f"{ci_base} so the PR moves forward:\n\n"
+                        f"1. git fetch origin {ci_base}\n"
+                        f"2. git rebase origin/{ci_base}\n"
+                        f"3. If no conflicts and no commits were replayed, the PR is already "
+                        f"up-to-date — GitHub's mergeability flag is just stale.  Report no "
+                        f"changes needed (don't force-push); retries will clear it.\n"
+                        f"4. Otherwise resolve conflicts and git push --force-with-lease.\n"
+                    )
+                    fix_task, _ = await _spawn_pipeline_task(
+                        task, "fix", session, ci_pr_number, ci_branch, ci_base,
+                        fix_prompt=rebase_prompt,
+                        original_task_id=ci_orig_id,
+                    )
+                    if fix_task:
+                        ci_loop["ci_waiting"] = False  # hand off; fix-completion will re-park
+                        task.context = {**(task.context or {}), "review_loop": ci_loop}
+                        from app.rollup_state import _is_rollup_parent_awaiting_merge
+                        if not _is_rollup_parent_awaiting_merge(task.context):
+                            task.status = TaskStatus.COMPLETED
+                        task.latest_status_message = f"Merge blocked on PR #{ci_pr_number} ({merge_msg[:100]}) — spawned rebase fix → {fix_task.id}"
+                        logger.info(f"[CI] PR #{ci_pr_number} merge blocked, spawned rebase fix → {fix_task.id} ({source})")
+                        session.add(task)
+                        await session.commit()
+                        return True
+
             if _merge_failures >= _escalate_at and not ci_loop.get("merge_escalated"):
                 ci_loop["merge_escalated"] = True
                 task.context = {**(task.context or {}), "review_loop": ci_loop}
@@ -438,8 +499,6 @@ async def _attempt_merge_with_retry_and_escalation(
                 await _maybe_create_failure_alert(task, session,
                     f"PR #{ci_pr_number} merge failed {_merge_failures} times — "
                     f"hard cap imminent ({_hard_cap - _merge_failures} retries remaining)")
-            _deterministic = _is_deterministic_merge_error(_norm_cur)
-            _repeated_identical = _err_streak >= 2
             if _merge_failures >= _hard_cap or _repeated_identical or _deterministic:
                 task.status = TaskStatus.FAILED
                 task.requires_approval = True

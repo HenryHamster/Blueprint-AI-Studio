@@ -1384,8 +1384,14 @@ async def orchestrator_worker():
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     logger.info(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
 
-                    # Select Max plan account from task owner's pool, filtered by model
+                    # Select Max plan account from task owner's pool, filtered by model.
+                    # Two sources feed the effective blacklist:
+                    #  - blacklisted_accounts: pruneable (rate-limit recovers → reusable)
+                    #  - provision_failed_accounts: sticky (silent pre-claim deaths stay
+                    #    unavailable for this task — prune logic below would otherwise
+                    #    reselect the same broken account every attempt).
                     _blacklist = (task.context or {}).get("blacklisted_accounts")
+                    _sticky = (task.context or {}).get("provision_failed_accounts") or []
                     task_project = await session.get(Project, task.project_id)
                     # Launcher pays; fall back to project owner for autonomous tasks
                     dispatch_user_id = task.launched_by_user_id or (task_project.user_id if task_project else "")
@@ -1419,7 +1425,8 @@ async def orchestrator_worker():
                             if not _blacklist:
                                 task.context.pop("blacklisted_accounts", None)
                             session.add(task)
-                    account = await select_max_plan_account(user_id=dispatch_user_id, model=task_model, blacklist=_blacklist)
+                    _effective_blacklist = list({*(_blacklist or []), *_sticky}) or None
+                    account = await select_max_plan_account(user_id=dispatch_user_id, model=task_model, blacklist=_effective_blacklist)
                     oauth_token = None
                     claude_config_json = None
                     account_id = None

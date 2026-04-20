@@ -180,6 +180,17 @@ async def test_merge_retry_all_attempts_fail_poll(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
+    # Pre-existing in-flight fix task → `already_fixing` gate skips the
+    # rebase-fix spawn so this test validates the retry-counter increment path.
+    existing_fix = Task(
+        project_id=project.id,
+        title="existing fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
+    )
+    db_session.add(existing_fix)
+
     task = _make_task(db_session, project)
     await db_session.commit()
     await db_session.refresh(task)
@@ -261,6 +272,17 @@ async def test_merge_no_retry_for_webhook_source(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # Pre-existing in-flight fix task → `already_fixing` gate skips the
+    # rebase-fix spawn so this test exercises the webhook one-shot path.
+    existing_fix = Task(
+        project_id=project.id,
+        title="existing fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
+    )
+    db_session.add(existing_fix)
 
     task = _make_task(db_session, project)
     await db_session.commit()
@@ -711,7 +733,18 @@ async def test_merge_failure_counter_increments(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Start with merge_failures=4
+    # Pre-existing in-flight fix task for this PR → `already_fixing` gate skips
+    # the rebase-fix spawn in _attempt_merge_with_retry_and_escalation, which
+    # lets this test exercise the ordinary transient-retry accumulation path.
+    existing_fix = Task(
+        project_id=project.id,
+        title="existing fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
+    )
+    db_session.add(existing_fix)
+
     task = _make_task(db_session, project, ci_loop_extra={"merge_failures": 4})
     await db_session.commit()
     await db_session.refresh(task)
@@ -754,7 +787,17 @@ async def test_merge_failure_escalates_at_10_failures(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Start with merge_failures=9, so this call pushes it to 10
+    # Pre-existing in-flight fix task → `already_fixing` gate skips the
+    # rebase-fix spawn so this test validates the 10-failure alert escalation.
+    existing_fix = Task(
+        project_id=project.id,
+        title="existing fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
+    )
+    db_session.add(existing_fix)
+
     task = _make_task(db_session, project, ci_loop_extra={"merge_failures": 9})
     await db_session.commit()
     await db_session.refresh(task)
@@ -799,6 +842,17 @@ async def test_merge_failure_final_warn_at_13_failures(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # Pre-existing in-flight fix task → `already_fixing` gate skips the
+    # rebase-fix spawn so this test validates the final-warn alert path.
+    existing_fix = Task(
+        project_id=project.id,
+        title="existing fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
+    )
+    db_session.add(existing_fix)
 
     # Start at HARD_CAP - 3 with merge_escalated already set; this call pushes
     # failures to HARD_CAP - 2 (13) and should trigger the final-warn alert.
@@ -853,6 +907,17 @@ async def test_merge_failure_does_not_double_escalate(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
+    # Pre-existing in-flight fix task → `already_fixing` gate skips the
+    # rebase-fix spawn so the escalated path proceeds without double-alerting.
+    existing_fix = Task(
+        project_id=project.id,
+        title="existing fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
+    )
+    db_session.add(existing_fix)
+
     # Already escalated with 10 failures; no new alert should fire on the next
     # transient failure (still below final-warn and hard-cap thresholds).
     task = _make_task(db_session, project, ci_loop_extra={
@@ -897,6 +962,17 @@ async def test_merge_failure_hard_cap_marks_failed(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # Pre-existing in-flight fix task → `already_fixing` gate skips the
+    # rebase-fix spawn so this test exercises the hard-cap path.
+    existing_fix = Task(
+        project_id=project.id,
+        title="existing fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
+    )
+    db_session.add(existing_fix)
 
     # One below the cap so this call crosses it; merge_escalated already True
     # so we test that the cap fires independently of the 10-failure escalation.
@@ -1137,6 +1213,17 @@ async def test_mergeable_state_clean_does_not_escalate_on_keyword(db_session, mo
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # Pre-existing in-flight fix task → `already_fixing` gate skips the
+    # rebase-fix spawn so this test exercises the clean-state non-escalation path.
+    existing_fix = Task(
+        project_id=project.id,
+        title="existing fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
+    )
+    db_session.add(existing_fix)
 
     task = _make_task(db_session, project)
     await db_session.commit()
@@ -1545,6 +1632,17 @@ async def test_merge_different_errors_do_not_trigger_early_exit(db_session, mock
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    # Pre-existing in-flight fix task → `already_fixing` gate skips the
+    # rebase-fix spawn so this test exercises the streak-reset path on new error.
+    existing_fix = Task(
+        project_id=project.id,
+        title="existing fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
+    )
+    db_session.add(existing_fix)
 
     task = _make_task(db_session, project, ci_loop_extra={
         "merge_failures": 2,

@@ -22,6 +22,10 @@ export function useSettings(addToast: AddToast) {
   const [newAccountToken, setNewAccountToken] = useState('');
   const [githubAccount, setGithubAccount] = useState<string | null>(null);
   const [requireApprovalGates, setRequireApprovalGates] = useState(true);
+  const [autoArchiveEnabled, setAutoArchiveEnabled] = useState(true);
+  const [autoArchiveTerminalAfterDays, setAutoArchiveTerminalAfterDays] = useState(7);
+  const [autoArchiveMaxTerminalTasksPerProject, setAutoArchiveMaxTerminalTasksPerProject] = useState(200);
+  const [autoArchiveIntervalMinutes, setAutoArchiveIntervalMinutes] = useState(60);
   const [notificationConfig, setNotificationConfig] = useState<NotificationConfig>({
     webhook_url: '',
     enabled_events: ['TASK_FAILED', 'APPROVAL_NEEDED', 'DEPLOY_HEALTH_ALERT'],
@@ -48,6 +52,10 @@ export function useSettings(addToast: AddToast) {
         setMaxPlanAccounts(data.max_plan_accounts || []);
         setGithubAccount(data.github_account || null);
         setRequireApprovalGates(data.require_approval_gates ?? true);
+        setAutoArchiveEnabled(data.auto_archive_enabled ?? true);
+        setAutoArchiveTerminalAfterDays(data.auto_archive_terminal_after_days ?? 7);
+        setAutoArchiveMaxTerminalTasksPerProject(data.auto_archive_max_terminal_tasks_per_project ?? 200);
+        setAutoArchiveIntervalMinutes(data.auto_archive_interval_minutes ?? 60);
         if (data.notification_config) {
           setNotificationConfig({
             webhook_url: data.notification_config.webhook_url ?? '',
@@ -213,6 +221,69 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
+  const updateAutoArchiveEnabled = async (value: boolean) => {
+    const prev = autoArchiveEnabled;
+    setAutoArchiveEnabled(value);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ auto_archive_enabled: value }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setAutoArchiveEnabled(prev);
+      addToast('Failed to update auto-archive', 'error');
+    }
+  };
+
+  const updateAutoArchiveTerminalAfterDays = async (value: number) => {
+    const v = Math.max(1, Math.min(90, value));
+    const prev = autoArchiveTerminalAfterDays;
+    setAutoArchiveTerminalAfterDays(v);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ auto_archive_terminal_after_days: v }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setAutoArchiveTerminalAfterDays(prev);
+      addToast('Failed to update archive age', 'error');
+    }
+  };
+
+  const updateAutoArchiveMaxTerminalTasksPerProject = async (value: number) => {
+    const v = Math.max(0, Math.min(10000, value));
+    const prev = autoArchiveMaxTerminalTasksPerProject;
+    setAutoArchiveMaxTerminalTasksPerProject(v);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ auto_archive_max_terminal_tasks_per_project: v }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setAutoArchiveMaxTerminalTasksPerProject(prev);
+      addToast('Failed to update archive cap', 'error');
+    }
+  };
+
+  const updateAutoArchiveIntervalMinutes = async (value: number) => {
+    const v = Math.max(5, Math.min(1440, value));
+    const prev = autoArchiveIntervalMinutes;
+    setAutoArchiveIntervalMinutes(v);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ auto_archive_interval_minutes: v }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setAutoArchiveIntervalMinutes(prev);
+      addToast('Failed to update archive interval', 'error');
+    }
+  };
+
   const handleUpdateMaxAutonomousRate = async (value: number) => {
     const v = Math.max(1, Math.min(50, value));
     const prev = maxAutonomousTasksPerHour;
@@ -348,6 +419,8 @@ export function useSettings(addToast: AddToast) {
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
     githubAccount, setGithubAccount,
     requireApprovalGates,
+    autoArchiveEnabled, autoArchiveTerminalAfterDays,
+    autoArchiveMaxTerminalTasksPerProject, autoArchiveIntervalMinutes,
     notificationConfig,
     buildConfig, setBuildConfig,
     // Handlers
@@ -360,6 +433,8 @@ export function useSettings(addToast: AddToast) {
     handleUpdateMaxAutonomousRate, handleUpdateAutonomousResearchInterval,
     handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
     updateHealthCheckUrls, updateRequireApprovalGates,
+    updateAutoArchiveEnabled, updateAutoArchiveTerminalAfterDays,
+    updateAutoArchiveMaxTerminalTasksPerProject, updateAutoArchiveIntervalMinutes,
     updateNotificationConfig,
     updateBuildConfig,
   };

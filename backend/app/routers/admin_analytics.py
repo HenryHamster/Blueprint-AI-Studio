@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -161,47 +162,152 @@ async def get_task_duration_stats(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
-    """p50 duration per task type (plus p50/p90 per context scope) from COMPLETED tasks in last 7 days."""
-    filters = [Task.status == TaskStatus.COMPLETED, Task.started_at.is_not(None), Task.created_at >= _utcnow() - timedelta(days=7)]
-    if project_id:
-        filters.append(Task.project_id == project_id)
-    completed = (await session.execute(select(Task).where(*filters))).scalars().all()
-    type_durations: dict = defaultdict(list)
-    scope_durations: dict = defaultdict(list)
-    for t in completed:
-        try: cat = datetime.fromisoformat(t.status_log[-1]["t"]) if t.status_log else t.created_at
-        except Exception: cat = t.created_at
-        dur = (cat - t.started_at).total_seconds()
-        if dur > 0:
-            type_durations[(t.first_payload).get("type", "create")].append(dur)
-            scope = (t.context or {}).get("scope")
-            if scope in ("small", "medium", "large"): scope_durations[scope].append(dur)
+    """p50 per task type + p50/p90 per scope + p50 per phase from COMPLETED tasks in last 7 days.
+
+    On Postgres, aggregates via percentile_cont so row-heavy JSONB columns never
+    materialize in app memory (an unarchived backlog otherwise OOMs Cloud Run).
+    On SQLite (test harness), falls back to the per-row Python implementation
+    since SQLite lacks percentile_cont / WITHIN GROUP / jsonb operators.
+    """
+    # Completion time = last status_log entry's "t" field (naive UTC ISO, matches
+    # _utcnow() in time_utils.py). Regex-gate the cast so a malformed entry
+    # degrades to created_at instead of erroring the whole query — mirrors the
+    # try/except in the previous Python implementation.
+    cutoff = _utcnow() - timedelta(days=7)
+    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    if dialect_name != "postgresql":
+        # Test harness path: compute in Python (test dataset sizes are tiny).
+        filters = [Task.status == TaskStatus.COMPLETED, Task.started_at.is_not(None), Task.created_at >= cutoff]
+        if project_id:
+            filters.append(Task.project_id == project_id)
+        completed = (await session.execute(select(Task).where(*filters))).scalars().all()
+        type_durations: dict = defaultdict(list)
+        scope_durations: dict = defaultdict(list)
+        for t in completed:
+            try:
+                cat = datetime.fromisoformat(t.status_log[-1]["t"]) if t.status_log else t.created_at
+            except Exception:
+                cat = t.created_at
+            dur = (cat - t.started_at).total_seconds()
+            if dur > 0:
+                type_durations[(t.first_payload).get("type", "create")].append(dur)
+                scope = (t.context or {}).get("scope")
+                if scope in ("small", "medium", "large"):
+                    scope_durations[scope].append(dur)
+        stats: dict = {}
+        for tt, durs in type_durations.items():
+            if len(durs) >= 3:
+                sd = sorted(durs); mid = len(sd) // 2
+                stats[tt] = {"p50_seconds": sd[mid] if len(sd) % 2 else (sd[mid - 1] + sd[mid]) / 2, "sample_count": len(durs)}
+        scope_stats: dict = {}
+        for sc, durs in scope_durations.items():
+            if len(durs) >= 3:
+                sd = sorted(durs); n = len(sd); mid = n // 2
+                p50 = sd[mid] if n % 2 else (sd[mid - 1] + sd[mid]) / 2
+                scope_stats[sc] = {"p50_seconds": p50, "p90_seconds": sd[min(n - 1, int(0.9 * n))], "sample_size": n}
+        provisioning_durs: list = []
+        execution_durs: list = []
+        for t in completed:
+            if t.vm_provisioned_at and t.vm_started_at and t.vm_stopped_at:
+                prov = (t.vm_started_at - t.vm_provisioned_at).total_seconds()
+                execd = (t.vm_stopped_at - t.vm_started_at).total_seconds()
+                if prov >= 0 and execd >= 0:
+                    provisioning_durs.append(prov)
+                    execution_durs.append(execd)
+        phase_duration_stats: dict = {}
+        for name, durs in (("provisioning", provisioning_durs), ("execution", execution_durs)):
+            if len(durs) >= 3:
+                sd = sorted(durs); n = len(sd); mid = n // 2
+                p50 = sd[mid] if n % 2 else (sd[mid - 1] + sd[mid]) / 2
+                phase_duration_stats[name] = {"p50_seconds": p50, "sample_size": n}
+        return {"stats": stats, "scope_duration_stats": scope_stats, "phase_duration_stats": phase_duration_stats}
+    sql = text(
+        """
+        WITH base AS (
+            SELECT
+                COALESCE(payloads -> 0 ->> 'type', 'create') AS tt,
+                CASE
+                    WHEN context ->> 'scope' IN ('small', 'medium', 'large')
+                        THEN context ->> 'scope'
+                END AS scope,
+                EXTRACT(EPOCH FROM (
+                    CASE
+                        WHEN status_log -> -1 ->> 't' ~ '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}'
+                            THEN (status_log -> -1 ->> 't')::timestamp
+                        ELSE created_at
+                    END
+                    - started_at
+                )) AS dur,
+                EXTRACT(EPOCH FROM (vm_started_at - vm_provisioned_at)) AS prov_dur,
+                EXTRACT(EPOCH FROM (vm_stopped_at - vm_started_at)) AS exec_dur,
+                (vm_provisioned_at IS NOT NULL
+                 AND vm_started_at IS NOT NULL
+                 AND vm_stopped_at IS NOT NULL) AS has_phase
+            FROM task
+            WHERE status = 'COMPLETED'
+              AND started_at IS NOT NULL
+              AND created_at >= :cutoff
+              AND (CAST(:project_id AS uuid) IS NULL OR project_id = CAST(:project_id AS uuid))
+        ),
+        type_agg AS (
+            SELECT 'type'::text AS kind, tt AS key,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY dur) AS p50,
+                   NULL::double precision AS p90,
+                   count(*) AS n
+            FROM base
+            WHERE dur > 0
+            GROUP BY tt
+            HAVING count(*) >= 3
+        ),
+        scope_agg AS (
+            SELECT 'scope'::text AS kind, scope AS key,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY dur) AS p50,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY dur) AS p90,
+                   count(*) AS n
+            FROM base
+            WHERE dur > 0 AND scope IS NOT NULL
+            GROUP BY scope
+            HAVING count(*) >= 3
+        ),
+        phase_agg AS (
+            SELECT 'phase'::text AS kind, phase_name AS key,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY d) AS p50,
+                   NULL::double precision AS p90,
+                   count(*) AS n
+            FROM (
+                SELECT 'provisioning'::text AS phase_name, prov_dur AS d
+                FROM base WHERE has_phase AND prov_dur >= 0 AND exec_dur >= 0
+                UNION ALL
+                SELECT 'execution'::text AS phase_name, exec_dur AS d
+                FROM base WHERE has_phase AND prov_dur >= 0 AND exec_dur >= 0
+            ) q
+            GROUP BY phase_name
+            HAVING count(*) >= 3
+        )
+        SELECT kind, key, p50, p90, n FROM type_agg
+        UNION ALL
+        SELECT kind, key, p50, p90, n FROM scope_agg
+        UNION ALL
+        SELECT kind, key, p50, p90, n FROM phase_agg
+        """
+    )
+    rows = (await session.execute(
+        sql, {"cutoff": cutoff, "project_id": str(project_id) if project_id else None}
+    )).all()
     stats: dict = {}
-    for tt, durs in type_durations.items():
-        if len(durs) >= 3:
-            sd = sorted(durs); mid = len(sd) // 2
-            stats[tt] = {"p50_seconds": sd[mid] if len(sd) % 2 else (sd[mid - 1] + sd[mid]) / 2, "sample_count": len(durs)}
     scope_stats: dict = {}
-    for sc, durs in scope_durations.items():
-        if len(durs) >= 3:
-            sd = sorted(durs); n = len(sd); mid = n // 2
-            p50 = sd[mid] if n % 2 else (sd[mid - 1] + sd[mid]) / 2
-            scope_stats[sc] = {"p50_seconds": p50, "p90_seconds": sd[min(n - 1, int(0.9 * n))], "sample_size": n}
-    provisioning_durs: list = []
-    execution_durs: list = []
-    for t in completed:
-        if t.vm_provisioned_at and t.vm_started_at and t.vm_stopped_at:
-            prov = (t.vm_started_at - t.vm_provisioned_at).total_seconds()
-            execd = (t.vm_stopped_at - t.vm_started_at).total_seconds()
-            if prov >= 0 and execd >= 0:
-                provisioning_durs.append(prov)
-                execution_durs.append(execd)
     phase_duration_stats: dict = {}
-    for name, durs in (("provisioning", provisioning_durs), ("execution", execution_durs)):
-        if len(durs) >= 3:
-            sd = sorted(durs); n = len(sd); mid = n // 2
-            p50 = sd[mid] if n % 2 else (sd[mid - 1] + sd[mid]) / 2
-            phase_duration_stats[name] = {"p50_seconds": p50, "sample_size": n}
+    for r in rows:
+        if r.kind == "type":
+            stats[r.key] = {"p50_seconds": float(r.p50), "sample_count": int(r.n)}
+        elif r.kind == "scope":
+            scope_stats[r.key] = {
+                "p50_seconds": float(r.p50),
+                "p90_seconds": float(r.p90),
+                "sample_size": int(r.n),
+            }
+        elif r.kind == "phase":
+            phase_duration_stats[r.key] = {"p50_seconds": float(r.p50), "sample_size": int(r.n)}
     return {"stats": stats, "scope_duration_stats": scope_stats, "phase_duration_stats": phase_duration_stats}
 
 
