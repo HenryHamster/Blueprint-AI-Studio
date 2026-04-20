@@ -171,6 +171,20 @@ export function DeploySection({
                     style={{ width: `${Math.min(100, (deployState.health_recovery_streak / (deployState.health_recovery_streak_required ?? 3)) * 100)}%` }}
                   />
                 </div>
+                {Array.isArray(deployState.health_recovery_history) && (
+                  <div className="flex items-center justify-between pt-1">
+                    <span className="text-[11px] text-neutral-600">Last {deployState.health_recovery_history_size ?? 5} probes</span>
+                    <div className="flex gap-1">
+                      {Array.from({ length: deployState.health_recovery_history_size ?? 5 }).map((_, i) => {
+                        const hist = deployState.health_recovery_history ?? [];
+                        const probe = hist[i];
+                        const isEmpty = probe === undefined;
+                        const color = isEmpty ? 'bg-neutral-700' : probe ? 'bg-emerald-500' : 'bg-red-500';
+                        return <span key={i} className={`w-2.5 h-2.5 rounded-full ${color}`} title={isEmpty ? 'no probe yet' : probe ? 'healthy' : 'failed'} />;
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 

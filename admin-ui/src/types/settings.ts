@@ -17,6 +17,8 @@ export interface DeployState {
   gcp_project_id: string;
   health_recovery_streak: number;
   health_recovery_streak_required: number;
+  health_recovery_history?: boolean[];
+  health_recovery_history_size?: number;
   health_failure_streak: number;
   health_failure_streak_threshold: number;
   health_check_interval_seconds?: number;
