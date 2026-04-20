@@ -20,7 +20,7 @@ from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
 from app.direction_lifecycle import _process_direction_lifecycle
 from app.research_completion import _handle_research_completion, _calibrate_scope, predict_spawn_success, _poor_decomp_history
-from app.direction_metrics import _compute_acceptance_rate, _compute_direction_quality_score, _compute_momentum_factor, _compute_productivity_score
+from app.direction_metrics import _compute_acceptance_rate, _compute_direction_quality_score, _compute_momentum_factor, _compute_productivity_score, _compute_rolling_median_review_iterations
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -1308,6 +1308,48 @@ class TestComputeDirectionQualityScore:
             -_compute_direction_quality_score(d),
         ))
         assert directions[0]["id"] == "high_q"
+
+
+class TestRollingMedianReviewIterations:
+    """Unit tests for _compute_rolling_median_review_iterations — pure function."""
+
+    def test_no_history_returns_none(self):
+        assert _compute_rolling_median_review_iterations({}) is None
+        assert _compute_rolling_median_review_iterations({"research_history": []}) is None
+
+    def test_no_recorded_values_returns_none(self):
+        d = {"research_history": [{"cycle_id": "c1"}, {"cycle_id": "c2"}]}
+        assert _compute_rolling_median_review_iterations(d) is None
+
+    def test_single_value(self):
+        d = {"research_history": [{"median_review_iterations": 4}]}
+        assert _compute_rolling_median_review_iterations(d) == 4.0
+
+    def test_odd_count_returns_middle(self):
+        d = {"research_history": [
+            {"median_review_iterations": 2},
+            {"median_review_iterations": 8},
+            {"median_review_iterations": 5},
+        ]}
+        assert _compute_rolling_median_review_iterations(d) == 5.0
+
+    def test_even_count_averages_middle(self):
+        # Only last 3 considered; with just 2 values present in window, average them.
+        d = {"research_history": [
+            {"cycle_id": "c1"},  # no iteration recorded
+            {"median_review_iterations": 3},
+            {"median_review_iterations": 7},
+        ]}
+        assert _compute_rolling_median_review_iterations(d) == 5.0
+
+    def test_only_last_three_cycles_considered(self):
+        d = {"research_history": [
+            {"median_review_iterations": 100},  # older, ignored
+            {"median_review_iterations": 1},
+            {"median_review_iterations": 2},
+            {"median_review_iterations": 3},
+        ]}
+        assert _compute_rolling_median_review_iterations(d) == 2.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────

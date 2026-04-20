@@ -1340,9 +1340,55 @@ async def claim_task(
             if task_type == "research":
                 from app.research_completion import _detect_dedup_deadlock
                 deadlocked, _ = _detect_dedup_deadlock(history)
+                research_recent_outcomes = [
+                    {"tasks_created": h.get("tasks_created", 0), "prs_merged": h.get("prs_merged", 0)}
+                    for h in history[-2:]
+                    if h.get("tasks_created", 0) > 0
+                ]
+                research_failure_stage_pattern = _compute_failure_stage_pattern(history)
+                research_scope_rates: dict[str, dict[str, int]] = {}
+                for cycle in [h for h in history if h.get("tasks_created", 0) > 0][-3:]:
+                    sb = cycle.get("scope_breakdown") or {}
+                    if not isinstance(sb, dict):
+                        continue
+                    for scope_name, counts in sb.items():
+                        if not isinstance(counts, dict):
+                            continue
+                        agg = research_scope_rates.setdefault(
+                            scope_name, {"created": 0, "merged": 0, "failed": 0}
+                        )
+                        agg["created"] += int(counts.get("created", 0) or 0)
+                        agg["merged"] += int(counts.get("merged", 0) or 0)
+                        agg["failed"] += int(counts.get("failed", 0) or 0)
+                research_scope_rates = {k: v for k, v in research_scope_rates.items() if v["created"] >= 1}
+                research_top_review_issues = None
+                try:
+                    from app.playbook_learning import compute_recurring_first_review_descriptions
+                    if current_direction_id:
+                        research_top_review_issues = compute_recurring_first_review_descriptions(
+                            high_iter_rows, _utcnow() - timedelta(days=14),
+                            task_filter=lambda ht: (ht.context or {}).get("direction_id") == current_direction_id,
+                            min_tasks=3,
+                            count_unique_tasks=True,
+                        )
+                except Exception:
+                    logger.exception("[AGENT] Failed to compute research top_first_review_issues (non-critical)")
+                success_summary: list[str] = []
+                for scope_name, counts in research_scope_rates.items():
+                    created = counts["created"]
+                    merged = counts["merged"]
+                    if created >= 2:
+                        success_summary.append(
+                            f"{scope_name}: {merged}/{created} merged ({round(merged / created * 100)}%)"
+                        )
                 response["direction_context"] = {
                     "possibly_saturated": bool(direction.get("possibly_saturated", False)),
                     "deadlock_detected": bool(deadlocked),
+                    "recent_outcomes": research_recent_outcomes,
+                    "failure_stage_pattern": research_failure_stage_pattern,
+                    "scope_success_rates": research_scope_rates,
+                    "top_first_review_issues": research_top_review_issues,
+                    "success_patterns": success_summary,
                 }
 
     # Inject co-change affinity context for create/fix/refactor tasks

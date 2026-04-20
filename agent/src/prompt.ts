@@ -692,21 +692,101 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     if (effort) scopeLines.push(`Effort: ${effort}`);
     if (calibratedFrom && calibratedFrom !== taskScope) {
       const order = ['small', 'medium', 'large'];
-      const fromIdx = order.indexOf(calibratedFrom);
+      const calibratedFromBase = calibratedFrom.split(':')[0];
+      const fromIdx = order.indexOf(calibratedFromBase);
       const toIdx = order.indexOf(taskScope);
       const isUpgrade = fromIdx >= 0 && toIdx > fromIdx;
+      const scopeRatesForCal = dirCtx?.scope_success_rates as
+        | Record<string, Record<string, unknown>>
+        | undefined;
+      const formatRate = (scope: string): string | null => {
+        const entry = scopeRatesForCal?.[scope];
+        if (!entry) return null;
+        const created = Number(entry.created) || 0;
+        const merged = Number(entry.merged) || 0;
+        if (created <= 0) return null;
+        const pct = Math.round((merged / created) * 100);
+        return `${scope}-scope tasks merge at ${pct}% (${merged}/${created})`;
+      };
+      const fromRate = formatRate(calibratedFromBase);
+      const toRate = formatRate(taskScope);
+      let ratesSuffix = '';
+      if (fromRate && toRate) {
+        ratesSuffix = ` Direction merge rates: ${toRate} vs ${fromRate}.`;
+      } else if (fromRate) {
+        ratesSuffix = ` Direction merge rate: ${fromRate}.`;
+      } else if (toRate) {
+        ratesSuffix = ` Direction merge rate: ${toRate}.`;
+      }
       if (isUpgrade) {
         scopeLines.push(
-          `Note: This task was originally scoped as ${calibratedFrom} but calibrated up to ${taskScope} because ${calibratedFrom}-scope tasks have struggled for this direction while smaller scopes have succeeded. Decompose the work into independent smaller pieces — each piece should be small enough to succeed on its own.`,
+          `Note: This task was originally scoped as ${calibratedFrom} but calibrated up to ${taskScope} because ${calibratedFrom}-scope tasks have struggled for this direction while smaller scopes have succeeded.${ratesSuffix} Decompose the work into independent smaller pieces — each piece should be small enough to succeed on its own.`,
         );
       } else {
         scopeLines.push(
-          `Note: This task was originally scoped as ${calibratedFrom} but calibrated down to ${taskScope} because ${calibratedFrom}-scope tasks have struggled for this direction. Stay tightly focused — the scope reduction is intentional to avoid the scope creep that caused prior ${calibratedFrom}-scope failures.`,
+          `Note: This task was originally scoped as ${calibratedFrom} but calibrated down to ${taskScope} because ${calibratedFrom}-scope tasks have struggled for this direction.${ratesSuffix} Stay tightly focused — the scope reduction is intentional to avoid the scope creep that caused prior ${calibratedFrom}-scope failures.`,
         );
       }
     }
     scopeLines.push('');
     prefix += scopeLines.join('\n') + '\n';
+  }
+
+  // Append hidden-signal section surfacing backend-computed quality signals
+  // stored in task.context that would otherwise never reach the agent.
+  if (taskContext) {
+    const signalLines: string[] = [];
+    const preventive = taskContext.preventive_context as Record<string, unknown> | undefined;
+    if (preventive && typeof preventive === 'object') {
+      const warning = strVal(preventive.warning);
+      if (warning) {
+        const overlapFiles = Array.isArray(preventive.overlap_files)
+          ? (preventive.overlap_files as unknown[]).map(f => strVal(f)).filter(Boolean)
+          : [];
+        const fingerprint = strVal(preventive.fingerprint);
+        const anomalyKey = strVal(preventive.anomaly_key);
+        signalLines.push('**Preventive warning:** ' + warning);
+        if (overlapFiles.length > 0) {
+          signalLines.push(`- Overlap files: ${overlapFiles.join(', ')}`);
+        }
+        if (fingerprint) signalLines.push(`- Failure fingerprint: ${fingerprint}`);
+        if (anomalyKey) signalLines.push(`- Anomaly key: ${anomalyKey}`);
+      }
+    }
+    const budgetWarning = strVal(taskContext._file_budget_warning);
+    if (budgetWarning) {
+      signalLines.push(`**File budget pressure:** ${budgetWarning}`);
+    }
+    const lowConfRate = taskContext.low_confidence_spawn_rate;
+    if (typeof lowConfRate === 'number' && Number.isFinite(lowConfRate)) {
+      const pct = Math.round(lowConfRate * 100);
+      signalLines.push(
+        `**Low-confidence spawn:** predicted merge probability is ${pct}% — prefer the smallest viable change and avoid speculative scope expansion.`,
+      );
+    }
+    const complexityScore = taskContext.complexity_score;
+    if (typeof complexityScore === 'number' && Number.isFinite(complexityScore) && complexityScore < 0.5) {
+      const pct = Math.round(complexityScore * 100);
+      signalLines.push(`**Complexity score:** ${pct}/100 (low merge-probability estimate).`);
+      const signals = taskContext.complexity_signals as Record<string, unknown> | undefined;
+      if (signals && typeof signals === 'object') {
+        const parts: string[] = [];
+        for (const [k, v] of Object.entries(signals)) {
+          if (v === null || v === undefined) continue;
+          if (typeof v === 'object') {
+            parts.push(`${k}=${JSON.stringify(v)}`);
+          } else {
+            parts.push(`${k}=${String(v)}`);
+          }
+        }
+        if (parts.length > 0) {
+          signalLines.push(`- Signals: ${parts.join(', ')}`);
+        }
+      }
+    }
+    if (signalLines.length > 0) {
+      prefix += ['## Quality Signals', ...signalLines, ''].join('\n') + '\n';
+    }
   }
 
   // Append remediation context when this task was spawned from an investigation.

@@ -5,6 +5,7 @@ Contains _update_direction_research_outcomes, called whenever a child task
 of a research cycle reaches a terminal status so that research_history
 entries accumulate live outcome statistics.
 """
+import statistics
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -277,6 +278,21 @@ async def _update_direction_research_outcomes(
                 if end_ts is not None and end_ts >= ct.vm_stopped_at:
                     review_durations.append((end_ts - ct.vm_stopped_at).total_seconds() / 3600)
             entry["avg_review_hours"] = round(sum(review_durations) / len(review_durations), 2) if review_durations else None
+            # Review iteration counts per child task — lets research agents see
+            # prompt-quality outcomes (fewer iterations = clearer prompt).
+            review_iters = [
+                int((ct.context or {}).get("review_loop", {}).get("iteration"))
+                for ct in child_tasks_rows
+                if ct.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+                and isinstance((ct.context or {}).get("review_loop"), dict)
+                and isinstance((ct.context or {}).get("review_loop", {}).get("iteration"), int)
+            ]
+            entry["median_review_iterations"] = (
+                round(statistics.median(review_iters), 2) if review_iters else None
+            )
+            entry["avg_review_iterations"] = (
+                round(sum(review_iters) / len(review_iters), 2) if review_iters else None
+            )
             # Capture failed task details so research agents can see WHY tasks failed
             failed_details = []
             infra_failures = 0

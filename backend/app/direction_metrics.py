@@ -219,6 +219,30 @@ def _compute_direction_quality_score(d: dict) -> float:
     return max(0.0, min(1.0, score))
 
 
+def _compute_rolling_median_review_iterations(d: dict) -> float | None:
+    """Return the median of per-cycle median_review_iterations across the last 3 cycles.
+
+    Reads median_review_iterations from each of the most recent research_history
+    entries (populated by direction_outcomes). Returns None when no cycle in the
+    window recorded a value, so callers can distinguish "unknown" from 0.
+    """
+    history = d.get("research_history", [])
+    recent = history[-3:]
+    values = [
+        float(e["median_review_iterations"])
+        for e in recent
+        if isinstance(e.get("median_review_iterations"), (int, float))
+    ]
+    if not values:
+        return None
+    values.sort()
+    n = len(values)
+    mid = n // 2
+    if n % 2 == 1:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2.0
+
+
 def _update_cycle_history(project: Any, cycle_id: str, updates: Dict[str, Any]) -> None:
     """Find a cycle entry by cycle_id in project.vision and apply updates in-place."""
     vision = dict(project.vision or {})

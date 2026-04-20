@@ -830,6 +830,22 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('calibrated down');
   });
 
+  it('includes per-scope merge rates in calibration note when available', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      context: { scope: 'small', scope_calibrated_from: 'medium' },
+      direction_context: {
+        scope_success_rates: {
+          small: { created: 10, merged: 8, failed: 2 },
+          medium: { created: 4, merged: 1, failed: 3 },
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('small-scope tasks merge at 80% (8/10)');
+    expect(result).toContain('medium-scope tasks merge at 25% (1/4)');
+  });
+
   it('omits scope calibration note when scope_calibrated_from matches current scope', () => {
     const task = {
       payloads: [{ type: 'create' }],

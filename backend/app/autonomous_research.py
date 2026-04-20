@@ -532,6 +532,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         _HISTORY_NUMERIC_FIELDS = {
             "tasks_created", "prs_merged", "tasks_failed",
             "failed_task_details", "scope_breakdown", "avg_time_to_merge_hours",
+            "median_review_iterations", "avg_review_iterations",
         }
         _AGGREGATE_FIELDS = {
             "total_cycles", "total_tasks_created", "total_prs_merged",
@@ -572,6 +573,18 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 ]
                 if compact_history:
                     summary["research_history"] = compact_history
+                # Rolling median of per-cycle median_review_iterations across last 3 cycles
+                recent_medians = [
+                    entry["median_review_iterations"]
+                    for entry in raw_history[-3:]
+                    if isinstance(entry.get("median_review_iterations"), (int, float))
+                ]
+                if recent_medians:
+                    sorted_m = sorted(recent_medians)
+                    n = len(sorted_m)
+                    summary["rolling_median_review_iterations"] = (
+                        sorted_m[n // 2] if n % 2 else (sorted_m[n // 2 - 1] + sorted_m[n // 2]) / 2
+                    )
             direction_summaries.append(summary)
 
         # Design doc summary — just keys and playbook, not full content.
