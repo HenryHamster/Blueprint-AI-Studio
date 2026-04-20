@@ -21,14 +21,21 @@ def _is_transient_scan_error(exc: Exception) -> bool:
 def _derive_failure_stage(failure_class: str, status_message: str) -> "str | None":
     """Derive the pipeline stage at which a task failure occurred.
 
-    Returns one of: 'provision', 'clone', 'test', 'lint', 'build', 'pr_creation',
-    'merge', 'review', or None.
+    Returns one of: 'provision', 'clone', 'integration', 'test', 'lint', 'build',
+    'pr_creation', 'merge', 'review', or None.
     """
     if failure_class == "PROVISION_FAILURE":
         return "provision"
     msg = (status_message or "").lower()
     if any(kw in msg for kw in ("checkout", "git clone", "clone")):
         return "clone"
+    if any(kw in msg for kw in (
+        "importerror", "import error", "cannot import", "no module named",
+        "module not found", "has no attribute", "no exported member",
+        "is not exported", "cannot find name", "does not exist on type",
+        "is not assignable to", "undefined export", "missing export",
+    )):
+        return "integration"
     if any(kw in msg for kw in ("lint", "ruff", "eslint", "tsc", "type error")):
         return "lint"
     if any(kw in msg for kw in ("build", "compile", "webpack", "bundle")):

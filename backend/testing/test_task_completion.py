@@ -1074,8 +1074,9 @@ class TestRemediationSuccessPropagation:
         await db_session.refresh(project)
 
         sibling = next(d for d in project.directions if d["id"] == "dir-2")
-        assert sibling["status"] == "paused"
-        assert sibling["auto_paused"] is True
+        assert sibling["status"] == "active"
+        assert not sibling.get("auto_paused")
+        assert sibling["last_remediation_task_id"] == str(task.id)
         notes = sibling.get("notes") or []
         assert len(notes) == 1
         assert notes[0]["source"] == "sibling_remediation_success"
@@ -1177,6 +1178,87 @@ class TestRemediationSuccessPropagation:
         sibling = next(d for d in project.directions if d["id"] == "dir-2")
         notes = sibling.get("notes") or []
         assert all(n["source"] != "sibling_remediation_success" for n in notes)
+
+    @pytest.mark.asyncio
+    async def test_unpauses_sibling_and_stamps_prior_art(self, db_session):
+        """Merged remediation should clear pause state and stamp prior-art fields on the sibling."""
+        sibling_seed = self._paused_sibling(
+            "dir-2",
+            "fp-shared",
+            paused_reason="recurring CODE_ERROR",
+            needs_manual_intervention=True,
+            escalation_notification_pending=True,
+        )
+        project = make_project(directions=[
+            {"id": "dir-1", "status": "active"},
+            sibling_seed,
+        ])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"prompt": "Pin pydantic in requirements.txt."}],
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-1",
+                "diagnosis_fingerprint": "fp-shared",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sibling = next(d for d in project.directions if d["id"] == "dir-2")
+        assert sibling["status"] == "active"
+        assert "auto_paused" not in sibling
+        assert "paused_at" not in sibling
+        assert "paused_reason" not in sibling
+        assert "needs_manual_intervention" not in sibling
+        assert "escalation_notification_pending" not in sibling
+        assert sibling["last_remediation_task_id"] == str(task.id)
+        assert sibling["last_remediation_diagnosis_task_id"] == "diag-1"
+        assert sibling["last_remediation_fingerprint"] == "fp-shared"
+        assert sibling["last_remediation_result"] == "merged"
+        assert sibling["last_remediation_at"]
+        assert sibling["cross_direction_remediation_source"] == "dir-1"
+
+    @pytest.mark.asyncio
+    async def test_does_not_unpause_sibling_with_different_fingerprint(self, db_session):
+        """Exact-fingerprint-match guard: siblings with a different fingerprint stay paused."""
+        project = make_project(directions=[
+            {"id": "dir-1", "status": "active"},
+            self._paused_sibling("dir-2", "fp-other"),
+        ])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"prompt": "Fix something else."}],
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-1",
+                "diagnosis_fingerprint": "fp-shared",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sibling = next(d for d in project.directions if d["id"] == "dir-2")
+        assert sibling["status"] == "paused"
+        assert sibling["auto_paused"] is True
+        assert "cross_direction_remediation_source" not in sibling
+        assert "last_remediation_task_id" not in sibling
 
 
 class TestRemediationFailurePropagation:

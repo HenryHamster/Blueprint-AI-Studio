@@ -1365,6 +1365,27 @@ def test_derive_failure_stage_specific_before_test_keyword():
     ) == "build"
 
 
+def test_derive_failure_stage_integration():
+    """Cross-file coordination failures map to 'integration', ahead of test/build."""
+    from app.task_lifecycle import _derive_failure_stage
+    assert _derive_failure_stage(
+        "CODE_ERROR", "ImportError: cannot import name 'foo' from 'app.bar'"
+    ) == "integration"
+    assert _derive_failure_stage(
+        "CODE_ERROR", "AttributeError: module 'app.x' has no attribute 'y'"
+    ) == "integration"
+    assert _derive_failure_stage(
+        "CODE_ERROR", "TS2305: Module './x' has no exported member 'Foo'"
+    ) == "integration"
+    assert _derive_failure_stage(
+        "CODE_ERROR", "Type 'string' is not assignable to type 'number'"
+    ) == "integration"
+    # Should win over generic test/build even when those keywords also appear
+    assert _derive_failure_stage(
+        "CODE_ERROR", "pytest failed: ImportError: no module named 'app.newmod'"
+    ) == "integration"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _merge_with_retry
 # ══════════════════════════════════════════════════════════════════════════════

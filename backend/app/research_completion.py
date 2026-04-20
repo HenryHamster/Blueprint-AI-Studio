@@ -946,9 +946,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Hard skip gate: ultra-low-confidence medium findings are dropped
         # entirely rather than spawned, escalated, or explored. Runs BEFORE
         # the exploration lottery so exploration cannot override the gate.
+        # Exception: data-starved directions (no medium scope_breakdown in the
+        # last 3 cycles) fall through to the exploration lottery, which has
+        # its own data-starved bypass. Otherwise weak pipeline-wide fallback
+        # signals create a death spiral where medium is never attempted.
         _hard_skip_threshold = _runtime_config.get("medium_hard_skip_threshold", 0.10)
+        _hard_skip_data_starved = False
+        if scope == "medium":
+            _hard_skip_data_starved = True
+            for _entry in ((_pred_direction or {}).get("research_history") or [])[-3:]:
+                if (_entry.get("scope_breakdown") or {}).get("medium"):
+                    _hard_skip_data_starved = False
+                    break
         if (
             scope == "medium"
+            and not _hard_skip_data_starved
             and isinstance(_hard_skip_threshold, (int, float))
             and _pred_p < float(_hard_skip_threshold)
         ):

@@ -4033,10 +4033,18 @@ async def test_hard_skip_below_threshold_drops_finding(db_session, mocker):
     with skip_reason='ultra_low_confidence'."""
     from app.shared_state import runtime_config
     direction_id = "d-hardskip-1"
-    _, task, _ = await _setup_escalation_project(db_session, direction_id, None)
+    project, task, _ = await _setup_escalation_project(db_session, direction_id, None)
     _mock_escalation_externals(mocker, direction_id)
     mocker.patch("app.research_completion.predict_spawn_success", return_value=0.05)
     runtime_config["medium_hard_skip_threshold"] = 0.10
+    # Seed medium history so the direction is not data-starved (which would
+    # bypass the hard-skip gate).
+    project.directions[0]["research_history"] = [
+        {"scope_breakdown": {"medium": {"tasks_created": 1, "prs_merged": 0}}}
+    ]
+    from sqlalchemy.orm.attributes import flag_modified as _fm1
+    _fm1(project, "directions")
+    await db_session.commit()
     try:
         await _handle_research_completion(task, "", db_session)
     finally:
@@ -4060,12 +4068,18 @@ async def test_hard_skip_above_threshold_runs_normal_path(db_session, mocker):
     follows the normal exploration/escalation path."""
     from app.shared_state import runtime_config
     direction_id = "d-hardskip-2"
-    _, task, _ = await _setup_escalation_project(db_session, direction_id, None)
+    project, task, _ = await _setup_escalation_project(db_session, direction_id, None)
     _mock_escalation_externals(mocker, direction_id)
     # 0.15 is above hard_skip (0.10) but below confidence_threshold (default 0.25)
     mocker.patch("app.research_completion.predict_spawn_success", return_value=0.15)
     mocker.patch.dict("app.shared_state.runtime_config", {"medium_exploration_fraction": 0})
     runtime_config["medium_hard_skip_threshold"] = 0.10
+    project.directions[0]["research_history"] = [
+        {"scope_breakdown": {"medium": {"tasks_created": 1, "prs_merged": 0}}}
+    ]
+    from sqlalchemy.orm.attributes import flag_modified as _fm2
+    _fm2(project, "directions")
+    await db_session.commit()
     try:
         await _handle_research_completion(task, "", db_session)
     finally:
@@ -4082,6 +4096,38 @@ async def test_hard_skip_above_threshold_runs_normal_path(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_hard_skip_bypassed_for_data_starved_direction(db_session, mocker):
+    """A direction with no medium scope_breakdown in its recent research_history
+    is data-starved — the hard-skip gate is bypassed so the exploration lottery
+    can run, breaking the self-reinforcing loop where medium is never attempted."""
+    from app.shared_state import runtime_config
+    direction_id = "d-hardskip-starved"
+    _, task, _ = await _setup_escalation_project(db_session, direction_id, None)
+    _mock_escalation_externals(mocker, direction_id)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.05)
+    # Force exploration to fire so a child is spawned (otherwise the finding
+    # still falls through to escalation, which also spawns a child).
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"medium_exploration_fraction": 1.0},
+    )
+    mocker.patch("app.research_completion.random.random", return_value=0.0)
+    runtime_config["medium_hard_skip_threshold"] = 0.10
+    try:
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        runtime_config.pop("medium_hard_skip_threshold", None)
+
+    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    children = result.scalars().all()
+    # A child was spawned (hard-skip was bypassed) and no deferral was recorded.
+    assert len(children) == 1
+    await db_session.refresh(task)
+    skip_counts = (task.context or {}).get("skipped_low_confidence_by_scope") or {}
+    assert skip_counts.get("medium", 0) == 0
+
+
+@pytest.mark.asyncio
 async def test_hard_skip_counter_in_scope_breakdown(db_session, mocker):
     """skipped_low_confidence counter from the parent research task surfaces in
     the per-direction scope_breakdown after _update_direction_research_outcomes
@@ -4094,7 +4140,13 @@ async def test_hard_skip_counter_in_scope_breakdown(db_session, mocker):
     mocker.patch("app.research_completion.predict_spawn_success", return_value=0.05)
     runtime_config["medium_hard_skip_threshold"] = 0.10
     # Seed a research_history entry so _update_direction_research_outcomes finds it.
-    project.directions[0]["research_history"] = [{"task_id": str(task.id), "tasks_created": 0}]
+    # Includes medium scope_breakdown so the hard-skip gate is not bypassed for
+    # data-starved directions.
+    project.directions[0]["research_history"] = [{
+        "task_id": str(task.id),
+        "tasks_created": 0,
+        "scope_breakdown": {"medium": {"tasks_created": 1, "prs_merged": 0}},
+    }]
     from sqlalchemy.orm.attributes import flag_modified
     flag_modified(project, "directions")
     db_session.add(project)

@@ -166,16 +166,18 @@ def _propagate_remediation_success_to_siblings(
     successful_direction_id: str,
     task: Task,
 ) -> None:
-    """Inject an informational note into paused sibling directions sharing ``fingerprint``.
+    """Un-pause sibling directions sharing ``fingerprint`` and stamp prior-art context.
 
     When a remediation merges, other auto-paused directions holding on the same
-    error fingerprint likely have the same root cause. Surface the successful
-    fix as a note on each so the next investigation has a concrete starting
-    point rather than re-diagnosing the shared root cause in parallel.
+    exact error fingerprint almost certainly share the root cause that was just
+    fixed. Rather than making each one wait out its own 48h cooldown and run an
+    independent diagnosis, clear their pause state, stamp the successful task as
+    prior art (so the diagnosis pipeline can reference what worked if they fail
+    again), and append an audit note. The match relies on
+    ``find_directions_sharing_fingerprint`` which enforces exact equality plus
+    auto-paused + recency filters, guarding against false positives.
 
-    Does NOT clear holds, ``auto_paused`` flags, or status. Mutates ``directions``
-    in place; the caller is responsible for persisting the change via
-    ``flag_modified``.
+    Mutates ``directions`` in place; the caller persists via ``flag_modified``.
     """
     from app.anomaly_detection import find_directions_sharing_fingerprint  # noqa: PLC0415
 
@@ -195,9 +197,30 @@ def _propagate_remediation_success_to_siblings(
         note_text += f" Approach: {prompt_snippet}"
     note_text = note_text[:STRATEGIC_RATIONALE_MAX]
     sibling_ids = {s.get("id") for s in siblings if s.get("id")}
+    diagnosis_task_id = (task.context or {}).get("diagnosis_task_id")
     for direction in directions:
         if direction.get("id") not in sibling_ids:
             continue
+        # Clear the auto-pause so the direction can resume on the next lifecycle
+        # sweep without waiting out its own cooldown.
+        direction["status"] = "active"
+        for field in (
+            "auto_paused",
+            "paused_reason",
+            "paused_at",
+            "needs_manual_intervention",
+            "escalation_notification_pending",
+        ):
+            direction.pop(field, None)
+        # Stamp prior art so autonomous_research_diagnosis can surface what
+        # worked if the same fingerprint resurfaces on this direction.
+        direction["last_remediation_task_id"] = str(task.id)
+        if diagnosis_task_id:
+            direction["last_remediation_diagnosis_task_id"] = str(diagnosis_task_id)
+        direction["last_remediation_fingerprint"] = str(fingerprint)
+        direction["last_remediation_result"] = "merged"
+        direction["last_remediation_at"] = now_iso
+        direction["cross_direction_remediation_source"] = str(successful_direction_id)
         notes = list(direction.get("notes") or [])
         notes.append({
             "text": note_text,

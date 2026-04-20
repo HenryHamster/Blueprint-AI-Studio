@@ -2336,16 +2336,19 @@ describe('buildSelfReviewChecklist', () => {
     expect(resultMedium).toBe(resultUndefined);
   });
 
-  it('medium with analysisPlan makes plan alignment and scope violations hard FAIL gates', () => {
+  it('medium with analysisPlan classifies unplanned files; only scope creep and missing planned files force FAIL', () => {
     const result = buildSelfReviewPrompt({
       ...baseOpts,
       taskScope: 'medium',
       analysisPlan: 'Files to change:\n- foo.ts',
     });
     expect(result).toContain('Plan alignment');
-    expect(result).toContain('HARD GATE');
-    expect(result).toContain('MUST be FAIL');
-    expect(result).not.toMatch(/justify or revert/i);
+    expect(result).toContain('caller impact');
+    expect(result).toContain('discovered dependency');
+    expect(result).toContain('scope creep');
+    expect(result).toContain('MUST result in a FAIL verdict');
+    // Unplanned-but-justified files are no longer an unconditional FAIL
+    expect(result).not.toMatch(/Justification is NOT acceptable/);
   });
 });
 
