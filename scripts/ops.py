@@ -16,6 +16,7 @@ Usage:
     python scripts/ops.py autonomy                  — show autonomous research state
     python scripts/ops.py directions                — show project directions, notes, and history
     python scripts/ops.py vision                    — show product vision and design document
+    python scripts/ops.py health                    — deploy health deep-dive (probe ring buffer, cycle age)
     python scripts/ops.py diagnostics               — pipeline diagnostics (stuck tasks, circuit breakers)
     python scripts/ops.py alerts [--dismiss ID]     — show/dismiss system alerts
     python scripts/ops.py digest [--hours N]        — catch-up digest (default 24h)
@@ -287,6 +288,125 @@ def cmd_autonomy(_args):
                 print(f"    direction:            {(direction.get('summary') or '?')[:100]}")
     except Exception as e:
         print(f"Autonomy: error ({e})")
+
+
+def _age_str(iso_or_dt):
+    """Return 'Ns ago' / 'Nm ago' for an ISO string or None."""
+    if not iso_or_dt:
+        return 'never'
+    from datetime import datetime, timezone
+    try:
+        if isinstance(iso_or_dt, str):
+            s = iso_or_dt.replace('Z', '+00:00')
+            ts = datetime.fromisoformat(s)
+        else:
+            ts = iso_or_dt
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        delta = (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception:
+        return str(iso_or_dt)
+    if delta < 60:
+        return f'{int(delta)}s ago'
+    if delta < 3600:
+        return f'{int(delta // 60)}m{int(delta % 60)}s ago'
+    return f'{int(delta // 3600)}h{int((delta % 3600) // 60)}m ago'
+
+
+def cmd_health(_args):
+    """Deep-dive on deploy health: probe ring buffer, cycle age, failure streaks."""
+    try:
+        ds = api("GET", "/api/admin/deploy-state")
+    except Exception as e:
+        print(f"Deploy state: error ({e})")
+        return
+
+    print("=== DEPLOY HEALTH ===")
+    print(f"  Status:       {ds.get('status', '?')}")
+    pr = ds.get('pause_reason')
+    if pr:
+        print(f"  Pause reason: {pr}")
+    paused_at = ds.get('paused_at')
+    if paused_at:
+        print(f"  Paused:       {_age_str(paused_at)}")
+
+    eh = ds.get('external_health') or {}
+    errs = eh.get('errors') or {}
+    print()
+    print("=== EXTERNAL DEPS ===")
+    for dep in ('github_api', 'db', 'claude_api', 'gcp'):
+        val = eh.get(dep)
+        if val is None:
+            continue
+        status = 'OK' if val else 'DOWN'
+        err = errs.get(dep, '')
+        suffix = f" — {err}" if err else ''
+        print(f"  {dep:12}: {status}{suffix}")
+    consec = eh.get('consecutive_failures') or {}
+    if any(consec.values()):
+        print(f"  consecutive failures: {consec}")
+
+    print()
+    print("=== PROBE SCHEDULE ===")
+    interval = ds.get('health_check_interval_seconds')
+    last = eh.get('last_check')
+    print(f"  Interval:     {interval}s" + (" (paused)" if interval == 15 else ""))
+    print(f"  Last probe:   {_age_str(last)}")
+    if last and interval:
+        from datetime import datetime, timezone
+        try:
+            ts = datetime.fromisoformat(last.replace('Z', '+00:00'))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            next_in = interval - (datetime.now(timezone.utc) - ts).total_seconds()
+            if next_in <= 0:
+                print(f"  Next probe:   running / overdue by {int(-next_in)}s")
+            else:
+                print(f"  Next probe:   in {int(next_in)}s")
+        except Exception:
+            pass
+    elif last is None:
+        print("  Next probe:   unknown — last_check is None (orchestrator may not have run _check_external_health yet)")
+
+    print()
+    print("=== RING BUFFER (3-of-5 gate) ===")
+    hist = ds.get('health_recovery_history') or []
+    size = ds.get('health_recovery_history_size') or 5
+    required = ds.get('health_recovery_streak_required') or 3
+    streak = ds.get('health_recovery_streak') or 0
+    dots = []
+    for i in range(size):
+        if i < len(hist):
+            dots.append('OK ' if hist[i] else 'FAIL')
+        else:
+            dots.append('--  ')
+    print(f"  Recovery:     [{' | '.join(dots)}]  {streak}/{required} healthy")
+    fs = ds.get('health_failure_streak') or 0
+    ft = ds.get('health_failure_streak_threshold') or 3
+    if fs:
+        print(f"  Failure:      {fs}/{ft} consecutive failures before pause")
+
+    print()
+    print("=== ORCHESTRATOR CYCLE ===")
+    try:
+        hd = api("GET", "/api/health/detailed")
+        comp = (hd.get('components') or {})
+        orch = comp.get('orchestrator') or {}
+        status = orch.get('status', '?')
+        cycle_age = orch.get('cycle_age_seconds')
+        print(f"  Status:       {status}")
+        if cycle_age is None:
+            print("  Last cycle:   never (loop has not completed a cycle since process start)")
+        else:
+            print(f"  Last cycle:   {int(cycle_age)}s ago")
+            if cycle_age > 30:
+                print("  WARNING: cycle >30s old — loop may be stuck")
+        if status == 'down':
+            print("  ACTION: try 'python scripts/ops.py restart-orchestrator'")
+        print(f"  Queued:       {orch.get('queued_tasks', '?')}")
+        print(f"  Active:       {orch.get('active_tasks', '?')}")
+    except Exception as e:
+        print(f"  (health/detailed unavailable: {e})")
 
 
 def cmd_diagnostics(_args):
@@ -766,6 +886,7 @@ COMMANDS = {
     'autonomy': cmd_autonomy,
     'directions': cmd_directions,
     'vision': cmd_vision,
+    'health': cmd_health,
     'diagnostics': cmd_diagnostics,
     'alerts': cmd_alerts,
     'digest': cmd_digest,
