@@ -48,6 +48,7 @@ async def lifespan(app):
     from app.services import gcp_cleanup_service, secret_reconciliation_service, stale_branch_cleanup_service, auto_archive_service
     from app.max_plan_pool import load_max_plan_pool
     from app.orchestrator import orchestrator_worker
+    from app.shared_state import runtime_config_sync_service
     from app.github import close_github_client
 
     # Startup: Initialize DB tables
@@ -83,6 +84,10 @@ async def lifespan(app):
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
+    # Per-instance runtime_config sync — propagates admin mutations across
+    # Cloud Run instances (each has its own in-memory dict; DB is shared).
+    config_sync_task = asyncio.create_task(runtime_config_sync_service())
+
     # Store references for admin restart endpoint
     from app.shared_state import background_tasks as _bg_tasks
     _bg_tasks["orchestrator"] = orchestrator_task
@@ -91,6 +96,7 @@ async def lifespan(app):
     _bg_tasks["secret_reconciliation"] = secret_recon_task
     _bg_tasks["stale_branch_cleanup"] = stale_branch_task
     _bg_tasks["auto_archive"] = auto_archive_task
+    _bg_tasks["config_sync"] = config_sync_task
 
     # Monitor background tasks for silent crashes (with exponential backoff)
     async def _monitor_background_tasks():
@@ -103,6 +109,7 @@ async def lifespan(app):
             "secret_reconciliation": secret_reconciliation_service,
             "stale_branch_cleanup": stale_branch_cleanup_service,
             "auto_archive": auto_archive_service,
+            "config_sync": runtime_config_sync_service,
         }
         while True:
             try:
@@ -176,7 +183,7 @@ async def lifespan(app):
 
     yield
     # Shutdown: graceful cleanup with timeout to let in-flight operations finish
-    tasks_to_cancel = [reaper_task, gcp_cleanup_task, secret_recon_task, stale_branch_task, orchestrator_task, monitor_task]
+    tasks_to_cancel = [reaper_task, gcp_cleanup_task, secret_recon_task, stale_branch_task, orchestrator_task, config_sync_task, monitor_task]
     for t in tasks_to_cancel:
         t.cancel()
     try:

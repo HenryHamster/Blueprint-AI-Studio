@@ -226,6 +226,126 @@ SCOPE_AWARE_RETRY_BUDGETS: Dict[str, Dict[str, int]] = {
 }
 
 
+async def sync_runtime_config_from_state(state) -> list[str]:
+    """Apply persisted DeploymentState values to in-memory runtime_config.
+
+    Cloud Run scales to multiple instances (max_instance_count=5); admin
+    mutations (pause, settings) only update the receiving instance's local
+    dict. DB state is the shared source of truth — this helper propagates it
+    to every instance when called periodically.
+
+    PAUSED/HALTED always forces max_concurrent_vms=0 regardless of the
+    persisted runtime_max_concurrent_vms value, so a pause on any instance
+    converges across the fleet even if the dispatch cap itself was also
+    changed recently.
+
+    Returns the list of keys whose values actually changed — caller can log.
+    """
+    if state is None:
+        return []
+
+    # Lazy import to avoid module-level circular dependency with app.models
+    from app.models import DeploymentStatus  # noqa: PLC0415
+
+    changed: list[str] = []
+
+    def _set(key: str, new_val) -> None:
+        old = runtime_config.get(key)
+        if old != new_val:
+            runtime_config[key] = new_val
+            changed.append(key)
+
+    async with runtime_config_lock:
+        try:
+            if state.runtime_max_concurrent_vms is not None:
+                _set("max_concurrent_vms", int(state.runtime_max_concurrent_vms))
+            if state.runtime_max_retries is not None:
+                _set("max_retries", int(state.runtime_max_retries))
+            if state.runtime_max_autonomous_tasks_per_hour is not None:
+                _set("max_autonomous_tasks_per_hour", int(state.runtime_max_autonomous_tasks_per_hour))
+            if getattr(state, "runtime_max_global_autonomous_tasks_per_hour", None) is not None:
+                _set("max_global_autonomous_tasks_per_hour", int(state.runtime_max_global_autonomous_tasks_per_hour))
+        except Exception as e:
+            logger.warning(f"[CONFIG-SYNC] Could not sync scalar config cols: {e}")
+
+        try:
+            if state.runtime_autonomous_research_interval_minutes is not None:
+                _set("autonomous_research_interval_minutes", int(state.runtime_autonomous_research_interval_minutes))
+            if getattr(state, "runtime_autonomous_direction_cooldown_minutes", None) is not None:
+                _set("autonomous_direction_cooldown_minutes", int(state.runtime_autonomous_direction_cooldown_minutes))
+        except Exception as e:
+            logger.warning(f"[CONFIG-SYNC] Could not sync autonomous cols: {e}")
+
+        try:
+            config_json = getattr(state, "runtime_config_json", None)
+            if config_json and isinstance(config_json, dict):
+                for key in (
+                    "task_type_models", "task_type_efforts", "agent_prompt_suffixes",
+                    "autonomous_periodic_tasks", "health_check_urls", "notification_config",
+                ):
+                    if key in config_json:
+                        _set(key, config_json[key])
+                if "strategic_research_frequency" in config_json:
+                    _set("strategic_research_frequency", int(config_json["strategic_research_frequency"]))
+                if "require_approval_gates" in config_json:
+                    _set("require_approval_gates", bool(config_json["require_approval_gates"]))
+                if "daily_cost_ceiling_usd" in config_json:
+                    _set("daily_cost_ceiling_usd", float(config_json["daily_cost_ceiling_usd"]))
+                if "auto_archive_enabled" in config_json:
+                    _set("auto_archive_enabled", bool(config_json["auto_archive_enabled"]))
+                for int_key in (
+                    "max_provision_retries", "max_rollup_retries",
+                    "architecture_review_frequency", "max_active_directions",
+                    "max_parallel_research_per_project",
+                    "auto_archive_terminal_after_days",
+                    "auto_archive_max_terminal_tasks_per_project",
+                    "auto_archive_interval_minutes",
+                ):
+                    if int_key in config_json:
+                        _set(int_key, int(config_json[int_key]))
+        except Exception as e:
+            logger.warning(f"[CONFIG-SYNC] Could not sync runtime_config_json: {e}")
+
+        # PAUSED/HALTED always forces the dispatch cap to 0 — overrides any
+        # restored runtime_max_concurrent_vms (which holds the pre-pause value
+        # for later resume).
+        try:
+            if state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+                _set("max_concurrent_vms", 0)
+        except Exception as e:
+            logger.warning(f"[CONFIG-SYNC] Could not apply PAUSED override: {e}")
+
+    return changed
+
+
+async def runtime_config_sync_service():
+    """Per-instance loop that refreshes runtime_config from DB every 15s.
+
+    Cloud Run scales across multiple instances; admin mutations are
+    instance-local. The orchestrator already syncs each cycle for the
+    dispatch path, but non-dispatch paths (routers, background services
+    reading prompt suffixes/notification config/etc.) still see stale
+    values. This loop makes every instance converge on the DB state
+    within ~15s regardless of which path reads runtime_config.
+    """
+    # Lazy imports avoid module-level circular deps.
+    from app.database import AsyncSessionLocal  # noqa: PLC0415
+    from app.models import DeploymentState  # noqa: PLC0415
+
+    while True:
+        try:
+            await asyncio.sleep(15)
+            async with AsyncSessionLocal() as session:
+                state = await session.get(DeploymentState, 1)
+                changed = await sync_runtime_config_from_state(state)
+                if changed:
+                    logger.info(f"[CONFIG-SYNC] Applied DB changes: {changed}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[CONFIG-SYNC] sync cycle failed: {e}", exc_info=True)
+
+
 def resolve_retry_budget(failure_class: str, scope: Optional[str]) -> int:
     """Return the retry budget for (failure_class, scope), falling back to the
     uniform retry_budgets_by_class value (or max_retries) if scope is not set

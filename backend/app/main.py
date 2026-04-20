@@ -285,54 +285,15 @@ async def _init_deployment_state():
                 if not state:
                     raise  # Genuine error, not a race
 
-        # Restore persisted runtime config values so settings survive restarts
-        # Wrapped in try/except: if migration hasn't added these columns yet, skip gracefully
+        # Restore persisted runtime config values so settings survive restarts.
+        # Shared with the periodic cross-instance sync (see sync_runtime_config_loop).
         try:
-            if state.runtime_max_concurrent_vms is not None:
-                _runtime_config["max_concurrent_vms"] = state.runtime_max_concurrent_vms
-            if state.runtime_max_retries is not None:
-                _runtime_config["max_retries"] = state.runtime_max_retries
-            if state.runtime_max_autonomous_tasks_per_hour is not None:
-                _runtime_config["max_autonomous_tasks_per_hour"] = state.runtime_max_autonomous_tasks_per_hour
-            if getattr(state, 'runtime_max_global_autonomous_tasks_per_hour', None) is not None:
-                _runtime_config["max_global_autonomous_tasks_per_hour"] = state.runtime_max_global_autonomous_tasks_per_hour
+            from app.shared_state import sync_runtime_config_from_state  # noqa: PLC0415
+            restored = await sync_runtime_config_from_state(state)
+            if restored:
+                logger.info(f"[DEPLOY] Restored runtime config from DB: {restored}")
         except Exception as e:
             logger.warning(f"[DEPLOY] Could not restore runtime config (migration pending?): {e}", exc_info=True)
-        try:
-            if state.runtime_autonomous_research_interval_minutes is not None:
-                _runtime_config["autonomous_research_interval_minutes"] = state.runtime_autonomous_research_interval_minutes
-            if getattr(state, 'runtime_autonomous_direction_cooldown_minutes', None) is not None:
-                _runtime_config["autonomous_direction_cooldown_minutes"] = state.runtime_autonomous_direction_cooldown_minutes
-        except Exception as e:
-            logger.warning(f"[DEPLOY] Could not restore autonomous research config (migration pending?): {e}", exc_info=True)
-        # Restore dict/list runtime config from JSONB column
-        try:
-            config_json = getattr(state, 'runtime_config_json', None)
-            if config_json and isinstance(config_json, dict):
-                for key in ("task_type_models", "task_type_efforts", "agent_prompt_suffixes",
-                             "autonomous_periodic_tasks", "health_check_urls",
-                             "notification_config"):
-                    if key in config_json:
-                        _runtime_config[key] = config_json[key]
-                if "strategic_research_frequency" in config_json:
-                    _runtime_config["strategic_research_frequency"] = int(config_json["strategic_research_frequency"])
-                if "require_approval_gates" in config_json:
-                    _runtime_config["require_approval_gates"] = bool(config_json["require_approval_gates"])
-                if "daily_cost_ceiling_usd" in config_json:
-                    _runtime_config["daily_cost_ceiling_usd"] = float(config_json["daily_cost_ceiling_usd"])
-                if "auto_archive_enabled" in config_json:
-                    _runtime_config["auto_archive_enabled"] = bool(config_json["auto_archive_enabled"])
-                for int_key in ("max_provision_retries", "max_rollup_retries",
-                                "architecture_review_frequency", "max_active_directions",
-                                "max_parallel_research_per_project",
-                                "auto_archive_terminal_after_days",
-                                "auto_archive_max_terminal_tasks_per_project",
-                                "auto_archive_interval_minutes"):
-                    if int_key in config_json:
-                        _runtime_config[int_key] = int(config_json[int_key])
-                logger.info(f"[DEPLOY] Restored runtime_config_json: {list(config_json.keys())}")
-        except Exception as e:
-            logger.warning(f"[DEPLOY] Could not restore runtime_config_json (migration pending?): {e}", exc_info=True)
         # Restore circuit breaker state — prevents deploy from clearing tripped breakers
         try:
             if state.circuit_breaker_states:
