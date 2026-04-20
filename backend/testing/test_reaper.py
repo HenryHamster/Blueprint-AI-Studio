@@ -21,7 +21,7 @@ from sqlmodel import SQLModel
 
 from sqlmodel import select as _select
 
-from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
+from app.models import Alert, AlertSeverity, Artifact, ArtifactType, Project, Task, TaskStatus
 from app.reaper import reaper_service, _copy_analysis_artifacts_to_previous, _reaper_skip_counts, _heartbeat_stale_cutoff
 from app.shared_state import runtime_config as _runtime_config
 
@@ -2265,3 +2265,210 @@ async def test_orphan_sweep_ignores_unheld_streaks(reaper_db):
     assert cleared == 0
     # Streak dict itself is untouched
     assert _ss.direction_failure_streaks[unheld_did]["consecutive_failures"] == 2
+
+
+# ── _task_has_open_pr + reap-with-PR handoff to EVALUATING ────────────────
+
+
+@pytest.mark.asyncio
+async def test_task_has_open_pr_finds_artifact(reaper_db):
+    """Helper returns (True, pr_number) when the task has a PULL_REQUEST artifact."""
+    from app.reaper import _task_has_open_pr
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(Artifact(
+        task_id=t.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/2903",
+    ))
+    await reaper_db.commit()
+
+    has_pr, pr_num = await _task_has_open_pr(t, reaper_db)
+    assert has_pr is True
+    assert pr_num == 2903
+
+
+@pytest.mark.asyncio
+async def test_task_has_open_pr_no_artifact(reaper_db):
+    """Helper returns (False, None) when no PULL_REQUEST artifact exists."""
+    from app.reaper import _task_has_open_pr
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    has_pr, pr_num = await _task_has_open_pr(t, reaper_db)
+    assert has_pr is False
+    assert pr_num is None
+
+
+@pytest.mark.asyncio
+async def test_task_has_open_pr_malformed_url(reaper_db):
+    """Helper returns (False, None) when the PR URL can't be parsed."""
+    from app.reaper import _task_has_open_pr
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(Artifact(
+        task_id=t.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="not-a-url",
+    ))
+    await reaper_db.commit()
+
+    has_pr, pr_num = await _task_has_open_pr(t, reaper_db)
+    assert has_pr is False
+    assert pr_num is None
+
+
+@pytest.mark.asyncio
+async def test_reap_with_open_pr_goes_to_evaluating(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Transient reap with a PR artifact → EVALUATING, not QUEUED.
+    The retry-from-scratch path would collide with the already-pushed branch;
+    the review pipeline should adjudicate the PR instead.
+    """
+    mocker.patch("app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock, return_value=(None, True))
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-with-pr",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(Artifact(
+        task_id=t.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/1234",
+    ))
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.EVALUATING
+    assert t.vm_instance_id is None
+    assert "#1234" in (t.latest_status_message or "")
+    assert "handed off to review pipeline" in (t.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_reap_without_pr_still_retries(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Transient reap on a task without a PR artifact → existing QUEUED behaviour preserved."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-no-pr",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    # Without a PR artifact, the existing retry path fires.
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_reap_with_open_pr_goes_to_evaluating(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Task at can_retry=False with a PR artifact → EVALUATING, not FAILED.
+    The review pipeline gets a chance to adjudicate; the 6h EVALUATING timeout
+    and 16-iter review-fix cap guarantee eventual termination.
+    """
+    mocker.patch("app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock, return_value=(None, True))
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-terminal-pr",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=3,  # already at max for most classes
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(Artifact(
+        task_id=t.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/9999",
+    ))
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.EVALUATING
+    assert "#9999" in (t.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_terminal_reap_without_pr_still_fails(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Terminal reap without a PR artifact → existing FAILED behaviour preserved."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-terminal-no-pr",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=5,  # definitely over any class budget
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED

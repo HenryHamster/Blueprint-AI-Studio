@@ -10,7 +10,7 @@ from typing import Dict
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
-from app.models import Task, TaskStatus, Project
+from app.models import Task, TaskStatus, Project, Artifact, ArtifactType
 from app.compute import get_provision_error, record_zone_failure, _capture_serial_for_vm, get_vm_zone, INFRA_PROVISION_PATTERNS, any_zone_available, soonest_zone_recovery
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import record_pipeline_event, external_health as _external_health, resolve_retry_budget
@@ -94,6 +94,34 @@ def _heartbeat_stale_cutoff(task, now: datetime) -> datetime:
     floor = _HEARTBEAT_EFFORT_FLOORS.get(effort, 0)
     seconds = max(seconds, floor)
     return now - timedelta(seconds=seconds)
+
+
+async def _task_has_open_pr(task, session) -> tuple[bool, int | None]:
+    """Check whether a task already published a PR that's still open.
+
+    Used by the reaper: a task that pushed a branch and opened a PR before
+    being reaped should hand off to the review pipeline (EVALUATING) rather
+    than retry from scratch (QUEUED) — the retry path would collide with the
+    existing branch and be refused by the agent's stale-branch guard
+    (agent/src/index.ts:706), orphaning the PR.
+
+    Source of truth is the Artifact table: the backend writes a
+    PULL_REQUEST artifact atomically with PR creation (see
+    routers/agent.py:2035). Returns (True, pr_number) on match.
+    """
+    stmt = select(Artifact).where(
+        Artifact.task_id == task.id,
+        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+    )
+    artifact = (await session.execute(stmt)).scalars().first()
+    if artifact is None or not artifact.pr_url:
+        return False, None
+    # Parse PR number from the URL (e.g. https://github.com/owner/repo/pull/2903)
+    try:
+        pr_num = int(artifact.pr_url.rstrip("/").rsplit("/", 1)[-1])
+    except (ValueError, IndexError):
+        return False, None
+    return True, pr_num
 
 
 async def _sweep_orphan_direction_holds(session) -> int:
@@ -565,7 +593,71 @@ async def reaper_service():
                         )
                         can_retry = task.attempt_count < class_budget
 
-                    if can_retry:
+                    # Open-PR handoff: if this attempt already pushed a branch
+                    # and opened a PR, retrying from scratch would collide with
+                    # the existing branch (see agent/src/index.ts:706 stale-
+                    # branch guard) and orphan the PR. Hand off to the review
+                    # pipeline instead — review/fix iteration + the existing
+                    # 6h EVALUATING hard timeout (services.py:807) + the 16-iter
+                    # review-fix cap guarantee termination.
+                    _has_open_pr, _pr_num = await _task_has_open_pr(task, session)
+                    if _has_open_pr and _pr_num:
+                        # Provision failures can't publish a PR (agent never ran),
+                        # so class_budget/reap_failure_class are only bound when
+                        # the agent-error branch above ran. Guard the format args.
+                        _display_class = (
+                            "PROVISION_FAILURE" if is_provision_failure
+                            else locals().get("reap_failure_class", "UNKNOWN")
+                        )
+                        _display_budget = locals().get("class_budget", "?")
+                        logger.info(
+                            f"[REAPER] Task {task.id} reaped mid-run with open PR #{_pr_num}; "
+                            f"handing off to review pipeline (was attempt {task.attempt_count}/{_display_budget})"
+                        )
+                        task.status = TaskStatus.EVALUATING
+                        task.vm_instance_id = None
+                        task.last_heartbeat = None
+                        task.latest_status_message = (
+                            f"Reaped mid-run with open PR #{_pr_num}; "
+                            f"handed off to review pipeline ({_display_class})"
+                        )
+                        session.add(task)
+                        # Spawn the review task that _process_post_commit would
+                        # have spawned if the agent had reported COMPLETED.
+                        try:
+                            from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
+                            _short_id = str(task.id).replace("-", "")[:8]
+                            _task_type = (task.first_payload or {}).get("type", "") or ""
+                            _type_prefix_map = {
+                                "docs": "docs", "deps": "deps", "migrate": "migrate",
+                                "refactor": "refactor", "perf": "task", "qa": "task",
+                                "security_audit": "task", "debug": "task", "smoketest": "task",
+                            }
+                            _branch_prefix = _type_prefix_map.get(_task_type, "task")
+                            _branch = f"blueprint/{_branch_prefix}-{_short_id}"
+                            _base_branch = (task.first_payload or {}).get("base_branch", "main")
+                            _original_prompt = (task.first_payload or {}).get("prompt", task.description or "")
+                            await _spawn_pipeline_task(
+                                task, "review", session, _pr_num, _branch, _base_branch,
+                                original_prompt=_original_prompt, original_task_id=str(task.id),
+                            )
+                        except Exception as _spawn_exc:
+                            # Review spawn is best-effort from the reaper — if it
+                            # fails, reaper Step 3 (stale EVALUATING sweep) will
+                            # retry within 15 min, and the 6h hard timeout still
+                            # bounds the EVALUATING state. Don't let this crash
+                            # the reaper cycle.
+                            logger.warning(
+                                f"[REAPER] Review spawn failed for reaped-with-PR task {task.id}: "
+                                f"{type(_spawn_exc).__name__}: {_spawn_exc}",
+                                exc_info=True,
+                            )
+                        await broadcast_to_project(
+                            str(task.project_id),
+                            "task_updated",
+                            {"task_id": str(task.id), "status": task.status}
+                        )
+                    elif can_retry:
                         # Check if this is a research/plan parent with work children —
                         # re-evaluate instead of re-run.
                         task_type = (task.first_payload).get("type", "")
