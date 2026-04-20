@@ -21,6 +21,29 @@ RATE_LIMIT = "RATE_LIMIT"
 # and not an infra outage; retry logic uses this class to route through scope
 # escalation (medium→large decomposition) instead of a same-scope retry.
 SCOPE_OVERFLOW = "SCOPE_OVERFLOW"
+# Migration-specific code defect: alembic chain breaks, duplicate heads,
+# missing migrations causing UndefinedColumn at runtime, EXPECTED_SCHEMA_REVISION
+# mismatches, or downgrade NotImplementedError/OperationalError. Distinct from
+# CODE_ERROR so auto-remediation can apply migration-specific fixes (rechain
+# down_revision, regenerate migration, bump EXPECTED_SCHEMA_REVISION).
+MIGRATION_ERROR = "MIGRATION_ERROR"
+
+
+# Substrings that uniquely identify migration-related failures. Kept narrow so
+# generic database connectivity errors stay in EXTERNAL_API.
+_MIGRATION_PATTERNS: tuple[str, ...] = (
+    "can't locate revision",
+    "cant locate revision",
+    "revisionerror",
+    "multiple head revisions",
+    "only a single head supported",
+    "multiple heads are present",
+    "undefinedcolumn",
+    "undefinedcolumnerror",
+    "schema version mismatch",
+    "expected_schema_revision",
+    "alembic.util.exc.commanderror",
+)
 
 
 # Failure classes that don't penalize direction health / research productivity —
@@ -77,6 +100,10 @@ def classify_failure_taxonomy(task: "Task") -> str:
         return TAXONOMY_SCOPE_RELATED
     if base in INFRA_CLASSES:
         return TAXONOMY_INFRA_RELATED
+    # Migration errors are code defects (the schema is wrong / migration missing),
+    # not review-quality or scope issues — route to code_defect bucket directly.
+    if base == MIGRATION_ERROR:
+        return TAXONOMY_CODE_DEFECT
 
     status_msg = (task.latest_status_message or "").lower()
     ctx = task.context or {}
@@ -220,6 +247,7 @@ _PROVISION_PHRASE_RE = re.compile(
 
 
 _SEVERITY: dict[str, int] = {
+    MIGRATION_ERROR: 3,
     CODE_ERROR: 3,
     AGENT_TIMEOUT: 2,
     PROVISION_FAILURE: 1,
@@ -362,6 +390,17 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     # Classify as AGENT_TIMEOUT (infra) rather than falling through to CODE_ERROR.
     if not combined.strip():
         return AGENT_TIMEOUT
+
+    # Migration-specific failures — alembic chain/head errors, missing migration
+    # column drift, schema-revision mismatches, downgrade failures. Checked before
+    # the database-connection EXTERNAL_API bank because UndefinedColumn errors
+    # surface via psycopg/asyncpg but indicate a missing migration, not a DB outage.
+    if any(kw in combined for kw in _MIGRATION_PATTERNS):
+        return MIGRATION_ERROR
+    if "downgrade" in combined and any(
+        kw in combined for kw in ("notimplementederror", "operationalerror")
+    ):
+        return MIGRATION_ERROR
 
     # Database / internal service unavailable — checked before provision failures because
     # PostgreSQL errors like "could not connect to server: Connection refused" contain

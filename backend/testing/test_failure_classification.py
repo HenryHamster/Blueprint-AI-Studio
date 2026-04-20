@@ -7,6 +7,7 @@ from app.failure_classification import (
     AGENT_TIMEOUT,
     CODE_ERROR,
     EXTERNAL_API,
+    MIGRATION_ERROR,
     PROVISION_FAILURE,
     RATE_LIMIT,
     SCOPE_OVERFLOW,
@@ -225,6 +226,42 @@ class TestClassifyFailureExternalApi:
     def test_database_error_is_external_api(self):
         assert classify_failure(_task("psycopg.OperationalError")) == EXTERNAL_API
         assert classify_failure(_task("asyncpg.exceptions.ConnectionFailure")) == EXTERNAL_API
+
+
+class TestClassifyFailureMigration:
+    @pytest.mark.parametrize("msg", [
+        "alembic.util.exc.CommandError: Can't locate revision identified by '0042abc'",
+        "RevisionError: revision 'abc123' not found",
+        "Multiple head revisions are present for given argument 'head'",
+        "Only a single head supported, found 2",
+        "Multiple heads are present in the migration history",
+        "psycopg.errors.UndefinedColumn: column tasks.new_field does not exist",
+        "asyncpg.exceptions.UndefinedColumnError: column does not exist",
+        "Schema version mismatch: expected 0042 got 0041",
+        "EXPECTED_SCHEMA_REVISION mismatch on startup",
+    ])
+    def test_migration_keywords(self, msg):
+        assert classify_failure(_task(msg)) == MIGRATION_ERROR
+
+    def test_downgrade_with_not_implemented(self):
+        msg = "alembic downgrade failed: NotImplementedError: no downgrade defined"
+        assert classify_failure(_task(msg)) == MIGRATION_ERROR
+
+    def test_downgrade_with_operational_error(self):
+        msg = "downgrade -1 raised OperationalError: column referenced by view"
+        assert classify_failure(_task(msg)) == MIGRATION_ERROR
+
+    def test_generic_db_error_not_migration(self):
+        """Plain psycopg connectivity errors must stay EXTERNAL_API."""
+        assert classify_failure(_task("psycopg.OperationalError: connection refused")) == EXTERNAL_API
+        assert classify_failure(_task("could not connect to server: timeout")) == EXTERNAL_API
+
+    def test_generic_operator_does_not_exist_not_migration(self):
+        assert classify_failure(_task("operator does not exist: text = int")) == EXTERNAL_API
+
+    def test_migration_taxonomy_is_code_defect(self):
+        t = _task("RevisionError: cannot locate")
+        assert classify_failure_taxonomy(t) == TAXONOMY_CODE_DEFECT
 
 
 class TestClassifyFailureRateLimit:

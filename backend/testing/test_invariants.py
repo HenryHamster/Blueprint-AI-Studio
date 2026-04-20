@@ -217,6 +217,168 @@ class TestSchemaRevisionSync:
             "crash on startup with UndefinedColumnError."
         )
 
+    def test_migration_column_types_match_models(self):
+        """Migration column types must be compatible with SQLModel definitions.
+
+        Catches auto-generation errors like declaring a JSONB field as sa.Text().
+        Comparison is by type family (String/Text compatible; JSONB must match
+        JSONB; Integer, Boolean, UUID, ARRAY must each match).
+        """
+        import glob as globmod
+        import re
+        from sqlmodel import SQLModel
+        from app import models  # noqa: F401
+
+        def family(name: str) -> str:
+            n = name.upper()
+            if n in {"STRING", "TEXT", "VARCHAR", "UNICODE", "UNICODETEXT",
+                     "AUTOSTRING", "CHAR", "NCHAR", "NVARCHAR"}:
+                return "STRING"
+            if n in {"INTEGER", "BIGINTEGER", "SMALLINTEGER", "INT"}:
+                return "INTEGER"
+            if n in {"UUID", "GUID"}:
+                return "UUID"
+            if n in {"DATETIME", "TIMESTAMP"}:
+                return "DATETIME"
+            if n in {"NUMERIC", "DECIMAL"}:
+                return "NUMERIC"
+            return n  # JSONB, JSON, BOOLEAN, FLOAT, DATE, ARRAY, ENUM, etc.
+
+        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
+
+        # Extract (table, col) -> type class name from migration files. Later files win.
+        add_col_re = re.compile(
+            r"add_column\(\s*['\"](\w+)['\"]\s*,\s*sa\.Column\(\s*['\"](\w+)['\"]\s*,"
+            r"\s*(?:sa|postgresql|sqlmodel\.sql\.sqltypes)\.(\w+)"
+        )
+        create_table_re = re.compile(r"create_table\(\s*['\"](\w+)['\"]", re.MULTILINE)
+        col_in_create_re = re.compile(
+            r"sa\.Column\(\s*['\"](\w+)['\"]\s*,"
+            r"\s*(?:sa|postgresql|sqlmodel\.sql\.sqltypes)\.(\w+)"
+        )
+
+        migration_types: dict[tuple[str, str], str] = {}
+        for path in files:
+            with open(path) as f:
+                content = f.read()
+            for m in add_col_re.finditer(content):
+                migration_types[(m.group(1), m.group(2))] = m.group(3)
+            for ct in create_table_re.finditer(content):
+                table = ct.group(1)
+                start, depth, end = ct.end(), 1, ct.end()
+                while end < len(content) and depth > 0:
+                    if content[end] == '(':
+                        depth += 1
+                    elif content[end] == ')':
+                        depth -= 1
+                    end += 1
+                for col_m in col_in_create_re.finditer(content[start:end]):
+                    migration_types[(table, col_m.group(1))] = col_m.group(2)
+
+        mismatches: list[str] = []
+        for table_name, table in SQLModel.metadata.tables.items():
+            for col in table.columns:
+                mig_type = migration_types.get((table_name, col.name))
+                if mig_type is None:
+                    continue  # covered by test_model_columns_covered_by_migrations
+                model_fam = family(type(col.type).__name__)
+                mig_fam = family(mig_type)
+                if model_fam != mig_fam:
+                    mismatches.append(
+                        f"  - {table_name}.{col.name}: model={type(col.type).__name__} "
+                        f"({model_fam}) vs migration={mig_type} ({mig_fam})"
+                    )
+
+        assert not mismatches, (
+            "Migration column types incompatible with models.py:\n"
+            + "\n".join(mismatches)
+            + "\n\nRegenerate the migration with the correct type to avoid runtime errors."
+        )
+
+    def test_model_indexes_covered_by_migrations(self):
+        """Every index defined on SQLModel metadata (both column-level
+        `index=True` and table-level `Index(...)` in `__table_args__`) must be
+        created by a migration. If an agent adds an index to models.py but
+        forgets the migration, queries silently fall back to sequential scans.
+
+        Scans migrations for `op.create_index(...)`, column-level `index=True`
+        inside `create_table`, and `op.drop_index(...)` to compute the effective
+        index set, then checks each metadata index against it.
+        """
+        import glob as globmod
+        import re
+        from sqlmodel import SQLModel
+        from app import models  # noqa: F401
+
+        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
+
+        # op.create_index('name', 'table', ['col', ...], ...) — handle optional op.f(...) wrapper
+        create_idx_re = re.compile(
+            r"create_index\(\s*(?:op\.f\(\s*)?['\"](\w+)['\"]\s*\)?\s*,"
+            r"\s*['\"](\w+)['\"]\s*,\s*\[([^\]]+)\]",
+            re.DOTALL,
+        )
+        drop_idx_re = re.compile(r"drop_index\(\s*(?:op\.f\(\s*)?['\"](\w+)['\"]")
+        create_table_re = re.compile(r"create_table\(\s*['\"](\w+)['\"]", re.MULTILINE)
+        col_start_re = re.compile(r"sa\.Column\(\s*['\"](\w+)['\"]")
+        str_re = re.compile(r"['\"](\w+)['\"]")
+
+        def _matched_block(text: str, start: int) -> str:
+            depth, end = 1, start
+            while end < len(text) and depth > 0:
+                if text[end] == '(':
+                    depth += 1
+                elif text[end] == ')':
+                    depth -= 1
+                end += 1
+            return text[start:end - 1]
+
+        idx_by_name: dict[str, tuple[str, frozenset[str]]] = {}
+        effective: set[tuple[str, frozenset[str]]] = set()
+
+        for path in files:
+            with open(path) as f:
+                content = f.read()
+            # Only consider upgrade() — drops in downgrade() must not cancel creates
+            content = content.split("def downgrade", 1)[0]
+
+            for m in create_idx_re.finditer(content):
+                name, table, cols_raw = m.group(1), m.group(2), m.group(3)
+                cols = frozenset(str_re.findall(cols_raw))
+                if cols:
+                    entry = (table, cols)
+                    idx_by_name[name] = entry
+                    effective.add(entry)
+
+            for ct in create_table_re.finditer(content):
+                table = ct.group(1)
+                block = _matched_block(content, ct.end())
+                for col_m in col_start_re.finditer(block):
+                    col_block = _matched_block(block, col_m.end())
+                    if re.search(r"\bindex\s*=\s*True\b", col_block):
+                        effective.add((table, frozenset([col_m.group(1)])))
+
+            for m in drop_idx_re.finditer(content):
+                target = idx_by_name.get(m.group(1))
+                if target:
+                    effective.discard(target)
+
+        missing: list[str] = []
+        for table_name, table in SQLModel.metadata.tables.items():
+            for idx in table.indexes:
+                cols = frozenset(c.name for c in idx.columns)
+                if (table_name, cols) not in effective:
+                    missing.append(f"  - {table_name}({', '.join(sorted(cols))}) [name={idx.name}]")
+
+        assert not missing, (
+            "Indexes defined on models but missing from alembic migrations:\n"
+            + "\n".join(missing)
+            + "\n\nAdd an op.create_index call to a migration for each missing "
+            "index, or queries will silently fall back to sequential scans."
+        )
+
 
 # ── Security Scanner Integrity ──────────────────────────────────────────────
 

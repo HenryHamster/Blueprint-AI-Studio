@@ -608,17 +608,63 @@ Output ONLY a JSON object in a \`\`\`json code fence:
         }
       } catch { /* ignore */ }
 
-      let existingMigrations = '';
+      let migrationFiles: string[] = [];
       try {
-        existingMigrations = git(['ls-tree', '-r', '--name-only', 'HEAD', ALEMBIC_VERSIONS_DIR])
-          .split('\n').filter(Boolean).sort().slice(-10).join('\n');
+        migrationFiles = git(['ls-tree', '-r', '--name-only', 'HEAD', ALEMBIC_VERSIONS_DIR])
+          .split('\n').filter(f => f && f.endsWith('.py') && !f.endsWith('__init__.py')).sort();
       } catch { /* ignore */ }
+      const existingMigrations = migrationFiles.slice(-10).join('\n');
+
+      // Pull full class definitions for any model class touched by the diff, so
+      // Claude can see exact column types and relationships (not just the diff).
+      let changedClassesContent = '';
+      try {
+        const fullModels = git(['show', `HEAD:${MODELS_PATH}`]);
+        const classNames = new Set<string>();
+        for (const m of modelsDiff.matchAll(/^@@[^@\n]*@@.*?\bclass\s+([A-Za-z_]\w*)/gm)) classNames.add(m[1]);
+        for (const m of modelsDiff.matchAll(/^[+\- ]\s*class\s+([A-Za-z_]\w*)\s*[(:]/gm)) classNames.add(m[1]);
+        if (classNames.size > 0) {
+          const lines = fullModels.split('\n');
+          const chunks: string[] = [];
+          for (const name of classNames) {
+            const start = lines.findIndex(l => new RegExp(`^class\\s+${name}\\b`).test(l));
+            if (start < 0) continue;
+            let end = lines.length;
+            for (let i = start + 1; i < lines.length; i++) {
+              if (/^(class|def)\s+\w+/.test(lines[i])) { end = i; break; }
+            }
+            chunks.push(lines.slice(start, end).join('\n').replace(/\n+$/, ''));
+          }
+          changedClassesContent = chunks.join('\n\n');
+        }
+      } catch { /* ignore */ }
+
+      // Pull the full content of the latest migration as a concrete example of
+      // the project's type-mapping / import / default conventions.
+      let latestMigrationPath = '';
+      let latestMigrationContent = '';
+      if (migrationFiles.length > 0) {
+        latestMigrationPath = migrationFiles[migrationFiles.length - 1];
+        try {
+          latestMigrationContent = git(['show', `HEAD:${latestMigrationPath}`]);
+        } catch { /* ignore */ }
+      }
 
       const migrationPrompt = `A code change modified ${MODELS_PATH} but did NOT add an alembic migration. Generate the missing migration and bump EXPECTED_SCHEMA_REVISION in backend/app/main.py.
 
 ## Diff of ${MODELS_PATH}
 \`\`\`diff
-${modelsDiff.slice(0, 8000)}
+${modelsDiff.slice(0, 6000)}
+\`\`\`
+
+## Full definitions of changed model class(es) (ground truth for column types)
+\`\`\`python
+${changedClassesContent ? changedClassesContent.slice(0, 6000) : '(no class definitions extracted — read ' + MODELS_PATH + ' directly)'}
+\`\`\`
+
+## Latest migration file${latestMigrationPath ? ` (${latestMigrationPath}) — follow these conventions for imports, type mappings, and server defaults` : ''}
+\`\`\`python
+${latestMigrationContent ? latestMigrationContent.slice(0, 4000) : '(none found)'}
 \`\`\`
 
 ## Recent migration files (for naming convention and down_revision)
