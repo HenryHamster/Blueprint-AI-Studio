@@ -523,6 +523,16 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       if (parts.length > 0) {
         dcLines.push(`Scope merge rates: ${parts.join(', ')}`);
       }
+      const crossParts: string[] = [];
+      for (const [scope, counts] of entries) {
+        const merged = Number(counts?.merged ?? 0);
+        const crossMerged = Number(counts?.merged_cross_module ?? 0);
+        if (merged < 1 || crossMerged < 1) continue;
+        crossParts.push(`${crossMerged} of ${merged} ${scope} merges touched 2+ directories`);
+      }
+      if (crossParts.length > 0) {
+        dcLines.push(`Cross-directory: ${crossParts.join('; ')} — multi-directory changes are proven to merge in this direction.`);
+      }
     }
     const priorAnalysis = Array.isArray(dirCtx.direction_prior_analysis)
       ? dirCtx.direction_prior_analysis as Array<Record<string, unknown>>

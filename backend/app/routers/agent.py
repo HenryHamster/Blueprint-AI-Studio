@@ -1147,11 +1147,12 @@ async def claim_task(
                         if not isinstance(counts, dict):
                             continue
                         agg_entry = scope_success_rates.setdefault(
-                            scope_name, {"created": 0, "merged": 0, "failed": 0}
+                            scope_name, {"created": 0, "merged": 0, "failed": 0, "merged_cross_module": 0}
                         )
                         agg_entry["created"] += int(counts.get("created", 0) or 0)
                         agg_entry["merged"] += int(counts.get("merged", 0) or 0)
                         agg_entry["failed"] += int(counts.get("failed", 0) or 0)
+                        agg_entry["merged_cross_module"] += int(counts.get("merged_cross_module", 0) or 0)
                 scope_success_rates = {
                     k: v for k, v in scope_success_rates.items() if v["created"] >= 1
                 }
@@ -1379,11 +1380,12 @@ async def claim_task(
                         if not isinstance(counts, dict):
                             continue
                         agg = research_scope_rates.setdefault(
-                            scope_name, {"created": 0, "merged": 0, "failed": 0}
+                            scope_name, {"created": 0, "merged": 0, "failed": 0, "merged_cross_module": 0}
                         )
                         agg["created"] += int(counts.get("created", 0) or 0)
                         agg["merged"] += int(counts.get("merged", 0) or 0)
                         agg["failed"] += int(counts.get("failed", 0) or 0)
+                        agg["merged_cross_module"] += int(counts.get("merged_cross_module", 0) or 0)
                 research_scope_rates = {k: v for k, v in research_scope_rates.items() if v["created"] >= 1}
                 research_top_review_issues = None
                 try:

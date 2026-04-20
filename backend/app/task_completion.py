@@ -76,7 +76,10 @@ async def _record_remediation_outcome(
     ctx = task.context or {}
     diagnosis_task_id = ctx.get("diagnosis_task_id")
     direction_id = ctx.get("direction_id")
-    if not diagnosis_task_id or not direction_id:
+    # diagnosis_task_id is optional — CI auto-remediation fixes may target a
+    # direction (by fingerprint match) without a prior investigation linkage.
+    # direction_id alone is sufficient to stamp the outcome.
+    if not direction_id:
         return False
     project = await session.get(Project, task.project_id)
     if not project:
@@ -95,7 +98,8 @@ async def _record_remediation_outcome(
     now_iso = _utcnow().isoformat()
     target["last_remediation_result"] = "merged" if merged else "failed"
     target["last_remediation_at"] = now_iso
-    target["last_remediation_diagnosis_task_id"] = str(diagnosis_task_id)
+    if diagnosis_task_id:
+        target["last_remediation_diagnosis_task_id"] = str(diagnosis_task_id)
     target["last_remediation_task_id"] = str(task.id)
     if fingerprint:
         target["last_remediation_fingerprint"] = str(fingerprint)

@@ -206,9 +206,11 @@ async def _handle_main_branch_ci_failure_inner(
         "ci_failure_type": failure_type,
         "trigger_failure_class": "CODE_ERROR",
     }
+    fingerprint: str | None = None
     if error_summary:
         from app.anomaly_detection import _error_fingerprint
-        task_context["_previous_error_fingerprint"] = _error_fingerprint(error_summary)
+        fingerprint = _error_fingerprint(error_summary)
+        task_context["_previous_error_fingerprint"] = fingerprint
     if prior_investigation is not None:
         task_context["prior_diagnosis_task_id"] = str(prior_investigation.id)
         # Propagate diagnosis linkage so _record_remediation_outcome can stamp
@@ -223,6 +225,16 @@ async def _handle_main_branch_ci_failure_inner(
             prior_fingerprint = prior_ctx.get("diagnosis_fingerprint") or prior_ctx.get("error_fingerprint")
             if prior_fingerprint:
                 task_context["diagnosis_fingerprint"] = str(prior_fingerprint)
+    # Fallback: no prior-investigation linkage, but if the CI error fingerprint
+    # matches an existing direction's fingerprint, stamp direction_id so the
+    # fix's outcome still reaches _record_remediation_outcome.
+    if "direction_id" not in task_context and fingerprint:
+        matched_direction_id = await _find_direction_by_fingerprint(
+            project_id=project_id, fingerprint=fingerprint, session=session,
+        )
+        if matched_direction_id:
+            task_context["direction_id"] = matched_direction_id
+            task_context["diagnosis_fingerprint"] = fingerprint
 
     task = Task(
         project_id=project_id,
@@ -321,6 +333,26 @@ async def _extract_ci_context(
         logger.warning("[AUTO-REMEDIATION] CI context extraction failed: %s", exc)
 
     return failed_checks, error_summary, failure_type
+
+
+async def _find_direction_by_fingerprint(
+    *,
+    project_id: uuid.UUID,
+    fingerprint: str,
+    session: AsyncSession,
+) -> str | None:
+    """Return a direction id whose error/last-remediation fingerprint matches."""
+    if not fingerprint:
+        return None
+    project = await session.get(Project, project_id)
+    if not project:
+        return None
+    for d in (project.directions or []):
+        if d.get("error_fingerprint") == fingerprint or d.get("last_remediation_fingerprint") == fingerprint:
+            did = d.get("id")
+            if did:
+                return str(did)
+    return None
 
 
 async def _find_matching_prior_investigation(
