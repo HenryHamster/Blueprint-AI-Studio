@@ -409,9 +409,9 @@ MODULE_SIZE_LIMITS = {
     "autonomous_research.py": 1600,
     "research_completion.py": 2050,
     "strategic_completion.py": 1500,
-    "rollup_management.py": 1550,
+    "rollup_management.py": 1600,
     "reaper.py": 1400,
-    "review_pipeline.py": 1200,
+    "review_pipeline.py": 1250,
     "deploy_health.py": 1000,
 }
 

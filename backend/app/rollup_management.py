@@ -1330,15 +1330,41 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         if fix_task:
                             logger.error(f"[ROLLUP] Merge blocked for rollup PR #{rollup_pr_number}, spawned fix → task {fix_task.id}")
                         else:
-                            parent.status = TaskStatus.FAILED
-                            parent.context = _clear_rollup_transient_state(parent.context)
-                            parent.latest_status_message = f"Rollup PR #{rollup_pr_number} merge blocked, fix not spawned (iteration cap)"
-                            from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
-                            _fc = classify_failure(parent)
-                            persist_failure_category(parent, _fc)
-                            _record_rollup_failure_signals(parent, _fc)
-                            await _maybe_create_failure_alert(parent, session, f"Rollup PR #{rollup_pr_number} merge blocked — fix iteration cap exhausted, manual intervention required")
-                            logger.warning(f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number}")
+                            from app.review_pipeline import (  # noqa: PLC0415
+                                SPAWN_REASON_KEY,
+                                SPAWN_REASON_DEFERRED,
+                                SPAWN_REASON_DEDUP,
+                                SPAWN_REASON_ALREADY_MERGED,
+                            )
+                            spawn_reason = (parent.context or {}).get(SPAWN_REASON_KEY)
+                            if spawn_reason in (SPAWN_REASON_DEFERRED, SPAWN_REASON_DEDUP):
+                                # Another review/fix is in flight on this PR — leave
+                                # parent EVALUATING; next rollup sweep retries once the
+                                # in-flight task finishes. latest_status_message was
+                                # already set by _spawn_pipeline_task.
+                                logger.info(
+                                    f"[ROLLUP] Fix spawn deferred for rollup PR #{rollup_pr_number} "
+                                    f"({spawn_reason}) — leaving parent EVALUATING, next sweep retries"
+                                )
+                            elif spawn_reason == SPAWN_REASON_ALREADY_MERGED:
+                                # PR merged while we were preparing the fix — no-op.
+                                logger.info(
+                                    f"[ROLLUP] PR #{rollup_pr_number} merged mid-flight — no fix needed"
+                                )
+                            else:
+                                # cap / stuck / unknown — terminal.
+                                parent.status = TaskStatus.FAILED
+                                parent.context = _clear_rollup_transient_state(parent.context)
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{rollup_pr_number} merge blocked, fix not spawned "
+                                    f"({spawn_reason or 'unknown'})"
+                                )
+                                from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
+                                _fc = classify_failure(parent)
+                                persist_failure_category(parent, _fc)
+                                _record_rollup_failure_signals(parent, _fc)
+                                await _maybe_create_failure_alert(parent, session, f"Rollup PR #{rollup_pr_number} merge blocked — fix iteration cap exhausted, manual intervention required")
+                                logger.warning(f"[ROLLUP] WARNING: Rollup fix spawn returned None for PR #{rollup_pr_number} (reason={spawn_reason})")
                             # NOTE: Do NOT delete staging_branch here — it contains
                             # all merged child work and requeueing should be possible.
                 else:
@@ -1371,15 +1397,38 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     if review_task:
                         logger.info(f"[ROLLUP] Spawned review for rollup PR #{rollup_pr_number} → task {review_task.id}")
                     else:
-                        parent.status = TaskStatus.FAILED
-                        parent.context = _clear_rollup_transient_state(parent.context)
-                        parent.latest_status_message = f"Rollup PR #{rollup_pr_number} created but review not spawned (iteration cap)"
-                        from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
-                        _fc = classify_failure(parent)
-                        persist_failure_category(parent, _fc)
-                        _record_rollup_failure_signals(parent, _fc)
-                        await _maybe_create_failure_alert(parent, session, f"Rollup PR #{rollup_pr_number} created but review task could not be spawned — iteration cap exhausted")
-                        logger.warning(f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number}")
+                        from app.review_pipeline import (  # noqa: PLC0415
+                            SPAWN_REASON_KEY,
+                            SPAWN_REASON_DEFERRED,
+                            SPAWN_REASON_DEDUP,
+                            SPAWN_REASON_ALREADY_MERGED,
+                        )
+                        spawn_reason = (parent.context or {}).get(SPAWN_REASON_KEY)
+                        if spawn_reason in (SPAWN_REASON_DEFERRED, SPAWN_REASON_DEDUP):
+                            # An active review/fix already owns this PR — leave parent
+                            # EVALUATING; next rollup sweep retries. latest_status_message
+                            # was already set by _spawn_pipeline_task.
+                            logger.info(
+                                f"[ROLLUP] Review spawn deferred for rollup PR #{rollup_pr_number} "
+                                f"({spawn_reason}) — leaving parent EVALUATING, next sweep retries"
+                            )
+                        elif spawn_reason == SPAWN_REASON_ALREADY_MERGED:
+                            logger.info(
+                                f"[ROLLUP] PR #{rollup_pr_number} merged mid-flight — no review needed"
+                            )
+                        else:
+                            parent.status = TaskStatus.FAILED
+                            parent.context = _clear_rollup_transient_state(parent.context)
+                            parent.latest_status_message = (
+                                f"Rollup PR #{rollup_pr_number} created but review not spawned "
+                                f"({spawn_reason or 'unknown'})"
+                            )
+                            from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
+                            _fc = classify_failure(parent)
+                            persist_failure_category(parent, _fc)
+                            _record_rollup_failure_signals(parent, _fc)
+                            await _maybe_create_failure_alert(parent, session, f"Rollup PR #{rollup_pr_number} created but review task could not be spawned — iteration cap exhausted")
+                            logger.warning(f"[ROLLUP] WARNING: Rollup review spawn returned None for PR #{rollup_pr_number} (reason={spawn_reason})")
                         # NOTE: Do NOT delete staging_branch here — it contains
                         # all merged child work and requeueing should be possible.
             except Exception as e:

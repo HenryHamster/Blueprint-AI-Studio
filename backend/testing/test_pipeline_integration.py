@@ -21,6 +21,10 @@ from app.review_pipeline import (
     _spawn_pipeline_task,
     MAX_REVIEW_FIX_ITERATIONS,
     PIPELINE_TASK_STALE_MINUTES,
+    SPAWN_REASON_KEY,
+    SPAWN_REASON_DEFERRED,
+    SPAWN_REASON_DEDUP,
+    SPAWN_REASON_SPAWNED,
 )
 
 
@@ -2621,3 +2625,172 @@ async def test_dedup_review_deferred_while_fix_active(
     assert alive_fix.status == TaskStatus.IN_PROGRESS, (
         "The running fix must not be cancelled when a review is deferred"
     )
+
+    assert (source.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_DEFERRED, (
+        "Deferred-cross-type return must record its reason on source_task.context "
+        "so rollup callers can distinguish defer (retry later) from cap (terminal)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_sources_cross_chain_dedup_on_shared_pr(
+    client: AsyncClient, db_session, mocker
+):
+    """Two rollup parents targeting the same rollup PR must dedup by PR number
+    (not by chain) — otherwise each parent independently spawns its own fix
+    task for the shared PR, and we end up with duplicate agents racing on the
+    same branch.
+
+    Scenario: parent A (rollup source) just spawned fix F for PR #7000. ~16s
+    later, parent B (also rollup source, different chain) enters rollup logic
+    for the same PR #7000 and calls _spawn_pipeline_task("fix"). The dedup
+    must see F as same-type active and return (F, False) rather than
+    greenlighting a duplicate spawn.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    project = Project(name="Rollup dedup test", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Parent A: rollup source that already spawned a fix for PR #7000.
+    parent_a = Task(
+        project_id=project.id,
+        payloads=[{"type": "perf", "prompt": "x", "base_branch": "research/abc"}],
+        context={"_is_rollup_review": True, "rollup_pr_number": 7000},
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(parent_a)
+    await db_session.commit()
+    await db_session.refresh(parent_a)
+
+    # The fix task parent_a spawned — chain keyed off parent_a.id.
+    fix_from_a = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "fix",
+            "pr_number": 7000,
+            "branch": "research/abc",
+            "base_branch": "main",
+            "original_task_id": str(parent_a.id),
+        }],
+        vm_instance_id="agent-fix-a",
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=_naive_utcnow(),
+    )
+    db_session.add(fix_from_a)
+    await db_session.commit()
+    await db_session.refresh(fix_from_a)
+
+    # Parent B: different rollup source, different chain, same PR.
+    parent_b = Task(
+        project_id=project.id,
+        payloads=[{"type": "perf", "prompt": "y", "base_branch": "research/abc"}],
+        context={"_is_rollup_review": True, "rollup_pr_number": 7000},
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(parent_b)
+    await db_session.commit()
+    await db_session.refresh(parent_b)
+
+    result, was_created = await _spawn_pipeline_task(
+        parent_b, "fix", db_session, 7000, "research/abc", "main",
+        fix_prompt="resolve conflicts",
+        original_task_id=str(parent_b.id),  # different chain from fix_from_a
+    )
+    await db_session.commit()
+
+    # Cross-chain dedup hit: return the existing fix, no new task.
+    assert result is not None, "Expected existing fix task (dedup hit)"
+    assert result.id == fix_from_a.id, "Expected fix_from_a as the dedup target"
+    assert was_created is False, "Must NOT create a duplicate fix"
+
+    await db_session.refresh(parent_b)
+    assert (parent_b.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_DEDUP
+
+
+@pytest.mark.asyncio
+async def test_non_rollup_sources_preserve_chain_based_dedup(
+    client: AsyncClient, db_session, mocker
+):
+    """Sanity check: non-rollup sources still require same-chain match. If a
+    fix is running on chain A, a non-rollup source on chain B must NOT dedup
+    against it (they're unrelated — different PRs normally, but if PR numbers
+    happen to match for some reason, chain isolation is the safety net)."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch("app.review_pipeline.broadcast_to_project")
+
+    project = Project(name="Non-rollup dedup test", user_id="user1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    create_a = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "a"}],
+        status=TaskStatus.COMPLETED,
+    )
+    create_b = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "b"}],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add_all([create_a, create_b])
+    await db_session.commit()
+    await db_session.refresh(create_a)
+    await db_session.refresh(create_b)
+
+    # Fix on chain A for PR #8001
+    fix_a = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "fix",
+            "pr_number": 8001,
+            "branch": "blueprint/task-a",
+            "base_branch": "main",
+            "original_task_id": str(create_a.id),
+        }],
+        vm_instance_id="agent-fix-a",
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=_naive_utcnow(),
+    )
+    db_session.add(fix_a)
+    await db_session.commit()
+    await db_session.refresh(fix_a)
+
+    # Source on chain B — not a rollup source. Same PR number is an edge case
+    # (shouldn't happen in normal flow) but we verify isolation regardless.
+    source_b = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "pr_number": 8001,
+            "branch": "blueprint/task-b",
+            "base_branch": "main",
+            "original_task_id": str(create_b.id),
+        }],
+        context={},  # no _is_rollup_review
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(source_b)
+    await db_session.commit()
+    await db_session.refresh(source_b)
+
+    result, was_created = await _spawn_pipeline_task(
+        source_b, "fix", db_session, 8001, "blueprint/task-b", "main",
+        fix_prompt="fix b",
+        original_task_id=str(create_b.id),
+    )
+    await db_session.commit()
+
+    # Different chain + not rollup → dedup skipped, fresh fix spawned.
+    assert result is not None
+    assert result.id != fix_a.id
+    assert was_created is True
+    await db_session.refresh(source_b)
+    assert (source_b.context or {}).get(SPAWN_REASON_KEY) == SPAWN_REASON_SPAWNED

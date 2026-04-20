@@ -558,6 +558,24 @@ async def _handle_cap_exhaustion(
         logger.warning(f"[PIPELINE] Cap-exhaustion: convergence investigation spawn failed for PR #{pr_number}: {e}", exc_info=True)
 
 
+SPAWN_REASON_KEY = "_last_pipeline_spawn_reason"
+# Reason codes written to ``source_task.context[SPAWN_REASON_KEY]`` by
+# ``_spawn_pipeline_task``. Rollup callers read this to distinguish
+# transient deferrals (retry next sweep) from terminal failures.
+SPAWN_REASON_SPAWNED = "spawned"
+SPAWN_REASON_DEDUP = "dedup_same_type"
+SPAWN_REASON_ALREADY_MERGED = "already_merged"
+SPAWN_REASON_DEFERRED = "deferred_cross_type"
+SPAWN_REASON_CAP = "cap_exhausted"
+SPAWN_REASON_STUCK = "stuck_cycle"
+
+
+def _set_spawn_reason(task: Task, reason: str) -> None:
+    ctx = dict(task.context or {})
+    ctx[SPAWN_REASON_KEY] = reason
+    task.context = ctx
+
+
 async def _spawn_pipeline_task(
     source_task: Task, task_type: str, session: AsyncSession,
     pr_number: int, branch: str, base_branch: str,
@@ -576,6 +594,10 @@ async def _spawn_pipeline_task(
                                    is running and the caller asked for a review)
                                 Caller must decide follow-up (retry later, mark
                                 for manual approval, etc.).
+                                The specific reason is written to
+                                ``source_task.context[SPAWN_REASON_KEY]`` so
+                                callers can distinguish transient defers from
+                                terminal caps without string-matching messages.
     - (existing_task, False) → same-type dedup hit: a review/fix of the SAME
                                 task_type is already running on the same chain
                                 and is still alive (has heartbeated recently).
@@ -605,12 +627,15 @@ async def _spawn_pipeline_task(
         if orig_task and (orig_task.context or {}).get("pr_merged"):
             logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (original task {resolved_original_id[:8]})")
             source_task.latest_status_message = f"PR #{pr_number} already merged — skipping {task_type}"
+            _set_spawn_reason(source_task, SPAWN_REASON_ALREADY_MERGED)
             session.add(source_task)
             return (None, False)
     except Exception:
         logger.debug(f"[PIPELINE] Could not verify pr_merged for original task {resolved_original_id[:8]}: skipping check")
     if (source_task.context or {}).get("pr_merged"):
         logger.info(f"[PIPELINE] Skipping {task_type} spawn for PR #{pr_number} — PR already merged (source task)")
+        _set_spawn_reason(source_task, SPAWN_REASON_ALREADY_MERGED)
+        session.add(source_task)
         return (None, False)
 
     # Dedup guard for active pipeline tasks on this PR/chain. The match axes are
@@ -627,6 +652,13 @@ async def _spawn_pipeline_task(
     #       review auto-spawns once the fix pushes.
     #     * any other cross-type combo ⇒ return (None, False) and let the caller
     #       retry on the next tick; no silent substitution.
+    #
+    # Rollup exception: rollup PRs aggregate subtasks whose parents each run
+    # their own rollup logic. When two rollup parents target the same PR, they
+    # each pass ``original_task_id=str(parent.id)`` — different chains, but the
+    # SAME rollup PR. Gate dedup on PR-number only in that case so we don't
+    # double-spawn review/fix for the shared PR.
+    is_rollup_source = bool((source_task.context or {}).get("_is_rollup_review"))
     active_pipeline = (await session.execute(
         select(Task).where(
             Task.project_id == source_task.project_id,
@@ -640,8 +672,9 @@ async def _spawn_pipeline_task(
         t_type = t_payload.get("type")
         t_orig = t_payload.get("original_task_id") or ""
         if (t_payload.get("pr_number") != pr_number
-                or t_type not in ("review", "fix")
-                or t_orig != resolved_original_id):
+                or t_type not in ("review", "fix")):
+            continue
+        if not is_rollup_source and t_orig != resolved_original_id:
             continue
 
         if _is_pipeline_task_stale(t):
@@ -669,6 +702,7 @@ async def _spawn_pipeline_task(
                 f"{task_type.title()} skipped for PR #{pr_number} — "
                 f"{t_type} active → {str(t.id)[:8]}"
             )
+            _set_spawn_reason(source_task, SPAWN_REASON_DEDUP)
             session.add(source_task)
             return (t, False)
 
@@ -695,6 +729,7 @@ async def _spawn_pipeline_task(
             f"{task_type.title()} deferred for PR #{pr_number} — "
             f"waiting on active {t_type} task {str(t.id)[:8]}"
         )
+        _set_spawn_reason(source_task, SPAWN_REASON_DEFERRED)
         session.add(source_task)
         return (None, False)
 
@@ -754,6 +789,8 @@ async def _spawn_pipeline_task(
             source_task, resolved_original_id, pr_number, pr_iterations, session,
             scope="global",
         )
+        _set_spawn_reason(source_task, SPAWN_REASON_CAP)
+        session.add(source_task)
         return (None, False)
 
     # Track review-fix iteration count to prevent infinite loops (per-chain)
@@ -767,6 +804,8 @@ async def _spawn_pipeline_task(
             source_task, resolved_original_id, pr_number, per_chain_cap, session,
             scope="per-chain",
         )
+        _set_spawn_reason(source_task, SPAWN_REASON_CAP)
+        session.add(source_task)
         return (None, False)
 
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
@@ -944,6 +983,8 @@ async def _spawn_pipeline_task(
                     f"[PIPELINE] Failed to mark stuck cycle on {resolved_original_id}: {e}",
                     exc_info=True,
                 )
+            _set_spawn_reason(source_task, SPAWN_REASON_STUCK)
+            session.add(source_task)
             return (None, False)
 
         # Issue-churn detection: complements stuck-cycle above. If total
@@ -1154,4 +1195,6 @@ async def _spawn_pipeline_task(
 
     await broadcast_to_project(str(source_task.project_id), "task_updated",
                                {"task_id": str(new_task.id), "status": TaskStatus.QUEUED})
+    _set_spawn_reason(source_task, SPAWN_REASON_SPAWNED)
+    session.add(source_task)
     return (new_task, True)
