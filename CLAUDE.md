@@ -28,3 +28,30 @@
 - `task.first_payload` is the standard accessor for the first payload element (not `(task.payloads or [{}])[0]`)
 - Always run tests before finishing: backend uses Docker (`bash scripts/test-backend.sh`), frontend: `cd admin-ui && npm run build`
 - New admin endpoints need `@require_project_access` or `@require_role` decorators
+
+## Generating Code for One Language From Another
+When one language generates source code for a different language
+(e.g. Python emitting a bash script, bash embedding a Python heredoc,
+TypeScript emitting a shell helper), escape semantics compound across
+every layer. `\n`, `\\`, and `\"` in the generator's source do NOT mean
+the same thing in the generated output, and silent mis-nesting is one
+of the hardest bug classes to diagnose — the generated output looks
+almost-right to the eye while being invalid to the embedded language.
+
+- **Avoid multi-line heredocs of another language inside a generator
+  string.** Two layers of escape (generator → embedded) is already
+  risky; three (generator → bash → embedded) is where production bugs
+  live.
+- **Preferred pattern:** the embedded script lives as a real file
+  (`.py`, `.js`, etc.) in the repo — directly lintable, directly
+  testable. The generator reads that file at module-load time,
+  base64-encodes it, and emits an invocation like
+  `echo '<blob>' | base64 -d > /tmp/foo.py; python3 /tmp/foo.py ...`.
+  Base64 is ASCII-safe so no character in the embedded script needs
+  to survive any escape pass.
+- **Short one-liners are fine** (`python3 -c '...'`, `jq '...'`,
+  `node -e '...'`) when the body is single-line and uses no backslash
+  escapes — the risk is in multi-line + backslash combinations.
+- When a test harness exists for generated shell (bash -n, shellcheck,
+  pattern checks), register new generators there rather than assuming
+  they'll be inspected manually.

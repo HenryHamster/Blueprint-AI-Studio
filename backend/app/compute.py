@@ -147,6 +147,16 @@ VPC_SUBNET = os.getenv("VPC_SUBNET", "agent-sandbox-subnet")
 # The base image for our agent
 AGENT_IMAGE_FAMILY = os.getenv("AGENT_IMAGE_FAMILY", f"projects/{GCP_PROJECT_ID}/global/images/family/blueprint-agent-v2")
 
+# Scripts baked into the startup script as base64 blobs. Loaded at module
+# import time so a missing file fails fast instead of during VM provisioning.
+# See backend/app/_agent_scripts/__init__.py for rationale.
+import base64 as _base64  # noqa: E402, PLC0415
+
+_AGENT_SCRIPTS_DIR = Path(__file__).parent / "_agent_scripts"
+_MATERIALIZE_MANIFEST_B64 = _base64.b64encode(
+    (_AGENT_SCRIPTS_DIR / "materialize_manifest.py").read_bytes()
+).decode("ascii")
+
 # The URL where the agent can reach this orchestrator
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8080")
 
@@ -803,76 +813,32 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     _send_beacon "PROVISION_PROGRESS: creds fetched, entering env setup" "$EARLY_TOKEN"
 
     # 3. Materialize the manifest into the env file and any auth/config files.
-    # Run python manifest block inside an `if` so bash's ERR trap doesn't
-    # fire on non-zero exit — ERR ignores commands in if-test position. This
-    # lets us capture stderr into LAST_STAGE_STDERR before re-triggering
-    # the trap. Previously `set +e` did NOT suppress ERR (bash fires ERR
-    # on any non-zero exit unless the command is in test/list context), so
-    # the manifest python block's failure killed the script silently
-    # without stderr in the heartbeat — observed in task 4ee24ed6.
+    # The materialize_manifest.py source is a real file under
+    # backend/app/_agent_scripts, embedded here as base64 to bypass the
+    # f-string escape mangling that burned task 0bcfd031 / c94d6d9b — a
+    # nested Python-in-bash heredoc had its `\n` and `\\` backslashes
+    # silently corrupted by Python's f-string interpolation, producing
+    # SyntaxError on every VM. Base64 is ASCII-safe: no escape ambiguity.
     MANIFEST_PATH=/tmp/agent_secret_manifest.json
     PY_STDERR=/tmp/agent_manifest_py.err
+    MATERIALIZE_PY=/tmp/materialize_manifest.py
     printf '%s' "$CREDS" > "$MANIFEST_PATH"
+    echo '{_MATERIALIZE_MANIFEST_B64}' | base64 -d > "$MATERIALIZE_PY"
     PY_EXIT=0
-    # `timeout 60` bounds the python block against hangs that bypass ERR:
-    # NSS lookups (pwd.getpwnam) can block for minutes on a broken stack,
-    # with no exception, no exit, no signal — observed in task 23889608.
-    # exit=124 from GNU timeout signals we hit the wall.
-    if timeout 60 python3 - "$MANIFEST_PATH" /etc/agent.env 2>"$PY_STDERR" <<'PY'
-import json
-import os
-import pathlib
-import sys
-
-manifest_path, env_path = sys.argv[1], sys.argv[2]
-with open(manifest_path, "r", encoding="utf-8") as fh:
-    manifest = json.load(fh)
-
-env = manifest.get("env", {{}})
-with open(env_path, "w", encoding="utf-8") as env_file:
-    for key, value in env.items():
-        if value is None:
-            continue
-        rendered = str(value).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
-        env_file.write(f'{{key}}="{{rendered}}"\n')
-
-# Bypass NSS for user lookup. pwd.getpwnam / grp.getgrnam go through
-# getent which honors /etc/nsswitch.conf; a broken NSS source (LDAP,
-# sss, systemd-resolved) blocks for many minutes with no exception —
-# exactly the silent-hang we observed on image family v2. /etc/passwd
-# + /etc/group are flat files that can't block.
-def _lookup(path, user):
-    with open(path) as fh:
-        for line in fh:
-            if line.startswith(user + ":"):
-                return int(line.strip().split(":")[2])
-    raise RuntimeError("user {{0}} missing from {{1}}".format(user, path))
-
-uid = _lookup("/etc/passwd", "agent")
-gid = _lookup("/etc/group", "agent")
-
-for item in manifest.get("files", []):
-    path = pathlib.Path(item["path"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(item.get("content", ""), encoding="utf-8")
-    os.chmod(path, int(item.get("mode", "0600"), 8))
-    os.chown(path, uid, gid)
-os.chmod(env_path, 0o600)
-PY
-    then
+    # `timeout 60` bounds the python block against hangs that bypass ERR
+    # (a broken NSS module can block pwd.getpwnam for minutes with no
+    # exception, no exit, no signal). exit=124 from timeout signals the
+    # wall; the `if` test-position prevents bash from firing ERR on the
+    # non-zero exit, so we can capture stderr before re-raising.
+    if timeout 60 python3 "$MATERIALIZE_PY" "$MANIFEST_PATH" /etc/agent.env 2>"$PY_STDERR"; then
       :  # success — fall through
     else
       PY_EXIT=$?
-      # Python block failed — capture stderr into LAST_STAGE_STDERR so the
-      # ERR trap's heartbeat carries the actual traceback. The `if !` above
-      # suppresses the automatic ERR trap on non-zero python exit, so we
-      # set LAST_STAGE_STDERR and fire `false` to trigger the trap
-      # deliberately, with the traceback attached.
-      LAST_STAGE_STDERR="python manifest exit=$PY_EXIT: $(cat "$PY_STDERR" 2>/dev/null || echo 'no stderr')"
-      rm -f "$MANIFEST_PATH" "$PY_STDERR"
+      LAST_STAGE_STDERR="materialize_manifest exit=$PY_EXIT: $(cat "$PY_STDERR" 2>/dev/null || echo 'no stderr')"
+      rm -f "$MANIFEST_PATH" "$PY_STDERR" "$MATERIALIZE_PY"
       false  # trigger ERR trap now, _report_failure has EARLY_TOKEN + stderr
     fi
-    rm -f "$MANIFEST_PATH" "$PY_STDERR"
+    rm -f "$MANIFEST_PATH" "$PY_STDERR" "$MATERIALIZE_PY"
 
     # Beacon B — env file materialized. Distinguishes "python manifest
     # block hung" from later-step hangs. Uses the token from the just-written

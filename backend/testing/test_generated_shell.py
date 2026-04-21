@@ -75,6 +75,9 @@ def _render_compute_startup_script() -> str:
         # Base64 of a valid GCS URI so the `echo ... | base64 -d` round-trips
         "payload_uri_b64": "Z3M6Ly9idWNrZXQvb2JqZWN0",
         "GCP_PROJECT_ID": "test-project",
+        # Use the real embedded base64 of materialize_manifest.py so the
+        # rendered script's `base64 -d` would produce valid Python.
+        "_MATERIALIZE_MANIFEST_B64": compute._MATERIALIZE_MANIFEST_B64,
     }
     return body.format(**placeholders)
 
@@ -272,6 +275,62 @@ class TestGeneratedShellContract:
             f"comment)."
         )
 
+    def test_no_multi_line_embedded_non_bash_code(self, gen: ShellGenerator):
+        """Regression: the single worst class of bug we shipped (task
+        0bcfd031 / c94d6d9b post-mortem) came from embedding a multi-line
+        Python heredoc inside a bash heredoc inside a Python f-string.
+        Three levels of escape interpretation, silently mis-nested, broke
+        every VM with a SyntaxError we never saw because the ERR path
+        also got corrupted in the same pass.
+
+        Rule: generated bash may contain SHORT (one-line) ``python3 -c``,
+        ``node -e``, ``jq`` etc., but NOT multi-line heredocs of another
+        language. Embed such scripts as real .py/.js files loaded via
+        base64 (see _agent_scripts/materialize_manifest.py for the
+        pattern).
+
+        We flag any ``<<'MARKER'`` heredoc whose body is identified as
+        Python, JS, or Ruby (by imports / require / similar).
+        """
+        script = gen.render()
+        # Find every heredoc: ``<<'MARKER'`` through a line starting with
+        # MARKER (optionally indented). Body is everything between.
+        heredoc_pat = re.compile(
+            r"<<'([A-Z_][A-Z0-9_]*)'\s*\n(.*?)\n\s*\1\s*$",
+            re.MULTILINE | re.DOTALL,
+        )
+        offenders = []
+        for m in heredoc_pat.finditer(script):
+            marker = m.group(1)
+            body = m.group(2)
+            # Skip trivial heredocs (JSON, short bash, etc.)
+            if body.count("\n") < 2:
+                continue
+            # Language fingerprints — these are cheap and specific
+            is_python = any(
+                token in body
+                for token in (
+                    "\nimport ", "\nfrom ",
+                    "def ", "print(", "sys.argv", "__name__",
+                )
+            )
+            is_node = any(
+                token in body for token in ("require(", "console.log", "=>")
+            )
+            lang = "python" if is_python else "node" if is_node else None
+            if lang:
+                offenders.append((marker, lang, body[:80]))
+        assert not offenders, (
+            f"{gen.name}: detected multi-line embedded {', '.join(l for _, l, _ in offenders)} "
+            f"heredocs in generated bash. Escape semantics across 3 layers "
+            f"(generator→bash→embedded-lang) are a landmine that has bitten "
+            f"us in production (see 0bcfd031 / c94d6d9b post-mortems).\n"
+            f"Fix: move the embedded code to a real .py/.js file under a "
+            f"scripts dir and load it via base64 (see "
+            f"backend/app/_agent_scripts/materialize_manifest.py). Offenders:\n"
+            + "\n".join(f"  <<'{m}' ({lang}): {preview!r}..." for m, lang, preview in offenders)
+        )
+
 
 # ---------------------------------------------------------------------------
 # compute.startup_script-specific expectations
@@ -314,14 +373,16 @@ class TestComputeStartupScriptBeacons:
         assert "if ! python3 " not in script and "if ! timeout " not in script, (
             "python manifest `if` is inverted — success triggers failure path"
         )
-        # Positive form must be present. Accept either `if python3 - ` or
-        # `if timeout N python3 - ` (we wrap in `timeout` to bound hangs).
+        # Positive form must be present. After the 0bcfd031 refactor the
+        # manifest python lives in a separate file, invoked as
+        # `timeout 60 python3 $MATERIALIZE_PY ...`. Accept that form OR
+        # the older `if python3 - ...` inline form.
         has_positive = (
             "if python3 - " in script
-            or re.search(r"if\s+timeout\s+\d+\s+python3\s+-\s+", script) is not None
+            or re.search(r"if\s+timeout\s+\d+\s+python3\s", script) is not None
         )
         assert has_positive, (
-            "expected `if python3 - ...` or `if timeout N python3 - ...` "
+            "expected an `if python3 ...; then ...; else ...; fi` guard "
             "around the manifest block"
         )
 
