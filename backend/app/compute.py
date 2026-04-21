@@ -803,15 +803,18 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     _send_beacon "PROVISION_PROGRESS: creds fetched, entering env setup" "$EARLY_TOKEN"
 
     # 3. Materialize the manifest into the env file and any auth/config files.
-    # Run python manifest block outside set -e so we can capture stderr for
-    # the heartbeat before triggering the ERR trap. Previously a python
-    # exception killed the script silently because /etc/agent.env didn't
-    # exist yet and _report_failure's TOKEN lookup returned empty.
+    # Run python manifest block inside an `if` so bash's ERR trap doesn't
+    # fire on non-zero exit — ERR ignores commands in if-test position. This
+    # lets us capture stderr into LAST_STAGE_STDERR before re-triggering
+    # the trap. Previously `set +e` did NOT suppress ERR (bash fires ERR
+    # on any non-zero exit unless the command is in test/list context), so
+    # the manifest python block's failure killed the script silently
+    # without stderr in the heartbeat — observed in task 4ee24ed6.
     MANIFEST_PATH=/tmp/agent_secret_manifest.json
     PY_STDERR=/tmp/agent_manifest_py.err
     printf '%s' "$CREDS" > "$MANIFEST_PATH"
-    set +e
-    python3 - "$MANIFEST_PATH" /etc/agent.env 2>"$PY_STDERR" <<'PY'
+    PY_EXIT=0
+    if ! python3 - "$MANIFEST_PATH" /etc/agent.env 2>"$PY_STDERR" <<'PY'
 import json
 import os
 import pathlib
@@ -841,15 +844,18 @@ for item in manifest.get("files", []):
     os.chown(path, uid, gid)
 os.chmod(env_path, 0o600)
 PY
-    PY_EXIT=$?
-    set -e
-    if [ $PY_EXIT -ne 0 ]; then
+    then
+      :  # success — fall through
+    else
+      PY_EXIT=$?
       # Python block failed — capture stderr into LAST_STAGE_STDERR so the
-      # ERR trap's heartbeat carries the actual traceback instead of "died
-      # silently at line N". Previously this path poweroff'd with no signal.
+      # ERR trap's heartbeat carries the actual traceback. The `if !` above
+      # suppresses the automatic ERR trap on non-zero python exit, so we
+      # set LAST_STAGE_STDERR and fire `false` to trigger the trap
+      # deliberately, with the traceback attached.
       LAST_STAGE_STDERR="python manifest exit=$PY_EXIT: $(cat "$PY_STDERR" 2>/dev/null || echo 'no stderr')"
       rm -f "$MANIFEST_PATH" "$PY_STDERR"
-      false  # trigger ERR trap, _report_failure now has EARLY_TOKEN + stderr
+      false  # trigger ERR trap now, _report_failure has EARLY_TOKEN + stderr
     fi
     rm -f "$MANIFEST_PATH" "$PY_STDERR"
 
