@@ -37,7 +37,7 @@ resource "random_password" "db_password" {
 resource "google_alloydb_cluster" "default" {
   cluster_id = "orchestrator-alloydb-${random_id.cluster_id_suffix.hex}"
   location   = var.region
-  
+
   network_config {
     network = google_compute_network.agent_vpc.id
   }
@@ -46,7 +46,7 @@ resource "google_alloydb_cluster" "default" {
     user     = "postgres"
     password = random_password.db_password.result
   }
-  
+
   # Ensure the private connection is established before creating the cluster
   depends_on = [google_service_networking_connection.vpc_connection]
 }
@@ -55,9 +55,19 @@ resource "google_alloydb_instance" "primary" {
   cluster       = google_alloydb_cluster.default.name
   instance_id   = "orchestrator-alloydb-primary"
   instance_type = "PRIMARY"
-  
+
   machine_config {
     cpu_count = 2 # Minimum vCPUs for AlloyDB
+  }
+
+  # pgaudit logs DDL, role, and write statements (skips SELECT to keep log
+  # volume sane). Enabling the extension requires an instance restart on
+  # first apply. password.enforce_complexity gates future CREATE/ALTER ROLE
+  # statements; existing generated credentials are unaffected.
+  database_flags = {
+    "alloydb.enable_pgaudit"      = "on"
+    "pgaudit.log"                 = "ddl,role,write"
+    "password.enforce_complexity" = "on"
   }
 }
 
