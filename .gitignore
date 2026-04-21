@@ -27,3 +27,6 @@ backend/CLAUDE.md
 /strategic
 /suggest
 research-*.md
+
+# Local git worktrees spawned by Claude Code — never commit as gitlinks
+.claude/worktrees/
