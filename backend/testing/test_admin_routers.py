@@ -1537,7 +1537,7 @@ class TestDirectionAutoPauseStats:
         db_session.add(project)
         await db_session.commit()
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         # Current window (last 24h): 3 auto-paused, 1 auto-retired
         def _msg(hours_ago: float, milestone: str, reason: str):
             m = ProjectMessage(

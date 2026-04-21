@@ -402,9 +402,13 @@ async def test_post_auto_fix_spawned_message_many_checks(db_session):
 
 @pytest.mark.asyncio
 async def test_post_auto_fix_result_merged(db_session):
-    project_id = uuid.uuid4()
+    # Real project required: post_auto_fix_result_message does session.get(Project)
+    # which autoflushes the pending msg → FK violation if no project exists.
+    project = Project(name="Auto Fix Merged Test", user_id="test-user-pafrm")
+    db_session.add(project)
+    await db_session.commit()
     msg = await post_auto_fix_result_message(
-        db_session, project_id, branch="main", result="merged", pr_number=99
+        db_session, project.id, branch="main", result="merged", pr_number=99
     )
     assert "merged" in msg.content
     assert "99" in msg.content

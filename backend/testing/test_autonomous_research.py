@@ -5984,7 +5984,7 @@ async def test_task_failure_investigation_lowered_streak_with_convergence_invest
     # Backdate past the 24h _recent_investigation_exists dedup but within
     # the 7-day convergence lookback window.
     from datetime import datetime, timedelta, timezone
-    backdated = datetime.now(timezone.utc) - timedelta(days=3)
+    backdated = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=3)
     convergence_inv = Task(
         project_id=project.id,
         title="Prior convergence investigation",
@@ -6057,7 +6057,7 @@ async def test_task_failure_investigation_spawns_with_interspersed_non_review_qu
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     # Prior failures ordered oldest -> newest: rq, rq, code_defect, rq.
     # Sliding window over last 4 priors has 3 review_quality (>= 2 required).
     prior_specs = [

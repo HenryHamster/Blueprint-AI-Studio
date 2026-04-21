@@ -3199,9 +3199,9 @@ class TestClearDirectionDiagnosisFlag:
     @pytest.mark.asyncio
     async def test_project_not_found_is_noop(self, db_session):
         import uuid
+        # Don't add/commit — we want to assert the function noops on a missing
+        # project. Committing would hit the FK constraint anyway.
         task = make_task(project_id=uuid.uuid4(), context={"direction_id": "dir-1"})
-        db_session.add(task)
-        await db_session.commit()
 
         await _clear_direction_diagnosis_flag(task, db_session, "summary")
 

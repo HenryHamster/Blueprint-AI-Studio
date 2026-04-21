@@ -9,7 +9,7 @@ from httpx import AsyncClient
 from app import shared_state
 from app.time_utils import _utcnow
 from app.models import TaskStatus
-from testing.factories import make_task
+from testing.factories import make_project, make_task
 
 
 @pytest.fixture
@@ -111,6 +111,9 @@ class TestTaskDurationStats:
     @pytest.mark.asyncio
     async def test_scope_duration_stats_computes_p50_p90(self, client: AsyncClient, db_session):
         """Completed tasks grouped by context scope get p50, p90, and sample_size."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
         now = _utcnow()
         started_at = now - timedelta(hours=2)
         # 3 small tasks at 10/20/30s, 3 large tasks at 100/200/300s.
@@ -120,6 +123,7 @@ class TestTaskDurationStats:
             for secs in durs:
                 completed_at = started_at + timedelta(seconds=secs)
                 db_session.add(make_task(
+                    project_id=project.id,
                     status=TaskStatus.COMPLETED,
                     payloads=[{"type": "create", "prompt": "x"}],
                     context={"scope": scope},
@@ -133,17 +137,24 @@ class TestTaskDurationStats:
         assert resp.status_code == 200
         scope_stats = resp.json()["scope_duration_stats"]
         assert set(scope_stats.keys()) == {"small", "large"}
-        assert scope_stats["small"] == {"p50_seconds": 20.0, "p90_seconds": 30.0, "sample_size": 3}
-        assert scope_stats["large"] == {"p50_seconds": 200.0, "p90_seconds": 300.0, "sample_size": 3}
+        # p90 with 3 samples: Postgres (production) uses percentile_cont linear
+        # interpolation → 28 / 280; SQLite fallback uses nearest-rank → 30 / 300.
+        # CI runs on Postgres, so assert the production values.
+        assert scope_stats["small"] == {"p50_seconds": 20.0, "p90_seconds": 28.0, "sample_size": 3}
+        assert scope_stats["large"] == {"p50_seconds": 200.0, "p90_seconds": 280.0, "sample_size": 3}
 
     @pytest.mark.asyncio
     async def test_scope_duration_stats_skips_insufficient_samples(self, client: AsyncClient, db_session):
         """Scopes with fewer than 3 samples are omitted from scope_duration_stats."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
         now = _utcnow()
         started_at = now - timedelta(hours=2)
         for secs in (10, 20):
             completed_at = started_at + timedelta(seconds=secs)
             db_session.add(make_task(
+                project_id=project.id,
                 status=TaskStatus.COMPLETED,
                 payloads=[{"type": "create", "prompt": "x"}],
                 context={"scope": "medium"},
@@ -160,6 +171,9 @@ class TestTaskDurationStats:
     @pytest.mark.asyncio
     async def test_phase_duration_stats_p50(self, client: AsyncClient, db_session):
         """Tasks with vm_provisioned_at/vm_started_at/vm_stopped_at get provisioning+execution p50."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
         now = _utcnow()
         started_at = now - timedelta(hours=2)
         # provisioning durations 10/20/30s, execution durations 100/200/300s.
@@ -168,6 +182,7 @@ class TestTaskDurationStats:
             vm_start = vm_prov + timedelta(seconds=prov_s)
             vm_stop = vm_start + timedelta(seconds=exec_s)
             db_session.add(make_task(
+                project_id=project.id,
                 status=TaskStatus.COMPLETED,
                 payloads=[{"type": "create", "prompt": "x"}],
                 started_at=started_at,

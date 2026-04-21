@@ -135,7 +135,7 @@ async def test_get_project_tasks_includes_cost_fields(client: AsyncClient, db_se
     await db_session.refresh(project)
     db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
 
-    start = datetime.now(timezone.utc) - timedelta(hours=1)
+    start = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
     stop = start + timedelta(seconds=3600)
     completed = Task(
         project_id=project.id,

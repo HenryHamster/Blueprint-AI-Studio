@@ -48,10 +48,12 @@ def _stash_projected_task_fields(
     raise AttributeError on Pydantic v2. Store these transient projection
     values directly on the instance dict instead.
     """
-    if first_payload is not None:
-        object.__setattr__(task, "_projected_first_payload", first_payload)
-    if completed_at_ts is not None:
-        object.__setattr__(task, "_projected_completed_at_ts", completed_at_ts)
+    # Always set both attrs (even when the projection is None) so downstream
+    # accessors take the projection branch instead of falling back to lazy-load
+    # an unloaded JSONB column. _derive_completed_at already handles a None
+    # cached_ts by returning task.created_at.
+    object.__setattr__(task, "_projected_first_payload", first_payload or {})
+    object.__setattr__(task, "_projected_completed_at_ts", completed_at_ts)
 
 
 def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]:

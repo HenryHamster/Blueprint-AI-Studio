@@ -3767,7 +3767,7 @@ async def test_digest_review_cap_exhaustion_summary_cost(client: AsyncClient, db
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     # 1 hour spot task
     db_session.add(make_task(
         project_id=project.id, title="c1", status=TaskStatus.FAILED,
