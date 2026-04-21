@@ -331,6 +331,7 @@ async def update_direction(
                     # reset remediation attempts so spawn calibration no longer
                     # penalizes the direction.
                     d.pop("needs_manual_intervention", None)
+                    d.pop("needs_manual_intervention_at", None)
                     d.pop("escalation_notification_pending", None)
                     d.pop("escalation_notification_retries", None)
                     d.pop("last_researched_at", None)

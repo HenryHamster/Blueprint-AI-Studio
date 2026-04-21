@@ -50,6 +50,12 @@ _MAX_ESCALATION_NOTIFICATION_RETRIES = 3
 # that counts as partial success rather than a failed fix. 0.5 == 50% reduction.
 _PARTIAL_SUCCESS_RATE_DROP = 0.5
 
+# TTL fallback for clearing needs_manual_intervention when no remediation monitor
+# ever started. The monitor only starts on a successful remediation merge; if
+# remediation keeps failing, the flag (and its operator alert) would otherwise
+# persist indefinitely.
+_STUCK_INTERVENTION_TTL_HOURS = 72
+
 
 def _detect_partial_remediation_success(direction: dict) -> bool | None:
     """Return True if post-remediation code-failure rate is materially lower than pre-remediation.
@@ -465,6 +471,33 @@ async def _process_direction_lifecycle(
             logger.warning(
                 f"[NOTIFY] Escalation retry {retries + 1} failed for {d.get('id')}: {_retry_exc}"
             )
+    # TTL fallback for stuck needs_manual_intervention. The flag is normally cleared
+    # when the remediation monitor expires (line ~561) or when the fingerprint
+    # changes on recovery, but both paths require remediation_monitor_started_at,
+    # which only gets set on a successful remediation merge. If remediation keeps
+    # failing, the flag (and operator alert) persists forever — clear it here
+    # once enough time has passed without a monitor ever starting.
+    for d in (project.directions or []):
+        if not d.get("needs_manual_intervention"):
+            continue
+        if d.get("remediation_monitor_started_at"):
+            continue
+        flagged_at = d.get("needs_manual_intervention_at")
+        if not flagged_at:
+            continue
+        try:
+            age_h = (_utcnow() - datetime.fromisoformat(flagged_at)).total_seconds() / 3600
+        except (ValueError, TypeError):
+            continue
+        if age_h < _STUCK_INTERVENTION_TTL_HOURS:
+            continue
+        d.pop("needs_manual_intervention", None)
+        d.pop("needs_manual_intervention_at", None)
+        directions_modified = True
+        logger.info(
+            f"[AUTONOMOUS] Cleared stuck needs_manual_intervention on {d.get('id')} "
+            f"after {age_h:.1f}h with no remediation monitor started"
+        )
     # Auto-recovery: reactivate auto-paused directions past cooldown
     recovery_hours = _runtime_config.get("direction_auto_recovery_hours", 48)
     for d in (project.directions or []):
@@ -489,6 +522,7 @@ async def _process_direction_lifecycle(
                 and str(current_fp) != str(last_rem_fp)
             ):
                 d.pop("needs_manual_intervention", None)
+                d.pop("needs_manual_intervention_at", None)
                 logger.info(
                     f"[AUTONOMOUS] Cleared needs_manual_intervention on {d.get('id')}: "
                     f"fingerprint changed since remediation"
@@ -559,6 +593,7 @@ async def _process_direction_lifecycle(
             if expired:
                 d.pop("remediation_monitor_started_at", None)
                 cleared = d.pop("needs_manual_intervention", None)
+                d.pop("needs_manual_intervention_at", None)
                 # Stamp "held" on the remediation_history entry that started this monitor
                 # so the digest funnel can count fixes that survived the full window.
                 held_iso = _utcnow().isoformat()
@@ -700,6 +735,7 @@ async def _process_direction_lifecycle(
                     )
                 else:
                     d["needs_manual_intervention"] = True
+                    d["needs_manual_intervention_at"] = _utcnow().isoformat()
                     logger.warning(
                         f"[AUTONOMOUS] Direction {did} flagged needs_manual_intervention "
                         f"after {d.get('remediation_attempts', 0)} remediation attempts"

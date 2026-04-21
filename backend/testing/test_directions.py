@@ -2175,6 +2175,86 @@ async def test_re_pause_without_monitoring_does_not_flag_intervention(db_session
     assert "needs_manual_intervention" not in d
 
 
+@pytest.mark.asyncio
+async def test_stuck_manual_intervention_cleared_after_ttl(db_session):
+    """needs_manual_intervention auto-clears via TTL when no remediation monitor ever started."""
+    flagged_at = (datetime.utcnow() - timedelta(hours=80)).isoformat()
+    direction = {
+        "id": "d-stuck001",
+        "text": "Stuck flagged direction",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "Saturated",
+        "paused_at": flagged_at,
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": flagged_at,
+    }
+    project = Project(
+        name="Stuck Intervention Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=60.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-stuck001")
+    assert "needs_manual_intervention" not in d
+    assert "needs_manual_intervention_at" not in d
+
+
+@pytest.mark.asyncio
+async def test_stuck_manual_intervention_preserved_when_monitor_active(db_session):
+    """TTL clear does not fire when a remediation_monitor_started_at is present."""
+    flagged_at = (datetime.utcnow() - timedelta(hours=80)).isoformat()
+    direction = {
+        "id": "d-stuck002",
+        "text": "Flagged with monitor",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "Saturated",
+        "paused_at": flagged_at,
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": flagged_at,
+        "remediation_monitor_started_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+    }
+    project = Project(
+        name="Stuck Intervention Monitor Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=60.0,
+        busy_direction_ids=set(), now=datetime.utcnow(),
+    )
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-stuck002")
+    assert d.get("needs_manual_intervention") is True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Diagnosis research on auto-pause
 # ─────────────────────────────────────────────────────────────────────────────
