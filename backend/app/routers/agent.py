@@ -1867,6 +1867,21 @@ async def agent_heartbeat(
         task.vm_started_at = _utcnow()
     if req.status_message:
         task.latest_status_message = req.status_message
+        # Log interesting lifecycle beacons so they're visible in Cloud
+        # Logging without needing to inspect the task row. Anything that
+        # looks like a structured forensic signal (PROVISION_*, AGENT_*,
+        # PRE_CLAIM_*, FATAL:, STARTUP_FAILED) gets echoed — a silent
+        # pre-claim death should then show up as a specific beacon landing
+        # instead of a log void.
+        msg = req.status_message
+        if any(msg.startswith(prefix) for prefix in (
+            "PROVISION_", "AGENT_BOOTED", "AGENT_AUTH_OK", "AGENT_CLAIMING",
+            "PRE_CLAIM_", "[FATAL", "STARTUP_FAILED",
+        )):
+            logger.info(
+                "[HEARTBEAT_BEACON] task=%s vm=%s msg=%s",
+                req.task_id, token.get("vm_instance_id"), msg[:300],
+            )
     if req.metrics or req.tool_trace is not None:
         ctx = dict(task.context or {})
         if req.metrics:

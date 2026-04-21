@@ -767,6 +767,23 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
       fi
     done
 
+    # Beacon A — creds fetched. Fired as early as possible so silent deaths
+    # have at least one forensic signal. Extracts token from CREDS inline
+    # since /etc/agent.env doesn't exist yet (written by the python block below).
+    # See the silent pre-claim death investigation (task 595c235d, 548043b9).
+    _send_beacon() {{
+      local msg="$1"
+      local tok="$2"
+      [ -z "$tok" ] && return 0
+      curl -sf -X POST "{ORCHESTRATOR_URL}/api/agent/heartbeat" \
+        -H "Content-Type: application/json" \
+        -H "X-Agent-Token: $tok" \
+        -d "$(printf '{{"task_id": "{task_id}", "status_message": "%s"}}' "$msg")" \
+        --connect-timeout 5 --max-time 10 >/dev/null 2>&1 || true
+    }}
+    EARLY_TOKEN="$(printf '%s' "$CREDS" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("env",{{}}).get("AGENT_SECRET_TOKEN",""))' 2>/dev/null || true)"
+    _send_beacon "PROVISION_PROGRESS: creds fetched, entering env setup" "$EARLY_TOKEN"
+
     # 3. Materialize the manifest into the env file and any auth/config files.
     MANIFEST_PATH=/tmp/agent_secret_manifest.json
     printf '%s' "$CREDS" > "$MANIFEST_PATH"
@@ -802,6 +819,12 @@ os.chmod(env_path, 0o600)
 PY
     rm -f "$MANIFEST_PATH"
 
+    # Beacon B — env file materialized. Distinguishes "python manifest
+    # block hung" from later-step hangs. Uses the token from the just-written
+    # /etc/agent.env so subsequent beacons have a canonical source.
+    AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2- || true)"
+    _send_beacon "PROVISION_PROGRESS: env file materialized, preparing payload" "$AGENT_TOKEN"
+
     # Add PAYLOAD_URI if present (validated safe GCS URI — no secrets)
     if [ -n "{payload_uri_b64}" ]; then
         echo "PAYLOAD_URI=\\"$(echo '{payload_uri_b64}' | base64 -d)\\"" >> /etc/agent.env
@@ -814,6 +837,10 @@ PY
         gsutil cp "$PAYLOAD_URI_DECODED" /etc/agent_payload.json
     fi
 
+    # Beacon C — payload downloaded (or skipped). Narrows "gsutil cp hung"
+    # vs. systemctl/agent issues to the correct culprit.
+    _send_beacon "PROVISION_PROGRESS: payload ready, entering diagnostics" "$AGENT_TOKEN"
+
     # 5. Agent diagnostics — log baked-in code version for debugging
     echo "Agent source files:"
     ls -la /opt/agent/src/handlers/ 2>/dev/null || echo "  (no handlers directory)"
@@ -821,18 +848,9 @@ PY
 
     # 6. Start the systemd service
     echo "Starting blueprint-agent service..."
-    # Early "startup script reached systemctl phase" beacon. Distinguishes
-    # "startup script never ran" from "startup script ran but agent service
-    # never reported healthy" when reaper later fires silent-pre-claim-death.
-    # Fire-and-forget with tight timeouts so a slow logging endpoint can't
-    # stall provisioning — the primary health check still fires at line ~845.
-    AGENT_TOKEN_EARLY="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2-)"
-    ORCH_URL_EARLY="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env | cut -d= -f2-)"
-    curl -sf -X POST "$ORCH_URL_EARLY/api/agent/heartbeat" \
-      -H "Content-Type: application/json" \
-      -H "X-Agent-Token: $AGENT_TOKEN_EARLY" \
-      -d '{{"task_id": "{task_id}", "status_message": "PROVISION_PROGRESS: startup-script reached systemctl phase"}}' \
-      --connect-timeout 5 --max-time 10 >/dev/null 2>&1 || true
+    # Beacon D — reached systemctl. If the 30s health check at line ~845 then
+    # fails, we know it's inside the agent process, not before it.
+    _send_beacon "PROVISION_PROGRESS: reached systemctl phase" "$AGENT_TOKEN"
     systemctl daemon-reload
     timeout 60 systemctl restart blueprint-agent || {{
         echo "Service start failed"
