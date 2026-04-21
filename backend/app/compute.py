@@ -814,7 +814,7 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     PY_STDERR=/tmp/agent_manifest_py.err
     printf '%s' "$CREDS" > "$MANIFEST_PATH"
     PY_EXIT=0
-    if ! python3 - "$MANIFEST_PATH" /etc/agent.env 2>"$PY_STDERR" <<'PY'
+    if python3 - "$MANIFEST_PATH" /etc/agent.env 2>"$PY_STDERR" <<'PY'
 import json
 import os
 import pathlib
@@ -894,8 +894,8 @@ PY
     systemctl daemon-reload
     timeout 60 systemctl restart blueprint-agent || {{
         echo "Service start failed"
-        AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2-)"
-        ORCH_URL="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env | cut -d= -f2-)"
+        AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env 2>/dev/null | cut -d= -f2- || true)"
+        ORCH_URL="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env 2>/dev/null | cut -d= -f2- || true)"
         SERVICE_LOG="$(journalctl -u blueprint-agent --no-pager -n 30 2>/dev/null | tr '"' "'" | tr '\\n' ' ' || echo 'no journal')"
         curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \
           -H "Content-Type: application/json" \
@@ -913,8 +913,13 @@ PY
     # the wait loop + poweroff path, so the reaper's no-heartbeat handler sees
     # the failure with its real classification.
     sleep 30
-    AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2-)"
-    ORCH_URL="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env | cut -d= -f2-)"
+    # Source the env file directly — systemd uses the same format, and a
+    # grep|cut pipeline crashes with pipefail+set-e when the pattern is
+    # missing. Guard against -u by defaulting to empty.
+    # shellcheck disable=SC1091
+    [ -f /etc/agent.env ] && . /etc/agent.env || true
+    AGENT_TOKEN="${{AGENT_SECRET_TOKEN:-}}"
+    ORCH_URL="${{ORCHESTRATOR_URL:-}}"
     if systemctl is-active --quiet blueprint-agent; then
       curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \
         -H "Content-Type: application/json" \
