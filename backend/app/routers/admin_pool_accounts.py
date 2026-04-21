@@ -154,6 +154,29 @@ def _account_secret_ref(db_account: MaxPlanAccount) -> str | None:
     return db_account.secret_blob_ref or db_account.oauth_token
 
 
+_CAP_FIELDS = ("daily_task_cap", "max_concurrent_tasks", "auto_disable_after_rate_limits")
+
+
+def _parse_cap(payload: Dict[str, Any], field: str) -> int | None | object:
+    """Return the parsed cap value, the sentinel `_UNSET` if the key is absent,
+    or None to clear. Raises _bad_request on invalid values."""
+    if field not in payload:
+        return _UNSET
+    raw = payload[field]
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise _bad_request(f"{field} must be a positive integer or null") from exc
+    if value < 1:
+        raise _bad_request(f"{field} must be a positive integer or null")
+    return value
+
+
+_UNSET = object()
+
+
 @router.post("/max-plan-accounts")
 @limiter.limit("10/minute")
 async def add_max_plan_account(
@@ -190,6 +213,12 @@ async def add_max_plan_account(
         raise _bad_request("claude_config_json is only valid for anthropic/oauth accounts")
 
     now = _utcnow()
+    cap_values: Dict[str, int | None] = {}
+    for field in _CAP_FIELDS:
+        parsed = _parse_cap(payload, field)
+        if parsed is not _UNSET:
+            cap_values[field] = parsed  # type: ignore[assignment]
+
     db_account = MaxPlanAccount(
         name=name.strip(),
         provider=provider,
@@ -200,6 +229,7 @@ async def add_max_plan_account(
         provider_metadata=normalized_metadata or None,
         token_created_at=now,
         user_id=current_user["user_id"],
+        **cap_values,
     )
     session.add(db_account)
     await session.commit()
@@ -238,6 +268,12 @@ async def add_max_plan_account(
         "active_tasks": 0,
         "total_tasks": db_account.total_tasks,
         "token_created_at": now.isoformat(),
+        "daily_task_cap": db_account.daily_task_cap,
+        "max_concurrent_tasks": db_account.max_concurrent_tasks,
+        "auto_disable_after_rate_limits": db_account.auto_disable_after_rate_limits,
+        "daily_task_count": 0,
+        "daily_task_count_reset_at": None,
+        "disabled_reason": None,
     }
     async with _max_plan_pool_lock:
         _max_plan_pools.setdefault(current_user["user_id"], []).append(entry)
@@ -331,11 +367,19 @@ async def update_max_plan_account(
         raise HTTPException(status_code=404, detail="Account not found")
 
     if "enabled" in payload:
+        was_enabled = db_account.enabled
         db_account.enabled = bool(payload["enabled"])
+        # Manual re-enable clears any auto-disable reason so the UI stops showing stale text.
+        if db_account.enabled and not was_enabled:
+            db_account.disabled_reason = None
     if "name" in payload:
         if not isinstance(payload["name"], str) or not payload["name"].strip():
             raise _bad_request("name must be a non-empty string")
         db_account.name = payload["name"].strip()
+    for field in _CAP_FIELDS:
+        parsed = _parse_cap(payload, field)
+        if parsed is not _UNSET:
+            setattr(db_account, field, parsed)
 
     target_provider, target_auth_mode, new_secret = _update_target_identity(payload, db_account)
     target_metadata = _provider_metadata_from_payload(payload, current=db_account.provider_metadata)
@@ -415,6 +459,10 @@ async def update_max_plan_account(
             mem_account["secret_blob_ref"] = db_account.secret_blob_ref
             mem_account["provider_metadata"] = db_account.provider_metadata or {}
             mem_account["claude_config_json"] = db_account.claude_config_json
+            mem_account["daily_task_cap"] = db_account.daily_task_cap
+            mem_account["max_concurrent_tasks"] = db_account.max_concurrent_tasks
+            mem_account["auto_disable_after_rate_limits"] = db_account.auto_disable_after_rate_limits
+            mem_account["disabled_reason"] = db_account.disabled_reason
             if normalized_secret is not None or "provider" in payload or "auth_mode" in payload:
                 mem_account["runtime_secret"] = normalized_secret
                 mem_account["runtime_ready"] = bool(normalized_secret)
@@ -433,6 +481,9 @@ async def update_max_plan_account(
         "provider": db_account.provider.value,
         "auth_mode": db_account.auth_mode.value,
         "enabled": db_account.enabled,
+        "daily_task_cap": db_account.daily_task_cap,
+        "max_concurrent_tasks": db_account.max_concurrent_tasks,
+        "auto_disable_after_rate_limits": db_account.auto_disable_after_rate_limits,
     }
 
 
@@ -461,9 +512,11 @@ async def reset_account_rate_limits(
             mem_account["enabled"] = True
             mem_account.pop("disabled_at", None)
             mem_account.pop("rl_hit_count", None)
+            mem_account["disabled_reason"] = None
 
     db_account.rate_limit_state = None
     db_account.enabled = True
+    db_account.disabled_reason = None
     db_account.updated_at = _utcnow()
     session.add(db_account)
     await session.commit()

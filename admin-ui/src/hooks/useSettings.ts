@@ -24,6 +24,9 @@ export function useSettings(addToast: AddToast) {
   const [newAccountToken, setNewAccountToken] = useState('');
   const [newAccountProviderMetadata, setNewAccountProviderMetadata] = useState<Record<string, string>>({});
   const [newAccountClaudeConfigJson, setNewAccountClaudeConfigJson] = useState('');
+  const [newAccountDailyTaskCap, setNewAccountDailyTaskCap] = useState<number | null>(null);
+  const [newAccountMaxConcurrentTasks, setNewAccountMaxConcurrentTasks] = useState<number | null>(null);
+  const [newAccountAutoDisableAfterRateLimits, setNewAccountAutoDisableAfterRateLimits] = useState<number | null>(null);
   const [githubAccount, setGithubAccount] = useState<string | null>(null);
   const [requireApprovalGates, setRequireApprovalGates] = useState(true);
   const [autoArchiveEnabled, setAutoArchiveEnabled] = useState(true);
@@ -121,6 +124,9 @@ export function useSettings(addToast: AddToast) {
       };
       if (Object.keys(newAccountProviderMetadata).length > 0) payload.provider_metadata = newAccountProviderMetadata;
       if (newAccountClaudeConfigJson.trim()) payload.claude_config_json = newAccountClaudeConfigJson;
+      if (newAccountDailyTaskCap !== null) payload.daily_task_cap = newAccountDailyTaskCap;
+      if (newAccountMaxConcurrentTasks !== null) payload.max_concurrent_tasks = newAccountMaxConcurrentTasks;
+      if (newAccountAutoDisableAfterRateLimits !== null) payload.auto_disable_after_rate_limits = newAccountAutoDisableAfterRateLimits;
       const res = await fetch(`${API_BASE_URL}/api/admin/max-plan-accounts`, {
         method: 'POST', headers: await authHeaders(),
         body: JSON.stringify(payload),
@@ -132,6 +138,9 @@ export function useSettings(addToast: AddToast) {
         setNewAccountToken('');
         setNewAccountProviderMetadata({});
         setNewAccountClaudeConfigJson('');
+        setNewAccountDailyTaskCap(null);
+        setNewAccountMaxConcurrentTasks(null);
+        setNewAccountAutoDisableAfterRateLimits(null);
         fetchSettings();
         addToast('Account added', 'success');
       } else {
@@ -171,6 +180,30 @@ export function useSettings(addToast: AddToast) {
         addToast('Failed to update account', 'error');
       }
     } catch (err) { console.error('Failed to toggle account:', err); addToast('Failed to update account', 'error'); }
+  };
+
+  const updateAccountCaps = async (
+    id: string,
+    caps: { daily_task_cap?: number | null; max_concurrent_tasks?: number | null; auto_disable_after_rate_limits?: number | null }
+  ) => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/max-plan-accounts/${id}`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify(caps),
+      });
+      if (res.ok) {
+        fetchSettings();
+        addToast('Caps updated', 'success');
+      } else {
+        const data = await res.json().catch(() => ({}));
+        const detail = typeof data?.detail === 'string' ? data.detail : null;
+        addToast(detail ? `Update failed: ${detail}` : `Update failed (HTTP ${res.status})`, 'error');
+      }
+    } catch (err) {
+      console.error('Failed to update account caps:', err);
+      const msg = err instanceof Error ? err.message : 'unknown error';
+      addToast(`Update failed: ${msg}`, 'error');
+    }
   };
 
   const resetAccountRateLimits = async (id: string) => {
@@ -530,6 +563,9 @@ export function useSettings(addToast: AddToast) {
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountProvider, setNewAccountProvider,
     newAccountAuthMode, setNewAccountAuthMode, newAccountToken, setNewAccountToken,
     newAccountProviderMetadata, setNewAccountProviderMetadata, newAccountClaudeConfigJson, setNewAccountClaudeConfigJson,
+    newAccountDailyTaskCap, setNewAccountDailyTaskCap,
+    newAccountMaxConcurrentTasks, setNewAccountMaxConcurrentTasks,
+    newAccountAutoDisableAfterRateLimits, setNewAccountAutoDisableAfterRateLimits,
     githubAccount, setGithubAccount,
     requireApprovalGates,
     autoArchiveEnabled, autoArchiveTerminalAfterDays,
@@ -542,6 +578,7 @@ export function useSettings(addToast: AddToast) {
     // Handlers
     fetchSettings,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
+    updateAccountCaps,
     connectGitHub,
     updateAgentPromptSuffixes,
     updateProviderTierModels, updateTaskTypeProviderPreferences, updateTaskTypeModelPreferenceConfig,

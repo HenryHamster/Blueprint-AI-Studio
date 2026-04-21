@@ -93,7 +93,14 @@ export interface HeaderBarProps {
   setNewAccountProviderMetadata: (value: Record<string, string>) => void;
   newAccountClaudeConfigJson: string;
   setNewAccountClaudeConfigJson: (value: string) => void;
+  newAccountDailyTaskCap: number | null;
+  setNewAccountDailyTaskCap: (value: number | null) => void;
+  newAccountMaxConcurrentTasks: number | null;
+  setNewAccountMaxConcurrentTasks: (value: number | null) => void;
+  newAccountAutoDisableAfterRateLimits: number | null;
+  setNewAccountAutoDisableAfterRateLimits: (value: number | null) => void;
   onAddAccount: () => void;
+  onUpdateAccountCaps: (id: string, caps: { daily_task_cap?: number | null; max_concurrent_tasks?: number | null; auto_disable_after_rate_limits?: number | null }) => void;
   providerTierModelMap: Record<string, Record<string, string>>;
   taskTypeProviderPreference: Record<string, ProviderName[]>;
   taskTypeModelPreferences: Record<string, ModelPreference[]>;
@@ -226,7 +233,14 @@ export function HeaderBar(props: HeaderBarProps) {
     setNewAccountProviderMetadata,
     newAccountClaudeConfigJson,
     setNewAccountClaudeConfigJson,
+    newAccountDailyTaskCap,
+    setNewAccountDailyTaskCap,
+    newAccountMaxConcurrentTasks,
+    setNewAccountMaxConcurrentTasks,
+    newAccountAutoDisableAfterRateLimits,
+    setNewAccountAutoDisableAfterRateLimits,
     onAddAccount,
+    onUpdateAccountCaps,
     providerTierModelMap,
     taskTypeProviderPreference,
     taskTypeModelPreferences,
@@ -429,7 +443,14 @@ export function HeaderBar(props: HeaderBarProps) {
           setNewAccountProviderMetadata={setNewAccountProviderMetadata}
           newAccountClaudeConfigJson={newAccountClaudeConfigJson}
           setNewAccountClaudeConfigJson={setNewAccountClaudeConfigJson}
+          newAccountDailyTaskCap={newAccountDailyTaskCap}
+          setNewAccountDailyTaskCap={setNewAccountDailyTaskCap}
+          newAccountMaxConcurrentTasks={newAccountMaxConcurrentTasks}
+          setNewAccountMaxConcurrentTasks={setNewAccountMaxConcurrentTasks}
+          newAccountAutoDisableAfterRateLimits={newAccountAutoDisableAfterRateLimits}
+          setNewAccountAutoDisableAfterRateLimits={setNewAccountAutoDisableAfterRateLimits}
           onAddAccount={onAddAccount}
+          onUpdateAccountCaps={onUpdateAccountCaps}
           providerTierModelMap={providerTierModelMap}
           taskTypeProviderPreference={taskTypeProviderPreference}
           taskTypeModelPreferences={taskTypeModelPreferences}

@@ -8,8 +8,10 @@ from datetime import datetime, timedelta, timezone
 
 from app.max_plan_pool import (
     _HEALTH_WINDOW_SECONDS,
+    _account_at_cap,
     _account_available_for_model,
     _compute_health_score,
+    _daily_reset_if_elapsed,
     _normalize_rl_model,
     _prune_health_events,
     cascade_disabled_models,
@@ -143,6 +145,58 @@ class TestPruneHealthEvents:
         _prune_health_events(acct, datetime.utcnow())
         assert "rl_events" not in acct
         assert "completion_events" not in acct
+
+
+# ── _daily_reset_if_elapsed ─────────────────────────────────────────────────
+
+class TestDailyResetIfElapsed:
+    def test_seeds_reset_at_when_missing(self):
+        now = datetime.utcnow()
+        acct = _acct(daily_task_count=3)
+        assert _daily_reset_if_elapsed(acct, now) is False
+        assert acct["daily_task_count_reset_at"] == now
+        # Existing count stays — we only seed the window marker.
+        assert acct["daily_task_count"] == 3
+
+    def test_no_reset_within_window(self):
+        now = datetime.utcnow()
+        acct = _acct(daily_task_count=5, daily_task_count_reset_at=now - timedelta(hours=12))
+        assert _daily_reset_if_elapsed(acct, now) is False
+        assert acct["daily_task_count"] == 5
+
+    def test_resets_after_window_elapsed(self):
+        now = datetime.utcnow()
+        acct = _acct(daily_task_count=42, daily_task_count_reset_at=now - timedelta(hours=25))
+        assert _daily_reset_if_elapsed(acct, now) is True
+        assert acct["daily_task_count"] == 0
+        assert acct["daily_task_count_reset_at"] == now
+
+
+# ── _account_at_cap ─────────────────────────────────────────────────────────
+
+class TestAccountAtCap:
+    def test_no_caps_configured_returns_none(self):
+        assert _account_at_cap(_acct()) is None
+
+    def test_daily_cap_reached_returns_reason(self):
+        acct = _acct(daily_task_cap=10, daily_task_count=10)
+        reason = _account_at_cap(acct)
+        assert reason is not None
+        assert "daily cap" in reason
+
+    def test_daily_cap_under_limit_returns_none(self):
+        acct = _acct(daily_task_cap=10, daily_task_count=9)
+        assert _account_at_cap(acct) is None
+
+    def test_concurrent_cap_reached_returns_reason(self):
+        acct = _acct(max_concurrent_tasks=2, active_tasks=2)
+        reason = _account_at_cap(acct)
+        assert reason is not None
+        assert "concurrent cap" in reason
+
+    def test_concurrent_cap_under_limit_returns_none(self):
+        acct = _acct(max_concurrent_tasks=2, active_tasks=1)
+        assert _account_at_cap(acct) is None
 
 
 # ── _account_available_for_model ────────────────────────────────────────────

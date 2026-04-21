@@ -146,6 +146,15 @@ async def get_settings(
              "active_tasks": a["active_tasks"], "total_tasks": a["total_tasks"],
              "token_created_at": a.get("token_created_at"),
              "rl_hit_count": a.get("rl_hit_count", 0),
+             "daily_task_cap": a.get("daily_task_cap"),
+             "max_concurrent_tasks": a.get("max_concurrent_tasks"),
+             "auto_disable_after_rate_limits": a.get("auto_disable_after_rate_limits"),
+             "daily_task_count": int(a.get("daily_task_count") or 0),
+             "daily_task_count_reset_at": (
+                 a["daily_task_count_reset_at"].isoformat()
+                 if a.get("daily_task_count_reset_at") else None
+             ),
+             "disabled_reason": a.get("disabled_reason"),
              "disabled_models": {
                  model: {"hits": info.get("hits", 0), "at": info["at"].isoformat() if info.get("at") else None}
                  for model, info in a.get("disabled_models", {}).items()

@@ -428,6 +428,13 @@ class MaxPlanAccount(SQLModel, table=True):
     total_tasks: int = Field(default=0)
     token_created_at: Optional[datetime] = Field(default=None)  # When the token was added (for age tracking)
     rate_limit_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    # Usage caps (null = unlimited).
+    daily_task_cap: Optional[int] = Field(default=None)
+    max_concurrent_tasks: Optional[int] = Field(default=None)
+    auto_disable_after_rate_limits: Optional[int] = Field(default=None)
+    daily_task_count: int = Field(default=0)
+    daily_task_count_reset_at: Optional[datetime] = Field(default=None)
+    disabled_reason: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 

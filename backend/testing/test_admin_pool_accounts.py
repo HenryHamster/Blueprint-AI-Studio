@@ -96,6 +96,98 @@ async def test_update_max_plan_account_requires_new_secret_when_provider_changes
     assert "Changing provider or auth_mode requires a new secret" in res.text
 
 
+async def test_add_max_plan_account_accepts_usage_caps(client, db_session, mocker):
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/caps/versions/1"),
+    )
+
+    res = await client.post(
+        "/api/admin/max-plan-accounts",
+        json={
+            "name": "Capped Account",
+            "oauth_token": "sk-ant-oat01-capped",
+            "daily_task_cap": 20,
+            "max_concurrent_tasks": 3,
+            "auto_disable_after_rate_limits": 5,
+        },
+    )
+
+    assert res.status_code == 200, res.text
+    acct = (
+        await db_session.execute(select(MaxPlanAccount).where(MaxPlanAccount.name == "Capped Account"))
+    ).scalars().one()
+    assert acct.daily_task_cap == 20
+    assert acct.max_concurrent_tasks == 3
+    assert acct.auto_disable_after_rate_limits == 5
+
+
+async def test_add_max_plan_account_rejects_zero_cap(client):
+    res = await client.post(
+        "/api/admin/max-plan-accounts",
+        json={
+            "name": "Zero Cap",
+            "oauth_token": "sk-ant-oat01-zero",
+            "daily_task_cap": 0,
+        },
+    )
+    assert res.status_code == 400
+    assert "daily_task_cap" in res.text
+
+
+async def test_patch_max_plan_account_updates_and_clears_caps(client, db_session):
+    acct = MaxPlanAccount(
+        user_id="test-user-123",
+        name="Patch Caps",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/patch/versions/1",
+        secret_blob_ref="projects/test/secrets/patch/versions/1",
+        daily_task_cap=10,
+        max_concurrent_tasks=2,
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct.id}",
+        json={"daily_task_cap": 50, "max_concurrent_tasks": None},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["daily_task_cap"] == 50
+    assert body["max_concurrent_tasks"] is None
+
+    await db_session.refresh(acct)
+    assert acct.daily_task_cap == 50
+    assert acct.max_concurrent_tasks is None
+
+
+async def test_patch_reenables_clears_disabled_reason(client, db_session):
+    acct = MaxPlanAccount(
+        user_id="test-user-123",
+        name="Auto Disabled",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/reenable/versions/1",
+        secret_blob_ref="projects/test/secrets/reenable/versions/1",
+        enabled=False,
+        disabled_reason="auto-disabled after 5 rate-limit hit(s)",
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct.id}",
+        json={"enabled": True},
+    )
+    assert res.status_code == 200, res.text
+
+    await db_session.refresh(acct)
+    assert acct.enabled is True
+    assert acct.disabled_reason is None
+
+
 async def test_update_max_plan_account_allows_auth_mode_change_with_existing_claude_config(client, db_session, mocker):
     mocker.patch(
         "app.secrets_manager.store_user_secret",

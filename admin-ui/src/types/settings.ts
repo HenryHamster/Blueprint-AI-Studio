@@ -56,6 +56,12 @@ export interface MaxPlanAccount {
   provider_metadata?: Record<string, string>;
   rl_hit_count?: number;
   disabled_models?: Record<string, { hits: number; at: string | null }>;
+  daily_task_cap?: number | null;
+  max_concurrent_tasks?: number | null;
+  auto_disable_after_rate_limits?: number | null;
+  daily_task_count?: number;
+  daily_task_count_reset_at?: string | null;
+  disabled_reason?: string | null;
 }
 
 export interface ProviderHealthSnapshot {

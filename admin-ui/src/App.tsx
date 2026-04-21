@@ -380,7 +380,14 @@ export default function App() {
         setNewAccountProviderMetadata={s.setNewAccountProviderMetadata}
         newAccountClaudeConfigJson={s.newAccountClaudeConfigJson}
         setNewAccountClaudeConfigJson={s.setNewAccountClaudeConfigJson}
+        newAccountDailyTaskCap={s.newAccountDailyTaskCap}
+        setNewAccountDailyTaskCap={s.setNewAccountDailyTaskCap}
+        newAccountMaxConcurrentTasks={s.newAccountMaxConcurrentTasks}
+        setNewAccountMaxConcurrentTasks={s.setNewAccountMaxConcurrentTasks}
+        newAccountAutoDisableAfterRateLimits={s.newAccountAutoDisableAfterRateLimits}
+        setNewAccountAutoDisableAfterRateLimits={s.setNewAccountAutoDisableAfterRateLimits}
         onAddAccount={s.addMaxPlanAccount}
+        onUpdateAccountCaps={s.updateAccountCaps}
         providerTierModelMap={s.providerTierModelMap}
         taskTypeProviderPreference={s.taskTypeProviderPreference}
         taskTypeModelPreferences={s.taskTypeModelPreferences}

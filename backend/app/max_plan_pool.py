@@ -242,6 +242,7 @@ _max_plan_pools: Dict[str, List[Dict[str, Any]]] = {}  # user_id → accounts
 _account_by_id: Dict[str, Dict[str, Any]] = {}  # account_id → account dict
 _max_plan_pool_lock = asyncio.Lock()
 _pending_rl_persists: List[str] = []  # Account IDs whose rate-limit state failed to persist
+_pending_cap_persists: set = set()  # Account IDs with dirty daily_task_count / disabled_reason to flush
 
 # Exact substrings from Claude Code CLI / Anthropic API rate-limit messages.
 # Shared between classify_failure() and any caller that needs to detect a real
@@ -409,6 +410,12 @@ async def load_max_plan_pool():
                 "active_tasks": active_per_account.get(acct_id, 0),
                 "total_tasks": acct.total_tasks,
                 "token_created_at": acct.token_created_at.isoformat() if acct.token_created_at else None,
+                "daily_task_cap": acct.daily_task_cap,
+                "max_concurrent_tasks": acct.max_concurrent_tasks,
+                "auto_disable_after_rate_limits": acct.auto_disable_after_rate_limits,
+                "daily_task_count": acct.daily_task_count,
+                "daily_task_count_reset_at": acct.daily_task_count_reset_at,
+                "disabled_reason": acct.disabled_reason,
             }
             # Restore rate-limit state from DB (skip expired cooldowns)
             rl_state = acct.rate_limit_state or {}
@@ -431,6 +438,37 @@ async def load_max_plan_pool():
             _account_by_id[acct_id] = entry
         total_active = sum(active_per_account.values())
         logger.info(f"[STARTUP] Loaded {len(_account_by_id)} Max plan accounts for {len(_max_plan_pools)} users ({total_active} active tasks reconciled)")
+
+
+_DAILY_WINDOW_SECONDS = 24 * 60 * 60
+
+
+def _daily_reset_if_elapsed(acct: dict, now: datetime | None = None) -> bool:
+    """Reset the daily counter if the 24h window since reset_at has elapsed (or
+    no reset_at has been set yet). Returns True when a reset happened so callers
+    can mark the account dirty for persistence."""
+    now = now or _utcnow()
+    reset_at = acct.get("daily_task_count_reset_at")
+    if reset_at is None:
+        acct["daily_task_count_reset_at"] = now
+        acct["daily_task_count"] = int(acct.get("daily_task_count") or 0)
+        return False
+    if (now - reset_at).total_seconds() >= _DAILY_WINDOW_SECONDS:
+        acct["daily_task_count"] = 0
+        acct["daily_task_count_reset_at"] = now
+        return True
+    return False
+
+
+def _account_at_cap(acct: dict) -> str | None:
+    """Return a reason string if the account is at any usage cap, else None."""
+    daily_cap = acct.get("daily_task_cap")
+    if daily_cap is not None and int(acct.get("daily_task_count") or 0) >= int(daily_cap):
+        return f"daily cap ({daily_cap}) reached"
+    concurrent_cap = acct.get("max_concurrent_tasks")
+    if concurrent_cap is not None and int(acct.get("active_tasks") or 0) >= int(concurrent_cap):
+        return f"concurrent cap ({concurrent_cap}) reached"
+    return None
 
 
 def _account_state_for_model(acct: dict, model: str | None, now: datetime | None = None) -> str:
@@ -613,16 +651,26 @@ async def select_max_plan_account(
         healthy: List[Dict[str, Any]] = []
         probing: List[Dict[str, Any]] = []
         normalized_provider = _normalize_provider_name(provider)
+        now = _utcnow()
+        dirty_from_reset: list[str] = []
         for a in user_pool:
             if blacklist and a["id"] in blacklist:
                 continue
             if normalized_provider and (_normalize_provider_name(a.get("provider")) or LLMProviderName.ANTHROPIC.value) != normalized_provider:
                 continue
-            state = _account_state_for_model(a, model)
+            if _daily_reset_if_elapsed(a, now):
+                dirty_from_reset.append(a["id"])
+            cap_reason = _account_at_cap(a)
+            if cap_reason:
+                continue
+            state = _account_state_for_model(a, model, now)
             if state == "healthy":
                 healthy.append(a)
             elif state == "probing" and a.get("active_tasks", 0) == 0:
                 probing.append(a)
+
+        for acct_id in dirty_from_reset:
+            _pending_cap_persists.add(acct_id)
 
         if healthy:
             # Prefer accounts with higher health scores (fewer rate limits, more completions).
@@ -637,6 +685,8 @@ async def select_max_plan_account(
             return None
 
         account["active_tasks"] = account.get("active_tasks", 0) + 1
+        account["daily_task_count"] = int(account.get("daily_task_count") or 0) + 1
+        _pending_cap_persists.add(account["id"])
         return account
 
 
@@ -790,6 +840,16 @@ async def disable_account_model(acct_id: str, model: str) -> None:
             f"[POOL] Account {acct['name']} disabled models {list(cascade)} "
             f"(primary {primary_key} hit #{primary_hits}, cooldown {cooldown:.0f}min)"
         )
+
+        auto_disable_threshold = acct.get("auto_disable_after_rate_limits")
+        if auto_disable_threshold is not None and primary_hits >= int(auto_disable_threshold):
+            reason = f"auto-disabled after {primary_hits} rate-limit hit(s) (threshold {auto_disable_threshold})"
+            acct["enabled"] = False
+            acct["disabled_at"] = now
+            acct["disabled_reason"] = reason
+            _pending_cap_persists.add(acct_id)
+            logger.warning(f"[POOL] Account {acct['name']} auto-disabled: {reason}")
+
         try:
             await _persist_rate_limit_state(acct_id)
         except SQLAlchemyError as e:
@@ -887,6 +947,9 @@ async def recheck_disabled_accounts():
                             }
                         } if dm else None
                         db_acct.enabled = acct.get("enabled", True)
+                        if acct.get("enabled", True):
+                            db_acct.disabled_reason = None
+                            acct["disabled_reason"] = None
                         rl_session.add(db_acct)
                 await rl_session.commit()
             # Clear any retried accounts on success
@@ -895,3 +958,28 @@ async def recheck_disabled_accounts():
                     _pending_rl_persists.remove(acct["id"])
         except Exception as e:
             logger.warning(f"[POOL] Failed to persist rate-limit state changes: {e}")
+
+    # Flush dirty usage-cap state (daily counter + auto-disable reason) to DB.
+    if _pending_cap_persists:
+        flush_ids = list(_pending_cap_persists)
+        try:
+            async with AsyncSessionLocal() as cap_session:
+                for acct_id in flush_ids:
+                    acct = _account_by_id.get(acct_id)
+                    if not acct:
+                        _pending_cap_persists.discard(acct_id)
+                        continue
+                    db_acct = await cap_session.get(MaxPlanAccount, uuid.UUID(acct_id))
+                    if db_acct is None:
+                        _pending_cap_persists.discard(acct_id)
+                        continue
+                    db_acct.daily_task_count = int(acct.get("daily_task_count") or 0)
+                    db_acct.daily_task_count_reset_at = acct.get("daily_task_count_reset_at")
+                    db_acct.disabled_reason = acct.get("disabled_reason")
+                    db_acct.enabled = acct.get("enabled", True)
+                    cap_session.add(db_acct)
+                await cap_session.commit()
+            for acct_id in flush_ids:
+                _pending_cap_persists.discard(acct_id)
+        except Exception as e:
+            logger.warning(f"[POOL] Failed to persist usage-cap state: {e}")
