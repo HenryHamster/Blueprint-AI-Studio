@@ -1,41 +1,53 @@
 #!/usr/bin/env bash
 # Run backend tests in Docker (mirrors CI).
 # Usage:
-#   scripts/test-backend.sh                       # full CI suite (import check + all tests)
-#   scripts/test-backend.sh testing/test_agent.py  # specific file
-#   scripts/test-backend.sh -k "test_name"         # specific test by name
-#   scripts/test-backend.sh --standalone           # standalone tests only (no DB fixtures)
+#   scripts/test-backend.sh                              # full suite, in-memory SQLite (fast)
+#   scripts/test-backend.sh testing/test_agent.py        # specific file
+#   scripts/test-backend.sh -k "test_name"               # specific test by name
+#   scripts/test-backend.sh --standalone                 # standalone tests only (no DB fixtures)
+#   scripts/test-backend.sh --postgres [...]             # use real Postgres sidecar (catches enum/JSONB/migration drift)
 set -euo pipefail
 cd "$(dirname "$0")/../backend"
+
+# --- Argument parsing: extract --postgres without disturbing other args ---
+USE_POSTGRES=0
+ARGS=()
+for arg in "$@"; do
+  if [ "$arg" = "--postgres" ]; then
+    USE_POSTGRES=1
+  else
+    ARGS+=("$arg")
+  fi
+done
+if [ "${#ARGS[@]}" -gt 0 ]; then set -- "${ARGS[@]}"; else set --; fi
+
+# --- Cleanup: combined trap for CLAUDE.md copy + Postgres sidecar ---
+PG_CONTAINER=""
+PG_NETWORK=""
+cleanup() {
+  rm -f CLAUDE.md
+  [ -n "$PG_CONTAINER" ] && docker rm -f "$PG_CONTAINER" &>/dev/null || true
+  [ -n "$PG_NETWORK" ] && docker network rm "$PG_NETWORK" &>/dev/null || true
+}
+trap cleanup EXIT
 
 # Copy root CLAUDE.md into the Docker build context so test_claude_md_* in
 # test_invariants.py finds it at /app/CLAUDE.md inside the image — mirrors
 # CI (.github/workflows/ci.yml already does this same cp before its own
-# docker build). Cleaned up on exit (including error/interrupt paths) via
-# trap so local dev doesn't see a stray file. backend/CLAUDE.md is already
-# in .gitignore as a safety net if the trap doesn't fire.
+# docker build). backend/CLAUDE.md is in .gitignore as a safety net.
 if [ -f ../CLAUDE.md ]; then
   cp ../CLAUDE.md CLAUDE.md
-  trap 'rm -f CLAUDE.md' EXIT
 fi
 
-ENV_ARGS="-e DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
-  -e GCP_PROJECT_ID=test-project \
-  -e LOCAL_MODE=true \
-  -e AGENT_JWT_SECRET=ci-test-secret \
-  -e WS_TICKET_SECRET=ci-test-secret"
-
-ENV_VARS="DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
-  GCP_PROJECT_ID=test-project \
-  LOCAL_MODE=true \
-  AGENT_JWT_SECRET=ci-test-secret \
-  WS_TICKET_SECRET=ci-test-secret"
-
-# Detect whether Docker is available; fall back to running pytest directly.
+# --- Detect Docker; --postgres requires it ---
 if command -v docker &>/dev/null; then
   USE_DOCKER=1
 else
   USE_DOCKER=0
+  if [ "$USE_POSTGRES" = "1" ]; then
+    echo "ERROR: --postgres requires Docker" >&2
+    exit 2
+  fi
   echo "=== Docker not found — running pytest directly ==="
   # Ensure pip-installed binaries are on PATH
   export PATH="$HOME/.local/bin:$PATH"
@@ -56,6 +68,41 @@ else
   PYTHON="${PYTHON:-python3}"
 fi
 
+# --- Configure DATABASE_URL / ENV_ARGS based on --postgres ---
+if [ "$USE_POSTGRES" = "1" ]; then
+  PG_NETWORK="blueprint-test-net-$$"
+  PG_CONTAINER="blueprint-test-pg-$$"
+  PG_DSN="postgresql+asyncpg://test:test@${PG_CONTAINER}:5432/test_blueprint"
+
+  echo "=== Starting Postgres sidecar (${PG_CONTAINER}) ==="
+  docker network create "$PG_NETWORK" >/dev/null
+  docker run -d --rm --name "$PG_CONTAINER" --network "$PG_NETWORK" \
+    -e POSTGRES_USER=test \
+    -e POSTGRES_PASSWORD=test \
+    -e POSTGRES_DB=test_blueprint \
+    postgres:15 >/dev/null
+
+  ENV_ARGS="--network $PG_NETWORK \
+    -e DATABASE_URL=$PG_DSN \
+    -e USE_TEST_POSTGRES=true \
+    -e GCP_PROJECT_ID=test-project \
+    -e LOCAL_MODE=true \
+    -e AGENT_JWT_SECRET=ci-test-secret \
+    -e WS_TICKET_SECRET=ci-test-secret"
+else
+  ENV_ARGS="-e DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
+    -e GCP_PROJECT_ID=test-project \
+    -e LOCAL_MODE=true \
+    -e AGENT_JWT_SECRET=ci-test-secret \
+    -e WS_TICKET_SECRET=ci-test-secret"
+fi
+
+ENV_VARS="DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
+  GCP_PROJECT_ID=test-project \
+  LOCAL_MODE=true \
+  AGENT_JWT_SECRET=ci-test-secret \
+  WS_TICKET_SECRET=ci-test-secret"
+
 _run() {
   # _run <cmd...> — runs inside Docker or directly, with env vars set
   if [ "$USE_DOCKER" = "1" ]; then
@@ -73,6 +120,17 @@ _run() {
 if [ "$USE_DOCKER" = "1" ]; then
   echo "=== Building backend image ==="
   docker build -t blueprint-backend-test . -q
+fi
+
+# --- Postgres needs migrations applied before tests ---
+if [ "$USE_POSTGRES" = "1" ]; then
+  echo "=== Waiting for Postgres ==="
+  for _ in $(seq 1 30); do
+    if docker exec "$PG_CONTAINER" pg_isready -U test &>/dev/null; then break; fi
+    sleep 0.5
+  done
+  echo "=== Running alembic migrations ==="
+  _run alembic upgrade head
 fi
 
 echo "=== Verify app imports ==="

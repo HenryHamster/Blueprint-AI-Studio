@@ -171,6 +171,7 @@ jobs:
         id: run_tests
         continue-on-error: true
         run: |
+          set -o pipefail
           docker run --rm --network host \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
             -e USE_TEST_POSTGRES=true \
@@ -178,9 +179,12 @@ jobs:
             -e WS_TICKET_SECRET=ci-test-secret \
             blueprint-backend-test \
             python -m pytest testing/ -v --tb=short --timeout=15 2>&1 | tee test-output.txt
+          pytest_status=${PIPESTATUS[0]}
 
           # Extract failed test IDs
           grep -E "FAILED" test-output.txt | sed 's/.*FAILED //' | sed 's/ -.*//' | sort -u > pr-test-failures.txt || true
+
+          exit $pytest_status
 
       - name: Save test failures baseline (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
