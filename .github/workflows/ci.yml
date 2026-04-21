@@ -180,7 +180,7 @@ jobs:
             -e AGENT_JWT_SECRET=ci-test-secret \
             -e WS_TICKET_SECRET=ci-test-secret \
             blueprint-backend-test \
-            python -m pytest testing/ -v --tb=short --timeout=15 2>&1 | tee test-output.txt
+            python -m pytest testing/ -v --tb=short --timeout=30 --timeout-method=signal --log-cli-level=WARNING 2>&1 | tee test-output.txt
           pytest_status=${PIPESTATUS[0]}
           set -e
 

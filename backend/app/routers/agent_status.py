@@ -1008,7 +1008,10 @@ async def update_agent_status(
                                 task.latest_status_message = f"Rate Limited — all accounts exhausted, retrying in 5min"
                         elif failure_class != "EXTERNAL_API":
                             ctx.pop("retry_after", None)
-                        ctx = clear_task_llm_runtime_context(ctx)
+                        # Preserve llm_* runtime identity keys (provider/model/auth_mode/
+                        # execution_mode) for observability — debugging which provider failed
+                        # and per-provider metrics need this. The blacklisted_accounts list
+                        # already prevents the next attempt from re-picking the failed account.
                         ctx.pop("_slot_released", None)
                         # The task just ran on a VM successfully enough to POST a result —
                         # provisioning path worked. Don't carry a stale provision budget
@@ -1424,7 +1427,15 @@ async def update_agent_status(
         # At this point the status change, artifact, and retry logic are all
         # persisted.  expire_on_commit=False keeps the task object usable.
         try:
-            if session.dirty or session.new:
+            # Commit unconditionally if a transaction is open. The earlier
+            # `if session.dirty or session.new` was unsafe: autoflush from any
+            # prior SELECT in this handler already wrote pending UPDATEs to the
+            # DB and cleared session.dirty, so the check would skip — and then
+            # session.close() would roll back the autoflushed changes. Manifests
+            # as task.status appearing to update in logs but reverting in DB
+            # (most visibly in the EXTERNAL_API permanent-auth-failure path,
+            # which has no explicit commit upstream of this point).
+            if session.in_transaction():
                 await session.commit()
         except Exception as early_exc:
             logger.error(f"[PIPELINE] Early commit failed for {task.id}: {early_exc}", exc_info=True)

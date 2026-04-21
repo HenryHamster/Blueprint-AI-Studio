@@ -3117,6 +3117,16 @@ async def test_external_api_permanent_auth_failure_does_not_requeue(client: Asyn
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    # _process_post_commit opens a separate session and does FOR UPDATE on the
+    # task, racing with the test's session and producing PostCommitLocked
+    # (~6s/iteration of FOR UPDATE retries). This test asserts handler-side
+    # permanent-auth detection only — post-commit (PR review/rollup wiring)
+    # isn't relevant here.
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=mocker.AsyncMock,
+        return_value={"status": "accepted"},
+    )
 
     project = Project(name="Auth Failure Test", user_id="test-user-auth-fail")
     db_session.add(project)

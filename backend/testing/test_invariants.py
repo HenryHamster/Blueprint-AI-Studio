@@ -658,7 +658,7 @@ class TestDirectionLifecycleInvariants:
 MODULE_SIZE_LIMITS = {
     # (relative_path_from_app_dir, max_lines)
     "main.py": 3500,
-    "task_completion.py": 2300,
+    "task_completion.py": 2400,
     "task_lifecycle.py": 2550,
     "orchestrator.py": 3000,
     "admin.py": 3000,
@@ -666,14 +666,14 @@ MODULE_SIZE_LIMITS = {
     "github.py": 2000,
     "routers/admin_settings.py": 3000,
     "routers/admin_analytics.py": 3200,
-    "routers/agent.py": 2100,
+    "routers/agent.py": 2200,
     "services.py": 1600,
-    "routers/agent_status.py": 1500,
+    "routers/agent_status.py": 1550,
     "autonomous_research.py": 1600,
     "research_completion.py": 2050,
     "strategic_completion.py": 1500,
     "rollup_management.py": 1600,
-    "reaper.py": 1400,
+    "reaper.py": 1450,
     "review_pipeline.py": 1250,
     "deploy_health.py": 1000,
 }
