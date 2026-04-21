@@ -346,6 +346,12 @@ def predict_spawn_success(
        Cross-module span is not a separate signal here — the composite complexity
        score already includes a module-span factor, so double-counting is avoided.
 
+    18. First-attempt rejection concentration (weight 1.0). Reads the direction's
+        per-category first-attempt rejection tally from
+        project.design_doc.direction_first_attempt_feedback[direction_id].
+        Applies 0.3 when total>=10 and max-category share>=0.5, 0.5 when
+        total>=5 and max-category share>=0.4, omitted otherwise.
+
     Returns a float in [0.0, 1.0]. Falls back to 0.5 when data is insufficient.
     No DB queries — uses only data already loaded during research_completion processing.
     """
@@ -682,6 +688,30 @@ def predict_spawn_success(
     elif momentum <= 0.5:
         signals.append(0.2)
         weights.append(1.0)
+
+    # Signal 18: first-attempt rejection concentration. When a direction has
+    # accumulated many first-attempt rejections concentrated in a single review
+    # category, it suggests a systematic prompt-quality or scope-calibration
+    # issue rather than random implementation flaws. Reads the per-direction
+    # tally written by playbook_learning._accumulate_direction_first_attempt.
+    direction_id = direction.get("id")
+    if project is not None and direction_id:
+        design_doc = getattr(project, "design_doc", None) or {}
+        dfa = design_doc.get("direction_first_attempt_feedback") or {}
+        entry = dfa.get(str(direction_id)) or {}
+        cat_counts = [
+            v for k, v in entry.items()
+            if k not in ("total", "last_updated") and isinstance(v, (int, float))
+        ]
+        total = sum(cat_counts)
+        if total >= 5 and cat_counts:
+            concentration = max(cat_counts) / total
+            if total >= 10 and concentration >= 0.5:
+                signals.append(0.3)
+                weights.append(1.0)
+            elif concentration >= 0.4:
+                signals.append(0.5)
+                weights.append(1.0)
 
     if not signals:
         return 0.5  # insufficient data — neutral

@@ -1358,6 +1358,7 @@ async def claim_task(
                     direction_successful_analysis.append(s_entry)
 
                 direction_first_attempt_feedback: Dict[str, int] | None = None
+                dfa_entry: dict = {}
                 try:
                     dfa_all = (project_for_playbook.design_doc or {}).get(
                         "direction_first_attempt_feedback"
@@ -1387,7 +1388,7 @@ async def claim_task(
                     "first_attempt_feedback": direction_first_attempt_feedback,
                 }
                 from app.direction_outcomes import summarize_review_quality_feedback
-                review_quality_feedback = summarize_review_quality_feedback(history)
+                review_quality_feedback = summarize_review_quality_feedback(history, dfa_entry)
                 if review_quality_feedback:
                     response["direction_context"]["review_quality_feedback"] = review_quality_feedback
 
@@ -1465,9 +1466,31 @@ async def claim_task(
                 }
                 if prompt_quality_patterns:
                     response["direction_context"]["prompt_quality_patterns"] = prompt_quality_patterns
-                research_review_quality_feedback = summarize_review_quality_feedback(history)
+                research_dfa_entry: dict = {}
+                try:
+                    if project_for_playbook and current_direction_id:
+                        research_dfa_entry = (
+                            (project_for_playbook.design_doc or {})
+                            .get("direction_first_attempt_feedback") or {}
+                        ).get(str(current_direction_id)) or {}
+                except Exception:
+                    logger.exception("[AGENT] Failed to read direction_first_attempt_feedback for research (non-critical)")
+                research_review_quality_feedback = summarize_review_quality_feedback(
+                    history, research_dfa_entry
+                )
                 if research_review_quality_feedback:
                     response["direction_context"]["review_quality_feedback"] = research_review_quality_feedback
+
+                from app.direction_outcomes import (
+                    summarize_dedup_filter,
+                    summarize_failure_hotspots,
+                )
+                failure_hotspots = summarize_failure_hotspots(direction, task.project_id)
+                if failure_hotspots:
+                    response["direction_context"]["failure_hotspots"] = failure_hotspots
+                dedup_summary = summarize_dedup_filter(history)
+                if dedup_summary:
+                    response["direction_context"]["dedup_filter_summary"] = dedup_summary
 
     # Inject co-change affinity context for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:

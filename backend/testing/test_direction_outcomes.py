@@ -2277,3 +2277,60 @@ def test_synthesize_prompt_quality_patterns_skips_when_differences_are_noise():
         }},
     ]
     assert synthesize_prompt_quality_patterns(history) == []
+
+
+def test_synthesize_prompt_quality_patterns_emits_scope_segmented_note():
+    from app.direction_outcomes import synthesize_prompt_quality_patterns
+    history = [
+        {"prompt_telemetry": {
+            "merged": {"count": 3, "avg_char_count": 600, "avg_related_file_count": 2.0,
+                       "frac_mentions_tests": 0.5, "frac_mentions_symbols": 0.5},
+            "failed": {"count": 2, "avg_char_count": 600, "avg_related_file_count": 2.0,
+                       "frac_mentions_tests": 0.5, "frac_mentions_symbols": 0.5},
+            "merged_small": {"count": 2, "avg_char_count": 300},
+            "failed_small": {"count": 2, "avg_char_count": 900},
+        }},
+        {"prompt_telemetry": {
+            "merged": {"count": 3, "avg_char_count": 600, "avg_related_file_count": 2.0,
+                       "frac_mentions_tests": 0.5, "frac_mentions_symbols": 0.5},
+            "failed": {"count": 2, "avg_char_count": 600, "avg_related_file_count": 2.0,
+                       "frac_mentions_tests": 0.5, "frac_mentions_symbols": 0.5},
+            "merged_small": {"count": 2, "avg_char_count": 320},
+            "failed_small": {"count": 2, "avg_char_count": 880},
+        }},
+    ]
+    notes = synthesize_prompt_quality_patterns(history)
+    assert any("Small-scope" in n for n in notes)
+
+
+def test_summarize_review_quality_feedback_includes_top_categories():
+    from app.direction_outcomes import summarize_review_quality_feedback
+    history = [{"reviews_dismissed": 1, "tasks_completed": 1}]
+    dfa = {
+        "missing_tests": 4,
+        "style": 2,
+        "naming": 1,
+        "obscure": 1,
+        "total": 8,
+        "last_updated": "2026-04-20T00:00:00",
+    }
+    result = summarize_review_quality_feedback(history, dfa)
+    assert result is not None
+    assert result["top_categories"] == {"missing_tests": 4, "style": 2, "naming": 1}
+
+
+def test_summarize_review_quality_feedback_skips_top_categories_when_sparse():
+    from app.direction_outcomes import summarize_review_quality_feedback
+    history = [{"reviews_dismissed": 1, "tasks_completed": 1}]
+    dfa = {"missing_tests": 1, "style": 1, "total": 2}
+    result = summarize_review_quality_feedback(history, dfa)
+    assert result is not None
+    assert "top_categories" not in result
+
+
+def test_summarize_review_quality_feedback_no_dfa_unchanged():
+    from app.direction_outcomes import summarize_review_quality_feedback
+    history = [{"reviews_dismissed": 2, "tasks_completed": 1}]
+    result = summarize_review_quality_feedback(history)
+    assert result is not None
+    assert "top_categories" not in result

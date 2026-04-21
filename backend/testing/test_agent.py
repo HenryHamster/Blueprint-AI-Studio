@@ -1657,6 +1657,123 @@ async def test_claim_injects_saturation_signals_for_research_task(client: AsyncC
 
 
 @pytest.mark.asyncio
+async def test_claim_injects_failure_hotspots_for_research_task(client: AsyncClient, db_session):
+    """Research direction_context surfaces diagnosed_affected_files and active anomalies."""
+    from sqlalchemy.orm.attributes import flag_modified
+    from app import shared_state as _ss
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Research Hotspot Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Direction with diagnosis",
+            "priority": "medium",
+            "diagnosed_affected_files": [
+                "backend/app/foo.py",
+                "backend/app/bar.py",
+            ],
+            "diagnosis_summary": "Recurring import failure in foo/bar modules.",
+            "last_remediation_fingerprint": "abc123def456",
+            "research_history": [],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior = _ss.persistent_anomalies.get(str(project.id))
+    _ss.persistent_anomalies[str(project.id)] = {
+        "PROVISION_FAILURE": {
+            "occurrence_count": 4,
+            "severity": "high",
+            "latest_details": "Zones cooling down in us-central1.",
+        }
+    }
+    try:
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "Research this direction"}],
+            vm_instance_id="agent-vm-research-hotspot",
+            context={"direction_id": direction_id},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        token = create_agent_token(str(task.id), "agent-vm-research-hotspot")
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+        assert resp.status_code == 200
+        dc = resp.json().get("direction_context") or {}
+        fh = dc.get("failure_hotspots")
+        assert fh is not None, f"failure_hotspots missing, dc keys: {list(dc.keys())}"
+        assert "backend/app/foo.py" in fh["diagnosed_affected_files"]
+        assert fh["last_remediation_fingerprint"] == "abc123def456"
+        assert fh["diagnosis_summary"].startswith("Recurring import failure")
+        assert any(a["key"] == "PROVISION_FAILURE" for a in fh["active_anomalies"])
+    finally:
+        if prior is None:
+            _ss.persistent_anomalies.pop(str(project.id), None)
+        else:
+            _ss.persistent_anomalies[str(project.id)] = prior
+
+
+@pytest.mark.asyncio
+async def test_claim_injects_dedup_filter_summary_for_research_task(client: AsyncClient, db_session):
+    """Claim endpoint surfaces dedup_filter_summary from last research_history entry."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Dedup Filter Summary Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Word overlap heavy",
+            "priority": "medium",
+            "research_history": [
+                {
+                    "tasks_created": 2,
+                    "findings_produced": 7,
+                    "filter_breakdown": {
+                        "hash_dedup": 0,
+                        "word_overlap_dedup": 4,
+                        "file_overlap_dedup": 1,
+                        "type_filtered": 0,
+                        "empty_prompt": 0,
+                    },
+                },
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "Research"}],
+        vm_instance_id="agent-vm-dedup-filter",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dedup-filter")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dc = resp.json().get("direction_context")
+    assert dc is not None
+    dfs = dc.get("dedup_filter_summary")
+    assert dfs is not None
+    assert "5/7 findings filtered" in dfs["summary"]
+    assert "word-overlap" in dfs["summary"]
+    assert "distinctive" in dfs["guidance"].lower()
+
+
+@pytest.mark.asyncio
 async def test_compute_failure_stage_pattern_code_error_dominant():
     """Returns code_error pattern when 60%+ of non-infra failures are code errors."""
     from app.routers.agent import _compute_failure_stage_pattern

@@ -1478,6 +1478,38 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         filtered_findings=filtered_findings,
     )
 
+    # Persist per-cycle deferred-finding counts on the direction's latest
+    # research_history entry so the next research agent can see how many of
+    # its prior findings failed to spawn and why. Without this, the agent
+    # cannot tell whether to produce fewer, higher-confidence findings.
+    _total_deferred = len(_all_deferred)
+    if _total_deferred > 0:
+        _denom = _impl_spawned + _total_deferred
+        _deferred_stats = {
+            "total": _total_deferred,
+            "by_reason": {
+                "degradation_gate": len(_deferred_findings),
+                "batch_cap": len(_batch_cap_deferred),
+                "ultra_low_confidence": len(_low_conf_skipped_findings),
+            },
+            "spawn_ratio": (_impl_spawned / _denom) if _denom > 0 else None,
+        }
+        _proj = await session.get(Project, task.project_id)
+        if _proj and _proj.directions:
+            _dirs = list(_proj.directions)
+            _changed = False
+            for _d in _dirs:
+                _hist = _d.get("research_history") or []
+                if _hist and _hist[-1].get("task_id") == str(task.id):
+                    _hist[-1]["deferred_stats"] = _deferred_stats
+                    _d["research_history"] = _hist
+                    _changed = True
+            if _changed:
+                _proj.directions = _dirs
+                flag_modified(_proj, "directions")
+                session.add(_proj)
+                await session.commit()
+
     # Mark per-direction cycle productivity so direction_lifecycle can pick
     # an adaptive cooldown: productive cycles (>=1 task spawned) get a shorter
     # cooldown, unproductive cycles keep the standard cooldown.

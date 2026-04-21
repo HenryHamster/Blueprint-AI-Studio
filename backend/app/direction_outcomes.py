@@ -584,13 +584,21 @@ async def _update_direction_research_outcomes(
         pt = (ct.context or {}).get("prompt_telemetry")
         if not isinstance(pt, dict):
             continue
+        scope_val = (ct.context or {}).get("scope")
         if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged"):
             pt_buckets["merged"].append(pt)
+            if scope_val in ("small", "medium"):
+                pt_buckets.setdefault(f"merged_{scope_val}", []).append(pt)
         elif _counts_as_failure(ct):
             pt_buckets["failed"].append(pt)
+            if scope_val in ("small", "medium"):
+                pt_buckets.setdefault(f"failed_{scope_val}", []).append(pt)
     prompt_telemetry_summary: dict = {}
     for bucket_name, items in pt_buckets.items():
         if not items:
+            continue
+        # Scope-segmented sub-buckets require 2+ entries to avoid noise.
+        if bucket_name not in ("merged", "failed") and len(items) < 2:
             continue
         n = len(items)
         def _avg(key: str):
@@ -836,13 +844,21 @@ def _refresh_pipeline_scope_merge_rates(project: Project) -> None:
     runtime_config["pipeline_scope_expansion_ratios"] = ratios
 
 
-def summarize_review_quality_feedback(history: list) -> dict | None:
+def summarize_review_quality_feedback(
+    history: list, first_attempt_feedback: dict | None = None
+) -> dict | None:
     """Aggregate review quality signals across the last 3 research cycles.
 
     Returns totals for reviews dismissed, overridden, and user-caught issues,
     plus an optional note when a signal is elevated relative to completed
     tasks — letting agents calibrate self-review thoroughness. Returns None
     when no recent cycle carries any of the signals.
+
+    When ``first_attempt_feedback`` is the direction's tally dict from
+    ``design_doc['direction_first_attempt_feedback'][direction_id]`` and the
+    total category counts are >= 3, includes a ``top_categories`` field with
+    the top 3 rejection categories (sorted by count desc) so agents see WHICH
+    categories are driving review pressure.
     """
     if not isinstance(history, list):
         return None
@@ -880,6 +896,15 @@ def summarize_review_quality_feedback(history: list) -> dict | None:
     }
     if note:
         result["note"] = note
+    if isinstance(first_attempt_feedback, dict):
+        cat_counts = {
+            k: v for k, v in first_attempt_feedback.items()
+            if k not in ("total", "last_updated")
+            and isinstance(v, int) and v > 0
+        }
+        if sum(cat_counts.values()) >= 3:
+            top = sorted(cat_counts.items(), key=lambda kv: -kv[1])[:3]
+            result["top_categories"] = dict(top)
     return result
 
 
@@ -947,4 +972,145 @@ def synthesize_prompt_quality_patterns(history: list) -> list[str]:
             f"{int(ms * 100)}% of merged prompts named specific symbols vs {int(fs * 100)}% of failed — "
             f"{'name concrete functions/classes' if ms > fs else 'symbol naming did not correlate with merge here'}."
         )
+
+    # Scope-segmented char-count guidance: when both merged_<scope> and
+    # failed_<scope> buckets have data across cycles, emit a scope-specific
+    # note so research agents can calibrate prompt detail per scope.
+    for scope in ("small", "medium"):
+        m_chars: list[float] = []
+        f_chars: list[float] = []
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            pt = entry.get("prompt_telemetry")
+            if not isinstance(pt, dict):
+                continue
+            m_seg = pt.get(f"merged_{scope}")
+            f_seg = pt.get(f"failed_{scope}")
+            if isinstance(m_seg, dict) and isinstance(m_seg.get("avg_char_count"), (int, float)):
+                m_chars.append(float(m_seg["avg_char_count"]))
+            if isinstance(f_seg, dict) and isinstance(f_seg.get("avg_char_count"), (int, float)):
+                f_chars.append(float(f_seg["avg_char_count"]))
+        if not m_chars or not f_chars:
+            continue
+        mv, fv = sum(m_chars) / len(m_chars), sum(f_chars) / len(f_chars)
+        if max(mv, fv) > 0 and abs(mv - fv) / max(mv, fv) >= 0.2:
+            notes.append(
+                f"{scope.capitalize()}-scope merged prompts averaged {int(mv)} chars "
+                f"vs {int(fv)} for failed {scope}-scope."
+            )
     return notes
+
+
+def summarize_failure_hotspots(direction: dict, project_id) -> dict | None:
+    """Build the failure_hotspots block for research direction_context.
+
+    Surfaces diagnosed affected files, the diagnosis summary, and any active
+    anomalies tracked in shared_state so research agents can either address
+    or steer away from known failure regions. Returns None when there is
+    nothing to surface.
+    """
+    if not isinstance(direction, dict):
+        return None
+    hotspot_files = [
+        f for f in (direction.get("diagnosed_affected_files") or [])
+        if isinstance(f, str)
+    ]
+    failure_hotspots: dict = {}
+    if hotspot_files:
+        failure_hotspots["diagnosed_affected_files"] = hotspot_files[:15]
+        diagnosis_summary = (direction.get("diagnosis_summary") or "").strip()
+        if diagnosis_summary:
+            failure_hotspots["diagnosis_summary"] = diagnosis_summary[:220]
+        last_fp = direction.get("last_remediation_fingerprint")
+        if last_fp:
+            failure_hotspots["last_remediation_fingerprint"] = last_fp
+    try:
+        from app import shared_state as _ss_anom
+        _anoms = _ss_anom.persistent_anomalies.get(str(project_id)) or {}
+        if _anoms:
+            active_anomalies = []
+            for key, info in list(_anoms.items())[:5]:
+                details = (info.get("latest_details") or "")[:140]
+                active_anomalies.append({
+                    "key": key,
+                    "occurrence_count": info.get("occurrence_count", 0),
+                    "severity": info.get("severity"),
+                    "details": details,
+                })
+            if active_anomalies:
+                failure_hotspots["active_anomalies"] = active_anomalies
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "Failed to surface active anomalies (non-critical)"
+        )
+    return failure_hotspots or None
+
+
+def summarize_dedup_filter(history: list) -> dict | None:
+    """Summarize last research cycle's filter_breakdown for the next agent.
+
+    Without this, the research agent cannot tell whether its last batch was
+    rejected because of duplicate phrasing, overlapping files, or wrong
+    finding type — and so cannot adjust. Returns a dict with a human-readable
+    summary plus optional dominant-cause guidance, or None if nothing was
+    filtered last cycle.
+    """
+    if not isinstance(history, list) or not history:
+        return None
+    last_entry = history[-1]
+    if not isinstance(last_entry, dict):
+        return None
+    fb = last_entry.get("filter_breakdown") or {}
+    hash_n = int(fb.get("hash_dedup", 0) or 0)
+    word_n = int(fb.get("word_overlap_dedup", 0) or 0)
+    file_n = int(fb.get("file_overlap_dedup", 0) or 0)
+    type_n = int(fb.get("type_filtered", 0) or 0)
+    total_filtered = hash_n + word_n + file_n + type_n
+    if total_filtered <= 0:
+        return None
+    findings_produced = int(last_entry.get("findings_produced", 0) or 0)
+    parts = []
+    if word_n:
+        parts.append(f"{word_n} word-overlap")
+    if file_n:
+        parts.append(f"{file_n} file-overlap")
+    if hash_n:
+        parts.append(f"{hash_n} hash-dedup")
+    if type_n:
+        parts.append(f"{type_n} type-filtered")
+    summary_text = (
+        f"Last cycle: {total_filtered}/{findings_produced} findings filtered "
+        f"({', '.join(parts)})"
+    )
+    dominant_n, dominant_kind = max(
+        ((word_n, "word"), (file_n, "file"), (hash_n, "hash"), (type_n, "type")),
+        key=lambda x: x[0],
+    )
+    guidance = None
+    if dominant_n > 0 and dominant_n * 2 >= total_filtered:
+        if dominant_kind == "word":
+            guidance = (
+                "Word-overlap dominates — use more distinctive titles and "
+                "descriptions to differentiate from existing work."
+            )
+        elif dominant_kind == "file":
+            guidance = (
+                "File-overlap dominates — findings target files with active "
+                "PRs. Pick different files or wait for active work to merge."
+            )
+        elif dominant_kind == "hash":
+            guidance = (
+                "Hash-dedup dominates — exact duplicate findings. Vary "
+                "phrasing and approach to avoid repeating prior work."
+            )
+        elif dominant_kind == "type":
+            guidance = (
+                "Most findings were type-filtered (direction_update / "
+                "design_doc_observation). Produce actionable task findings."
+            )
+    result: dict = {"summary": summary_text}
+    if guidance:
+        result["guidance"] = guidance
+    return result

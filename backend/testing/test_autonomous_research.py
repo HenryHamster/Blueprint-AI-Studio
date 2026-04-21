@@ -4367,6 +4367,44 @@ async def test_health_gate_deferred_findings_stored_in_context(db_session, mocke
 
 
 @pytest.mark.asyncio
+async def test_deferred_stats_persisted_on_research_history_entry(db_session, mocker):
+    """Deferred finding counts are persisted on the direction's latest research_history entry."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-defstats01"
+    direction = _active_direction(direction_id, "Deferred stats persistence")
+    project = Project(
+        name="Deferred Stats", user_id="test-user-123", autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    findings = [_make_finding(f"Finding {i}", direction_id) for i in range(5)]
+    mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
+    mocker.patch(
+        "app.research_completion._assess_spawn_health",
+        return_value=(True, "high failure rate"),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][-1]
+    assert "deferred_stats" in entry
+    stats = entry["deferred_stats"]
+    assert stats["total"] == 5 - _DEGRADED_SPAWN_CAP
+    assert stats["by_reason"]["degradation_gate"] == 5 - _DEGRADED_SPAWN_CAP
+    assert stats["by_reason"]["batch_cap"] == 0
+    assert stats["by_reason"]["ultra_low_confidence"] == 0
+    assert 0 < stats["spawn_ratio"] < 1
+
+
+@pytest.mark.asyncio
 async def test_health_gate_metadata_findings_bypass_cap(db_session, mocker):
     """Metadata finding types (design_doc_observation, direction_update) bypass the health gate."""
     from app.research_completion import _DEGRADED_SPAWN_CAP

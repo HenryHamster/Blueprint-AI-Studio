@@ -1280,6 +1280,95 @@ class TestPredictSpawnSuccessQualityAndMomentum:
         assert predict_spawn_success("small", regressed) < predict_spawn_success("small", clean)
 
 
+# ── predict_spawn_success: first-attempt rejection concentration ──────────────
+
+
+class TestPredictSpawnSuccessFirstAttemptConcentration:
+    """Signal 18 in predict_spawn_success."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_pipeline_rates(self):
+        from app.shared_state import runtime_config
+        prev = runtime_config.get("pipeline_scope_merge_rates")
+        runtime_config["pipeline_scope_merge_rates"] = {}
+        yield
+        if prev is None:
+            runtime_config.pop("pipeline_scope_merge_rates", None)
+        else:
+            runtime_config["pipeline_scope_merge_rates"] = prev
+
+    def _direction(self):
+        return {
+            "id": "dir-abc",
+            "research_history": [{"tasks_created": 2, "prs_merged": 1}],
+        }
+
+    def test_strong_concentration_penalty(self):
+        from app.spawn_calibration import predict_spawn_success
+        direction = self._direction()
+        project_bad = _make_project(design_doc={
+            "direction_first_attempt_feedback": {
+                "dir-abc": {"correctness": 8, "style": 2, "total": 10},
+            },
+        })
+        project_clean = _make_project(design_doc={})
+        assert predict_spawn_success("small", direction, project=project_bad) < \
+               predict_spawn_success("small", direction, project=project_clean)
+
+    def test_moderate_concentration_penalty(self):
+        from app.spawn_calibration import predict_spawn_success
+        direction = self._direction()
+        project_mod = _make_project(design_doc={
+            "direction_first_attempt_feedback": {
+                "dir-abc": {"correctness": 3, "style": 2, "scope": 2, "total": 7},
+            },
+        })
+        project_strong = _make_project(design_doc={
+            "direction_first_attempt_feedback": {
+                "dir-abc": {"correctness": 8, "style": 2, "total": 10},
+            },
+        })
+        # Strong signal (0.3) penalizes more than moderate (0.5)
+        assert predict_spawn_success("small", direction, project=project_strong) < \
+               predict_spawn_success("small", direction, project=project_mod)
+
+    def test_below_threshold_omitted(self):
+        from app.spawn_calibration import predict_spawn_success
+        direction = self._direction()
+        project_low = _make_project(design_doc={
+            "direction_first_attempt_feedback": {
+                "dir-abc": {"correctness": 2, "style": 1, "total": 3},
+            },
+        })
+        project_none = _make_project(design_doc={})
+        assert predict_spawn_success("small", direction, project=project_low) == \
+               predict_spawn_success("small", direction, project=project_none)
+
+    def test_spread_not_concentrated_omitted(self):
+        from app.spawn_calibration import predict_spawn_success
+        direction = self._direction()
+        project_spread = _make_project(design_doc={
+            "direction_first_attempt_feedback": {
+                "dir-abc": {"a": 2, "b": 2, "c": 2, "d": 2, "total": 8},
+            },
+        })
+        project_none = _make_project(design_doc={})
+        assert predict_spawn_success("small", direction, project=project_spread) == \
+               predict_spawn_success("small", direction, project=project_none)
+
+    def test_missing_direction_id_omitted(self):
+        from app.spawn_calibration import predict_spawn_success
+        direction = {"research_history": [{"tasks_created": 2, "prs_merged": 1}]}
+        project_bad = _make_project(design_doc={
+            "direction_first_attempt_feedback": {
+                "dir-abc": {"correctness": 8, "total": 8},
+            },
+        })
+        project_none = _make_project(design_doc={})
+        assert predict_spawn_success("small", direction, project=project_bad) == \
+               predict_spawn_success("small", direction, project=project_none)
+
+
 # ── anomaly_summary in _spawn_strategic_review payload ───────────────────────
 
 @pytest.mark.asyncio
