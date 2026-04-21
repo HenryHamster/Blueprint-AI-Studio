@@ -311,12 +311,18 @@ class TestComputeStartupScriptBeacons:
         """
         script = _render_compute_startup_script()
         # Negated form must not appear.
-        assert "if ! python3 - " not in script, (
+        assert "if ! python3 " not in script and "if ! timeout " not in script, (
             "python manifest `if` is inverted — success triggers failure path"
         )
-        # Positive form must be present in the manifest block.
-        assert "if python3 - " in script, (
-            "expected `if python3 - ...` around the manifest block"
+        # Positive form must be present. Accept either `if python3 - ` or
+        # `if timeout N python3 - ` (we wrap in `timeout` to bound hangs).
+        has_positive = (
+            "if python3 - " in script
+            or re.search(r"if\s+timeout\s+\d+\s+python3\s+-\s+", script) is not None
+        )
+        assert has_positive, (
+            "expected `if python3 - ...` or `if timeout N python3 - ...` "
+            "around the manifest block"
         )
 
     def test_env_file_sourced_not_greped_in_healthcheck(self):

@@ -814,12 +814,14 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     PY_STDERR=/tmp/agent_manifest_py.err
     printf '%s' "$CREDS" > "$MANIFEST_PATH"
     PY_EXIT=0
-    if python3 - "$MANIFEST_PATH" /etc/agent.env 2>"$PY_STDERR" <<'PY'
+    # `timeout 60` bounds the python block against hangs that bypass ERR:
+    # NSS lookups (pwd.getpwnam) can block for minutes on a broken stack,
+    # with no exception, no exit, no signal — observed in task 23889608.
+    # exit=124 from GNU timeout signals we hit the wall.
+    if timeout 60 python3 - "$MANIFEST_PATH" /etc/agent.env 2>"$PY_STDERR" <<'PY'
 import json
 import os
 import pathlib
-import pwd
-import grp
 import sys
 
 manifest_path, env_path = sys.argv[1], sys.argv[2]
@@ -834,8 +836,21 @@ with open(env_path, "w", encoding="utf-8") as env_file:
         rendered = str(value).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
         env_file.write(f'{{key}}="{{rendered}}"\n')
 
-uid = pwd.getpwnam("agent").pw_uid
-gid = grp.getgrnam("agent").gr_gid
+# Bypass NSS for user lookup. pwd.getpwnam / grp.getgrnam go through
+# getent which honors /etc/nsswitch.conf; a broken NSS source (LDAP,
+# sss, systemd-resolved) blocks for many minutes with no exception —
+# exactly the silent-hang we observed on image family v2. /etc/passwd
+# + /etc/group are flat files that can't block.
+def _lookup(path, user):
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith(user + ":"):
+                return int(line.strip().split(":")[2])
+    raise RuntimeError("user {{0}} missing from {{1}}".format(user, path))
+
+uid = _lookup("/etc/passwd", "agent")
+gid = _lookup("/etc/group", "agent")
+
 for item in manifest.get("files", []):
     path = pathlib.Path(item["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
