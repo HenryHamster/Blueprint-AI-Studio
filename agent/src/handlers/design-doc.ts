@@ -216,9 +216,14 @@ Skip full re-analysis of systems with no files in the manifest.
    This helps the strategic agent avoid proposing features on shaky foundations.
 9. If open messages mention architecture or systems, incorporate those observations into the relevant pages.
    Do NOT resolve messages — the strategic review agent handles message responses and resolution.
-10. Review playbook entries (run: ./playbook get) — remove outdated entries, merge duplicates,
-   and validate that entries reflect the current codebase state. Use ./playbook delete <key>
-   for stale entries.`;
+10. ACTIVELY CURATE the design doc — it is not an append-only log.
+    - Delete systems/capabilities/notes that describe code that no longer exists or no longer matters.
+    - Merge duplicate or near-duplicate pages; rename to canonical IDs.
+    - Use ./design-doc delete "<key>" liberally. A lean, accurate doc beats a sprawling one.
+11. ACTIVELY CURATE the playbook (./playbook get, ./playbook delete <key>):
+    - Remove entries that describe fixed bugs, stale APIs, or patterns the codebase no longer uses.
+    - Merge duplicates. Don't hoard entries "just in case" — keep only what a future agent would actually benefit from.
+    - There is no reward for playbook volume. Fewer, sharper entries is better than hundreds of vague ones.`;
 
   statusRef.value = 'Running architecture review...';
   let { exitCode } = await runClaudeCode(prompt + designDocFirstTaskSection + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);

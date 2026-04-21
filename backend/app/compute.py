@@ -821,6 +821,18 @@ PY
 
     # 6. Start the systemd service
     echo "Starting blueprint-agent service..."
+    # Early "startup script reached systemctl phase" beacon. Distinguishes
+    # "startup script never ran" from "startup script ran but agent service
+    # never reported healthy" when reaper later fires silent-pre-claim-death.
+    # Fire-and-forget with tight timeouts so a slow logging endpoint can't
+    # stall provisioning — the primary health check still fires at line ~845.
+    AGENT_TOKEN_EARLY="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2-)"
+    ORCH_URL_EARLY="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env | cut -d= -f2-)"
+    curl -sf -X POST "$ORCH_URL_EARLY/api/agent/heartbeat" \
+      -H "Content-Type: application/json" \
+      -H "X-Agent-Token: $AGENT_TOKEN_EARLY" \
+      -d '{{"task_id": "{task_id}", "status_message": "PROVISION_PROGRESS: startup-script reached systemctl phase"}}' \
+      --connect-timeout 5 --max-time 10 >/dev/null 2>&1 || true
     systemctl daemon-reload
     timeout 60 systemctl restart blueprint-agent || {{
         echo "Service start failed"

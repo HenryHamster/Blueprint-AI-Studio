@@ -6,10 +6,12 @@ Provides:
   - ALL_TASK_TYPES frozenset for backward-compat consumers
   - Per-type payload models with required-field enforcement
   - validate_task_payload()  — strict, raises ValueError on bad input
-  - validate_internal_payload() — fail-open, logs WARNING and returns raw dict
+  - validate_internal_payload() — fail-open for schema, fail-closed for size
+  - PayloadTooLargeError — raised when serialized payload exceeds the budget
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from enum import Enum
@@ -18,6 +20,33 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 logger = logging.getLogger(__name__)
+
+
+# Hard upper bound on a serialized task payload. Above this, agent startup
+# stalls in ways that don't surface as explained failures — see the silent
+# pre-claim death investigation (task 595c235d). 256 KB is well above any
+# legitimate payload (normal design_doc_update is ~80 KB) while cutting off
+# runaway JSON state from bloating claim responses.
+_MAX_PAYLOAD_BYTES = 256 * 1024
+
+
+class PayloadTooLargeError(ValueError):
+    """Raised when a payload exceeds _MAX_PAYLOAD_BYTES after serialization.
+
+    Inherits from ValueError so existing callers that catch ValueError still
+    handle this, but validate_internal_payload re-raises it specifically so
+    oversized payloads never queue silently.
+    """
+
+    def __init__(self, size: int, limit: int, top_keys: list[tuple[str, int]]):
+        self.size = size
+        self.limit = limit
+        self.top_keys = top_keys
+        preview = ", ".join(f"{k}={n}B" for k, n in top_keys[:5])
+        super().__init__(
+            f"Payload is {size} bytes, exceeds limit of {limit} "
+            f"(top keys by size: {preview})"
+        )
 
 
 class TaskType(str, Enum):
@@ -251,10 +280,29 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
 }
 
 
+def _enforce_payload_size(payload: dict) -> None:
+    """Raise PayloadTooLargeError when *payload* would serialize past the budget.
+
+    Runs json.dumps once; callers don't need to re-serialize. The top-key
+    byte breakdown attached to the exception makes it obvious which field
+    blew the budget (typically one unbounded JSON list).
+    """
+    size = len(json.dumps(payload, default=str).encode())
+    if size <= _MAX_PAYLOAD_BYTES:
+        return
+    top_keys = sorted(
+        ((k, len(json.dumps(v, default=str).encode())) for k, v in payload.items()),
+        key=lambda pair: pair[1],
+        reverse=True,
+    )
+    raise PayloadTooLargeError(size, _MAX_PAYLOAD_BYTES, top_keys)
+
+
 def validate_task_payload(raw: dict) -> dict:
     """Validate *raw* against the per-type schema.
 
-    Returns a plain dict (model_dump).  Raises ValueError on any violation.
+    Returns a plain dict (model_dump).  Raises ValueError on any violation
+    (PayloadTooLargeError — a ValueError subclass — on size overflow).
     Extra keys present in *raw* are preserved (extra='allow').
     """
     type_value = raw.get("type")
@@ -280,17 +328,24 @@ def validate_task_payload(raw: dict) -> dict:
     result = instance.model_dump(exclude_none=True)
     # Re-inject 'type' — it lives on the raw dict but not on the Pydantic model
     result["type"] = type_value
+    _enforce_payload_size(result)
     return result
 
 
 def validate_internal_payload(payload: dict, context: str) -> dict:
     """Fail-open validation for internal callers.
 
-    On any validation error, logs a WARNING and returns the original dict
-    unchanged so that existing in-flight tasks are never broken.
+    Schema violations log a WARNING and return the original dict so existing
+    in-flight tasks are never broken. PayloadTooLargeError always re-raises —
+    an oversized payload will stall the agent silently if queued, so the
+    spawn site must deal with it rather than quietly accepting the overflow.
     """
     try:
         return validate_task_payload(payload)
+    except PayloadTooLargeError:
+        # Never swallow size overflows — the whole point of the check is to
+        # prevent oversized payloads from reaching the claim response.
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "validate_internal_payload failed [%s]: %s — returning original payload",

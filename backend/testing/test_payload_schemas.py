@@ -3,7 +3,9 @@ import pytest
 
 from app.payload_schemas import (
     ALL_TASK_TYPES,
+    PayloadTooLargeError,
     TaskType,
+    _MAX_PAYLOAD_BYTES,
     validate_internal_payload,
     validate_task_payload,
 )
@@ -586,3 +588,63 @@ def test_type_preserved_in_output():
             raw.update({"prompt": "x", "pr_number": 1, "branch": "main"})
         result = validate_task_payload(raw)
         assert result["type"] == t, f"'type' missing from result for {t!r}"
+
+
+# ---------------------------------------------------------------------------
+# Payload-size budget (prevents silent pre-claim death from oversized state)
+# ---------------------------------------------------------------------------
+
+def test_oversized_payload_raises_payload_too_large_error():
+    """Payloads larger than _MAX_PAYLOAD_BYTES must fail validation hard."""
+    # Build a strategic_review payload with a huge design_doc field. Using
+    # strategic_review because its schema accepts dict-valued design_doc via
+    # extra='allow' without triggering per-type required-field errors.
+    big_blob = {"payload_archive": ["x" * 100] * 5000}  # ~500KB
+    raw = {"type": "strategic_review", "design_doc": big_blob}
+    with pytest.raises(PayloadTooLargeError) as exc_info:
+        validate_task_payload(raw)
+    err = exc_info.value
+    assert err.size > _MAX_PAYLOAD_BYTES
+    assert err.limit == _MAX_PAYLOAD_BYTES
+    # Top-keys breakdown should identify the offending field
+    top_key_names = [k for k, _ in err.top_keys]
+    assert "design_doc" in top_key_names
+    # Error message includes size and the largest field for log diagnostics
+    msg = str(err)
+    assert "exceeds limit" in msg
+    assert "design_doc" in msg
+
+
+def test_oversized_payload_is_value_error_subclass():
+    """PayloadTooLargeError must remain a ValueError subclass so legacy
+    except-ValueError sites keep working."""
+    assert issubclass(PayloadTooLargeError, ValueError)
+
+
+def test_normal_payload_passes_size_check():
+    """A realistic strategic_review payload should be well under the budget."""
+    raw = {
+        "type": "strategic_review",
+        "design_doc": {"summary": "ok", "systems/sys-a": {"id": "sys-a"}},
+        "vision": {"focus": ["ship"]},
+    }
+    result = validate_task_payload(raw)
+    assert result["type"] == "strategic_review"
+
+
+def test_validate_internal_payload_reraises_size_errors():
+    """validate_internal_payload is fail-open for schema errors but MUST
+    re-raise size errors — silently queueing an oversized payload is the
+    exact scenario the budget is trying to prevent."""
+    big_blob = {"data": ["x" * 100] * 5000}
+    raw = {"type": "strategic_review", "design_doc": big_blob}
+    with pytest.raises(PayloadTooLargeError):
+        validate_internal_payload(raw, context="test")
+
+
+def test_validate_internal_payload_swallows_schema_errors():
+    """Schema errors should still fail open — existing behavior preserved."""
+    # Missing required 'prompt' for a create task. Should log + return raw.
+    raw = {"type": "create"}
+    result = validate_internal_payload(raw, context="test")
+    assert result == raw  # returns original dict unchanged

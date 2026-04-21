@@ -23,6 +23,27 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
+# Keys kept in Project.design_doc for operator/UI consumption but never
+# consumed by the agent. Stripping them before the payload goes out prevents
+# unbounded state (e.g. playbook_archive) from bloating claim responses —
+# see the silent pre-claim death investigation (task 595c235d).
+_AGENT_UNUSED_DESIGN_DOC_KEYS = frozenset({"playbook_archive"})
+
+
+def _agent_view_design_doc(doc: dict | None) -> dict:
+    """Shallow copy of *doc* with agent-unused + internal (``_``-prefixed) keys
+    dropped. The agent's design-doc handler only renders 200-char previews of
+    each key, so operator-only state like ``playbook_archive`` has no
+    functional purpose downstream and just inflates the payload."""
+    if not doc:
+        return {}
+    return {
+        k: v
+        for k, v in doc.items()
+        if k not in _AGENT_UNUSED_DESIGN_DOC_KEYS and not k.startswith("_")
+    }
+
+
 async def _build_shipped_changes_manifest(
     project: Project, session: AsyncSession
 ) -> list[dict]:
@@ -605,7 +626,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
 
     payload: dict = validate_internal_payload({
         "type": "design_doc_update",
-        "design_doc": project.design_doc or {},
+        "design_doc": _agent_view_design_doc(project.design_doc),
         "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
         "project_name": project.name,
         "vision": project.vision or {},
@@ -807,7 +828,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     payload: dict = validate_internal_payload({
         "type": "strategic_review",
         "research_mode": "strategic",
-        "design_doc": project.design_doc or {},
+        "design_doc": _agent_view_design_doc(project.design_doc),
         "vision": project.vision or {},
         "problem_model": project.problem_model or {},
         "running_update": project.running_update or [],

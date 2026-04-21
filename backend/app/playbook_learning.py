@@ -36,6 +36,13 @@ from app.models import Task, Project, TaskStatus, _utcnow
 # total limit.
 _PLAYBOOK_CAPACITY_BYTES = 25 * 1024
 
+# Cap on playbook_archive length. The archive exists for operator review of
+# retired playbook entries; there is no functional reason to keep more than
+# the most-recent N. Without this cap the archive grows monotonically
+# (observed: 517 entries / 351 KB on a single project) and can bloat the
+# design_doc past the agent payload budget. Configurable via runtime_config.
+_PLAYBOOK_ARCHIVE_MAX_DEFAULT = 50
+
 # Entries older than this (in days) with fewer than _STALE_CONFIRM_THRESHOLD
 # confirmed uses are deprioritised during the claim sort.
 _STALE_AGE_DAYS = 30
@@ -219,6 +226,17 @@ def _archive_least_useful_entry(doc: dict) -> dict:
 
     archive = list(doc.get("playbook_archive") or [])
     archive.append(victim_entry)
+    # Trim oldest entries past the cap so the archive can't grow without
+    # bound — see the payload budget rationale at _PLAYBOOK_ARCHIVE_MAX_DEFAULT.
+    from app.shared_state import runtime_config as _rc  # noqa: PLC0415
+    archive_max = _rc.get("playbook_archive_max", _PLAYBOOK_ARCHIVE_MAX_DEFAULT)
+    if archive_max > 0 and len(archive) > archive_max:
+        dropped = len(archive) - archive_max
+        archive = archive[-archive_max:]
+        logger.info(
+            "[PLAYBOOK] Dropped %d oldest archive entries to stay within cap of %d",
+            dropped, archive_max,
+        )
     doc["playbook_archive"] = archive
 
     logger.info(

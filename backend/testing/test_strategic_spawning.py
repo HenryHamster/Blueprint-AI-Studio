@@ -1546,3 +1546,73 @@ async def test_playbook_summary_caps_at_ten_entries(db_session, mocker):
     assert len(entries) == 10
     # Newest-first ordering — entry 14 has the latest date
     assert entries[0]["key"] == "auto-pattern-14"
+
+
+# ---------------------------------------------------------------------------
+# _agent_view_design_doc — strips agent-unused + internal keys
+# ---------------------------------------------------------------------------
+
+def test_agent_view_design_doc_strips_playbook_archive():
+    """playbook_archive is operator-only state — it must never ship in agent
+    payloads. Unbounded growth of this field was the trigger for the silent
+    pre-claim death investigation (task 595c235d, 351KB archive bloat)."""
+    from app.strategic_spawning import _agent_view_design_doc
+    doc = {
+        "summary": "keep",
+        "systems/sys-a": {"id": "sys-a"},
+        "playbook_archive": [{"_archived_key": "playbook/foo"}] * 500,
+    }
+    view = _agent_view_design_doc(doc)
+    assert "playbook_archive" not in view
+    assert view["summary"] == "keep"
+    assert view["systems/sys-a"] == {"id": "sys-a"}
+
+
+def test_agent_view_design_doc_strips_internal_keys():
+    """Keys prefixed with ``_`` are internal/operator state; the agent's
+    design-doc handler already filters them client-side, so stripping them
+    server-side is both safe and saves bytes on the wire."""
+    from app.strategic_spawning import _agent_view_design_doc
+    doc = {
+        "summary": "keep",
+        "_meta": {"last_updated": "x"},
+        "_strategic_cycle_history": [1, 2, 3],
+    }
+    view = _agent_view_design_doc(doc)
+    assert "_meta" not in view
+    assert "_strategic_cycle_history" not in view
+    assert view["summary"] == "keep"
+
+
+def test_agent_view_design_doc_handles_empty_input():
+    from app.strategic_spawning import _agent_view_design_doc
+    assert _agent_view_design_doc(None) == {}
+    assert _agent_view_design_doc({}) == {}
+
+
+@pytest.mark.asyncio
+async def test_design_doc_update_payload_omits_playbook_archive(db_session):
+    """Integration: _spawn_design_doc_update must not ship playbook_archive."""
+    project = _make_project(
+        id=uuid.uuid4(),
+        name="archive-strip-test",
+        github_owner="test", github_repo="repo",
+        autonomous_enabled=True,
+        vision={"purpose": "test"},
+        design_doc={
+            "summary": "ok",
+            "playbook_archive": [{"_archived_key": f"playbook/e{i}"} for i in range(100)],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_design_doc_update(project, db_session)
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1
+    payload = tasks[0].payloads[0]
+    dd = payload["design_doc"]
+    assert "playbook_archive" not in dd
+    assert dd["summary"] == "ok"

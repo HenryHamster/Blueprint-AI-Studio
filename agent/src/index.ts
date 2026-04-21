@@ -1790,9 +1790,20 @@ async function main() {
     sendHeartbeatSync(PRE_CLAIM_TASK_ID, `PRE_CLAIM_FAILED: ${truncated}`);
   };
 
+  // Early "node reached main" beacon. Lands before any async work, so if the
+  // agent silently hangs during validation or claim we can at least tell
+  // that node started and the TASK_ID env was readable — see the silent
+  // pre-claim death forensics in the reaper. Best-effort, non-blocking.
+  if (PRE_CLAIM_TASK_ID) {
+    sendHeartbeatSync(PRE_CLAIM_TASK_ID, 'AGENT_BOOTED: node reached main(), validating auth');
+  }
+
   log(`Provider runtime: provider=${PROVIDER} auth_mode=${AUTH_MODE} execution_mode=${LLM_EXECUTION_MODE}`);
   log(runner.credentialSummary());
   await validateProviderAuth(runner, reportPreClaimFailure, process.env.LLM_MODEL);
+  if (PRE_CLAIM_TASK_ID) {
+    sendHeartbeatSync(PRE_CLAIM_TASK_ID, 'AGENT_AUTH_OK: provider validation complete');
+  }
 
   // Retry any stale result files from previous runs (network failure / VM kill mid-POST)
   try {
@@ -1818,6 +1829,9 @@ async function main() {
   // Claim task. Wrap in try/catch so a claim failure (network, 4xx, 5xx) is
   // reported via pre-claim heartbeat rather than dying silently. Without this
   // the task stays in PROVISIONING until the reaper times out with no evidence.
+  if (PRE_CLAIM_TASK_ID) {
+    sendHeartbeatSync(PRE_CLAIM_TASK_ID, 'AGENT_CLAIMING: requesting task payload');
+  }
   let task: Record<string, unknown>;
   try {
     task = await apiPost('/api/agent/claim') as Record<string, unknown>;

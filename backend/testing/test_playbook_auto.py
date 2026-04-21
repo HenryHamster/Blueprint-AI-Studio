@@ -653,6 +653,67 @@ def test_archive_prefers_older_entries_within_same_tier():
     assert "playbook/recent" in result
 
 
+def test_archive_caps_playbook_archive_length():
+    """_archive_least_useful_entry trims playbook_archive past the cap.
+
+    Without this cap the archive grows monotonically — a single project
+    observed 517 entries / 351 KB of archive, which bloated the design_doc
+    payload past the agent budget and caused silent pre-claim death."""
+    from app.playbook_learning import _archive_least_useful_entry, _PLAYBOOK_ARCHIVE_MAX_DEFAULT
+    from app.shared_state import runtime_config
+
+    # Pre-populate archive with cap+5 entries so the next archival exceeds the cap
+    existing_archive = [
+        {"_archived_key": f"playbook/old-{i}", "content": "x"}
+        for i in range(_PLAYBOOK_ARCHIVE_MAX_DEFAULT + 5)
+    ]
+    doc = {
+        "playbook_archive": existing_archive,
+        "playbook/victim": {
+            "content": "least useful",
+            "confirmed_count": 0,
+            "updated_at": _utcnow().isoformat(),
+        },
+    }
+
+    # Ensure runtime_config default is used
+    runtime_config.pop("playbook_archive_max", None)
+
+    result = _archive_least_useful_entry(doc)
+    archive = result["playbook_archive"]
+
+    # Length should be exactly the cap after trim + new entry
+    assert len(archive) == _PLAYBOOK_ARCHIVE_MAX_DEFAULT
+    # Oldest entries should have been dropped; the newly-archived one is the tail
+    assert archive[-1]["_archived_key"] == "playbook/victim"
+    # The very oldest entries (old-0, old-1, etc.) are gone
+    keys = [e["_archived_key"] for e in archive]
+    assert "playbook/old-0" not in keys
+
+
+def test_archive_cap_respects_runtime_config_override():
+    """Operators can tune playbook_archive_max via runtime_config."""
+    from app.playbook_learning import _archive_least_useful_entry
+    from app.shared_state import runtime_config
+
+    runtime_config["playbook_archive_max"] = 3
+    try:
+        existing_archive = [
+            {"_archived_key": f"old-{i}"} for i in range(5)
+        ]
+        doc = {
+            "playbook_archive": existing_archive,
+            "playbook/new": {
+                "content": "least useful", "confirmed_count": 0,
+                "updated_at": _utcnow().isoformat(),
+            },
+        }
+        result = _archive_least_useful_entry(doc)
+        assert len(result["playbook_archive"]) == 3
+    finally:
+        runtime_config.pop("playbook_archive_max", None)
+
+
 def test_maybe_archive_for_capacity_triggers_at_threshold():
     """maybe_archive_for_capacity archives when combined size exceeds 25KB."""
     from app.playbook_learning import maybe_archive_for_capacity, _PLAYBOOK_CAPACITY_BYTES
