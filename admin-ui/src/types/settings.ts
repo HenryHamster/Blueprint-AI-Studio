@@ -1,3 +1,6 @@
+export type ProviderName = 'anthropic' | 'openai' | 'gemini';
+export type AuthMode = 'oauth' | 'api_key' | 'service_account';
+
 export interface DeployState {
   status: string;
   current_revision: string;
@@ -25,6 +28,22 @@ export interface DeployState {
   external_health?: Record<string, unknown>;
 }
 
+export interface ProviderModeCapabilities {
+  [capability: string]: boolean | number | string | null;
+}
+
+export interface ProviderCatalogEntry {
+  auth_modes: Record<string, { required_metadata_fields: string[] }>;
+  supported_execution_modes: string[];
+  execution_modes: string[];
+  mode_capabilities: Record<string, ProviderModeCapabilities>;
+}
+
+export interface ModelPreference {
+  provider: ProviderName;
+  model: string;
+}
+
 export interface MaxPlanAccount {
   id: string;
   name: string;
@@ -32,8 +51,37 @@ export interface MaxPlanAccount {
   active_tasks: number;
   total_tasks: number;
   token_created_at: string | null;
+  provider: ProviderName;
+  auth_mode: AuthMode;
+  provider_metadata?: Record<string, string>;
   rl_hit_count?: number;
   disabled_models?: Record<string, { hits: number; at: string | null }>;
+}
+
+export interface ProviderHealthSnapshot {
+  provider: ProviderName;
+  dep_name: string;
+  configured: boolean;
+  dispatch_relevant: boolean;
+  status: 'ok' | 'degraded' | 'down' | 'inactive' | 'unknown';
+  reason: string | null;
+  has_raw_credentials: boolean;
+  total_accounts: number;
+  enabled_accounts: number;
+  ready_accounts: number;
+  available_accounts: number;
+  primary_model: string | null;
+  dispatch_available: boolean;
+}
+
+export interface ProviderApisHealth {
+  status: 'ok' | 'degraded' | 'down' | 'unknown';
+  fallback_enabled: boolean;
+  required_providers: ProviderName[];
+  available_providers: ProviderName[];
+  degraded_providers: ProviderName[];
+  down_providers: ProviderName[];
+  providers: Record<string, ProviderHealthSnapshot>;
 }
 
 export interface OrchestratorHealth {
@@ -41,8 +89,16 @@ export interface OrchestratorHealth {
   queued_tasks: number;
   active_tasks: number;
   pool_info: Record<string, unknown>;
+  deploy_state?: {
+    status: string;
+    rollback_count: number;
+    rollback_reason: string | null;
+    pause_reason: string | null;
+    monitoring_since: string | null;
+    recent_outcomes: { created_at: string; status: string; failure_class: string | null }[];
+  } | null;
   deploy_monitoring?: {
-    external_health?: Record<string, boolean | string | string[]>;
+    external_health?: Record<string, unknown>;
   };
 }
 

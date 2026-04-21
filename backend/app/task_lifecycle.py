@@ -563,6 +563,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         attempt = child_ctx.get("_attempt_number", 1)
         _ctx_keys_to_strip = {
             "max_plan_account_id",
+            "llm_account_id",
+            "llm_provider",
+            "llm_auth_mode",
+            "llm_model",
+            "llm_execution_mode",
             "provision_failures",
             "provision_failures_infra",
             "_infra_wait",

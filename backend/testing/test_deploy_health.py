@@ -8,6 +8,8 @@ Covers:
   5. Failure streak resets to 0 on a healthy cycle
   6. Pre-pause VM count is restored (capped at 2) on resume
 """
+import copy
+
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, patch
@@ -18,6 +20,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
 import app.deploy_health as _dh
+import app.health_check_primitives as _hcp
 import app.shared_state as _shared_state
 from app.models import DeploymentState, DeploymentStatus, Project
 
@@ -99,12 +102,15 @@ def _seed_recovery_history(*values):
 @pytest.fixture(autouse=True)
 def reset_shared_state():
     """Restore shared_state fields touched by _check_pause_mode after each test."""
-    original_ext = dict(_shared_state.external_health)
-    original_rc = dict(_shared_state.runtime_config)
-    original_dm = dict(_shared_state.deploy_monitoring)
+    original_ext = copy.deepcopy(_shared_state.external_health)
+    original_rc = copy.deepcopy(_shared_state.runtime_config)
+    original_dm = copy.deepcopy(_shared_state.deploy_monitoring)
     yield
+    _shared_state.external_health.clear()
     _shared_state.external_health.update(original_ext)
+    _shared_state.runtime_config.clear()
     _shared_state.runtime_config.update(original_rc)
+    _shared_state.deploy_monitoring.clear()
     _shared_state.deploy_monitoring.update(original_dm)
 
 
@@ -149,10 +155,39 @@ async def test_first_failure_does_not_pause(dh_db):
     await _dh._check_pause_mode()
 
     assert _dh._pause_failure_streak == 1
-    assert _shared_state.runtime_config["max_concurrent_vms"] == 4  # unchanged
 
-    state = (await dh_db.execute(select(DeploymentState).where(DeploymentState.id == 1))).scalars().first()
+
+@pytest.mark.asyncio
+async def test_provider_specific_failure_without_dispatch_outage_does_not_pause(dh_db):
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    _shared_state.runtime_config["max_concurrent_vms"] = 4
+    _set_critical_failures("anthropic_api")
+
+    await _dh._check_pause_mode()
+    await _dh._check_pause_mode()
+    await _dh._check_pause_mode()
+
+    state = await dh_db.get(DeploymentState, 1)
     assert state.status == DeploymentStatus.STABLE.value
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+
+
+@pytest.mark.asyncio
+async def test_dispatch_api_failure_triggers_pause_after_three_checks(dh_db):
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    _shared_state.runtime_config["max_concurrent_vms"] = 4
+    _set_critical_failures("dispatch_api")
+
+    await _dh._check_pause_mode()
+    await _dh._check_pause_mode()
+    await _dh._check_pause_mode()
+
+    state = await dh_db.get(DeploymentState, 1)
+    assert state.status == DeploymentStatus.PAUSED.value
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 0
+    assert state.pre_pause_max_vms == 4
+    assert state.pause_reason is not None
+    assert "dispatch_api" in state.pause_reason
 
 
 @pytest.mark.asyncio
@@ -232,7 +267,7 @@ async def test_pause_creates_alerts(dh_db):
     """Alerts are created when the pipeline auto-pauses on the 3rd failure."""
     await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
     _shared_state.runtime_config["max_concurrent_vms"] = 2
-    _set_critical_failures("claude_api")
+    _set_critical_failures("dispatch_api")
 
     _dh._pause_failure_streak = 2
 
@@ -358,7 +393,7 @@ async def test_resume_vm_count_capped_at_2(dh_db):
     await _make_deploy_state(
         dh_db,
         status=DeploymentStatus.PAUSED,
-        pause_reason="External dependency down: claude_api",
+        pause_reason="External dependency down: dispatch_api",
         pre_pause_max_vms=10,  # was running 10 VMs
     )
     _shared_state.runtime_config["max_concurrent_vms"] = 0
@@ -751,14 +786,14 @@ async def test_forced_resume_after_max_duration(dh_db):
     await _make_deploy_state(
         dh_db,
         status=DeploymentStatus.PAUSED,
-        pause_reason="External dependency down: claude_api",
+        pause_reason="External dependency down: dispatch_api",
         pre_pause_max_vms=8,
         paused_at=long_ago,
     )
     _shared_state.runtime_config["max_concurrent_vms"] = 0
     _shared_state.runtime_config["max_auto_pause_duration_seconds"] = 7200
     _shared_state.deploy_monitoring["window_start"] = None
-    _set_critical_failures("claude_api")  # health probes still failing
+    _set_critical_failures("dispatch_api")  # health probes still failing
 
     await _dh._check_pause_mode()
 
@@ -853,14 +888,14 @@ async def test_forced_resume_sets_grace_timestamp(dh_db):
     await _make_deploy_state(
         dh_db,
         status=DeploymentStatus.PAUSED,
-        pause_reason="External dependency down: claude_api",
+        pause_reason="External dependency down: dispatch_api",
         pre_pause_max_vms=8,
         paused_at=long_ago,
     )
     _shared_state.runtime_config["max_concurrent_vms"] = 0
     _shared_state.runtime_config["max_auto_pause_duration_seconds"] = 7200
     _shared_state.deploy_monitoring["window_start"] = None
-    _set_critical_failures("claude_api")
+    _set_critical_failures("dispatch_api")
 
     assert _dh._last_auto_resume_at is None
     await _dh._check_pause_mode()
@@ -970,14 +1005,14 @@ async def test_forced_resume_then_pause_preserves_original_count(dh_db):
     await _make_deploy_state(
         dh_db,
         status=DeploymentStatus.PAUSED,
-        pause_reason="External dependency down: claude_api",
+        pause_reason="External dependency down: dispatch_api",
         pre_pause_max_vms=8,
         paused_at=long_ago,
     )
     _shared_state.runtime_config["max_concurrent_vms"] = 0
     _shared_state.runtime_config["max_auto_pause_duration_seconds"] = 7200
     _shared_state.deploy_monitoring["window_start"] = None
-    _set_critical_failures("claude_api")
+    _set_critical_failures("dispatch_api")
 
     # Trigger forced resume.
     await _dh._check_pause_mode()
@@ -1052,8 +1087,8 @@ def test_check_gcp_health_fresh_provision_failures_return_failed():
     assert ext["gcp"] is False
 
 
-def test_check_claude_api_health_stale_rate_limits_return_healthy(mocker):
-    """Single-key path: stale RATE_LIMIT entries must not keep Claude API failing."""
+def test_check_provider_api_health_anthropic_stale_rate_limits_return_healthy(mocker):
+    """Stale RATE_LIMIT entries must not keep Anthropic provider health failing."""
     mocker.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "x"}, clear=False)
     mocker.patch.object(_hcp, "_account_by_id", {})
     _shared_state.deploy_monitoring["task_results"] = deque([
@@ -1064,11 +1099,11 @@ def test_check_claude_api_health_stale_rate_limits_return_healthy(mocker):
         (_ts(18), "failure", "RATE_LIMIT", "create"),
     ], maxlen=100)
     ext = {"errors": {}}
-    assert _hcp.check_claude_api_health(ext) is None
-    assert ext["claude_api"] is True
+    assert _hcp.check_provider_api_health(ext, "anthropic") is None
+    assert ext["anthropic_api"] is True
 
 
-def test_check_claude_api_health_fresh_rate_limits_return_failed(mocker):
+def test_check_provider_api_health_anthropic_fresh_rate_limits_return_failed(mocker):
     mocker.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "x"}, clear=False)
     mocker.patch.object(_hcp, "_account_by_id", {})
     _shared_state.deploy_monitoring["task_results"] = deque([
@@ -1079,8 +1114,66 @@ def test_check_claude_api_health_fresh_rate_limits_return_failed(mocker):
         (_ts(1), "failure", "RATE_LIMIT", "create"),
     ], maxlen=100)
     ext = {"errors": {}}
-    assert _hcp.check_claude_api_health(ext) == "claude_api"
-    assert ext["claude_api"] is False
+    assert _hcp.check_provider_api_health(ext, "anthropic") == "anthropic_api"
+    assert ext["anthropic_api"] is False
+
+
+def test_check_provider_api_health_openai_down_when_no_account_can_dispatch(mocker):
+    account = {
+        "id": "acct-openai",
+        "provider": "openai",
+        "enabled": True,
+        "runtime_secret": "sk-test",
+        "runtime_ready": True,
+    }
+    mocker.patch.object(_hcp, "_account_by_id", {"acct-openai": account})
+    mocker.patch.object(_hcp, "_account_available_for_model", return_value=False)
+    _shared_state.runtime_config["task_type_provider_preference"] = {"create": ["openai"]}
+    _shared_state.runtime_config["cross_provider_fallback_enabled"] = False
+
+    ext = {"errors": {}, "provider_health": {}}
+    assert _hcp.check_provider_api_health(ext, "openai") == "openai_api"
+    assert ext["openai_api"] is False
+    assert ext["provider_health"]["openai"]["status"] == "down"
+
+
+def test_get_dispatch_health_snapshot_degrades_when_primary_provider_down_but_fallback_available():
+    _shared_state.runtime_config["task_type_provider_preference"] = {"create": ["anthropic", "openai"]}
+    _shared_state.runtime_config["task_type_model_preferences"] = {}
+    _shared_state.runtime_config["task_type_models"] = {}
+    _shared_state.runtime_config["cross_provider_fallback_enabled"] = True
+
+    ext = {
+        "provider_health": {
+            "anthropic": {"status": "down"},
+            "openai": {"status": "ok"},
+        }
+    }
+
+    snapshot = _hcp.get_dispatch_health_snapshot(ext)
+
+    assert snapshot["status"] == "degraded"
+    assert snapshot["required_providers"] == ["anthropic", "openai"]
+    assert snapshot["available_providers"] == ["openai"]
+    assert snapshot["down_providers"] == ["anthropic"]
+
+
+def test_get_dispatch_health_snapshot_uses_task_type_models_to_infer_required_provider():
+    _shared_state.runtime_config["task_type_provider_preference"] = {}
+    _shared_state.runtime_config["task_type_model_preferences"] = {}
+    _shared_state.runtime_config["task_type_models"] = {"create": "gpt-5"}
+    _shared_state.runtime_config["cross_provider_fallback_enabled"] = False
+
+    ext = {
+        "provider_health": {
+            "openai": {"status": "ok"},
+        }
+    }
+
+    snapshot = _hcp.get_dispatch_health_snapshot(ext)
+
+    assert snapshot["required_providers"] == ["openai"]
+    assert snapshot["available_providers"] == ["openai"]
 
 
 # ── Tests: check_github_health (passive + active modes) ───────────────────────
@@ -1275,7 +1368,7 @@ async def test_flap_escalation_requires_5_of_5_recovery(dh_db):
     await _make_deploy_state(
         dh_db,
         status=DeploymentStatus.PAUSED,
-        pause_reason="External dependency down: claude_api",
+        pause_reason="External dependency down: dispatch_api",
         pre_pause_max_vms=4,
     )
     _shared_state.runtime_config["max_concurrent_vms"] = 0
@@ -1307,7 +1400,7 @@ async def test_flap_escalated_resume_creates_error_alert(dh_db):
     await _make_deploy_state(
         dh_db,
         status=DeploymentStatus.PAUSED,
-        pause_reason="External dependency down: claude_api",
+        pause_reason="External dependency down: dispatch_api",
         pre_pause_max_vms=4,
     )
     _shared_state.runtime_config["max_concurrent_vms"] = 0
@@ -1382,7 +1475,7 @@ async def test_external_health_uses_short_interval_when_paused(mocker):
     from datetime import datetime as _dt, timedelta as _td
     mocker.patch("app.deploy_health.check_db_health", new_callable=AsyncMock, return_value=None)
     mocker.patch("app.deploy_health.check_github_health", new_callable=AsyncMock, return_value=None)
-    mocker.patch("app.deploy_health.check_claude_api_health", return_value=None)
+    mocker.patch("app.deploy_health.check_provider_api_health", return_value=None)
     mocker.patch("app.deploy_health.check_gcp_health", return_value=None)
     mocker.patch("app.deploy_health.recheck_disabled_accounts", new_callable=AsyncMock)
     mocker.patch("app.deploy_health.log_zone_health_transitions")
@@ -1409,7 +1502,7 @@ async def test_external_health_uses_normal_interval_when_active(mocker):
     from datetime import datetime as _dt, timedelta as _td
     mocker.patch("app.deploy_health.check_db_health", new_callable=AsyncMock, return_value=None)
     mocker.patch("app.deploy_health.check_github_health", new_callable=AsyncMock, return_value=None)
-    mocker.patch("app.deploy_health.check_claude_api_health", return_value=None)
+    mocker.patch("app.deploy_health.check_provider_api_health", return_value=None)
     mocker.patch("app.deploy_health.check_gcp_health", return_value=None)
     mocker.patch("app.deploy_health.recheck_disabled_accounts", new_callable=AsyncMock)
     mocker.patch("app.deploy_health.log_zone_health_transitions")
@@ -1534,14 +1627,14 @@ async def test_force_resume_increments_consecutive_counter(dh_db):
     await _make_deploy_state(
         dh_db,
         status=DeploymentStatus.PAUSED,
-        pause_reason="External dependency down: claude_api",
+        pause_reason="External dependency down: dispatch_api",
         pre_pause_max_vms=8,
         paused_at=long_ago,
     )
     _shared_state.runtime_config["max_concurrent_vms"] = 0
     _shared_state.runtime_config["max_auto_pause_duration_seconds"] = 7200
     _shared_state.deploy_monitoring["window_start"] = None
-    _set_critical_failures("claude_api")
+    _set_critical_failures("dispatch_api")
 
     _dh._consecutive_force_resumes = 1  # simulating a prior force-resume
 
@@ -1590,14 +1683,14 @@ async def test_force_resume_escalation_threshold_changes_title(dh_db, mocker):
     await dh_db.commit()
 
     # Non-escalated case (counter = 1).
-    await _REAL_CREATE_FORCED_RESUME_ALERTS(dh_db, 7200, ["claude_api"], 1)
+    await _REAL_CREATE_FORCED_RESUME_ALERTS(dh_db, 7200, ["dispatch_api"], 1)
     await dh_db.commit()
     alerts = (await dh_db.execute(select(Alert))).scalars().all()
     assert len(alerts) == 1
     assert alerts[0].title == "Pipeline force-resumed: max auto-pause duration exceeded"
 
     # Escalated case (counter = 3).
-    await _REAL_CREATE_FORCED_RESUME_ALERTS(dh_db, 7200, ["claude_api"], 3)
+    await _REAL_CREATE_FORCED_RESUME_ALERTS(dh_db, 7200, ["dispatch_api"], 3)
     await dh_db.commit()
     alerts = (await dh_db.execute(select(Alert).order_by(Alert.created_at))).scalars().all()
     escalated = [a for a in alerts if a.title.startswith("Prolonged pipeline stall")]

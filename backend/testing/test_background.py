@@ -2711,13 +2711,13 @@ async def test_infra_recovery_does_not_resurrect_code_error_tasks(reaper_db, moc
 
 @pytest.mark.asyncio
 async def test_infra_recovery_resurrects_external_api_when_deps_healthy(reaper_db, mocker):
-    """An EXTERNAL_API task is resurrected when both github_api and claude_api are healthy."""
+    """An EXTERNAL_API task is resurrected when both github_api and dispatch_api are healthy."""
     _common_infra_recovery_mocks(mocker)
     mocker.patch("app.reaper.any_zone_available", return_value=True)
     # Patch external_health directly in the module
     mocker.patch.dict(
         "app.reaper._external_health",
-        {"github_api": True, "claude_api": True},
+        {"github_api": True, "dispatch_api": True},
     )
 
     project = Project(name="External API Recovery Test", user_id="user1")
@@ -2762,7 +2762,7 @@ async def test_infra_recovery_clears_api_failure_retries_on_external_api_resurre
     mocker.patch("app.reaper.any_zone_available", return_value=True)
     mocker.patch.dict(
         "app.reaper._external_health",
-        {"github_api": True, "claude_api": True},
+        {"github_api": True, "dispatch_api": True},
     )
 
     project = Project(name="API Retry Clear Test", user_id="user1")
@@ -2808,7 +2808,7 @@ async def test_infra_recovery_does_not_resurrect_external_api_when_deps_unhealth
     mocker.patch("app.reaper.any_zone_available", return_value=True)
     mocker.patch.dict(
         "app.reaper._external_health",
-        {"github_api": False, "claude_api": True},
+        {"github_api": False, "dispatch_api": True},
     )
 
     project = Project(name="External API Unhealthy Test", user_id="user1")

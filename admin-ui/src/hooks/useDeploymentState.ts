@@ -1,26 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { User } from 'firebase/auth';
-import type { DeployState } from '../types/settings';
+import type { DeployState, OrchestratorHealth, ProviderApisHealth } from '../types/settings';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
-
-interface OrchestratorHealth {
-  last_cycle_seconds_ago: number | null;
-  queued_tasks: number;
-  active_tasks: number;
-  pool_info: Record<string, unknown>;
-  deploy_state?: {
-    status: string;
-    rollback_count: number;
-    rollback_reason: string | null;
-    pause_reason: string | null;
-    monitoring_since: string | null;
-    recent_outcomes: { created_at: string; status: string; failure_class: string | null }[];
-  } | null;
-  deploy_monitoring?: {
-    external_health?: Record<string, boolean | string | string[]>;
-  };
-}
 
 interface CircuitBreakerState {
   state: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
@@ -30,8 +12,9 @@ interface CircuitBreakerState {
 
 interface DetailedHealth {
   circuit_breaker: { projects: Record<string, CircuitBreakerState> };
-  max_plan_pool: { total: number; available: number };
+  max_plan_pool: { total: number; available: number; by_provider?: Record<string, { total: number; available: number }> };
   autonomous: { enabled: boolean; consecutive_failures: number };
+  provider_apis: ProviderApisHealth;
   github_quota: {
     remaining: number | null;
     limit: number | null;
@@ -209,8 +192,17 @@ export function useDeploymentState(
         const data = await res.json();
         setDetailedHealth({
           circuit_breaker: data.components?.circuit_breaker ?? { projects: {} },
-          max_plan_pool: data.components?.max_plan_pool ?? { total: 0, available: 0 },
+          max_plan_pool: data.components?.max_plan_pool ?? { total: 0, available: 0, by_provider: {} },
           autonomous: data.components?.autonomous ?? { enabled: false, consecutive_failures: 0 },
+          provider_apis: data.components?.provider_apis ?? {
+            status: 'unknown',
+            fallback_enabled: false,
+            required_providers: [],
+            available_providers: [],
+            degraded_providers: [],
+            down_providers: [],
+            providers: {},
+          },
           github_quota: data.components?.github_quota ?? {
             remaining: null, limit: null, reset_at: null, last_updated: null, status: 'unknown',
           },

@@ -16,4 +16,4 @@ packer init agent.pkr.hcl
 # Build the image
 packer build -var "project_id=$GCP_PROJECT_ID" agent.pkr.hcl
 
-echo "Packer build complete. The image 'blueprint-agent' is now available in project '$GCP_PROJECT_ID'."
+echo "Packer build complete. The image family 'blueprint-agent-v2' is now available in project '$GCP_PROJECT_ID'."

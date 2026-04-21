@@ -8,6 +8,7 @@ Covers:
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
+import uuid
 
 import pytest
 from google.api_core.exceptions import Aborted
@@ -136,6 +137,72 @@ class TestStoreAgentSecretIamRetry:
 
         assert client.set_iam_policy.call_count == 5
         assert client.get_iam_policy.call_count == 5
+
+
+class TestAgentSecretManifest:
+    def test_build_agent_secret_manifest_includes_runtime_identity(self):
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-123",
+            task_id=task_id,
+            oauth_token="sk-ant-test",
+            task_type="create",
+            provider="anthropic",
+            auth_mode="oauth",
+            model="claude-sonnet-4-6",
+            execution_mode="advisor",
+        )
+
+        assert manifest["env"]["PROVIDER"] == "anthropic"
+        assert manifest["env"]["AUTH_MODE"] == "oauth"
+        assert manifest["env"]["LLM_MODEL"] == "claude-sonnet-4-6"
+        assert manifest["env"]["LLM_EXECUTION_MODE"] == "advisor"
+        assert manifest["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-test"
+        assert manifest["env"]["TASK_ID"] == str(task_id)
+        assert manifest["metadata"]["task_type"] == "create"
+        assert manifest["files"] == []
+
+    def test_build_agent_secret_manifest_materializes_file_based_provider_auth(self):
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-openai",
+            task_id=task_id,
+            oauth_token='{"tokens":{"access_token":"abc"}}',
+            task_type="create",
+            provider="openai",
+            auth_mode="oauth",
+            model="gpt-5",
+        )
+
+        assert manifest["env"]["PROVIDER"] == "openai"
+        assert manifest["env"]["AUTH_MODE"] == "oauth"
+        assert manifest["env"]["CODEX_HOME"] == "/opt/agent/openai"
+        assert manifest["files"] == [
+            {
+                "path": "/opt/agent/openai/auth.json",
+                "content": '{"tokens":{"access_token":"abc"}}',
+                "mode": "0600",
+            }
+        ]
+
+    def test_build_agent_secret_manifest_includes_provider_metadata_backed_files(self):
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-gemini",
+            task_id=task_id,
+            oauth_token='{"type":"service_account","client_email":"bot@example.com","private_key":"abc"}',
+            task_type="research",
+            provider="gemini",
+            auth_mode="service_account",
+            model="gemini-2.5-pro",
+            provider_metadata={"project": "demo-proj", "location": "us-central1"},
+        )
+
+        assert manifest["env"]["GOOGLE_APPLICATION_CREDENTIALS"] == "/opt/agent/gemini/sa.json"
+        assert manifest["env"]["GOOGLE_CLOUD_PROJECT"] == "demo-proj"
+        assert manifest["env"]["GOOGLE_CLOUD_LOCATION"] == "us-central1"
+        assert manifest["files"][0]["path"] == "/opt/agent/gemini/sa.json"
+        assert '"client_email":"bot@example.com"' in manifest["files"][0]["content"]
 
 
 # ─── Zone success-rate tracking tests ────────────────────────────────────────

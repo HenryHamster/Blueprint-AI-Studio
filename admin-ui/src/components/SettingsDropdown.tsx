@@ -9,7 +9,7 @@ import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImp
 import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench, Tag } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
 export type { MaxPlanAccount } from '../types/settings';
-import type { DeployState, MaxPlanAccount } from '../types/settings';
+import type { AuthMode, DeployState, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName } from '../types/settings';
 import { DeploySection } from './SettingsDeploySection';
 
 
@@ -67,9 +67,30 @@ interface SettingsDropdownProps {
   onResetRateLimits: (id: string) => void;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
+  newAccountProvider: ProviderName;
+  setNewAccountProvider: (value: ProviderName) => void;
+  newAccountAuthMode: AuthMode;
+  setNewAccountAuthMode: (value: AuthMode) => void;
   newAccountToken: string;
   setNewAccountToken: (value: string) => void;
+  newAccountProviderMetadata: Record<string, string>;
+  setNewAccountProviderMetadata: (value: Record<string, string>) => void;
+  newAccountClaudeConfigJson: string;
+  setNewAccountClaudeConfigJson: (value: string) => void;
   onAddAccount: () => void;
+  providerTierModelMap: Record<string, Record<string, string>>;
+  taskTypeProviderPreference: Record<string, ProviderName[]>;
+  taskTypeModelPreferences: Record<string, ModelPreference[]>;
+  providerExecutionModes: Record<string, string[]>;
+  providerModeCapabilities: Record<string, Record<string, Record<string, boolean | number | string | null>>>;
+  taskTypeExecutionDefaults: Record<string, string>;
+  crossProviderFallbackEnabled: boolean;
+  providers: Record<string, ProviderCatalogEntry>;
+  onUpdateProviderTierModels: (value: Record<string, Record<string, string>>) => Promise<void>;
+  onUpdateTaskTypeProviderPreferences: (value: Record<string, ProviderName[]>) => Promise<void>;
+  onUpdateTaskTypeModelPreferences: (value: Record<string, ModelPreference[]>) => Promise<void>;
+  onUpdateTaskTypeExecutionDefaults: (value: Record<string, string>) => Promise<void>;
+  onUpdateCrossProviderFallback: (value: boolean) => Promise<void>;
   refreshInterval: number;
   onUpdateRefreshInterval: (value: number) => void;
   pageSize: number;
@@ -130,6 +151,12 @@ const ALL_PAGE_SIZE = 500;
 
 const TASK_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'security_audit', 'qa', 'deps', 'docs', 'smoketest', 'debug', 'perf', 'investigate', 'rollup', 'strategic_review', 'design_doc_update'] as const;
 type TaskType = typeof TASK_TYPES[number];
+const PROVIDER_ORDER: ProviderName[] = ['anthropic', 'openai', 'gemini'];
+const FALLBACK_AUTH_MODES: Record<ProviderName, AuthMode[]> = {
+  anthropic: ['oauth', 'api_key'],
+  openai: ['api_key', 'oauth'],
+  gemini: ['api_key', 'service_account'],
+};
 
 const ALL_PROMPT_SUFFIX_TYPES = [
   'create', 'review', 'fix', 'plan', 'research', 'security_audit', 'qa',
@@ -214,9 +241,30 @@ export function SettingsDropdown({
   onResetRateLimits,
   newAccountName,
   setNewAccountName,
+  newAccountProvider,
+  setNewAccountProvider,
+  newAccountAuthMode,
+  setNewAccountAuthMode,
   newAccountToken,
   setNewAccountToken,
+  newAccountProviderMetadata,
+  setNewAccountProviderMetadata,
+  newAccountClaudeConfigJson,
+  setNewAccountClaudeConfigJson,
   onAddAccount,
+  providerTierModelMap,
+  taskTypeProviderPreference,
+  taskTypeModelPreferences,
+  providerExecutionModes,
+  providerModeCapabilities,
+  taskTypeExecutionDefaults,
+  crossProviderFallbackEnabled,
+  providers,
+  onUpdateProviderTierModels,
+  onUpdateTaskTypeProviderPreferences,
+  onUpdateTaskTypeModelPreferences,
+  onUpdateTaskTypeExecutionDefaults,
+  onUpdateCrossProviderFallback,
   refreshInterval,
   onUpdateRefreshInterval,
   pageSize,
@@ -279,19 +327,22 @@ export function SettingsDropdown({
   // Per-task-type overrides
   const [taskTypeModels, setTaskTypeModels] = useState<Record<TaskType, string>>(() => {
     const result = {} as Record<TaskType, string>;
-    for (const t of ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'] as TaskType[]) {
+    for (const t of TASK_TYPES) {
       result[t] = JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeModel:${t}`) ?? 'null') ?? '';
     }
     return result;
   });
   const [taskTypeEfforts, setTaskTypeEfforts] = useState<Record<TaskType, string>>(() => {
     const result = {} as Record<TaskType, string>;
-    for (const t of ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor'] as TaskType[]) {
+    for (const t of TASK_TYPES) {
       result[t] = JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeEffort:${t}`) ?? 'null') ?? '';
     }
     return result;
   });
   const [healthCheckUrlsInput, setHealthCheckUrlsInput] = useState(() => healthCheckUrls.join('\n'));
+  const [taskTypeRoutingDrafts, setTaskTypeRoutingDrafts] = useState<Record<TaskType, string>>({} as Record<TaskType, string>);
+  const [taskTypeModelPrefDrafts, setTaskTypeModelPrefDrafts] = useState<Record<TaskType, string>>({} as Record<TaskType, string>);
+  const [providerTierDrafts, setProviderTierDrafts] = useState<Record<string, Record<string, string>>>({});
 
   useEffect(() => {
     const id = setInterval(() => setTick(t => t + 1), 1000);
@@ -301,6 +352,27 @@ export function SettingsDropdown({
   useEffect(() => { setRetriesInputVal(String(maxRetries)); }, [maxRetries]);
   useEffect(() => { setAutonomousRateInputVal(String(maxAutonomousTasksPerHour)); }, [maxAutonomousTasksPerHour]);
   useEffect(() => { setHealthCheckUrlsInput(healthCheckUrls.join('\n')); }, [healthCheckUrls]);
+  useEffect(() => {
+    const availableAuthModes = (Object.keys(providers[newAccountProvider]?.auth_modes ?? {}) as AuthMode[]).length > 0
+      ? Object.keys(providers[newAccountProvider]?.auth_modes ?? {}) as AuthMode[]
+      : FALLBACK_AUTH_MODES[newAccountProvider];
+    if (!availableAuthModes.includes(newAccountAuthMode) && availableAuthModes.length > 0) {
+      setNewAccountAuthMode(availableAuthModes[0]);
+    }
+  }, [newAccountAuthMode, newAccountProvider, providers, setNewAccountAuthMode]);
+  useEffect(() => {
+    const drafts = {} as Record<TaskType, string>;
+    for (const type of TASK_TYPES) drafts[type] = (taskTypeProviderPreference[type] ?? []).join(', ');
+    setTaskTypeRoutingDrafts(drafts);
+  }, [taskTypeProviderPreference]);
+  useEffect(() => {
+    const drafts = {} as Record<TaskType, string>;
+    for (const type of TASK_TYPES) {
+      drafts[type] = (taskTypeModelPreferences[type] ?? []).map(pref => `${pref.provider}:${pref.model}`).join('\n');
+    }
+    setTaskTypeModelPrefDrafts(drafts);
+  }, [taskTypeModelPreferences]);
+  useEffect(() => { setProviderTierDrafts(providerTierModelMap); }, [providerTierModelMap]);
 
   // Close on Escape
   useEffect(() => {
@@ -316,6 +388,72 @@ export function SettingsDropdown({
   const visibleSections = SECTIONS.filter(s =>
     (!s.adminOnly || isAdmin) && (!s.projectOnly || selectedProjectId !== null)
   );
+  const providerNames = Object.keys(providers).length > 0 ? (Object.keys(providers) as ProviderName[]) : PROVIDER_ORDER;
+  const allModes = Array.from(new Set(Object.values(providerExecutionModes).flat())).filter(Boolean);
+  const providerSelectOptions = providerNames.filter(Boolean);
+  const allModelOptions = Array.from(new Set([
+    ...Object.values(providerTierModelMap).flatMap(providerMap => Object.values(providerMap || {})),
+    ...Object.values(taskTypeModelPreferences).flatMap(prefs => prefs.map(pref => pref.model)),
+    ...Object.values(taskTypeModels).filter(Boolean),
+  ])).filter(Boolean).sort();
+  const requiredMetadataFields = providers[newAccountProvider]?.auth_modes?.[newAccountAuthMode]?.required_metadata_fields ?? [];
+  const newAccountAuthModes = (Object.keys(providers[newAccountProvider]?.auth_modes ?? {}) as AuthMode[]).length > 0
+    ? Object.keys(providers[newAccountProvider]?.auth_modes ?? {}) as AuthMode[]
+    : FALLBACK_AUTH_MODES[newAccountProvider];
+  const newAccountSecretLabel =
+    newAccountProvider === 'gemini' && newAccountAuthMode === 'service_account'
+      ? 'Service account JSON'
+      : newAccountProvider === 'openai' && newAccountAuthMode === 'oauth'
+      ? 'auth.json'
+      : newAccountProvider === 'gemini'
+      ? 'Gemini API key'
+      : newAccountProvider === 'openai'
+      ? 'OpenAI API key'
+      : newAccountAuthMode === 'api_key'
+      ? 'Anthropic API key'
+      : 'OAuth token';
+
+  function normalizeProviderCsv(value: string): ProviderName[] {
+    return value
+      .split(',')
+      .map(v => v.trim())
+      .filter((v): v is ProviderName => providerSelectOptions.includes(v as ProviderName))
+      .filter((v, idx, arr) => arr.indexOf(v) === idx);
+  }
+
+  function parseModelPreferenceLines(value: string): ModelPreference[] {
+    return value
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean)
+      .map(line => {
+        const [provider, ...rest] = line.split(':');
+        return { provider: provider.trim() as ProviderName, model: rest.join(':').trim() };
+      })
+      .filter(pref => providerSelectOptions.includes(pref.provider) && pref.model);
+  }
+
+  function handleProviderRoutingBlur(type: TaskType) {
+    const next = normalizeProviderCsv(taskTypeRoutingDrafts[type] ?? '');
+    void onUpdateTaskTypeProviderPreferences({ ...taskTypeProviderPreference, [type]: next });
+  }
+
+  function handleModelPreferenceBlur(type: TaskType) {
+    const next = parseModelPreferenceLines(taskTypeModelPrefDrafts[type] ?? '');
+    void onUpdateTaskTypeModelPreferences({ ...taskTypeModelPreferences, [type]: next });
+  }
+
+  function updateTierModel(providerName: string, tier: string, value: string, persist = false) {
+    const next = {
+      ...providerTierDrafts,
+      [providerName]: {
+        ...(providerTierDrafts[providerName] ?? {}),
+        [tier]: value,
+      },
+    };
+    setProviderTierDrafts(next);
+    if (persist) void onUpdateProviderTierModels(next);
+  }
 
   // --- Section renderers ---
 
@@ -380,7 +518,9 @@ export function SettingsDropdown({
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
               >
                 <option value="">Orchestrator default</option>
-                <option value="claude-opus-4-7">claude-opus-4-7</option>
+                {allModelOptions.map(model => (
+                  <option key={model} value={model}>{model}</option>
+                ))}
               </select>
             </div>
             <div>
@@ -542,9 +682,42 @@ export function SettingsDropdown({
   function renderTaskTypes() {
     return (
       <div className="space-y-6">
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Provider Routing</h3>
+          <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-4 space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm text-neutral-200">Cross-provider fallback</div>
+                <div className="text-[11px] text-neutral-500">If the preferred provider is exhausted, the orchestrator can use the next configured provider.</div>
+              </div>
+              <Toggle enabled={crossProviderFallbackEnabled} onChange={v => { void onUpdateCrossProviderFallback(v); }} />
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              {providerSelectOptions.map(providerName => (
+                <div key={providerName} className="bg-neutral-950 border border-neutral-800 rounded-lg p-3">
+                  <div className="text-xs font-medium text-neutral-300 capitalize mb-2">{providerName}</div>
+                  <div className="space-y-2">
+                    {(['opus', 'sonnet', 'haiku'] as const).map(tier => (
+                      <label key={tier} className="block">
+                        <div className="text-[10px] text-neutral-500 mb-1 uppercase">{tier}</div>
+                        <input
+                          value={providerTierDrafts[providerName]?.[tier] ?? ''}
+                          onChange={e => updateTierModel(providerName, tier, e.target.value)}
+                          onBlur={e => updateTierModel(providerName, tier, e.target.value, true)}
+                          className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                        />
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
         {/* Per-task-type overrides */}
         <div>
-          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Model & Effort Overrides</h3>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Task-Type Defaults</h3>
           <div className="grid grid-cols-2 gap-3">
             {TASK_TYPES.map(type => (
               <div key={type} className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2.5">
@@ -563,7 +736,9 @@ export function SettingsDropdown({
                       className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     >
                       <option value="">default</option>
-                      <option value="claude-opus-4-7">opus-4-7</option>
+                      {allModelOptions.map(model => (
+                        <option key={model} value={model}>{model}</option>
+                      ))}
                     </select>
                   </div>
                   <div>
@@ -584,6 +759,46 @@ export function SettingsDropdown({
                       <option value="high">high</option>
                       <option value="max">max</option>
                     </select>
+                  </div>
+                </div>
+                <div className="mt-3 space-y-2">
+                  <div>
+                    <div className="text-[10px] text-neutral-500 mb-1">Execution mode</div>
+                    <select
+                      value={taskTypeExecutionDefaults[type] ?? 'default'}
+                      onChange={e => {
+                        void onUpdateTaskTypeExecutionDefaults({ ...taskTypeExecutionDefaults, [type]: e.target.value });
+                      }}
+                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                    >
+                      {allModes.map(mode => (
+                        <option key={mode} value={mode}>{mode}</option>
+                      ))}
+                    </select>
+                    {providerModeCapabilities.anthropic?.[taskTypeExecutionDefaults[type] ?? 'default']?.read_only_preferred && (
+                      <div className="text-[10px] text-blue-400 mt-1">Prefers read-only/advisory execution when supported.</div>
+                    )}
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-neutral-500 mb-1">Provider order</div>
+                    <input
+                      value={taskTypeRoutingDrafts[type] ?? ''}
+                      onChange={e => setTaskTypeRoutingDrafts(prev => ({ ...prev, [type]: e.target.value }))}
+                      onBlur={() => handleProviderRoutingBlur(type)}
+                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      placeholder="anthropic, openai, gemini"
+                    />
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-neutral-500 mb-1">Concrete model priority</div>
+                    <textarea
+                      value={taskTypeModelPrefDrafts[type] ?? ''}
+                      onChange={e => setTaskTypeModelPrefDrafts(prev => ({ ...prev, [type]: e.target.value }))}
+                      onBlur={() => handleModelPreferenceBlur(type)}
+                      rows={3}
+                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none"
+                      placeholder={'openai:gpt-5\nanthropic:claude-opus-4-7'}
+                    />
                   </div>
                 </div>
               </div>
@@ -892,9 +1107,9 @@ export function SettingsDropdown({
           )}
         </div>
 
-        {/* Max Plan Accounts */}
+        {/* LLM Accounts */}
         <div>
-          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Max Plan Accounts</h3>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">LLM Accounts</h3>
           {maxPlanAccounts.length > 0 && (() => {
             const total = maxPlanAccounts.length;
             const available = maxPlanAccounts.filter(a => a.enabled && !Object.keys(a.disabled_models || {}).length).length;
@@ -931,10 +1146,16 @@ export function SettingsDropdown({
                       className={`w-2.5 h-2.5 rounded-full shrink-0 ${isRateLimited ? 'bg-amber-500' : a.enabled ? 'bg-emerald-500' : 'bg-neutral-600'}`}
                       title={isRateLimited ? 'Rate-limited' : a.enabled ? 'Enabled (click to disable)' : 'Disabled (click to enable)'} />
                     <div className="flex-1 min-w-0">
-                      <div className="text-sm text-neutral-200 truncate">{a.name}</div>
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div className="text-sm text-neutral-200 truncate">{a.name}</div>
+                        <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700">{a.provider}</span>
+                        <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500 border border-neutral-700">{a.auth_mode}</span>
+                      </div>
                       <div className="text-[11px] text-neutral-500 font-mono">
                         {a.active_tasks} active
                         {tokenAge && <span className={`ml-2 ${isExpiring ? 'text-amber-400' : ''}`}>&middot; token {tokenAge}</span>}
+                        {a.provider_metadata?.project && <span className="ml-2">&middot; {a.provider_metadata.project}</span>}
+                        {a.provider_metadata?.location && <span className="ml-2">@ {a.provider_metadata.location}</span>}
                       </div>
                     </div>
                     <button onClick={() => onRemoveAccount(a.id)}
@@ -968,9 +1189,61 @@ export function SettingsDropdown({
           <div className="mt-4 space-y-2">
             <input value={newAccountName} onChange={e => setNewAccountName(e.target.value)}
               placeholder="Account name" className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600" />
-            <input value={newAccountToken} onChange={e => setNewAccountToken(e.target.value)}
-              placeholder="sk-ant-oat01-... (from claude setup-token)" type="password"
-              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 font-mono" />
+            <div className="grid grid-cols-2 gap-2">
+              <select
+                value={newAccountProvider}
+                onChange={e => setNewAccountProvider(e.target.value as ProviderName)}
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              >
+                {providerSelectOptions.map(providerName => (
+                  <option key={providerName} value={providerName}>{providerName}</option>
+                ))}
+              </select>
+              <select
+                value={newAccountAuthMode}
+                onChange={e => setNewAccountAuthMode(e.target.value as AuthMode)}
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              >
+                {newAccountAuthModes.map(mode => (
+                  <option key={mode} value={mode}>{mode}</option>
+                ))}
+              </select>
+            </div>
+            {requiredMetadataFields.length > 0 && (
+              <div className="grid grid-cols-2 gap-2">
+                {requiredMetadataFields.map(field => (
+                  <input
+                    key={field}
+                    value={newAccountProviderMetadata[field] ?? ''}
+                    onChange={e => setNewAccountProviderMetadata({ ...newAccountProviderMetadata, [field]: e.target.value })}
+                    placeholder={field}
+                    className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                  />
+                ))}
+              </div>
+            )}
+            {(newAccountProvider === 'openai' && newAccountAuthMode === 'oauth') || (newAccountProvider === 'gemini' && newAccountAuthMode === 'service_account') ? (
+              <textarea
+                value={newAccountToken}
+                onChange={e => setNewAccountToken(e.target.value)}
+                rows={4}
+                placeholder={newAccountSecretLabel}
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none"
+              />
+            ) : (
+              <input value={newAccountToken} onChange={e => setNewAccountToken(e.target.value)}
+                placeholder={newAccountSecretLabel} type="password"
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 font-mono" />
+            )}
+            {newAccountProvider === 'anthropic' && newAccountAuthMode === 'oauth' && (
+              <textarea
+                value={newAccountClaudeConfigJson}
+                onChange={e => setNewAccountClaudeConfigJson(e.target.value)}
+                rows={3}
+                placeholder="Optional claude_config_json"
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none"
+              />
+            )}
             <button onClick={onAddAccount} disabled={!newAccountName || !newAccountToken}
               className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-neutral-300 text-xs py-2 px-4 rounded-lg transition-colors border border-neutral-700">
               Add Account

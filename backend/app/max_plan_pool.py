@@ -1,9 +1,9 @@
 """
-Max Plan account pool — in-memory cache of DB-persisted Claude Code OAuth accounts.
+Max Plan account pool — in-memory cache of DB-persisted LLM accounts.
 
 Extracted from main.py. This module owns:
   - Global pool state (_max_plan_pools, _account_by_id, _max_plan_pool_lock, _pending_rl_persists)
-  - RATE_LIMIT_PATTERNS constant (shared with classify_failure in main.py and reaper.py)
+  - Anthropic RATE_LIMIT_PATTERNS constant (shared with classify_failure in main.py and reaper.py)
   - Pool lifecycle: load_max_plan_pool, select_max_plan_account, release_max_plan_account,
     recheck_disabled_accounts
   - Helpers: _all_accounts, _account_available_for_model, _extract_task_model
@@ -13,15 +13,226 @@ import asyncio
 import logging
 import random
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import AsyncSessionLocal
+from app.models import LLMAuthMode, LLMProviderName
+from app.providers.registry import get_provider
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_QUALITY_TIER = "opus"
+TASK_RUNTIME_CONTEXT_KEYS = (
+    "llm_account_id",
+    "llm_provider",
+    "llm_auth_mode",
+    "llm_model",
+    "llm_execution_mode",
+    "max_plan_account_id",
+)
+
+
+@dataclass(frozen=True)
+class LLMSelectionResult:
+    provider: str
+    auth_mode: str
+    model: str | None
+    quality_tier: str | None
+    execution_mode: str | None
+    account: Dict[str, Any] | None
+
+    @property
+    def account_id(self) -> str | None:
+        return self.account.get("id") if self.account else None
+
+
+def _task_context(task_or_ctx: Any) -> dict[str, Any]:
+    if isinstance(task_or_ctx, Mapping):
+        return dict(task_or_ctx)
+    return dict(getattr(task_or_ctx, "context", {}) or {})
+
+
+def get_task_llm_account_id(task_or_ctx: Any) -> str | None:
+    ctx = _task_context(task_or_ctx)
+    return ctx.get("llm_account_id") or ctx.get("max_plan_account_id")
+
+
+def get_task_llm_provider(task_or_ctx: Any) -> str | None:
+    ctx = _task_context(task_or_ctx)
+    raw = ctx.get("llm_provider")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def get_task_llm_auth_mode(task_or_ctx: Any) -> str | None:
+    ctx = _task_context(task_or_ctx)
+    raw = ctx.get("llm_auth_mode")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def clear_task_llm_runtime_context(context: Mapping[str, Any] | None) -> dict[str, Any]:
+    new_ctx = dict(context or {})
+    for key in TASK_RUNTIME_CONTEXT_KEYS:
+        new_ctx.pop(key, None)
+    return new_ctx
+
+
+def apply_task_llm_runtime_context(
+    context: Mapping[str, Any] | None,
+    *,
+    account_id: str | None,
+    provider: str | None,
+    auth_mode: str | None,
+    model: str | None,
+    execution_mode: str | None = None,
+) -> dict[str, Any]:
+    new_ctx = clear_task_llm_runtime_context(context)
+    if account_id:
+        new_ctx["llm_account_id"] = account_id
+        # Compatibility bridge for old call sites still keyed on max_plan_account_id.
+        new_ctx["max_plan_account_id"] = account_id
+    if provider:
+        new_ctx["llm_provider"] = provider
+    if auth_mode:
+        new_ctx["llm_auth_mode"] = auth_mode
+    if model:
+        new_ctx["llm_model"] = model
+    if execution_mode:
+        new_ctx["llm_execution_mode"] = execution_mode
+    return new_ctx
+
+
+def _normalize_provider_name(raw: str | LLMProviderName | None) -> str | None:
+    if isinstance(raw, LLMProviderName):
+        return raw.value
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def _normalize_auth_mode(raw: str | LLMAuthMode | None) -> str | None:
+    if isinstance(raw, LLMAuthMode):
+        return raw.value
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def _task_type(task: Any) -> str:
+    payloads = getattr(task, "payloads", None) or []
+    if payloads:
+        return payloads[0].get("type", "create")
+    return "create"
+
+
+def get_task_llm_execution_mode(task_or_ctx: Any) -> str | None:
+    ctx = _task_context(task_or_ctx)
+    raw = ctx.get("llm_execution_mode")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def infer_provider_for_model(model: str | None, runtime_config: Mapping[str, Any]) -> str | None:
+    if not model:
+        return None
+    for provider_name in LLMProviderName:
+        provider = get_provider(provider_name)
+        for tier in ("opus", "sonnet", "haiku"):
+            if provider.tier_to_model(tier, runtime_config) == model:
+                return provider_name.value
+    return None
+
+
+def infer_quality_tier_for_model(
+    provider_name: str | LLMProviderName | None,
+    model: str | None,
+    runtime_config: Mapping[str, Any],
+) -> str | None:
+    normalized_provider = _normalize_provider_name(provider_name)
+    if not normalized_provider or not model:
+        return None
+    provider = get_provider(normalized_provider)
+    for tier in ("opus", "sonnet", "haiku"):
+        if provider.tier_to_model(tier, runtime_config) == model:
+            return tier
+    return None
+
+
+def resolve_task_provider_preference(task: Any, runtime_config: Mapping[str, Any]) -> list[str]:
+    ctx = _task_context(task)
+    explicit = ctx.get("provider_preference")
+    if isinstance(explicit, list):
+        values = [_normalize_provider_name(v) for v in explicit]
+        resolved = [v for v in values if v]
+        if resolved:
+            return resolved
+    task_type = _task_type(task)
+    configured = (runtime_config.get("task_type_provider_preference", {}) or {}).get(task_type)
+    if isinstance(configured, list):
+        values = [_normalize_provider_name(v) for v in configured]
+        resolved = [v for v in values if v]
+        if resolved:
+            return resolved
+    return [LLMProviderName.ANTHROPIC.value]
+
+
+def resolve_task_model_preferences(task: Any, runtime_config: Mapping[str, Any]) -> list[dict[str, str]]:
+    ctx = _task_context(task)
+    payloads = getattr(task, "payloads", None) or []
+    payload = payloads[0] if payloads else {}
+    explicit = payload.get("model_preferences") or ctx.get("model_preferences")
+    raw_prefs = explicit if isinstance(explicit, list) else (runtime_config.get("task_type_model_preferences", {}) or {}).get(_task_type(task))
+    if not isinstance(raw_prefs, list):
+        return []
+    prefs: list[dict[str, str]] = []
+    for pref in raw_prefs:
+        if not isinstance(pref, Mapping):
+            continue
+        provider_name = _normalize_provider_name(pref.get("provider"))
+        model_name = pref.get("model")
+        if provider_name and isinstance(model_name, str) and model_name.strip():
+            prefs.append({"provider": provider_name, "model": model_name.strip()})
+    return prefs
+
+
+def cross_provider_fallback_enabled(runtime_config: Mapping[str, Any]) -> bool:
+    return bool(runtime_config.get("cross_provider_fallback_enabled", False)) if isinstance(runtime_config, Mapping) else False
+
+
+def resolve_task_execution_mode(
+    task: Any,
+    runtime_config: Mapping[str, Any],
+    provider_name: str,
+) -> str:
+    ctx = _task_context(task)
+    payloads = getattr(task, "payloads", None) or []
+    payload = payloads[0] if payloads else {}
+    explicit = payload.get("execution_mode") or ctx.get("execution_mode") or ctx.get("llm_execution_mode")
+    provider_modes = runtime_config.get("provider_execution_modes", {}) if isinstance(runtime_config, Mapping) else {}
+    supported = provider_modes.get(provider_name) if isinstance(provider_modes, Mapping) else None
+    supported_modes = [m for m in supported if isinstance(m, str) and m] if isinstance(supported, list) else ["default"]
+    requested = explicit if isinstance(explicit, str) and explicit.strip() else runtime_config.get("task_type_execution_defaults", {}).get(_task_type(task), "default")
+    if requested in supported_modes:
+        return requested
+    return "default"
+
+
+def _account_runtime_ready(acct: dict) -> bool:
+    provider = _normalize_provider_name(acct.get("provider")) or LLMProviderName.ANTHROPIC.value
+    auth_mode = _normalize_auth_mode(acct.get("auth_mode")) or LLMAuthMode.OAUTH.value
+    if provider == LLMProviderName.ANTHROPIC.value and auth_mode == LLMAuthMode.OAUTH.value:
+        return bool(acct.get("oauth_token"))
+    return bool(acct.get("runtime_ready"))
 
 
 # --- Max Plan Account Pool ---
@@ -40,17 +251,9 @@ _pending_rl_persists: List[str] = []  # Account IDs whose rate-limit state faile
 # Do NOT add loose keywords like "credit", "billing", "429", "quota exceeded",
 # or "overloaded" — those caused false positives that disabled accounts for
 # unrelated failures (GCP quota, credit-card setup errors, Anthropic 529s).
-RATE_LIMIT_PATTERNS = [
-    # Subscription / Max-plan quota exhausted (CLI messages)
-    "you've hit your limit",                                 # "...· resets 5am (Asia/Seoul)"
-    "you've hit your usage limit",
-    "claude ai usage limit reached",
-    "you're out of extra usage",
-    "5-hour limit reached",
-    # Anthropic API 429
-    "api error: rate limit reached",                         # Claude Code's wrapper around 429
-    "this request would exceed your account's rate limit",   # raw 429 JSON body
-]
+RATE_LIMIT_PATTERNS = list(
+    get_provider(LLMProviderName.ANTHROPIC).rate_limit_patterns(LLMAuthMode.OAUTH)
+)
 
 # Claude Max plan shares session quota across model tiers. Empirically:
 #   - Opus 429 implies Sonnet is also rate-limited (shared session bucket);
@@ -171,7 +374,7 @@ async def load_max_plan_pool():
         )).scalars().all()
         active_per_account: Dict[str, int] = {}
         for t in active_tasks:
-            acct_id = (t.context or {}).get("max_plan_account_id")
+            acct_id = get_task_llm_account_id(t)
             if acct_id:
                 active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
 
@@ -179,20 +382,28 @@ async def load_max_plan_pool():
         _account_by_id.clear()
         for acct in accounts:
             acct_id = str(acct.id)
-            # Resolve Secret Manager resource names to actual tokens
-            token = acct.oauth_token
-            if token and token.startswith("projects/"):
+            provider = acct.provider or LLMProviderName.ANTHROPIC
+            auth_mode = acct.auth_mode or LLMAuthMode.OAUTH
+            runtime_secret = acct.secret_blob_ref or acct.oauth_token
+            if runtime_secret and runtime_secret.startswith("projects/"):
                 try:
                     from app.secrets_manager import get_user_secret
-                    token = await get_user_secret(token)
+                    runtime_secret = await get_user_secret(runtime_secret)
                 except Exception:
-                    logger.exception(f"[POOL] Failed to fetch token from Secret Manager for account {acct.name}")
-                    token = None
+                    logger.exception(f"[POOL] Failed to fetch secret from Secret Manager for account {acct.name}")
+                    runtime_secret = None
+            token = runtime_secret if provider == LLMProviderName.ANTHROPIC and auth_mode == LLMAuthMode.OAUTH else None
             entry = {
                 "id": acct_id,
                 "user_id": acct.user_id,
                 "name": acct.name,
+                "provider": provider.value if isinstance(provider, LLMProviderName) else str(provider),
+                "auth_mode": auth_mode.value if isinstance(auth_mode, LLMAuthMode) else str(auth_mode),
+                "secret_blob_ref": acct.secret_blob_ref,
+                "provider_metadata": acct.provider_metadata or {},
+                "runtime_secret": runtime_secret,
                 "oauth_token": token,
+                "runtime_ready": bool(runtime_secret),
                 "claude_config_json": acct.claude_config_json,
                 "enabled": acct.enabled,
                 "active_tasks": active_per_account.get(acct_id, 0),
@@ -237,7 +448,7 @@ def _account_state_for_model(acct: dict, model: str | None, now: datetime | None
     (Opus 429 → opus, sonnet, haiku entries); the clear path (on success)
     removes the cascade scope. Each entry is independent.
     """
-    if not acct.get("oauth_token"):
+    if not _account_runtime_ready(acct):
         return "unavailable"
     if not acct.get("enabled", True):
         return "unavailable"
@@ -335,10 +546,26 @@ def describe_pool_blockage(model: str | None, user_id: str | None = None) -> str
 
 def _extract_task_model(task: Any) -> str | None:
     """Extract which model a task uses from its payload."""
+    ctx = _task_context(task)
+    if ctx.get("llm_model"):
+        return ctx.get("llm_model")
     payloads = task.payloads or []
     if payloads:
         return payloads[0].get("model")
     return None
+
+
+def resolve_task_quality_tier(task: Any, runtime_config: Mapping[str, Any]) -> str:
+    ctx = _task_context(task)
+    payloads = getattr(task, "payloads", None) or []
+    payload = payloads[0] if payloads else {}
+    explicit_tier = payload.get("quality_tier") or ctx.get("quality_tier")
+    if isinstance(explicit_tier, str) and explicit_tier.strip():
+        return explicit_tier.strip()
+    explicit_model = payload.get("model") or ctx.get("llm_model")
+    inferred_provider = get_task_llm_provider(task) or infer_provider_for_model(explicit_model, runtime_config)
+    inferred_tier = infer_quality_tier_for_model(inferred_provider, explicit_model, runtime_config)
+    return inferred_tier or DEFAULT_QUALITY_TIER
 
 
 async def _persist_rate_limit_state(acct_id: str) -> None:
@@ -365,7 +592,12 @@ async def _persist_rate_limit_state(acct_id: str) -> None:
         await rl_session.commit()
 
 
-async def select_max_plan_account(user_id: str, model: str | None = None, blacklist: List[str] | None = None) -> Dict[str, Any] | None:
+async def select_max_plan_account(
+    user_id: str,
+    model: str | None = None,
+    blacklist: List[str] | None = None,
+    provider: str | LLMProviderName | None = None,
+) -> Dict[str, Any] | None:
     """Select a Max plan account for a task. Two-tier circuit-breaker selection:
 
     1. Healthy accounts first, picked by min(active_tasks) for load balancing.
@@ -380,8 +612,11 @@ async def select_max_plan_account(user_id: str, model: str | None = None, blackl
         user_pool = _max_plan_pools.get(user_id, [])
         healthy: List[Dict[str, Any]] = []
         probing: List[Dict[str, Any]] = []
+        normalized_provider = _normalize_provider_name(provider)
         for a in user_pool:
             if blacklist and a["id"] in blacklist:
+                continue
+            if normalized_provider and (_normalize_provider_name(a.get("provider")) or LLMProviderName.ANTHROPIC.value) != normalized_provider:
                 continue
             state = _account_state_for_model(a, model)
             if state == "healthy":
@@ -403,6 +638,107 @@ async def select_max_plan_account(user_id: str, model: str | None = None, blackl
 
         account["active_tasks"] = account.get("active_tasks", 0) + 1
         return account
+
+
+async def select_llm_runtime_for_task(
+    user_id: str,
+    task: Any,
+    runtime_config: Mapping[str, Any],
+    blacklist: List[str] | None = None,
+) -> LLMSelectionResult | None:
+    explicit_model = _extract_task_model(task)
+    allow_fallback = cross_provider_fallback_enabled(runtime_config)
+    model_preferences = [] if explicit_model else resolve_task_model_preferences(task, runtime_config)
+    provider_preference = resolve_task_provider_preference(task, runtime_config)
+    quality_tier = resolve_task_quality_tier(task, runtime_config)
+    explicit_provider = get_task_llm_provider(task) or infer_provider_for_model(explicit_model, runtime_config)
+
+    if not allow_fallback:
+        if model_preferences:
+            model_preferences = model_preferences[:1]
+        if provider_preference:
+            provider_preference = provider_preference[:1]
+
+    if model_preferences:
+        for pref in model_preferences:
+            provider_name = pref["provider"]
+            model_name = pref["model"]
+            account = await select_max_plan_account(
+                user_id=user_id,
+                model=model_name,
+                blacklist=blacklist,
+                provider=provider_name,
+            )
+            if account:
+                return LLMSelectionResult(
+                    provider=provider_name,
+                    auth_mode=_normalize_auth_mode(account.get("auth_mode")) or LLMAuthMode.OAUTH.value,
+                    model=model_name,
+                    quality_tier=infer_quality_tier_for_model(provider_name, model_name, runtime_config),
+                    execution_mode=resolve_task_execution_mode(task, runtime_config, provider_name),
+                    account=account,
+                )
+
+    if explicit_provider:
+        if allow_fallback:
+            provider_preference = [explicit_provider] + [p for p in provider_preference if p != explicit_provider]
+        else:
+            provider_preference = [explicit_provider]
+    elif explicit_model and provider_preference:
+        # Unknown/custom model strings must not silently degrade into tier defaults
+        # or cross-provider retries. Keep the caller's requested model on the
+        # first configured provider only until mappings are updated.
+        provider_preference = provider_preference[:1]
+
+    for provider_name in provider_preference:
+        provider = get_provider(provider_name)
+        model = (
+            explicit_model
+            if explicit_model and (explicit_provider is None or provider_name == explicit_provider)
+            else provider.tier_to_model(quality_tier, runtime_config)
+        )
+        if not model:
+            continue
+        account = await select_max_plan_account(
+            user_id=user_id,
+            model=model,
+            blacklist=blacklist,
+            provider=provider_name,
+        )
+        if account:
+            return LLMSelectionResult(
+                provider=provider_name,
+                auth_mode=_normalize_auth_mode(account.get("auth_mode")) or LLMAuthMode.OAUTH.value,
+                model=model,
+                quality_tier=quality_tier,
+                execution_mode=resolve_task_execution_mode(task, runtime_config, provider_name),
+                account=account,
+            )
+
+    if explicit_provider and explicit_model:
+        return LLMSelectionResult(
+            provider=explicit_provider,
+            auth_mode=get_task_llm_auth_mode(task) or LLMAuthMode.OAUTH.value,
+            model=explicit_model,
+            quality_tier=quality_tier,
+            execution_mode=resolve_task_execution_mode(task, runtime_config, explicit_provider),
+            account=None,
+        )
+
+    if provider_preference:
+        fallback_provider = provider_preference[0]
+        provider = get_provider(fallback_provider)
+        fallback_model = explicit_model or provider.tier_to_model(quality_tier, runtime_config)
+        return LLMSelectionResult(
+            provider=fallback_provider,
+            auth_mode=LLMAuthMode.OAUTH.value,
+            model=fallback_model,
+            quality_tier=quality_tier,
+            execution_mode=resolve_task_execution_mode(task, runtime_config, fallback_provider),
+            account=None,
+        )
+
+    return None
 
 
 async def release_max_plan_account(account_id: str):

@@ -4,7 +4,7 @@ Extracted from app.main to reduce module size. Contains:
 - should_rollback: causation analysis for rollback decisions
 - _get_deploy_state_for_update: DB accessor with FOR UPDATE
 - _check_monitoring_window: post-deploy monitoring window logic
-- _check_external_health: checks DB, GitHub API, GCP, Claude API health
+- _check_external_health: checks DB, GitHub API, GCP, and provider-aware dispatch health
 - _create_auto_pause_alerts / _create_auto_resume_alerts: alert helpers
 - _check_pause_mode: auto-pause on critical failures, auto-resume on recovery
 - broadcast_deploy_state: WebSocket broadcast wrapper
@@ -24,8 +24,9 @@ from app.max_plan_pool import recheck_disabled_accounts
 from app.health_check_primitives import (
     check_db_health,
     check_github_health,
-    check_claude_api_health,
+    check_provider_api_health,
     check_gcp_health,
+    get_dispatch_health_snapshot,
     log_zone_health_transitions,
 )
 import app.shared_state as _shared_state
@@ -368,9 +369,21 @@ async def _check_external_health():
     if result:
         failed.append(result)
 
-    result = check_claude_api_health(ext)
-    if result:
-        failed.append(result)
+    for provider_name in ("anthropic", "openai", "gemini"):
+        result = check_provider_api_health(ext, provider_name)
+        if result:
+            failed.append(result)
+
+    dispatch_health = get_dispatch_health_snapshot(ext)
+    ext["dispatch_health"] = dispatch_health
+    ext["dispatch_api"] = dispatch_health["status"] != "down"
+    if not ext["dispatch_api"]:
+        ext.setdefault("errors", {})["dispatch_api"] = (
+            "no dispatchable provider path remains"
+        )
+        failed.append("dispatch_api")
+    else:
+        ext.setdefault("errors", {}).pop("dispatch_api", None)
 
     result = check_gcp_health(ext)
     if result:
@@ -394,7 +407,7 @@ async def _check_external_health():
 
     # Track consecutive failure counts per dependency (used by dispatch gate)
     consec = ext.setdefault("consecutive_failures", {})
-    for dep in ("github_api", "claude_api", "gcp", "db"):
+    for dep in ("github_api", "anthropic_api", "openai_api", "gemini_api", "dispatch_api", "gcp", "db"):
         if dep in failed:
             consec[dep] = consec.get(dep, 0) + 1
         else:
@@ -452,7 +465,8 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
     """Create WARNING alerts on all projects when the pipeline auto-pauses due to external dep failures."""
     from app.main import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
     title = "Pipeline auto-paused: external dependencies down"
-    rl_details = _build_rate_limit_details() if "claude_api" in failed_deps else None
+    dispatch_health = (_shared_state.external_health.get("dispatch_health", {}) or {})
+    rl_details = _build_rate_limit_details() if "anthropic_api" in failed_deps else None
     if rl_details:
         suffix_parts = [
             f"{rl_details['rate_limited_accounts']}/{rl_details['total_accounts']} accounts rate-limited"
@@ -464,8 +478,13 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
         rl_suffix = " (" + "; ".join(suffix_parts) + ")"
     else:
         rl_suffix = ""
+    dispatch_suffix = ""
+    if "dispatch_api" in failed_deps and dispatch_health:
+        down_providers = dispatch_health.get("down_providers", [])
+        if down_providers:
+            dispatch_suffix = f" (no dispatchable providers: {', '.join(down_providers)})"
     msg = (
-        f"Pipeline auto-paused: external dependencies down — {', '.join(failed_deps)}{rl_suffix}. "
+        f"Pipeline auto-paused: external dependencies down — {', '.join(failed_deps)}{rl_suffix}{dispatch_suffix}. "
         "Will auto-resume when healthy."
     )
     projects = (await session.execute(select(Project))).scalars().all()
@@ -655,8 +674,8 @@ async def _check_pause_mode():
     global _pause_failure_streak, _last_auto_resume_at, _last_resume_was_forced, _consecutive_force_resumes
     ext = _shared_state.external_health
     failed = ext.get("failed_deps", [])
-    # Auto-pause on critical deps including Claude API (rate limits, not just missing credentials)
-    critical_failures = [d for d in failed if d in ("db", "github_api", "gcp", "claude_api")]
+    # Auto-pause only when critical infrastructure is down or no dispatchable provider path remains.
+    critical_failures = [d for d in failed if d in ("db", "github_api", "gcp", "dispatch_api")]
     is_healthy = not critical_failures
 
     if critical_failures:
@@ -798,7 +817,7 @@ async def _check_pause_mode():
         )
 
         if not (should_force_resume or should_normal_resume):
-            tracked_deps = ("db", "github_api", "gcp", "claude_api")
+            tracked_deps = ("db", "github_api", "gcp", "dispatch_api", "anthropic_api", "openai_api", "gemini_api")
             consec_map = ext.get("consecutive_failures", {}) or {}
             failed_set = set(failed)
             still_failing = {d: consec_map.get(d, 0) for d in tracked_deps if d in failed_set}

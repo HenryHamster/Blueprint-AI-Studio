@@ -9,6 +9,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _task_rate_limit_patterns(task: "Task") -> tuple[str, ...]:
+    from app.max_plan_pool import RATE_LIMIT_PATTERNS, get_task_llm_auth_mode, get_task_llm_provider  # noqa: PLC0415
+    from app.models import LLMAuthMode, LLMProviderName  # noqa: PLC0415
+    from app.providers.registry import get_provider  # noqa: PLC0415
+
+    provider_raw = get_task_llm_provider(task)
+    auth_mode_raw = get_task_llm_auth_mode(task)
+    if not provider_raw or not auth_mode_raw:
+        return tuple(RATE_LIMIT_PATTERNS)
+    try:
+        provider = LLMProviderName(provider_raw)
+        auth_mode = LLMAuthMode(auth_mode_raw)
+    except ValueError:
+        return tuple(RATE_LIMIT_PATTERNS)
+    try:
+        return get_provider(provider).rate_limit_patterns(auth_mode)
+    except Exception:
+        logger.exception(
+            "[FAILURE_CLASS] Failed to resolve rate-limit patterns for provider=%s auth_mode=%s",
+            provider_raw,
+            auth_mode_raw,
+        )
+        return tuple(RATE_LIMIT_PATTERNS)
+
+
 # Canonical failure classes that the classifier and rollups use.
 # Any mutation here must be reflected in the analytics sets that import INFRA_CLASSES.
 CODE_ERROR = "CODE_ERROR"
@@ -370,7 +395,6 @@ def classify_timeout_subtype(task: "Task", logs: Optional[str] = None) -> str:
 def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     """Classify a task failure for deployment monitoring.
     Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API"""
-    from app.max_plan_pool import RATE_LIMIT_PATTERNS  # noqa: PLC0415
 
     # Fast path: agent already reported a structured category — prefer it over regex.
     # Accept both the legacy lowercase labels (pre-normalization writes) and the
@@ -444,7 +468,8 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
 
     # Claude API rate limit — exact Claude Code / Anthropic API error strings only.
     # See RATE_LIMIT_PATTERNS docstring for why broad keywords were removed.
-    if any(kw in combined for kw in RATE_LIMIT_PATTERNS):
+    rate_limit_patterns = _task_rate_limit_patterns(task)
+    if any(kw in combined for kw in rate_limit_patterns):
         return "RATE_LIMIT"
 
     # Workflow limits — iteration caps, spawn failures due to pipeline state (not code errors).

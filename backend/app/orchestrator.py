@@ -13,7 +13,8 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Tuple
+from pathlib import Path
+from typing import Any, Dict, Tuple
 
 from fastapi import HTTPException
 from sqlalchemy import func as _func
@@ -401,7 +402,115 @@ async def _persist_pipeline_events():
         logger.warning(f"[PIPELINE EVENTS] Failed to persist: {e}", exc_info=True)
 
 
-_CRITICAL_EXTERNAL_DEPS = ("github_api", "claude_api", "gcp")
+_CRITICAL_EXTERNAL_DEPS = ("github_api", "dispatch_api", "gcp")
+
+_ENV_FALLBACK_DEFAULT_MODELS = {
+    "anthropic": "claude-opus-4-7",
+    "openai": "gpt-5",
+    "gemini": "gemini-2.5-pro",
+}
+
+
+def _provider_env_credential_hint(provider: str | None) -> str:
+    if provider == "openai":
+        return "OPENAI_API_KEY or CODEX_API_KEY or CODEX_HOME/auth.json"
+    if provider == "gemini":
+        return "GEMINI_API_KEY or GOOGLE_APPLICATION_CREDENTIALS (+ GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION)"
+    return "ANTHROPIC_API_KEY"
+
+
+def _resolve_env_runtime_fallback(
+    *,
+    provider: str | None,
+    model: str | None,
+    execution_mode: str | None,
+    task: Task,
+    runtime_config: dict[str, Any],
+    resolve_execution_mode,
+) -> tuple[str | None, str, str | None, str | None, str | None, dict[str, str]]:
+    """Return env-backed runtime credentials when no pool account is available."""
+    provider_name = provider or "anthropic"
+    runtime_model = model or _ENV_FALLBACK_DEFAULT_MODELS.get(provider_name)
+    runtime_execution_mode = execution_mode
+    provider_metadata: dict[str, str] = {}
+
+    if provider_name == "openai":
+        secret = os.getenv("OPENAI_API_KEY") or os.getenv("CODEX_API_KEY")
+        auth_mode = "api_key"
+        if not secret:
+            codex_home = (os.getenv("CODEX_HOME") or "").strip()
+            auth_path = Path(codex_home) / "auth.json" if codex_home else None
+            if not auth_path or not auth_path.exists():
+                return None, provider_name, None, runtime_model, runtime_execution_mode, provider_metadata
+            try:
+                secret = auth_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                logger.warning(
+                    f"[ORCHESTRATOR] Failed to read OpenAI auth.json from CODEX_HOME={codex_home!r}: {exc}"
+                )
+                return None, provider_name, None, runtime_model, runtime_execution_mode, provider_metadata
+            auth_mode = "oauth"
+        runtime_execution_mode = runtime_execution_mode or resolve_execution_mode(task, runtime_config, provider_name)
+        return secret, provider_name, auth_mode, runtime_model, runtime_execution_mode, provider_metadata
+
+    if provider_name == "gemini":
+        secret = os.getenv("GEMINI_API_KEY")
+        if secret:
+            runtime_execution_mode = runtime_execution_mode or resolve_execution_mode(task, runtime_config, provider_name)
+            return secret, provider_name, "api_key", runtime_model, runtime_execution_mode, provider_metadata
+        service_account_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if not service_account_path:
+            return None, provider_name, None, runtime_model, runtime_execution_mode, provider_metadata
+        try:
+            secret = Path(service_account_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning(
+                f"[ORCHESTRATOR] Failed to read GOOGLE_APPLICATION_CREDENTIALS={service_account_path!r}: {exc}"
+            )
+            return None, provider_name, None, runtime_model, runtime_execution_mode, provider_metadata
+        project = (os.getenv("GOOGLE_CLOUD_PROJECT") or "").strip()
+        location = (os.getenv("GOOGLE_CLOUD_LOCATION") or "").strip()
+        if not project or not location:
+            logger.warning(
+                "[ORCHESTRATOR] GOOGLE_APPLICATION_CREDENTIALS is set for Gemini service-account fallback "
+                "but GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION are both required"
+            )
+            return None, provider_name, None, runtime_model, runtime_execution_mode, provider_metadata
+        if project:
+            provider_metadata["project"] = project
+        if location:
+            provider_metadata["location"] = location
+        runtime_execution_mode = runtime_execution_mode or resolve_execution_mode(task, runtime_config, provider_name)
+        return secret, provider_name, "service_account", runtime_model, runtime_execution_mode, provider_metadata
+
+    secret = os.getenv("ANTHROPIC_API_KEY")
+    if not secret:
+        return None, provider_name, None, runtime_model, runtime_execution_mode, provider_metadata
+    runtime_execution_mode = runtime_execution_mode or resolve_execution_mode(task, runtime_config, provider_name)
+    return secret, provider_name, "api_key", runtime_model, runtime_execution_mode, provider_metadata
+
+
+def _sync_task_payload_runtime_fields(
+    task: Task,
+    *,
+    model: str | None,
+    execution_mode: str | None,
+) -> bool:
+    """Keep payload runtime hints aligned with the resolved task runtime identity."""
+    if not task.payloads:
+        return False
+    payload = task.payloads[0]
+    if payload is None:
+        payload = {}
+        task.payloads[0] = payload
+    changed = False
+    if model and payload.get("model") != model:
+        payload["model"] = model
+        changed = True
+    if execution_mode and payload.get("execution_mode") != execution_mode:
+        payload["execution_mode"] = execution_mode
+        changed = True
+    return changed
 
 
 def get_confirmed_down_critical_deps() -> list:
@@ -488,14 +597,19 @@ async def orchestrator_worker():
     from app.max_plan_pool import (
         load_max_plan_pool,
         release_max_plan_account,
-        select_max_plan_account,
         recheck_disabled_accounts,
         _extract_task_model,
         _account_available_for_model,
         _account_by_id,
         _max_plan_pools,
         _max_plan_pool_lock,
+        apply_task_llm_runtime_context,
+        clear_task_llm_runtime_context,
+        get_task_llm_account_id,
+        resolve_task_execution_mode,
+        select_llm_runtime_for_task,
     )
+    from app.providers.registry import get_provider
     from app.main import (
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
@@ -633,7 +747,7 @@ async def orchestrator_worker():
                             fresh_t.latest_status_message = f"Failed after {provision_failures} provision attempts"
                             fresh_t.context = {**(fresh_t.context or {}), "failure_category": "PROVISION_FAILURE", "provision_failures": provision_failures}
                             logger.error(f"[ORCHESTRATOR] Task {t.id} exceeded provision retry limit ({provision_failures}) — marking FAILED")
-                            acct_id = (fresh_t.context or {}).get("max_plan_account_id")
+                            acct_id = get_task_llm_account_id(fresh_t)
                             if acct_id:
                                 await release_max_plan_account(acct_id)
                             session.add(fresh_t)
@@ -642,7 +756,7 @@ async def orchestrator_worker():
                             continue
                         stale_vm_ids.append(fresh_t.vm_instance_id)
                         # Release Max Plan account slot before requeueing
-                        acct_id = (fresh_t.context or {}).get("max_plan_account_id")
+                        acct_id = get_task_llm_account_id(fresh_t)
                         if acct_id:
                             await release_max_plan_account(acct_id)
                         # Cancel any lingering coroutine reference
@@ -653,7 +767,9 @@ async def orchestrator_worker():
                         fresh_t.status = TaskStatus.QUEUED
                         fresh_t.started_at = None
                         fresh_t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                        fresh_t.context = {**(fresh_t.context or {}), "provision_failures": provision_failures}
+                        fresh_t.context = clear_task_llm_runtime_context(
+                            {**(fresh_t.context or {}), "provision_failures": provision_failures}
+                        )
                         session.add(fresh_t)
                         tasks_recovered += 1
                         if fresh_t.last_heartbeat is None:
@@ -833,13 +949,14 @@ async def orchestrator_worker():
                 # without a matching GROUP BY token).
                 active_per_account: Dict[str, int] = {}
                 _acct_id_rows = (await session.execute(
-                    select(Task.context["max_plan_account_id"].as_string())
+                    select(Task.context)
                     .where(
                         Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
                     )
                 )).all()
                 for row in _acct_id_rows:
-                    acct_id = row[0]
+                    ctx = row[0] or {}
+                    acct_id = ctx.get("llm_account_id") or ctx.get("max_plan_account_id")
                     if acct_id:
                         active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
                 async with _max_plan_pool_lock:
@@ -962,7 +1079,7 @@ async def orchestrator_worker():
                                 cancel_task.status = TaskStatus.CANCELLED
                                 cancel_task.latest_status_message = "Cancelled: dependency task failed"
                                 # Release account slot if held
-                                cancel_acct = (cancel_task.context or {}).get("max_plan_account_id")
+                                cancel_acct = get_task_llm_account_id(cancel_task)
                                 if cancel_acct and not (cancel_task.context or {}).get("_slot_released"):
                                     await release_max_plan_account(cancel_acct)
                                     cancel_task.context = {**(cancel_task.context or {}), "_slot_released": True}
@@ -977,7 +1094,7 @@ async def orchestrator_worker():
                                 for child in children:
                                     child.status = TaskStatus.CANCELLED
                                     child.latest_status_message = "Cancelled: parent dependency failed"
-                                    child_acct = (child.context or {}).get("max_plan_account_id")
+                                    child_acct = get_task_llm_account_id(child)
                                     if child_acct and not (child.context or {}).get("_slot_released"):
                                         await release_max_plan_account(child_acct)
                                         child.context = {**(child.context or {}), "_slot_released": True}
@@ -1487,7 +1604,7 @@ async def orchestrator_worker():
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     logger.info(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
 
-                    # Select Max plan account from task owner's pool, filtered by model.
+                    # Resolve the task's LLM runtime identity and select an eligible account.
                     # Two sources feed the effective blacklist:
                     #  - blacklisted_accounts: pruneable (rate-limit recovers → reusable)
                     #  - provision_failed_accounts: sticky (silent pre-claim deaths stay
@@ -1498,23 +1615,10 @@ async def orchestrator_worker():
                     task_project = await session.get(Project, task.project_id)
                     # Launcher pays; fall back to project owner for autonomous tasks
                     dispatch_user_id = task.launched_by_user_id or (task_project.user_id if task_project else "")
-                    # Resolve which model this task needs
+                    task_type = task.payloads[0].get("type", "create") if task.payloads else "create"
                     task_model = _extract_task_model(task)
                     if not task_model:
-                        task_type = task.payloads[0].get("type", "create") if task.payloads else "create"
                         task_model = _runtime_config.get("task_type_models", {}).get(task_type)
-                    # Always persist model to payload so rate-limit handler knows which
-                    # model was used. Default to opus-4-7 when no per-type override.
-                    if task.payloads and not task.payloads[0].get("model"):
-                        task.payloads[0]["model"] = task_model or "claude-opus-4-7"
-                        from sqlalchemy.orm.attributes import flag_modified
-                        flag_modified(task, "payloads")
-                        session.add(task)
-                    # Keep task_model in sync with the payload — otherwise
-                    # select_max_plan_account gets model=None and bypasses
-                    # disabled_models filtering entirely.
-                    if task.payloads:
-                        task_model = task.payloads[0].get("model") or task_model
                     # Prune stale blacklist entries — accounts whose model cooldown has expired
                     # should be eligible again, otherwise rate-limited tasks get stuck forever
                     if _blacklist:
@@ -1529,24 +1633,57 @@ async def orchestrator_worker():
                                 task.context.pop("blacklisted_accounts", None)
                             session.add(task)
                     _effective_blacklist = list({*(_blacklist or []), *_sticky}) or None
-                    account = await select_max_plan_account(user_id=dispatch_user_id, model=task_model, blacklist=_effective_blacklist)
-                    oauth_token = None
+                    runtime_selection = await select_llm_runtime_for_task(
+                        user_id=dispatch_user_id,
+                        task=task,
+                        runtime_config=_runtime_config,
+                        blacklist=_effective_blacklist,
+                    )
+                    runtime_secret = None
                     claude_config_json = None
                     account_id = None
+                    runtime_provider = None
+                    runtime_auth_mode = None
+                    runtime_model = task_model
+                    runtime_execution_mode = None
+                    runtime_provider_metadata = None
+                    if runtime_selection:
+                        runtime_provider = runtime_selection.provider
+                        runtime_auth_mode = runtime_selection.auth_mode
+                        runtime_model = runtime_selection.model or runtime_model
+                        runtime_execution_mode = runtime_selection.execution_mode
+                    account = runtime_selection.account if runtime_selection else None
                     if account:
                         account_id = account["id"]
-                        oauth_token = account.get("oauth_token")
+                        runtime_secret = account.get("runtime_secret") or account.get("oauth_token")
                         claude_config_json = account.get("claude_config_json")
-                        logger.info(f"[ORCHESTRATOR] Using Max plan account '{account['name']}'")
+                        runtime_provider_metadata = account.get("provider_metadata") or {}
+                        logger.info(
+                            f"[ORCHESTRATOR] Using LLM account '{account['name']}' "
+                            f"(provider={runtime_provider}, auth_mode={runtime_auth_mode}, model={runtime_model})"
+                        )
                     else:
                         # No available account — either all disabled/blacklisted or none configured
                         user_pool = _max_plan_pools.get(dispatch_user_id, [])
-                        if user_pool:
+                        provider_accounts = user_pool
+                        if user_pool and runtime_provider:
+                            provider_handler = get_provider(runtime_provider)
+                            provider_accounts = [
+                                acct for acct in user_pool
+                                if str(acct.get("provider") or "anthropic") == runtime_provider
+                            ]
+                            ready_provider_accounts = [
+                                acct for acct in provider_accounts
+                                if acct.get("enabled", True) and provider_handler.account_has_credentials(acct)
+                            ]
+                        else:
+                            ready_provider_accounts = list(provider_accounts)
+                        if user_pool and ready_provider_accounts:
                             # Accounts exist but all blocked — notify user and skip
                             logger.info(f"[ORCHESTRATOR] All accounts blocked for task {task.id} — skipping (will retry next cycle)")
                             # Calculate earliest recovery time from account cooldowns
                             earliest_recovery = None
-                            for acct in user_pool:
+                            for acct in ready_provider_accounts:
                                 dm = acct.get('disabled_models', {})
                                 for info in dm.values():
                                     disabled_at = info.get('at')
@@ -1566,13 +1703,20 @@ async def orchestrator_worker():
                             if earliest_recovery:
                                 wait_min = max(0, (earliest_recovery - _utcnow()).total_seconds() / 60)
                                 stall_msg = f'All accounts rate-limited — earliest recovery in {int(wait_min)}min'
+                                stall_delay_minutes = rate_limit_retry_minutes(earliest_recovery)
                             else:
-                                stall_msg = 'All accounts rate-limited — waiting for cooldown'
+                                target_runtime = runtime_model or task_model or "requested runtime"
+                                provider_label = runtime_provider or "LLM"
+                                stall_msg = (
+                                    f"No eligible {provider_label} account available for {target_runtime} "
+                                    "— waiting for capacity or retry reset"
+                                )
+                                stall_delay_minutes = 2
                             # Retry delay based on earliest known recovery to avoid
                             # hot-looping every 2 min when recovery is hours away.
                             # set_retry_after clamps to RETRY_AFTER_MAX_MINUTES.
                             stall_ctx = dict(task.context or {})
-                            set_retry_after(stall_ctx, rate_limit_retry_minutes(earliest_recovery))
+                            set_retry_after(stall_ctx, stall_delay_minutes)
                             task.context = stall_ctx
                             # Escalate when a task is stuck cycling through retry_after holds.
                             # Each reset is up to RETRY_AFTER_MAX_MINUTES (30m), so 8 resets ≈ 4h.
@@ -1604,7 +1748,7 @@ async def orchestrator_worker():
                                     task.status = TaskStatus.FAILED
                                     task.latest_status_message = _exhaust_msg[:500]
                                     persist_failure_category(task, "retry_after_exhausted")
-                                    _acct_id = (task.context or {}).get("max_plan_account_id")
+                                    _acct_id = get_task_llm_account_id(task)
                                     if _acct_id:
                                         await release_max_plan_account(_acct_id)
                                     session.add(task)
@@ -1666,7 +1810,7 @@ async def orchestrator_worker():
                                 logger.exception(f"[ORCHESTRATOR] Failed to evaluate retry_after escalation for task {task.id}")
                             if _auto_failed:
                                 continue
-                            if not (task.latest_status_message or "").startswith("All accounts"):
+                            if task.latest_status_message != stall_msg:
                                 # Update directly on the locked task object (separate session would deadlock)
                                 task.latest_status_message = stall_msg
                                 await broadcast_to_project(str(task.project_id), "task_updated",
@@ -1678,18 +1822,54 @@ async def orchestrator_worker():
                             ):
                                 _cycle_earliest_recovery = earliest_recovery
                             continue
-                        # No accounts at all — check for API key fallback
-                        if os.getenv("ANTHROPIC_API_KEY"):
-                            logger.info("[ORCHESTRATOR] No Max plan accounts, using ANTHROPIC_API_KEY fallback")
+                        # No accounts at all — fall back to raw provider credentials when present
+                        (
+                            runtime_secret,
+                            runtime_provider,
+                            runtime_auth_mode,
+                            runtime_model,
+                            runtime_execution_mode,
+                            runtime_provider_metadata,
+                        ) = _resolve_env_runtime_fallback(
+                            provider=runtime_provider,
+                            model=runtime_model or task_model,
+                            execution_mode=runtime_execution_mode,
+                            task=task,
+                            runtime_config=_runtime_config,
+                            resolve_execution_mode=resolve_task_execution_mode,
+                        )
+                        if runtime_secret:
+                            logger.info(
+                                f"[ORCHESTRATOR] No LLM pool account available, using env credential fallback "
+                                f"(provider={runtime_provider}, auth_mode={runtime_auth_mode}, model={runtime_model})"
+                            )
                         else:
                             logger.warning(f"[ORCHESTRATOR] No credentials available — skipping task {task.id}")
                             # Update directly on the locked task object (separate session would deadlock)
-                            task.latest_status_message = "Waiting for credentials — add a Max plan account or set ANTHROPIC_API_KEY"
+                            task.latest_status_message = (
+                                "Waiting for credentials — add an LLM account or set "
+                                f"{_provider_env_credential_hint(runtime_provider)}"
+                            )
                             session.add(task)
                             continue
 
-                    # Store which account this task uses for cleanup on completion
-                    task.context = {**(task.context or {}), "max_plan_account_id": account_id}
+                    if _sync_task_payload_runtime_fields(
+                        task,
+                        model=runtime_model,
+                        execution_mode=runtime_execution_mode,
+                    ):
+                        from sqlalchemy.orm.attributes import flag_modified
+                        flag_modified(task, "payloads")
+                        session.add(task)
+
+                    task.context = apply_task_llm_runtime_context(
+                        task.context,
+                        account_id=account_id,
+                        provider=runtime_provider,
+                        auth_mode=runtime_auth_mode,
+                        model=runtime_model,
+                        execution_mode=runtime_execution_mode,
+                    )
 
                     # Mark as PROVISIONING to prevent other workers from picking it up.
                     # last_heartbeat is intentionally NOT set here — it must reflect real
@@ -1713,14 +1893,20 @@ async def orchestrator_worker():
                         # Release the pre-incremented slot on commit failure
                         if account_id:
                             await release_max_plan_account(account_id)
+                        task.context = clear_task_llm_runtime_context(task.context)
                         await session.rollback()
                         continue
 
                     # Trigger GCP Compute Engine provisioning in the background
                     # All values passed as args to avoid stale closure captures across loop iterations
                     async def _provision_and_handle(vm_id: str, t_id: uuid.UUID, p_id: uuid.UUID,
-                                                    payloads: list, token: str, config_json: str,
-                                                    acct_id_for_release: str):
+                                                    payloads: list, secret_value: str | None, config_json: str | None,
+                                                    acct_id_for_release: str,
+                                                    llm_provider: str | None,
+                                                    llm_auth_mode: str | None,
+                                                    llm_model: str | None,
+                                                    llm_execution_mode: str | None,
+                                                    llm_provider_metadata: dict | None):
                         success = False
                         try:
                             t_type = (payloads[0] or {}).get("type", "") if payloads else ""
@@ -1739,12 +1925,19 @@ async def orchestrator_worker():
 
                             payload_uri, secret_version_name = await asyncio.gather(
                                 _upload_payload_safe(),
-                                prepare_and_store_agent_secret(vm_id, t_id, token, config_json, t_type),
+                                prepare_and_store_agent_secret(
+                                    vm_id, t_id, secret_value, config_json, t_type,
+                                    provider=llm_provider, auth_mode=llm_auth_mode, model=llm_model,
+                                    execution_mode=llm_execution_mode, provider_metadata=llm_provider_metadata,
+                                ),
                             )
 
                             success = await provision_agent_vm(vm_id, t_id, payload_uri,
-                                                               oauth_token=token, claude_config_json=config_json,
-                                                               task_type=t_type, secret_version_name=secret_version_name)
+                                                               oauth_token=secret_value, claude_config_json=config_json,
+                                                               task_type=t_type, secret_version_name=secret_version_name,
+                                                               provider=llm_provider, auth_mode=llm_auth_mode,
+                                                               model=llm_model, execution_mode=llm_execution_mode,
+                                                               provider_metadata=llm_provider_metadata)
                             if success:
                                 # Verify the task still wants this VM — stale recovery may have
                                 # requeued the task with a new vm_id while we were provisioning.
@@ -1896,6 +2089,8 @@ async def orchestrator_worker():
                                                     failed_task.latest_status_message = f"Provision failed (attempt {prov_failures}/{max_prov_retries}), requeued: {provision_err or 'unknown'}"
                                                     logger.warning(f"[ORCHESTRATOR] Task {t_id} provision failed (attempt {prov_failures}) — requeuing")
 
+                                            if failed_task.status == TaskStatus.QUEUED:
+                                                ctx = clear_task_llm_runtime_context(ctx)
                                             failed_task.context = ctx
                                             inner_session.add(failed_task)
                                             await inner_session.commit()
@@ -1915,7 +2110,9 @@ async def orchestrator_worker():
 
                     provision_coro = asyncio.create_task(_provision_and_handle(
                         task.vm_instance_id, task.id, task.project_id,
-                        task.payloads, oauth_token, claude_config_json, account_id
+                        task.payloads, runtime_secret, claude_config_json, account_id,
+                        runtime_provider, runtime_auth_mode, runtime_model,
+                        runtime_execution_mode, runtime_provider_metadata,
                     ))
                     _provision_coroutines[str(task.id)] = provision_coro
                     provision_coro.add_done_callback(lambda _, tid=str(task.id): _provision_coroutines.pop(tid, None))

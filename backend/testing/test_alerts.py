@@ -391,13 +391,13 @@ class TestAutoPauseAlerts:
         await db_session.commit()
         await db_session.refresh(project)
 
-        await _create_auto_pause_alerts(db_session, ["db", "claude_api"])
+        await _create_auto_pause_alerts(db_session, ["db", "dispatch_api"])
         await db_session.commit()
 
         alerts = await _undismissed_alerts(db_session, project_id=project.id)
         assert len(alerts) == 1
         assert "db" in alerts[0].message
-        assert "claude_api" in alerts[0].message
+        assert "dispatch_api" in alerts[0].message
         assert "Will auto-resume when healthy." in alerts[0].message
 
     @pytest.mark.asyncio

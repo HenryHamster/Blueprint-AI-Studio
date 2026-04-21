@@ -54,7 +54,7 @@ def cmd_status(_args):
         eh = ds.get('external_health', {})
         if eh:
             errs = eh.get('errors', {})
-            for dep in ['github_api', 'db', 'claude_api', 'gcp']:
+            for dep in ['github_api', 'db', 'dispatch_api', 'anthropic_api', 'openai_api', 'gemini_api', 'gcp']:
                 val = eh.get(dep)
                 if val is not None:
                     status = 'OK' if val else 'DOWN'
@@ -334,7 +334,7 @@ def cmd_health(_args):
     errs = eh.get('errors') or {}
     print()
     print("=== EXTERNAL DEPS ===")
-    for dep in ('github_api', 'db', 'claude_api', 'gcp'):
+    for dep in ('github_api', 'db', 'dispatch_api', 'anthropic_api', 'openai_api', 'gemini_api', 'gcp'):
         val = eh.get(dep)
         if val is None:
             continue

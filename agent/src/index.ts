@@ -19,24 +19,88 @@ import {
 
 // ── Failure categories ───────────────────────────────────────────────────────
 export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'timeout';
+type ProviderName = 'anthropic' | 'openai' | 'gemini';
+type AuthMode = 'oauth' | 'api_key' | 'service_account';
+type OutputMode = 'claude-stream-json' | 'text';
 
-// Exact substrings from Claude Code CLI / Anthropic API rate-limit messages.
-// Must stay in sync with backend/app/max_plan_pool.py:RATE_LIMIT_PATTERNS.
-// Do NOT add loose keywords like "credit", "billing", "429", or "overloaded" —
-// those cause false positives that disable accounts for unrelated failures.
-const RATE_LIMIT_PATTERNS: readonly string[] = [
-  "you've hit your limit",
-  "you've hit your usage limit",
-  "claude ai usage limit reached",
-  "you're out of extra usage",
-  "5-hour limit reached",
-  "api error: rate limit reached",
-  "this request would exceed your account's rate limit",
-] as const;
+const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode, readonly string[]>>>> = {
+  anthropic: {
+    oauth: [
+      "you've hit your limit",
+      "you've hit your usage limit",
+      'claude ai usage limit reached',
+      "you're out of extra usage",
+      '5-hour limit reached',
+      'api error: rate limit reached',
+      "this request would exceed your account's rate limit",
+    ],
+    api_key: [
+      "you've hit your limit",
+      "you've hit your usage limit",
+      'claude ai usage limit reached',
+      "you're out of extra usage",
+      '5-hour limit reached',
+      'api error: rate limit reached',
+      "this request would exceed your account's rate limit",
+    ],
+  },
+  openai: {
+    oauth: [
+      "you've hit your usage limit",
+      "you've hit rate limit",
+      'exceeded retry limit',
+      'last status: 429',
+      'insufficient_quota',
+      'usage_not_included',
+      'rate_limit_exceeded',
+    ],
+    api_key: [
+      'quota exceeded. check your plan and billing',
+      'rate limit reached for',
+      'please try again in',
+    ],
+  },
+  gemini: {
+    api_key: [
+      'rate limit exceeded',
+      "you've hit the api rate limit",
+      'resource has been exhausted',
+      'resource_exhausted',
+      'please wait and try again later',
+      'you have reached your daily',
+      'automatically switching from gemini-',
+    ],
+    service_account: [
+      'resource has been exhausted',
+      'resource_exhausted',
+      'ratelimitexceeded',
+    ],
+  },
+} as const;
 
-export function matchesRateLimit(text: string): boolean {
+function normalizeProvider(raw: string | undefined): ProviderName {
+  if (raw === 'openai' || raw === 'gemini') return raw;
+  return 'anthropic';
+}
+
+function normalizeAuthMode(raw: string | undefined, provider: ProviderName): AuthMode {
+  if (provider === 'gemini' && raw === 'service_account') return raw;
+  if (raw === 'api_key' || raw === 'oauth') return raw;
+  if (provider === 'gemini') return 'api_key';
+  return 'oauth';
+}
+
+const PROVIDER: ProviderName = normalizeProvider(process.env.PROVIDER);
+const AUTH_MODE: AuthMode = normalizeAuthMode(process.env.AUTH_MODE, PROVIDER);
+const LLM_EXECUTION_MODE = process.env.LLM_EXECUTION_MODE || 'default';
+
+function getRateLimitPatterns(provider: ProviderName, authMode: AuthMode): readonly string[] {
+  return RATE_LIMIT_PATTERNS[provider][authMode] ?? RATE_LIMIT_PATTERNS[provider].oauth ?? [];
+}
+
+export function matchesRateLimit(text: string, provider: ProviderName = PROVIDER, authMode: AuthMode = AUTH_MODE): boolean {
   const lower = text.toLowerCase();
-  return RATE_LIMIT_PATTERNS.some(p => lower.includes(p));
+  return getRateLimitPatterns(provider, authMode).some(p => lower.includes(p));
 }
 
 // Thrown when Claude CLI output matches a rate-limit pattern. Carries the
@@ -199,15 +263,27 @@ export async function apiPost(path: string, body: Record<string, unknown> = {}, 
  *  If the POST fails (network error, VM kill), the file survives for retry on next startup. */
 export async function persistAndPostStatus(taskId: string, payload: Record<string, unknown>) {
   const resultPath = `/tmp/task_${taskId}_result.json`;
-  fs.writeFileSync(resultPath, JSON.stringify(payload), 'utf-8');
+  const enrichedPayload = enrichStatusPayload(taskId, payload);
+  fs.writeFileSync(resultPath, JSON.stringify(enrichedPayload), 'utf-8');
   try {
-    const result = await apiPost('/api/agent/status', payload);
+    const result = await apiPost('/api/agent/status', enrichedPayload);
     try { fs.unlinkSync(resultPath); } catch { /* ignore — file already gone */ }
     return result;
   } catch (e) {
     // File intentionally left on disk — retried on next agent startup
     throw e;
   }
+}
+
+function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): Record<string, unknown> {
+  return {
+    provider: PROVIDER,
+    auth_mode: AUTH_MODE,
+    model: process.env.LLM_MODEL || undefined,
+    execution_mode: LLM_EXECUTION_MODE,
+    task_id: taskId,
+    ...payload,
+  };
 }
 
 export async function apiGet(path: string, retries = API_MAX_RETRIES) {
@@ -1302,16 +1378,221 @@ interface ClaudeOutput {
   result?: string;
 }
 
+interface RunnerCommand {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  outputMode: OutputMode;
+  timeoutMs: number;
+  promptInput: 'arg' | 'stdin' | 'stdin-file';
+  displayName: string;
+}
+
+interface ValidationCommand {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  timeoutMs: number;
+}
+
+interface ProviderRunner {
+  provider: ProviderName;
+  authMode: AuthMode;
+  displayName: string;
+  credentialSummary(): string;
+  buildRunCommand(prompt: string, model?: string, effort?: string, disallowedTools?: string[]): RunnerCommand;
+  buildValidationCommand(model?: string): ValidationCommand | null;
+  missingCredentials(): string[];
+}
+
+function buildBaseCliEnv(): Record<string, string> {
+  const env: Record<string, string> = {
+    HOME: process.env.HOME || '/home/agent',
+    PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+    LANG: process.env.LANG || 'en_US.UTF-8',
+    TERM: process.env.TERM || 'xterm-256color',
+  };
+  for (const key of [
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+    'OPENAI_API_KEY',
+    'CODEX_API_KEY',
+    'CODEX_HOME',
+    'GEMINI_API_KEY',
+    'GOOGLE_APPLICATION_CREDENTIALS',
+    'GOOGLE_CLOUD_PROJECT',
+    'GOOGLE_CLOUD_LOCATION',
+    'ORCHESTRATOR_URL',
+    'TASK_ID',
+  ]) {
+    if (process.env[key]) env[key] = process.env[key]!;
+  }
+  if (AGENT_TOKEN) env.AGENT_API_TOKEN = AGENT_TOKEN;
+  return env;
+}
+
+function withExecutionModePrompt(prompt: string): string {
+  if (LLM_EXECUTION_MODE !== 'advisor') return prompt;
+  return [
+    'Execution mode: advisor.',
+    'Prioritize analysis, recommendations, and risk assessment.',
+    'Avoid making code changes unless the task explicitly requires implementation.',
+    '',
+    prompt,
+  ].join('\n');
+}
+
+export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: AuthMode = AUTH_MODE): ProviderRunner {
+  const baseEnv = buildBaseCliEnv();
+  if (provider === 'openai') {
+    return {
+      provider,
+      authMode,
+      displayName: 'OpenAI Codex',
+      credentialSummary: () => authMode === 'oauth' ? 'Using Codex OAuth auth.json' : 'Using OPENAI/CODEX API key auth',
+      missingCredentials: () => {
+        if (authMode === 'oauth') return baseEnv.CODEX_HOME ? [] : ['CODEX_HOME'];
+        return (baseEnv.OPENAI_API_KEY || baseEnv.CODEX_API_KEY) ? [] : ['OPENAI_API_KEY or CODEX_API_KEY'];
+      },
+      buildRunCommand: (_prompt, model) => {
+        const args = ['exec', '--full-auto'];
+        if (model) args.push('-m', model);
+        return {
+          command: 'codex',
+          args,
+          env: baseEnv,
+          outputMode: 'text',
+          timeoutMs: claudeTimeoutForEffort(undefined),
+          promptInput: 'stdin',
+          displayName: 'OpenAI Codex',
+        };
+      },
+      buildValidationCommand: (model) => {
+        const args = ['exec'];
+        if (model) args.push('-m', model);
+        args.push('Respond with OK.');
+        return { command: 'codex', args, env: baseEnv, timeoutMs: 30_000 };
+      },
+    };
+  }
+  if (provider === 'gemini') {
+    return {
+      provider,
+      authMode,
+      displayName: 'Gemini CLI',
+      credentialSummary: () => authMode === 'service_account' ? 'Using Gemini Vertex service account auth' : 'Using GEMINI_API_KEY auth',
+      missingCredentials: () => {
+        if (authMode === 'service_account') return baseEnv.GOOGLE_APPLICATION_CREDENTIALS ? [] : ['GOOGLE_APPLICATION_CREDENTIALS'];
+        return baseEnv.GEMINI_API_KEY ? [] : ['GEMINI_API_KEY'];
+      },
+      buildRunCommand: (_prompt, model) => {
+        const args = ['--approval-mode=yolo', '-o', 'text'];
+        if (model) args.push('-m', model);
+        return {
+          command: 'gemini',
+          args,
+          env: baseEnv,
+          outputMode: 'text',
+          timeoutMs: claudeTimeoutForEffort(undefined),
+          promptInput: 'stdin',
+          displayName: 'Gemini CLI',
+        };
+      },
+      buildValidationCommand: (model) => {
+        const args = ['-o', 'text', '-p', 'Respond with OK.'];
+        if (model) args.push('-m', model);
+        return { command: 'gemini', args, env: baseEnv, timeoutMs: 30_000 };
+      },
+    };
+  }
+  return {
+    provider: 'anthropic',
+    authMode,
+    displayName: 'Claude Code',
+    credentialSummary: () => baseEnv.CLAUDE_CODE_OAUTH_TOKEN ? 'Using OAuth token for Claude Code auth' : 'Using ANTHROPIC_API_KEY as fallback auth',
+    missingCredentials: () => (baseEnv.CLAUDE_CODE_OAUTH_TOKEN || baseEnv.ANTHROPIC_API_KEY) ? [] : ['CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY'],
+    buildRunCommand: (_prompt, model, effort, disallowedTools) => {
+      const args = ['-p', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
+      if (model) args.push('--model', model);
+      if (effort) args.push('--effort', effort);
+      if (disallowedTools && disallowedTools.length > 0) {
+        for (const tool of disallowedTools) args.push('--disallowedTools', tool);
+      }
+      return {
+        command: 'claude',
+        args,
+        env: baseEnv,
+        outputMode: 'claude-stream-json',
+        timeoutMs: claudeTimeoutForEffort(effort),
+        promptInput: 'stdin-file',
+        displayName: 'Claude Code',
+      };
+    },
+    buildValidationCommand: () => ({
+      command: 'claude',
+      args: ['-p', 'respond with OK', '--max-turns', '1', '--output-format', 'stream-json', '--dangerously-skip-permissions'],
+      env: baseEnv,
+      timeoutMs: 30_000,
+    }),
+  };
+}
+
+async function validateProviderAuth(runner: ProviderRunner, reportPreClaimFailure: (reason: string) => void, model?: string): Promise<void> {
+  const missing = runner.missingCredentials();
+  if (missing.length > 0) {
+    const reason = `missing provider credentials: ${missing.join(', ')}`;
+    log(reason);
+    reportPreClaimFailure(reason);
+    process.exit(1);
+  }
+  const validation = runner.buildValidationCommand(model);
+  if (!validation) return;
+  try {
+    log(`Validating ${runner.displayName} credentials...`);
+    const result = await new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve) => {
+      let stdout = '';
+      let stderr = '';
+      const check = spawn(validation.command, validation.args, { cwd: '/tmp', env: validation.env });
+      const valTimeout = setTimeout(() => { try { check.kill(); } catch { /* ignore */ } }, validation.timeoutMs);
+      check.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+      check.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+      check.on('close', (code) => { clearTimeout(valTimeout); resolve({ exitCode: code ?? 1, stdout, stderr }); });
+    });
+    const combined = `${result.stderr}\n${result.stdout}`;
+    if (result.exitCode !== 0 && matchesRateLimit(combined, runner.provider, runner.authMode)) {
+      const snippet = combined.slice(0, 200);
+      log(`${runner.displayName} validation failed — account rate-limited: ${snippet}`);
+      reportPreClaimFailure(`token validation rate-limited: ${snippet}`);
+      process.exit(1);
+    }
+    if (result.exitCode !== 0) {
+      log(`${runner.displayName} validation exited non-zero (${result.exitCode}) — continuing`);
+      return;
+    }
+    log(`${runner.displayName} validation OK`);
+  } catch (e) {
+    log(`${runner.displayName} validation error (continuing): ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[]): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
 }> {
+  return runProviderAgent(prompt, ws, statusRef, model, effort, disallowedTools);
+}
+
+export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[]): Promise<{
+  exitCode: number; allOutput: string; lastResultText: string;
+}> {
+  const runner = getProviderRunner();
+  const runCommand = runner.buildRunCommand(prompt, model, effort, disallowedTools);
   let allOutput = '';
   let lastResultText = '';
   let stderrBuffer = '';
   let timedOut = false;
 
-  sendLog(ws, `\n--- Claude Code starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\n\n`);
-  log('Spawning Claude Code CLI...');
+  sendLog(ws, `\n--- ${runner.displayName} starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\nMode: ${LLM_EXECUTION_MODE}\n\n`);
+  log(`Spawning ${runner.displayName} CLI...`);
 
   // Write ./note helper for agent annotations (available to all task types)
   try {
@@ -1373,117 +1654,118 @@ echo ""
   } catch { /* workspace may not exist yet for some handlers */ }
 
   const exitCode = await new Promise<number>((resolve) => {
-    const claudeEnv: Record<string, string> = {
-      HOME: process.env.HOME || '/home/agent',
-      PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
-      LANG: process.env.LANG || 'en_US.UTF-8',
-      TERM: process.env.TERM || 'xterm-256color',
-    };
-    if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
-      claudeEnv.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    }
-    if (process.env.ANTHROPIC_API_KEY) {
-      claudeEnv.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-    }
-    if (process.env.ORCHESTRATOR_URL) {
-      claudeEnv.ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL;
-    }
-    // Pass agent token via env (not disk) so helpers like ./design-doc can auth
-    if (AGENT_TOKEN) {
-      claudeEnv.AGENT_API_TOKEN = AGENT_TOKEN;
-    }
-    if (process.env.TASK_ID) {
-      claudeEnv.TASK_ID = process.env.TASK_ID;
+    let promptFile = '';
+    let promptFd: number | undefined;
+    let child = null as ReturnType<typeof spawn> | null;
+
+    if (runCommand.promptInput === 'stdin-file') {
+      // Write prompt to a temp file and pipe via stdin to avoid E2BIG when
+      // the prompt (design doc + project context + directions) exceeds ARG_MAX (~128KB).
+      promptFile = `/tmp/agent_prompt_${process.env.TASK_ID || 'unknown'}.txt`;
+      fs.writeFileSync(promptFile, withExecutionModePrompt(prompt));
+      promptFd = fs.openSync(promptFile, 'r');
     }
 
-    // Write prompt to a temp file and pipe via stdin to avoid E2BIG when
-    // the prompt (design doc + project context + directions) exceeds ARG_MAX (~128KB).
-    const promptFile = `/tmp/agent_prompt_${process.env.TASK_ID || 'unknown'}.txt`;
-    fs.writeFileSync(promptFile, prompt);
-
-    const args = ['-p', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
-    if (model) args.push('--model', model);
-    if (effort) args.push('--effort', effort);
-    if (disallowedTools && disallowedTools.length > 0) {
-      for (const tool of disallowedTools) {
-        args.push('--disallowedTools', tool);
+    child = spawn(runCommand.command, runCommand.args, {
+      cwd: WORKSPACE,
+      env: runCommand.env,
+      detached: true,
+      stdio: [runCommand.promptInput === 'stdin' ? 'pipe' : (promptFd ?? 'ignore'), 'pipe', 'pipe'],
+    });
+    if (promptFd !== undefined) fs.closeSync(promptFd);
+    if (runCommand.promptInput === 'stdin') {
+      try {
+        child.stdin?.end(withExecutionModePrompt(prompt));
+      } catch {
+        // If the child exits immediately, the close path will surface the real failure.
       }
     }
-    const promptFd = fs.openSync(promptFile, 'r');
-    const claude = spawn('claude', args, { cwd: WORKSPACE, env: claudeEnv, detached: true, stdio: [promptFd, 'pipe', 'pipe'] });
-    fs.closeSync(promptFd);
 
-    // Kill Claude if it exceeds its effort-scaled timeout — kill entire process
-    // group (negative PID) so child processes (npm, pytest, etc.) are also
-    // terminated.
-    const timeoutMs = claudeTimeoutForEffort(effort);
+    const timeoutMs = runCommand.timeoutMs;
     const timeoutMinutes = timeoutMs / 60000;
     const killTimer = setTimeout(() => {
-      log(`Claude Code process timed out after ${timeoutMinutes} minutes — killing process group`);
-      sendLog(ws, `\n[TIMEOUT] Claude Code exceeded ${timeoutMinutes}-minute time limit\n`);
+      log(`${runCommand.displayName} process timed out after ${timeoutMinutes} minutes — killing process group`);
+      sendLog(ws, `\n[TIMEOUT] ${runCommand.displayName} exceeded ${timeoutMinutes}-minute time limit\n`);
       timedOut = true;
-      const pid = claude.pid;
+      const pid = child?.pid;
       if (pid) { try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ } }
       setTimeout(() => { if (pid) { try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ } } }, 5000);
     }, timeoutMs);
 
-    claude.stdout!.on('data', (data: Buffer) => {
+    child.stdout!.on('data', (data: Buffer) => {
       const text = data.toString();
       if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
-      for (const line of text.split('\n').filter(Boolean)) {
-        try {
-          const obj = JSON.parse(line) as ClaudeOutput;
-          if (obj.type === 'assistant' && obj.message?.content) {
-            for (const block of obj.message.content) {
-              if (block.type === 'text') {
-                sendLog(ws, (block.text ?? '') + '\n');
-                statusRef.value = (block.text ?? '').slice(0, 100);
-              } else if (block.type === 'tool_use') {
-                sendLog(ws, `[tool: ${strVal(block.name)}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
-                statusRef.value = `Using tool: ${strVal(block.name)}`;
-                recordToolUse(strVal(block.name), block.input);
+      if (runCommand.outputMode === 'claude-stream-json') {
+        for (const line of text.split('\n').filter(Boolean)) {
+          try {
+            const obj = JSON.parse(line) as ClaudeOutput;
+            if (obj.type === 'assistant' && obj.message?.content) {
+              for (const block of obj.message.content) {
+                if (block.type === 'text') {
+                  sendLog(ws, (block.text ?? '') + '\n');
+                  statusRef.value = (block.text ?? '').slice(0, 100);
+                } else if (block.type === 'tool_use') {
+                  sendLog(ws, `[tool: ${strVal(block.name)}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
+                  statusRef.value = `Using tool: ${strVal(block.name)}`;
+                  recordToolUse(strVal(block.name), block.input);
+                }
               }
+            } else if (obj.type === 'result') {
+              lastResultText = obj.result ?? '';
+              sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
             }
-          } else if (obj.type === 'result') {
-            lastResultText = obj.result ?? '';
-            sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
+          } catch {
+            sendLog(ws, text);
           }
-        } catch { sendLog(ws, text); }
+        }
+      } else {
+        sendLog(ws, text);
+        const trimmed = text.trim();
+        if (trimmed) {
+          lastResultText = `${lastResultText}${text}`.trim();
+          statusRef.value = trimmed.slice(0, 100);
+        }
       }
     });
 
-    claude.stderr!.on('data', (data: Buffer) => {
+    child.stderr!.on('data', (data: Buffer) => {
       const text = sanitize(data.toString());
       if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
       if (stderrBuffer.length < 50_000) stderrBuffer += text;
       sendLog(ws, `[stderr] ${text}`);
     });
 
-    claude.on('error', (err) => { clearTimeout(killTimer); sendLog(ws, `[error] ${err.message}\n`); resolve(1); });
-    claude.on('close', (code) => { clearTimeout(killTimer); log(`Claude Code exited with code ${code ?? 'null'}`); resolve(code ?? 1); });
+    child.on('error', (err) => { clearTimeout(killTimer); sendLog(ws, `[error] ${err.message}\n`); resolve(1); });
+    child.on('close', (code) => {
+      clearTimeout(killTimer);
+      if (promptFile) {
+        try { fs.unlinkSync(promptFile); } catch { /* ignore */ }
+      }
+      log(`${runCommand.displayName} exited with code ${code ?? 'null'}`);
+      resolve(code ?? 1);
+    });
   });
 
-  sendLog(ws, `\n--- Claude Code exited (code: ${exitCode}) ---\n`);
+  sendLog(ws, `\n--- ${runner.displayName} exited (code: ${exitCode}) ---\n`);
 
   if (timedOut) {
-    throw new ClaudeTimeoutError(`Claude Code exceeded ${claudeTimeoutForEffort(effort) / 60000}-minute time limit`);
+    throw new ClaudeTimeoutError(`${runner.displayName} exceeded ${runCommand.timeoutMs / 60000}-minute time limit`);
   }
 
-  // Detect Claude rate-limit / usage exhaustion from stderr using exact
-  // substrings from RATE_LIMIT_PATTERNS.
   if (exitCode !== 0) {
     const combined = stderrBuffer + allOutput.slice(-5000);
-    if (matchesRateLimit(combined)) {
+    if (matchesRateLimit(combined, runner.provider, runner.authMode)) {
       const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
-      throw new RateLimitError(`Claude API usage exhausted — ${snippet}`);
+      throw new RateLimitError(`${runner.displayName} API usage exhausted — ${snippet}`);
     }
   }
 
-  return { exitCode, allOutput, lastResultText };
+  return { exitCode, allOutput, lastResultText: lastResultText || allOutput.trim() };
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
 async function main() {
+  const runner = getProviderRunner();
   log(`Blueprint Agent starting (VM: ${VM_INSTANCE_ID})`);
   log(`Registered handlers (${Object.keys(handlers).length}): ${Object.keys(handlers).join(', ')}`);
   log(`Agent source: ${import.meta.url}`);
@@ -1508,46 +1790,9 @@ async function main() {
     sendHeartbeatSync(PRE_CLAIM_TASK_ID, `PRE_CLAIM_FAILED: ${truncated}`);
   };
 
-  // Auth: CLAUDE_CODE_OAUTH_TOKEN env var is read directly by Claude Code CLI (no file needed)
-  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
-    log('Using OAuth token for Claude Code auth');
-  } else if (process.env.ANTHROPIC_API_KEY) {
-    log('Using ANTHROPIC_API_KEY as fallback auth');
-  }
-
-  // Pre-validate token before claiming task — catch dead tokens in ~5s instead of 2+ min
-  try {
-    const valEnv: Record<string, string> = {
-      HOME: process.env.HOME || '/home/agent',
-      PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
-      LANG: process.env.LANG || 'en_US.UTF-8',
-      TERM: process.env.TERM || 'xterm-256color',
-    };
-    if (process.env.CLAUDE_CODE_OAUTH_TOKEN) valEnv.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    if (process.env.ANTHROPIC_API_KEY) valEnv.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-
-    log('Validating Claude auth token...');
-    const valResult = await new Promise<{exitCode: number; stderr: string}>((resolve) => {
-      let stderr = '';
-      const check = spawn('claude', ['-p', 'respond with OK', '--max-turns', '1', '--output-format', 'stream-json', '--dangerously-skip-permissions'],
-        { cwd: '/tmp', env: valEnv });
-      const valTimeout = setTimeout(() => { try { check.kill(); } catch { /* ignore */ } }, 30000);
-      check.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
-      check.on('close', (code) => { clearTimeout(valTimeout); resolve({ exitCode: code ?? 1, stderr }); });
-    });
-    if (valResult.exitCode !== 0 && matchesRateLimit(valResult.stderr)) {
-      log(`Token validation FAILED — account rate-limited: ${valResult.stderr.slice(0, 200)}`);
-      // Report the rate-limit before exiting so the reaper's status message has
-      // forensic evidence instead of a silent provision failure.
-      reportPreClaimFailure(`token validation rate-limited: ${valResult.stderr.slice(0, 200)}`);
-      // Exit immediately — reaper will catch the task in PROVISIONING and requeue.
-      // Don't waste 2+ minutes of setup only to discover the same thing.
-      process.exit(1);
-    }
-    log('Token validation OK');
-  } catch (e) {
-    log(`Token validation error (continuing): ${e instanceof Error ? e.message : String(e)}`);
-  }
+  log(`Provider runtime: provider=${PROVIDER} auth_mode=${AUTH_MODE} execution_mode=${LLM_EXECUTION_MODE}`);
+  log(runner.credentialSummary());
+  await validateProviderAuth(runner, reportPreClaimFailure, process.env.LLM_MODEL);
 
   // Retry any stale result files from previous runs (network failure / VM kill mid-POST)
   try {
@@ -1586,7 +1831,7 @@ async function main() {
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
   const payload = payloads[0] ?? {} as Record<string, unknown>;
   const taskType = strVal(payload.type, 'create');
-  const model = payload.model ? strVal(payload.model) : undefined;
+  const model = payload.model ? strVal(payload.model) : (process.env.LLM_MODEL || undefined);
   const effort = payload.effort ? strVal(payload.effort) : undefined;
   const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
   const buildConfig = (projectMetadata?.build_config ?? {}) as Record<string, unknown>;

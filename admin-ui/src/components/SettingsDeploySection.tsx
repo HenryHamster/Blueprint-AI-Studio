@@ -3,6 +3,18 @@ import { Play, Pause, RotateCw, Wrench, CheckCircle, Zap } from 'lucide-react';
 import { parseTimestamp } from '../utils/time';
 import type { DeployState } from '../types/settings';
 
+const EXTERNAL_DEP_ORDER = ['github_api', 'db', 'dispatch_api', 'anthropic_api', 'openai_api', 'gemini_api', 'gcp'] as const;
+
+const EXTERNAL_DEP_LABELS: Record<string, string> = {
+  github_api: 'GitHub',
+  db: 'DB',
+  dispatch_api: 'Dispatch',
+  anthropic_api: 'Anthropic',
+  openai_api: 'OpenAI',
+  gemini_api: 'Gemini',
+  gcp: 'GCP',
+};
+
 function useHealthCountdown(lastCheckIso: string | undefined, intervalSeconds: number | undefined): number | null {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -106,14 +118,17 @@ export function DeploySection({
             {deployState.external_health && (
               <div className="bg-neutral-900 rounded-lg border border-neutral-800 p-4 space-y-2">
                 <div className="text-[11px] text-neutral-500 uppercase tracking-wider mb-1">External Dependencies</div>
-                {(['github_api', 'db', 'claude_api', 'gcp'] as const).map((dep) => {
+                {EXTERNAL_DEP_ORDER.filter((dep) => {
+                  if (!(dep in deployState.external_health!)) return false;
+                  return typeof deployState.external_health?.[dep] === 'boolean';
+                }).map((dep) => {
                   const healthy = deployState.external_health?.[dep];
                   const error = (deployState.external_health?.errors as Record<string, string> | undefined)?.[dep];
                   if (healthy === undefined) return null;
                   return (
                     <div key={dep} className="space-y-0.5">
                       <div className="flex items-center justify-between">
-                        <span className="text-xs text-neutral-400">{dep.replace('_', ' ')}</span>
+                        <span className="text-xs text-neutral-400">{EXTERNAL_DEP_LABELS[dep] ?? dep.replace('_', ' ')}</span>
                         <span className={`text-xs font-semibold ${healthy ? 'text-emerald-400' : 'text-red-400'}`}>
                           {healthy ? 'OK' : 'DOWN'}
                         </span>

@@ -166,7 +166,13 @@ async def reaper_service():
     Marks them as FAILED and issues a delete command to GCP if they haven't sent a heartbeat in 5 minutes.
     """
     # Deferred imports to avoid circular dependency with app.main
-    from app.max_plan_pool import release_max_plan_account, disable_account_model, _extract_task_model  # noqa: PLC0415
+    from app.max_plan_pool import (  # noqa: PLC0415
+        clear_task_llm_runtime_context,
+        disable_account_model,
+        get_task_llm_account_id,
+        _extract_task_model,
+        release_max_plan_account,
+    )
     from app.main import (  # noqa: PLC0415
         _ensure_vm_deleted,
         _maybe_create_failure_alert,
@@ -380,7 +386,7 @@ async def reaper_service():
                         _reaper_old_vms[str(task.id)] = fresh_task.vm_instance_id
 
                     # Release Max Plan account slot (idempotent — skip if already released)
-                    acct_id = (fresh_task.context or {}).get("max_plan_account_id")
+                    acct_id = get_task_llm_account_id(fresh_task)
                     if acct_id and not (fresh_task.context or {}).get("_slot_released"):
                         await release_max_plan_account(acct_id)
                         task.context = {**(task.context or {}), "_slot_released": True}
@@ -401,7 +407,7 @@ async def reaper_service():
                     )
                     is_rate_limited = classify_failure(task, logs=combined_logs) == "RATE_LIMIT"
                     if is_rate_limited:
-                        rl_acct_id = (task.context or {}).get("max_plan_account_id")
+                        rl_acct_id = get_task_llm_account_id(task)
                         logger.info(f"[REAPER] Task {task.id} rate-limited (account={rl_acct_id}) — requeuing immediately with account blacklisted")
                         # Disable the exhausted model on the account so the orchestrator's
                         # blacklist pruning preserves this entry on the next dispatch cycle.
@@ -447,7 +453,7 @@ async def reaper_service():
                                 )
                             rl_ctx["blacklisted_accounts"] = blacklisted
                         _copy_analysis_artifacts_to_previous(rl_ctx)
-                        rl_ctx.pop("max_plan_account_id", None)
+                        rl_ctx = clear_task_llm_runtime_context(rl_ctx)
                         rl_ctx.pop("_slot_released", None)
                         rl_ctx.pop("retry_after", None)  # clear any stale delay
                         # Rate-limit is an account-level issue, not a provision failure —
@@ -478,7 +484,7 @@ async def reaper_service():
                                 prov_zone = cached
                         if not prov_zone:
                             prov_zone = (task.context or {}).get("provision_zone")
-                        failed_acct = (task.context or {}).get("max_plan_account_id")
+                        failed_acct = get_task_llm_account_id(task)
 
                         # Classify: infra-wide (all zones/quota exhausted) vs task-specific
                         provision_err = get_provision_error(fresh_task.vm_instance_id or "")
@@ -680,7 +686,7 @@ async def reaper_service():
                             logger.info(f"[REAPER] Retrying task {task.id} ({retry_label})")
                             reap_ctx = task.context or {}
                             reap_zone = reap_ctx.get("provision_zone", "?")
-                            reap_acct = (reap_ctx.get("max_plan_account_id") or "?")[:8]
+                            reap_acct = (get_task_llm_account_id(reap_ctx) or "?")[:8]
                             task.latest_status_message = f"Reaped ({retry_label}): {reap_reason} [zone={reap_zone}, acct={reap_acct}]"
                             task.status = TaskStatus.QUEUED
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -688,7 +694,7 @@ async def reaper_service():
                             task.started_at = None
                             reaper_ctx = dict(task.context or {})
                             # Clear account so dispatcher does fresh selection (respects blacklist)
-                            reaper_ctx.pop("max_plan_account_id", None)
+                            reaper_ctx = clear_task_llm_runtime_context(reaper_ctx)
                             reaper_ctx.pop("_slot_released", None)
                             # Enrich with failure diagnosis for retry guidance
                             try:
@@ -816,7 +822,7 @@ async def reaper_service():
                             blacklisted_accounts = ctx.get("blacklisted_accounts", []) or []
                             sticky_accounts = ctx.get("provision_failed_accounts", []) or []
                             all_blocked = list({*blacklisted_accounts, *sticky_accounts})
-                            acct_id = ctx.get("max_plan_account_id", "no account")
+                            acct_id = get_task_llm_account_id(ctx) or "no account"
                             gcp_error = provision_err or "no GCP error captured"
                             gcp_error_short = gcp_error[:200]
                             # Distinguish: VM created but agent died vs. GCP API failure
@@ -1091,7 +1097,7 @@ async def reaper_service():
                         elif _fail_cat == "EXTERNAL_API":
                             _infra_ready = (
                                 _external_health.get("github_api", False)
-                                and _external_health.get("claude_api", False)
+                                and _external_health.get("dispatch_api", False)
                             )
                         elif _fail_cat == "AGENT_TIMEOUT":
                             # Process crashes and heartbeat timeouts are transient per-VM
@@ -1119,7 +1125,7 @@ async def reaper_service():
                         _new_ctx.pop("_infra_wait", None)
                         _new_ctx.pop("blacklisted_accounts", None)
                         _new_ctx.pop("provision_failed_accounts", None)
-                        _new_ctx.pop("max_plan_account_id", None)
+                        _new_ctx = clear_task_llm_runtime_context(_new_ctx)
                         _new_ctx.pop("_slot_released", None)
                         _new_ctx.pop("retry_after", None)
                         _new_ctx.pop("failure_category", None)
@@ -1200,7 +1206,7 @@ async def reaper_service():
                         elif _fc == "EXTERNAL_API":
                             _ready = (
                                 _external_health.get("github_api", False)
-                                and _external_health.get("claude_api", False)
+                                and _external_health.get("dispatch_api", False)
                             )
                         if _ready:
                             clear_direction_hold(_did)

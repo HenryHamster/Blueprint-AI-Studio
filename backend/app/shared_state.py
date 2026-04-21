@@ -88,6 +88,89 @@ runtime_config: Dict = {
     "max_autonomous_tasks_per_hour": 12,
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
+    # Future-facing provider tier map used by multi-provider selection. v1 keeps
+    # Anthropic as the only dispatch path but persists the structure now so v2
+    # can enable provider-aware resolution without another config shape change.
+    "provider_tier_model_map": {
+        "anthropic": {
+            "opus": "claude-opus-4-7",
+            "sonnet": "claude-sonnet-4-6",
+            "haiku": "claude-haiku-4-5-20251001",
+        },
+        "openai": {
+            "opus": "gpt-5",
+            "sonnet": "gpt-4.1",
+            "haiku": "gpt-4o-mini",
+        },
+        "gemini": {
+            "opus": "gemini-2.5-pro",
+            "sonnet": "gemini-2.5-flash",
+            "haiku": "gemini-2.5-flash-lite",
+        },
+    },
+    # Future-facing per-task-type provider preference order. Current dispatch
+    # ignores this until the provider-aware selection slice is enabled.
+    "task_type_provider_preference": {
+        "strategic_review": ["anthropic"],
+        "design_doc_update": ["anthropic"],
+        "research": ["anthropic"],
+        "create": ["anthropic"],
+        "refactor": ["anthropic"],
+        "plan": ["anthropic"],
+        "review": ["anthropic"],
+        "fix": ["anthropic"],
+        "qa": ["anthropic"],
+        "deps": ["anthropic"],
+        "docs": ["anthropic"],
+        "migrate": ["anthropic"],
+        "security_audit": ["anthropic"],
+        "perf": ["anthropic"],
+        "smoketest": ["anthropic"],
+        "debug": ["anthropic"],
+    },
+    # Optional per-task-type concrete model priority overrides. When present,
+    # selection uses these ordered {provider, model} pairs before falling back
+    # to provider preference + quality tier resolution.
+    "task_type_model_preferences": {},
+    "cross_provider_fallback_enabled": False,
+    # Provider execution modes. Modes are resolved separately from provider/model
+    # so features like Claude advisor mode can be introduced without reshaping
+    # the dispatch pipeline again.
+    "provider_execution_modes": {
+        "anthropic": ["default", "advisor"],
+        "openai": ["default"],
+        "gemini": ["default"],
+    },
+    "provider_mode_capabilities": {
+        "anthropic": {
+            "default": {"read_only_preferred": False},
+            "advisor": {"read_only_preferred": True},
+        },
+        "openai": {
+            "default": {"read_only_preferred": False},
+        },
+        "gemini": {
+            "default": {"read_only_preferred": False},
+        },
+    },
+    "task_type_execution_defaults": {
+        "strategic_review": "advisor",
+        "design_doc_update": "advisor",
+        "research": "advisor",
+        "plan": "advisor",
+        "review": "advisor",
+        "security_audit": "advisor",
+        "perf": "advisor",
+        "smoketest": "advisor",
+        "debug": "advisor",
+        "create": "default",
+        "refactor": "default",
+        "fix": "default",
+        "qa": "default",
+        "deps": "default",
+        "docs": "default",
+        "migrate": "default",
+    },
     # Per-task-type model/effort defaults (synced from frontend settings)
     # All tasks use opus-4-7; effort varies by type:
     #   max: strategic_review, design_doc_update
@@ -295,6 +378,13 @@ async def sync_runtime_config_from_state(state) -> list[str]:
             config_json = getattr(state, "runtime_config_json", None)
             if config_json and isinstance(config_json, dict):
                 for key in (
+                    "provider_tier_model_map",
+                    "task_type_provider_preference",
+                    "task_type_model_preferences",
+                    "cross_provider_fallback_enabled",
+                    "provider_execution_modes",
+                    "provider_mode_capabilities",
+                    "task_type_execution_defaults",
                     "task_type_models", "task_type_efforts", "agent_prompt_suffixes",
                     "autonomous_periodic_tasks", "health_check_urls", "notification_config",
                 ):
@@ -933,9 +1023,14 @@ tasks_failed_total: int = 0
 # --- External Dependency Health ---
 external_health: Dict = {
     "github_api": True,
-    "claude_api": True,
+    "anthropic_api": True,
+    "openai_api": True,
+    "gemini_api": True,
+    "dispatch_api": True,
     "gcp": True,
     "db": True,
+    "provider_health": {},          # provider_name -> structured provider health snapshot
+    "dispatch_health": {},          # aggregate dispatchability summary
     "last_check": None,             # datetime of last health check
     "failed_deps": [],              # list of currently-failed dependency names
     "errors": {},                   # dep_name -> last error message

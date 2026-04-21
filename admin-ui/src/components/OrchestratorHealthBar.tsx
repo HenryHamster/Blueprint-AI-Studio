@@ -1,26 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import type { Task } from './TaskCard';
+import type { OrchestratorHealth, ProviderApisHealth } from '../types/settings';
 import { timeAgo, parseTimestamp, formatDurationSec } from '../utils/time';
 import { apiFetch } from '../api';
-
-interface OrchestratorHealth {
-  last_cycle_seconds_ago: number | null;
-  queued_tasks: number;
-  active_tasks: number;
-  pool_info: Record<string, unknown>;
-  deploy_state?: {
-    status: string;
-    rollback_count: number;
-    rollback_reason: string | null;
-    pause_reason: string | null;
-    monitoring_since: string | null;
-    recent_outcomes: { created_at: string; status: string; failure_class: string | null }[];
-  } | null;
-  deploy_monitoring?: {
-    external_health?: Record<string, boolean | string | string[]>;
-  };
-}
 
 interface CircuitBreakerState {
   state: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
@@ -38,8 +21,9 @@ interface GithubQuota {
 
 interface DetailedHealth {
   circuit_breaker: { projects: Record<string, CircuitBreakerState> };
-  max_plan_pool: { total: number; available: number };
+  max_plan_pool: { total: number; available: number; by_provider?: Record<string, { total: number; available: number }> };
   autonomous: { enabled: boolean; consecutive_failures: number };
+  provider_apis: ProviderApisHealth;
   github_quota: GithubQuota;
 }
 
@@ -63,6 +47,7 @@ const DEP_LABELS: Record<string, string> = {
   github_api: 'GitHub',
   db: 'DB',
   gcp: 'GCP',
+  dispatch_api: 'Dispatch',
 };
 
 function statusColor(val: boolean | string): string {
@@ -143,6 +128,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
 
   const externalHealth = health?.deploy_monitoring?.external_health ?? {};
   const orderedDeps = (['github_api', 'db', 'gcp'] as const).filter(k => k in externalHealth);
+  const providerApis = detailedHealth?.provider_apis ?? null;
 
   // Circuit breaker derived state
   const openProjects = useMemo(() => {
@@ -309,6 +295,48 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
             <div className="flex items-center gap-1.5" title="No Max Plan accounts available">
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
               <span className="text-amber-400">Pool empty</span>
+            </div>
+          </>
+        )}
+
+        {providerApis && providerApis.required_providers.length > 0 && (
+          <>
+            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            <div className="flex items-center gap-2" title={`Provider health: ${providerApis.status}`}>
+              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                providerApis.status === 'down' ? 'bg-red-500 animate-pulse' :
+                providerApis.status === 'degraded' ? 'bg-amber-400' :
+                'bg-emerald-500'
+              }`} />
+              <span className={providerApis.status === 'down' ? 'text-red-400' : providerApis.status === 'degraded' ? 'text-amber-400' : 'text-neutral-400'}>
+                LLMs
+              </span>
+              <div className="flex items-center gap-1.5">
+                {providerApis.required_providers.map(provider => {
+                  const snapshot = providerApis.providers?.[provider];
+                  const status = snapshot?.status ?? 'unknown';
+                  const color =
+                    status === 'down' ? 'bg-red-500' :
+                    status === 'degraded' ? 'bg-amber-400' :
+                    status === 'ok' ? 'bg-emerald-500' :
+                    'bg-neutral-600';
+                  const label = provider.slice(0, 3).toUpperCase();
+                  const title = snapshot
+                    ? `${provider}: ${status}${snapshot.reason ? ` — ${snapshot.reason}` : ''}`
+                    : `${provider}: unknown`;
+                  return (
+                    <div key={provider} className="flex items-center gap-1" title={title}>
+                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${color}`} />
+                      <span className="text-neutral-500">{label}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              {providerApis.fallback_enabled && (
+                <span className="text-[10px] text-blue-400 border border-blue-900/50 bg-blue-950/20 rounded px-1.5 py-0.5">
+                  fallback
+                </span>
+              )}
             </div>
           </>
         )}

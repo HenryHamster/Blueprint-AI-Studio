@@ -3,7 +3,7 @@ import { useMemo, useState, useRef, useEffect } from 'react';
 import { Activity, Network, Compass, Microscope, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
-import type { DeployState } from '../types/settings';
+import type { AuthMode, DeployState, ModelPreference, ProviderCatalogEntry, ProviderName } from '../types/settings';
 import type { Task } from '../types/task';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig } from '../types/project';
 
@@ -83,9 +83,30 @@ export interface HeaderBarProps {
   onResetRateLimits: (id: string) => void;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
+  newAccountProvider: ProviderName;
+  setNewAccountProvider: (value: ProviderName) => void;
+  newAccountAuthMode: AuthMode;
+  setNewAccountAuthMode: (value: AuthMode) => void;
   newAccountToken: string;
   setNewAccountToken: (value: string) => void;
+  newAccountProviderMetadata: Record<string, string>;
+  setNewAccountProviderMetadata: (value: Record<string, string>) => void;
+  newAccountClaudeConfigJson: string;
+  setNewAccountClaudeConfigJson: (value: string) => void;
   onAddAccount: () => void;
+  providerTierModelMap: Record<string, Record<string, string>>;
+  taskTypeProviderPreference: Record<string, ProviderName[]>;
+  taskTypeModelPreferences: Record<string, ModelPreference[]>;
+  providerExecutionModes: Record<string, string[]>;
+  providerModeCapabilities: Record<string, Record<string, Record<string, boolean | number | string | null>>>;
+  taskTypeExecutionDefaults: Record<string, string>;
+  crossProviderFallbackEnabled: boolean;
+  providers: Record<string, ProviderCatalogEntry>;
+  onUpdateProviderTierModels: (value: Record<string, Record<string, string>>) => Promise<void>;
+  onUpdateTaskTypeProviderPreferences: (value: Record<string, ProviderName[]>) => Promise<void>;
+  onUpdateTaskTypeModelPreferences: (value: Record<string, ModelPreference[]>) => Promise<void>;
+  onUpdateTaskTypeExecutionDefaults: (value: Record<string, string>) => Promise<void>;
+  onUpdateCrossProviderFallback: (value: boolean) => Promise<void>;
   showMetrics: boolean;
   onToggleMetrics: () => void;
   metricsHistory: { timestamp: number; completedCount: number }[];
@@ -195,9 +216,30 @@ export function HeaderBar(props: HeaderBarProps) {
     onResetRateLimits,
     newAccountName,
     setNewAccountName,
+    newAccountProvider,
+    setNewAccountProvider,
+    newAccountAuthMode,
+    setNewAccountAuthMode,
     newAccountToken,
     setNewAccountToken,
+    newAccountProviderMetadata,
+    setNewAccountProviderMetadata,
+    newAccountClaudeConfigJson,
+    setNewAccountClaudeConfigJson,
     onAddAccount,
+    providerTierModelMap,
+    taskTypeProviderPreference,
+    taskTypeModelPreferences,
+    providerExecutionModes,
+    providerModeCapabilities,
+    taskTypeExecutionDefaults,
+    crossProviderFallbackEnabled,
+    providers,
+    onUpdateProviderTierModels,
+    onUpdateTaskTypeProviderPreferences,
+    onUpdateTaskTypeModelPreferences,
+    onUpdateTaskTypeExecutionDefaults,
+    onUpdateCrossProviderFallback,
     showMetrics,
     onToggleMetrics,
     metricsHistory,
@@ -377,9 +419,30 @@ export function HeaderBar(props: HeaderBarProps) {
           onResetRateLimits={onResetRateLimits}
           newAccountName={newAccountName}
           setNewAccountName={setNewAccountName}
+          newAccountProvider={newAccountProvider}
+          setNewAccountProvider={setNewAccountProvider}
+          newAccountAuthMode={newAccountAuthMode}
+          setNewAccountAuthMode={setNewAccountAuthMode}
           newAccountToken={newAccountToken}
           setNewAccountToken={setNewAccountToken}
+          newAccountProviderMetadata={newAccountProviderMetadata}
+          setNewAccountProviderMetadata={setNewAccountProviderMetadata}
+          newAccountClaudeConfigJson={newAccountClaudeConfigJson}
+          setNewAccountClaudeConfigJson={setNewAccountClaudeConfigJson}
           onAddAccount={onAddAccount}
+          providerTierModelMap={providerTierModelMap}
+          taskTypeProviderPreference={taskTypeProviderPreference}
+          taskTypeModelPreferences={taskTypeModelPreferences}
+          providerExecutionModes={providerExecutionModes}
+          providerModeCapabilities={providerModeCapabilities}
+          taskTypeExecutionDefaults={taskTypeExecutionDefaults}
+          crossProviderFallbackEnabled={crossProviderFallbackEnabled}
+          providers={providers}
+          onUpdateProviderTierModels={onUpdateProviderTierModels}
+          onUpdateTaskTypeProviderPreferences={onUpdateTaskTypeProviderPreferences}
+          onUpdateTaskTypeModelPreferences={onUpdateTaskTypeModelPreferences}
+          onUpdateTaskTypeExecutionDefaults={onUpdateTaskTypeExecutionDefaults}
+          onUpdateCrossProviderFallback={onUpdateCrossProviderFallback}
           refreshInterval={refreshInterval}
           onUpdateRefreshInterval={onUpdateRefreshInterval}
           pageSize={pageSize}

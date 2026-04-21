@@ -1,5 +1,7 @@
+import json
 import os
 import re
+import tempfile
 import uuid
 import time
 import random
@@ -10,6 +12,7 @@ import signal
 import threading
 from collections import OrderedDict as _OrderedDict, deque as _deque
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -142,7 +145,7 @@ VPC_NETWORK = os.getenv("VPC_NETWORK", "agent-sandbox-vpc")
 VPC_SUBNET = os.getenv("VPC_SUBNET", "agent-sandbox-subnet")
 
 # The base image for our agent
-AGENT_IMAGE_FAMILY = os.getenv("AGENT_IMAGE_FAMILY", f"projects/{GCP_PROJECT_ID}/global/images/family/blueprint-agent")
+AGENT_IMAGE_FAMILY = os.getenv("AGENT_IMAGE_FAMILY", f"projects/{GCP_PROJECT_ID}/global/images/family/blueprint-agent-v2")
 
 # The URL where the agent can reach this orchestrator
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8080")
@@ -203,6 +206,9 @@ if not LOCAL_MODE and os.getenv("K_REVISION"):  # K_REVISION set by Cloud Run �
         logger.exception(f"[STARTUP] Image family validation FAILED — will retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s")
 
 from app.auth import create_agent_token  # must be after env vars are loaded above
+from app.models import LLMAuthMode, LLMProviderName
+from app.providers.base import FileMaterial
+from app.providers.registry import get_provider
 
 ARTIFACT_BUCKET_NAME = os.getenv("ARTIFACT_BUCKET_NAME", "blueprint-agent-artifacts")
 
@@ -228,6 +234,11 @@ async def prepare_and_store_agent_secret(
     oauth_token: str | None = None,
     claude_config_json: str | None = None,
     task_type: str = "",
+    provider: str | None = None,
+    auth_mode: str | None = None,
+    model: str | None = None,
+    execution_mode: str | None = None,
+    provider_metadata: dict | None = None,
 ) -> str | None:
     """Build agent credentials and store them in Secret Manager.
 
@@ -237,23 +248,96 @@ async def prepare_and_store_agent_secret(
     """
     if LOCAL_MODE:
         return None
+    manifest = build_agent_secret_manifest(
+        vm_instance_id=vm_instance_id,
+        task_id=task_id,
+        oauth_token=oauth_token,
+        claude_config_json=claude_config_json,
+        task_type=task_type,
+        provider=provider,
+        auth_mode=auth_mode,
+        model=model,
+        execution_mode=execution_mode,
+        provider_metadata=provider_metadata,
+    )
+    return await asyncio.to_thread(
+        _store_agent_secret,
+        vm_instance_id,
+        json.dumps(manifest, separators=(",", ":")),
+    )
+
+
+def build_agent_secret_manifest(
+    *,
+    vm_instance_id: str,
+    task_id: uuid.UUID,
+    oauth_token: str | None = None,
+    claude_config_json: str | None = None,
+    task_type: str = "",
+    provider: str | None = None,
+    auth_mode: str | None = None,
+    model: str | None = None,
+    execution_mode: str | None = None,
+    provider_metadata: dict | None = None,
+) -> dict:
+    """Build the provider-aware secret manifest consumed by agent startup."""
     agent_jwt = create_agent_token(str(task_id), vm_instance_id, task_type=task_type)
-    secret_env_lines = [
-        f"AGENT_SECRET_TOKEN={agent_jwt}",
-        f"CLAUDE_CODE_OAUTH_TOKEN={oauth_token}" if oauth_token else None,
-        f"ANTHROPIC_API_KEY={ANTHROPIC_API_KEY}" if (not oauth_token and ANTHROPIC_API_KEY) else None,
-    ]
+    provider_name = provider or LLMProviderName.ANTHROPIC.value
+    provider_enum = LLMProviderName(provider_name)
+    resolved_auth_mode = auth_mode or (
+        LLMAuthMode.OAUTH.value if provider_name == LLMProviderName.ANTHROPIC.value and oauth_token else LLMAuthMode.API_KEY.value
+    )
+    auth_mode_enum = LLMAuthMode(resolved_auth_mode)
+    provider_impl = get_provider(provider_enum)
+    runtime_secret = oauth_token
+    if runtime_secret is None and provider_enum == LLMProviderName.ANTHROPIC and auth_mode_enum == LLMAuthMode.API_KEY:
+        runtime_secret = ANTHROPIC_API_KEY or None
+    secret_material = provider_impl.secret_material(
+        runtime_secret,
+        auth_mode_enum,
+        provider_metadata=provider_metadata,
+    )
+    files = list(secret_material.files)
     if claude_config_json:
-        import base64 as _b64
-        config_b64 = _b64.b64encode(claude_config_json.encode()).decode()
-        secret_env_lines.append(f"CLAUDE_CONFIG_B64={config_b64}")
-    secret_env_content = "\n".join(line for line in secret_env_lines if line)
-    return await asyncio.to_thread(_store_agent_secret, vm_instance_id, secret_env_content)
+        files.append(FileMaterial(path="/home/agent/.claude.json", content=claude_config_json, mode="0600"))
+
+    env = {
+        "AGENT_SECRET_TOKEN": agent_jwt,
+        "VM_INSTANCE_ID": vm_instance_id,
+        "ORCHESTRATOR_URL": ORCHESTRATOR_URL,
+        "TASK_ID": str(task_id),
+        "PROVIDER": provider_name,
+        "AUTH_MODE": auth_mode_enum.value,
+    }
+    if model:
+        env["LLM_MODEL"] = model
+    if execution_mode:
+        env["LLM_EXECUTION_MODE"] = execution_mode
+    env.update(secret_material.env)
+    return {
+        "env": env,
+        "files": [
+            {"path": item.path, "content": item.content, "mode": item.mode}
+            for item in files
+        ],
+        "metadata": {
+            "vm_instance_id": vm_instance_id,
+            "task_id": str(task_id),
+            "task_type": task_type,
+            "provider": provider_name,
+            "auth_mode": auth_mode_enum.value,
+            "model": model,
+            "execution_mode": execution_mode,
+        },
+    }
 
 
 async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None,
                               oauth_token: str | None = None, claude_config_json: str | None = None,
-                              task_type: str = "", secret_version_name: str | None = None):
+                              task_type: str = "", secret_version_name: str | None = None,
+                              provider: str | None = None, auth_mode: str | None = None,
+                              model: str | None = None, execution_mode: str | None = None,
+                              provider_metadata: dict | None = None):
     """
     Provisions an agent. In LOCAL_MODE, spawns a subprocess.
     In production, creates a GCP Compute Engine VM.
@@ -288,9 +372,15 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
                 f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL - (now - _image_family_last_check):.0f}s."
             )
     if LOCAL_MODE:
-        return await _provision_local(vm_instance_id, task_id, payload_uri, oauth_token, task_type=task_type)
+        return await _provision_local(
+            vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json,
+            task_type=task_type, provider=provider, auth_mode=auth_mode, model=model,
+            execution_mode=execution_mode, provider_metadata=provider_metadata,
+        )
     return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json,
-                                task_type=task_type, secret_version_name=secret_version_name)
+                                task_type=task_type, secret_version_name=secret_version_name,
+                                provider=provider, auth_mode=auth_mode, model=model,
+                                execution_mode=execution_mode, provider_metadata=provider_metadata)
 
 
 _last_provision_error: _OrderedDict = _OrderedDict()
@@ -327,24 +417,34 @@ async def cleanup_orphaned_vms(active_vm_ids: list[str]):
 
 # ─── Local Mode Implementation ──────────────────────────────────────────────
 
-async def _provision_local(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None, oauth_token: str | None = None, task_type: str = ""):
+async def _provision_local(
+    vm_instance_id: str,
+    task_id: uuid.UUID,
+    payload_uri: str | None = None,
+    oauth_token: str | None = None,
+    claude_config_json: str | None = None,
+    task_type: str = "",
+    provider: str | None = None,
+    auth_mode: str | None = None,
+    model: str | None = None,
+    execution_mode: str | None = None,
+    provider_metadata: dict | None = None,
+):
     logger.info(f"[LOCAL] Spawning agent subprocess: {vm_instance_id} (Task: {task_id})")
-
-    agent_jwt = create_agent_token(str(task_id), vm_instance_id, task_type=task_type)
-
-    env = {
-        **os.environ,
-        "VM_INSTANCE_ID": vm_instance_id,
-        "ORCHESTRATOR_URL": ORCHESTRATOR_URL,
-        "AGENT_SECRET_TOKEN": agent_jwt,
-        "PAYLOAD_URI": payload_uri or "",
-    }
-    # OAuth token (primary) — passed as env var, Claude Code CLI reads it directly
-    if oauth_token:
-        env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
-    # API key (fallback) — only if no OAuth token
-    elif ANTHROPIC_API_KEY:
-        env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+    manifest = build_agent_secret_manifest(
+        vm_instance_id=vm_instance_id,
+        task_id=task_id,
+        oauth_token=oauth_token,
+        claude_config_json=claude_config_json,
+        task_type=task_type,
+        provider=provider,
+        auth_mode=auth_mode,
+        model=model,
+        execution_mode=execution_mode,
+        provider_metadata=provider_metadata,
+    )
+    env = {**os.environ, **_materialize_local_manifest(vm_instance_id, manifest)}
+    env["PAYLOAD_URI"] = payload_uri or ""
 
     agent_dir = os.path.abspath(AGENT_DIR)
     if not os.path.isdir(agent_dir):
@@ -390,6 +490,13 @@ async def _delete_local(vm_instance_id: str):
         except Exception:
             logger.exception("[LOCAL] Failed to kill subprocess")
             return False
+    try:
+        local_root = _local_manifest_root(vm_instance_id)
+        if local_root.exists():
+            import shutil
+            shutil.rmtree(local_root, ignore_errors=True)
+    except Exception:
+        logger.warning(f"[LOCAL] Failed to clean manifest files for {vm_instance_id}")
     return True
 
 
@@ -487,6 +594,40 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
     return version.name
 
 
+def _local_manifest_root(vm_instance_id: str) -> Path:
+    return Path(tempfile.gettempdir()) / "blueprint-agent-state" / vm_instance_id
+
+
+def _materialize_local_manifest(vm_instance_id: str, manifest: dict) -> dict[str, str]:
+    """Write manifest files locally and return env vars for the subprocess."""
+    root = _local_manifest_root(vm_instance_id)
+    root.mkdir(parents=True, exist_ok=True)
+
+    path_map: dict[str, str] = {}
+    env = {str(key): str(value) for key, value in (manifest.get("env") or {}).items() if value is not None}
+    for item in manifest.get("files", []) or []:
+        original_path = str(item["path"])
+        local_path = root / original_path.lstrip("/").replace("/", os.sep)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_text(str(item.get("content", "")), encoding="utf-8")
+        try:
+            os.chmod(local_path, int(str(item.get("mode", "0600")), 8))
+        except OSError:
+            logger.warning(f"[LOCAL] Failed to chmod local manifest file: {local_path}")
+        path_map[original_path] = str(local_path)
+
+    for original, localized in path_map.items():
+        original_parent = os.path.dirname(original.rstrip("/"))
+        localized_parent = os.path.dirname(localized)
+        for key, value in list(env.items()):
+            if value == original:
+                env[key] = localized
+            elif original_parent and value == original_parent:
+                env[key] = localized_parent
+
+    return env
+
+
 def _delete_agent_secret(vm_instance_id: str) -> None:
     """Delete the agent credentials secret from GCP Secret Manager (best-effort)."""
     from google.cloud import secretmanager
@@ -545,7 +686,10 @@ async def reconcile_orphaned_secrets(active_vm_ids: set[str]) -> dict:
 
 async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None,
                          oauth_token: str | None = None, claude_config_json: str | None = None,
-                         task_type: str = "", secret_version_name: str | None = None):
+                         task_type: str = "", secret_version_name: str | None = None,
+                         provider: str | None = None, auth_mode: str | None = None,
+                         model: str | None = None, execution_mode: str | None = None,
+                         provider_metadata: dict | None = None):
     from google.cloud import compute_v1
 
     logger.info(f"Starting provisioning for VM: {vm_instance_id} (Task: {task_id})")
@@ -555,7 +699,9 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
         # (Callers that run upload_json_payload concurrently pass secret_version_name
         # from prepare_and_store_agent_secret to avoid this sequential fallback.)
         secret_version_name = await prepare_and_store_agent_secret(
-            vm_instance_id, task_id, oauth_token, claude_config_json, task_type
+            vm_instance_id, task_id, oauth_token, claude_config_json, task_type,
+            provider=provider, auth_mode=auth_mode, model=model,
+            execution_mode=execution_mode, provider_metadata=provider_metadata,
         )
 
     # payload_uri is validated upstream and safe to embed in the startup script
@@ -621,47 +767,59 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
       fi
     done
 
-    # 3. Write static env vars first, then append secrets from Secret Manager.
-    # TASK_ID is baked here so the agent can POST pre-claim failure heartbeats
-    # (the JWT already binds sub=task_id, so the backend heartbeat endpoint
-    # accepts the same task_id before claim has happened).
-    cat <<'STATICENV' > /etc/agent.env
-VM_INSTANCE_ID="{vm_instance_id}"
-ORCHESTRATOR_URL="{ORCHESTRATOR_URL}"
-TASK_ID="{task_id}"
-STATICENV
+    # 3. Materialize the manifest into the env file and any auth/config files.
+    MANIFEST_PATH=/tmp/agent_secret_manifest.json
+    printf '%s' "$CREDS" > "$MANIFEST_PATH"
+    python3 - "$MANIFEST_PATH" /etc/agent.env <<'PY'
+import json
+import os
+import pathlib
+import pwd
+import grp
+import sys
 
-    # Append the credential lines retrieved from Secret Manager
-    echo "$CREDS" >> /etc/agent.env
+manifest_path, env_path = sys.argv[1], sys.argv[2]
+with open(manifest_path, "r", encoding="utf-8") as fh:
+    manifest = json.load(fh)
+
+env = manifest.get("env", {{}})
+with open(env_path, "w", encoding="utf-8") as env_file:
+    for key, value in env.items():
+        if value is None:
+            continue
+        rendered = str(value).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+        env_file.write(f'{{key}}="{{rendered}}"\n')
+
+uid = pwd.getpwnam("agent").pw_uid
+gid = grp.getgrnam("agent").gr_gid
+for item in manifest.get("files", []):
+    path = pathlib.Path(item["path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(item.get("content", ""), encoding="utf-8")
+    os.chmod(path, int(item.get("mode", "0600"), 8))
+    os.chown(path, uid, gid)
+os.chmod(env_path, 0o600)
+PY
+    rm -f "$MANIFEST_PATH"
 
     # Add PAYLOAD_URI if present (validated safe GCS URI — no secrets)
     if [ -n "{payload_uri_b64}" ]; then
         echo "PAYLOAD_URI=\\"$(echo '{payload_uri_b64}' | base64 -d)\\"" >> /etc/agent.env
     fi
 
-    # 4. Claude Code onboarding bypass — extract from env if present
-    CLAUDE_CONFIG_B64="$(grep '^CLAUDE_CONFIG_B64=' /etc/agent.env | cut -d= -f2- || true)"
-    if [ -n "$CLAUDE_CONFIG_B64" ]; then
-        echo "$CLAUDE_CONFIG_B64" | base64 -d > /home/agent/.claude.json
-        chown agent:agent /home/agent/.claude.json
-        # Remove config b64 from env file (not needed at runtime)
-        sed -i '/^CLAUDE_CONFIG_B64=/d' /etc/agent.env
-        echo "Claude Code config installed."
-    fi
-
-    # 5. Download payload if provided
+    # 4. Download payload if provided
     if [ -n "{payload_uri_b64}" ]; then
         PAYLOAD_URI_DECODED="$(echo '{payload_uri_b64}' | base64 -d)"
         echo "Downloading payload from $PAYLOAD_URI_DECODED..."
         gsutil cp "$PAYLOAD_URI_DECODED" /etc/agent_payload.json
     fi
 
-    # 6. Agent diagnostics — log baked-in code version for debugging
+    # 5. Agent diagnostics — log baked-in code version for debugging
     echo "Agent source files:"
     ls -la /opt/agent/src/handlers/ 2>/dev/null || echo "  (no handlers directory)"
     head -1 /opt/agent/src/index.ts 2>/dev/null || echo "  (index.ts missing)"
 
-    # 7. Start the systemd service
+    # 6. Start the systemd service
     echo "Starting blueprint-agent service..."
     systemctl daemon-reload
     timeout 60 systemctl restart blueprint-agent || {{
@@ -677,7 +835,7 @@ STATICENV
         poweroff
     }}
 
-    # 7b. Notify orchestrator that startup completed — early health signal
+    # 6b. Notify orchestrator that startup completed — early health signal
     # Settle window: Type=simple returns as soon as npm is fork()ed, which is
     # not the same as the agent actually running a line of TypeScript. Wait 30s
     # and re-check is-active before claiming success. If the agent has already

@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
-from sqlalchemy import Column, String, Integer, Index, text, event
+from sqlalchemy import Column, String, Integer, Index, text, event, Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB
 import logging
 import uuid
@@ -38,6 +38,18 @@ class ArtifactType(str, Enum):
     DEBUG_RESULT = "DEBUG_RESULT"
     PERF_REPORT = "PERF_REPORT"
     INVESTIGATION_REPORT = "INVESTIGATION_REPORT"
+
+
+class LLMProviderName(str, Enum):
+    ANTHROPIC = "anthropic"
+    OPENAI = "openai"
+    GEMINI = "gemini"
+
+
+class LLMAuthMode(str, Enum):
+    OAUTH = "oauth"
+    API_KEY = "api_key"
+    SERVICE_ACCOUNT = "service_account"
 
 
 # --- Auto-pause diagnosis workflow constants ---
@@ -384,15 +396,34 @@ class DeploymentState(SQLModel, table=True):
 
 class MaxPlanAccount(SQLModel, table=True):
     """
-    Persisted Max plan account for Claude Code OAuth token pooling.
-    Each account holds a long-lived OAuth token (sk-ant-oat01-...) generated via `claude setup-token`.
+    Persisted LLM account record used by the current Anthropic pool and future
+    multi-provider account selection. In v1, Anthropic OAuth remains the only
+    runnable path; other provider/auth combinations are stored for future use.
     Active task counts are tracked in-memory only.
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     user_id: str = Field(index=True)
     name: str
-    oauth_token: str  # Secret Manager resource name (or raw token for backward compat)
+    provider: LLMProviderName = Field(
+        default=LLMProviderName.ANTHROPIC,
+        sa_column=Column(
+            SAEnum(LLMProviderName, name="llmprovider"),
+            nullable=False,
+            default=LLMProviderName.ANTHROPIC,
+        ),
+    )
+    auth_mode: LLMAuthMode = Field(
+        default=LLMAuthMode.OAUTH,
+        sa_column=Column(
+            SAEnum(LLMAuthMode, name="llmauthmode"),
+            nullable=False,
+            default=LLMAuthMode.OAUTH,
+        ),
+    )
+    oauth_token: Optional[str] = Field(default=None)  # Secret Manager resource name (or raw token for backward compat)
     claude_config_json: Optional[str] = Field(default=None)  # ~/.claude.json content for onboarding bypass
+    secret_blob_ref: Optional[str] = Field(default=None)
+    provider_metadata: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     enabled: bool = Field(default=True)
     total_tasks: int = Field(default=0)
     token_created_at: Optional[datetime] = Field(default=None)  # When the token was added (for age tracking)

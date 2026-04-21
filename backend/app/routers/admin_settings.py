@@ -11,11 +11,40 @@ from sqlalchemy.orm import aliased
 
 from app.database import get_session
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
-from app.models import Task, TaskStatus, UserIntegration, DeploymentState, DeploymentStatus, _utcnow
+from app.models import (
+    DeploymentState,
+    DeploymentStatus,
+    LLMAuthMode,
+    LLMProviderName,
+    Task,
+    TaskStatus,
+    UserIntegration,
+    _utcnow,
+)
 from app.auth import get_current_user, require_admin
 from app.github import generate_installation_access_token
+from app.providers.registry import get_provider, list_providers
 
 logger = logging.getLogger(__name__)
+
+
+def _build_provider_catalog(runtime_config: Dict[str, Any]) -> dict[str, Any]:
+    catalog: dict[str, Any] = {}
+    runtime_modes = runtime_config.get("provider_execution_modes", {}) if isinstance(runtime_config, dict) else {}
+    runtime_caps = runtime_config.get("provider_mode_capabilities", {}) if isinstance(runtime_config, dict) else {}
+    for provider in list_providers():
+        catalog[provider.name.value] = {
+            "auth_modes": {
+                mode.value: {
+                    "required_metadata_fields": list(provider.required_metadata_fields(mode)),
+                }
+                for mode in provider.supported_auth_modes
+            },
+            "supported_execution_modes": list(provider.supported_execution_modes()),
+            "execution_modes": list(runtime_modes.get(provider.name.value, provider.supported_execution_modes())),
+            "mode_capabilities": runtime_caps.get(provider.name.value, {}),
+        }
+    return catalog
 
 router = APIRouter(
     prefix="/api/admin",
@@ -68,6 +97,14 @@ async def get_settings(
         "max_autonomous_tasks_per_hour": _runtime_config["max_autonomous_tasks_per_hour"],
         "max_global_autonomous_tasks_per_hour": _runtime_config.get("max_global_autonomous_tasks_per_hour", 50),
         "autonomous_research_interval_minutes": _runtime_config.get("autonomous_research_interval_minutes", 30),
+        "provider_tier_model_map": _runtime_config.get("provider_tier_model_map", {}),
+        "task_type_provider_preference": _runtime_config.get("task_type_provider_preference", {}),
+        "task_type_model_preferences": _runtime_config.get("task_type_model_preferences", {}),
+        "cross_provider_fallback_enabled": _runtime_config.get("cross_provider_fallback_enabled", False),
+        "provider_execution_modes": _runtime_config.get("provider_execution_modes", {}),
+        "provider_mode_capabilities": _runtime_config.get("provider_mode_capabilities", {}),
+        "providers": _build_provider_catalog(_runtime_config),
+        "task_type_execution_defaults": _runtime_config.get("task_type_execution_defaults", {}),
         "task_type_models": _runtime_config.get("task_type_models", {}),
         "task_type_efforts": _runtime_config.get("task_type_efforts", {}),
         "health_check_urls": _runtime_config.get("health_check_urls", []),
@@ -95,9 +132,17 @@ async def get_settings(
             }),
             is_admin=current_user.get("role") == "admin",
         ),
-        "using_max_plan": len([a for a in user_pool if a.get("enabled", True)]) > 0,
+        "using_max_plan": len([
+            a for a in user_pool
+            if a.get("enabled", True)
+            and a.get("provider", LLMProviderName.ANTHROPIC.value) == LLMProviderName.ANTHROPIC.value
+            and a.get("auth_mode", LLMAuthMode.OAUTH.value) == LLMAuthMode.OAUTH.value
+        ]) > 0,
         "max_plan_accounts": [
             {"id": a["id"], "name": a["name"], "enabled": a.get("enabled", True),
+             "provider": a.get("provider", LLMProviderName.ANTHROPIC.value),
+             "auth_mode": a.get("auth_mode", LLMAuthMode.OAUTH.value),
+             "provider_metadata": a.get("provider_metadata", {}),
              "active_tasks": a["active_tasks"], "total_tasks": a["total_tasks"],
              "token_created_at": a.get("token_created_at"),
              "rl_hit_count": a.get("rl_hit_count", 0),
@@ -108,6 +153,15 @@ async def get_settings(
             for a in user_pool
         ],
     }
+
+
+@router.get("/providers")
+async def get_provider_catalog(
+    current_user: dict = Depends(get_current_user),
+):
+    from app.shared_state import runtime_config as _runtime_config
+
+    return {"providers": _build_provider_catalog(_runtime_config)}
 
 
 @router.patch("/settings")
@@ -179,16 +233,133 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 1440):
             raise HTTPException(status_code=400, detail="autonomous_research_interval_minutes must be between 1 and 1440")
         _runtime_config["autonomous_research_interval_minutes"] = val
-    # Legacy 4-6 entries accepted so stored runtime_config from prior revisions
-    # validates without rewrite; new tasks should use claude-opus-4-7 only.
-    VALID_MODELS = {"claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", ""}
+    if "provider_tier_model_map" in payload:
+        val = payload["provider_tier_model_map"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="provider_tier_model_map must be a dict")
+        valid_providers = {p.value for p in LLMProviderName}
+        valid_tiers = {"opus", "sonnet", "haiku"}
+        for provider_name, tier_map in val.items():
+            if provider_name not in valid_providers:
+                raise HTTPException(status_code=400, detail=f"Invalid provider in provider_tier_model_map: {provider_name}")
+            if not isinstance(tier_map, dict):
+                raise HTTPException(status_code=400, detail=f"provider_tier_model_map[{provider_name}] must be a dict")
+            for tier, model in tier_map.items():
+                if tier not in valid_tiers:
+                    raise HTTPException(status_code=400, detail=f"Invalid tier for {provider_name}: {tier}")
+                if not isinstance(model, str) or not model.strip():
+                    raise HTTPException(status_code=400, detail=f"Model for {provider_name}/{tier} must be a non-empty string")
+        _runtime_config["provider_tier_model_map"] = val
+    if "task_type_provider_preference" in payload:
+        val = payload["task_type_provider_preference"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="task_type_provider_preference must be a dict")
+        valid_providers = {p.value for p in LLMProviderName}
+        for task_type, providers in val.items():
+            if not isinstance(task_type, str) or not task_type:
+                raise HTTPException(status_code=400, detail="task_type_provider_preference keys must be non-empty strings")
+            if not isinstance(providers, list) or not all(isinstance(p, str) for p in providers):
+                raise HTTPException(status_code=400, detail=f"Provider preference for {task_type} must be a list of strings")
+            invalid = [p for p in providers if p not in valid_providers]
+            if invalid:
+                raise HTTPException(status_code=400, detail=f"Invalid providers for {task_type}: {', '.join(invalid)}")
+        _runtime_config["task_type_provider_preference"] = val
+    if "task_type_model_preferences" in payload:
+        val = payload["task_type_model_preferences"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="task_type_model_preferences must be a dict")
+        valid_providers = {p.value for p in LLMProviderName}
+        for task_type, prefs in val.items():
+            if not isinstance(task_type, str) or not task_type:
+                raise HTTPException(status_code=400, detail="task_type_model_preferences keys must be non-empty strings")
+            if not isinstance(prefs, list):
+                raise HTTPException(status_code=400, detail=f"Model preferences for {task_type} must be a list")
+            for pref in prefs:
+                if not isinstance(pref, dict):
+                    raise HTTPException(status_code=400, detail=f"Each model preference for {task_type} must be an object")
+                provider_name = pref.get("provider")
+                model_name = pref.get("model")
+                if provider_name not in valid_providers:
+                    raise HTTPException(status_code=400, detail=f"Invalid provider in model preferences for {task_type}: {provider_name}")
+                if not isinstance(model_name, str) or not model_name:
+                    raise HTTPException(status_code=400, detail=f"Invalid model in model preferences for {task_type}")
+        _runtime_config["task_type_model_preferences"] = val
+    if "cross_provider_fallback_enabled" in payload:
+        val = payload["cross_provider_fallback_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(status_code=400, detail="cross_provider_fallback_enabled must be a boolean")
+        _runtime_config["cross_provider_fallback_enabled"] = val
+    if "provider_execution_modes" in payload:
+        val = payload["provider_execution_modes"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="provider_execution_modes must be a dict")
+        valid_providers = {p.value for p in LLMProviderName}
+        for provider_name, modes in val.items():
+            if provider_name not in valid_providers:
+                raise HTTPException(status_code=400, detail=f"Invalid provider in provider_execution_modes: {provider_name}")
+            if not isinstance(modes, list) or not all(isinstance(m, str) and m for m in modes):
+                raise HTTPException(status_code=400, detail=f"Execution modes for {provider_name} must be a non-empty string list")
+            provider = get_provider(provider_name)
+            supported = set(provider.supported_execution_modes())
+            invalid_modes = [m for m in modes if m not in supported]
+            if invalid_modes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid execution modes for {provider_name}: {', '.join(invalid_modes)}",
+                )
+        _runtime_config["provider_execution_modes"] = val
+    if "provider_mode_capabilities" in payload:
+        val = payload["provider_mode_capabilities"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="provider_mode_capabilities must be a dict")
+        valid_providers = {p.value for p in LLMProviderName}
+        for provider_name, mode_map in val.items():
+            if provider_name not in valid_providers:
+                raise HTTPException(status_code=400, detail=f"Invalid provider in provider_mode_capabilities: {provider_name}")
+            if not isinstance(mode_map, dict):
+                raise HTTPException(status_code=400, detail="provider_mode_capabilities values must be dicts")
+            provider = get_provider(provider_name)
+            supported = set(provider.supported_execution_modes())
+            for mode_name, capability_map in mode_map.items():
+                if mode_name not in supported:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid execution mode in provider_mode_capabilities for {provider_name}: {mode_name}",
+                    )
+                if not isinstance(capability_map, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Capabilities for {provider_name}/{mode_name} must be an object",
+                    )
+        _runtime_config["provider_mode_capabilities"] = val
+    if "task_type_execution_defaults" in payload:
+        val = payload["task_type_execution_defaults"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="task_type_execution_defaults must be a dict")
+        if any(not isinstance(v, str) or not v for v in val.values()):
+            raise HTTPException(status_code=400, detail="task_type_execution_defaults values must be non-empty strings")
+        provider_modes = _runtime_config.get("provider_execution_modes", {})
+        known_modes = {
+            mode
+            for modes in provider_modes.values()
+            if isinstance(modes, list)
+            for mode in modes
+            if isinstance(mode, str)
+        }
+        invalid_defaults = sorted({mode for mode in val.values() if mode not in known_modes})
+        if invalid_defaults:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown execution modes in task_type_execution_defaults: {', '.join(invalid_defaults)}",
+            )
+        _runtime_config["task_type_execution_defaults"] = val
     VALID_EFFORTS = {"low", "medium", "high", "max", ""}
     if "task_type_models" in payload:
         val = payload["task_type_models"]
         if not isinstance(val, dict):
             raise HTTPException(status_code=400, detail="task_type_models must be a dict")
-        if any(v not in VALID_MODELS for v in val.values()):
-            raise HTTPException(status_code=400, detail="Invalid model in task_type_models")
+        if any(not isinstance(v, str) for v in val.values()):
+            raise HTTPException(status_code=400, detail="task_type_models values must be strings")
         _runtime_config["task_type_models"] = val
     if "task_type_efforts" in payload:
         val = payload["task_type_efforts"]
@@ -442,6 +613,13 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             # Persist dict/list config fields to JSONB column
             try:
                 state.runtime_config_json = {
+                    "provider_tier_model_map": _runtime_config.get("provider_tier_model_map", {}),
+                    "task_type_provider_preference": _runtime_config.get("task_type_provider_preference", {}),
+                    "task_type_model_preferences": _runtime_config.get("task_type_model_preferences", {}),
+                    "cross_provider_fallback_enabled": _runtime_config.get("cross_provider_fallback_enabled", False),
+                    "provider_execution_modes": _runtime_config.get("provider_execution_modes", {}),
+                    "provider_mode_capabilities": _runtime_config.get("provider_mode_capabilities", {}),
+                    "task_type_execution_defaults": _runtime_config.get("task_type_execution_defaults", {}),
                     "task_type_models": _runtime_config.get("task_type_models", {}),
                     "task_type_efforts": _runtime_config.get("task_type_efforts", {}),
                     "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),

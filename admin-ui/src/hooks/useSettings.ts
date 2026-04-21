@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { MaxPlanAccount } from '../types/settings';
+import type { AuthMode, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName } from '../types/settings';
 import type { NotificationConfig } from '../components/SettingsNotificationsSection';
 import type { BuildConfig } from '../types/project';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
@@ -19,7 +19,11 @@ export function useSettings(addToast: AddToast) {
   const [usingMaxPlan, setUsingMaxPlan] = useState(false);
   const [maxPlanAccounts, setMaxPlanAccounts] = useState<MaxPlanAccount[]>([]);
   const [newAccountName, setNewAccountName] = useState('');
+  const [newAccountProvider, setNewAccountProvider] = useState<ProviderName>('anthropic');
+  const [newAccountAuthMode, setNewAccountAuthMode] = useState<AuthMode>('oauth');
   const [newAccountToken, setNewAccountToken] = useState('');
+  const [newAccountProviderMetadata, setNewAccountProviderMetadata] = useState<Record<string, string>>({});
+  const [newAccountClaudeConfigJson, setNewAccountClaudeConfigJson] = useState('');
   const [githubAccount, setGithubAccount] = useState<string | null>(null);
   const [requireApprovalGates, setRequireApprovalGates] = useState(true);
   const [autoArchiveEnabled, setAutoArchiveEnabled] = useState(true);
@@ -31,6 +35,14 @@ export function useSettings(addToast: AddToast) {
     enabled_events: ['TASK_FAILED', 'APPROVAL_NEEDED', 'DEPLOY_HEALTH_ALERT'],
     throttle_seconds: 30,
   });
+  const [providerTierModelMap, setProviderTierModelMap] = useState<Record<string, Record<string, string>>>({});
+  const [taskTypeProviderPreference, setTaskTypeProviderPreference] = useState<Record<string, ProviderName[]>>({});
+  const [taskTypeModelPreferences, setTaskTypeModelPreferences] = useState<Record<string, ModelPreference[]>>({});
+  const [providerExecutionModes, setProviderExecutionModes] = useState<Record<string, string[]>>({});
+  const [providerModeCapabilities, setProviderModeCapabilities] = useState<Record<string, Record<string, Record<string, boolean | number | string | null>>>>({});
+  const [taskTypeExecutionDefaults, setTaskTypeExecutionDefaults] = useState<Record<string, string>>({});
+  const [crossProviderFallbackEnabled, setCrossProviderFallbackEnabled] = useState(false);
+  const [providers, setProviders] = useState<Record<string, ProviderCatalogEntry>>({});
   const [buildConfig, setBuildConfig] = useState<BuildConfig | null>(null);
 
   // ── Handlers ────────────────────────────────────────────────────────────
@@ -50,6 +62,14 @@ export function useSettings(addToast: AddToast) {
         setAgentPromptSuffixes(data.agent_prompt_suffixes ?? {});
         setUsingMaxPlan(data.using_max_plan ?? false);
         setMaxPlanAccounts(data.max_plan_accounts || []);
+        setProviderTierModelMap(data.provider_tier_model_map ?? {});
+        setTaskTypeProviderPreference(data.task_type_provider_preference ?? {});
+        setTaskTypeModelPreferences(data.task_type_model_preferences ?? {});
+        setProviderExecutionModes(data.provider_execution_modes ?? {});
+        setProviderModeCapabilities(data.provider_mode_capabilities ?? {});
+        setTaskTypeExecutionDefaults(data.task_type_execution_defaults ?? {});
+        setCrossProviderFallbackEnabled(data.cross_provider_fallback_enabled ?? false);
+        setProviders(data.providers ?? {});
         setGithubAccount(data.github_account || null);
         setRequireApprovalGates(data.require_approval_gates ?? true);
         setAutoArchiveEnabled(data.auto_archive_enabled ?? true);
@@ -78,16 +98,40 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
+  const patchSettings = async (payload: Record<string, unknown>) => {
+    const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+      method: 'PATCH',
+      headers: await authHeaders(),
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail || `HTTP ${res.status}`);
+    }
+  };
+
   const addMaxPlanAccount = async () => {
     if (!newAccountName || !newAccountToken) return;
     try {
+      const payload: Record<string, unknown> = {
+        name: newAccountName,
+        provider: newAccountProvider,
+        auth_mode: newAccountAuthMode,
+        secret: newAccountToken,
+      };
+      if (Object.keys(newAccountProviderMetadata).length > 0) payload.provider_metadata = newAccountProviderMetadata;
+      if (newAccountClaudeConfigJson.trim()) payload.claude_config_json = newAccountClaudeConfigJson;
       const res = await fetch(`${API_BASE_URL}/api/admin/max-plan-accounts`, {
         method: 'POST', headers: await authHeaders(),
-        body: JSON.stringify({ name: newAccountName, oauth_token: newAccountToken }),
+        body: JSON.stringify(payload),
       });
       if (res.ok) {
         setNewAccountName('');
+        setNewAccountProvider('anthropic');
+        setNewAccountAuthMode('oauth');
         setNewAccountToken('');
+        setNewAccountProviderMetadata({});
+        setNewAccountClaudeConfigJson('');
         fetchSettings();
       } else {
         addToast('Failed to add account', 'error');
@@ -166,8 +210,68 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
+  const updateProviderTierModels = async (value: Record<string, Record<string, string>>) => {
+    const prev = providerTierModelMap;
+    setProviderTierModelMap(value);
+    try {
+      await patchSettings({ provider_tier_model_map: value });
+    } catch (err) {
+      console.error('Failed to update provider tier model map:', err);
+      setProviderTierModelMap(prev);
+      addToast('Failed to update provider tier model map', 'error');
+    }
+  };
+
+  const updateTaskTypeProviderPreferences = async (value: Record<string, ProviderName[]>) => {
+    const prev = taskTypeProviderPreference;
+    setTaskTypeProviderPreference(value);
+    try {
+      await patchSettings({ task_type_provider_preference: value });
+    } catch (err) {
+      console.error('Failed to update provider preference:', err);
+      setTaskTypeProviderPreference(prev);
+      addToast('Failed to update provider preference', 'error');
+    }
+  };
+
+  const updateTaskTypeModelPreferenceConfig = async (value: Record<string, ModelPreference[]>) => {
+    const prev = taskTypeModelPreferences;
+    setTaskTypeModelPreferences(value);
+    try {
+      await patchSettings({ task_type_model_preferences: value });
+    } catch (err) {
+      console.error('Failed to update model preferences:', err);
+      setTaskTypeModelPreferences(prev);
+      addToast('Failed to update model preferences', 'error');
+    }
+  };
+
+  const updateTaskTypeExecutionDefaultConfig = async (value: Record<string, string>) => {
+    const prev = taskTypeExecutionDefaults;
+    setTaskTypeExecutionDefaults(value);
+    try {
+      await patchSettings({ task_type_execution_defaults: value });
+    } catch (err) {
+      console.error('Failed to update execution defaults:', err);
+      setTaskTypeExecutionDefaults(prev);
+      addToast('Failed to update execution defaults', 'error');
+    }
+  };
+
+  const updateCrossProviderFallback = async (value: boolean) => {
+    const prev = crossProviderFallbackEnabled;
+    setCrossProviderFallbackEnabled(value);
+    try {
+      await patchSettings({ cross_provider_fallback_enabled: value });
+    } catch (err) {
+      console.error('Failed to update fallback setting:', err);
+      setCrossProviderFallbackEnabled(prev);
+      addToast('Failed to update cross-provider fallback', 'error');
+    }
+  };
+
   const syncTaskTypeDefaults = async () => {
-    const types = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'security_audit', 'qa', 'deps'];
+    const types = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'security_audit', 'qa', 'deps', 'docs', 'smoketest', 'debug', 'perf', 'investigate', 'rollup', 'strategic_review', 'design_doc_update'];
     const models: Record<string, string> = {};
     const efforts: Record<string, string> = {};
     for (const t of types) {
@@ -416,18 +520,25 @@ export function useSettings(addToast: AddToast) {
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour,
     autonomousResearchIntervalMinutes, directionCooldownMinutes, strategicResearchFrequency,
     healthCheckUrls, agentPromptSuffixes, usingMaxPlan,
-    maxPlanAccounts, newAccountName, setNewAccountName, newAccountToken, setNewAccountToken,
+    maxPlanAccounts, newAccountName, setNewAccountName, newAccountProvider, setNewAccountProvider,
+    newAccountAuthMode, setNewAccountAuthMode, newAccountToken, setNewAccountToken,
+    newAccountProviderMetadata, setNewAccountProviderMetadata, newAccountClaudeConfigJson, setNewAccountClaudeConfigJson,
     githubAccount, setGithubAccount,
     requireApprovalGates,
     autoArchiveEnabled, autoArchiveTerminalAfterDays,
     autoArchiveMaxTerminalTasksPerProject, autoArchiveIntervalMinutes,
     notificationConfig,
+    providerTierModelMap, taskTypeProviderPreference, taskTypeModelPreferences,
+    providerExecutionModes, providerModeCapabilities, taskTypeExecutionDefaults,
+    crossProviderFallbackEnabled, providers,
     buildConfig, setBuildConfig,
     // Handlers
     fetchSettings,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
     connectGitHub,
     updateAgentPromptSuffixes,
+    updateProviderTierModels, updateTaskTypeProviderPreferences, updateTaskTypeModelPreferenceConfig,
+    updateTaskTypeExecutionDefaultConfig, updateCrossProviderFallback,
     syncTaskTypeDefaults,
     updateMaxVMs, updateMaxRetries,
     handleUpdateMaxAutonomousRate, handleUpdateAutonomousResearchInterval,

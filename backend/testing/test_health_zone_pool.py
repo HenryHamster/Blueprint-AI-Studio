@@ -101,9 +101,14 @@ def all_deps_healthy():
     original = dict(_shared_state.external_health)
     _shared_state.external_health.update({
         "github_api": True,
-        "claude_api": True,
+        "anthropic_api": True,
+        "openai_api": True,
+        "gemini_api": True,
+        "dispatch_api": True,
         "gcp": True,
         "db": True,
+        "provider_health": {},
+        "dispatch_health": {},
         "last_check": None,
         "failed_deps": [],
         "errors": {},
@@ -239,7 +244,7 @@ class TestHealthEndpoint:
         """external_deps contains each dependency key."""
         resp = await health_client.get("/health")
         deps = resp.json()["external_deps"]
-        for key in ("github_api", "claude_api", "gcp", "db"):
+        for key in ("github_api", "anthropic_api", "openai_api", "gemini_api", "dispatch_api", "gcp", "db"):
             assert key in deps
 
     @pytest.mark.asyncio

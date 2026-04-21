@@ -21,8 +21,8 @@ source "googlecompute" "agent_image" {
   project_id          = var.project_id
   source_image_family = "ubuntu-2204-lts"
   zone                = var.zone
-  image_name          = "blueprint-agent-v1-{{timestamp}}"
-  image_family        = "blueprint-agent"
+  image_name          = "blueprint-agent-v2-{{timestamp}}"
+  image_family        = "blueprint-agent-v2"
   ssh_username        = "packer"
 }
 
@@ -36,15 +36,17 @@ build {
       "sudo apt-get install -y curl git wget gnupg",
       "curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -",
       "sudo apt-get install -y nodejs",
-      "sudo npm install -g @anthropic-ai/claude-code",
+      "sudo npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
       "git config --global user.email 'blueprint-agent@automated.dev'",
       "git config --global user.name 'Blueprint Agent'",
       "sudo mkdir -p /opt/agent /tmp/workspace",
       "sudo chown -R packer:packer /opt/agent",
       "# Pre-create workspace and install gcloud/gsutil for faster startup",
       "sudo apt-get install -y apt-transport-https ca-certificates jq",
-      "# Pre-warm Claude Code by running setup (caches binary downloads)",
-      "claude --version || true"
+      "# Pre-warm CLI installs so the baked image already has first-run caches",
+      "claude --version || true",
+      "codex --version || true",
+      "gemini --version || true"
     ]
   }
 

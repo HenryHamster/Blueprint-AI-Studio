@@ -477,8 +477,11 @@ async def claim_task(
         {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS}
     )
 
-    # Strip internal fields (max_plan_account_id) from context before returning to agent
-    safe_context = {k: v for k, v in (task.context or {}).items() if not k.startswith("max_plan_")}
+    # Strip internal runtime-routing fields before returning task context to the agent.
+    safe_context = {
+        k: v for k, v in (task.context or {}).items()
+        if not k.startswith("max_plan_") and not k.startswith("llm_")
+    }
     response = {
         "task_id": str(task.id),
         "title": task.title,

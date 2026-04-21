@@ -13,8 +13,9 @@ from typing import Optional
 
 import app.shared_state as _shared_state
 from app.database import AsyncSessionLocal
-from app.max_plan_pool import _OPUS_MODEL, _account_available_for_model, _account_by_id
-from app.models import Task
+from app.max_plan_pool import _OPUS_MODEL, _account_available_for_model, _account_by_id, infer_provider_for_model
+from app.models import LLMProviderName, Task
+from app.providers.registry import get_provider
 from sqlmodel import select
 
 logger = logging.getLogger("blueprint")
@@ -24,6 +25,16 @@ logger = logging.getLogger("blueprint")
 # (max_concurrent_vms=0) no new results are appended, so the last pre-pause
 # failures would otherwise keep tripping checks forever.
 _TASK_RESULT_STALENESS_MINUTES = 15
+_PROVIDER_DEP_KEYS = {
+    LLMProviderName.ANTHROPIC.value: "anthropic_api",
+    LLMProviderName.OPENAI.value: "openai_api",
+    LLMProviderName.GEMINI.value: "gemini_api",
+}
+_RAW_PROVIDER_ENV_VARS = {
+    LLMProviderName.ANTHROPIC.value: ("ANTHROPIC_API_KEY",),
+    LLMProviderName.OPENAI.value: ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_HOME"),
+    LLMProviderName.GEMINI.value: ("GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"),
+}
 
 
 async def check_db_health(ext: dict) -> Optional[str]:
@@ -86,64 +97,206 @@ async def check_github_health(ext: dict, now: datetime) -> Optional[str]:
         ext["errors"]["github_api"] = f"{type(e).__name__}: {str(e)[:200]} (check: {check_method})"
         return "github_api"
 
+def _normalized_provider_name(raw: str | LLMProviderName | None) -> str | None:
+    if isinstance(raw, LLMProviderName):
+        return raw.value
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
 
-def check_claude_api_health(ext: dict) -> Optional[str]:
-    """Check Claude API credential and account availability.
 
-    Returns 'claude_api' if failed, None if healthy.
-    """
-    has_credentials = bool(_account_by_id) or bool(os.getenv("ANTHROPIC_API_KEY"))
-    if not has_credentials:
-        ext["claude_api"] = False
-        return "claude_api"
+def _provider_dep_key(provider_name: str | LLMProviderName) -> str:
+    normalized = _normalized_provider_name(provider_name)
+    if not normalized:
+        raise ValueError("provider_name is required")
+    return _PROVIDER_DEP_KEYS[normalized]
 
-    all_accounts = list(_account_by_id.values())
-    if all_accounts:
-        # Check if accounts have a token and are enabled. Don't use model=None
-        # (conservative path treats any per-model disable as fully unavailable,
-        # which causes one rate-limited model to poison the entire health check).
-        # Per-model availability is enforced at dispatch time.
-        available_accounts = [a for a in all_accounts if a.get("oauth_token") and a.get("enabled", True)]
-        if not available_accounts:
-            ext["claude_api"] = False
-            disabled_names = [a["name"] for a in all_accounts]
-            logger.warning(f"[HEALTH] All Claude API accounts unavailable: {', '.join(disabled_names)}")
-            return "claude_api"
-        # Also verify at least one account can dispatch on the primary model (Opus).
-        # Without this, all-accounts-Opus-rate-limited reports healthy even though
-        # no task can actually dispatch, defeating auto-pause.
-        opus_available = [a for a in available_accounts if _account_available_for_model(a, _OPUS_MODEL)]
-        if not opus_available:
-            ext["claude_api"] = False
-            logger.warning(
-                f"[HEALTH] All Claude API accounts rate-limited for {_OPUS_MODEL} — "
-                f"0/{len(available_accounts)} can dispatch primary model"
+
+def _has_raw_provider_credentials(provider_name: str) -> bool:
+    return any(bool(os.getenv(env_name)) for env_name in _RAW_PROVIDER_ENV_VARS.get(provider_name, ()))
+
+
+def _dispatch_provider_sets() -> tuple[set[str], set[str]]:
+    runtime_config = _shared_state.runtime_config
+    primary: set[str] = set()
+    all_candidates: set[str] = set()
+
+    provider_preferences = runtime_config.get("task_type_provider_preference", {})
+    if isinstance(provider_preferences, dict):
+        for providers in provider_preferences.values():
+            if not isinstance(providers, list):
+                continue
+            ordered = []
+            for provider_name in providers:
+                normalized = _normalized_provider_name(provider_name)
+                if normalized and normalized not in ordered:
+                    ordered.append(normalized)
+            if ordered:
+                primary.add(ordered[0])
+                all_candidates.update(ordered)
+
+    model_preferences = runtime_config.get("task_type_model_preferences", {})
+    if isinstance(model_preferences, dict):
+        for prefs in model_preferences.values():
+            if not isinstance(prefs, list):
+                continue
+            ordered = []
+            for pref in prefs:
+                if not isinstance(pref, dict):
+                    continue
+                normalized = _normalized_provider_name(pref.get("provider"))
+                if normalized and normalized not in ordered:
+                    ordered.append(normalized)
+            if ordered:
+                primary.add(ordered[0])
+                all_candidates.update(ordered)
+
+    task_type_models = runtime_config.get("task_type_models", {})
+    if isinstance(task_type_models, dict):
+        for model_name in task_type_models.values():
+            if not isinstance(model_name, str):
+                continue
+            normalized = _normalized_provider_name(
+                infer_provider_for_model(model_name.strip(), runtime_config)
             )
-            return "claude_api"
-        ext["claude_api"] = True
-        if len(opus_available) < len(available_accounts):
-            logger.info(
-                f"[HEALTH] Claude API degraded — {len(available_accounts) - len(opus_available)}/"
-                f"{len(available_accounts)} accounts rate-limited for {_OPUS_MODEL}, "
-                f"{len(opus_available)} still available"
-            )
-        return None
-    else:
-        # No account pool — using raw ANTHROPIC_API_KEY. Fall back to burst detection
-        # since there's no per-account cooldown mechanism for a single key.
-        recent_results = list(_shared_state.deploy_monitoring["task_results"])[-5:]
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=_TASK_RESULT_STALENESS_MINUTES)).isoformat()
-        fresh_results = [r for r in recent_results if r[0] >= cutoff]
-        rate_limit_count = sum(1 for r in fresh_results if r[2] == "RATE_LIMIT")
-        if rate_limit_count >= 3:
-            ext["claude_api"] = False
-            logger.warning(
-                f"[HEALTH] Claude API rate limited (single key) — {rate_limit_count}/5 recent tasks hit limits"
-            )
-            return "claude_api"
+            if normalized:
+                primary.add(normalized)
+                all_candidates.add(normalized)
+
+    if not primary and not all_candidates:
+        primary.add(LLMProviderName.ANTHROPIC.value)
+        all_candidates.add(LLMProviderName.ANTHROPIC.value)
+
+    return primary, all_candidates
+
+
+def _dispatch_relevant_providers() -> set[str]:
+    primary, all_candidates = _dispatch_provider_sets()
+    if _shared_state.runtime_config.get("cross_provider_fallback_enabled", False):
+        return all_candidates
+    return primary
+
+
+def _provider_rate_limit_bursting(provider_name: str) -> bool:
+    if provider_name != LLMProviderName.ANTHROPIC.value:
+        return False
+    recent_results = list(_shared_state.deploy_monitoring["task_results"])[-5:]
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=_TASK_RESULT_STALENESS_MINUTES)).isoformat()
+    fresh_results = [r for r in recent_results if r[0] >= cutoff]
+    rate_limit_count = sum(1 for r in fresh_results if r[2] == "RATE_LIMIT")
+    return rate_limit_count >= 3
+
+
+def get_provider_health_snapshot(provider_name: str | LLMProviderName) -> dict:
+    normalized = _normalized_provider_name(provider_name)
+    if not normalized:
+        raise ValueError("provider_name is required")
+    provider = get_provider(normalized)
+    accounts = [
+        account for account in _account_by_id.values()
+        if (_normalized_provider_name(account.get("provider")) or LLMProviderName.ANTHROPIC.value) == normalized
+    ]
+    raw_credentials = _has_raw_provider_credentials(normalized)
+    relevant_providers = _dispatch_relevant_providers()
+    dispatch_relevant = normalized in relevant_providers
+    configured = dispatch_relevant or bool(accounts) or raw_credentials
+    primary_model = provider.tier_to_model("opus", _shared_state.runtime_config) or _OPUS_MODEL
+
+    enabled_accounts = [account for account in accounts if account.get("enabled", True)]
+    ready_accounts = [account for account in enabled_accounts if provider.account_has_credentials(account)]
+    dispatchable_accounts = [account for account in ready_accounts if _account_available_for_model(account, primary_model)]
+
+    status = "inactive"
+    reason = None
+    if configured and accounts:
+        if not ready_accounts:
+            status = "down"
+            reason = "no enabled accounts with credentials"
+        elif not dispatchable_accounts:
+            status = "down"
+            reason = f"no accounts available for {primary_model}"
+        elif len(dispatchable_accounts) < len(ready_accounts):
+            status = "degraded"
+            reason = f"{len(ready_accounts) - len(dispatchable_accounts)} account(s) unavailable for {primary_model}"
         else:
-            ext["claude_api"] = True
-            return None
+            status = "ok"
+    elif configured and raw_credentials:
+        if _provider_rate_limit_bursting(normalized):
+            status = "down"
+            reason = "recent rate-limit burst detected for raw provider credentials"
+        else:
+            status = "ok"
+    elif configured:
+        status = "down"
+        reason = "provider selected for dispatch but no credentials are configured"
+
+    return {
+        "provider": normalized,
+        "dep_name": _provider_dep_key(normalized),
+        "configured": configured,
+        "dispatch_relevant": dispatch_relevant,
+        "status": status,
+        "reason": reason,
+        "has_raw_credentials": raw_credentials,
+        "total_accounts": len(accounts),
+        "enabled_accounts": len(enabled_accounts),
+        "ready_accounts": len(ready_accounts),
+        "available_accounts": len(dispatchable_accounts),
+        "primary_model": primary_model,
+        "dispatch_available": status in ("ok", "degraded"),
+    }
+
+
+def check_provider_api_health(ext: dict, provider_name: str | LLMProviderName) -> Optional[str]:
+    snapshot = get_provider_health_snapshot(provider_name)
+    provider_key = snapshot["provider"]
+    dep_key = snapshot["dep_name"]
+    ext.setdefault("provider_health", {})[provider_key] = snapshot
+    ext[dep_key] = snapshot["status"] != "down"
+    if snapshot["status"] == "down" and snapshot["configured"]:
+        ext.setdefault("errors", {})[dep_key] = snapshot["reason"] or "provider unavailable"
+        return dep_key
+    ext.setdefault("errors", {}).pop(dep_key, None)
+    return None
+
+
+def get_dispatch_health_snapshot(ext: dict) -> dict:
+    relevant_providers = sorted(_dispatch_relevant_providers())
+    provider_health = ext.get("provider_health", {}) or {}
+    available = []
+    degraded = []
+    down = []
+    inactive = []
+    for provider_name in relevant_providers:
+        snapshot = provider_health.get(provider_name) or get_provider_health_snapshot(provider_name)
+        status = snapshot.get("status", "inactive")
+        if status in ("ok", "degraded"):
+            available.append(provider_name)
+        if status == "degraded":
+            degraded.append(provider_name)
+        elif status == "down":
+            down.append(provider_name)
+        elif status == "inactive":
+            inactive.append(provider_name)
+
+    if not relevant_providers:
+        status = "down"
+    elif not available:
+        status = "down"
+    elif degraded or down:
+        status = "degraded"
+    else:
+        status = "ok"
+
+    return {
+        "status": status,
+        "fallback_enabled": bool(_shared_state.runtime_config.get("cross_provider_fallback_enabled", False)),
+        "required_providers": relevant_providers,
+        "available_providers": available,
+        "degraded_providers": degraded,
+        "down_providers": down,
+        "inactive_providers": inactive,
+    }
 
 
 def check_gcp_health(ext: dict) -> Optional[str]:

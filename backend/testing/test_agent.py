@@ -95,6 +95,50 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_agent_status_update_persists_runtime_identity(client: AsyncClient, db_session, mocker):
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+
+    project = Project(name="Agent Runtime Identity Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-runtime",
+        status=TaskStatus.IN_PROGRESS,
+        context={"llm_account_id": "acct-1", "max_plan_account_id": "acct-1"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-runtime")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "ERROR_LOG",
+        "logs": "provider-specific failure",
+        "failure_category": "rate_limited",
+        "provider": "openai",
+        "auth_mode": "api_key",
+        "model": "gpt-5",
+        "execution_mode": "default",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.context["llm_provider"] == "openai"
+    assert task.context["llm_auth_mode"] == "api_key"
+    assert task.context["llm_model"] == "gpt-5"
+    assert task.context["llm_execution_mode"] == "default"
+    assert task.context["failure_category"] == "RATE_LIMIT"
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_retry_is_idempotent(client: AsyncClient, db_session):
     """
     A second claim from the same VM shortly after a successful first claim must

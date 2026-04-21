@@ -2124,6 +2124,7 @@ async def test_health_detailed_endpoint_includes_pipeline_health(
 
     assert "pipeline_health" in data["components"]
     assert data["components"]["pipeline_health"]["status"] == "ok"
+    assert "provider_apis" in data["components"]
 
 
 # ── Review measurement attribution split ─────────────────────────────────────

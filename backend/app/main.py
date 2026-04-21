@@ -119,7 +119,7 @@ from app.strategic_constants import (  # noqa: E402
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0038"
+EXPECTED_SCHEMA_REVISION = "0039"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -999,6 +999,18 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
         "last_check": last_check.isoformat() if isinstance(last_check, datetime) else last_check,
     }
 
+    provider_health = _shared_state.external_health.get("provider_health", {}) or {}
+    dispatch_health = _shared_state.external_health.get("dispatch_health", {}) or {}
+    components["provider_apis"] = {
+        "status": dispatch_health.get("status", "unknown"),
+        "fallback_enabled": dispatch_health.get("fallback_enabled", False),
+        "required_providers": dispatch_health.get("required_providers", []),
+        "available_providers": dispatch_health.get("available_providers", []),
+        "degraded_providers": dispatch_health.get("degraded_providers", []),
+        "down_providers": dispatch_health.get("down_providers", []),
+        "providers": provider_health,
+    }
+
     # --- Orchestrator ---
     cycle_age: Optional[float] = None
     if _orch._orchestrator_last_cycle:
@@ -1049,7 +1061,19 @@ async def health_detailed(session: AsyncSession = Depends(get_session), current_
         pool_status = "ok"
     else:
         pool_status = "down"
-    components["max_plan_pool"] = {"status": pool_status, "total": total_accounts, "available": available_accounts}
+    by_provider: Dict[str, Dict[str, int]] = {}
+    for account in _account_by_id.values():
+        provider_name = account.get("provider", "anthropic")
+        bucket = by_provider.setdefault(provider_name, {"total": 0, "available": 0})
+        bucket["total"] += 1
+        if account.get("enabled", True):
+            bucket["available"] += 1
+    components["max_plan_pool"] = {
+        "status": pool_status,
+        "total": total_accounts,
+        "available": available_accounts,
+        "by_provider": by_provider,
+    }
 
     # --- Circuit Breakers ---
     breaker_states: Dict[str, Any] = {}
@@ -1157,12 +1181,9 @@ async def health_check():
             hung_seconds = (_utcnow() - _orch._orchestrator_cycle_started).total_seconds()
             orchestrator_hung = hung_seconds > 300
 
-    # Only DB is critical for 503 — GitHub/Claude/GCP outages shouldn't remove us from LB
+    # Only DB is critical for 503 — provider or external API outages shouldn't remove us from LB.
     critical_healthy = external_health.get("db", True)
-    degraded_deps = [
-        k for k in ("github_api", "claude_api", "gcp")
-        if not external_health.get(k, True)
-    ]
+    degraded_deps = [dep for dep in (external_health.get("failed_deps", []) or []) if dep != "db"]
     if orchestrator_hung:
         degraded_deps.append("orchestrator_hung")
 
@@ -1177,7 +1198,10 @@ async def health_check():
             "revision": _current_revision,
             "orchestrator_alive": orchestrator_alive,
             "orchestrator_cycle_age_seconds": cycle_age,
-            "external_deps": {k: v for k, v in external_health.items() if k not in ("last_check", "failed_deps", "errors")},
+            "external_deps": {
+                k: v for k, v in external_health.items()
+                if k not in ("last_check", "failed_deps", "errors", "provider_health", "dispatch_health")
+            },
             "degraded_deps": degraded_deps,
         }
     )

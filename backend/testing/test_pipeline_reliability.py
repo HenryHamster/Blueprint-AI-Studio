@@ -1825,7 +1825,7 @@ class TestExternalHealthGate:
     """Unit tests for the pre-flight external health gate in the dispatch path.
 
     The gate reads shared_state.external_health["consecutive_failures"] and
-    blocks dispatch when a *critical* dependency (github_api, claude_api, gcp)
+    blocks dispatch when a *critical* dependency (github_api, dispatch_api, gcp)
     has been confirmed down for 2+ consecutive health checks.
     """
 
@@ -1835,7 +1835,8 @@ class TestExternalHealthGate:
         """Set consecutive_failures entries; reset all others to 0."""
         _shared_state.external_health["consecutive_failures"] = {
             "github_api": kwargs.get("github_api", 0),
-            "claude_api": kwargs.get("claude_api", 0),
+            "dispatch_api": kwargs.get("dispatch_api", 0),
+            "anthropic_api": kwargs.get("anthropic_api", 0),
             "gcp": kwargs.get("gcp", 0),
             "db": kwargs.get("db", 0),
         }
@@ -1856,12 +1857,20 @@ class TestExternalHealthGate:
         result = get_confirmed_down_critical_deps()
         assert "github_api" in result
 
-    def test_dispatch_skipped_when_claude_api_confirmed_down(self):
-        """Gate returns claude_api when it has >=2 consecutive failures."""
+    def test_dispatch_skipped_when_dispatch_api_confirmed_down(self):
+        """Gate returns dispatch_api when it has >=2 consecutive failures."""
         from app.orchestrator import get_confirmed_down_critical_deps
-        self._set_consec(claude_api=3)
+        self._set_consec(dispatch_api=3)
         result = get_confirmed_down_critical_deps()
-        assert "claude_api" in result
+        assert "dispatch_api" in result
+
+    def test_dispatch_proceeds_when_only_anthropic_api_is_confirmed_down(self):
+        """Anthropic-only outages must not block dispatch when aggregate dispatch is healthy."""
+        from app.orchestrator import get_confirmed_down_critical_deps
+        self._set_consec(anthropic_api=3)
+        result = get_confirmed_down_critical_deps()
+        assert "anthropic_api" not in result
+        assert result == []
 
     def test_dispatch_skipped_when_gcp_confirmed_down(self):
         """Gate returns gcp when it has >=2 consecutive failures."""
@@ -1904,10 +1913,10 @@ class TestExternalHealthGate:
     def test_multiple_deps_down_all_returned(self):
         """If multiple critical deps are confirmed down, all are returned."""
         from app.orchestrator import get_confirmed_down_critical_deps
-        self._set_consec(github_api=2, claude_api=2)
+        self._set_consec(github_api=2, dispatch_api=2)
         result = get_confirmed_down_critical_deps()
         assert "github_api" in result
-        assert "claude_api" in result
+        assert "dispatch_api" in result
         assert "gcp" not in result
         assert "db" not in result
 

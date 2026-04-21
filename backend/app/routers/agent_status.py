@@ -32,12 +32,18 @@ from app.routers.agent import verify_agent_token
 from app.max_plan_pool import (
     _max_plan_pool_lock,
     _account_by_id,
+    apply_task_llm_runtime_context,
+    clear_task_llm_runtime_context,
     release_max_plan_account,
     _account_available_for_model,
     _max_plan_pools,
     _extract_task_model,
     clear_rate_limit_state_on_success,
     disable_account_model,
+    get_task_llm_account_id,
+    get_task_llm_auth_mode,
+    get_task_llm_execution_mode,
+    get_task_llm_provider,
     record_completion_event,
 )
 from app.task_lifecycle import _process_post_commit, PostCommitLocked
@@ -540,6 +546,28 @@ async def update_agent_status(
 
     # 2. Update task status
     task.status = payload.status
+    if payload.provider or payload.auth_mode or payload.model or payload.execution_mode:
+        task.context = apply_task_llm_runtime_context(
+            task.context,
+            account_id=get_task_llm_account_id(task),
+            provider=payload.provider or get_task_llm_provider(task),
+            auth_mode=payload.auth_mode or get_task_llm_auth_mode(task),
+            model=payload.model or (task.context or {}).get("llm_model"),
+            execution_mode=payload.execution_mode or get_task_llm_execution_mode(task),
+        )
+        flag_modified(task, 'context')
+    payloads = list(task.payloads or [])
+    if payloads:
+        payload_updated = False
+        if payload.model and not payloads[0].get("model"):
+            payloads[0]["model"] = payload.model
+            payload_updated = True
+        if payload.execution_mode and not payloads[0].get("execution_mode"):
+            payloads[0]["execution_mode"] = payload.execution_mode
+            payload_updated = True
+        if payload_updated:
+            task.payloads = payloads
+            flag_modified(task, 'payloads')
     # Preserve logs as status message when:
     # - no artifact is created (e.g., "no changes" completion), OR
     # - task is failing (artifact-bearing failures must not silently lose diagnostic text)
@@ -837,7 +865,7 @@ async def update_agent_status(
                     )
                 # Probe success: clear cascade-scoped disabled_models entries.
                 # No-op if the account wasn't probing anything for this model.
-                acct_id_clear = (task.context or {}).get("max_plan_account_id")
+                acct_id_clear = get_task_llm_account_id(task)
                 model_clear = _extract_task_model(task)
                 if acct_id_clear and model_clear:
                     try:
@@ -863,7 +891,7 @@ async def update_agent_status(
 
                 # Rate-limited or transient API failures: requeue instead of permanently failing
                 if failure_class in ("RATE_LIMIT", "EXTERNAL_API"):
-                    acct_id = (task.context or {}).get("max_plan_account_id")
+                    acct_id = get_task_llm_account_id(task)
                     model = _extract_task_model(task)
                     if acct_id:
                         await release_max_plan_account(acct_id)
@@ -879,7 +907,7 @@ async def update_agent_status(
                     # Track API failure retries to prevent infinite loops
                     ctx = dict(task.context or {})
                     # Blacklist the account that just hit rate limit so retry picks a different one
-                    acct_id_for_blacklist = (task.context or {}).get("max_plan_account_id")
+                    acct_id_for_blacklist = get_task_llm_account_id(task)
                     if acct_id_for_blacklist and failure_class == "RATE_LIMIT":
                         blacklisted = list(ctx.get("blacklisted_accounts") or [])
                         if acct_id_for_blacklist not in blacklisted:
@@ -980,7 +1008,7 @@ async def update_agent_status(
                                 task.latest_status_message = f"Rate Limited — all accounts exhausted, retrying in 5min"
                         elif failure_class != "EXTERNAL_API":
                             ctx.pop("retry_after", None)
-                        ctx.pop("max_plan_account_id", None)
+                        ctx = clear_task_llm_runtime_context(ctx)
                         ctx.pop("_slot_released", None)
                         # The task just ran on a VM successfully enough to POST a result —
                         # provisioning path worked. Don't carry a stale provision budget
@@ -1000,7 +1028,7 @@ async def update_agent_status(
         # Release Max plan account slot (idempotent — skip if already released by reaper)
         # Runs regardless of whether result recording above succeeded or threw.
         # Flush immediately so _slot_released persists even if downstream processing fails.
-        acct_id = (task.context or {}).get("max_plan_account_id")
+        acct_id = get_task_llm_account_id(task)
         if acct_id and not (task.context or {}).get("_slot_released"):
             await release_max_plan_account(acct_id)
             task.context = {**(task.context or {}), "_slot_released": True}

@@ -28,6 +28,7 @@ vi.mock('fs', () => ({
 
 vi.mock('child_process', () => ({
   spawn: vi.fn().mockReturnValue({
+    stdin: { on: vi.fn(), end: vi.fn() },
     stderr: { on: vi.fn() },
     stdout: { on: vi.fn() },
     on: vi.fn(),
@@ -48,7 +49,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
 import type WebSocket from 'ws';
 
@@ -695,6 +696,18 @@ describe('matchesRateLimit', () => {
   it('returns false for unrelated error output', () => {
     expect(matchesRateLimit('TypeError: cannot read property of undefined')).toBe(false);
   });
+
+  it('detects OpenAI API-key rate limits when provider/auth are supplied', () => {
+    expect(matchesRateLimit('Rate limit reached for gpt-5 in organization test', 'openai', 'api_key')).toBe(true);
+  });
+
+  it('detects Gemini service-account rate limits when provider/auth are supplied', () => {
+    expect(matchesRateLimit('RESOURCE_EXHAUSTED while calling model', 'gemini', 'service_account')).toBe(true);
+  });
+
+  it('does not cross-match provider-specific rate limits', () => {
+    expect(matchesRateLimit('Rate limit reached for gpt-5 in organization test', 'anthropic', 'oauth')).toBe(false);
+  });
 });
 
 describe('RateLimitError', () => {
@@ -709,6 +722,26 @@ describe('RateLimitError', () => {
   it('plain Error is not a RateLimitError', () => {
     const err = new Error('Claude API usage exhausted — banner');
     expect(err).not.toBeInstanceOf(RateLimitError);
+  });
+});
+
+describe('provider runner prompt transport', () => {
+  it('uses stdin for OpenAI run commands instead of argv prompts', () => {
+    const runner = getProviderRunner('openai', 'api_key');
+    const command = runner.buildRunCommand('Very long prompt body', 'gpt-5');
+
+    expect(command.promptInput).toBe('stdin');
+    expect(command.args).toEqual(['exec', '--full-auto', '-m', 'gpt-5']);
+    expect(command.args.join(' ')).not.toContain('Very long prompt body');
+  });
+
+  it('uses stdin for Gemini run commands instead of argv prompts', () => {
+    const runner = getProviderRunner('gemini', 'api_key');
+    const command = runner.buildRunCommand('Very long prompt body', 'gemini-2.5-pro');
+
+    expect(command.promptInput).toBe('stdin');
+    expect(command.args).toEqual(['--approval-mode=yolo', '-o', 'text', '-m', 'gemini-2.5-pro']);
+    expect(command.args.join(' ')).not.toContain('Very long prompt body');
   });
 });
 
