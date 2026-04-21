@@ -171,7 +171,9 @@ jobs:
         id: run_tests
         continue-on-error: true
         run: |
-          set -o pipefail
+          # Disable -e so pytest's non-zero exit doesn't short-circuit the failure-extraction
+          # below. We propagate pytest's exit code at the end via $pytest_status.
+          set +e
           docker run --rm --network host \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
             -e USE_TEST_POSTGRES=true \
@@ -180,9 +182,19 @@ jobs:
             blueprint-backend-test \
             python -m pytest testing/ -v --tb=short --timeout=15 2>&1 | tee test-output.txt
           pytest_status=${PIPESTATUS[0]}
+          set -e
 
-          # Extract failed test IDs
-          grep -E "FAILED" test-output.txt | sed 's/.*FAILED //' | sed 's/ -.*//' | sort -u > pr-test-failures.txt || true
+          # Extract failed test IDs from pytest's "short test summary info" section.
+          grep -E "^FAILED " test-output.txt | sed 's/^FAILED //' | sed 's/ -.*//' | sort -u > pr-test-failures.txt || true
+
+          # Fallback: pytest exited non-zero but printed no FAILED summary (timeout / crash /
+          # collection error). Surface a sentinel + the tail so the Evaluate step is useful.
+          if [ "$pytest_status" -ne 0 ] && [ ! -s pr-test-failures.txt ]; then
+            echo "<pytest crashed or hung; no FAILED summary captured>" > pr-test-failures.txt
+            echo ""
+            echo "=== Last 50 lines of pytest output ==="
+            tail -50 test-output.txt
+          fi
 
           exit $pytest_status
 
