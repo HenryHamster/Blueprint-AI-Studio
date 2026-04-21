@@ -2,12 +2,14 @@ import { useState, useEffect } from 'react';
 import { Plus, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch } from '../api';
 import DesignDocViewer from './DesignDocViewer';
-import VisionViewer from './VisionViewer';
+import ProblemModelViewer from './ProblemModelViewer';
+import RunningUpdatePanel from './RunningUpdatePanel';
 import { DirectionCard } from './DirectionCard';
 import { AutonomousConfigSection } from './AutonomousConfigSection';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { useAutonomousConfig } from '../hooks/useAutonomousConfig';
 import { formatRelativeTime } from '../utils/directionHelpers';
+import type { ProblemModel, RunningUpdateEntry } from '../types';
 
 interface Project {
   id: string;
@@ -105,9 +107,11 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   const [loading, setLoading] = useState(false);
   const [taskCounts, setTaskCounts] = useState<Record<string, number>>({});
   const [activeTasks, setActiveTasks] = useState<Record<string, Array<{ id: string; status: string; title: string; latest_status_message?: string }>>>({});
-  const [vision, setVision] = useState<Record<string, unknown>>({});
   const [designDoc, setDesignDoc] = useState<Record<string, unknown>>({});
-  const [activeTab, setActiveTab] = useState<'directions' | 'vision' | 'design-doc'>('directions');
+  const [problemModel, setProblemModel] = useState<ProblemModel>({});
+  const [runningUpdate, setRunningUpdate] = useState<RunningUpdateEntry[]>([]);
+  const [runningUpdateAckAt, setRunningUpdateAckAt] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<'directions' | 'problem-model' | 'running-update' | 'design-doc'>('directions');
 
   // Error feedback
   const [error, setError] = useState<string | null>(null);
@@ -173,8 +177,10 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
       const data = await res.json();
       setDirections(data.directions ?? []);
       setAutonomousEnabled(data.autonomous_enabled ?? false);
-      setVision(data.vision ?? {});
       setDesignDoc(data.design_doc ?? {});
+      setProblemModel(data.problem_model ?? {});
+      setRunningUpdate(Array.isArray(data.running_update) ? data.running_update : []);
+      setRunningUpdateAckAt(data.running_update_acknowledged_at ?? null);
       if (countsRes.ok) {
         const countsData = await countsRes.json();
         setTaskCounts(countsData.counts ?? {});
@@ -476,14 +482,33 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             Directions
           </button>
           <button
-            onClick={() => setActiveTab('vision')}
+            onClick={() => setActiveTab('problem-model')}
             className={`px-4 py-2.5 text-sm font-medium transition-colors ${
-              activeTab === 'vision'
+              activeTab === 'problem-model'
                 ? 'text-neutral-100 border-b-2 border-cyan-500'
                 : 'text-neutral-500 hover:text-neutral-300'
             }`}
           >
-            Vision
+            Problem Model
+            {(() => {
+              const gapCount = (problemModel.gaps ?? []).length;
+              return gapCount > 0 ? <span className="ml-1.5 text-xs text-neutral-500">({gapCount})</span> : null;
+            })()}
+          </button>
+          <button
+            onClick={() => setActiveTab('running-update')}
+            className={`px-4 py-2.5 text-sm font-medium transition-colors ${
+              activeTab === 'running-update'
+                ? 'text-neutral-100 border-b-2 border-emerald-500'
+                : 'text-neutral-500 hover:text-neutral-300'
+            }`}
+          >
+            Running Update
+            {runningUpdate.length > 0 && (
+              <span className="ml-1.5 inline-flex items-center justify-center text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded-full px-1.5 py-0.5">
+                {runningUpdate.length}
+              </span>
+            )}
           </button>
           <button
             onClick={() => setActiveTab('design-doc')}
@@ -629,44 +654,54 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
 
         {/* Directions list */}
         <div className="flex-1 overflow-y-auto custom-scrollbar px-5 py-3">
-          {/* Vision quick-link */}
+          {/* Problem Model quick-link */}
           {selectedProjectId && !loading && (() => {
-            const visionSystems = Array.isArray(vision.systems) ? vision.systems as Array<Record<string, unknown>> : [];
-            const hasPurpose = typeof vision.purpose === 'string' && vision.purpose;
-            const statusCounts = visionSystems.reduce<Record<string, number>>((acc, s) => {
-              const st = String(s.status || 'planned');
+            const capabilities = problemModel.capabilities ?? [];
+            const gaps = problemModel.gaps ?? [];
+            const hasPurpose = Boolean(problemModel.intent?.purpose);
+            const pending = problemModel.pending_user_confirmation ?? [];
+            const statusCounts = capabilities.reduce<Record<string, number>>((acc, c) => {
+              const st = c.status || 'planned';
               acc[st] = (acc[st] || 0) + 1;
               return acc;
             }, {});
-            const vBarColors: Record<string, string> = {
-              mature: 'bg-cyan-500', functional: 'bg-emerald-500', in_progress: 'bg-amber-500', planned: 'bg-neutral-600',
+            const capBarColors: Record<string, string> = {
+              working: 'bg-emerald-500', partial: 'bg-amber-500', planned: 'bg-neutral-600',
             };
-            if (!hasPurpose && Object.keys(vision).length === 0) return null;
+            const modelEmpty = !hasPurpose && capabilities.length === 0 && gaps.length === 0;
+            if (modelEmpty) return null;
             return (
             <div className="mb-5">
               <button
-                onClick={() => setActiveTab('vision')}
+                onClick={() => setActiveTab('problem-model')}
                 className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors"
               >
                 <ChevronRight className="w-3.5 h-3.5 text-cyan-500/60 group-hover:text-cyan-400 transition-colors" />
                 <span className="text-[12px] font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
-                  Product Vision
+                  Problem Model
                 </span>
-                {typeof vision.last_updated === 'string' && (
+                {problemModel.last_updated && (
                   <span className="text-[9px] text-neutral-600 font-mono ml-1">
-                    {formatRelativeTime(vision.last_updated as string)}
+                    {formatRelativeTime(problemModel.last_updated)}
                   </span>
                 )}
-                <span className="text-[9px] text-neutral-600 ml-1">{visionSystems.length} systems</span>
+                <span className="text-[9px] text-neutral-600 ml-1">
+                  {gaps.length} gap{gaps.length === 1 ? '' : 's'}
+                </span>
+                {pending.length > 0 && (
+                  <span className="text-[9px] text-amber-400 ml-1 font-semibold">
+                    {pending.length} needs attention
+                  </span>
+                )}
               </button>
-              {visionSystems.length > 0 && (
+              {capabilities.length > 0 && (
                 <div className="px-1.5 mt-0.5">
                   <div className="flex h-1.5 rounded-full overflow-hidden bg-neutral-800 mb-1">
-                    {['mature', 'functional', 'in_progress', 'planned'].map(status => {
+                    {(['working', 'partial', 'planned'] as const).map(status => {
                       const count = statusCounts[status] || 0;
                       if (count === 0) return null;
-                      const pct = (count / visionSystems.length) * 100;
-                      return <div key={status} className={`${vBarColors[status]} transition-all`} style={{ width: `${pct}%` }} />;
+                      const pct = (count / capabilities.length) * 100;
+                      return <div key={status} className={`${capBarColors[status]} transition-all`} style={{ width: `${pct}%` }} />;
                     })}
                   </div>
                 </div>
@@ -674,6 +709,24 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             </div>
             );
           })()}
+
+          {/* Running Update quick-link */}
+          {selectedProjectId && !loading && runningUpdate.length > 0 && (
+            <div className="mb-5">
+              <button
+                onClick={() => setActiveTab('running-update')}
+                className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors"
+              >
+                <ChevronRight className="w-3.5 h-3.5 text-emerald-500/60 group-hover:text-emerald-400 transition-colors" />
+                <span className="text-[12px] font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
+                  Running Update
+                </span>
+                <span className="inline-flex items-center justify-center text-[9px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded-full px-1.5 py-0.5 ml-1">
+                  {runningUpdate.length} new
+                </span>
+              </button>
+            </div>
+          )}
 
           {/* Architecture quick-link */}
           {(() => {
@@ -830,15 +883,30 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
         </div>
         </>)}
 
-        {/* === Vision tab content === */}
-        {activeTab === 'vision' && (
-          <div className="flex-1 overflow-y-auto custom-scrollbar">
-            <VisionViewer
-              vision={vision}
-              directions={directions}
-              selectedProjectId={selectedProjectId}
+        {/* === Problem Model tab content === */}
+        {activeTab === 'problem-model' && selectedProjectId && (
+          <div className="flex-1 overflow-hidden">
+            <ProblemModelViewer
+              projectId={selectedProjectId}
+              problemModel={problemModel}
               addToast={addToast}
-              onVisionUpdated={setVision}
+              onUpdated={setProblemModel}
+            />
+          </div>
+        )}
+
+        {/* === Running Update tab content === */}
+        {activeTab === 'running-update' && selectedProjectId && (
+          <div className="flex-1 overflow-hidden">
+            <RunningUpdatePanel
+              projectId={selectedProjectId}
+              entries={runningUpdate}
+              acknowledgedAt={runningUpdateAckAt}
+              addToast={addToast}
+              onAcknowledged={() => {
+                setRunningUpdate([]);
+                setRunningUpdateAckAt(new Date().toISOString());
+              }}
             />
           </div>
         )}

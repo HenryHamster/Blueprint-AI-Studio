@@ -50,6 +50,13 @@ async def get_all_projects(
             "directions": project.directions,
             "vision": project.vision or {},
             "design_doc": project.design_doc or {},
+            "problem_model": project.problem_model or {},
+            "running_update": project.running_update or [],
+            "running_update_acknowledged_at": (
+                project.running_update_acknowledged_at.isoformat()
+                if project.running_update_acknowledged_at else None
+            ),
+            "self_reflection_log": project.self_reflection_log or [],
             "build_config": project.build_config or {},
             "autonomous_enabled": project.autonomous_enabled,
             "is_self_repo": project.is_self_repo,
@@ -66,6 +73,9 @@ class ProjectUpdate(BaseModel):
     design_doc: Optional[Dict[str, Any]] = None
     build_config: Optional[Dict[str, Any]] = None
     autonomous_enabled: Optional[bool] = None
+    # User-editable subset of problem_model — intent, constraints, context.
+    # Gaps / capabilities / friction are agent-owned and not writable here.
+    problem_model_patch: Optional[Dict[str, Any]] = None
 
 
 @router.patch("/projects/{project_id}")
@@ -120,6 +130,38 @@ async def update_project(
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid build_config structure")
         flag_modified(project, "build_config")
+
+    if payload.problem_model_patch is not None:
+        # User-editable subset only — intent / context / constraints. Agent-
+        # owned fields (gaps, capabilities, friction, archived_gaps,
+        # pending_user_confirmation, revision_log) pass through unchanged.
+        # Bump revision, stamp last_updated, mark last_updated_by="user"
+        # so the agent can distinguish user edits during its next cycle.
+        from pydantic import ValidationError as _PmValidationError  # noqa: PLC0415
+
+        from app.problem_model import ProblemModel, parse_problem_model  # noqa: PLC0415
+
+        ALLOWED_USER_FIELDS = {"intent", "context", "constraints"}
+        invalid = set(payload.problem_model_patch.keys()) - ALLOWED_USER_FIELDS
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot edit agent-owned problem_model fields: {sorted(invalid)}. "
+                       f"Editable fields: {sorted(ALLOWED_USER_FIELDS)}",
+            )
+        current = parse_problem_model(project.problem_model)
+        merged_raw: Dict[str, Any] = current.model_dump()
+        for field, value in payload.problem_model_patch.items():
+            merged_raw[field] = value
+        try:
+            validated = ProblemModel.model_validate(merged_raw)
+        except _PmValidationError as ve:
+            raise HTTPException(status_code=400, detail=f"Invalid problem_model patch: {ve}") from None
+        validated.revision = current.revision + 1
+        validated.last_updated = _utcnow().isoformat()
+        validated.last_updated_by = "user"
+        project.problem_model = validated.model_dump()
+        flag_modified(project, "problem_model")
 
     session.add(project)
     await session.commit()

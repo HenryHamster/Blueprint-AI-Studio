@@ -64,7 +64,20 @@ async def get_directions(
     directions_with_rate = [
         {**d, "merge_rate": _compute_direction_merge_rate(d)} for d in directions
     ]
-    return {"directions": directions_with_rate, "autonomous_enabled": project.autonomous_enabled, "vision": project.vision or {}, "design_doc": project.design_doc or {}}
+    return {
+        "directions": directions_with_rate,
+        "autonomous_enabled": project.autonomous_enabled,
+        "vision": project.vision or {},
+        "design_doc": project.design_doc or {},
+        "problem_model": project.problem_model or {},
+        "running_update": project.running_update or [],
+        "running_update_acknowledged_at": (
+            project.running_update_acknowledged_at.isoformat()
+            if project.running_update_acknowledged_at else None
+        ),
+        "self_reflection_log": project.self_reflection_log or [],
+        "is_self_repo": bool(project.is_self_repo),
+    }
 
 
 @router.post("/projects/{project_id}/directions")

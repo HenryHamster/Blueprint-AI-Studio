@@ -1597,6 +1597,112 @@ class TestDirectionAutoPauseStats:
         assert data["top_reasons"] == []
 
 
+class TestProjectEndpointsSurfaceProblemModel:
+    """Project endpoints expose problem_model + running_update fields so the
+    admin-ui can render the new strategic views."""
+
+    @pytest.mark.asyncio
+    async def test_list_projects_includes_new_fields(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "intent": {"purpose": "Build X.", "current_focus": "Ship Y."},
+        }
+        project.running_update = [{"ts": "2026-04-21T00:00:00", "whats_changed": "x"}]
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data, list)
+        our = next((p for p in data if p["id"] == str(project.id)), None)
+        assert our is not None
+        assert "problem_model" in our
+        assert our["problem_model"]["intent"]["purpose"] == "Build X."
+        assert "running_update" in our
+        assert len(our["running_update"]) == 1
+        assert "running_update_acknowledged_at" in our
+        assert "self_reflection_log" in our
+
+
+class TestPatchProblemModel:
+    """PATCH /api/admin/projects/{id} accepts problem_model_patch for the
+    user-editable subset (intent, context, constraints)."""
+
+    @pytest.mark.asyncio
+    async def test_patch_intent_and_constraints(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "problem_model_patch": {
+                    "intent": {"purpose": "Autonomous dev.", "current_focus": "Review loop."},
+                    "constraints": ["Solo dev, 4h/day.", "Don't touch CI workflows."],
+                    "context": {"project_type": "personal", "team": "solo"},
+                }
+            },
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["intent"]["purpose"] == "Autonomous dev."
+        assert pm["intent"]["current_focus"] == "Review loop."
+        assert pm["constraints"] == ["Solo dev, 4h/day.", "Don't touch CI workflows."]
+        assert pm["context"]["project_type"] == "personal"
+        assert pm["revision"] == 1
+        assert pm["last_updated_by"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_agent_owned_fields(
+        self, client: AsyncClient, db_session
+    ):
+        """Users cannot rewrite gaps / capabilities / friction via PATCH —
+        those are agent-owned. Enforcing this at the API layer prevents
+        accidental data loss."""
+        project = await _make_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"problem_model_patch": {"gaps": [{"id": "g-x", "name": "mine"}]}},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        msg = body.get("detail") or body.get("error", {}).get("message", "")
+        assert "agent-owned" in msg or "Cannot edit" in msg
+
+    @pytest.mark.asyncio
+    async def test_patch_preserves_agent_fields(
+        self, client: AsyncClient, db_session
+    ):
+        """Patching intent does not disturb agent-owned fields."""
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "intent": {"purpose": "Old.", "current_focus": ""},
+            "gaps": [{"id": "g-keep", "name": "should survive", "status": "active"}],
+            "capabilities": [{"name": "CapA", "status": "working"}],
+            "revision": 3,
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"problem_model_patch": {"intent": {"purpose": "New purpose."}}},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["intent"]["purpose"] == "New purpose."
+        assert len(pm["gaps"]) == 1
+        assert pm["gaps"][0]["id"] == "g-keep"
+        assert len(pm["capabilities"]) == 1
+        assert pm["revision"] == 4  # bumped
+        assert pm["last_updated_by"] == "user"
+
+
 class TestAcknowledgeRunningUpdate:
     """Acknowledge endpoint clears the running_update list and stamps
     running_update_acknowledged_at — the user's way to reset the

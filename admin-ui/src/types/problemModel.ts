@@ -1,0 +1,161 @@
+// Shape of the strategic layer's problem_model — mirrors the Pydantic
+// schema in backend/app/problem_model.py. Kept free-form where the backend
+// schema uses string literals so the UI can render future additions
+// without a type-error wall.
+
+export type SourceType =
+  | 'user_message'
+  | 'friction_promotion'
+  | 'agent_observation'
+  | 'self_reflection'
+  | 'shipped_change'
+  | 'direction_outcome';
+
+export interface Source {
+  type: SourceType;
+  message_id?: string | null;
+  excerpt?: string | null;
+  friction_id?: string | null;
+  direction_id?: string | null;
+  pr_number?: number | null;
+}
+
+export interface Intent {
+  purpose: string;
+  current_focus: string;
+  source?: Source | null;
+}
+
+export interface ProjectContext {
+  project_type?: string | null;
+  users?: string | null;
+  team?: string | null;
+  deploy_cadence?: string | null;
+  notes?: string | null;
+}
+
+export type CapabilityStatus = 'working' | 'partial' | 'planned';
+
+export interface Capability {
+  name: string;
+  status: CapabilityStatus;
+  notes?: string | null;
+  source?: Source | null;
+}
+
+export type GapSize = 'small' | 'medium' | 'large';
+export type GapPriority = 'high' | 'medium' | 'low';
+export type GapStatus = 'active' | 'closed' | 'abandoned' | 'blocked';
+
+export interface GapHistoryEvent {
+  ts: string;
+  event: string;
+  note?: string | null;
+}
+
+export interface Gap {
+  id: string;
+  name: string;
+  description?: string;
+  evidence?: string;
+  size: GapSize;
+  priority: GapPriority;
+  status: GapStatus;
+  opened?: string;
+  closed?: string | null;
+  tag?: string | null;
+  source?: Source | null;
+  active_moves: string[];
+  past_moves: string[];
+  history: GapHistoryEvent[];
+}
+
+export type FrictionStatus = 'active' | 'mitigated' | 'resolved';
+
+export interface Friction {
+  id: string;
+  name: string;
+  description?: string;
+  seen_in: string[];
+  status: FrictionStatus;
+  mitigations_tried: string[];
+  source?: Source | null;
+  promoted_to_gap_id?: string | null;
+}
+
+export type PendingConfirmationType =
+  | 'credentials_needed'
+  | 'access_needed'
+  | 'intent_change'
+  | 'major_decision';
+
+export interface PendingConfirmation {
+  id: string;
+  type: PendingConfirmationType;
+  proposal: string;
+  rationale?: string;
+  created_at?: string;
+}
+
+export interface RevisionLogEntry {
+  revision: number;
+  ts: string;
+  summary?: string;
+  changes?: Record<string, unknown>;
+}
+
+export interface ProblemModel {
+  revision?: number;
+  last_updated?: string | null;
+  last_updated_by?: 'agent' | 'user' | null;
+  intent?: Intent;
+  context?: ProjectContext;
+  constraints?: string[];
+  capabilities?: Capability[];
+  gaps?: Gap[];
+  archived_gaps?: Gap[];
+  friction?: Friction[];
+  pending_user_confirmation?: PendingConfirmation[];
+  revision_log?: RevisionLogEntry[];
+}
+
+// Running-update accumulating journal — appended each cycle until the user
+// acknowledges to clear it.
+export interface RunningUpdateEntry {
+  ts: string;
+  cycle_task_id?: string | null;
+  whats_changed?: string;
+  whats_working_on?: string;
+  blockers?: string;
+  next_up?: string;
+}
+
+// Self-reflection log — one entry per cycle on self-repo projects.
+export interface SelfReflectionEntry {
+  ts: string;
+  cycle_task_id?: string | null;
+  what_was_hard?: string;
+  missing_context?: string;
+  proposed_self_improvement?: string;
+}
+
+// Subset of problem_model fields the user is allowed to edit via PATCH.
+export interface ProblemModelPatch {
+  intent?: Partial<Intent>;
+  context?: Partial<ProjectContext>;
+  constraints?: string[];
+}
+
+// Shape of what the Directions endpoint returns (plus the legacy fields
+// it has always returned).
+export interface DirectionsEndpointResponse {
+  directions: Array<Record<string, unknown>>;
+  autonomous_enabled: boolean;
+  vision: Record<string, unknown>;
+  design_doc: Record<string, unknown>;
+  problem_model: ProblemModel;
+  running_update: RunningUpdateEntry[];
+  running_update_acknowledged_at: string | null;
+  self_reflection_log: SelfReflectionEntry[];
+  is_self_repo: boolean;
+}

@@ -1,0 +1,440 @@
+import { useState } from 'react';
+import { Pencil, ChevronDown, ChevronRight, AlertCircle, Target, Box, CheckCircle2, Circle, Clock, Flag } from 'lucide-react';
+import { timeAgo } from '../utils/time';
+import { MarkdownContent } from './MarkdownContent';
+import { ProblemModelEditor } from './ProblemModelEditor';
+import type {
+  ProblemModel,
+  Gap,
+  Capability,
+  Friction,
+  PendingConfirmation,
+  ProblemModelPatch,
+  Source,
+} from '../types';
+
+interface ProblemModelViewerProps {
+  projectId: string;
+  problemModel: ProblemModel;
+  addToast: (message: string, type: 'success' | 'error' | 'info') => void;
+  onUpdated: (patched: ProblemModel) => void;
+}
+
+const capabilityBarColors: Record<string, string> = {
+  working: 'bg-emerald-500',
+  partial: 'bg-amber-500',
+  planned: 'bg-neutral-600',
+};
+
+const capabilityStatusLabels: Record<string, string> = {
+  working: 'Working',
+  partial: 'Partial',
+  planned: 'Planned',
+};
+
+const priorityColors: Record<string, string> = {
+  high: 'bg-rose-500/15 text-rose-300 border-rose-500/30',
+  medium: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+  low: 'bg-neutral-700/40 text-neutral-400 border-neutral-700',
+};
+
+const sizeColors: Record<string, string> = {
+  small: 'text-neutral-500',
+  medium: 'text-neutral-400',
+  large: 'text-neutral-300',
+};
+
+const pendingTypeLabels: Record<string, string> = {
+  credentials_needed: 'Credentials needed',
+  access_needed: 'Access needed',
+  intent_change: 'Intent change',
+  major_decision: 'Major decision',
+};
+
+function SourceBadge({ source }: { source: Source }) {
+  const parts: string[] = [source.type.replace(/_/g, ' ')];
+  if (source.message_id) parts.push(`msg ${source.message_id.slice(0, 8)}`);
+  if (source.pr_number) parts.push(`PR #${source.pr_number}`);
+  if (source.direction_id) parts.push(`dir ${source.direction_id.slice(0, 8)}`);
+  if (source.friction_id) parts.push(`friction ${source.friction_id.slice(0, 8)}`);
+  return (
+    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-800/70 text-neutral-400 border border-neutral-800">
+      {parts.join(' · ')}
+    </span>
+  );
+}
+
+function SectionHeader({ children, icon, count }: { children: React.ReactNode; icon?: React.ReactNode; count?: number }) {
+  return (
+    <div className="flex items-center gap-2 mb-2 mt-4 first:mt-0">
+      {icon && <span className="text-neutral-500">{icon}</span>}
+      <h3 className="text-sm font-semibold text-neutral-200 uppercase tracking-wide">{children}</h3>
+      {typeof count === 'number' && (
+        <span className="text-xs text-neutral-500">({count})</span>
+      )}
+    </div>
+  );
+}
+
+function CapabilityBar({ capability }: { capability: Capability }) {
+  const status = capability.status || 'planned';
+  return (
+    <div className="flex items-center gap-3 py-1.5">
+      <div className={`w-2 h-2 rounded-full ${capabilityBarColors[status] || capabilityBarColors.planned}`} />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-baseline gap-2">
+          <span className="text-sm text-neutral-200 truncate">{capability.name}</span>
+          <span className="text-xs text-neutral-500">{capabilityStatusLabels[status] || status}</span>
+        </div>
+        {capability.notes && (
+          <p className="text-xs text-neutral-500 truncate">{capability.notes}</p>
+        )}
+      </div>
+      {capability.source && <SourceBadge source={capability.source} />}
+    </div>
+  );
+}
+
+function GapCard({ gap }: { gap: Gap }) {
+  return (
+    <div className="border border-neutral-800 rounded-md p-3 bg-neutral-900/40">
+      <div className="flex items-start justify-between gap-2 mb-1">
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-1.5 mb-1">
+            <span className={`inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded border ${priorityColors[gap.priority] || priorityColors.medium}`}>
+              {gap.priority}
+            </span>
+            <span className={`text-[10px] uppercase tracking-wide ${sizeColors[gap.size] || sizeColors.medium}`}>
+              {gap.size}
+            </span>
+            {gap.tag && (
+              <span className="inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                {gap.tag}
+              </span>
+            )}
+            <span className="text-[10px] font-mono text-neutral-600">{gap.id}</span>
+          </div>
+          <h4 className="text-sm font-medium text-neutral-100">{gap.name}</h4>
+        </div>
+        {gap.source && <SourceBadge source={gap.source} />}
+      </div>
+      {gap.description && (
+        <p className="text-sm text-neutral-300 mt-1.5">{gap.description}</p>
+      )}
+      {gap.evidence && (
+        <p className="text-xs text-neutral-500 mt-1 italic">Evidence: {gap.evidence}</p>
+      )}
+      {(gap.active_moves.length > 0 || gap.past_moves.length > 0) && (
+        <div className="mt-2 text-xs text-neutral-500 flex flex-wrap gap-2">
+          {gap.active_moves.length > 0 && (
+            <span><span className="text-neutral-400">Active:</span> {gap.active_moves.length} direction{gap.active_moves.length === 1 ? '' : 's'}</span>
+          )}
+          {gap.past_moves.length > 0 && (
+            <span><span className="text-neutral-400">Past:</span> {gap.past_moves.length}</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ArchivedGapRow({ gap }: { gap: Gap }) {
+  return (
+    <div className="flex items-baseline gap-2 py-1 text-sm">
+      <span className="text-neutral-600 text-xs font-mono shrink-0">{gap.id}</span>
+      <span className="text-neutral-300 truncate flex-1">{gap.name}</span>
+      <span className={`text-[10px] uppercase px-1.5 py-0.5 rounded ${gap.status === 'closed' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-neutral-700/40 text-neutral-500'}`}>
+        {gap.status}
+      </span>
+      {gap.closed && <span className="text-xs text-neutral-500">{timeAgo(gap.closed)}</span>}
+    </div>
+  );
+}
+
+function FrictionRow({ friction }: { friction: Friction }) {
+  const statusColor = friction.status === 'resolved'
+    ? 'text-emerald-400'
+    : friction.status === 'mitigated' ? 'text-amber-400' : 'text-rose-400';
+  return (
+    <div className="border border-neutral-800 rounded-md p-2.5 bg-neutral-900/30">
+      <div className="flex items-baseline gap-2 mb-0.5">
+        <span className={`text-xs uppercase tracking-wide font-semibold ${statusColor}`}>
+          {friction.status}
+        </span>
+        <span className="text-sm text-neutral-200 flex-1">{friction.name}</span>
+        {friction.source && <SourceBadge source={friction.source} />}
+      </div>
+      {friction.description && (
+        <p className="text-xs text-neutral-500 mt-0.5">{friction.description}</p>
+      )}
+      {friction.seen_in.length > 0 && (
+        <p className="text-xs text-neutral-600 mt-1">
+          Seen in {friction.seen_in.length} direction{friction.seen_in.length === 1 ? '' : 's'}
+        </p>
+      )}
+      {friction.promoted_to_gap_id && (
+        <p className="text-xs text-cyan-400 mt-1">
+          Promoted to gap {friction.promoted_to_gap_id}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function PendingConfirmationRow({ pending }: { pending: PendingConfirmation }) {
+  return (
+    <div className="border border-amber-500/40 rounded-md p-3 bg-amber-500/5">
+      <div className="flex items-start gap-2">
+        <AlertCircle size={14} className="text-amber-400 shrink-0 mt-0.5" />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-baseline gap-2 mb-1">
+            <span className="text-xs font-semibold text-amber-300 uppercase tracking-wide">
+              {pendingTypeLabels[pending.type] || pending.type}
+            </span>
+            <span className="text-[10px] font-mono text-neutral-600">{pending.id}</span>
+          </div>
+          <p className="text-sm text-neutral-100">{pending.proposal}</p>
+          {pending.rationale && (
+            <p className="text-xs text-neutral-400 mt-1">{pending.rationale}</p>
+          )}
+          {pending.created_at && (
+            <p className="text-[10px] text-neutral-500 mt-1">{timeAgo(pending.created_at)}</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function ProblemModelViewer({
+  projectId,
+  problemModel,
+  addToast,
+  onUpdated,
+}: ProblemModelViewerProps) {
+  const [showEditor, setShowEditor] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
+
+  const intent = problemModel.intent ?? { purpose: '', current_focus: '' };
+  const context = problemModel.context ?? {};
+  const constraints = problemModel.constraints ?? [];
+  const capabilities = problemModel.capabilities ?? [];
+  const gaps = problemModel.gaps ?? [];
+  const archivedGaps = problemModel.archived_gaps ?? [];
+  const friction = problemModel.friction ?? [];
+  const pending = problemModel.pending_user_confirmation ?? [];
+  const revision = problemModel.revision ?? 0;
+  const lastUpdated = problemModel.last_updated ?? '';
+  const lastUpdatedBy = problemModel.last_updated_by ?? null;
+
+  const isEmpty = !intent.purpose && !intent.current_focus && constraints.length === 0
+    && capabilities.length === 0 && gaps.length === 0 && friction.length === 0;
+
+  // Group capabilities by status for a cleaner visual grouping
+  const capsByStatus = capabilities.reduce<Record<string, Capability[]>>((acc, cap) => {
+    const s = cap.status || 'planned';
+    (acc[s] ||= []).push(cap);
+    return acc;
+  }, {});
+
+  // Sort gaps by priority (high > medium > low)
+  const priorityRank: Record<string, number> = { high: 0, medium: 1, low: 2 };
+  const sortedGaps = [...gaps].sort((a, b) =>
+    (priorityRank[a.priority] ?? 3) - (priorityRank[b.priority] ?? 3)
+  );
+
+  const hasContextFields = Boolean(
+    context.project_type || context.users || context.team || context.deploy_cadence || context.notes
+  );
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Header */}
+      <div className="border-b border-neutral-800 px-4 py-3 flex items-start justify-between gap-3">
+        <div className="flex-1 min-w-0">
+          <h2 className="text-sm font-semibold text-neutral-100 flex items-center gap-2">
+            <Target size={14} className="text-neutral-400" />
+            Problem Model
+          </h2>
+          <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-neutral-500 mt-1">
+            <span>rev {revision}</span>
+            {lastUpdated && <span>updated {timeAgo(lastUpdated)}</span>}
+            {lastUpdatedBy && <span>by {lastUpdatedBy}</span>}
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => setShowEditor(true)}
+          className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-neutral-700 bg-neutral-800/50 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100 transition"
+        >
+          <Pencil size={11} />
+          Edit intent
+        </button>
+      </div>
+
+      <div className="flex-1 overflow-y-auto custom-scrollbar px-4 py-4 space-y-2">
+        {isEmpty && (
+          <div className="text-center py-12 text-neutral-500">
+            <p className="text-sm">The problem model hasn't been populated yet.</p>
+            <p className="text-xs mt-1 text-neutral-600">
+              Edit intent to seed it, or run a strategic cycle to have the agent bootstrap it.
+            </p>
+          </div>
+        )}
+
+        {/* Pending confirmations — visually prominent when present */}
+        {pending.length > 0 && (
+          <section>
+            <SectionHeader icon={<AlertCircle size={14} />} count={pending.length}>
+              Needs your attention
+            </SectionHeader>
+            <div className="space-y-2">
+              {pending.map((p) => <PendingConfirmationRow key={p.id} pending={p} />)}
+            </div>
+          </section>
+        )}
+
+        {/* Intent */}
+        {(intent.purpose || intent.current_focus) && (
+          <section>
+            <SectionHeader icon={<Flag size={14} />}>Intent</SectionHeader>
+            {intent.purpose && (
+              <div className="mb-2">
+                <h4 className="text-xs text-neutral-500 uppercase tracking-wide mb-0.5">Purpose</h4>
+                <p className="text-sm text-neutral-200">{intent.purpose}</p>
+              </div>
+            )}
+            {intent.current_focus && (
+              <div>
+                <h4 className="text-xs text-neutral-500 uppercase tracking-wide mb-0.5">Current focus</h4>
+                <p className="text-sm text-neutral-200">{intent.current_focus}</p>
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* Context */}
+        {hasContextFields && (
+          <section>
+            <SectionHeader>Context</SectionHeader>
+            <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1.5 text-sm">
+              {context.project_type && <><dt className="text-xs text-neutral-500">Type</dt><dd className="text-neutral-300">{context.project_type}</dd></>}
+              {context.users && <><dt className="text-xs text-neutral-500">Users</dt><dd className="text-neutral-300">{context.users}</dd></>}
+              {context.team && <><dt className="text-xs text-neutral-500">Team</dt><dd className="text-neutral-300">{context.team}</dd></>}
+              {context.deploy_cadence && <><dt className="text-xs text-neutral-500">Cadence</dt><dd className="text-neutral-300">{context.deploy_cadence}</dd></>}
+            </dl>
+            {context.notes && (
+              <div className="mt-2">
+                <h4 className="text-xs text-neutral-500 uppercase tracking-wide mb-0.5">Notes</h4>
+                <div className="text-sm text-neutral-300">
+                  <MarkdownContent content={context.notes} />
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* Constraints */}
+        {constraints.length > 0 && (
+          <section>
+            <SectionHeader count={constraints.length}>Constraints</SectionHeader>
+            <ul className="space-y-1">
+              {constraints.map((c, i) => (
+                <li key={i} className="text-sm text-neutral-300 pl-3 border-l-2 border-neutral-800">{c}</li>
+              ))}
+            </ul>
+          </section>
+        )}
+
+        {/* Capabilities */}
+        {capabilities.length > 0 && (
+          <section>
+            <SectionHeader icon={<Box size={14} />} count={capabilities.length}>Capabilities</SectionHeader>
+            <div className="space-y-3">
+              {(['working', 'partial', 'planned'] as const).map((status) => {
+                const caps = capsByStatus[status] ?? [];
+                if (caps.length === 0) return null;
+                return (
+                  <div key={status}>
+                    <h4 className="text-[11px] font-medium text-neutral-500 uppercase tracking-wide mb-1">
+                      {capabilityStatusLabels[status]} ({caps.length})
+                    </h4>
+                    <div className="divide-y divide-neutral-800/70 border border-neutral-800/70 rounded-md">
+                      {caps.map((c, i) => (
+                        <div key={i} className="px-2"><CapabilityBar capability={c} /></div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {/* Gaps (active) */}
+        {sortedGaps.length > 0 && (
+          <section>
+            <SectionHeader icon={<Circle size={14} />} count={sortedGaps.length}>Active gaps</SectionHeader>
+            <div className="space-y-2">
+              {sortedGaps.map((g) => <GapCard key={g.id} gap={g} />)}
+            </div>
+          </section>
+        )}
+
+        {/* Friction */}
+        {friction.length > 0 && (
+          <section>
+            <SectionHeader count={friction.length}>Friction</SectionHeader>
+            <div className="space-y-2">
+              {friction.map((f) => <FrictionRow key={f.id} friction={f} />)}
+            </div>
+          </section>
+        )}
+
+        {/* Archived gaps */}
+        {archivedGaps.length > 0 && (
+          <section>
+            <button
+              type="button"
+              onClick={() => setShowArchived((v) => !v)}
+              className="flex items-center gap-1.5 text-xs text-neutral-500 hover:text-neutral-300 transition mt-4"
+            >
+              {showArchived ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+              <CheckCircle2 size={12} />
+              Archived gaps ({archivedGaps.length})
+            </button>
+            {showArchived && (
+              <div className="mt-2 pl-4 border-l border-neutral-800 space-y-1">
+                {archivedGaps.map((g) => <ArchivedGapRow key={g.id} gap={g} />)}
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* Revision hint at bottom */}
+        {lastUpdated && (
+          <div className="pt-4 text-xs text-neutral-600 text-center">
+            <Clock size={10} className="inline mr-1" />
+            rev {revision} — {timeAgo(lastUpdated)} by {lastUpdatedBy || 'unknown'}
+          </div>
+        )}
+      </div>
+
+      {showEditor && (
+        <ProblemModelEditor
+          projectId={projectId}
+          problemModel={problemModel}
+          onClose={() => setShowEditor(false)}
+          onSaved={(patched) => {
+            setShowEditor(false);
+            onUpdated(patched);
+          }}
+          addToast={addToast}
+        />
+      )}
+    </div>
+  );
+}
+
+// Re-export for convenience
+export type { ProblemModelPatch };

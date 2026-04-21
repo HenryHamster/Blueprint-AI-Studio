@@ -21,8 +21,12 @@ vi.mock('./DesignDocViewer', () => ({
   default: () => <div data-testid="design-doc-viewer">DesignDoc</div>,
 }));
 
-vi.mock('./VisionViewer', () => ({
-  default: () => <div data-testid="vision-viewer">VisionContent</div>,
+vi.mock('./ProblemModelViewer', () => ({
+  default: () => <div data-testid="problem-model-viewer">ProblemModelContent</div>,
+}));
+
+vi.mock('./RunningUpdatePanel', () => ({
+  default: () => <div data-testid="running-update-panel">RunningUpdateContent</div>,
 }));
 
 vi.mock('./AutonomousConfigSection', () => ({
@@ -170,13 +174,22 @@ describe('DirectionsPanel', () => {
     expect(screen.getAllByText('Proposed by Agent (1)').length).toBeGreaterThan(0);
   });
 
-  it('clicking the Vision tab shows VisionViewer', async () => {
+  it('clicking the Problem Model tab shows ProblemModelViewer', async () => {
     mockFetch(baseResponses);
     const user = userEvent.setup();
     render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} />);
     await screen.findByText('Project 1');
-    await user.click(screen.getByRole('button', { name: 'Vision' }));
-    expect(screen.getByTestId('vision-viewer')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /Problem Model/ }));
+    expect(screen.getByTestId('problem-model-viewer')).toBeInTheDocument();
+  });
+
+  it('clicking the Running Update tab shows RunningUpdatePanel', async () => {
+    mockFetch(baseResponses);
+    const user = userEvent.setup();
+    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} />);
+    await screen.findByText('Project 1');
+    await user.click(screen.getByRole('button', { name: /Running Update/ }));
+    expect(screen.getByTestId('running-update-panel')).toBeInTheDocument();
   });
 
   it('clicking the Design Doc tab shows DesignDocViewer', async () => {
