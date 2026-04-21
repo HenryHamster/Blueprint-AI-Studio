@@ -536,6 +536,11 @@ async def trigger_strategic_cycle(
 
     from app.shared_state import runtime_config as _runtime_config
 
+    # Strip agent-unused / operator-only keys (e.g. playbook_archive) before
+    # shipping the design_doc. See _agent_view_design_doc for rationale.
+    from app.strategic_spawning import _agent_view_design_doc  # noqa: PLC0415
+    design_doc_for_agent = _agent_view_design_doc(project.design_doc)
+
     if phase == "design_doc":
         # Fetch open messages
         open_msgs_result = await session.execute(
@@ -556,7 +561,7 @@ async def trigger_strategic_cycle(
                      _runtime_config.get("task_type_efforts", {}).get("research") or None
         payload = {
             "type": "design_doc_update",
-            "design_doc": project.design_doc or {},
+            "design_doc": design_doc_for_agent,
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
             "vision": project.vision or {},
@@ -610,7 +615,7 @@ async def trigger_strategic_cycle(
         payload = {
             "type": "strategic_review",
             "research_mode": "strategic",
-            "design_doc": project.design_doc or {},
+            "design_doc": design_doc_for_agent,
             "vision": project.vision or {},
             "directions_summary": direction_stats,
             "outcome_evaluation": _build_outcome_evaluation(project),

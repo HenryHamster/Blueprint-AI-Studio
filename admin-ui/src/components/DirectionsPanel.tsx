@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Plus, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight } from 'lucide-react';
+import { Plus, X, ToggleLeft, ToggleRight, ChevronDown, ChevronRight, Zap } from 'lucide-react';
 import { apiFetch } from '../api';
 import DesignDocViewer from './DesignDocViewer';
 import ProblemModelViewer from './ProblemModelViewer';
@@ -191,6 +191,32 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
       addToast('Failed to load directions', 'error');
     }
     setLoading(false);
+  }
+
+  async function triggerCycle(phase: 'design_doc' | 'strategic_review' | 'full') {
+    if (!selectedProjectId) return;
+    const apiPhase = phase === 'full' ? 'design_doc' : phase;
+    const labels = {
+      design_doc: 'Architecture review',
+      strategic_review: 'Strategic review',
+      full: 'Full cycle',
+    } as const;
+    try {
+      const res = await apiFetch(
+        `/api/admin/projects/${selectedProjectId}/strategic-cycle?phase=${apiPhase}`,
+        { method: 'POST' },
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail || `HTTP ${res.status}`);
+      }
+      addToast(`${labels[phase]} triggered`, 'success');
+    } catch (err) {
+      addToast(
+        `Failed to trigger ${labels[phase].toLowerCase()}: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
   }
 
   async function addDirection() {
@@ -524,6 +550,36 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
               return pc > 0 ? <span className="ml-1.5 text-xs text-neutral-500">({pc})</span> : null;
             })()}
           </button>
+          {/* Spawn triggers — right-aligned so they're reachable from every
+              tab. "Arch review" runs design_doc_update (Phase 1); "Strategic"
+              runs strategic_review (Phase 2) against the current design doc;
+              "Full cycle" runs Phase 1 which chains into Phase 2 on success. */}
+          <div className="ml-auto flex items-center gap-1 pr-2">
+            <button
+              type="button"
+              onClick={() => triggerCycle('design_doc')}
+              title="Run architecture review (Phase 1)"
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded border border-purple-900/50 text-purple-400 hover:bg-purple-900/20 transition-colors"
+            >
+              <Zap className="w-3 h-3" /> Arch review
+            </button>
+            <button
+              type="button"
+              onClick={() => triggerCycle('strategic_review')}
+              title="Run strategic review (Phase 2 only, skip design doc update)"
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded border border-cyan-900/50 text-cyan-400 hover:bg-cyan-900/20 transition-colors"
+            >
+              <Zap className="w-3 h-3" /> Strategic
+            </button>
+            <button
+              type="button"
+              onClick={() => triggerCycle('full')}
+              title="Run full cycle (Phase 1 then chains to Phase 2)"
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded border border-neutral-700 text-neutral-400 hover:bg-neutral-800/50 transition-colors"
+            >
+              <Zap className="w-3 h-3" /> Full cycle
+            </button>
+          </div>
         </div>
 
         {/* === Directions tab content === */}

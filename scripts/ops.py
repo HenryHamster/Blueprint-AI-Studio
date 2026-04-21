@@ -871,6 +871,81 @@ def cmd_vision(args):
         print(f"\n  Stats: {spawns} research spawns, {cycles} strategic cycles")
 
 
+def cmd_strategic_cycle(args):
+    """Manually trigger a strategic cycle.
+
+    Usage:
+        ops.py strategic-cycle                  -- full cycle (design_doc -> chains to strategic_review)
+        ops.py strategic-cycle --phase strategic_review  -- Phase 2 only (no design doc update)
+    """
+    phase = "design_doc"
+    i = 0
+    while i < len(args):
+        if args[i] == '--phase' and i + 1 < len(args):
+            phase = args[i + 1]; i += 2
+        else:
+            i += 1
+    pid = get_project_id()
+    result = api("POST", f"/api/admin/projects/{pid}/strategic-cycle?phase={phase}")
+    task_id = result.get("task_id") or result.get("id") or "?"
+    print(f"Spawned {phase} task: {task_id}")
+    print(f"  Title: {result.get('title', '?')}")
+    if phase == "design_doc":
+        print("  Phase 1 will chain into strategic_review (Phase 2) on completion.")
+
+
+def cmd_trim_playbook_archive(args):
+    """Trim design_doc.playbook_archive to the last N entries (default 50).
+
+    One-shot cleanup for projects that accumulated archive entries before the
+    mechanical cap shipped. The live code caps archive length on every
+    _archive_least_useful_entry call, but that only kicks in on the next
+    archival event — this forces an immediate trim.
+
+    Usage:
+        ops.py trim-playbook-archive              — trim to 50 entries
+        ops.py trim-playbook-archive --keep 20    — trim to 20 entries
+        ops.py trim-playbook-archive --dry-run    — report size without writing
+    """
+    keep = 50
+    dry_run = False
+    i = 0
+    while i < len(args):
+        if args[i] == '--keep' and i + 1 < len(args):
+            keep = int(args[i + 1]); i += 2
+        elif args[i] == '--dry-run':
+            dry_run = True; i += 1
+        else:
+            i += 1
+
+    pid = get_project_id()
+    data = api("GET", f"/api/admin/projects/{pid}/directions")
+    doc = data.get('design_doc') or {}
+    archive = doc.get('playbook_archive') or []
+
+    print(f"Current playbook_archive: {len(archive)} entries")
+    before_bytes = len(json.dumps(archive).encode())
+    print(f"Archive size: {before_bytes:,} bytes ({before_bytes // 1024} KB)")
+
+    if len(archive) <= keep:
+        print(f"Already within cap of {keep} — nothing to trim.")
+        return
+
+    trimmed = archive[-keep:]
+    after_bytes = len(json.dumps(trimmed).encode())
+    dropped = len(archive) - len(trimmed)
+    print(f"Would drop {dropped} oldest entries -> {len(trimmed)} remain ({after_bytes:,} bytes)")
+
+    if dry_run:
+        print("(dry-run -- no changes written)")
+        return
+
+    new_doc = dict(doc)
+    new_doc['playbook_archive'] = trimmed
+    api("PATCH", f"/api/admin/projects/{pid}", {"design_doc": new_doc})
+    print(f"Trimmed archive to {len(trimmed)} entries ({before_bytes - after_bytes:,} bytes freed)")
+
+
 COMMANDS = {
     'status': cmd_status,
     'resume': cmd_resume,
@@ -896,6 +971,8 @@ COMMANDS = {
     'restart-orchestrator': cmd_restart_orchestrator,
     'message': cmd_message,
     'messages': cmd_messages,
+    'trim-playbook-archive': cmd_trim_playbook_archive,
+    'strategic-cycle': cmd_strategic_cycle,
 }
 
 if __name__ == '__main__':
