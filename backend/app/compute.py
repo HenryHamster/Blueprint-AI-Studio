@@ -713,21 +713,30 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
 
     # Report failures to the orchestrator before powering off — otherwise
     # the reaper has no signal about WHY the VM died and blindly retries.
+    # EARLY_TOKEN is populated once CREDS is fetched (step 2) so failures
+    # BEFORE /etc/agent.env is written still land a heartbeat.
+    EARLY_TOKEN=""
+    LAST_STAGE_STDERR=""
     _report_failure() {{
       local line=$1
       echo "FATAL: Startup script failed at line $line"
-      # Best-effort: read agent token from env file if it exists, otherwise
-      # fall back to metadata-embedded values (Secret Manager may not have been reached yet).
       local TOKEN=""
       local ORCH="{ORCHESTRATOR_URL}"
       if [ -f /etc/agent.env ]; then
         TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env 2>/dev/null | cut -d= -f2- || true)"
       fi
+      if [ -z "$TOKEN" ] && [ -n "$EARLY_TOKEN" ]; then
+        TOKEN="$EARLY_TOKEN"
+      fi
       if [ -n "$TOKEN" ] && [ -n "$ORCH" ]; then
+        local err_excerpt
+        err_excerpt="$(printf '%s' "$LAST_STAGE_STDERR" | tr '\n' ' ' | tr '"' "'" | head -c 400)"
+        local msg="STARTUP_FAILED at line $line"
+        [ -n "$err_excerpt" ] && msg="$msg | $err_excerpt"
         curl -sf -X POST "$ORCH/api/agent/heartbeat" \
           -H "Content-Type: application/json" \
           -H "X-Agent-Token: $TOKEN" \
-          -d '{{"task_id": "{task_id}", "status_message": "STARTUP_FAILED at line '$line'"}}' \
+          -d "$(printf '{{"task_id": "{task_id}", "status_message": "%s"}}' "$msg")" \
           --connect-timeout 5 --max-time 10 || true
       fi
       poweroff
@@ -785,9 +794,15 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     _send_beacon "PROVISION_PROGRESS: creds fetched, entering env setup" "$EARLY_TOKEN"
 
     # 3. Materialize the manifest into the env file and any auth/config files.
+    # Run python manifest block outside set -e so we can capture stderr for
+    # the heartbeat before triggering the ERR trap. Previously a python
+    # exception killed the script silently because /etc/agent.env didn't
+    # exist yet and _report_failure's TOKEN lookup returned empty.
     MANIFEST_PATH=/tmp/agent_secret_manifest.json
+    PY_STDERR=/tmp/agent_manifest_py.err
     printf '%s' "$CREDS" > "$MANIFEST_PATH"
-    python3 - "$MANIFEST_PATH" /etc/agent.env <<'PY'
+    set +e
+    python3 - "$MANIFEST_PATH" /etc/agent.env 2>"$PY_STDERR" <<'PY'
 import json
 import os
 import pathlib
@@ -817,7 +832,17 @@ for item in manifest.get("files", []):
     os.chown(path, uid, gid)
 os.chmod(env_path, 0o600)
 PY
-    rm -f "$MANIFEST_PATH"
+    PY_EXIT=$?
+    set -e
+    if [ $PY_EXIT -ne 0 ]; then
+      # Python block failed — capture stderr into LAST_STAGE_STDERR so the
+      # ERR trap's heartbeat carries the actual traceback instead of "died
+      # silently at line N". Previously this path poweroff'd with no signal.
+      LAST_STAGE_STDERR="python manifest exit=$PY_EXIT: $(cat "$PY_STDERR" 2>/dev/null || echo 'no stderr')"
+      rm -f "$MANIFEST_PATH" "$PY_STDERR"
+      false  # trigger ERR trap, _report_failure now has EARLY_TOKEN + stderr
+    fi
+    rm -f "$MANIFEST_PATH" "$PY_STDERR"
 
     # Beacon B — env file materialized. Distinguishes "python manifest
     # block hung" from later-step hangs. Uses the token from the just-written
