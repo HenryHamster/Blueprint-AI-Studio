@@ -275,6 +275,50 @@ class TestGeneratedShellContract:
             f"comment)."
         )
 
+    def test_rendered_has_same_comment_count_as_source(self, gen: ShellGenerator):
+        """Regression for the `\\n-in-a-comment` bug (0bcfd031 / 8c9255a9
+        post-mortems): if a generator f-string has a comment whose TEXT
+        contains ``\\n`` or ``\\\\``, Python's f-string interpolation
+        turns the escape into a real newline (or backslash), splitting
+        the comment mid-line and often emitting executable bash on the
+        second half. Backticks in the stray half open command
+        substitutions that fail at runtime with a misleading line
+        number.
+
+        bash -n can't catch this because the result IS syntactically
+        valid bash — just semantically wrong. shellcheck-at-error
+        doesn't flag it either. The only reliable check is on the
+        generator source: a comment line in the f-string body should
+        render verbatim, and any line-count inflation means something
+        got interpolated where it shouldn't.
+
+        Check: every line of the rendered output that starts with
+        ``#`` (optionally after whitespace) must contain no unescaped
+        characters that f-string would interpret. In practice we detect
+        the bug symptom: a rendered line that LOOKS like executable
+        bash but came from the second half of a split comment.
+
+        We flag: rendered lines that start with leading whitespace +
+        backtick, which is the signature of a comment gone wrong.
+        """
+        script = gen.render()
+        offenders = []
+        for i, line in enumerate(script.splitlines(), 1):
+            stripped = line.lstrip()
+            # Real bash rarely starts a LINE with a backtick (command
+            # substitution at line-start). Split-comment fragments do.
+            if stripped.startswith("`"):
+                offenders.append((i, line))
+        assert not offenders, (
+            f"{gen.name}: lines starting with a backtick are almost "
+            f"certainly split-comment fragments from f-string "
+            f"interpolation turning `\\n` in a source comment into a "
+            f"real newline (see task 8c9255a9 post-mortem). Remove "
+            f"backslash escapes and backticks from comments inside the "
+            f"generator f-string body.\n"
+            + "\n".join(f"  line {i}: {l!r}" for i, l in offenders)
+        )
+
     def test_no_multi_line_embedded_non_bash_code(self, gen: ShellGenerator):
         """Regression: the single worst class of bug we shipped (task
         0bcfd031 / c94d6d9b post-mortem) came from embedding a multi-line

@@ -812,24 +812,16 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     EARLY_TOKEN="$(printf '%s' "$CREDS" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("env",{{}}).get("AGENT_SECRET_TOKEN",""))' 2>/dev/null || true)"
     _send_beacon "PROVISION_PROGRESS: creds fetched, entering env setup" "$EARLY_TOKEN"
 
-    # 3. Materialize the manifest into the env file and any auth/config files.
-    # The materialize_manifest.py source is a real file under
-    # backend/app/_agent_scripts, embedded here as base64 to bypass the
-    # f-string escape mangling that burned task 0bcfd031 / c94d6d9b — a
-    # nested Python-in-bash heredoc had its `\n` and `\\` backslashes
-    # silently corrupted by Python's f-string interpolation, producing
-    # SyntaxError on every VM. Base64 is ASCII-safe: no escape ambiguity.
+    # 3. Materialize manifest via materialize_manifest.py (base64-embedded
+    # script; see backend/app/_agent_scripts/ for rationale).
     MANIFEST_PATH=/tmp/agent_secret_manifest.json
     PY_STDERR=/tmp/agent_manifest_py.err
     MATERIALIZE_PY=/tmp/materialize_manifest.py
     printf '%s' "$CREDS" > "$MANIFEST_PATH"
     echo '{_MATERIALIZE_MANIFEST_B64}' | base64 -d > "$MATERIALIZE_PY"
     PY_EXIT=0
-    # `timeout 60` bounds the python block against hangs that bypass ERR
-    # (a broken NSS module can block pwd.getpwnam for minutes with no
-    # exception, no exit, no signal). exit=124 from timeout signals the
-    # wall; the `if` test-position prevents bash from firing ERR on the
-    # non-zero exit, so we can capture stderr before re-raising.
+    # timeout 60 bounds hangs. if-test position suppresses ERR on
+    # non-zero exit so we can capture stderr before re-raising.
     if timeout 60 python3 "$MATERIALIZE_PY" "$MANIFEST_PATH" /etc/agent.env 2>"$PY_STDERR"; then
       :  # success — fall through
     else
