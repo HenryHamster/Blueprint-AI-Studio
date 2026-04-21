@@ -407,7 +407,7 @@ class MaxPlanAccount(SQLModel, table=True):
     provider: LLMProviderName = Field(
         default=LLMProviderName.ANTHROPIC,
         sa_column=Column(
-            SAEnum(LLMProviderName, name="llmprovider"),
+            SAEnum(LLMProviderName, name="llmprovider", values_callable=lambda obj: [e.value for e in obj]),
             nullable=False,
             default=LLMProviderName.ANTHROPIC,
         ),
@@ -415,7 +415,7 @@ class MaxPlanAccount(SQLModel, table=True):
     auth_mode: LLMAuthMode = Field(
         default=LLMAuthMode.OAUTH,
         sa_column=Column(
-            SAEnum(LLMAuthMode, name="llmauthmode"),
+            SAEnum(LLMAuthMode, name="llmauthmode", values_callable=lambda obj: [e.value for e in obj]),
             nullable=False,
             default=LLMAuthMode.OAUTH,
         ),
