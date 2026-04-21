@@ -152,10 +152,41 @@ const ALL_PAGE_SIZE = 500;
 const TASK_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'security_audit', 'qa', 'deps', 'docs', 'smoketest', 'debug', 'perf', 'investigate', 'rollup', 'strategic_review', 'design_doc_update'] as const;
 type TaskType = typeof TASK_TYPES[number];
 const PROVIDER_ORDER: ProviderName[] = ['anthropic', 'openai', 'gemini'];
+
+type Tier = 'haiku' | 'sonnet' | 'opus';
+const TIER_ORDER: Tier[] = ['haiku', 'sonnet', 'opus'];
+const TIER_LABEL: Record<Tier, string> = { haiku: 'Fast', sonnet: 'Balanced', opus: 'Smart' };
+const TIER_HINT: Record<Tier, string> = {
+  haiku: 'Cheap and quick, best for routine tasks.',
+  sonnet: 'Good default — solid reasoning at reasonable cost.',
+  opus: 'Deepest reasoning, saved for heavy lifting.',
+};
+
+const TASK_CATEGORIES: { id: 'think' | 'build' | 'check'; label: string; hint: string; types: TaskType[] }[] = [
+  { id: 'think', label: 'Think', hint: 'Plan, research, investigate — reasoning-heavy.',
+    types: ['research', 'plan', 'strategic_review', 'design_doc_update', 'investigate', 'debug'] },
+  { id: 'build', label: 'Build', hint: 'Write or change code.',
+    types: ['create', 'fix', 'refactor', 'migrate'] },
+  { id: 'check', label: 'Check', hint: 'Review, verify, maintain.',
+    types: ['review', 'security_audit', 'qa', 'perf', 'smoketest', 'docs', 'deps', 'rollup'] },
+];
+const CATEGORY_DEFAULT_TIER: Record<'think' | 'build' | 'check', Tier> = {
+  think: 'opus', build: 'sonnet', check: 'sonnet',
+};
+const CATEGORY_DEFAULT_EFFORT: Record<'think' | 'build' | 'check', string> = {
+  think: 'high', build: 'medium', check: 'medium',
+};
 const FALLBACK_AUTH_MODES: Record<ProviderName, AuthMode[]> = {
   anthropic: ['oauth', 'api_key'],
   openai: ['api_key', 'oauth'],
   gemini: ['api_key', 'service_account'],
+};
+
+const METADATA_HINTS: Record<string, { label: string; placeholder: string }> = {
+  project: { label: 'GCP project ID', placeholder: 'my-gcp-project' },
+  location: { label: 'Vertex region (e.g. us-central1)', placeholder: 'us-central1' },
+  organization: { label: 'OpenAI organization ID (optional)', placeholder: 'org-xxxxxxxx' },
+  region: { label: 'Region', placeholder: 'us-east-1' },
 };
 
 const ALL_PROMPT_SUFFIX_TYPES = [
@@ -343,6 +374,7 @@ export function SettingsDropdown({
   const [taskTypeRoutingDrafts, setTaskTypeRoutingDrafts] = useState<Record<TaskType, string>>({} as Record<TaskType, string>);
   const [taskTypeModelPrefDrafts, setTaskTypeModelPrefDrafts] = useState<Record<TaskType, string>>({} as Record<TaskType, string>);
   const [providerTierDrafts, setProviderTierDrafts] = useState<Record<string, Record<string, string>>>({});
+  const [showAdvancedTaskTypes, setShowAdvancedTaskTypes] = useState(false);
 
   useEffect(() => {
     const id = setInterval(() => setTick(t => t + 1), 1000);
@@ -679,16 +711,169 @@ export function SettingsDropdown({
     );
   }
 
+  function modelToTier(model: string): Tier | null {
+    if (!model) return null;
+    for (const providerMap of Object.values(providerTierModelMap)) {
+      for (const tier of TIER_ORDER) {
+        if (providerMap?.[tier] === model) return tier;
+      }
+    }
+    return null;
+  }
+
+  function tierToModel(tier: Tier): string {
+    for (const p of providerSelectOptions) {
+      const m = providerTierModelMap[p]?.[tier];
+      if (m) return m;
+    }
+    for (const map of Object.values(providerTierModelMap)) {
+      if (map?.[tier]) return map[tier];
+    }
+    return '';
+  }
+
+  function categoryTier(types: TaskType[]): Tier | 'mixed' | 'custom' | 'default' {
+    const tiers = new Set<string>();
+    for (const t of types) {
+      const model = taskTypeModels[t] ?? '';
+      if (!model) { tiers.add('default'); continue; }
+      const tier = modelToTier(model);
+      tiers.add(tier ?? 'custom');
+    }
+    if (tiers.size === 0) return 'default';
+    if (tiers.size > 1) return 'mixed';
+    const only = [...tiers][0];
+    if (only === 'default' || only === 'custom') return only;
+    return only as Tier;
+  }
+
+  function categoryEffort(types: TaskType[]): string | 'mixed' {
+    const efforts = new Set<string>();
+    for (const t of types) efforts.add(taskTypeEfforts[t] ?? '');
+    if (efforts.size > 1) return 'mixed';
+    return [...efforts][0] ?? '';
+  }
+
+  function applyCategoryTier(types: TaskType[], tier: Tier | '') {
+    const model = tier ? tierToModel(tier) : '';
+    const next = { ...taskTypeModels };
+    for (const t of types) {
+      next[t] = model;
+      localStorage.setItem(`blueprint-admin:taskTypeModel:${t}`, JSON.stringify(model));
+    }
+    setTaskTypeModels(next);
+    setTimeout(onSyncTaskTypeDefaults, 0);
+  }
+
+  function applyCategoryEffort(types: TaskType[], effort: string) {
+    const next = { ...taskTypeEfforts };
+    for (const t of types) {
+      next[t] = effort;
+      localStorage.setItem(`blueprint-admin:taskTypeEffort:${t}`, JSON.stringify(effort));
+    }
+    setTaskTypeEfforts(next);
+    setTimeout(onSyncTaskTypeDefaults, 0);
+  }
+
+  function overrideCount(): number {
+    let n = 0;
+    for (const t of TASK_TYPES) {
+      if ((taskTypeExecutionDefaults[t] && taskTypeExecutionDefaults[t] !== 'default')
+        || (taskTypeProviderPreference[t] && taskTypeProviderPreference[t].length > 0)
+        || (taskTypeModelPreferences[t] && taskTypeModelPreferences[t].length > 0)) n++;
+    }
+    return n;
+  }
+
   function renderTaskTypes() {
+    const overrides = overrideCount();
     return (
       <div className="space-y-6">
+        {/* Categories — primary UX */}
         <div>
-          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Provider Routing</h3>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">By category</h3>
+          <p className="text-[11px] text-neutral-500 mb-3">Pick a tier and effort for a group of task types at once. Tier maps to a concrete model via Provider Routing below.</p>
+          <div className="space-y-2">
+            {TASK_CATEGORIES.map(cat => {
+              const tier = categoryTier(cat.types);
+              const effort = categoryEffort(cat.types);
+              const tierVal = tier === 'mixed' || tier === 'custom' || tier === 'default' ? '' : tier;
+              return (
+                <div key={cat.id} className="bg-neutral-900 border border-neutral-800 rounded-lg p-3">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-sm font-medium text-neutral-200">{cat.label}</span>
+                        <span className="text-[11px] text-neutral-500">{cat.types.length} types</span>
+                      </div>
+                      <div className="text-[11px] text-neutral-500">{cat.hint}</div>
+                      <div className="text-[10px] text-neutral-600 mt-0.5 truncate">{cat.types.map(t => t.replace('_', ' ')).join(', ')}</div>
+                    </div>
+                    <div className="flex gap-2 shrink-0">
+                      <div>
+                        <div className="text-[10px] text-neutral-500 mb-1">Tier</div>
+                        <select
+                          value={tierVal}
+                          onChange={e => applyCategoryTier(cat.types, e.target.value as Tier | '')}
+                          className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 min-w-[110px]"
+                        >
+                          <option value="">
+                            {tier === 'mixed' ? 'Mixed' : tier === 'custom' ? 'Custom' : 'Orchestrator default'}
+                          </option>
+                          {TIER_ORDER.map(t => (
+                            <option key={t} value={t}>{TIER_LABEL[t]}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-neutral-500 mb-1">Effort</div>
+                        <select
+                          value={effort === 'mixed' ? '' : effort}
+                          onChange={e => applyCategoryEffort(cat.types, e.target.value)}
+                          className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 min-w-[90px]"
+                        >
+                          <option value="">{effort === 'mixed' ? 'Mixed' : 'Default'}</option>
+                          <option value="low">low</option>
+                          <option value="medium">medium</option>
+                          <option value="high">high</option>
+                          <option value="max">max</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                  {(tier !== 'mixed' && tier !== 'custom' && tier !== 'default') && (
+                    <div className="text-[10px] text-neutral-600 mt-2">{TIER_HINT[tier]}</div>
+                  )}
+                  <div className="mt-2 flex gap-3 text-[10px] text-neutral-600">
+                    <button
+                      onClick={() => applyCategoryTier(cat.types, CATEGORY_DEFAULT_TIER[cat.id])}
+                      className="hover:text-neutral-300 transition-colors"
+                    >
+                      Reset tier to {TIER_LABEL[CATEGORY_DEFAULT_TIER[cat.id]]}
+                    </button>
+                    <span className="text-neutral-800">·</span>
+                    <button
+                      onClick={() => applyCategoryEffort(cat.types, CATEGORY_DEFAULT_EFFORT[cat.id])}
+                      className="hover:text-neutral-300 transition-colors"
+                    >
+                      Reset effort to {CATEGORY_DEFAULT_EFFORT[cat.id]}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Provider Routing — defines what each tier resolves to */}
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">Provider Routing</h3>
+          <p className="text-[11px] text-neutral-500 mb-3">Concrete model each tier resolves to, per provider. The orchestrator picks from the left-most provider that has the tier configured.</p>
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-4 space-y-4">
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-sm text-neutral-200">Cross-provider fallback</div>
-                <div className="text-[11px] text-neutral-500">If the preferred provider is exhausted, the orchestrator can use the next configured provider.</div>
+                <div className="text-[11px] text-neutral-500">If the preferred provider is exhausted, fall back to the next configured one.</div>
               </div>
               <Toggle enabled={crossProviderFallbackEnabled} onChange={v => { void onUpdateCrossProviderFallback(v); }} />
             </div>
@@ -697,13 +882,14 @@ export function SettingsDropdown({
                 <div key={providerName} className="bg-neutral-950 border border-neutral-800 rounded-lg p-3">
                   <div className="text-xs font-medium text-neutral-300 capitalize mb-2">{providerName}</div>
                   <div className="space-y-2">
-                    {(['opus', 'sonnet', 'haiku'] as const).map(tier => (
+                    {TIER_ORDER.slice().reverse().map(tier => (
                       <label key={tier} className="block">
-                        <div className="text-[10px] text-neutral-500 mb-1 uppercase">{tier}</div>
+                        <div className="text-[10px] text-neutral-500 mb-1">{TIER_LABEL[tier]} <span className="text-neutral-700">({tier})</span></div>
                         <input
                           value={providerTierDrafts[providerName]?.[tier] ?? ''}
                           onChange={e => updateTierModel(providerName, tier, e.target.value)}
                           onBlur={e => updateTierModel(providerName, tier, e.target.value, true)}
+                          placeholder={tier === 'opus' ? 'e.g. claude-opus-4-7' : tier === 'sonnet' ? 'e.g. claude-sonnet-4-6' : 'e.g. claude-haiku-4-5'}
                           className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                         />
                       </label>
@@ -715,95 +901,119 @@ export function SettingsDropdown({
           </div>
         </div>
 
-        {/* Per-task-type overrides */}
+        {/* Per-task overrides — collapsed by default */}
         <div>
-          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Task-Type Defaults</h3>
-          <div className="grid grid-cols-2 gap-3">
-            {TASK_TYPES.map(type => (
-              <div key={type} className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2.5">
-                <div className="text-xs font-medium text-neutral-300 capitalize mb-2">{type.replace('_', ' ')}</div>
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <div className="text-[10px] text-neutral-500 mb-1">Model</div>
-                    <select
-                      value={taskTypeModels[type]}
-                      onChange={e => {
-                        const val = e.target.value;
-                        setTaskTypeModels(prev => ({ ...prev, [type]: val }));
-                        localStorage.setItem(`blueprint-admin:taskTypeModel:${type}`, JSON.stringify(val));
-                        setTimeout(onSyncTaskTypeDefaults, 0);
-                      }}
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                    >
-                      <option value="">default</option>
-                      {allModelOptions.map(model => (
-                        <option key={model} value={model}>{model}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <div className="text-[10px] text-neutral-500 mb-1">Effort</div>
-                    <select
-                      value={taskTypeEfforts[type]}
-                      onChange={e => {
-                        const val = e.target.value;
-                        setTaskTypeEfforts(prev => ({ ...prev, [type]: val }));
-                        localStorage.setItem(`blueprint-admin:taskTypeEffort:${type}`, JSON.stringify(val));
-                        setTimeout(onSyncTaskTypeDefaults, 0);
-                      }}
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                    >
-                      <option value="">default</option>
-                      <option value="low">low</option>
-                      <option value="medium">medium</option>
-                      <option value="high">high</option>
-                      <option value="max">max</option>
-                    </select>
-                  </div>
-                </div>
-                <div className="mt-3 space-y-2">
-                  <div>
-                    <div className="text-[10px] text-neutral-500 mb-1">Execution mode</div>
-                    <select
-                      value={taskTypeExecutionDefaults[type] ?? 'default'}
-                      onChange={e => {
-                        void onUpdateTaskTypeExecutionDefaults({ ...taskTypeExecutionDefaults, [type]: e.target.value });
-                      }}
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                    >
-                      {allModes.map(mode => (
-                        <option key={mode} value={mode}>{mode}</option>
-                      ))}
-                    </select>
-                    {providerModeCapabilities.anthropic?.[taskTypeExecutionDefaults[type] ?? 'default']?.read_only_preferred && (
-                      <div className="text-[10px] text-blue-400 mt-1">Prefers read-only/advisory execution when supported.</div>
-                    )}
-                  </div>
-                  <div>
-                    <div className="text-[10px] text-neutral-500 mb-1">Provider order</div>
-                    <input
-                      value={taskTypeRoutingDrafts[type] ?? ''}
-                      onChange={e => setTaskTypeRoutingDrafts(prev => ({ ...prev, [type]: e.target.value }))}
-                      onBlur={() => handleProviderRoutingBlur(type)}
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                      placeholder="anthropic, openai, gemini"
-                    />
-                  </div>
-                  <div>
-                    <div className="text-[10px] text-neutral-500 mb-1">Concrete model priority</div>
-                    <textarea
-                      value={taskTypeModelPrefDrafts[type] ?? ''}
-                      onChange={e => setTaskTypeModelPrefDrafts(prev => ({ ...prev, [type]: e.target.value }))}
-                      onBlur={() => handleModelPreferenceBlur(type)}
-                      rows={3}
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none"
-                      placeholder={'openai:gpt-5\nanthropic:claude-opus-4-7'}
-                    />
-                  </div>
-                </div>
+          <button
+            onClick={() => setShowAdvancedTaskTypes(v => !v)}
+            className="w-full flex items-center justify-between bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded-lg px-4 py-2.5 transition-colors"
+          >
+            <div className="text-left">
+              <div className="text-xs font-semibold text-neutral-300 uppercase tracking-wider">Per-task overrides</div>
+              <div className="text-[11px] text-neutral-500 mt-0.5">
+                {overrides > 0
+                  ? `${overrides} task type${overrides === 1 ? '' : 's'} with execution mode, provider, or concrete model overrides.`
+                  : 'Only change this if you need to pin a specific model or execution mode for one task type.'}
               </div>
-            ))}
-          </div>
+            </div>
+            <span className="text-[10px] text-neutral-600">{showAdvancedTaskTypes ? '\u25B2' : '\u25BC'}</span>
+          </button>
+          {showAdvancedTaskTypes && (
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              {TASK_TYPES.map(type => {
+                const currentTier = modelToTier(taskTypeModels[type] ?? '');
+                return (
+                  <div key={type} className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2.5">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-xs font-medium text-neutral-300 capitalize">{type.replace('_', ' ')}</div>
+                      <div className="text-[10px] text-neutral-600">
+                        {currentTier ? TIER_LABEL[currentTier] : taskTypeModels[type] ? 'Custom' : 'Default'}
+                        {taskTypeEfforts[type] && <span> · {taskTypeEfforts[type]}</span>}
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <div className="text-[10px] text-neutral-500 mb-1">Model</div>
+                        <select
+                          value={taskTypeModels[type]}
+                          onChange={e => {
+                            const val = e.target.value;
+                            setTaskTypeModels(prev => ({ ...prev, [type]: val }));
+                            localStorage.setItem(`blueprint-admin:taskTypeModel:${type}`, JSON.stringify(val));
+                            setTimeout(onSyncTaskTypeDefaults, 0);
+                          }}
+                          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                        >
+                          <option value="">default</option>
+                          {allModelOptions.map(model => (
+                            <option key={model} value={model}>{model}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-neutral-500 mb-1">Effort</div>
+                        <select
+                          value={taskTypeEfforts[type]}
+                          onChange={e => {
+                            const val = e.target.value;
+                            setTaskTypeEfforts(prev => ({ ...prev, [type]: val }));
+                            localStorage.setItem(`blueprint-admin:taskTypeEffort:${type}`, JSON.stringify(val));
+                            setTimeout(onSyncTaskTypeDefaults, 0);
+                          }}
+                          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                        >
+                          <option value="">default</option>
+                          <option value="low">low</option>
+                          <option value="medium">medium</option>
+                          <option value="high">high</option>
+                          <option value="max">max</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div className="mt-3 space-y-2">
+                      <div>
+                        <div className="text-[10px] text-neutral-500 mb-1">Execution mode</div>
+                        <select
+                          value={taskTypeExecutionDefaults[type] ?? 'default'}
+                          onChange={e => {
+                            void onUpdateTaskTypeExecutionDefaults({ ...taskTypeExecutionDefaults, [type]: e.target.value });
+                          }}
+                          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                        >
+                          {allModes.map(mode => (
+                            <option key={mode} value={mode}>{mode}</option>
+                          ))}
+                        </select>
+                        {providerModeCapabilities.anthropic?.[taskTypeExecutionDefaults[type] ?? 'default']?.read_only_preferred && (
+                          <div className="text-[10px] text-blue-400 mt-1">Prefers read-only/advisory execution when supported.</div>
+                        )}
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-neutral-500 mb-1">Provider order</div>
+                        <input
+                          value={taskTypeRoutingDrafts[type] ?? ''}
+                          onChange={e => setTaskTypeRoutingDrafts(prev => ({ ...prev, [type]: e.target.value }))}
+                          onBlur={() => handleProviderRoutingBlur(type)}
+                          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                          placeholder="anthropic, openai, gemini"
+                        />
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-neutral-500 mb-1">Concrete model priority</div>
+                        <textarea
+                          value={taskTypeModelPrefDrafts[type] ?? ''}
+                          onChange={e => setTaskTypeModelPrefDrafts(prev => ({ ...prev, [type]: e.target.value }))}
+                          onBlur={() => handleModelPreferenceBlur(type)}
+                          rows={2}
+                          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none"
+                          placeholder={'openai:gpt-5\nanthropic:claude-opus-4-7'}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* Prompt suffixes */}
@@ -1211,25 +1421,55 @@ export function SettingsDropdown({
             </div>
             {requiredMetadataFields.length > 0 && (
               <div className="grid grid-cols-2 gap-2">
-                {requiredMetadataFields.map(field => (
-                  <input
-                    key={field}
-                    value={newAccountProviderMetadata[field] ?? ''}
-                    onChange={e => setNewAccountProviderMetadata({ ...newAccountProviderMetadata, [field]: e.target.value })}
-                    placeholder={field}
-                    className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                  />
-                ))}
+                {requiredMetadataFields.map(field => {
+                  const hint = METADATA_HINTS[field];
+                  return (
+                    <div key={field}>
+                      <input
+                        value={newAccountProviderMetadata[field] ?? ''}
+                        onChange={e => setNewAccountProviderMetadata({ ...newAccountProviderMetadata, [field]: e.target.value })}
+                        placeholder={hint?.placeholder ?? field}
+                        className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      />
+                      {hint && <div className="text-[10px] text-neutral-600 mt-0.5">{hint.label}</div>}
+                    </div>
+                  );
+                })}
               </div>
             )}
             {(newAccountProvider === 'openai' && newAccountAuthMode === 'oauth') || (newAccountProvider === 'gemini' && newAccountAuthMode === 'service_account') ? (
-              <textarea
-                value={newAccountToken}
-                onChange={e => setNewAccountToken(e.target.value)}
-                rows={4}
-                placeholder={newAccountSecretLabel}
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none"
-              />
+              <div className="space-y-1.5">
+                <textarea
+                  value={newAccountToken}
+                  onChange={e => setNewAccountToken(e.target.value)}
+                  rows={4}
+                  placeholder={`Paste ${newAccountSecretLabel} or upload the file below`}
+                  className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none"
+                />
+                <label className="flex items-center gap-2 text-[11px] text-neutral-500 hover:text-neutral-300 cursor-pointer transition-colors">
+                  <span className="inline-flex items-center gap-1 bg-neutral-800 border border-neutral-700 rounded px-2 py-1 hover:bg-neutral-700">
+                    <FileDown className="w-3 h-3" /> Upload {newAccountSecretLabel}
+                  </span>
+                  <input
+                    type="file"
+                    accept=".json,application/json"
+                    className="hidden"
+                    onChange={e => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      const reader = new FileReader();
+                      reader.onload = ev => {
+                        const text = String(ev.target?.result ?? '');
+                        setNewAccountToken(text);
+                        if (!newAccountName) setNewAccountName(file.name.replace(/\.json$/i, ''));
+                      };
+                      reader.readAsText(file);
+                      e.target.value = '';
+                    }}
+                  />
+                  <span>or drop a .json file</span>
+                </label>
+              </div>
             ) : (
               <input value={newAccountToken} onChange={e => setNewAccountToken(e.target.value)}
                 placeholder={newAccountSecretLabel} type="password"
@@ -1244,10 +1484,29 @@ export function SettingsDropdown({
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none"
               />
             )}
-            <button onClick={onAddAccount} disabled={!newAccountName || !newAccountToken}
-              className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-neutral-300 text-xs py-2 px-4 rounded-lg transition-colors border border-neutral-700">
-              Add Account
-            </button>
+            {(() => {
+              const missingMeta = requiredMetadataFields.filter(f => !(newAccountProviderMetadata[f] ?? '').trim());
+              const missing: string[] = [];
+              if (!newAccountName) missing.push('name');
+              if (!newAccountToken) missing.push(newAccountSecretLabel.toLowerCase());
+              if (missingMeta.length) missing.push(...missingMeta);
+              const disabled = missing.length > 0;
+              return (
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={onAddAccount}
+                    disabled={disabled}
+                    title={disabled ? `Missing: ${missing.join(', ')}` : undefined}
+                    className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed text-neutral-300 text-xs py-2 px-4 rounded-lg transition-colors border border-neutral-700"
+                  >
+                    Add Account
+                  </button>
+                  {disabled && (
+                    <span className="text-[11px] text-neutral-600">Missing: {missing.join(', ')}</span>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         </div>
       </div>

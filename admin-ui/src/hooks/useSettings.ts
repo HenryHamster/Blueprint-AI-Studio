@@ -133,10 +133,17 @@ export function useSettings(addToast: AddToast) {
         setNewAccountProviderMetadata({});
         setNewAccountClaudeConfigJson('');
         fetchSettings();
+        addToast('Account added', 'success');
       } else {
-        addToast('Failed to add account', 'error');
+        const data = await res.json().catch(() => ({}));
+        const detail = typeof data?.detail === 'string' ? data.detail : null;
+        addToast(detail ? `Add account failed: ${detail}` : `Add account failed (HTTP ${res.status})`, 'error');
       }
-    } catch (err) { console.error('Failed to add account:', err); addToast('Failed to add account', 'error'); }
+    } catch (err) {
+      console.error('Failed to add account:', err);
+      const msg = err instanceof Error ? err.message : 'unknown error';
+      addToast(`Add account failed: ${msg}`, 'error');
+    }
   };
 
   const removeMaxPlanAccount = async (id: string) => {
