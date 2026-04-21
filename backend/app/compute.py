@@ -719,7 +719,9 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     LAST_STAGE_STDERR=""
     _report_failure() {{
       local line=$1
-      echo "FATAL: Startup script failed at line $line"
+      local cmd="$2"
+      local stack="$3"
+      echo "FATAL: Startup script failed at line $line: $cmd"
       local TOKEN=""
       local ORCH="{ORCHESTRATOR_URL}"
       if [ -f /etc/agent.env ]; then
@@ -731,7 +733,11 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
       if [ -n "$TOKEN" ] && [ -n "$ORCH" ]; then
         local err_excerpt
         err_excerpt="$(printf '%s' "$LAST_STAGE_STDERR" | tr '\n' ' ' | tr '"' "'" | head -c 400)"
-        local msg="STARTUP_FAILED at line $line"
+        # Sanitize cmd + stack for JSON: strip quotes/newlines, cap length.
+        local cmd_clean stack_clean
+        cmd_clean="$(printf '%s' "$cmd" | tr '\n\t' '  ' | tr '"' "'" | head -c 200)"
+        stack_clean="$(printf '%s' "$stack" | tr '\n' ' ' | tr '"' "'" | head -c 100)"
+        local msg="STARTUP_FAILED line=$line cmd=[$cmd_clean] stack=[$stack_clean]"
         [ -n "$err_excerpt" ] && msg="$msg | $err_excerpt"
         curl -sf -X POST "$ORCH/api/agent/heartbeat" \
           -H "Content-Type: application/json" \
@@ -741,7 +747,10 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
       fi
       poweroff
     }}
-    trap '_report_failure $LINENO' ERR
+    # Capture BASH_COMMAND (the command that triggered ERR) and a compact
+    # BASH_LINENO stack so we can tell whether the failure was inside a
+    # function, a heredoc'd subcommand, or the main script.
+    trap '_report_failure $LINENO "$BASH_COMMAND" "${{BASH_LINENO[*]}}"' ERR
     echo "Starting Agent VM Initialization..."
 
     # 1. Self-Destruct Mechanism (Defense in Depth)
