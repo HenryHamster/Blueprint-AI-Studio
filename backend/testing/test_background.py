@@ -462,13 +462,12 @@ async def test_stale_branch_cleanup_preserves_active_task_branch(cleanup_db, moc
 
 @pytest.mark.asyncio
 async def test_stale_branch_cleanup_deletes_orphaned_branch(cleanup_db, mocker):
-    """Branches whose owning task is TERMINAL and >7 days stale should be deleted."""
+    """Branches whose owning task is TERMINAL and HEAD commit is stale should be deleted."""
     project = Project(name="Cleanup Test 2", user_id="user2", github_owner="org", github_repo="repo")
     cleanup_db.add(project)
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
 
-    old = datetime.utcnow() - timedelta(days=10)
     task = Task(
         id=_uuid_with_prefix("deadbeef"),
         project_id=project.id,
@@ -477,15 +476,16 @@ async def test_stale_branch_cleanup_deletes_orphaned_branch(cleanup_db, mocker):
     )
     cleanup_db.add(task)
     await cleanup_db.commit()
-    # Force updated_at into the past — default_factory set it to "now"
-    task.updated_at = old
-    cleanup_db.add(task)
-    await cleanup_db.commit()
 
     mocker.patch("app.services._get_project_github_token", return_value="tok")
     mocker.patch("app.github.list_branches", return_value=[
         {"name": "blueprint/task-deadbeef", "sha": "sha2"},
     ])
+    # HEAD commit 10 days old — well past the 2-day stale threshold.
+    mocker.patch(
+        "app.github.get_commit_date",
+        return_value=datetime.utcnow() - timedelta(days=10),
+    )
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
     await _run_stale_branch_cleanup()
@@ -571,14 +571,89 @@ async def test_stale_branch_cleanup_skips_branch_with_no_matching_task(cleanup_d
 
 
 @pytest.mark.asyncio
+async def test_stale_branch_cleanup_skips_terminal_task_with_open_pr(cleanup_db, mocker):
+    """COMPLETED task with a PR reference but NO closure marker (pr_merged /
+    pr_rejected / pr_closed_unmerged) must keep its branch — the PR may still
+    be awaiting review and deleting the branch auto-closes it. Gate 5.5."""
+    project = Project(name="Cleanup PR Test", user_id="userpr", github_owner="org", github_repo="repo")
+    cleanup_db.add(project)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(project)
+
+    task = Task(
+        id=_uuid_with_prefix("beef0001"),
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        # PR reference present, no closure flag — PR may still be open.
+        context={"review_loop": {"pr_number": 42, "pr_url": "https://github.com/org/repo/pull/42"}},
+    )
+    cleanup_db.add(task)
+    await cleanup_db.commit()
+
+    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.github.list_branches", return_value=[
+        {"name": "blueprint/task-beef0001", "sha": "shapr"},
+    ])
+    # Commit is well past the stale threshold — only Gate 5.5 should hold.
+    mocker.patch(
+        "app.github.get_commit_date",
+        return_value=datetime.utcnow() - timedelta(days=10),
+    )
+    mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
+
+    await _run_stale_branch_cleanup()
+
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_cleanup_deletes_terminal_task_with_merged_pr(cleanup_db, mocker):
+    """COMPLETED task whose PR merged (pr_merged=True) is safe to clean up
+    once stale. Confirms Gate 5.5 doesn't over-block when a closure marker
+    is present."""
+    project = Project(name="Cleanup Merged PR Test", user_id="usermerged", github_owner="org", github_repo="repo")
+    cleanup_db.add(project)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(project)
+
+    task = Task(
+        id=_uuid_with_prefix("beef0002"),
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "review_loop": {"pr_number": 43},
+            "pr_merged": True,
+        },
+    )
+    cleanup_db.add(task)
+    await cleanup_db.commit()
+
+    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.github.list_branches", return_value=[
+        {"name": "blueprint/task-beef0002", "sha": "shamerged"},
+    ])
+    mocker.patch(
+        "app.github.get_commit_date",
+        return_value=datetime.utcnow() - timedelta(days=10),
+    )
+    mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
+
+    await _run_stale_branch_cleanup()
+
+    mock_delete.assert_called_once_with("tok", "org", "repo", "blueprint/task-beef0002")
+
+
+@pytest.mark.asyncio
 async def test_stale_branch_cleanup_skips_recent_terminal_task(cleanup_db, mocker):
-    """Terminal task that finished <7 days ago should keep its branch. Gate 6."""
+    """Terminal task whose branch HEAD commit is fresher than the stale
+    threshold (2d) should keep its branch. Gate 6."""
     project = Project(name="Cleanup Test 6", user_id="user6", github_owner="org", github_repo="repo")
     cleanup_db.add(project)
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
 
-    recent = datetime.utcnow() - timedelta(days=2)
     task = Task(
         id=_uuid_with_prefix("12345678"),
         project_id=project.id,
@@ -587,14 +662,16 @@ async def test_stale_branch_cleanup_skips_recent_terminal_task(cleanup_db, mocke
     )
     cleanup_db.add(task)
     await cleanup_db.commit()
-    task.updated_at = recent
-    cleanup_db.add(task)
-    await cleanup_db.commit()
 
     mocker.patch("app.services._get_project_github_token", return_value="tok")
     mocker.patch("app.github.list_branches", return_value=[
         {"name": "blueprint/task-12345678", "sha": "sha6"},
     ])
+    # HEAD commit 12 hours old — well inside the 2-day stale buffer.
+    mocker.patch(
+        "app.github.get_commit_date",
+        return_value=datetime.utcnow() - timedelta(hours=12),
+    )
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
     await _run_stale_branch_cleanup()
@@ -2204,7 +2281,9 @@ def test_provision_gcp_script_has_settle_window_before_success_heartbeat():
     # The preceding region must contain the settle window + is-active check.
     # Bound the search to a window immediately before the heartbeat curl so
     # we don't accidentally match the earlier `systemctl restart` block.
-    window_start = max(0, success_idx - 600)
+    # 1500 chars is enough to cover the settle window + sourcing /etc/agent.env
+    # + the is-active branch without reaching back to the restart block.
+    window_start = max(0, success_idx - 1500)
     pre_heartbeat = source[window_start:success_idx]
     assert "sleep 30" in pre_heartbeat, (
         "expected 30s settle window before success heartbeat — Type=simple "

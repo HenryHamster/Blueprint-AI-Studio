@@ -109,13 +109,18 @@ async def secret_reconciliation_service():
 
 _STALE_BRANCH_PREFIXES = ("blueprint/", "research/", "plan/")
 _PROTECTED_BRANCHES = frozenset(["main", "master", "develop", "dev"])
-# Caps raised from 20/50 after the age check moved off the GitHub API onto the
-# local DB (task.updated_at). The per-branch cost is now a dict lookup + one
-# DELETE call on actually-deleted branches, so the cleanup can absorb much
-# larger backlogs in a single cycle without breaking the 5000/hr budget.
+# Per-cycle caps. The age check costs one GitHub commit-date call per candidate
+# branch (i.e. branches that already passed the terminal-task filter), plus a
+# DELETE per actually-deleted branch. At 4 cycles/day these caps fit well
+# inside the 5000/hr install-token budget even during backlog drain.
 _MAX_DELETES_PER_PROJECT = 500
 _MAX_DELETES_TOTAL = 1000
-_STALE_BRANCH_AGE_DAYS = 7
+# Shortened from 7d. Age now comes from the branch HEAD commit date (external,
+# immutable) rather than task.updated_at (which auto-archive's bulk UPDATE
+# used to bump, silently resetting a 7d clock on every hop). Two days still
+# leaves a comfortable buffer to review/merge a PR before its branch becomes
+# eligible for cleanup.
+_STALE_BRANCH_AGE_DAYS = 2
 # Skip an entire cleanup cycle when either quota bucket is low — leaves
 # headroom for task spawning and CI polling, and prevents the branch cleanup
 # from being the last straw when something else has already burned the budget.
@@ -147,6 +152,42 @@ def _extract_branch_short_id(branch_name: str) -> str | None:
     """
     m = _BRANCH_SHORT_ID_RE.match(branch_name)
     return m.group(1) if m else None
+
+
+def _pr_possibly_open(ctx: dict | None) -> bool:
+    """True if task context references a PR without an explicit closure marker.
+
+    GitHub auto-closes any open PR whose HEAD is the deleted branch, so if a
+    reviewer is still sitting on a PR, deleting the branch silently kills the
+    review. We err heavily on the false-positive side: the cost of a false
+    positive is one orphan branch; the cost of a false negative is a closed
+    open PR and lost work.
+
+    Closure markers set elsewhere in the codebase:
+      - ci_completion.py / admin.py set pr_merged=True when a PR merges
+      - review_pipeline.py sets pr_rejected=True when a review closes a PR
+      - rollup_management.py sets pr_closed_unmerged=True for closed-unmerged
+
+    PR reference keys observed across the codebase: pr_url, pr_number,
+    rollup_pr_url, rollup_pr_number, review_loop.pr_number/pr_url.
+    """
+    if not ctx:
+        return False
+    if (
+        ctx.get("pr_merged") is True
+        or ctx.get("pr_rejected") is True
+        or ctx.get("pr_closed_unmerged") is True
+    ):
+        return False
+    review_loop = ctx.get("review_loop") or {}
+    return bool(
+        ctx.get("pr_url")
+        or ctx.get("pr_number")
+        or ctx.get("rollup_pr_url")
+        or ctx.get("rollup_pr_number")
+        or review_loop.get("pr_number")
+        or review_loop.get("pr_url")
+    )
 
 
 async def _get_project_github_token(project, session):
@@ -206,20 +247,21 @@ async def _get_project_github_token(project, session):
 
 
 async def _run_stale_branch_cleanup():
-    """Delete branches whose owning task is terminal and >7 days old.
+    """Delete branches whose owning task is terminal and HEAD commit is stale.
 
-    Uses `task.updated_at` (authoritative, from the local DB) as the age signal
-    instead of fetching commit metadata from GitHub. That drops per-branch cost
-    from one API call to a dict lookup and lets the caps be raised so a large
-    backlog can be cleared in a single cycle.
+    Age is measured from the branch's HEAD commit date via the GitHub API, not
+    from task.updated_at. Task.updated_at has `onupdate=_utcnow`, so any write
+    to the task row — notably auto-archive's bulk UPDATE at the same staleness
+    threshold — silently resets the clock, stalling cleanup indefinitely. The
+    commit date is external and immune to that.
 
     Safety: each branch must pass six independent gates before deletion — name
     isn't protected, isn't on an active task, matches the known naming shape,
-    resolves to a task row we own, that task is terminal, and its updated_at
-    is older than the stale threshold.
+    resolves to a task row we own, that task is terminal, and the branch HEAD
+    commit is older than the stale threshold.
     """
     from app.models import Project
-    from app.github import list_branches, delete_branch
+    from app.github import list_branches, delete_branch, get_commit_date
 
     # Quota gate — skip the whole cycle if either bucket is low. Avoids the
     # fail-cascade pattern where cleanup tips an already-strained budget over.
@@ -324,17 +366,19 @@ async def _run_stale_branch_cleanup():
                 sid for b in branches
                 if (sid := _extract_branch_short_id(b["name"]))
             }
+            # short_id -> (status, context). context is loaded so Gate 5.5 can
+            # check for PR closure markers before deleting the branch.
             task_meta: dict[str, tuple] = {}
             if branch_short_ids:
                 rows = (await session.execute(
-                    select(Task.id, Task.status, Task.updated_at).where(
+                    select(Task.id, Task.status, Task.context).where(
                         Task.project_id == project.id,
                         func.substr(cast(Task.id, String), 1, 8).in_(branch_short_ids),
                     )
                 )).all()
                 for row in rows:
                     sid = str(row.id).replace("-", "")[:8]
-                    task_meta[sid] = (row.status, row.updated_at)
+                    task_meta[sid] = (row.status, row.context)
 
             project_deleted = 0
             for branch_info in branches:
@@ -366,26 +410,39 @@ async def _run_stale_branch_cleanup():
                 meta = task_meta.get(short_id)
                 if meta is None:
                     continue
+                status, ctx = meta
 
                 # Gate 5: task must be terminal. This catches the case where
                 # a research/plan task is active but active_branches didn't
                 # include its computed `research/{short_id}` or
                 # `plan/{short_id}` name (the existing active_branches
                 # derivation only computes `blueprint/{prefix}-{short_id}`).
-                status, updated_at = meta
                 if status not in _TERMINAL_TASK_STATUSES:
                     continue
 
-                # Gate 6: DB-authoritative age check.
-                if updated_at.tzinfo is not None:
-                    updated_at = updated_at.replace(tzinfo=None)
-                if (now - updated_at) < stale_age:
+                # Gate 5.5: if the task opened a PR and no closure marker is
+                # set, the PR may still be open awaiting review. Deleting the
+                # branch would auto-close it and lose the reviewer's context.
+                if _pr_possibly_open(ctx):
+                    continue
+
+                # Gate 6: commit-date age check. Uses the branch HEAD commit
+                # date from GitHub — external and immutable, unlike
+                # task.updated_at which any row-write can reset.
+                commit_date = await get_commit_date(token, owner, repo, branch_info["sha"])
+                if commit_date is None:
+                    # API error or missing commit — leave the branch alone;
+                    # next cycle will retry.
+                    continue
+                if commit_date.tzinfo is not None:
+                    commit_date = commit_date.replace(tzinfo=None)
+                if (now - commit_date) < stale_age:
                     continue
 
                 try:
                     deleted = await delete_branch(token, owner, repo, name)
                     if deleted:
-                        age_days = (now - updated_at).days
+                        age_days = (now - commit_date).days
                         logger.info(
                             f"[BRANCH CLEANUP] Deleted {name} from {owner}/{repo} "
                             f"(task {short_id}, {status}, age: {age_days}d)"
@@ -424,10 +481,7 @@ async def _run_stale_branch_cleanup():
                     logger.warning(f"[BRANCH CLEANUP] Failed to create cleanup alert: {e}")
 
     if total_deleted > 0:
-        logger.info(
-            f"[BRANCH CLEANUP] Total deleted this cycle: {total_deleted} "
-            f"(DB-authoritative age check, 0 commit-date API calls)"
-        )
+        logger.info(f"[BRANCH CLEANUP] Total deleted this cycle: {total_deleted}")
 
 
 async def stale_branch_cleanup_service():

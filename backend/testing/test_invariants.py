@@ -667,7 +667,7 @@ MODULE_SIZE_LIMITS = {
     "routers/admin_settings.py": 3000,
     "routers/admin_analytics.py": 3200,
     "routers/agent.py": 2300,
-    "services.py": 1600,
+    "services.py": 1700,
     "routers/agent_status.py": 1550,
     "autonomous_research.py": 1600,
     "research_completion.py": 2050,
