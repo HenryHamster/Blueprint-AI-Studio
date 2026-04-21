@@ -903,6 +903,7 @@ PY
           -d '{{"task_id": "{task_id}", "status_message": "PROVISION_HEALTH_FAILED: service start failed. Journal: '"$SERVICE_LOG"'"}}' \
           --connect-timeout 10 --max-time 15 || true
         poweroff
+        exit 1  # poweroff is async; exit so bash doesn't continue to step 6b
     }}
 
     # 6b. Notify orchestrator that startup completed — early health signal
