@@ -10,7 +10,7 @@ completion event.
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -94,9 +94,9 @@ async def apply_post_spawn_state(
     research_branch: str,
     original_base: str,
     research_depth: int,
-    parent_research_task_id: Optional[str],
+    parent_research_task_id: str | None,
     batch_cap_applied_count: int = 0,
-    filtered_findings: Optional[List[Dict[str, Any]]] = None,
+    filtered_findings: List[Dict[str, Any]] | None = None,
 ) -> None:
     """Apply all direction-state updates after research child tasks have been spawned.
 
@@ -357,17 +357,10 @@ async def apply_post_spawn_state(
                                 ),
                             )
                             session.add(alert)
-                            try:
-                                from app.notification_dispatch import post_direction_milestone_message  # noqa: PLC0415
-                                _ac_reason = (
-                                    f"Saturated with {total_merged} PRs merged across {total_cycles} cycles"
-                                )
-                                await post_direction_milestone_message(
-                                    session, task.project_id, d.get("text", did),
-                                    "auto-completed", _ac_reason, task.id,
-                                )
-                            except Exception as _e:
-                                logger.warning(f"[NOTIFY] Failed to post auto-completed message: {_e}")
+                            # Auto-completed message was noisy. The Alert above
+                            # captures the same info; the next strategic cycle's
+                            # cycle_summary can narrate the completion if worth
+                            # surfacing to the user.
 
             project.directions = directions
             flag_modified(project, "directions")
@@ -404,7 +397,7 @@ async def apply_post_spawn_state(
     # Process direction notes — append to the target direction's notes list
     if direction_notes:
         # Deferred import of strategic caps — shared with main.py
-        from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX  # noqa: PLC0415
+        from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
         note_project = await session.get(Project, task.project_id)
         if note_project:
             note_directions = list(note_project.directions or [])
@@ -439,7 +432,7 @@ async def apply_post_spawn_state(
     proposals_created = 0
     if direction_proposals:
         # Deferred import to avoid circular dependency
-        from app.strategic_completion import _is_direction_duplicate  # noqa: PLC0415
+        from app.strategic_completion import _is_direction_duplicate
         proposal_project = await session.get(Project, task.project_id)
         if proposal_project:
             proj_directions = list(proposal_project.directions or [])
@@ -455,7 +448,7 @@ async def apply_post_spawn_state(
                 if not proposal_text.strip():
                     continue
                 if _is_direction_duplicate(proposal_text, proj_directions, rejected_proposals):
-                    logger.info(f"[RESEARCH] Skipping direction proposal — overlaps with existing direction")
+                    logger.info("[RESEARCH] Skipping direction proposal — overlaps with existing direction")
                     continue
                 new_direction = {
                     "id": f"d-{uuid.uuid4().hex[:8]}",
@@ -484,11 +477,11 @@ async def apply_post_spawn_state(
         if payload0.get('directions'):
             direction_texts = [payload0['directions'][0].get('text', 'general improvement')]
         summary_lines = [
-            f'# Research Summary',
+            '# Research Summary',
             f'**Direction**: {direction_texts[0][:200] if direction_texts else "general"}',
             f'**Tasks Created**: {len(child_tasks)}{_filter_str}',
-            f'',
-            f'## Findings:',
+            '',
+            '## Findings:',
         ]
         for ct in child_tasks[:10]:
             p = ct.first_payload

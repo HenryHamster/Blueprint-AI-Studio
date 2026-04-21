@@ -6,7 +6,7 @@ Extracted from autonomous_research.py to create headroom in that module.
 """
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -109,7 +109,7 @@ def _build_escalation_args(direction: dict) -> dict:
     Shared by the initial auto-pause escalation path and the retry loop so both
     produce identical message bodies when re-derived from the direction.
     """
-    from app.strategic_completion import _build_direction_failure_summary  # noqa: PLC0415
+    from app.strategic_completion import _build_direction_failure_summary
     summary = _build_direction_failure_summary(direction)
     rem_summary = (
         f"cycles_analyzed={summary['cycles_analyzed']} "
@@ -146,7 +146,7 @@ async def _compute_direction_error_fingerprint(
     pattern and the escalation path can compare it against the last
     remediation's fingerprint.
     """
-    from app.anomaly_detection import _task_error_fingerprint, count_matching_fingerprints  # noqa: PLC0415
+    from app.anomaly_detection import _task_error_fingerprint, count_matching_fingerprints
 
     base_query = select(Task).where(
         Task.project_id == project_id,
@@ -197,7 +197,7 @@ async def _spawn_direction_diagnosis(
     direction_id = direction.get("id")
     if not direction_id:
         return False
-    from app.autonomous_research import _recent_investigation_exists  # noqa: PLC0415
+    from app.autonomous_research import _recent_investigation_exists
     if await _recent_investigation_exists(project.id, str(direction_id), session):
         return False
     cutoff = _utcnow() - timedelta(hours=24)
@@ -224,7 +224,7 @@ async def _spawn_direction_diagnosis(
         )).first()
         if shared is not None:
             existing_task_id = str(shared[0])
-            from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX  # noqa: PLC0415
+            from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
             note_text = (
                 f"Skipped duplicate investigation: shares error fingerprint "
                 f"{str(fingerprint)[:80]} with existing investigate task {existing_task_id}."
@@ -343,8 +343,8 @@ async def _spawn_direction_diagnosis(
                 "implemented incorrectly.\n"
             )
         extras += (
-            f"Avoid proposing a fix targeting the same fingerprint that already "
-            f"failed; prior attempts did not resolve the recurring pattern.\n"
+            "Avoid proposing a fix targeting the same fingerprint that already "
+            "failed; prior attempts did not resolve the recurring pattern.\n"
         )
     prompt = (
         f"A research direction was auto-paused for repeated code failures.\n\n"
@@ -410,7 +410,7 @@ async def _process_direction_lifecycle(
 
     Returns a list of active, non-cooling directions eligible for research.
     """
-    from app.strategic_completion import _check_direction_health, _check_direction_completion  # noqa: PLC0415
+    from app.strategic_completion import _check_direction_health, _check_direction_completion
 
     directions_modified = False
     # Prune dead directions (expired/completed/rejected) to prevent JSON bloat
@@ -438,7 +438,7 @@ async def _process_direction_lifecycle(
                     "remediation_attempts": int(d.get("remediation_attempts", 0)),
                 },
             )
-            from app.models import Alert, AlertSeverity  # noqa: PLC0415
+            from app.models import Alert, AlertSeverity
             session.add(Alert(
                 project_id=project.id,
                 severity=AlertSeverity.ERROR,
@@ -454,7 +454,7 @@ async def _process_direction_lifecycle(
             directions_modified = True
             continue
         try:
-            from app.notification_dispatch import post_remediation_escalation_message  # noqa: PLC0415
+            from app.notification_dispatch import post_remediation_escalation_message
             await post_remediation_escalation_message(
                 session, project.id, **_build_escalation_args(d),
             )
@@ -741,7 +741,7 @@ async def _process_direction_lifecycle(
                         f"after {d.get('remediation_attempts', 0)} remediation attempts"
                     )
                     try:
-                        from app.notification_dispatch import post_remediation_escalation_message  # noqa: PLC0415
+                        from app.notification_dispatch import post_remediation_escalation_message
                         await post_remediation_escalation_message(
                             session, project.id, **_build_escalation_args(d),
                         )
@@ -759,18 +759,15 @@ async def _process_direction_lifecycle(
                         )
             logger.info(f"[AUTONOMOUS] Auto-paused direction {did}: {pause_reason}")
             auto_paused_any = True
-            try:
-                from app.notification_dispatch import post_direction_milestone_message  # noqa: PLC0415
-                await post_direction_milestone_message(
-                    session, project.id, d.get("text", did), "auto-paused", pause_reason
-                )
-            except Exception as _e:
-                logger.warning(f"[NOTIFY] Failed to post auto-paused message: {_e}")
+            # Auto-pause messages were noisy ("Direction auto-paused: X — reason").
+            # The next strategic cycle's agent-authored cycle_summary should
+            # mention paused directions that matter; the direction UI already
+            # reflects pause status. Dropping the auto-message here.
             try:
                 if _is_code_failure_pause_reason(pause_reason):
                     await _spawn_direction_diagnosis(project, d, pause_reason, session)
                 else:
-                    from app.autonomous_research_diagnosis import _spawn_unproductive_diagnosis  # noqa: PLC0415
+                    from app.autonomous_research_diagnosis import _spawn_unproductive_diagnosis
                     await _spawn_unproductive_diagnosis(project, d, pause_reason, session)
             except Exception as _e:
                 logger.warning(f"[DIAGNOSIS] Failed to spawn investigate task for {did}: {_e}")
@@ -788,7 +785,7 @@ async def _process_direction_lifecycle(
                     f"[AUTONOMOUS] Auto-retired direction {did} after "
                     f"{code_pause_count} code-failure auto-pause cycles: {d.get('text', '')[:60]}"
                 )
-                from app.models import Alert, AlertSeverity  # noqa: PLC0415
+                from app.models import Alert, AlertSeverity
                 alert = Alert(
                     project_id=project.id,
                     severity=AlertSeverity.INFO,
@@ -800,24 +797,17 @@ async def _process_direction_lifecycle(
                     ),
                 )
                 session.add(alert)
-                try:
-                    from app.notification_dispatch import post_direction_milestone_message as _post_milestone  # noqa: PLC0415
-                    _retire_reason = (
-                        f"Auto-retired after {code_pause_count} consecutive code-failure auto-pause cycles. "
-                        f"Slot freed for strategic agent to create a replacement."
-                    )
-                    await _post_milestone(
-                        session, project.id, d.get("text", did), "auto-retired", _retire_reason
-                    )
-                except Exception as _e:
-                    logger.warning(f"[NOTIFY] Failed to post auto-retired message: {_e}")
+                # Auto-retire message was noisy. The Alert above (INFO
+                # severity) carries the same information into the alerts
+                # surface; the next strategic cycle can cite the retirement
+                # in its cycle_summary if it's worth surfacing to the user.
                 directions_modified = True
             else:
                 # Spawn diagnosis research so the agent can investigate the failure
                 # pattern before the 48h cooldown elapses — skipped on auto-retire
                 # since a retired direction is terminal and has no future cycles.
                 try:
-                    from app.autonomous_research import _spawn_direction_diagnosis  # noqa: PLC0415
+                    from app.autonomous_research import _spawn_direction_diagnosis
                     if await _spawn_direction_diagnosis(project, d, pause_reason, session):
                         d["diagnosis_spawned_at"] = _utcnow().isoformat()
                         directions_modified = True

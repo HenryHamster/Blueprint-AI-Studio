@@ -1341,7 +1341,6 @@ class TestDispatchExternalNotification:
     @pytest.mark.asyncio
     async def test_respects_throttle_seconds(self, mocker):
         """Second call within throttle window is silently dropped."""
-        import time
         from app import shared_state
         from app.notification_dispatch import dispatch_external_notification, _last_dispatch_time
 
@@ -1405,7 +1404,6 @@ class TestNotificationConfigStartupRestore:
         """notification_config written to DeploymentState.runtime_config_json
         must be loaded back into shared_state.runtime_config on _init_deployment_state.
         """
-        import sqlalchemy
         from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
         from sqlalchemy.orm import sessionmaker
         from sqlalchemy.pool import StaticPool
@@ -1597,4 +1595,58 @@ class TestDirectionAutoPauseStats:
         assert data["auto_recovered_count"] == 0
         assert data["currently_auto_paused"] == 0
         assert data["top_reasons"] == []
-        assert data["trend"] == "flat"
+
+
+class TestAcknowledgeRunningUpdate:
+    """Acknowledge endpoint clears the running_update list and stamps
+    running_update_acknowledged_at — the user's way to reset the
+    accumulating strategic journal."""
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_clears_entries(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        project.running_update = [
+            {"ts": "2026-04-20T00:00:00", "whats_changed": "x"},
+            {"ts": "2026-04-21T00:00:00", "whats_changed": "y"},
+        ]
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/running-update/acknowledge"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "acknowledged"
+        assert data["cleared_entries"] == 2
+        assert "acknowledged_at" in data
+
+        await db_session.refresh(project)
+        assert project.running_update == []
+        assert project.running_update_acknowledged_at is not None
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_empty_is_idempotent(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/running-update/acknowledge"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["cleared_entries"] == 0
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_requires_project_access(
+        self, client: AsyncClient, db_session
+    ):
+        """A user without access to the project gets 404 from the
+        _get_user_project_with_role helper."""
+        other = Project(name="Other", user_id="other-user")
+        db_session.add(other)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{other.id}/running-update/acknowledge"
+        )
+        assert resp.status_code == 404

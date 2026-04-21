@@ -2303,20 +2303,9 @@ async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSes
             })
         flag_modified(project, 'vision')
         session.add(project)
-    if spawned:
-        phase1_msg = ProjectMessage(
-            project_id=task.project_id,
-            message_type=MessageType.NOTE,
-            from_type="strategic",
-            from_task_id=task.id,
-            content=f"Architecture analysis completed ({page_count} pages, rev {rev}). Strategic review starting.",
-            context={
-                "event_type": "cycle_phase1_complete",
-                "cycle_id": cycle_id,
-                "page_count": page_count,
-                "revision": rev,
-            },
-        )
-        session.add(phase1_msg)
+    # Previously emitted a "Architecture analysis completed, strategic review
+    # starting" phase-transition message. Removed as part of the auto-status
+    # cleanup — the phase transition is visible in the task timeline and the
+    # eventual strategic cycle_summary carries the user-facing narrative.
     session.add(task)
     await session.commit()

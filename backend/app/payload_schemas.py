@@ -13,9 +13,9 @@ from __future__ import annotations
 import logging
 import re
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class TaskType(str, Enum):
 ALL_TASK_TYPES: frozenset[str] = frozenset(t.value for t in TaskType)
 
 
-def _validate_branch_name(v: Optional[str]) -> Optional[str]:
+def _validate_branch_name(v: str | None) -> str | None:
     """Shared branch safety checks — mirrors CreateTaskPayload.validate_branch_name."""
     if v is None:
         return v
@@ -71,10 +71,10 @@ class BasePayload(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     base_branch: str = Field(default="main")
-    model: Optional[str] = None
-    effort: Optional[str] = Field(default=None, pattern=r"^(low|medium|high|max)$")
-    prompt_suffix: Optional[str] = None
-    title: Optional[str] = None
+    model: str | None = None
+    effort: str | None = Field(default=None, pattern=r"^(low|medium|high|max)$")
+    prompt_suffix: str | None = None
+    title: str | None = None
 
     @field_validator("base_branch")
     @classmethod
@@ -117,9 +117,9 @@ class InvestigatePayload(_PromptRequired):
 class ReviewPayload(BasePayload):
     pr_number: int = Field(..., gt=0)
     branch: str = Field(..., min_length=1)
-    original_prompt: Optional[str] = None
-    original_task_id: Optional[str] = None
-    original_task_type: Optional[str] = None
+    original_prompt: str | None = None
+    original_task_id: str | None = None
+    original_task_type: str | None = None
 
     @field_validator("branch")
     @classmethod
@@ -135,8 +135,8 @@ class FixPayload(BasePayload):
     prompt: str = Field(..., min_length=1)
     pr_number: int = Field(..., gt=0)
     branch: str = Field(..., min_length=1)
-    original_task_id: Optional[str] = None
-    original_prompt: Optional[str] = None
+    original_task_id: str | None = None
+    original_prompt: str | None = None
 
     @field_validator("branch")
     @classmethod
@@ -153,42 +153,49 @@ class _SystemPopulated(BasePayload):
 
 
 class ResearchPayload(_SystemPopulated):
-    directions: Optional[list[dict[str, Any]]] = None
-    research_mode: Optional[str] = None
-    current_direction_id: Optional[str] = None
-    anomaly_signals: Optional[list[dict[str, Any]]] = None
-    project_name: Optional[str] = None
-    design_doc: Optional[dict[str, Any]] = None
+    directions: list[dict[str, Any]] | None = None
+    research_mode: str | None = None
+    current_direction_id: str | None = None
+    anomaly_signals: list[dict[str, Any]] | None = None
+    project_name: str | None = None
+    design_doc: dict[str, Any] | None = None
 
 
 class StrategicReviewPayload(_SystemPopulated):
-    design_doc: Optional[dict[str, Any]] = None
-    vision: Optional[dict[str, Any]] = None
-    directions_summary: Optional[list[dict[str, Any]]] = None
-    outcome_evaluation: Optional[dict[str, Any]] = None
-    recent_interventions: Optional[dict[str, Any]] = None
-    previous_decision_outcomes: Optional[dict[str, Any]] = None
-    open_messages: Optional[list[dict[str, Any]]] = None
-    conversation_thread: Optional[list[dict[str, Any]]] = None
-    project_name: Optional[str] = None
-    research_mode: Optional[str] = None
-    max_active_directions: Optional[int] = None
-    rejected_proposals: Optional[list[dict[str, Any]]] = None
-    anomaly_summary: Optional[dict[str, Any]] = None
-    playbook_summary: Optional[dict[str, Any]] = None
+    design_doc: dict[str, Any] | None = None
+    vision: dict[str, Any] | None = None
+    problem_model: dict[str, Any] | None = None
+    running_update: list[dict[str, Any]] | None = None
+    running_update_acknowledged_at: str | None = None
+    user_last_active_at: str | None = None
+    self_reflection_log: list[dict[str, Any]] | None = None
+    is_self_repo: bool | None = None
+    directions_summary: list[dict[str, Any]] | None = None
+    outcome_evaluation: dict[str, Any] | None = None
+    recent_interventions: dict[str, Any] | None = None
+    previous_decision_outcomes: dict[str, Any] | None = None
+    open_messages: list[dict[str, Any]] | None = None
+    conversation_thread: list[dict[str, Any]] | None = None
+    project_name: str | None = None
+    research_mode: str | None = None
+    max_active_directions: int | None = None
+    rejected_proposals: list[dict[str, Any]] | None = None
+    anomaly_summary: dict[str, Any] | None = None
+    playbook_summary: dict[str, Any] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
-    design_doc: Optional[dict[str, Any]] = None
-    vision: Optional[dict[str, Any]] = None
-    open_messages: Optional[list[dict[str, Any]]] = None
-    project_name: Optional[str] = None
-    proposed_changes: Optional[list[dict[str, Any]]] = None
-    shipped_changes_manifest: Optional[list[dict[str, Any]]] = None
+    design_doc: dict[str, Any] | None = None
+    vision: dict[str, Any] | None = None
+    problem_model: dict[str, Any] | None = None
+    open_messages: list[dict[str, Any]] | None = None
+    project_name: str | None = None
+    proposed_changes: list[dict[str, Any]] | None = None
+    shipped_changes_manifest: list[dict[str, Any]] | None = None
 
 
 class SecurityAuditPayload(_SystemPopulated):
-    prompt: Optional[str] = None
+    prompt: str | None = None
 
 
 class QAPayload(_SystemPopulated):
@@ -204,19 +211,19 @@ class DocsPayload(_SystemPopulated):
 
 
 class SmokestestPayload(_SystemPopulated):
-    health_check_urls: Optional[list[str]] = None
+    health_check_urls: list[str] | None = None
 
 
 class DebugPayload(_SystemPopulated):
-    failed_task_id: Optional[str] = None
-    failed_task_title: Optional[str] = None
-    error_logs: Optional[str] = None
-    failed_task_prompt: Optional[str] = None
-    failed_task_type: Optional[str] = None
+    failed_task_id: str | None = None
+    failed_task_title: str | None = None
+    error_logs: str | None = None
+    failed_task_prompt: str | None = None
+    failed_task_type: str | None = None
 
 
 class PerfPayload(_SystemPopulated):
-    prompt: Optional[str] = None
+    prompt: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +267,7 @@ def validate_task_payload(raw: dict) -> dict:
         valid = ", ".join(sorted(ALL_TASK_TYPES))
         raise ValueError(
             f"Unknown task type {type_value!r}. Valid types: {valid}"
-        )
+        ) from None
 
     model_cls = _MODEL_FOR_TYPE[task_type]
     try:

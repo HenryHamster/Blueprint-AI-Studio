@@ -7,8 +7,8 @@ and the _handle_strategic_completion handler.
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from datetime import timedelta
+from typing import Any, Dict
 
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,66 +16,12 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.direction_metrics import _compute_direction_quality_score
-from app.models import Project, ProjectMessage, MessageType, Task, TaskStatus
-from app.research_completion import _update_cycle_history, _compute_saturation
+from app.models import Project, ProjectMessage, MessageType, Task
+from app.research_completion import _update_cycle_history
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
-
-
-async def _post_cycle_summary_message(
-    project: Project,
-    task: Task,
-    session: AsyncSession,
-    cycle_id: Optional[str],
-    vision_rev: Any,
-    active_dirs: int,
-    dirs_created: int,
-    dirs_retired: int,
-) -> None:
-    """Post a ProjectMessage summarising the completed strategic cycle."""
-    content = (
-        f"Strategic cycle completed: vision updated (rev {vision_rev}), "
-        f"{dirs_created} direction(s) created, {dirs_retired} retired, "
-        f"{active_dirs} active total."
-    )
-    # Append brief direction titles for context
-    from app.strategic_constants import CYCLE_SUMMARY_MAX  # noqa: PLC0415
-    if dirs_created > 0 or dirs_retired > 0:
-        lines = []
-        for d in (project.directions or []):
-            raw_title = (d.get("text") or "")
-            title = raw_title[:120] + ("…" if len(raw_title) > 120 else "")
-            if d.get("status") == "active" and dirs_created > 0:
-                notes = d.get("notes") or []
-                if any(cycle_id and cycle_id in (n.get("text") or "") for n in notes):
-                    lines.append(f"  + {title}")
-            elif d.get("status") == "expired" and dirs_retired > 0:
-                notes = d.get("notes") or []
-                if any("Retired by strategic review" in (n.get("text") or "") for n in notes):
-                    lines.append(f"  - {title}")
-        if lines:
-            detail = "\n" + "\n".join(lines[:10])
-            if len(content) + len(detail) <= CYCLE_SUMMARY_MAX:
-                content += detail
-
-    summary_msg = ProjectMessage(
-        project_id=project.id,
-        message_type=MessageType.NOTE,
-        from_type="strategic",
-        from_task_id=task.id,
-        content=content[:CYCLE_SUMMARY_MAX],
-        context={
-            "event_type": "cycle_summary",
-            "cycle_id": cycle_id,
-            "dirs_created": dirs_created,
-            "dirs_retired": dirs_retired,
-            "vision_revision": vision_rev,
-            "active_direction_count": active_dirs,
-        },
-    )
-    session.add(summary_msg)
 
 
 async def _record_strategic_task_failure(task: Task, session: AsyncSession) -> None:
@@ -116,7 +62,7 @@ _RATIONALE_PERSIST_MAX = 200
 _CYCLE_REASONING_MAX = 500
 
 
-def _extract_rationale_from_notes(direction: Optional[dict], prefix: str) -> Optional[str]:
+def _extract_rationale_from_notes(direction: dict | None, prefix: str) -> str | None:
     """Return the latest note rationale matching prefix, or None."""
     if not direction:
         return None
@@ -245,7 +191,7 @@ def _extract_cycle_reasoning(task: Task) -> str:
     return msg.strip()[:_CYCLE_REASONING_MAX]
 
 
-def _check_direction_health(direction: dict) -> Optional[str]:
+def _check_direction_health(direction: dict) -> str | None:
     """Return a pause reason if this direction should be auto-paused, else None."""
     history = direction.get("research_history") or []
 
@@ -306,7 +252,7 @@ def _check_direction_health(direction: dict) -> Optional[str]:
 _CODE_FAILURE_PAUSE_PREFIXES = ("High code failure rate:", "Recent stall:")
 
 
-def _is_code_failure_pause_reason(pause_reason: Optional[str]) -> bool:
+def _is_code_failure_pause_reason(pause_reason: str | None) -> bool:
     """True when pause_reason was produced by Rules 3 or 4 in _check_direction_health.
 
     Used by the direction_lifecycle auto-pause path to decide whether to spawn
@@ -346,7 +292,7 @@ def _build_direction_failure_summary(direction: dict) -> Dict[str, Any]:
     }
 
 
-def _check_direction_completion(direction: dict) -> Optional[str]:
+def _check_direction_completion(direction: dict) -> str | None:
     """Return a completion suggestion string if this direction appears successfully complete, else None."""
     history = direction.get("research_history") or []
     if len(history) < 4:
@@ -406,7 +352,7 @@ async def _check_direction_starvation(
 
     Resets both counter and override when dirs_created > 0 (starvation resolved).
     """
-    from app.main import _create_strategic_alert  # noqa: PLC0415
+    from app.main import _create_strategic_alert
 
     directions = project.directions or []
     active_count = sum(1 for d in directions if d.get("status") == "active")
@@ -540,7 +486,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     Falls back to log parsing for backward compatibility if the agent used the old approach.
     """
     # Deferred imports to avoid circular dependency
-    from app.main import _create_strategic_alert  # noqa: PLC0415
+    from app.main import _create_strategic_alert
 
     project = await session.get(Project, task.project_id)
     if not project:
@@ -598,14 +544,6 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         _spawn_suffix_msg = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
         task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {active_dirs} active directions, {dirs_created} created, {dirs_retired} retired{_spawn_suffix_msg}"
         session.add(task)
-        try:
-            from app.notification_dispatch import post_cycle_summary_message  # noqa: PLC0415
-            await post_cycle_summary_message(
-                session, project.id, vision_rev, dirs_created, dirs_retired,
-                ops_applied=0, msgs_created=0, task_id=task.id,
-            )
-        except Exception as _e:
-            logger.warning(f"[NOTIFY] Failed to post cycle summary message: {_e}")
         # Audit: check for unaddressed FEEDBACK messages
         remaining_feedback_result = await session.execute(
             select(func.count()).select_from(ProjectMessage).where(
@@ -624,9 +562,10 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 session,
                 f"{open_feedback_count} FEEDBACK message(s) remain unaddressed after strategic review — agent may be ignoring user requests",
             )
-        await _post_cycle_summary_message(
-            project, task, session, cycle_id, vision_rev, active_dirs, dirs_created, dirs_retired
-        )
+        # Per-cycle message post removed: the strategic agent now appends
+        # to project.running_update instead, which persists across cycles
+        # and is cleared when the user acknowledges. Replaces the previous
+        # one-message-per-cycle noise.
         await session.commit()
         logger.info(f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions")
         return
@@ -665,6 +604,8 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         return
 
     new_vision = parsed.get("vision")
+    new_problem_model = parsed.get("problem_model")
+    new_running_update_entry = parsed.get("running_update_entry")
     direction_ops = parsed.get("direction_operations", [])
 
     # Lock project row to prevent concurrent direction/vision mutations
@@ -741,7 +682,103 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         project.vision = new_vision
         flag_modified(project, "vision")
         logger.info(f"[STRATEGIC] Updated vision for project {project.id} to revision {new_vision['revision']}")
-    else:
+
+    # Apply problem_model update — new strategic source of truth running
+    # alongside vision during the migration. Failures here are logged and
+    # swallowed so a malformed problem_model doesn't block vision / direction
+    # ops writes.
+    if new_problem_model and isinstance(new_problem_model, dict):
+        try:
+            from pydantic import ValidationError as _PmValidationError
+
+            from app.problem_model import apply_agent_update
+            try:
+                new_pm_raw, pm_diff = apply_agent_update(
+                    current_raw=project.problem_model,
+                    proposed_raw=new_problem_model,
+                    now_iso=_utcnow().isoformat(),
+                )
+            except _PmValidationError as pm_err:
+                logger.warning(
+                    f"[STRATEGIC] Task {task.id}: problem_model validation failed — "
+                    f"keeping prior state. Error: {pm_err}"
+                )
+            else:
+                project.problem_model = new_pm_raw
+                flag_modified(project, "problem_model")
+                logger.info(
+                    f"[STRATEGIC] Updated problem_model for project {project.id} "
+                    f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
+                )
+        except Exception:
+            logger.exception("[STRATEGIC] Failed to apply problem_model update (non-fatal)")
+
+    # Append the agent's running_update entry (if any). The running_update
+    # is the persistent journal of project evolution shown to the user on
+    # check-in; agent appends each cycle, user acknowledges to reset. This
+    # replaces the previous per-cycle message post.
+    if new_running_update_entry and isinstance(new_running_update_entry, dict):
+        try:
+            from pydantic import ValidationError as _RuValidationError
+
+            from app.problem_model import RunningUpdateEntry, append_running_update
+            try:
+                ru_entry = RunningUpdateEntry.model_validate({
+                    "ts": _utcnow().isoformat(),
+                    "cycle_task_id": str(task.id),
+                    **new_running_update_entry,
+                })
+            except _RuValidationError as ru_err:
+                logger.warning(
+                    f"[STRATEGIC] Task {task.id}: running_update_entry validation failed — "
+                    f"skipping. Error: {ru_err}"
+                )
+            else:
+                project.running_update = append_running_update(
+                    project.running_update, ru_entry
+                )
+                flag_modified(project, "running_update")
+                logger.info(
+                    f"[STRATEGIC] Appended running_update entry for project {project.id} "
+                    f"(log size: {len(project.running_update)})"
+                )
+        except Exception:
+            logger.exception("[STRATEGIC] Failed to append running_update (non-fatal)")
+
+    # Append the agent's self_reflection entry (if any) to the project's
+    # self_reflection log. The log drives self-improvement on self-repo
+    # projects: recurring complaints about agent limitations become input
+    # to future strategic cycles which open self_improvement gaps.
+    new_reflection = parsed.get("self_reflection")
+    if new_reflection and isinstance(new_reflection, dict):
+        try:
+            from pydantic import ValidationError as _SrValidationError
+
+            from app.problem_model import SelfReflectionEntry, append_self_reflection
+            try:
+                entry = SelfReflectionEntry.model_validate({
+                    "ts": _utcnow().isoformat(),
+                    "cycle_task_id": str(task.id),
+                    **new_reflection,
+                })
+            except _SrValidationError as sr_err:
+                logger.warning(
+                    f"[STRATEGIC] Task {task.id}: self_reflection validation failed — "
+                    f"skipping. Error: {sr_err}"
+                )
+            else:
+                project.self_reflection_log = append_self_reflection(
+                    project.self_reflection_log, entry
+                )
+                flag_modified(project, "self_reflection_log")
+                logger.info(
+                    f"[STRATEGIC] Appended self_reflection entry for project {project.id} "
+                    f"(log size: {len(project.self_reflection_log)})"
+                )
+        except Exception:
+            logger.exception("[STRATEGIC] Failed to append self_reflection (non-fatal)")
+
+    if not new_vision or not isinstance(new_vision, dict):
         # No vision produced — increment failure counter to prevent infinite strategic loops
         current_vision = dict(project.vision or {})
         failures = current_vision.get("_strategic_failures", 0) + 1
@@ -771,7 +808,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         creates_count = 0
 
         # Deferred import to avoid circular dependency with app.main.
-        from app.strategic_constants import (  # noqa: PLC0415
+        from app.strategic_constants import (
             STRATEGIC_DIRECTION_TEXT_MAX,
             STRATEGIC_NOTES_HISTORY_MAX,
             STRATEGIC_RATIONALE_MAX,
@@ -939,7 +976,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     session.add(project)
 
     # Deferred import of message/resolution caps — same STRATEGIC_* namespace
-    from app.strategic_constants import STRATEGIC_MESSAGE_CONTENT_MAX, STRATEGIC_RESOLUTION_MAX  # noqa: PLC0415
+    from app.strategic_constants import STRATEGIC_MESSAGE_CONTENT_MAX, STRATEGIC_RESOLUTION_MAX
 
     # Process messages from agent (questions, blockers, notes)
     msgs_created = 0
@@ -993,7 +1030,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 msgs_resolved += 1
                 if msg.message_type == MessageType.FEEDBACK:
                     try:
-                        from app.notification_dispatch import post_feedback_acknowledgment  # noqa: PLC0415
+                        from app.notification_dispatch import post_feedback_acknowledgment
                         await post_feedback_acknowledgment(
                             session, project.id, msg.id,
                             msg.resolution or "Addressed by strategic review",
@@ -1024,19 +1061,10 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         )
 
     vision_rev = (project.vision or {}).get("revision", "?")
-    _active_dirs_end = sum(1 for d in (project.directions or []) if d.get("status") == "active")
-    await _post_cycle_summary_message(
-        project, task, session, cycle_id, vision_rev, _active_dirs_end, dirs_created, retires_applied
-    )
+    # Per-cycle message post removed: the strategic agent now appends to
+    # project.running_update instead, which persists across cycles and is
+    # cleared when the user acknowledges.
     task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} messages, {msgs_resolved} resolved"
     session.add(task)
-    try:
-        from app.notification_dispatch import post_cycle_summary_message  # noqa: PLC0415
-        await post_cycle_summary_message(
-            session, project.id, vision_rev, dirs_created, retires_applied,
-            ops_applied=ops_applied, msgs_created=msgs_created, task_id=task.id,
-        )
-    except Exception as _e:
-        logger.warning(f"[NOTIFY] Failed to post cycle summary message: {_e}")
     await session.commit()  # Single commit: vision + directions + messages + task status
     logger.info(f"[STRATEGIC] Task {task.id} complete: vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} msgs created, {msgs_resolved} resolved")

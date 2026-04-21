@@ -119,7 +119,7 @@ from app.strategic_constants import (  # noqa: E402
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0040"
+EXPECTED_SCHEMA_REVISION = "0043"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -2143,6 +2143,150 @@ async def strategic_operation(
             "task_id": str(new_task.id),
             "type": spawn_type,
             "priority": 100,
+        })
+
+    elif payload.op == "set_problem_model":
+        # Full-model replacement. Validated and merged via apply_agent_update:
+        # bumps revision, stamps last_updated, auto-archives closed/abandoned
+        # gaps, preserves existing archived_gaps + revision_log, appends a
+        # revision_log entry with the structured diff.
+        from pydantic import ValidationError as _PmValidationError
+
+        from app.problem_model import apply_agent_update
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="problem_model must be an object")
+        try:
+            new_pm_raw, pm_diff = apply_agent_update(
+                current_raw=project.problem_model,
+                proposed_raw=data,
+                now_iso=_utcnow().isoformat(),
+            )
+        except _PmValidationError as ve:
+            raise HTTPException(status_code=400, detail=f"Invalid problem_model: {ve}") from None
+        project.problem_model = new_pm_raw
+        flag_modified(project, "problem_model")
+        session.add(project)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True, "_strategic_problem_model_set": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] problem_model updated for project {project.id} "
+            f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
+        )
+        return _resp({
+            "status": "ok",
+            "op": "set_problem_model",
+            "revision": new_pm_raw.get("revision"),
+            "diff": pm_diff,
+        })
+
+    elif payload.op == "append_running_update":
+        # Append one entry to project.running_update — the user's journal
+        # that persists across cycles until they acknowledge to clear it.
+        from pydantic import ValidationError as _RuValidationError
+
+        from app.problem_model import RunningUpdateEntry, append_running_update
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="running_update entry must be an object")
+        try:
+            entry = RunningUpdateEntry.model_validate({
+                "ts": _utcnow().isoformat(),
+                "cycle_task_id": str(task.id),
+                **data,
+            })
+        except _RuValidationError as ve:
+            raise HTTPException(status_code=400, detail=f"Invalid running_update entry: {ve}") from None
+        project.running_update = append_running_update(project.running_update, entry)
+        flag_modified(project, "running_update")
+        session.add(project)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True, "_strategic_running_update_appended": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] Appended running_update entry for project {project.id} "
+            f"(log size: {len(project.running_update)})"
+        )
+        return _resp({
+            "status": "ok",
+            "op": "append_running_update",
+            "log_size": len(project.running_update),
+        })
+
+    elif payload.op == "reflect":
+        # Append a self-reflection entry to project.self_reflection_log.
+        # Drives the self-improvement loop on self-repo projects.
+        from pydantic import ValidationError as _SrValidationError
+
+        from app.problem_model import SelfReflectionEntry, append_self_reflection
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="self_reflection entry must be an object")
+        try:
+            entry = SelfReflectionEntry.model_validate({
+                "ts": _utcnow().isoformat(),
+                "cycle_task_id": str(task.id),
+                **data,
+            })
+        except _SrValidationError as ve:
+            raise HTTPException(status_code=400, detail=f"Invalid self_reflection entry: {ve}") from None
+        project.self_reflection_log = append_self_reflection(project.self_reflection_log, entry)
+        flag_modified(project, "self_reflection_log")
+        session.add(project)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] Appended self_reflection for project {project.id} "
+            f"(log size: {len(project.self_reflection_log)})"
+        )
+        return _resp({
+            "status": "ok",
+            "op": "reflect",
+            "log_size": len(project.self_reflection_log),
+        })
+
+    elif payload.op == "pending_confirm":
+        # Add a pending_user_confirmation item to the problem_model.
+        # Scoped to external blockers only: credentials, access, major
+        # pivots. Agents can ONLY create — users resolve via the UI.
+        from pydantic import ValidationError as _PcValidationError
+
+        from app.problem_model import (
+            PendingConfirmation,
+            parse_problem_model,
+        )
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="pending_confirmation must be an object")
+        try:
+            pending = PendingConfirmation.model_validate({
+                "id": data.get("id") or f"p-{uuid.uuid4().hex[:8]}",
+                "created_at": _utcnow().isoformat(),
+                **data,
+            })
+        except _PcValidationError as ve:
+            raise HTTPException(status_code=400, detail=f"Invalid pending_confirmation: {ve}") from None
+        current_model = parse_problem_model(project.problem_model)
+        current_model.pending_user_confirmation.append(pending)
+        project.problem_model = current_model.model_dump()
+        flag_modified(project, "problem_model")
+        session.add(project)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] Added pending_confirmation '{pending.id}' to project {project.id}"
+        )
+        return _resp({
+            "status": "ok",
+            "op": "pending_confirm",
+            "id": pending.id,
         })
 
     else:

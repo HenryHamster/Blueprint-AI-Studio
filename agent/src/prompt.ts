@@ -357,7 +357,7 @@ export function synthesizeSuccessPatterns(
   const scopeRates = dirCtx.scope_success_rates as Record<string, Record<string, unknown>> | undefined;
   if (scopeRates && typeof scopeRates === 'object' && taskScope) {
     const rateFor = (scope: string) => {
-      const s = scopeRates[scope];
+      const s = scopeRates[scope] as Record<string, unknown> | undefined;
       if (!s) return null;
       const created = Number(s.created ?? 0);
       const merged = Number(s.merged ?? 0);
@@ -369,8 +369,8 @@ export function synthesizeSuccessPatterns(
       let best: { scope: string; pct: number; merged: number; created: number } | null = null;
       for (const [scope, counts] of Object.entries(scopeRates)) {
         if (scope === taskScope) continue;
-        const created = Number(counts?.created ?? 0);
-        const merged = Number(counts?.merged ?? 0);
+        const created = Number(counts.created ?? 0);
+        const merged = Number(counts.merged ?? 0);
         if (created < 2) continue;
         const pct = Math.round((merged / created) * 100);
         if (!best || pct > best.pct) best = { scope, pct, merged, created };
@@ -444,6 +444,53 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
   const taskScope = taskContext ? strVal(taskContext.scope) : '';
 
   let prefix = '';
+
+  // Project Vision — strategic "why" set by the strategic research agent.
+  // Surfaced first so tactical agents can align their work to it.
+  const vision = task.vision as Record<string, unknown> | undefined;
+  if (vision && typeof vision === 'object') {
+    const vLines: string[] = ['## Project Vision'];
+    const purpose = strVal(vision.purpose);
+    if (purpose) vLines.push(`**Purpose:** ${purpose}`);
+    const successCriteria = vision.success_criteria;
+    if (typeof successCriteria === 'string' && successCriteria) {
+      vLines.push(`**Success criteria:** ${successCriteria}`);
+    } else if (Array.isArray(successCriteria) && successCriteria.length > 0) {
+      vLines.push('**Success criteria:**');
+      for (const sc of successCriteria) {
+        const s = strVal(sc);
+        if (s) vLines.push(`- ${s}`);
+      }
+    }
+    const priorities = Array.isArray(vision.priorities) ? vision.priorities as unknown[] : [];
+    if (priorities.length > 0) {
+      vLines.push('**Priorities:**');
+      for (const p of priorities) {
+        const s = strVal(p);
+        if (s) vLines.push(`- ${s}`);
+      }
+    }
+    const systems = Array.isArray(vision.systems) ? vision.systems as Array<Record<string, unknown>> : [];
+    if (systems.length > 0) {
+      vLines.push('**Systems:**');
+      for (const sys of systems) {
+        const name = strVal(sys.name);
+        if (!name) continue;
+        const status = strVal(sys.status);
+        const desc = strVal(sys.description);
+        const statusSuffix = status ? ` (${status})` : '';
+        const descSuffix = desc ? ` — ${desc}` : '';
+        vLines.push(`- **${name}**${statusSuffix}${descSuffix}`);
+      }
+    }
+    const context = strVal(vision.context);
+    if (context) vLines.push(`**Context:** ${context}`);
+    if (vLines.length > 1) {
+      vLines.push('');
+      prefix += vLines.join('\n') + '\n';
+    }
+  }
+
   if (projectCtx) {
     const hasData = Object.keys(projectCtx).some(k => {
       const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
@@ -466,6 +513,32 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     if (title) dcLines.push(`**Goal:** ${title}`);
     const priority = strVal(dirCtx.priority);
     if (priority) dcLines.push(`**Priority:** ${priority}`);
+    const narrative = dirCtx.narrative as Record<string, unknown> | undefined;
+    if (narrative && typeof narrative === 'object') {
+      const established = Array.isArray(narrative.established_findings)
+        ? (narrative.established_findings as unknown[]).map(s => strVal(s)).filter(Boolean)
+        : [];
+      if (established.length > 0) {
+        dcLines.push('**Established findings (what we know):**');
+        for (const f of established) dcLines.push(`- ${f}`);
+      }
+      const openQuestions = Array.isArray(narrative.open_questions)
+        ? (narrative.open_questions as unknown[]).map(s => strVal(s)).filter(Boolean)
+        : [];
+      if (openQuestions.length > 0) {
+        dcLines.push('**Open questions (still investigating):**');
+        for (const q of openQuestions) dcLines.push(`- ${q}`);
+      }
+      const lastCycle = narrative.last_cycle as Record<string, unknown> | undefined;
+      if (lastCycle && typeof lastCycle === 'object') {
+        const tc = Number(lastCycle.tasks_created ?? 0);
+        const pm = Number(lastCycle.prs_merged ?? 0);
+        const pr = Number(lastCycle.prs_rejected ?? 0);
+        if (tc > 0) {
+          dcLines.push(`**Last productive cycle:** ${pm}/${tc} merged${pr > 0 ? `, ${pr} rejected` : ''}`);
+        }
+      }
+    }
     const failedApproaches = Array.isArray(dirCtx.failed_approaches) ? dirCtx.failed_approaches as unknown[] : [];
     if (failedApproaches.length > 0) {
       dcLines.push('**Avoid (already tried and failed):**');
@@ -493,7 +566,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     }
     const recentOutcomes = Array.isArray(dirCtx.recent_outcomes) ? dirCtx.recent_outcomes as Array<Record<string, unknown>> : [];
     if (recentOutcomes.length > 0) {
-      const parts = recentOutcomes.map(o => `${o.prs_merged}/${o.tasks_created} merged`);
+      const parts = recentOutcomes.map(o => `${Number(o.prs_merged ?? 0)}/${Number(o.tasks_created ?? 0)} merged`);
       dcLines.push(`Recent cycles: ${parts.join(', ')}`);
     }
     const failureStagePattern = dirCtx.failure_stage_pattern as Record<string, unknown> | undefined;
@@ -517,11 +590,11 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       });
       const parts: string[] = [];
       for (const [scope, counts] of entries) {
-        const created = Number(counts?.created ?? 0);
-        const merged = Number(counts?.merged ?? 0);
+        const created = Number(counts.created ?? 0);
+        const merged = Number(counts.merged ?? 0);
         if (created < 1) continue;
         const pct = Math.round((merged / created) * 100);
-        const failed = Number(counts?.failed ?? 0);
+        const failed = Number(counts.failed ?? 0);
         const suffix = failed > 0 ? `, ${failed} failed` : '';
         parts.push(`${scope} ${merged}/${created} (${pct}%${suffix})`);
       }
@@ -530,7 +603,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       }
       const expansionParts: string[] = [];
       for (const [scope, counts] of entries) {
-        const ratio = Number(counts?.avg_expansion_ratio);
+        const ratio = Number(counts.avg_expansion_ratio);
         if (!Number.isFinite(ratio) || ratio <= 0) continue;
         expansionParts.push(`${scope}-scope averages ${ratio.toFixed(1)}x file expansion`);
       }
@@ -541,8 +614,8 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       }
       const crossParts: string[] = [];
       for (const [scope, counts] of entries) {
-        const merged = Number(counts?.merged ?? 0);
-        const crossMerged = Number(counts?.merged_cross_module ?? 0);
+        const merged = Number(counts.merged ?? 0);
+        const crossMerged = Number(counts.merged_cross_module ?? 0);
         if (merged < 1 || crossMerged < 1) continue;
         crossParts.push(`${crossMerged} of ${merged} ${scope} merges touched 2+ directories`);
       }
@@ -695,7 +768,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     if (reviewEffCats && Object.keys(reviewEffCats).length > 0) {
       dcLines.push('**Review effectiveness trends (per category):**');
       for (const [cat, info] of Object.entries(reviewEffCats)) {
-        const trend = info?.trend;
+        const trend = info.trend;
         const trendIndicator = trend === 'decreasing' ? 'trending down'
           : trend === 'increasing' ? 'trending up ⚠'
           : trend === 'stable' ? 'persistent'
@@ -850,7 +923,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
           ? signals.factors as Record<string, unknown>
           : {};
         const f = (k: string): number | null =>
-          typeof factors[k] === 'number' ? factors[k] as number : null;
+          typeof factors[k] === 'number' ? factors[k] : null;
 
         const sentences: string[] = [];
         if (files !== null && modules !== null) {
@@ -901,7 +974,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     if (typeof attemptsRaw === 'number' && Number.isFinite(attemptsRaw)) {
       attempts = attemptsRaw;
     } else if (dirCtx && typeof dirCtx.remediation_attempts === 'number') {
-      attempts = dirCtx.remediation_attempts as number;
+      attempts = dirCtx.remediation_attempts;
     }
     if (attempts !== null && attempts > 0) {
       remLines.push(`- Prior remediation attempts on this direction: ${attempts} — if a previous remediation failed to hold, favor a different angle over repeating the prior fix shape.`);
@@ -930,14 +1003,14 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   const maxAttempts = typeof ctx._max_attempts === 'number' && ctx._max_attempts >= attemptNumber
     ? ctx._max_attempts
     : 0;
-  const previousError = strVal(ctx._previous_error as unknown);
-  const previousFailureClass = strVal(ctx._previous_failure_class as unknown);
-  const previousPrUrl = strVal(ctx._previous_pr_url as unknown);
+  const previousError = strVal(ctx._previous_error);
+  const previousFailureClass = strVal(ctx._previous_failure_class);
+  const previousPrUrl = strVal(ctx._previous_pr_url);
   const previousChangedFiles = Array.isArray(ctx._previous_changed_files)
     ? (ctx._previous_changed_files as unknown[]).map(f => strVal(f)).filter(Boolean)
     : [];
-  const previousFailureStage = strVal(ctx._previous_failure_stage as unknown);
-  const previousErrorSummary = strVal(ctx._previous_error_summary as unknown);
+  const previousFailureStage = strVal(ctx._previous_failure_stage);
+  const previousErrorSummary = strVal(ctx._previous_error_summary);
   const previousIsRecurring = ctx._previous_is_recurring === true;
   const failureClassHistory = Array.isArray(ctx._failure_class_history)
     ? (ctx._failure_class_history as unknown[]).map(f => strVal(f)).filter(Boolean)
@@ -947,9 +1020,9 @@ export function buildRetryContext(task: Record<string, unknown>): string {
         (e): e is Record<string, unknown> => typeof e === 'object' && e !== null,
       )
     : [];
-  const previousTestFailureSummary = strVal(ctx._previous_test_failure_summary as unknown);
+  const previousTestFailureSummary = strVal(ctx._previous_test_failure_summary);
   const previousSelfReviewOutcome = ctx._previous_self_review_outcome as Record<string, unknown> | undefined;
-  const previousAnalysisPlan = strVal(ctx._previous_analysis_plan as unknown);
+  const previousAnalysisPlan = strVal(ctx._previous_analysis_plan);
   const prevAttempt = attemptNumber - 1;
 
   const failureTypeLabel = previousFailureClass || 'UNKNOWN';
@@ -997,10 +1070,10 @@ export function buildRetryContext(task: Record<string, unknown>): string {
   // Prefer enriched diff summary over plain file list when available
   if (previousDiffSummary.length > 0) {
     const fileLines = previousDiffSummary.map(e => {
-      const file = strVal(e.file as unknown);
+      const file = strVal(e.file);
       const additions = typeof e.additions === 'number' ? e.additions : 0;
       const deletions = typeof e.deletions === 'number' ? e.deletions : 0;
-      const changeType = strVal(e.change_type as unknown) || 'modified';
+      const changeType = strVal(e.change_type) || 'modified';
       return `  - ${file} (${changeType}, +${additions}/-${deletions} lines)`;
     });
     lines.push(`Files changed in previous attempt:\n${fileLines.join('\n')}`);

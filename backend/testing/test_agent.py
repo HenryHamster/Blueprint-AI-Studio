@@ -5015,3 +5015,151 @@ async def test_debug_result_low_confidence_does_not_spawn_fix_task(client: Async
 
     await db_session.refresh(task)
     assert task.plan_output == debug_payload
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_injects_project_vision(client: AsyncClient, db_session):
+    """Strategic vision is surfaced on the claim response so tactical agents
+    can align their work to the project's stated purpose."""
+    project = Project(
+        name="Vision Inject Test",
+        user_id="test-user-vision",
+        vision={
+            "purpose": "Build an autonomous coding studio.",
+            "success_criteria": ["Agents self-improve", "CI stays green"],
+            "priorities": ["Stability over features"],
+            "systems": [
+                {"id": "orch", "name": "Orchestrator", "status": "functional", "description": "Routes tasks"},
+            ],
+            "revision": 3,
+            "last_updated": "2026-04-21T00:00:00",
+            "_strategic_failures": 2,
+            "_strategic_cycle_history": [{"foo": "bar"}],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Vision consumer",
+        payloads=[{"type": "create", "prompt": "Add a widget"}],
+        vm_instance_id="agent-vm-vision",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-vision")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    vision = data.get("vision")
+    assert vision is not None
+    assert vision["purpose"] == "Build an autonomous coding studio."
+    assert vision["success_criteria"] == ["Agents self-improve", "CI stays green"]
+    assert vision["priorities"] == ["Stability over features"]
+    assert vision["revision"] == 3
+    assert vision["systems"][0]["name"] == "Orchestrator"
+    assert vision["systems"][0]["status"] == "functional"
+    # Internal tracking fields must not leak to agents
+    assert "_strategic_failures" not in vision
+    assert "_strategic_cycle_history" not in vision
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_omits_vision_when_empty(client: AsyncClient, db_session):
+    """If vision is unset or only contains internal fields, no vision key is added."""
+    project = Project(
+        name="Empty Vision",
+        user_id="test-user-empty-vision",
+        vision={"_strategic_failures": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="No vision task",
+        payloads=[{"type": "create", "prompt": "x"}],
+        vm_instance_id="agent-vm-novision",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-novision")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    assert "vision" not in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_injects_direction_narrative(client: AsyncClient, db_session):
+    """Direction narrative (established findings + open questions + last cycle)
+    is surfaced under direction_context for create/fix/refactor/research/plan."""
+    direction_id = str(uuid.uuid4())
+    research_context = (
+        "## Established Findings\n"
+        "- Celery workers crash under burst load\n"
+        "- Redis is not the bottleneck\n"
+        "\n"
+        "## Failed Approaches\n"
+        "- Raising worker count without backpressure\n"
+        "\n"
+        "## Open Questions\n"
+        "- Does autoscaling help?\n"
+    )
+    project = Project(
+        name="Direction Narrative Test",
+        user_id="test-user-narrative",
+        directions=[
+            {
+                "id": direction_id,
+                "title": "Stabilize task queue",
+                "priority": "high",
+                "status": "active",
+                "research_context": research_context,
+                "research_history": [
+                    {"tasks_created": 4, "prs_merged": 2, "prs_rejected": 1},
+                    {"tasks_created": 0, "prs_merged": 0, "prs_rejected": 0},
+                    {"tasks_created": 3, "prs_merged": 3, "prs_rejected": 0},
+                ],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Narrative consumer",
+        payloads=[{"type": "create", "prompt": "Fix the queue"}],
+        vm_instance_id="agent-vm-narrative",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-narrative")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    narrative = (resp.json().get("direction_context") or {}).get("narrative")
+    assert narrative is not None
+    assert narrative["established_findings"] == [
+        "Celery workers crash under burst load",
+        "Redis is not the bottleneck",
+    ]
+    assert narrative["open_questions"] == ["Does autoscaling help?"]
+    # Last productive cycle — skips the zero-task cycle in the middle
+    assert narrative["last_cycle"] == {
+        "tasks_created": 3,
+        "prs_merged": 3,
+        "prs_rejected": 0,
+    }

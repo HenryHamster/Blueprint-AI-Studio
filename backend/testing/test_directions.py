@@ -2755,6 +2755,244 @@ async def test_strategic_api_accumulates_direction_ids(db_session, mocker):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Strategic API — new problem_model / running_update / reflect / pending_confirm ops
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _make_strategic_project_and_task(db_session):
+    """Shared setup: one project + one strategic_review task, returns (project, task_id)."""
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    project = Project(name="P-strategic-new", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, user_id="u1", task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id, "task_type": "strategic_review",
+    }
+    return project, task_id
+
+
+def _cleanup_strategic_overrides():
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    app.dependency_overrides.pop(get_session, None)
+    app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_problem_model_happy_path(db_session):
+    """op=set_problem_model validates, bumps revision, persists."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post("/api/agent/strategic", json={
+                "op": "set_problem_model", "task_id": task_id,
+                "data": {
+                    "intent": {
+                        "purpose": "Build an autonomous dev studio.",
+                        "current_focus": "Stabilize the review loop.",
+                    },
+                    "gaps": [
+                        {"id": "g-mem", "name": "No cross-cycle memory",
+                         "size": "large", "priority": "high", "status": "active"},
+                    ],
+                },
+            })
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["op"] == "set_problem_model"
+        assert body["revision"] == 1
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["intent"]["purpose"] == "Build an autonomous dev studio."
+        assert len(pm["gaps"]) == 1
+        assert pm["gaps"][0]["id"] == "g-mem"
+        assert pm["revision"] == 1
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_problem_model_rejects_malformed(db_session):
+    """Invalid schema fields return 400, don't mutate state."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            # size="enormous" is not a valid GapSize literal
+            resp = await ac.post("/api/agent/strategic", json={
+                "op": "set_problem_model", "task_id": task_id,
+                "data": {"gaps": [{"id": "g-bad", "name": "x", "size": "enormous"}]},
+            })
+        assert resp.status_code == 400
+        body = resp.json()
+        msg = body.get("detail") or body.get("error", {}).get("message", "")
+        assert "Invalid problem_model" in msg
+
+        await db_session.refresh(project)
+        # Model unchanged (still empty dict)
+        assert project.problem_model in (None, {}, {"revision": 0})
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_append_running_update(db_session):
+    """op=append_running_update validates entry and appends to project.running_update."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post("/api/agent/strategic", json={
+                "op": "append_running_update", "task_id": task_id,
+                "data": {
+                    "whats_changed": "Opened a gap for cross-cycle memory (your ask).",
+                    "whats_working_on": "- Strategic memory — direction in review",
+                    "next_up": "Merge the schema migration.",
+                },
+            })
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["op"] == "append_running_update"
+        assert body["log_size"] == 1
+
+        await db_session.refresh(project)
+        assert len(project.running_update) == 1
+        entry = project.running_update[0]
+        assert entry["whats_changed"].startswith("Opened a gap")
+        assert entry["cycle_task_id"] == task_id
+        assert entry["ts"]  # server-stamped
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_reflect(db_session):
+    """op=reflect appends to project.self_reflection_log."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post("/api/agent/strategic", json={
+                "op": "reflect", "task_id": task_id,
+                "data": {
+                    "what_was_hard": "Couldn't tell two near-duplicate directions apart.",
+                    "missing_context": "Direction outcome doesn't include user rejection reason.",
+                    "proposed_self_improvement": "Add rejection_reason to direction outcomes.",
+                },
+            })
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["op"] == "reflect"
+        assert body["log_size"] == 1
+
+        await db_session.refresh(project)
+        assert len(project.self_reflection_log) == 1
+        entry = project.self_reflection_log[0]
+        assert entry["what_was_hard"].startswith("Couldn't tell")
+        assert entry["cycle_task_id"] == task_id
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_pending_confirm(db_session):
+    """op=pending_confirm adds a pending_user_confirmation item to problem_model."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post("/api/agent/strategic", json={
+                "op": "pending_confirm", "task_id": task_id,
+                "data": {
+                    "type": "credentials_needed",
+                    "proposal": "Need OpenAI key with higher rate limit.",
+                    "rationale": "Strategic cycles hitting 429s consistently.",
+                },
+            })
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["op"] == "pending_confirm"
+        assert body["id"].startswith("p-")
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        pending = pm.get("pending_user_confirmation", [])
+        assert len(pending) == 1
+        item = pending[0]
+        assert item["type"] == "credentials_needed"
+        assert item["proposal"].startswith("Need OpenAI")
+        assert item["id"] == body["id"]
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_pending_confirm_rejects_invalid_type(db_session):
+    """Invalid pending_confirmation type returns 400."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    _project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post("/api/agent/strategic", json={
+                "op": "pending_confirm", "task_id": task_id,
+                "data": {"type": "some_made_up_type", "proposal": "x"},
+            })
+        assert resp.status_code == 400
+        body = resp.json()
+        msg = body.get("detail") or body.get("error", {}).get("message", "")
+        assert "Invalid pending_confirmation" in msg
+    finally:
+        _cleanup_strategic_overrides()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Standalone tests for _calibrate_scope (no DB required)
 # ─────────────────────────────────────────────────────────────────────────────
 

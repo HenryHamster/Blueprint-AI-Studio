@@ -294,6 +294,54 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('## Direction Context');
   });
 
+  it('renders ## Project Vision section when task.vision is present', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      vision: {
+        purpose: 'Build an autonomous coding studio.',
+        success_criteria: ['Agents self-improve', 'CI stays green'],
+        priorities: ['Stability over features'],
+        systems: [
+          { name: 'Orchestrator', status: 'functional', description: 'Routes tasks' },
+        ],
+        revision: 3,
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Project Vision');
+    expect(result).toContain('**Purpose:** Build an autonomous coding studio.');
+    expect(result).toContain('- Agents self-improve');
+    expect(result).toContain('- CI stays green');
+    expect(result).toContain('- Stability over features');
+    expect(result).toContain('- **Orchestrator** (functional) — Routes tasks');
+  });
+
+  it('does not render ## Project Vision when task.vision is absent', () => {
+    const task = { payloads: [{ type: 'create' }] };
+    expect(buildContextPrefix(task)).not.toContain('## Project Vision');
+  });
+
+  it('renders narrative (established findings, open questions, last cycle) in Direction Context', () => {
+    const task = {
+      direction_context: {
+        title: 'Stabilize queue',
+        priority: 'high',
+        narrative: {
+          established_findings: ['Workers crash under burst', 'Redis is not the bottleneck'],
+          open_questions: ['Does autoscaling help?'],
+          last_cycle: { tasks_created: 3, prs_merged: 3, prs_rejected: 0 },
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('**Established findings (what we know):**');
+    expect(result).toContain('- Workers crash under burst');
+    expect(result).toContain('- Redis is not the bottleneck');
+    expect(result).toContain('**Open questions (still investigating):**');
+    expect(result).toContain('- Does autoscaling help?');
+    expect(result).toContain('**Last productive cycle:** 3/3 merged');
+  });
+
   it('renders scope_success_rates as a concise merge-rate line in Direction Context', () => {
     const task = {
       direction_context: {
@@ -1933,7 +1981,7 @@ describe('buildRetryContext', () => {
     const result = buildRetryContext(task);
     expect(result).toContain('src/foo.ts (modified, +10/-5 lines)');
     // Should not show the plain format alongside the enriched format
-    expect(result).not.toMatch(/  - src\/foo\.ts\n/);
+    expect(result).not.toMatch(/ {2}- src\/foo\.ts\n/);
   });
 
   it('renders test failure summary when _previous_test_failure_summary is present', () => {
@@ -2412,7 +2460,7 @@ describe('buildSelfReviewPrompt', () => {
         check_results: Record<string, { passed: boolean; issue?: string }>;
         issues_found: number;
       };
-      const failedCount = Object.values(parsed.check_results).filter(r => r.passed === false).length;
+      const failedCount = Object.values(parsed.check_results).filter(r => !r.passed).length;
       if (failedCount > 0) {
         expect(parsed.verdict).toBe('FAIL');
         expect(parsed.issues_found).toBeGreaterThanOrEqual(1);

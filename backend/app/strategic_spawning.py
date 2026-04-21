@@ -609,6 +609,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
         "project_name": project.name,
         "vision": project.vision or {},
+        "problem_model": project.problem_model or {},
         "open_messages": open_msgs,
         "shipped_changes_manifest": shipped_changes_manifest,
         "base_branch": "main",
@@ -780,6 +781,19 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     # Executor still needs a flat list of open messages for resolve operations
     open_msgs = [msg for msg in conversation_thread if msg["status"] == "open"]
 
+    # When did the user last engage? Last ProjectMessage from_type='user'.
+    # The strategic agent uses this to frame its running_update "since last
+    # check-in" narrative at the right granularity.
+    _last_user_msg = next(
+        (m for m in reversed(all_thread_msgs) if m.from_type == "user"),
+        None,
+    )
+    user_last_active_at = (
+        _last_user_msg.created_at.isoformat()
+        if _last_user_msg and _last_user_msg.created_at
+        else None
+    )
+
     review_model = _runtime_config.get("task_type_models", {}).get("strategic_review") or \
                    _runtime_config.get("task_type_models", {}).get("research") or None
     review_effort = _runtime_config.get("task_type_efforts", {}).get("strategic_review") or \
@@ -795,6 +809,15 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "research_mode": "strategic",
         "design_doc": project.design_doc or {},
         "vision": project.vision or {},
+        "problem_model": project.problem_model or {},
+        "running_update": project.running_update or [],
+        "running_update_acknowledged_at": (
+            project.running_update_acknowledged_at.isoformat()
+            if project.running_update_acknowledged_at else None
+        ),
+        "user_last_active_at": user_last_active_at,
+        "self_reflection_log": (project.self_reflection_log or [])[-5:],
+        "is_self_repo": bool(project.is_self_repo),
         "directions_summary": direction_stats,
         "outcome_evaluation": _build_outcome_evaluation(project),
         "recent_interventions": recent_interventions,

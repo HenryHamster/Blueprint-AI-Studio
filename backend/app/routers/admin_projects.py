@@ -127,6 +127,33 @@ async def update_project(
     return project
 
 
+@router.post("/projects/{project_id}/running-update/acknowledge")
+@limiter.limit("30/minute")
+async def acknowledge_running_update(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Acknowledge the project's running_update, clearing the accumulated
+    entries and stamping the acknowledgement time. The strategic agent
+    starts a fresh accumulation on the next cycle."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    cleared_count = len(project.running_update or [])
+    project.running_update = []
+    project.running_update_acknowledged_at = _utcnow()
+    flag_modified(project, "running_update")
+    session.add(project)
+    await session.commit()
+    return {
+        "status": "acknowledged",
+        "cleared_entries": cleared_count,
+        "acknowledged_at": project.running_update_acknowledged_at.isoformat(),
+    }
+
+
 @router.delete("/projects/{project_id}")
 @limiter.limit("10/minute")
 async def delete_project_admin(

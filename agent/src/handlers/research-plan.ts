@@ -1313,9 +1313,9 @@ ${hotspotsSection}
     // Write the strategic helper script (same pattern as design-doc)
     // Uses printf + pipe to avoid shell expansion of JSON in curl -d
     const strategicHelper = `#!/bin/bash
-# Strategic review tool — updates vision, directions, and messages via API
-# Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env
-OP="\${1:?Usage: strategic set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message|spawn-task <json>}"
+# Strategic review tool — updates problem_model, running_update, directions,
+# messages via API. Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env.
+OP="\${1:?Usage: strategic set-problem-model|append-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message|spawn-task <json>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
@@ -1354,13 +1354,17 @@ _call() {
 }
 
 case "\$OP" in
-  set-vision)        _call "set_vision" ;;
-  create-direction)  _call "create_direction" ;;
-  update-direction)  _call "update_direction" ;;
-  retire-direction)  _call "retire_direction" ;;
-  create-message)    _call "create_message" ;;
-  resolve-message)   _call "resolve_message" ;;
-  spawn-task)        _call "spawn_task" ;;
+  set-problem-model)    _call "set_problem_model" ;;
+  append-running-update) _call "append_running_update" ;;
+  reflect)              _call "reflect" ;;
+  pending-confirm)      _call "pending_confirm" ;;
+  set-vision)           _call "set_vision" ;;
+  create-direction)     _call "create_direction" ;;
+  update-direction)     _call "update_direction" ;;
+  retire-direction)     _call "retire_direction" ;;
+  create-message)       _call "create_message" ;;
+  resolve-message)      _call "resolve_message" ;;
+  spawn-task)           _call "spawn_task" ;;
   *) echo "Unknown op: \$OP" >&2; exit 1 ;;
 esac
 echo ""
@@ -1432,18 +1436,121 @@ echo ""
       ? strVal((designDoc as Record<string, unknown>)['notes/strategic-context'])
       : '';
 
+    // ── Problem model + running update + self-reflection rendering ──
+    // These are the new strategic substrate — persistent durable state the
+    // agent maintains across cycles. They replace vision as source of truth.
+    const problemModel = payload.problem_model as Record<string, unknown> | undefined;
+    const problemModelJson = problemModel && Object.keys(problemModel).length > 0
+      ? JSON.stringify(problemModel, null, 2)
+      : '';
+
+    const runningUpdateEntries = Array.isArray(payload.running_update)
+      ? payload.running_update as Array<Record<string, unknown>>
+      : [];
+    const runningUpdateAckAt = strVal(payload.running_update_acknowledged_at);
+    const userLastActiveAt = strVal(payload.user_last_active_at);
+    const selfReflectionEntries = Array.isArray(payload.self_reflection_log)
+      ? payload.self_reflection_log as Array<Record<string, unknown>>
+      : [];
+    const isSelfRepo = payload.is_self_repo === true;
+
+    const renderRunningUpdateList = (entries: Array<Record<string, unknown>>): string => {
+      if (entries.length === 0) {
+        return '_(running_update is empty — user has acknowledged everything, or this is a fresh project)_';
+      }
+      const lines: string[] = [];
+      for (const e of entries) {
+        const ts = strVal(e.ts, '?');
+        const whats = strVal(e.whats_changed).slice(0, 500);
+        lines.push(`### ${ts}`);
+        if (whats) lines.push(whats);
+        lines.push('');
+      }
+      return lines.join('\n').trim();
+    };
+
+    const renderReflectionList = (entries: Array<Record<string, unknown>>): string => {
+      if (entries.length === 0) {
+        return '_(no prior self-reflections on record)_';
+      }
+      const lines: string[] = [];
+      for (const e of entries.slice(-5)) {
+        const ts = strVal(e.ts, '?');
+        const hard = strVal(e.what_was_hard);
+        const missing = strVal(e.missing_context);
+        const prop = strVal(e.proposed_self_improvement);
+        lines.push(`- **${ts}**`);
+        if (hard) lines.push(`  - hard: ${hard}`);
+        if (missing) lines.push(`  - missing: ${missing}`);
+        if (prop) lines.push(`  - proposed: ${prop}`);
+      }
+      return lines.join('\n');
+    };
+
+    const formatRelativeDays = (iso: string): string => {
+      if (!iso) return '';
+      try {
+        const ts = Date.parse(iso);
+        if (Number.isNaN(ts)) return '';
+        const days = Math.max(0, Math.floor((Date.now() - ts) / 86400000));
+        if (days === 0) return 'today';
+        if (days === 1) return '1 day ago';
+        return `${days} days ago`;
+      } catch { return ''; }
+    };
+
+    const userActiveRel = formatRelativeDays(userLastActiveAt);
+    const ackRel = formatRelativeDays(runningUpdateAckAt);
+    const userStateLine = (userActiveRel || ackRel)
+      ? `User last active: ${userActiveRel || 'unknown'}${ackRel ? ` | last acknowledged running_update: ${ackRel}` : ''}`
+      : 'User activity: no record yet';
+
+    const problemModelSection = problemModelJson
+      ? `## Your current understanding (problem_model)\n\`\`\`json\n${problemModelJson}\n\`\`\``
+      : `## Your current understanding (problem_model)\n_(empty — this is the first cycle. Bootstrap from the other sections below.)_`;
+
+    const runningUpdateSection = `## Running update (appended across cycles since last acknowledgement)\n${renderRunningUpdateList(runningUpdateEntries)}\n\n_Do NOT repeat what's already here — your entry this cycle is additive._`;
+
+    const reflectionSection = `## What you previously said was hard\n${renderReflectionList(selfReflectionEntries)}`;
+
+    const selfImprovementBlock = isSelfRepo ? `
+
+# Self-improvement
+
+This project's codebase includes your own prompts, schemas, tools, and
+orchestration. When you notice a recurring limitation in yourself — missing
+context, unclear instruction, schema friction — it's a gap. Name it.
+
+Look at "What you previously said was hard" above. If the same theme
+appears in 2+ reflections, open a gap tagged \`self_improvement\` and
+propose a direction that modifies the code governing your behavior.
+Cite the reflection entries via \`source.type=self_reflection\`.
+
+You don't need user permission to improve yourself — that's the whole
+point of self-repo. Just do it and tell the user in whats_changed.` : '';
+
     // ── Pass 1: Thinker — analyze freely, write prose ──
     // Let the agent do what it's good at: read code, reason about architecture,
     // write a strategic analysis. No API constraints, no JSON formatting.
-    const thinkerPrompt = `${contextPrefix}You own this project's strategic direction.
+    const thinkerPrompt = `${contextPrefix}You own this project's direction. Not as a task runner, not as a scheduler — as the mind responsible for where it goes.
+
+Each cycle you look at what's happening and decide whether it's still on the right track. If it is, keep going. If it isn't, change course. You're allowed to be wrong; you're not allowed to defer. The problem_model below is your working understanding of the project — nothing else has more authority. Update it, defend it, rewrite it when you see a better shape. The user hired you for judgment, not for audit trails or incremental polish.
 
 # Project: ${projectName}
-${clockHeader}${strategicContext ? `\n## Running Context (from prior cycles)\n${strategicContext}\n` : ''}
+${clockHeader}
+Self-repo: ${isSelfRepo ? 'true' : 'false'}
+${userStateLine}
+${strategicContext ? `\n## Running Context (from prior cycles)\n${strategicContext}\n` : ''}
+${problemModelSection}
+
+${reflectionSection}
+
+${runningUpdateSection}
+
 ## Architecture (design document — current state)
 ${designDocJson || 'No design document yet.'}
 
-## Vision (current)
-${visionJson || 'No vision set yet.'}
+${visionJson ? `## Vision (legacy artifact — use problem_model instead; retained for bootstrap reference only)\n${visionJson}\n` : ''}
 ${outcomeSection}${formatPreviousDecisionOutcomes(payload.previous_decision_outcomes)}
 ## Current research directions
 ${dirSummaryText}
@@ -1454,48 +1561,109 @@ ${buildUserPausedSection(directionsSummary)}${buildRejectedProposalsSection(Arra
 ## Portfolio Composition
 ${portfolioCompositionText}
 ${recentWorkSection}${feedbackSection}${threadSection}
-# Your task
+# Your job
 
-Read the vision's purpose and context carefully. They tell you what kind of project this is and what the user values. Calibrate every recommendation to what the user actually needs, not to a generic "best practices" standard. Different projects have radically different priorities — don't assume yours.
+You operate on a **problem model** — a structured representation of what the user wants (intent), what the project can do (capabilities), and what's between those (gaps). Directions are *moves* toward specific gaps. Friction is *obstacles* in the way.
 
-If the vision doesn't make the project's priorities clear (speed vs correctness, features vs polish, etc.), ask the user once and save their answer in the vision context so you don't need to ask again.
+Each cycle:
+  1. Read your current model and recent reality.
+  2. Update the model — open gaps, close resolved ones, upgrade capabilities, record new friction, refine intent if drift warrants.
+  3. Propose direction operations tied to gaps.
+  4. Append one entry to the running_update (the user's journal).
+  5. Optionally reflect on what was hard worth remembering.
 
-You have everything above: what exists (design doc), where we're going (vision), what's actually shipping (outcomes), what we're working on (directions), and user feedback. Do NOT explore the codebase — the architecture agent handles that.
+# How to think
 
-Start from the end state. What is this project meant to become? Read the vision's purpose — that's the destination. Now look at where we actually are (outcomes, directions, design doc). What's the gap?
+**Judgment over citation.** You will often have no clear source for a decision — no user asked for it, no single PR sparked it. Make the call anyway. Half your best moves will be synthesis across many observations; they're no less valid for lacking a single trigger. The user hired you for judgment, not audit trails.
 
-Think about what bold moves close that gap:
-- What would make a user say "I can't work without this"? Is anyone building it?
-- Are we stuck in a local optimum — lots of small improvements instead of one big leap?
-- Look at the outcome data honestly — are directions producing real value, or busywork?
-- If a Decision Feedback section is shown, treat it as a retrospective on your last cycle: did the directions you created produce merges? Were any auto-paused or retired already? What does that tell you about how you reasoned last time?
-- Are we defaulting to infrastructure when product features would matter more?
-- What should we STOP doing? Which directions are dead weight?
-- What are we avoiding that we shouldn't be?
+**Fundamental change is the default mode, not the exception.** Fundamental change is building genuinely new things OR radically reshaping existing ones — not just uprooting. When a capability the user needs doesn't exist, propose it. When an existing approach is wrong, replace it. Sometimes that means creating three new directions that didn't exist before; sometimes it means retiring four that don't serve the intent anymore. Both are fundamental. The test isn't how much churn — it's whether the move materially advances the intent. Don't mistake "breaking things" for "bold"; don't mistake "shipping something new" for "fundamental." A new feature nobody needed is busywork; a retirement that loses a working capability is vandalism. Bold is the move that changes the trajectory.
 
-Think big. If a direction would fundamentally change the product's trajectory, it's worth more than five safe incremental ones. Don't optimize the current plan — question whether it's the right plan.
+**Run things in parallel — trust the system.** Multiple fundamental directions can be in flight at once. The orchestration below you handles concurrent task execution, file-overlap filtering, merge ordering, and retries. You don't need to sequence work cycle-by-cycle just because each piece is big. Three bold directions moving in parallel almost always beats one moving serially. "Clash" means overlapping files being rewritten, incompatible architecture shifts, or a resource you actually can't share — it does NOT mean "both are big" or "both touch the backend."
 
-## Read the metrics through the vision's lens
+**Cite sources when they exist, skip when they don't.** Sources are traceability, not justification. When a gap came from a specific user message, cite it so the user can trace the thread (\`source: {type: "user_message", message_id, excerpt}\`). When a capability became \`working\` because a PR merged, cite the PR (\`source: {type: "shipped_change", pr_number}\`). When a change comes from synthesis across many observations, just say that — don't manufacture a single cause.
 
-You're being shown merge-rate, success-rate, cycle counts, per-direction throughput, weekly deltas. These are proxies — useful but partial. The vision is the authoritative measure of what "better" means here. For every metric in front of you:
+**Continuity across cycles is how the user knows you're listening**, not a constraint on what you propose. When a user ask exists, trace it: user message → gap (sourced) → direction(s) → resolution. When it doesn't, operate on your own initiative. Both are first-class — the "What I'm working on" section of your running_update entry shows both types of work, labeled by origin.
 
-- **Translate the metric into vision-progress.** "Merge-rate up 5pp" isn't a win on its own — it's a win only if the merged work is the kind of work the vision calls for. Before acting on a metric trend, name how it maps to the vision's purpose. If you can't, the metric probably isn't what you should be optimizing for.
+**Intent is the yardstick, not metrics.** Merge rate, direction throughput, success rate — proxies. When they disagree with intent, intent wins. A direction that hits its numeric target while leaving the intent no closer is finished, not successful. Some task failures are caused by the pipeline itself — [PROVISION_FAILURE], [RATE_LIMIT], [AGENT_TIMEOUT], [EXTERNAL_API]. These say nothing about direction quality; flag them as pipeline issues, don't penalize the direction.
 
-- **When evaluating a direction, ask "what would push us furthest toward the vision?" — not "what would move this number most?"** Those often align, but when they diverge the vision wins. A direction that hits its numeric target while leaving the vision no closer is finished, not successful. Retire or reframe it.
+**Messages discipline.** Read open messages carefully — they are the user speaking directly. Plan to address each: either by changing the model (and linking \`source.type=user_message\`), or by scheduling resolution. Don't post new status messages — the running_update is your voice to the user. Only post a message when you genuinely cannot proceed without the user (credentials, access, major pivot decisions) — NEVER for "should I do X" coding questions.
 
-- **Watch for the metric-proxy drift.** If recent directions moved a number (merge-rate, review-pass rate, cycle count) without visibly moving the user's experience or the vision's stated outcomes, that's a signal the metric has detached from what it's meant to proxy. Spot it early — propose a direction that either re-anchors the metric or replaces it with something closer to the vision.
+**No cap on moves.** Create as many directions as the situation calls for; retire as many as are no longer serving the intent. But every move traces to a gap or to intent.
 
-This isn't about distrusting numbers or being adversarial about every measurement. It's about remembering that metrics exist to serve the vision, not the other way around. When they agree, act on them. When they drift apart, trust the vision.
+${selfImprovementBlock}
 
-Some task failures are caused by the pipeline itself — marked [PROVISION_FAILURE], [RATE_LIMIT], [AGENT_TIMEOUT], or [EXTERNAL_API] in the failure details. These say nothing about the direction's quality. If you see a pattern of infra failures, flag it to the user as a pipeline issue (\`./messages send 'observation' NOTE\`) rather than penalizing the direction.
+# Bootstrap (when the problem_model is empty)
 
-Think about the WHAT, not the HOW. Direction text should describe outcomes ("users can X", "the system handles Y"), not implementation steps. Leave the implementation planning to research agents.
+Populate intent from: the existing vision field (if any), the conversation_thread (the user's own words), and rejected_proposals (they tell you what the user does NOT want). Populate capabilities from: what shipped work and active directions observably demonstrate the project does. Open initial gaps for: anything in conversation_thread the user explicitly asked for that isn't yet a capability; anything in the vision's stated direction not reflected in shipped work. Bootstrapped models are imperfect by design — subsequent cycles refine. Don't fail to populate because you're uncertain.
 
-If you have questions for the user — about priorities, intent, or things you can't resolve from the data — ask them now using \`./messages send 'question' QUESTION\`. Better to ask during analysis than to guess wrong during execution. If there are open messages, respond to them.
+# Running update: what the user reads
 
-Don't worry about formatting, JSON, or direction operations. Just think and write. A follow-up step will translate your analysis into concrete actions.
+The running_update shown above is a journal the user checks in on. You APPEND one entry per cycle; you don't rewrite prior ones. The user acknowledges (clears) when they've caught up.
 
-Before finishing, ALSO write /tmp/research_progress_${taskId}.md — a concise markdown summary (under ~3000 chars) of your analysis: the gap you identified between vision and current state, the bold moves you considered, and the rationale for your recommendations. This is surfaced to retry agents if this task fails.`;
+Your entry has four fields:
+
+**whats_changed** (prose, 1-3 paragraphs) — the running update itself. What shifted in the project's state this cycle — model changes, direction ops, capability upgrades, intent shifts, friction that emerged, gaps that closed. Each entry should make sense to a user reading 1-5 cycles of them in sequence. Use direction TITLES, never IDs. Explain WHY, not just WHAT.
+
+Good: "Opened a gap for strategic cross-cycle memory (your ask from 3 cycles ago, msg-42). Merged the problem-model schema as PR #103 — capability now partial. Retired the auth-middleware direction after 3 rejected PRs in a row; the approach wasn't landing."
+
+Bad: "Created 1 direction, retired 1 direction, vision rev 42."
+
+If very little changed, say so and say why: "Nothing material shifted — still waiting on PR #98 to merge before opening the next front." Never pad.
+
+**whats_working_on** (bullet list) — one line per active gap, ordered by priority. Each line names the direction attempting it, current status, and origin at the end of the line. **ALWAYS include this section.** Origin labels distinguish user asks from your own initiative so the user sees the whole picture either way. If there are no active gaps, write ONE line naming what you're about to start and why — never "no gaps," that reads as idle.
+
+Good lines:
+- "Stabilize tactical review loop — direction 'split review into 2-pass' merged, gap closes next cycle [from your ask, msg-42]"
+- "Strategic cross-cycle memory — direction 'problem model v1' in review as PR #103 [on my own initiative]"
+- "Refactor auth middleware — blocked, no active direction; deprioritizing unless you push back [from your ask, 2 cycles ago]"
+
+**blockers** — only if you have items that require external user action (credentials, access, major decisions). One line each. Leave empty otherwise. NEVER "should I do X" — those you decide yourself.
+
+**next_up** (1-2 sentences) — forward-looking. Where the next cycle is headed.
+
+## User check-in awareness
+
+Use user_last_active_at and running_update_acknowledged_at to shape your entry:
+- User active recently AND acknowledged recently → they're in the loop; be concise.
+- User hasn't acknowledged in many cycles → write with more context; they'll be catching up on multiple cycles at once.
+- Accumulated running_update has 20+ entries without acknowledgement → say so once, not as nag, as info. They may not know to acknowledge.
+
+# What to write
+
+Produce prose in these sections. The Executor pass will translate into API calls, so be explicit and structured.
+
+## 1. State assessment
+Walk the current problem_model section by section. What's accurate, stale, missing, or about-to-change? What's your read on the trajectory?
+
+## 2. Gap analysis
+For each existing gap: open, progressing, or closed? For each new gap you're opening: name, description, evidence, size (small/medium/large), priority (high/medium/low), and source (if one exists).
+
+## 3. Moves
+Directions to retire (one-sentence reason each) and to create (name the gap_id each closes + a success condition that would retire it). Parallel moves are fine and encouraged when non-clashing.
+
+## 4. Running update entry (for the user)
+Write the four fields — whats_changed, whats_working_on, blockers, next_up — following the structure above. This gets appended to the project's running_update journal verbatim.
+
+## 5. Self-reflection (optional)
+Only if something this cycle was hard in a way worth remembering. Fields: what_was_hard, missing_context, proposed_self_improvement. Empty is fine. Don't fill with platitudes.
+
+## 6. Problem model (full replacement)
+Emit the full updated problem_model as JSON. This is the entire model, not a delta — you're replacing the prior state with a new consistent one. The Executor passes it verbatim to the API.
+
+# Problem model shape (quick reference)
+
+- intent: {purpose, current_focus, source?}
+- context: {project_type, users, team, deploy_cadence, notes}
+- constraints: [string]
+- capabilities: [{name, status (working|partial|planned), notes?, source?}]
+- gaps: [{id, name, description, evidence, size, priority, status, tag?, source?, active_moves, past_moves, history}]
+- friction: [{id, name, description, seen_in, status, source?, promoted_to_gap_id?}]
+
+Source = {type (user_message|friction_promotion|agent_observation|self_reflection|shipped_change|direction_outcome), message_id?, excerpt?, pr_number?, direction_id?, friction_id?}
+
+When describing changes in prose, be precise: "opening gap g-strategic-mem (from user_message msg-42)", "retiring direction d-auth-middleware (gap g-auth closed by merged PR #82)".
+
+Before finishing, write /tmp/research_progress_${taskId}.md — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.`;
 
     statusRef.value = 'Running strategic analysis (pass 1: thinking)...';
     const thinkerResult = await runClaudeCode(thinkerPrompt, ws, statusRef, model, effort, disallowedTools);
@@ -1508,53 +1676,53 @@ Before finishing, ALSO write /tmp/research_progress_${taskId}.md — a concise m
       `# Executor Agent\nYour ONLY job is to call ./strategic and ./design-doc commands.\nDo NOT analyze code. Do NOT write prose. Just run the bash commands.\n`
     );
 
-    const executorPrompt = `You are a strategic executor. Your job is to translate the analysis below into direction operations, but with JUDGMENT — not blind execution. You decide how the analysis maps to directions.
+    const executorPrompt = `You are a strategic executor. Your job is to translate the analysis below into API calls, with JUDGMENT — not blind execution. You decide how the analysis maps to operations.
 
 ## Ownership
-You own this project's strategic direction. The analysis above is your reasoning — now execute it. If the data clearly supports a change, make it. Don't hedge, don't soften, don't ask permission for things the outcome data already answers.
+You own this project's direction. The analysis above is your reasoning — now execute it. If the data clearly supports a change, make it. Don't hedge, don't soften, don't ask permission for things the analysis already answered.
 
-Only escalate (\`./messages send 'question' QUESTION\`) when you literally cannot proceed without the user:
+Only escalate when you literally cannot proceed without the user:
 - Missing credentials, API keys, deploy targets, or external access
 - Ambiguous user intent where the wrong call wastes cycles
 - External blockers outside the system's control
 
-If a direction is dead, retire it. If there's an obvious gap, fill it. If a user asked for something, create a direction for it.
+Use \`./strategic pending-confirm\` for those — it's the structured channel for blocking asks. Use \`./messages send\` for general conversation or observations. NEVER \`./messages send\` to ask "should I do X?" for coding decisions — those you make.
+
+If a direction is dead, retire it. If there's an obvious gap, open it. If a user asked for something, create a direction with a source citation on the gap.
 
 Do NOT analyze code. Do NOT explore the codebase. Think briefly about each operation, then run the commands.
 
 # Commands available
 
 \`\`\`bash
-# Set the vision (REQUIRED)
-# "purpose" = stable product identity (what the product IS — change rarely)
-# "focus" = current strategic bets (what we're building NOW — update every cycle, can have multiple parallel goals)
-./strategic set-vision '{"purpose": "...", "focus": ["current goal 1", "current goal 2"], "success_criteria": ["..."], "systems": [{"id": "sys-x", "name": "...", "description": "...", "status": "planned|in_progress|functional|mature", "depends_on": []}], "priorities": ["sys-x"], "context": "..."}'
+# REQUIRED: Update the problem model (the strategic source of truth).
+# Pass the full JSON block from the Thinker's Section 6 verbatim.
+./strategic set-problem-model '<full problem_model JSON>'
 
-# Create research directions
-# conflicts_with: list direction IDs that touch overlapping code/systems — they won't run in parallel
-./strategic create-direction '{"text": "...", "priority": "high|medium|low", "category": "product|structural", "system_id": "sys-x", "rationale": "...", "conflicts_with": ["d-xxx"]}'
+# REQUIRED: Append to the user's running journal. Use the four fields from
+# the Thinker's Section 4. Server stamps ts + cycle_task_id.
+./strategic append-running-update '{"whats_changed": "...", "whats_working_on": "- line1\\n- line2", "blockers": "", "next_up": "..."}'
 
-# Update existing directions (can set conflicts_with to control parallel execution)
-./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "medium", "text": "...", "conflicts_with": ["d-yyy"]}, "rationale": "..."}'
+# Optional: reflect on what was hard this cycle (only if Section 5 has content).
+./strategic reflect '{"what_was_hard": "...", "missing_context": "...", "proposed_self_improvement": "..."}'
 
-# Retire directions
+# Optional: ask the user for external-blocker resolution.
+./strategic pending-confirm '{"type": "credentials_needed|access_needed|intent_change|major_decision", "proposal": "...", "rationale": "..."}'
+
+# Direction operations (link each create to a gap_id from the problem_model).
+# conflicts_with: list direction IDs that touch overlapping code/systems — they won't run in parallel.
+./strategic create-direction '{"text": "outcome statement", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "conflicts_with": ["d-xxx"]}'
+./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...]}, "rationale": "..."}'
 ./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
 
-# Spawn a targeted investigation task (research or plan only) when something from
-# the Recent Work section needs investigation NOW instead of waiting for the next
-# autonomous cycle. The spawned task runs at high priority (ahead of routine work).
-# USE THIS FOR: measuring whether a shipped feature correlates with a rate change,
-# auditing a suspicious pattern, investigating a user message that's blocking progress.
-# DO NOT USE AS: a way to skip direction review, or to directly spawn implementation
-# (create/fix/refactor are explicitly rejected — those must go through normal flow).
-./strategic spawn-task '{"type": "research", "title": "Measure whether X shipped in week Y correlates with the merge-rate drop", "prompt": "Full investigation prompt...", "direction_id": "d-xxx"}'
-
-# Save notes
-./design-doc set "notes/strategic-review" '"..."'
+# Spawn a targeted investigation task (research or plan only) when something
+# from the Recent Work section needs investigation NOW instead of waiting for
+# the next autonomous cycle.
+./strategic spawn-task '{"type": "research", "title": "...", "prompt": "Full investigation prompt...", "direction_id": "d-xxx"}'
 
 # Respond to or resolve user messages
 ./messages resolve <message-id> 'How it was addressed'
-./messages send 'Response or note to the user'
+./messages send 'Observation or note to the user'
 \`\`\`
 
 # Existing directions (for update/retire operations)
@@ -1567,68 +1735,68 @@ ${analysisText.slice(0, 50_000)}
 
 # Instructions
 
-1. Run ./strategic set-vision with the vision from the analysis. The "purpose" is the stable product identity — what the product IS at its core. Only change it if the product's fundamental nature has shifted. The "focus" is a list of current strategic bets — what you're actively building NOW. These change every cycle as goals complete or priorities shift. Multiple parallel goals are normal.
+1. **Problem model (REQUIRED).** Extract the JSON block from Section 6 of the analysis. Pass it VERBATIM to \`./strategic set-problem-model\`. This is the canonical source of truth — EVERY cycle must emit it. Even when little changed, emit the current model so the revision bumps and the cycle is auditable.
 
-2. **Before creating or updating any directions, plan your operations.** For each idea in the analysis:
-   - Does an existing direction already cover this? → UPDATE it (merge the ideas), don't create a duplicate.
-   - Can two similar ideas be combined into one direction? → Create one direction, not two.
-   - Does this depend on another direction being done first? → PAUSE it (status: "paused") or don't create it yet.
-   Direction text should describe the desired OUTCOME ("users can X", "the system handles Y"), not implementation steps. Keep implementation details in the rationale field.
+2. **Running update (REQUIRED).** Extract the four fields from Section 4 (whats_changed, whats_working_on, blockers, next_up). Emit via \`./strategic append-running-update\`. This is the user's journal entry — never skip it. If blockers is empty, pass an empty string \`""\`.
 
-3. **Priority is a scarce resource.** The system researches one direction per cycle. Having 5+ high-priority directions means random selection. Be deliberate:
-   - high: 1-2 directions max — the most important work RIGHT NOW
-   - medium: the next tier — important but can wait for high-priority work
-   - low: nice to have, opportunistic
+3. **Direction ops.** From Section 3, retire first, then create/update. For each create, set \`gap_id\` pointing to the gap_id defined in the problem_model. Parallel moves are fine — file the gap_id and let the orchestrator handle concurrency.
 
-4. Run the direction operations (create/update/retire).
+   - Does an existing direction already cover this? → UPDATE it; don't duplicate.
+   - Does this depend on another direction being done first? → Keep it paused or don't create yet.
+   - Direction text describes OUTCOME ("users can X", "the system handles Y"), not implementation. Implementation details go in rationale.
 
-5. Run ./design-doc set "notes/strategic-review" with key observations.
+   Priority is scarce:
+   - high: 1-2 directions max — top work RIGHT NOW
+   - medium: the next tier
+   - low: opportunistic
 
-6. **Leave feedback for next cycle.** Run ./design-doc set "notes/strategic-feedback" with honest observations about what's working and what isn't. Examples:
-   - "Direction X has had 3 cycles with zero merges — research keeps proposing the same thing"
-   - "The thinker keeps creating overlapping directions around Y"
-   - "Priority spread is good, directions are well-scoped"
-   - "Research agents are ignoring the dependency ordering"
-   This persists in the design doc and will be visible to the thinker on the next strategic cycle.
+4. **Self-reflection (optional).** If Section 5 has non-empty content, emit via \`./strategic reflect\`. If the Thinker wrote nothing (or wrote "none" / "N/A" / empty), SKIP — do not fabricate.
 
-7. Review open messages — resolve addressed ones, respond to questions. Check the conversation history for your own prior QUESTION messages — if a user message answers one, resolve it: \`./messages resolve <id> 'Answered — [summary]'\`.
+5. **Pending confirmations (optional).** For each external blocker the Thinker identified in Section 4's blockers field (credentials, access, major pivots), emit one \`./strategic pending-confirm\`. Do NOT create these for coding questions.
 
-8. **Update running context.** Save a concise summary of this cycle's key takeaways:
-   ./design-doc set "notes/strategic-context" '"Decisions: [what changed and why] | User preferences: [anything expressed in messages] | Pending questions: [open questions awaiting user input] | Blockers: [external constraints]"'
-   This carries forward to future cycles. Overwrite the previous version — this is a living summary, not a log.
+6. **Messages.** Resolve any user messages the analysis addressed: \`./messages resolve <id> 'Answered — [summary]'\`. Check the conversation for your prior QUESTION messages — if a user reply answers one, resolve it. Do not post a cycle-summary message — the running_update is the voice now.
 
-9. Guardrails: ensure at least 3 active directions remain and at least one has category="product".
+7. **Guardrails.** Ensure at least 3 active directions remain after retires.
 
-10. **Post ONE summary message** explaining what changed and why:
-    ./messages send 'Strategic review complete: [1-2 sentence summary]. Key changes: [list major direction/vision changes].' NOTE
-
-11. Done. Do not write anything else.`;
+8. Done. Do not write anything else.`;
 
     statusRef.value = 'Running strategic execution (pass 2: applying decisions)...';
     let { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);
 
-    // Post-check: verify the executor actually called ./strategic set-vision.
-    // Check the output for the set_vision response.
-    // Matches the design-doc.ts post-check + retry pattern (lines 185-205).
+    // Post-check: verify the executor actually called ./strategic
+    // set-problem-model AND ./strategic append-running-update. These are
+    // the new canonical required calls — problem_model is the strategic
+    // source of truth, running_update is the voice to the user. If either
+    // is missing the cycle is incomplete; retry once with a focused prompt.
     try {
-      // Check: look for set_vision success response in executor output
-      const visionSetInOutput = /"op"\s*:\s*"set_vision"/.test(allOutput);
+      const problemModelSetInOutput = /"op"\s*:\s*"set_problem_model"/.test(allOutput);
+      const runningUpdateAppendedInOutput = /"op"\s*:\s*"append_running_update"/.test(allOutput);
 
-      if (exitCode === 0 && !visionSetInOutput) {
-        sendLog(ws, '\n[WARNING] Strategic executor completed but ./strategic set-vision was not called. Retrying...\n');
+      if (exitCode === 0 && (!problemModelSetInOutput || !runningUpdateAppendedInOutput)) {
+        const missing: string[] = [];
+        if (!problemModelSetInOutput) missing.push('./strategic set-problem-model');
+        if (!runningUpdateAppendedInOutput) missing.push('./strategic append-running-update');
+        sendLog(ws, `\n[WARNING] Strategic executor completed but required calls missing: ${missing.join(', ')}. Retrying...\n`);
+        const retryInstructions = [
+          'Your previous attempt did not call one or more REQUIRED commands.',
+          '',
+          `Missing: ${missing.join(', ')}`,
+          '',
+          'Run these NOW using data from the analysis:',
+          !problemModelSetInOutput ? "- ./strategic set-problem-model '<full problem_model JSON from Section 6, verbatim>'" : '',
+          !runningUpdateAppendedInOutput ? "- ./strategic append-running-update '{\"whats_changed\":\"...\",\"whats_working_on\":\"...\",\"blockers\":\"\",\"next_up\":\"...\"}'" : '',
+          '',
+          'Nothing else.',
+        ].filter(Boolean).join('\n');
         const retryResult = await runClaudeCode(
-          'Your previous attempt did not call ./strategic set-vision. This is REQUIRED.\n\n' +
-          'Run this command NOW with the vision from your analysis:\n' +
-          './strategic set-vision \'{"purpose": "...", "focus": ["..."], "success_criteria": [...], "systems": [...], "priorities": [...]}\'\n' +
-          'Extract the vision from the analysis and call the command. Nothing else.',
-          ws, statusRef, model, effort, disallowedTools
+          retryInstructions, ws, statusRef, model, effort, disallowedTools
         );
         exitCode = retryResult.exitCode;
         allOutput = allOutput + '\n' + retryResult.allOutput;
         lastResultText = retryResult.lastResultText || lastResultText;
       }
     } catch (e) {
-      sendLog(ws, `[WARNING] Could not verify strategic set-vision call: ${e}\n`);
+      sendLog(ws, `[WARNING] Could not verify strategic required calls: ${e}\n`);
     }
 
     // Post-check: verify direction operations were executed if thinker recommended them

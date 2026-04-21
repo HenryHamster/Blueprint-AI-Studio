@@ -120,8 +120,35 @@ class Project(SQLModel, table=True):
     # diagnose repeated code failures — see DIAGNOSIS_* constants above):
     #   diagnosis_in_progress: bool, diagnosis_task_id: str, diagnosis_started_at: ISO str
     directions: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, default=[]))
-    # Strategic product vision maintained by the strategic research agent
+    # Strategic product vision maintained by the strategic research agent.
+    # Legacy: being replaced by ``problem_model`` (see below). During migration
+    # we render vision from the problem model; once all consumers migrate, this
+    # column becomes a cache or is removed.
     vision: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))
+    # Structured problem model — the strategic layer's durable understanding.
+    # Replaces vision + design_doc/notes/strategic-context as the source of
+    # truth for strategic state. Shape defined in app.problem_model.ProblemModel.
+    problem_model: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))
+    # Self-reflection log — append-only list of the strategic agent's
+    # own observations about what was hard / what context it was missing
+    # each cycle. Used on self-repo projects to drive the self-improvement
+    # loop. Empty list on non-self-repo projects. Entry shape defined in
+    # app.problem_model.SelfReflectionEntry; cap SELF_REFLECTION_LOG_MAX.
+    self_reflection_log: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=True, default=[]),
+    )
+    # Running update — the strategic agent's accumulating narrative of what
+    # has changed in the project, appended to each cycle. Persists across
+    # cycles so the user sees a journal of the project's evolution since
+    # their last check-in. User acknowledges to clear the list + stamp
+    # running_update_acknowledged_at; agent starts a fresh accumulation
+    # after acknowledge. Entry shape: app.problem_model.RunningUpdateEntry.
+    running_update: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=True, default=[]),
+    )
+    running_update_acknowledged_at: Optional[datetime] = Field(default=None)
     # Living architectural description maintained by design doc update agent
     design_doc: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))
     # Toggle autonomous research/task generation

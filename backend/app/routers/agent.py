@@ -393,6 +393,130 @@ def _compute_failure_stage_pattern(history: list) -> "dict | None":
 
 
 # ---------------------------------------------------------------------------
+# Helper: compact strategic vision for the claim response
+# ---------------------------------------------------------------------------
+
+def _build_vision_summary(vision_raw: dict | None) -> "dict | None":
+    """Return a size-bounded, agent-safe view of project.vision.
+
+    Strips internal fields (``_strategic_failures``, ``_strategic_cycle_history``,
+    ``_strategic_frequency_override``, etc.) and truncates free-text entries so
+    the claim payload stays bounded. Returns None when there is nothing
+    meaningful to surface — so callers can skip injection entirely.
+    """
+    if not vision_raw or not isinstance(vision_raw, dict):
+        return None
+    summary: dict = {}
+    purpose = vision_raw.get("purpose")
+    if isinstance(purpose, str) and purpose.strip():
+        summary["purpose"] = purpose.strip()[:600]
+    success = vision_raw.get("success_criteria")
+    if isinstance(success, str) and success.strip():
+        summary["success_criteria"] = success.strip()[:600]
+    elif isinstance(success, list):
+        compact = [str(s).strip()[:200] for s in success if isinstance(s, str) and s.strip()]
+        if compact:
+            summary["success_criteria"] = compact[:5]
+    context_field = vision_raw.get("context")
+    if isinstance(context_field, str) and context_field.strip():
+        summary["context"] = context_field.strip()[:600]
+    priorities = vision_raw.get("priorities")
+    if isinstance(priorities, list):
+        compact_p: list = []
+        for p in priorities[:5]:
+            if isinstance(p, str) and p.strip():
+                compact_p.append(p.strip()[:200])
+            elif isinstance(p, dict):
+                text = p.get("text") or p.get("title") or p.get("name")
+                if isinstance(text, str) and text.strip():
+                    compact_p.append(text.strip()[:200])
+        if compact_p:
+            summary["priorities"] = compact_p
+    systems = vision_raw.get("systems")
+    if isinstance(systems, list):
+        compact_s: list = []
+        for sys in systems[:6]:
+            if not isinstance(sys, dict):
+                continue
+            name = sys.get("name") or sys.get("id")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            entry = {"name": name.strip()[:80]}
+            status = sys.get("status")
+            if isinstance(status, str) and status.strip():
+                entry["status"] = status.strip()[:40]
+            desc = sys.get("description")
+            if isinstance(desc, str) and desc.strip():
+                entry["description"] = desc.strip()[:200]
+            compact_s.append(entry)
+        if compact_s:
+            summary["systems"] = compact_s
+    revision = vision_raw.get("revision")
+    if isinstance(revision, int):
+        summary["revision"] = revision
+    last_updated = vision_raw.get("last_updated")
+    if isinstance(last_updated, str) and last_updated:
+        summary["last_updated"] = last_updated[:40]
+    if not summary:
+        return None
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Helper: direction narrative (what we know, what's open)
+# ---------------------------------------------------------------------------
+
+def _build_direction_narrative(direction: dict) -> "dict | None":
+    """Extract a short "where we are" narrative from a direction.
+
+    Pulls the top bullets from the Established Findings and Open Questions
+    sections of research_context, plus the most recent productive cycle
+    outcome. The aim is to give tactical agents a sense of trajectory —
+    what's been confirmed, what's still unknown — without dumping the full
+    research document into the prompt.
+    """
+    if not isinstance(direction, dict):
+        return None
+    from app.research_context import _parse_research_context
+    rc_text = direction.get("research_context", "") or ""
+    parsed = _parse_research_context(rc_text) if rc_text else {}
+    established = parsed.get("established", []) if isinstance(parsed, dict) else []
+    open_questions = parsed.get("open_questions", []) if isinstance(parsed, dict) else []
+
+    def _trim(items: list, limit: int, char_cap: int) -> list:
+        return [
+            item.strip()[:char_cap]
+            for item in items[:limit]
+            if isinstance(item, str) and item.strip()
+        ]
+
+    narrative: dict = {}
+    top_established = _trim(established, 3, 240)
+    if top_established:
+        narrative["established_findings"] = top_established
+    top_open = _trim(open_questions, 2, 240)
+    if top_open:
+        narrative["open_questions"] = top_open
+
+    history = direction.get("research_history") or []
+    productive = [h for h in history if isinstance(h, dict) and h.get("tasks_created", 0) > 0]
+    if productive:
+        last = productive[-1]
+        merged = int(last.get("prs_merged", 0) or 0)
+        created = int(last.get("tasks_created", 0) or 0)
+        rejected = int(last.get("prs_rejected", 0) or 0)
+        if created > 0:
+            narrative["last_cycle"] = {
+                "tasks_created": created,
+                "prs_merged": merged,
+                "prs_rejected": rejected,
+            }
+    if not narrative:
+        return None
+    return narrative
+
+
+# ---------------------------------------------------------------------------
 # Agent lifecycle endpoints
 # ---------------------------------------------------------------------------
 
@@ -1612,6 +1736,31 @@ async def claim_task(
                         await session.commit()
                     except Exception:
                         logger.exception("[AGENT] Failed to track arch context injection (non-critical)")
+
+    # Inject strategic vision so tactical agents understand the "why" behind
+    # their work. Useful for every task type — the orchestrator's strategic
+    # layer publishes this, but until now it was never read by implementers.
+    if project_for_playbook:
+        vision_summary = _build_vision_summary(project_for_playbook.vision)
+        if vision_summary:
+            response["vision"] = vision_summary
+
+    # Inject direction narrative (established findings + open questions + last
+    # cycle outcome) for task types that work inside a direction. Gives agents
+    # a sense of trajectory rather than just a snapshot of recent tasks.
+    if direction_id and project_for_playbook and task_type in (
+        "create", "fix", "refactor", "research", "plan",
+    ):
+        _narrative_direction = next(
+            (d for d in (project_for_playbook.directions or []) if d.get("id") == direction_id),
+            None,
+        )
+        if _narrative_direction:
+            narrative = _build_direction_narrative(_narrative_direction)
+            if narrative:
+                if "direction_context" not in response:
+                    response["direction_context"] = {}
+                response["direction_context"]["narrative"] = narrative
 
     # Inject build_config so the agent knows how to lint/test/build
     if project_for_playbook and project_for_playbook.build_config:
