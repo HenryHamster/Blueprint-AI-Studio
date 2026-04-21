@@ -482,17 +482,44 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           </button>
         </div>
 
-        {/* Project selector (shared) */}
-        <div className="px-5 py-2 border-b border-neutral-800 shrink-0">
+        {/* Project selector + spawn triggers. Triggers live here so they're
+            always visible and don't compete with the tabs row for width. */}
+        <div className="px-5 py-2 border-b border-neutral-800 shrink-0 flex items-center gap-2">
           <select
             value={selectedProjectId}
             onChange={e => setSelectedProjectId(e.target.value)}
-            className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            className="flex-1 min-w-0 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
           >
             {projects.map(p => (
               <option key={p.id} value={p.id}>{p.name || p.id}</option>
             ))}
           </select>
+          <div className="shrink-0 flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => triggerCycle('design_doc')}
+              title="Run architecture review (Phase 1 only)"
+              className="inline-flex items-center gap-1 text-xs px-2 py-1.5 rounded border border-purple-900/50 text-purple-400 hover:bg-purple-900/20 transition-colors"
+            >
+              <Zap className="w-3 h-3" /> Arch
+            </button>
+            <button
+              type="button"
+              onClick={() => triggerCycle('strategic_review')}
+              title="Run strategic review (Phase 2 only, skip design doc update)"
+              className="inline-flex items-center gap-1 text-xs px-2 py-1.5 rounded border border-cyan-900/50 text-cyan-400 hover:bg-cyan-900/20 transition-colors"
+            >
+              <Zap className="w-3 h-3" /> Strategic
+            </button>
+            <button
+              type="button"
+              onClick={() => triggerCycle('full')}
+              title="Run full cycle (Phase 1 then chains to Phase 2)"
+              className="inline-flex items-center gap-1 text-xs px-2 py-1.5 rounded border border-neutral-700 text-neutral-300 hover:bg-neutral-800/60 transition-colors"
+            >
+              <Zap className="w-3 h-3" /> Full cycle
+            </button>
+          </div>
         </div>
 
         {/* Tabs */}
@@ -550,36 +577,6 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
               return pc > 0 ? <span className="ml-1.5 text-xs text-neutral-500">({pc})</span> : null;
             })()}
           </button>
-          {/* Spawn triggers — right-aligned so they're reachable from every
-              tab. "Arch review" runs design_doc_update (Phase 1); "Strategic"
-              runs strategic_review (Phase 2) against the current design doc;
-              "Full cycle" runs Phase 1 which chains into Phase 2 on success. */}
-          <div className="ml-auto flex items-center gap-1 pr-2">
-            <button
-              type="button"
-              onClick={() => triggerCycle('design_doc')}
-              title="Run architecture review (Phase 1)"
-              className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded border border-purple-900/50 text-purple-400 hover:bg-purple-900/20 transition-colors"
-            >
-              <Zap className="w-3 h-3" /> Arch review
-            </button>
-            <button
-              type="button"
-              onClick={() => triggerCycle('strategic_review')}
-              title="Run strategic review (Phase 2 only, skip design doc update)"
-              className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded border border-cyan-900/50 text-cyan-400 hover:bg-cyan-900/20 transition-colors"
-            >
-              <Zap className="w-3 h-3" /> Strategic
-            </button>
-            <button
-              type="button"
-              onClick={() => triggerCycle('full')}
-              title="Run full cycle (Phase 1 then chains to Phase 2)"
-              className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded border border-neutral-700 text-neutral-400 hover:bg-neutral-800/50 transition-colors"
-            >
-              <Zap className="w-3 h-3" /> Full cycle
-            </button>
-          </div>
         </div>
 
         {/* === Directions tab content === */}
