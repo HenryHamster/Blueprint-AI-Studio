@@ -828,17 +828,14 @@ direction_failure_streaks: Dict[str, Dict] = {}
 
 # Number of consecutive CODE_ERROR failures before a direction is held
 DIRECTION_HOLD_THRESHOLD = 3
-# Higher threshold for consecutive infra failures (PROVISION_FAILURE, RATE_LIMIT,
-# AGENT_TIMEOUT, EXTERNAL_API, SCOPE_OVERFLOW). A single infra failure is noise,
-# but a sustained streak suggests the direction's scope/scale is the real cause
-# (e.g. files that consistently OOM the agent, scope that always overflows).
-DIRECTION_INFRA_HOLD_THRESHOLD = 6
 # Automatic hold expiry (safety valve so a direction doesn't stay blocked forever)
 DIRECTION_HOLD_TIMEOUT_HOURS = 2
 
 # _DIRECTION_INFRA_CLASSES: imported from failure_classification at module top-level.
-# Failure classes that are infrastructure-level and should NOT count toward
-# the direction streak (the direction is blameless for infra failures).
+# Infrastructure failures (RATE_LIMIT, PROVISION_FAILURE, AGENT_TIMEOUT,
+# EXTERNAL_API, SCOPE_OVERFLOW) do NOT count toward the direction streak —
+# they're platform noise, not the direction's fault. Account health +
+# provisioning tracking handle them upstream.
 
 
 def record_direction_result(
@@ -886,22 +883,12 @@ def record_direction_result(
         return
 
     if failure_class in _DIRECTION_INFRA_CLASSES:
-        streak["consecutive_infra_failures"] += 1
-        streak["last_failure_class"] = failure_class
-        streak["last_failure_at"] = _utcnow()
-        if (
-            streak["consecutive_infra_failures"] >= DIRECTION_INFRA_HOLD_THRESHOLD
-            and not streak["held"]
-        ):
-            streak["held"] = True
-            streak["held_at"] = _utcnow()
-            streak["held_reason"] = "infra"
-            streak["held_failure_class"] = failure_class
-            logger.warning(
-                f"[DIRECTION HEALTH] Direction {direction_id} HELD after "
-                f"{streak['consecutive_infra_failures']} consecutive infra "
-                f"failures (last: {failure_class})."
-            )
+        # Infra failures (RATE_LIMIT, PROVISION_FAILURE, AGENT_TIMEOUT,
+        # EXTERNAL_API, SCOPE_OVERFLOW) are not the direction's fault — they
+        # happen at the pool / VM / third-party level. Counting them against
+        # the direction wrongly holds innocent directions when the platform
+        # has a bad hour. Account health + VM provisioning tracking handle
+        # these upstream; the direction's streak stays unaffected.
         return
 
     streak["consecutive_failures"] += 1

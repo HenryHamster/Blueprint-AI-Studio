@@ -36,17 +36,6 @@ class AnthropicProvider(LLMProvider):
     name = LLMProviderName.ANTHROPIC
     supported_auth_modes = (LLMAuthMode.OAUTH, LLMAuthMode.API_KEY)
 
-    def validate_settings(self, bag: Mapping[str, Any]) -> dict[str, Any]:
-        cleaned = super().validate_settings(bag)
-        model = cleaned.get("model")
-        fallback = cleaned.get("fallback_model")
-        if model and fallback and model == fallback:
-            raise ValueError(
-                f"fallback_model {fallback!r} must differ from model {model!r} — "
-                "Claude Code CLI cannot fall back to the same tier that's rate-limited."
-            )
-        return cleaned
-
     def validate_secret(
         self,
         raw: str,
@@ -187,7 +176,11 @@ class AnthropicProvider(LLMProvider):
             args += ["--effort", cli_effort]
 
         fallback_model = bag.get("fallback_model")
-        if isinstance(fallback_model, str):
+        # Same-tier fallback is a no-op (can't fall back to the rate-limited
+        # tier), so treat it as "no fallback configured" rather than emitting
+        # a useless flag. Account- and provider-level fallback already cover
+        # the cross-model case anyway.
+        if isinstance(fallback_model, str) and fallback_model != model:
             args += ["--fallback-model", fallback_model]
 
         # Agent VMs are ephemeral and isolated; any permission mode other than

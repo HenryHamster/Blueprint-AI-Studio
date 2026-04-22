@@ -51,6 +51,7 @@ export interface DirectionCardProps {
   rejectProposal: (id: string) => Promise<void>;
   reviveProposal: (id: string) => Promise<void>;
   reactivateDirection: (id: string) => Promise<void>;
+  unholdDirection: (id: string) => Promise<void>;
   markDirectionComplete: (id: string) => Promise<void>;
   quickToggleStatus: (id: string, status: 'active' | 'paused') => Promise<void>;
   deleteDirection: (id: string) => Promise<void>;
@@ -83,7 +84,7 @@ function DirectionCardImpl({
   setEditingId, setEditText, setEditPriority, setEditStatus, setEditCategory, setEditPathTags, setEditPathInput, setEditCompletionCriteria, setEditCostBudget,
   startEdit,
   updateDirection, approveProposal, rejectProposal, reviveProposal,
-  reactivateDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
+  reactivateDirection, unholdDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
   applyDirectionUpdate, dismissDirectionUpdate, triggerResearch, reorderDirections,
   taskCounts, activeTasks, cooldownMinutes, researchingIds, researchSuccessIds,
   forceConfirmId, setForceConfirmId,
@@ -459,6 +460,26 @@ function DirectionCardImpl({
               {d.paused_reason}
               {d.paused_at && <span className="text-neutral-600"> · paused {formatRelativeTime(d.paused_at)}</span>}
             </p>
+          )}
+          {/* Hold banner — direction paused from autonomous spawning after a
+              CODE_ERROR streak. Clears on next success or via manual unhold. */}
+          {d.held && (
+            <div className="mt-1.5 flex items-start gap-1.5 p-1.5 bg-red-950/30 border border-red-900/50 rounded">
+              <AlertTriangle className="w-3 h-3 text-red-400 shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <p className="text-[11px] text-red-300 font-medium leading-tight">On hold</p>
+                <p className="text-[10px] text-red-400/80 leading-relaxed mt-0.5">
+                  {d.held_reason || 'Held after repeated failures.'}
+                </p>
+              </div>
+              <button
+                onClick={(e) => { e.stopPropagation(); void unholdDirection(d.id); }}
+                className="text-[10px] px-2 py-0.5 rounded border border-red-700 text-red-200 hover:bg-red-900/40 shrink-0"
+                title="Clear the hold so this direction can spawn autonomous tasks again"
+              >
+                unhold
+              </button>
+            </div>
           )}
           {/* Positive completion suggestion */}
           {d.possibly_complete && d.completion_suggestion && (

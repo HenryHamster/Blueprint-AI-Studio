@@ -66,6 +66,12 @@ export interface Direction {
   paused_reason?: string;
   paused_at?: string;
   auto_paused?: boolean;
+  // Hold state: a direction with repeated CODE_ERROR failures is held from
+  // autonomous spawning until manually cleared or the 2-hour timeout elapses.
+  // Populated by backend GET /directions response. held_reason is null when
+  // held=false.
+  held?: boolean;
+  held_reason?: string | null;
   // Diagnosis / remediation pipeline state (surfaced from backend direction dict)
   needs_manual_intervention?: boolean;
   diagnosis_in_progress?: boolean;
@@ -279,6 +285,19 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
       fetchDirections();
     } catch {
       setError('Failed to reactivate direction. Please try again.');
+    }
+  }
+
+  async function unholdDirection(id: string) {
+    setError(null);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}/unhold`, {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error('Failed to unhold direction');
+      fetchDirections();
+    } catch {
+      setError('Failed to unhold direction. Please try again.');
     }
   }
 
@@ -902,6 +921,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                             rejectProposal={rejectProposal}
                             reviveProposal={reviveProposal}
                             reactivateDirection={reactivateDirection}
+                            unholdDirection={unholdDirection}
                             markDirectionComplete={markDirectionComplete}
                             quickToggleStatus={quickToggleStatus}
                             deleteDirection={deleteDirection}

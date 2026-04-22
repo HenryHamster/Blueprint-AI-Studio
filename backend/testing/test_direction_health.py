@@ -24,7 +24,6 @@ from app.shared_state import (
     get_held_directions,
     get_pipeline_health_snapshot,
     DIRECTION_HOLD_THRESHOLD,
-    DIRECTION_INFRA_HOLD_THRESHOLD,
     DIRECTION_HOLD_TIMEOUT_HOURS,
 )
 from app.orchestrator_filters import filter_held_directions
@@ -53,15 +52,19 @@ class TestRecordDirectionResult:
     def setup_method(self):
         _setup()
 
-    def test_infra_failures_do_not_count_toward_code_streak(self):
+    def test_infra_failures_are_ignored_entirely(self):
+        """Infra failures (RATE_LIMIT, PROVISION_FAILURE, AGENT_TIMEOUT,
+        EXTERNAL_API, SCOPE_OVERFLOW) are platform noise, not the direction's
+        fault — they must NOT count toward any hold streak, ever."""
         did = _fresh_direction_id()
-        for fc in ("PROVISION_FAILURE", "RATE_LIMIT", "AGENT_TIMEOUT", "EXTERNAL_API"):
-            record_direction_result(did, success=False, failure_class=fc)
-        streak = _ss.direction_failure_streaks[did]
-        assert streak["consecutive_failures"] == 0
-        # Below the infra threshold — not held yet
-        assert not streak["held"]
-        assert streak["consecutive_infra_failures"] == 4
+        for fc in ("PROVISION_FAILURE", "RATE_LIMIT", "AGENT_TIMEOUT", "EXTERNAL_API", "SCOPE_OVERFLOW"):
+            for _ in range(20):  # way past any threshold
+                record_direction_result(did, success=False, failure_class=fc)
+        # Direction state may or may not exist depending on init path; either
+        # way it must not be held.
+        streak = _ss.direction_failure_streaks.get(did, {})
+        assert not streak.get("held")
+        assert streak.get("consecutive_failures", 0) == 0
 
     def test_code_error_increments_streak(self):
         did = _fresh_direction_id()
@@ -96,58 +99,27 @@ class TestRecordDirectionResult:
         assert "" not in _ss.direction_failure_streaks
 
     def test_mixed_infra_and_code_errors(self):
+        """Only code errors count; infra failures are ignored."""
         did = _fresh_direction_id()
-        # 2 code errors + 5 infra failures: neither threshold crossed (code=3, infra=6)
         for _ in range(2):
             record_direction_result(did, success=False, failure_class="CODE_ERROR")
-        for _ in range(5):
+        for _ in range(50):  # infra failures should have no effect
             record_direction_result(did, success=False, failure_class="PROVISION_FAILURE")
         streak = _ss.direction_failure_streaks[did]
         assert streak["consecutive_failures"] == 2
-        assert streak["consecutive_infra_failures"] == 5
         assert not streak["held"]
 
-    def test_infra_hold_triggered_at_infra_threshold(self):
+    def test_interleaved_infra_does_not_reset_code_streak(self):
+        """Code streak must not be reset by interleaved infra noise."""
         did = _fresh_direction_id()
-        for _ in range(DIRECTION_INFRA_HOLD_THRESHOLD):
-            record_direction_result(did, success=False, failure_class="AGENT_TIMEOUT")
-        streak = _ss.direction_failure_streaks[did]
-        assert streak["consecutive_infra_failures"] == DIRECTION_INFRA_HOLD_THRESHOLD
-        assert streak["held"]
-        assert streak["held_reason"] == "infra"
-        held, reason = is_direction_held(did)
-        assert held
-        assert "infra" in reason
-        assert "AGENT_TIMEOUT" in reason
-
-    def test_infra_hold_below_threshold_not_held(self):
-        did = _fresh_direction_id()
-        for _ in range(DIRECTION_INFRA_HOLD_THRESHOLD - 1):
-            record_direction_result(did, success=False, failure_class="PROVISION_FAILURE")
-        streak = _ss.direction_failure_streaks[did]
-        assert not streak["held"]
-
-    def test_success_resets_both_counters(self):
-        did = _fresh_direction_id()
-        for _ in range(2):
-            record_direction_result(did, success=False, failure_class="CODE_ERROR")
-        for _ in range(3):
-            record_direction_result(did, success=False, failure_class="RATE_LIMIT")
-        record_direction_result(did, success=True)
-        streak = _ss.direction_failure_streaks[did]
-        assert streak["consecutive_failures"] == 0
-        assert streak["consecutive_infra_failures"] == 0
-        assert not streak["held"]
-        assert streak["held_reason"] == ""
-
-    def test_code_hold_takes_priority_over_later_infra(self):
-        """Once held by code-error streak, further infra failures don't change reason."""
-        did = _fresh_direction_id()
-        for _ in range(DIRECTION_HOLD_THRESHOLD):
-            record_direction_result(did, success=False, failure_class="CODE_ERROR")
+        record_direction_result(did, success=False, failure_class="CODE_ERROR")
+        record_direction_result(did, success=False, failure_class="RATE_LIMIT")
+        record_direction_result(did, success=False, failure_class="CODE_ERROR")
         record_direction_result(did, success=False, failure_class="PROVISION_FAILURE")
+        record_direction_result(did, success=False, failure_class="CODE_ERROR")
         streak = _ss.direction_failure_streaks[did]
-        assert streak["held_reason"] == "code"
+        assert streak["consecutive_failures"] == 3
+        assert streak["held"]
         _, reason = is_direction_held(did)
         assert "CODE_ERROR" in reason
 

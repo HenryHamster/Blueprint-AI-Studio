@@ -59,13 +59,20 @@ async def get_directions(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
+    from app.shared_state import is_direction_held as _is_direction_held  # noqa: PLC0415
     project = await _get_user_project(project_id, current_user["user_id"], session)
     directions = project.directions or []
-    directions_with_rate = [
-        {**d, "merge_rate": _compute_direction_merge_rate(d)} for d in directions
-    ]
+    enriched = []
+    for d in directions:
+        held, reason = _is_direction_held(d.get("id", ""))
+        enriched.append({
+            **d,
+            "merge_rate": _compute_direction_merge_rate(d),
+            "held": held,
+            "held_reason": reason if held else None,
+        })
     return {
-        "directions": directions_with_rate,
+        "directions": enriched,
         "autonomous_enabled": project.autonomous_enabled,
         "vision": project.vision or {},
         "design_doc": project.design_doc or {},
