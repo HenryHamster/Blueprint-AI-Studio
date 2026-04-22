@@ -42,30 +42,30 @@ def test_anthropic_schema_rejects_invalid_enum():
         provider.validate_settings({"effort": "absurd"})
 
 
-def test_anthropic_validate_drops_fallback_model_equal_to_model(caplog):
-    # Emerges post-merge when one layer pins model and another pins
-    # fallback_model to the same tier — the Claude Code CLI won't accept
-    # a same-tier fallback, so we drop it rather than raise (which would
-    # hard-stall the orchestrator on the merged bag).
+def test_anthropic_cli_skips_same_tier_fallback_model():
+    # Post-merge, defaults + effort matrix can produce a bag where
+    # fallback_model equals model. That's a no-op for Claude Code CLI
+    # (can't fall back to the rate-limited tier), so settings_to_cli
+    # omits --fallback-model rather than emitting a useless flag.
+    # Account/provider fallback already handle cross-model rerouting.
     provider = get_provider(LLMProviderName.ANTHROPIC)
-    merged = merge_settings(
-        {"fallback_model": "claude-sonnet-4-6"},        # e.g. defaults
-        {"model": "claude-sonnet-4-6", "effort": "medium"},  # e.g. per-effort
-    )
-    with caplog.at_level("WARNING", logger="app.providers.anthropic"):
-        cleaned = provider.validate_settings(merged)
-    assert cleaned["model"] == "claude-sonnet-4-6"
-    assert "fallback_model" not in cleaned
-    assert any("fallback_model" in rec.getMessage() for rec in caplog.records)
+    cli = provider.settings_to_cli({
+        "model": "claude-sonnet-4-6",
+        "fallback_model": "claude-sonnet-4-6",
+    })
+    assert "--model" in cli.args
+    assert "--fallback-model" not in cli.args
 
 
-def test_anthropic_validate_keeps_fallback_model_when_different():
+def test_anthropic_cli_emits_fallback_model_when_different():
     provider = get_provider(LLMProviderName.ANTHROPIC)
-    cleaned = provider.validate_settings({
+    cli = provider.settings_to_cli({
         "model": "claude-opus-4-7",
         "fallback_model": "claude-sonnet-4-6",
     })
-    assert cleaned["fallback_model"] == "claude-sonnet-4-6"
+    assert "--fallback-model" in cli.args
+    idx = cli.args.index("--fallback-model")
+    assert cli.args[idx + 1] == "claude-sonnet-4-6"
 
 
 def test_openai_schema_accepts_known_knobs():
