@@ -191,7 +191,15 @@ async def lifespan(app):
                         except Exception as alert_exc:
                             logger.warning(f"[MONITOR] Failed to create crash alert: {alert_exc}")
                         factory = task_factories.get(name)
-                        if factory and not t.cancelled():
+                        # Always restart cancelled tasks too — the watchdog
+                        # above intentionally cancels hung tasks expecting
+                        # this path to respawn them. Previously the
+                        # `not t.cancelled()` guard left cancelled tasks
+                        # dead forever, spamming DIED alerts every 30s with
+                        # no recovery. Shutdown cancellation is handled
+                        # separately (the monitor loop itself is cancelled
+                        # during shutdown, exiting before reaching here).
+                        if factory:
                             state = restart_state.setdefault(name, {"attempts": 0, "last_restart": None})
                             now = _utcnow()
                             # Reset attempts if last restart was >5 min ago (ran long enough to be stable)
