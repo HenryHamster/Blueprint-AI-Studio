@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { AuthMode, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName } from '../types/settings';
+import type { AuthMode, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsDefaults, TaskTypeProviderOverrides } from '../types/settings';
 import type { NotificationConfig } from '../components/SettingsNotificationsSection';
 import type { BuildConfig } from '../types/project';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
@@ -41,11 +41,14 @@ export function useSettings(addToast: AddToast) {
   const [providerTierModelMap, setProviderTierModelMap] = useState<Record<string, Record<string, string>>>({});
   const [taskTypeProviderPreference, setTaskTypeProviderPreference] = useState<Record<string, ProviderName[]>>({});
   const [taskTypeModelPreferences, setTaskTypeModelPreferences] = useState<Record<string, ModelPreference[]>>({});
-  const [providerExecutionModes, setProviderExecutionModes] = useState<Record<string, string[]>>({});
-  const [providerModeCapabilities, setProviderModeCapabilities] = useState<Record<string, Record<string, Record<string, boolean | number | string | null>>>>({});
-  const [taskTypeExecutionDefaults, setTaskTypeExecutionDefaults] = useState<Record<string, string>>({});
-  const [crossProviderFallbackEnabled, setCrossProviderFallbackEnabled] = useState(false);
+  const [providerSelectionMode, setProviderSelectionMode] = useState<'balanced' | 'preferred' | 'exclusive'>('balanced');
+  const [crossProviderFallbackEnabled, setCrossProviderFallbackEnabled] = useState(true);
   const [providers, setProviders] = useState<Record<string, ProviderCatalogEntry>>({});
+  // Settings-bag system: provider-specific defaults + sparse per-task-type
+  // overrides. Replaces the retired task_type_models/task_type_efforts and
+  // task_type_execution_defaults / provider_execution_modes keys.
+  const [providerSettingsDefaults, setProviderSettingsDefaults] = useState<ProviderSettingsDefaults>({});
+  const [taskTypeProviderOverrides, setTaskTypeProviderOverrides] = useState<TaskTypeProviderOverrides>({});
   const [buildConfig, setBuildConfig] = useState<BuildConfig | null>(null);
 
   // ── Handlers ────────────────────────────────────────────────────────────
@@ -68,11 +71,16 @@ export function useSettings(addToast: AddToast) {
         setProviderTierModelMap(data.provider_tier_model_map ?? {});
         setTaskTypeProviderPreference(data.task_type_provider_preference ?? {});
         setTaskTypeModelPreferences(data.task_type_model_preferences ?? {});
-        setProviderExecutionModes(data.provider_execution_modes ?? {});
-        setProviderModeCapabilities(data.provider_mode_capabilities ?? {});
-        setTaskTypeExecutionDefaults(data.task_type_execution_defaults ?? {});
-        setCrossProviderFallbackEnabled(data.cross_provider_fallback_enabled ?? false);
+        const rawMode = data.provider_selection_mode;
+        const resolvedMode: 'balanced' | 'preferred' | 'exclusive' =
+          rawMode === 'balanced' || rawMode === 'preferred' || rawMode === 'exclusive'
+            ? rawMode
+            : data.cross_provider_fallback_enabled ? 'preferred' : 'exclusive';
+        setProviderSelectionMode(resolvedMode);
+        setCrossProviderFallbackEnabled(data.cross_provider_fallback_enabled ?? (resolvedMode !== 'exclusive'));
         setProviders(data.providers ?? {});
+        setProviderSettingsDefaults((data.provider_settings_defaults ?? {}) as ProviderSettingsDefaults);
+        setTaskTypeProviderOverrides((data.task_type_provider_overrides ?? {}) as TaskTypeProviderOverrides);
         setGithubAccount(data.github_account || null);
         setRequireApprovalGates(data.require_approval_gates ?? true);
         setAutoArchiveEnabled(data.auto_archive_enabled ?? true);
@@ -85,15 +93,6 @@ export function useSettings(addToast: AddToast) {
             enabled_events: data.notification_config.enabled_events ?? ['TASK_FAILED', 'APPROVAL_NEEDED', 'DEPLOY_HEALTH_ALERT'],
             throttle_seconds: data.notification_config.throttle_seconds ?? 30,
           });
-        }
-        // Seed localStorage with server-authoritative task type defaults
-        const serverModels = (data.task_type_models ?? {}) as Record<string, string>;
-        const serverEfforts = (data.task_type_efforts ?? {}) as Record<string, string>;
-        for (const [t, m] of Object.entries(serverModels)) {
-          localStorage.setItem(`blueprint-admin:taskTypeModel:${t}`, JSON.stringify(m));
-        }
-        for (const [t, e] of Object.entries(serverEfforts)) {
-          localStorage.setItem(`blueprint-admin:taskTypeEffort:${t}`, JSON.stringify(e));
         }
       }
     } catch (err) {
@@ -286,49 +285,47 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
-  const updateTaskTypeExecutionDefaultConfig = async (value: Record<string, string>) => {
-    const prev = taskTypeExecutionDefaults;
-    setTaskTypeExecutionDefaults(value);
+  const updateProviderSettingsDefaults = async (value: ProviderSettingsDefaults) => {
+    const prev = providerSettingsDefaults;
+    setProviderSettingsDefaults(value);
     try {
-      await patchSettings({ task_type_execution_defaults: value });
+      await patchSettings({ provider_settings_defaults: value });
     } catch (err) {
-      console.error('Failed to update execution defaults:', err);
-      setTaskTypeExecutionDefaults(prev);
-      addToast('Failed to update execution defaults', 'error');
+      console.error('Failed to update provider settings defaults:', err);
+      setProviderSettingsDefaults(prev);
+      addToast('Failed to update provider settings defaults', 'error');
+    }
+  };
+
+  const updateTaskTypeProviderOverrides = async (value: TaskTypeProviderOverrides) => {
+    const prev = taskTypeProviderOverrides;
+    setTaskTypeProviderOverrides(value);
+    try {
+      await patchSettings({ task_type_provider_overrides: value });
+    } catch (err) {
+      console.error('Failed to update task-type provider overrides:', err);
+      setTaskTypeProviderOverrides(prev);
+      addToast('Failed to update task-type overrides', 'error');
+    }
+  };
+
+  const updateProviderSelectionMode = async (value: 'balanced' | 'preferred' | 'exclusive') => {
+    const prevMode = providerSelectionMode;
+    const prevFallback = crossProviderFallbackEnabled;
+    setProviderSelectionMode(value);
+    setCrossProviderFallbackEnabled(value !== 'exclusive');
+    try {
+      await patchSettings({ provider_selection_mode: value });
+    } catch (err) {
+      console.error('Failed to update provider selection mode:', err);
+      setProviderSelectionMode(prevMode);
+      setCrossProviderFallbackEnabled(prevFallback);
+      addToast('Failed to update provider selection mode', 'error');
     }
   };
 
   const updateCrossProviderFallback = async (value: boolean) => {
-    const prev = crossProviderFallbackEnabled;
-    setCrossProviderFallbackEnabled(value);
-    try {
-      await patchSettings({ cross_provider_fallback_enabled: value });
-    } catch (err) {
-      console.error('Failed to update fallback setting:', err);
-      setCrossProviderFallbackEnabled(prev);
-      addToast('Failed to update cross-provider fallback', 'error');
-    }
-  };
-
-  const syncTaskTypeDefaults = async () => {
-    const types = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'security_audit', 'qa', 'deps', 'docs', 'smoketest', 'debug', 'perf', 'investigate', 'rollup', 'strategic_review', 'design_doc_update'];
-    const models: Record<string, string> = {};
-    const efforts: Record<string, string> = {};
-    for (const t of types) {
-      const m = JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeModel:${t}`) ?? 'null') ?? '';
-      const e = JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeEffort:${t}`) ?? 'null') ?? '';
-      if (m) models[t] = m;
-      if (e) efforts[t] = e;
-    }
-    try {
-      await fetch(`${API_BASE_URL}/api/admin/settings`, {
-        method: 'PATCH',
-        headers: await authHeaders(),
-        body: JSON.stringify({ task_type_models: models, task_type_efforts: efforts }),
-      });
-    } catch (err) {
-      console.error('Failed to sync task type defaults:', err);
-    }
+    await updateProviderSelectionMode(value ? 'preferred' : 'exclusive');
   };
 
   const updateMaxVMs = async (value: number) => {
@@ -572,8 +569,10 @@ export function useSettings(addToast: AddToast) {
     autoArchiveMaxTerminalTasksPerProject, autoArchiveIntervalMinutes,
     notificationConfig,
     providerTierModelMap, taskTypeProviderPreference, taskTypeModelPreferences,
-    providerExecutionModes, providerModeCapabilities, taskTypeExecutionDefaults,
+    providerSelectionMode,
     crossProviderFallbackEnabled, providers,
+    providerSettingsDefaults, setProviderSettingsDefaults,
+    taskTypeProviderOverrides, setTaskTypeProviderOverrides,
     buildConfig, setBuildConfig,
     // Handlers
     fetchSettings,
@@ -582,8 +581,9 @@ export function useSettings(addToast: AddToast) {
     connectGitHub,
     updateAgentPromptSuffixes,
     updateProviderTierModels, updateTaskTypeProviderPreferences, updateTaskTypeModelPreferenceConfig,
-    updateTaskTypeExecutionDefaultConfig, updateCrossProviderFallback,
-    syncTaskTypeDefaults,
+    updateProviderSelectionMode,
+    updateCrossProviderFallback,
+    updateProviderSettingsDefaults, updateTaskTypeProviderOverrides,
     updateMaxVMs, updateMaxRetries,
     handleUpdateMaxAutonomousRate, handleUpdateAutonomousResearchInterval,
     handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,

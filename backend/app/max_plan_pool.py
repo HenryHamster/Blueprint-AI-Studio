@@ -21,6 +21,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import AsyncSessionLocal
 from app.models import LLMAuthMode, LLMProviderName
+from app.providers.base import merge_settings
 from app.providers.registry import get_provider
 from app.time_utils import _utcnow
 
@@ -44,8 +45,15 @@ class LLMSelectionResult:
     auth_mode: str
     model: str | None
     quality_tier: str | None
-    execution_mode: str | None
     account: Dict[str, Any] | None
+    # Resolved provider-specific settings bag (deep-merged from
+    # provider_settings_defaults → task_type_provider_overrides → payload).
+    # Shape is provider-defined and validated by provider.validate_settings().
+    settings: Dict[str, Any] | None = None
+    # Retained for historical task records that still persist llm_execution_mode
+    # in their context; no longer drives dispatch behavior. Always None for
+    # newly-selected tasks.
+    execution_mode: str | None = None
 
     @property
     def account_id(self) -> str | None:
@@ -168,6 +176,10 @@ def infer_quality_tier_for_model(
     return None
 
 
+ALL_PROVIDERS: tuple[str, ...] = tuple(p.value for p in LLMProviderName)
+_VALID_SELECTION_MODES: frozenset[str] = frozenset({"balanced", "preferred", "exclusive"})
+
+
 def resolve_task_provider_preference(task: Any, runtime_config: Mapping[str, Any]) -> list[str]:
     ctx = _task_context(task)
     explicit = ctx.get("provider_preference")
@@ -183,7 +195,10 @@ def resolve_task_provider_preference(task: Any, runtime_config: Mapping[str, Any
         resolved = [v for v in values if v]
         if resolved:
             return resolved
-    return [LLMProviderName.ANTHROPIC.value]
+    # Default allow-list is every provider so newly-added accounts get used
+    # without a config change. Narrow via task_type_provider_preference if a
+    # given task type is better served by a subset.
+    return list(ALL_PROVIDERS)
 
 
 def resolve_task_model_preferences(task: Any, runtime_config: Mapping[str, Any]) -> list[dict[str, str]]:
@@ -205,26 +220,73 @@ def resolve_task_model_preferences(task: Any, runtime_config: Mapping[str, Any])
     return prefs
 
 
+def provider_selection_mode(runtime_config: Mapping[str, Any]) -> str:
+    """Return the active provider-selection mode.
+
+    Reads the canonical ``provider_selection_mode`` key first; falls back to
+    the legacy ``cross_provider_fallback_enabled`` boolean so deployments
+    that haven't migrated their persisted config still behave sensibly
+    (True → "preferred", False → "exclusive"). Unknown values fall back to
+    "balanced" — the safest default when a new account is added.
+    """
+    if not isinstance(runtime_config, Mapping):
+        return "balanced"
+    raw = runtime_config.get("provider_selection_mode")
+    if isinstance(raw, str) and raw in _VALID_SELECTION_MODES:
+        return raw
+    legacy = runtime_config.get("cross_provider_fallback_enabled")
+    if legacy is False:
+        return "exclusive"
+    if legacy is True:
+        return "preferred"
+    return "balanced"
+
+
 def cross_provider_fallback_enabled(runtime_config: Mapping[str, Any]) -> bool:
-    return bool(runtime_config.get("cross_provider_fallback_enabled", False)) if isinstance(runtime_config, Mapping) else False
+    """Legacy boolean view of provider_selection_mode — True iff a task may
+    cross provider boundaries (balanced or preferred). Kept for callers that
+    still expect the pre-enum flag shape."""
+    return provider_selection_mode(runtime_config) in ("balanced", "preferred")
 
 
-def resolve_task_execution_mode(
+def resolve_task_provider_settings(
     task: Any,
     runtime_config: Mapping[str, Any],
     provider_name: str,
-) -> str:
+) -> dict[str, Any]:
+    """Resolve the provider-specific settings bag for a task.
+
+    Three-layer deep-merge:
+      1. provider_settings_defaults[provider]  — base bag
+      2. task_type_provider_overrides[task_type][provider]  — sparse delta
+      3. payload.provider_settings[provider] / context.provider_settings[provider]
+         — per-task override
+
+    Validated against provider.settings_schema() before return. Unknown keys
+    raise ValueError (fail-closed — typos should be loud).
+    """
+    defaults_all = runtime_config.get("provider_settings_defaults", {}) or {}
+    overrides_all = runtime_config.get("task_type_provider_overrides", {}) or {}
+    base = defaults_all.get(provider_name) if isinstance(defaults_all, Mapping) else None
+    task_type = _task_type(task)
+    task_override = overrides_all.get(task_type) if isinstance(overrides_all, Mapping) else None
+    type_bag = task_override.get(provider_name) if isinstance(task_override, Mapping) else None
+
     ctx = _task_context(task)
     payloads = getattr(task, "payloads", None) or []
     payload = payloads[0] if payloads else {}
-    explicit = payload.get("execution_mode") or ctx.get("execution_mode") or ctx.get("llm_execution_mode")
-    provider_modes = runtime_config.get("provider_execution_modes", {}) if isinstance(runtime_config, Mapping) else {}
-    supported = provider_modes.get(provider_name) if isinstance(provider_modes, Mapping) else None
-    supported_modes = [m for m in supported if isinstance(m, str) and m] if isinstance(supported, list) else ["default"]
-    requested = explicit if isinstance(explicit, str) and explicit.strip() else runtime_config.get("task_type_execution_defaults", {}).get(_task_type(task), "default")
-    if requested in supported_modes:
-        return requested
-    return "default"
+    payload_settings = payload.get("provider_settings") if isinstance(payload, Mapping) else None
+    ctx_settings = ctx.get("provider_settings")
+    payload_bag = payload_settings.get(provider_name) if isinstance(payload_settings, Mapping) else None
+    ctx_bag = ctx_settings.get(provider_name) if isinstance(ctx_settings, Mapping) else None
+
+    merged = merge_settings(base, type_bag, ctx_bag, payload_bag)
+    if not merged:
+        return {}
+    provider = get_provider(provider_name)
+    return provider.validate_settings(merged)
+
+
 
 
 def _account_runtime_ready(acct: dict) -> bool:
@@ -636,6 +698,95 @@ async def _persist_rate_limit_state(acct_id: str) -> None:
         await rl_session.commit()
 
 
+async def select_max_plan_account_balanced(
+    user_id: str,
+    provider_models: List[tuple[str, str | None]],
+    blacklist: List[str] | None = None,
+) -> tuple[Dict[str, Any], str, str | None] | None:
+    """Balanced-mode selection: flatten all accounts across the given providers
+    into one pool and pick the single best by (health_score, -active_tasks).
+
+    ``provider_models`` is an ordered list of (provider_name, model) pairs —
+    the model determines which disabled_models cascade is checked for that
+    provider. Returns (account, provider_name, model) for the winner, or
+    None when no account is eligible across any provider.
+
+    Probing-mode semantics carry over: an account in ``probing`` state is
+    eligible only when its ``active_tasks == 0`` (serialized probe). Healthy
+    accounts win over probing when both are available, matching the
+    single-provider selector's contract.
+    """
+    if not provider_models:
+        return None
+    async with _max_plan_pool_lock:
+        user_pool = _max_plan_pools.get(user_id, [])
+        # Build lookup from account id → (provider, model) so we can resolve
+        # the winner's attribution when we rank across all providers at once.
+        candidates_healthy: List[tuple[Dict[str, Any], str, str | None]] = []
+        candidates_probing: List[tuple[Dict[str, Any], str, str | None]] = []
+        now = _utcnow()
+        dirty_from_reset: list[str] = []
+        seen_ids: set[str] = set()
+        for provider_name, model in provider_models:
+            normalized_provider = _normalize_provider_name(provider_name)
+            if not normalized_provider:
+                continue
+            for a in user_pool:
+                if a["id"] in seen_ids:
+                    continue
+                if blacklist and a["id"] in blacklist:
+                    continue
+                acct_provider = (
+                    _normalize_provider_name(a.get("provider"))
+                    or LLMProviderName.ANTHROPIC.value
+                )
+                if acct_provider != normalized_provider:
+                    continue
+                if _daily_reset_if_elapsed(a, now):
+                    dirty_from_reset.append(a["id"])
+                if _account_at_cap(a):
+                    continue
+                state = _account_state_for_model(a, model, now)
+                if state == "healthy":
+                    candidates_healthy.append((a, normalized_provider, model))
+                    seen_ids.add(a["id"])
+                elif state == "probing" and a.get("active_tasks", 0) == 0:
+                    candidates_probing.append((a, normalized_provider, model))
+                    seen_ids.add(a["id"])
+
+        for acct_id in dirty_from_reset:
+            _pending_cap_persists.add(acct_id)
+
+        winner: tuple[Dict[str, Any], str, str | None] | None = None
+        if candidates_healthy:
+            if len(candidates_healthy) > 1:
+                qualified = [
+                    c for c in candidates_healthy
+                    if _compute_health_score(c[0], now) >= _HEALTH_SCORE_DISQUALIFY_THRESHOLD
+                ]
+                if qualified:
+                    candidates_healthy = qualified
+            winner = max(
+                candidates_healthy,
+                key=lambda c: (_compute_health_score(c[0], now), -c[0].get("active_tasks", 0)),
+            )
+        elif candidates_probing:
+            # Deterministic tiebreak on id — same contract as the single-provider selector.
+            winner = min(candidates_probing, key=lambda c: c[0]["id"])
+            logger.info(
+                f"[POOL] Balanced-mode probing account {winner[0]['name']} "
+                f"(provider={winner[1]}, cooldown elapsed, serializing as probe)"
+            )
+
+        if winner is None:
+            return None
+        account, prov, model = winner
+        account["active_tasks"] = account.get("active_tasks", 0) + 1
+        account["daily_task_count"] = int(account.get("daily_task_count") or 0) + 1
+        _pending_cap_persists.add(account["id"])
+        return account, prov, model
+
+
 async def select_max_plan_account(
     user_id: str,
     model: str | None = None,
@@ -710,7 +861,8 @@ async def select_llm_runtime_for_task(
     blacklist: List[str] | None = None,
 ) -> LLMSelectionResult | None:
     explicit_model = _extract_task_model(task)
-    allow_fallback = cross_provider_fallback_enabled(runtime_config)
+    mode = provider_selection_mode(runtime_config)
+    allow_fallback = mode in ("balanced", "preferred")
     model_preferences = [] if explicit_model else resolve_task_model_preferences(task, runtime_config)
     provider_preference = resolve_task_provider_preference(task, runtime_config)
     quality_tier = resolve_task_quality_tier(task, runtime_config)
@@ -738,8 +890,8 @@ async def select_llm_runtime_for_task(
                     auth_mode=_normalize_auth_mode(account.get("auth_mode")) or LLMAuthMode.OAUTH.value,
                     model=model_name,
                     quality_tier=infer_quality_tier_for_model(provider_name, model_name, runtime_config),
-                    execution_mode=resolve_task_execution_mode(task, runtime_config, provider_name),
                     account=account,
+                    settings=resolve_task_provider_settings(task, runtime_config, provider_name),
                 )
 
     if explicit_provider:
@@ -753,13 +905,56 @@ async def select_llm_runtime_for_task(
         # first configured provider only until mappings are updated.
         provider_preference = provider_preference[:1]
 
+    # Balanced mode: pool all listed providers' accounts and pick globally by
+    # (health, -load). An explicit per-task provider/model still pins the
+    # selection (handled above via trimmed provider_preference), so this only
+    # kicks in for the common path where no pin is set.
+    if mode == "balanced" and len(provider_preference) > 1 and not explicit_model:
+        provider_models: list[tuple[str, str | None]] = []
+        for provider_name in provider_preference:
+            provider = get_provider(provider_name)
+            pre_settings = resolve_task_provider_settings(task, runtime_config, provider_name)
+            bag_model = pre_settings.get("model") if isinstance(pre_settings, Mapping) else None
+            if isinstance(bag_model, str) and bag_model:
+                model = bag_model
+            else:
+                model = provider.tier_to_model(quality_tier, runtime_config)
+            if not model:
+                continue
+            provider_models.append((provider_name, model))
+        if provider_models:
+            balanced_result = await select_max_plan_account_balanced(
+                user_id=user_id,
+                provider_models=provider_models,
+                blacklist=blacklist,
+            )
+            if balanced_result is not None:
+                account, provider_name, chosen_model = balanced_result
+                return LLMSelectionResult(
+                    provider=provider_name,
+                    auth_mode=_normalize_auth_mode(account.get("auth_mode")) or LLMAuthMode.OAUTH.value,
+                    model=chosen_model,
+                    quality_tier=quality_tier,
+                    account=account,
+                    settings=resolve_task_provider_settings(task, runtime_config, provider_name),
+                )
+            # Fall through to per-provider iteration so the unaccounted-for
+            # fallback (no account present, but explicit_provider/model set)
+            # still resolves a synthetic result below.
+
     for provider_name in provider_preference:
         provider = get_provider(provider_name)
-        model = (
-            explicit_model
-            if explicit_model and (explicit_provider is None or provider_name == explicit_provider)
-            else provider.tier_to_model(quality_tier, runtime_config)
-        )
+        # Resolve settings bag first so a bag-pinned `model` (e.g. a task-type
+        # override forcing gemini-2.5-flash for smoketest) takes precedence
+        # over tier resolution. Explicit payload.model still wins over both.
+        pre_settings = resolve_task_provider_settings(task, runtime_config, provider_name)
+        bag_model = pre_settings.get("model") if isinstance(pre_settings, Mapping) else None
+        if explicit_model and (explicit_provider is None or provider_name == explicit_provider):
+            model = explicit_model
+        elif isinstance(bag_model, str) and bag_model:
+            model = bag_model
+        else:
+            model = provider.tier_to_model(quality_tier, runtime_config)
         if not model:
             continue
         account = await select_max_plan_account(
@@ -774,8 +969,8 @@ async def select_llm_runtime_for_task(
                 auth_mode=_normalize_auth_mode(account.get("auth_mode")) or LLMAuthMode.OAUTH.value,
                 model=model,
                 quality_tier=quality_tier,
-                execution_mode=resolve_task_execution_mode(task, runtime_config, provider_name),
                 account=account,
+                settings=resolve_task_provider_settings(task, runtime_config, provider_name),
             )
 
     if explicit_provider and explicit_model:
@@ -784,8 +979,8 @@ async def select_llm_runtime_for_task(
             auth_mode=get_task_llm_auth_mode(task) or LLMAuthMode.OAUTH.value,
             model=explicit_model,
             quality_tier=quality_tier,
-            execution_mode=resolve_task_execution_mode(task, runtime_config, explicit_provider),
             account=None,
+            settings=resolve_task_provider_settings(task, runtime_config, explicit_provider),
         )
 
     if provider_preference:
@@ -797,8 +992,8 @@ async def select_llm_runtime_for_task(
             auth_mode=LLMAuthMode.OAUTH.value,
             model=fallback_model,
             quality_tier=quality_tier,
-            execution_mode=resolve_task_execution_mode(task, runtime_config, fallback_provider),
             account=None,
+            settings=resolve_task_provider_settings(task, runtime_config, fallback_provider),
         )
 
     return None

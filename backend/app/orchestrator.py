@@ -424,11 +424,14 @@ def _resolve_env_runtime_fallback(
     provider: str | None,
     model: str | None,
     execution_mode: str | None,
-    task: Task,
-    runtime_config: dict[str, Any],
-    resolve_execution_mode,
+    task: Task,                              # noqa: ARG001 — kept for signature stability
+    runtime_config: dict[str, Any],          # noqa: ARG001
 ) -> tuple[str | None, str, str | None, str | None, str | None, dict[str, str]]:
-    """Return env-backed runtime credentials when no pool account is available."""
+    """Return env-backed runtime credentials when no pool account is available.
+
+    `execution_mode` is no longer resolved from runtime config (retired with
+    the settings-bag redesign); whatever the caller passes is round-tripped.
+    """
     provider_name = provider or "anthropic"
     runtime_model = model or _ENV_FALLBACK_DEFAULT_MODELS.get(provider_name)
     runtime_execution_mode = execution_mode
@@ -450,13 +453,11 @@ def _resolve_env_runtime_fallback(
                 )
                 return None, provider_name, None, runtime_model, runtime_execution_mode, provider_metadata
             auth_mode = "oauth"
-        runtime_execution_mode = runtime_execution_mode or resolve_execution_mode(task, runtime_config, provider_name)
         return secret, provider_name, auth_mode, runtime_model, runtime_execution_mode, provider_metadata
 
     if provider_name == "gemini":
         secret = os.getenv("GEMINI_API_KEY")
         if secret:
-            runtime_execution_mode = runtime_execution_mode or resolve_execution_mode(task, runtime_config, provider_name)
             return secret, provider_name, "api_key", runtime_model, runtime_execution_mode, provider_metadata
         service_account_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         if not service_account_path:
@@ -480,13 +481,11 @@ def _resolve_env_runtime_fallback(
             provider_metadata["project"] = project
         if location:
             provider_metadata["location"] = location
-        runtime_execution_mode = runtime_execution_mode or resolve_execution_mode(task, runtime_config, provider_name)
         return secret, provider_name, "service_account", runtime_model, runtime_execution_mode, provider_metadata
 
     secret = os.getenv("ANTHROPIC_API_KEY")
     if not secret:
         return None, provider_name, None, runtime_model, runtime_execution_mode, provider_metadata
-    runtime_execution_mode = runtime_execution_mode or resolve_execution_mode(task, runtime_config, provider_name)
     return secret, provider_name, "api_key", runtime_model, runtime_execution_mode, provider_metadata
 
 
@@ -606,7 +605,6 @@ async def orchestrator_worker():
         apply_task_llm_runtime_context,
         clear_task_llm_runtime_context,
         get_task_llm_account_id,
-        resolve_task_execution_mode,
         select_llm_runtime_for_task,
     )
     from app.providers.registry import get_provider
@@ -1623,8 +1621,6 @@ async def orchestrator_worker():
                     dispatch_user_id = task.launched_by_user_id or (task_project.user_id if task_project else "")
                     task_type = task.payloads[0].get("type", "create") if task.payloads else "create"
                     task_model = _extract_task_model(task)
-                    if not task_model:
-                        task_model = _runtime_config.get("task_type_models", {}).get(task_type)
                     # Prune stale blacklist entries — accounts whose model cooldown has expired
                     # should be eligible again, otherwise rate-limited tasks get stuck forever
                     if _blacklist:
@@ -1825,7 +1821,6 @@ async def orchestrator_worker():
                             execution_mode=runtime_execution_mode,
                             task=task,
                             runtime_config=_runtime_config,
-                            resolve_execution_mode=resolve_task_execution_mode,
                         )
                         if runtime_secret:
                             logger.info(

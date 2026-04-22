@@ -94,6 +94,38 @@ const PROVIDER: ProviderName = normalizeProvider(process.env.PROVIDER);
 const AUTH_MODE: AuthMode = normalizeAuthMode(process.env.AUTH_MODE, PROVIDER);
 const LLM_EXECUTION_MODE = process.env.LLM_EXECUTION_MODE || 'default';
 
+// Provider settings bag + pre-translated CLI shape emitted by the backend
+// (see build_agent_secret_manifest in backend/app/compute.py). The settings
+// bag is provider-specific and validated server-side; the CLI translation
+// already maps it into CLI env/args/prompt fragments so this runtime applies
+// them verbatim.
+export type LLMCliTranslation = {
+  env: Record<string, string>;
+  args: string[];
+  prompt_fragments: string[];
+  unsupported: string[];
+};
+
+export function parseLLMCliTranslation(): LLMCliTranslation | null {
+  const raw = process.env.LLM_CLI_TRANSLATION;
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<LLMCliTranslation>;
+    return {
+      env: parsed.env ?? {},
+      args: Array.isArray(parsed.args) ? parsed.args.map(String) : [],
+      prompt_fragments: Array.isArray(parsed.prompt_fragments) ? parsed.prompt_fragments.map(String) : [],
+      unsupported: Array.isArray(parsed.unsupported) ? parsed.unsupported.map(String) : [],
+    };
+  } catch (e) {
+    // Log but don't fail — runner falls back to legacy model/effort env vars.
+    console.warn(`[LLM_SETTINGS] Failed to parse LLM_CLI_TRANSLATION: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+}
+
+const LLM_CLI_TRANSLATION: LLMCliTranslation | null = parseLLMCliTranslation();
+
 function getRateLimitPatterns(provider: ProviderName, authMode: AuthMode): readonly string[] {
   return RATE_LIMIT_PATTERNS[provider][authMode] ?? RATE_LIMIT_PATTERNS[provider].oauth ?? [];
 }
@@ -1428,18 +1460,37 @@ function buildBaseCliEnv(): Record<string, string> {
     if (process.env[key]) env[key] = process.env[key]!;
   }
   if (AGENT_TOKEN) env.AGENT_API_TOKEN = AGENT_TOKEN;
+  // Merge provider-settings translation env last so it can't overwrite auth
+  // keys (those came from secret_material above). Extra env vars from the
+  // translator extend the baseline for the subprocess.
+  if (LLM_CLI_TRANSLATION?.env) {
+    for (const [k, v] of Object.entries(LLM_CLI_TRANSLATION.env)) {
+      if (!(k in env)) env[k] = v;
+    }
+  }
   return env;
 }
 
 function withExecutionModePrompt(prompt: string): string {
-  if (LLM_EXECUTION_MODE !== 'advisor') return prompt;
-  return [
-    'Execution mode: advisor.',
-    'Prioritize analysis, recommendations, and risk assessment.',
-    'Avoid making code changes unless the task explicitly requires implementation.',
-    '',
-    prompt,
-  ].join('\n');
+  const fragments: string[] = [];
+  // Settings-bag prompt fragments (from backend translator) — these carry
+  // fallback instructions for knobs the CLI can't express natively, like
+  // the advisor tool on non-opus executors.
+  if (LLM_CLI_TRANSLATION?.prompt_fragments?.length) {
+    fragments.push(...LLM_CLI_TRANSLATION.prompt_fragments);
+  }
+  // Legacy advisor mode path — retained for back-compat during rollout of
+  // the settings-bag system. Deleted when the legacy execution_mode field
+  // is retired in Phase E of the provider-settings redesign.
+  if (LLM_EXECUTION_MODE === 'advisor' && !LLM_CLI_TRANSLATION) {
+    fragments.push(
+      'Execution mode: advisor.',
+      'Prioritize analysis, recommendations, and risk assessment.',
+      'Avoid making code changes unless the task explicitly requires implementation.',
+    );
+  }
+  if (!fragments.length) return prompt;
+  return [...fragments, '', prompt].join('\n');
 }
 
 export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: AuthMode = AUTH_MODE): ProviderRunner {
@@ -1456,7 +1507,15 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
       },
       buildRunCommand: (_prompt, model) => {
         const args = ['exec', '--full-auto'];
-        if (model) args.push('-m', model);
+        // When the backend emits a settings-bag translation, it already contains
+        // the -m flag plus any -c model_reasoning_effort/verbosity/etc overrides.
+        // Otherwise fall back to the legacy model arg. Do not pass both to avoid
+        // duplicate -m flags.
+        if (LLM_CLI_TRANSLATION) {
+          args.push(...LLM_CLI_TRANSLATION.args);
+        } else if (model) {
+          args.push('-m', model);
+        }
         return {
           command: 'codex',
           args,
@@ -1486,8 +1545,19 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         return baseEnv.GEMINI_API_KEY ? [] : ['GEMINI_API_KEY'];
       },
       buildRunCommand: (_prompt, model) => {
-        const args = ['--approval-mode=yolo', '-o', 'text'];
-        if (model) args.push('-m', model);
+        // --approval-mode and -o are baseline flags the backend translation
+        // won't emit; keep them here. Settings-bag translation carries -m
+        // (alias if thinking/temp are configured, else raw model) plus any
+        // sandbox/approval overrides the operator set explicitly.
+        const args = ['-o', 'text'];
+        const translationArgs = LLM_CLI_TRANSLATION?.args ?? [];
+        const hasApprovalOverride = translationArgs.some(a => typeof a === 'string' && a.startsWith('--approval-mode'));
+        if (!hasApprovalOverride) args.unshift('--approval-mode=yolo');
+        if (LLM_CLI_TRANSLATION) {
+          args.push(...translationArgs);
+        } else if (model) {
+          args.push('-m', model);
+        }
         return {
           command: 'gemini',
           args,
@@ -1513,8 +1583,22 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
     missingCredentials: () => (baseEnv.CLAUDE_CODE_OAUTH_TOKEN || baseEnv.ANTHROPIC_API_KEY) ? [] : ['CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY'],
     buildRunCommand: (_prompt, model, effort, disallowedTools) => {
       const args = ['-p', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
-      if (model) args.push('--model', model);
-      if (effort) args.push('--effort', effort);
+      // Prefer settings-bag translation when present — it already contains
+      // --model, --effort, --betas, --permission-mode, --fallback-model, etc.
+      // Fall back to legacy model/effort params only when no translation is
+      // available (older backend deploys or missing settings).
+      let effectiveEffort = effort;
+      if (LLM_CLI_TRANSLATION) {
+        args.push(...LLM_CLI_TRANSLATION.args);
+        // Pick up effort from the translation for timeout computation.
+        const idx = LLM_CLI_TRANSLATION.args.indexOf('--effort');
+        if (idx >= 0 && idx + 1 < LLM_CLI_TRANSLATION.args.length) {
+          effectiveEffort = LLM_CLI_TRANSLATION.args[idx + 1];
+        }
+      } else {
+        if (model) args.push('--model', model);
+        if (effort) args.push('--effort', effort);
+      }
       if (disallowedTools && disallowedTools.length > 0) {
         for (const tool of disallowedTools) args.push('--disallowedTools', tool);
       }
@@ -1523,7 +1607,7 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         args,
         env: baseEnv,
         outputMode: 'claude-stream-json',
-        timeoutMs: claudeTimeoutForEffort(effort),
+        timeoutMs: claudeTimeoutForEffort(effectiveEffort),
         promptInput: 'stdin-file',
         displayName: 'Claude Code',
       };
@@ -1799,6 +1883,12 @@ async function main() {
   }
 
   log(`Provider runtime: provider=${PROVIDER} auth_mode=${AUTH_MODE} execution_mode=${LLM_EXECUTION_MODE}`);
+  if (LLM_CLI_TRANSLATION) {
+    log(`Settings bag: ${LLM_CLI_TRANSLATION.args.length} CLI args, ${LLM_CLI_TRANSLATION.prompt_fragments.length} prompt fragments`);
+    if (LLM_CLI_TRANSLATION.unsupported.length > 0) {
+      log(`Settings bag unsupported (not honored by CLI): ${LLM_CLI_TRANSLATION.unsupported.join('; ')}`);
+    }
+  }
   log(runner.credentialSummary());
   await validateProviderAuth(runner, reportPreClaimFailure, process.env.LLM_MODEL);
   if (PRE_CLAIM_TASK_ID) {

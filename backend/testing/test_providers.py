@@ -73,6 +73,11 @@ def test_gemini_service_account_materializes_credentials_file():
     assert material.files[0].path == "/opt/agent/gemini/sa.json"
 
 
-def test_anthropic_provider_exposes_supported_execution_modes():
-    provider = get_provider(LLMProviderName.ANTHROPIC)
-    assert provider.supported_execution_modes() == ("default", "advisor")
+def test_providers_expose_default_execution_mode_only():
+    """Execution modes were retired with the settings-bag redesign; advisor
+    is now a per-provider knob under `anthropic.advisor` in the settings bag,
+    not a dispatch mode. The base class reports `("default",)` for all
+    providers now."""
+    for provider_name in (LLMProviderName.ANTHROPIC, LLMProviderName.OPENAI, LLMProviderName.GEMINI):
+        provider = get_provider(provider_name)
+        assert provider.supported_execution_modes() == ("default",)

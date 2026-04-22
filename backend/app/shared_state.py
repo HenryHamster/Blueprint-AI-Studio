@@ -108,110 +108,77 @@ runtime_config: Dict = {
             "haiku": "gemini-2.5-flash-lite",
         },
     },
-    # Future-facing per-task-type provider preference order. Current dispatch
-    # ignores this until the provider-aware selection slice is enabled.
+    # Per-task-type provider allow-list. Defaults to every provider so adding
+    # an account to the pool actually puts it into rotation without requiring
+    # a config change. Narrow a given task type to a single provider (e.g.
+    # {"research": ["anthropic"]}) if merge-rate data shows that's better.
+    # The list is interpreted by `provider_selection_mode`:
+    #   - balanced  → all listed providers' accounts pooled, picked by health + load
+    #   - preferred → strict ordering; fall through on exhaustion
+    #   - exclusive → first listed provider only, no fallback
     "task_type_provider_preference": {
-        "strategic_review": ["anthropic"],
-        "design_doc_update": ["anthropic"],
-        "research": ["anthropic"],
-        "create": ["anthropic"],
-        "refactor": ["anthropic"],
-        "plan": ["anthropic"],
-        "review": ["anthropic"],
-        "fix": ["anthropic"],
-        "qa": ["anthropic"],
-        "deps": ["anthropic"],
-        "docs": ["anthropic"],
-        "migrate": ["anthropic"],
-        "security_audit": ["anthropic"],
-        "perf": ["anthropic"],
-        "smoketest": ["anthropic"],
-        "debug": ["anthropic"],
+        "strategic_review": ["anthropic", "openai", "gemini"],
+        "design_doc_update": ["anthropic", "openai", "gemini"],
+        "research": ["anthropic", "openai", "gemini"],
+        "create": ["anthropic", "openai", "gemini"],
+        "refactor": ["anthropic", "openai", "gemini"],
+        "plan": ["anthropic", "openai", "gemini"],
+        "review": ["anthropic", "openai", "gemini"],
+        "fix": ["anthropic", "openai", "gemini"],
+        "qa": ["anthropic", "openai", "gemini"],
+        "deps": ["anthropic", "openai", "gemini"],
+        "docs": ["anthropic", "openai", "gemini"],
+        "migrate": ["anthropic", "openai", "gemini"],
+        "security_audit": ["anthropic", "openai", "gemini"],
+        "perf": ["anthropic", "openai", "gemini"],
+        "smoketest": ["anthropic", "openai", "gemini"],
+        "debug": ["anthropic", "openai", "gemini"],
     },
     # Optional per-task-type concrete model priority overrides. When present,
     # selection uses these ordered {provider, model} pairs before falling back
     # to provider preference + quality tier resolution.
     "task_type_model_preferences": {},
-    "cross_provider_fallback_enabled": False,
-    # Provider execution modes. Modes are resolved separately from provider/model
-    # so features like Claude advisor mode can be introduced without reshaping
-    # the dispatch pipeline again.
-    "provider_execution_modes": {
-        "anthropic": ["default", "advisor"],
-        "openai": ["default"],
-        "gemini": ["default"],
+    # Provider selection mode — controls how the pool chooses across the
+    # providers listed in task_type_provider_preference:
+    #   "balanced"  — flatten all accounts across listed providers into one
+    #                 pool; pick globally by (health_score, -active_tasks).
+    #                 Adding an account makes it immediately eligible for work.
+    #   "preferred" — strict ordering; try each provider in list order, only
+    #                 fall through when the earlier provider has no capacity.
+    #   "exclusive" — first listed provider only; never fall back cross-provider.
+    # Per-account max_concurrent_tasks/daily_task_cap still apply in every mode.
+    "provider_selection_mode": "balanced",
+    # DEPRECATED: legacy boolean superseded by provider_selection_mode. Kept
+    # readable in GET/PATCH for backwards compat — True ≡ "preferred",
+    # False ≡ "exclusive". If both keys are present, mode wins.
+    "cross_provider_fallback_enabled": True,
+    # Provider settings bags: canonical source of per-provider dispatch knobs
+    # (effort, verbosity, thinking budget, advisor toggle, etc.). Defaults are
+    # intentionally provider-neutral on model selection — concrete model comes
+    # from `provider_tier_model_map[provider][quality_tier]` unless a bag key
+    # explicitly pins one. Shape per provider is declared by that provider's
+    # settings_schema(); unknown keys are rejected at resolution time.
+    "provider_settings_defaults": {
+        "anthropic": {"effort": "medium"},
+        "openai": {"reasoning_effort": "medium", "verbosity": "medium"},
+        "gemini": {},
     },
-    "provider_mode_capabilities": {
-        "anthropic": {
-            "default": {"read_only_preferred": False},
-            "advisor": {"read_only_preferred": True},
-        },
-        "openai": {
-            "default": {"read_only_preferred": False},
-        },
-        "gemini": {
-            "default": {"read_only_preferred": False},
-        },
-    },
-    "task_type_execution_defaults": {
-        "strategic_review": "advisor",
-        "design_doc_update": "advisor",
-        "research": "advisor",
-        "plan": "advisor",
-        "review": "advisor",
-        "security_audit": "advisor",
-        "perf": "advisor",
-        "smoketest": "advisor",
-        "debug": "advisor",
-        "create": "default",
-        "refactor": "default",
-        "fix": "default",
-        "qa": "default",
-        "deps": "default",
-        "docs": "default",
-        "migrate": "default",
-    },
-    # Per-task-type model/effort defaults (synced from frontend settings)
-    # All tasks use opus-4-7; effort varies by type:
-    #   max: strategic_review, design_doc_update
-    #   high: research, architecture (design_doc)
-    #   medium: create, refactor, plan, review, fix, qa, deps, docs, migrate, security_audit, perf
-    #   low: smoketest and other quick checks
-    "task_type_models": {
-        "strategic_review": "claude-opus-4-7",
-        "design_doc_update": "claude-opus-4-7",
-        "research": "claude-opus-4-7",
-        "create": "claude-opus-4-7",
-        "refactor": "claude-opus-4-7",
-        "plan": "claude-opus-4-7",
-        "review": "claude-opus-4-7",
-        "fix": "claude-opus-4-7",
-        "qa": "claude-opus-4-7",
-        "deps": "claude-opus-4-7",
-        "docs": "claude-opus-4-7",
-        "migrate": "claude-opus-4-7",
-        "security_audit": "claude-opus-4-7",
-        "perf": "claude-opus-4-7",
-        "smoketest": "claude-opus-4-7",
-        "debug": "claude-opus-4-7",
-    },
-    "task_type_efforts": {
-        "strategic_review": "max",
-        "design_doc_update": "max",
-        "research": "high",
-        "create": "medium",
-        "refactor": "medium",
-        "plan": "medium",
-        "review": "medium",
-        "fix": "medium",
-        "qa": "medium",
-        "deps": "medium",
-        "docs": "medium",
-        "migrate": "medium",
-        "security_audit": "medium",
-        "perf": "medium",
-        "smoketest": "low",
-        "debug": "medium",
+    # Sparse per-(task_type, provider) overrides. Deep-merged over provider
+    # defaults at dispatch time. Only record actual deviations here so a later
+    # change to the default propagates everywhere that didn't opt out. A
+    # task-type with no entry inherits defaults verbatim. Bags may set
+    # provider-specific model overrides when a task deserves a specific model
+    # (e.g. {"gemini": {"model": "gemini-2.5-flash"}} to pin a cheap provider).
+    "task_type_provider_overrides": {
+        "strategic_review": {"anthropic": {"effort": "max"}},
+        "design_doc_update": {"anthropic": {"effort": "max"}},
+        "research": {"anthropic": {"effort": "high"}},
+        "security_audit": {"anthropic": {"effort": "high"}},
+        "perf": {"anthropic": {"effort": "high"}},
+        "debug": {"anthropic": {"effort": "high"}},
+        "smoketest": {"anthropic": {"effort": "low"}},
+        "docs": {"anthropic": {"effort": "low"}},
+        "deps": {"anthropic": {"effort": "low"}},
     },
     # Per-type extra instructions appended to the agent's base prompt
     # e.g. {"research": "Focus especially on performance bottlenecks.", "qa": "Use pytest only."}
@@ -381,11 +348,10 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "provider_tier_model_map",
                     "task_type_provider_preference",
                     "task_type_model_preferences",
+                    "provider_selection_mode",
                     "cross_provider_fallback_enabled",
-                    "provider_execution_modes",
-                    "provider_mode_capabilities",
-                    "task_type_execution_defaults",
-                    "task_type_models", "task_type_efforts", "agent_prompt_suffixes",
+                    "agent_prompt_suffixes",
+                    "provider_settings_defaults", "task_type_provider_overrides",
                     "autonomous_periodic_tasks", "health_check_urls", "notification_config",
                 ):
                     if key in config_json:

@@ -10,7 +10,13 @@
       "Bash(grep -r proxy /Users/alokthakrar/Projects/blueprint/BlueprintAIStudio --include=*.py --include=*.tf --include=*.md --include=*.sh -i)",
       "Bash(git log:*)",
       "Bash(gcloud compute images list *)",
-      "Bash(python scripts/tasks.py list)"
+      "Bash(python scripts/tasks.py list)",
+      "Bash(python *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:docs.cloud.google.com)",
+      "WebFetch(domain:platform.openai.com)",
+      "WebSearch",
+      "WebFetch(domain:ai.google.dev)"
     ]
   }
 }

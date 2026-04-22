@@ -357,11 +357,8 @@ export default function App() {
         onUpdateDirectionCooldownMinutes={s.handleUpdateDirectionCooldownMinutes}
         strategicResearchFrequency={s.strategicResearchFrequency}
         onUpdateStrategicResearchFrequency={s.handleUpdateStrategicResearchFrequency}
-        onSyncTaskTypeDefaults={s.syncTaskTypeDefaults}
         healthCheckUrls={s.healthCheckUrls}
         onUpdateHealthCheckUrls={s.updateHealthCheckUrls}
-        agentPromptSuffixes={s.agentPromptSuffixes}
-        onUpdateAgentPromptSuffixes={s.updateAgentPromptSuffixes}
         githubAccount={s.githubAccount}
         onConnectGitHub={s.connectGitHub}
         maxPlanAccounts={s.maxPlanAccounts}
@@ -389,18 +386,12 @@ export default function App() {
         onAddAccount={s.addMaxPlanAccount}
         onUpdateAccountCaps={s.updateAccountCaps}
         providerTierModelMap={s.providerTierModelMap}
-        taskTypeProviderPreference={s.taskTypeProviderPreference}
         taskTypeModelPreferences={s.taskTypeModelPreferences}
-        providerExecutionModes={s.providerExecutionModes}
-        providerModeCapabilities={s.providerModeCapabilities}
-        taskTypeExecutionDefaults={s.taskTypeExecutionDefaults}
-        crossProviderFallbackEnabled={s.crossProviderFallbackEnabled}
         providers={s.providers}
-        onUpdateProviderTierModels={s.updateProviderTierModels}
-        onUpdateTaskTypeProviderPreferences={s.updateTaskTypeProviderPreferences}
-        onUpdateTaskTypeModelPreferences={s.updateTaskTypeModelPreferenceConfig}
-        onUpdateTaskTypeExecutionDefaults={s.updateTaskTypeExecutionDefaultConfig}
-        onUpdateCrossProviderFallback={s.updateCrossProviderFallback}
+        providerSettingsDefaults={s.providerSettingsDefaults}
+        taskTypeProviderOverrides={s.taskTypeProviderOverrides}
+        onUpdateProviderSettingsDefaults={s.updateProviderSettingsDefaults}
+        onUpdateTaskTypeProviderOverrides={s.updateTaskTypeProviderOverrides}
         showMetrics={s.showMetrics}
         onToggleMetrics={() => s.setShowMetrics(prev => !prev)}
         metricsHistory={s.metricsHistory}

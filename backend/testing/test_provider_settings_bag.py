@@ -1,0 +1,479 @@
+"""Tests for the provider-settings bag system: schemas, validation, merge,
+CLI translation, and end-to-end resolution via resolve_task_provider_settings."""
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from app.models import LLMProviderName
+from app.providers.base import merge_settings
+from app.providers.registry import get_provider
+
+
+# ---------------------------------------------------------------------------
+# Schema validation
+# ---------------------------------------------------------------------------
+
+def test_anthropic_schema_accepts_known_knobs():
+    provider = get_provider(LLMProviderName.ANTHROPIC)
+    validated = provider.validate_settings({
+        "model": "claude-sonnet-4-6",
+        "effort": "high",
+        "advisor": {"enabled": True, "model": "claude-opus-4-7"},
+        "betas": ["advisor-tool-2026-03-01"],
+    })
+    assert validated["model"] == "claude-sonnet-4-6"
+    assert validated["effort"] == "high"
+    assert validated["advisor"]["enabled"] is True
+    assert validated["betas"] == ["advisor-tool-2026-03-01"]
+
+
+def test_anthropic_schema_rejects_unknown_keys():
+    provider = get_provider(LLMProviderName.ANTHROPIC)
+    with pytest.raises(ValueError, match="unknown key"):
+        provider.validate_settings({"bogus_key": 123})
+
+
+def test_anthropic_schema_rejects_invalid_enum():
+    provider = get_provider(LLMProviderName.ANTHROPIC)
+    with pytest.raises(ValueError, match="not in allowed values"):
+        provider.validate_settings({"effort": "absurd"})
+
+
+def test_openai_schema_accepts_known_knobs():
+    provider = get_provider(LLMProviderName.OPENAI)
+    validated = provider.validate_settings({
+        "model": "gpt-5.4-mini",
+        "reasoning_effort": "minimal",
+        "verbosity": "low",
+        "service_tier": "flex",
+    })
+    assert validated["reasoning_effort"] == "minimal"
+    assert validated["verbosity"] == "low"
+
+
+def test_openai_schema_rejects_invalid_reasoning_effort():
+    provider = get_provider(LLMProviderName.OPENAI)
+    with pytest.raises(ValueError):
+        provider.validate_settings({"reasoning_effort": "extreme"})
+
+
+def test_gemini_schema_accepts_nested_safety():
+    provider = get_provider(LLMProviderName.GEMINI)
+    validated = provider.validate_settings({
+        "model": "gemini-2.5-pro",
+        "thinking_budget": 4096,
+        "temperature": 0.3,
+        "safety": {"harassment": "BLOCK_ONLY_HIGH"},
+    })
+    assert validated["safety"]["harassment"] == "BLOCK_ONLY_HIGH"
+
+
+def test_gemini_schema_rejects_unknown_safety_category():
+    provider = get_provider(LLMProviderName.GEMINI)
+    with pytest.raises(ValueError, match="unknown key"):
+        provider.validate_settings({"safety": {"something_else": "OFF"}})
+
+
+def test_schema_validator_accepts_null_values_for_optional_scalars():
+    """Null is always allowed for scalar types (string/number/boolean/integer).
+
+    Anthropic's schema uses this so e.g. `max_budget_usd` can round-trip as
+    null from the UI to represent "unset" without raising. Required-field
+    enforcement is separate (see test_schema_validator_enforces_required_keys).
+    """
+    from app.providers.base import _validate_against_schema
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "effort": {"type": "string"},
+            "max_budget_usd": {"type": "number"},
+            "enabled": {"type": "boolean"},
+            "count": {"type": "integer"},
+            "betas": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+    assert _validate_against_schema(
+        {"effort": None, "max_budget_usd": None, "enabled": None, "count": None, "betas": None},
+        schema,
+        path="",
+    ) == {"effort": None, "max_budget_usd": None, "enabled": None, "count": None, "betas": None}
+
+
+def test_schema_validator_rejects_wrong_type_on_scalars():
+    """Even when null is allowed, other wrong types raise."""
+    from app.providers.base import _validate_against_schema
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"effort": {"type": "string"}, "count": {"type": "integer"}},
+    }
+    with pytest.raises(ValueError, match="expected string"):
+        _validate_against_schema({"effort": 42}, schema, path="")
+    with pytest.raises(ValueError, match="expected integer"):
+        _validate_against_schema({"count": "many"}, schema, path="")
+
+
+def test_schema_validator_rejects_object_where_scalar_expected():
+    from app.providers.base import _validate_against_schema
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"effort": {"type": "string"}},
+    }
+    with pytest.raises(ValueError, match="expected string"):
+        _validate_against_schema({"effort": {"nested": "value"}}, schema, path="")
+
+
+def test_manifest_omits_translation_when_settings_produces_empty_bag():
+    """Empty bag {} should not emit LLM_SETTINGS or LLM_CLI_TRANSLATION env vars.
+
+    Protects the old-backend→new-agent back-compat path: if settings are
+    unconfigured, the agent falls back to legacy LLM_MODEL/LLM_EXECUTION_MODE.
+    """
+    import uuid as _uuid
+    from app.compute import build_agent_secret_manifest
+
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="vm-test",
+        task_id=_uuid.uuid4(),
+        oauth_token="sk-ant-oat01-test",
+        task_type="review",
+        provider="anthropic",
+        auth_mode="oauth",
+        model="claude-opus-4-7",
+        provider_settings=None,
+    )
+    assert "LLM_SETTINGS" not in manifest["env"]
+    assert "LLM_CLI_TRANSLATION" not in manifest["env"]
+    # Legacy model env var still populated for back-compat.
+    assert manifest["env"]["LLM_MODEL"] == "claude-opus-4-7"
+
+
+def test_manifest_includes_translation_even_when_bag_is_empty_dict():
+    """An empty dict is a valid bag (=no overrides, inherit all); the manifest
+    should still emit LLM_SETTINGS='{}' so the agent knows the backend is
+    speaking the new protocol and doesn't fall back to legacy-only mode."""
+    import json
+    import uuid as _uuid
+    from app.compute import build_agent_secret_manifest
+
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="vm-test",
+        task_id=_uuid.uuid4(),
+        oauth_token="sk-ant-oat01-test",
+        task_type="review",
+        provider="anthropic",
+        auth_mode="oauth",
+        model="claude-opus-4-7",
+        provider_settings={},
+    )
+    assert manifest["env"]["LLM_SETTINGS"] == "{}"
+    # Translation is present but args list is empty since no knobs to translate.
+    translation = json.loads(manifest["env"]["LLM_CLI_TRANSLATION"])
+    assert translation["args"] == []
+
+
+def test_resolve_settings_handles_missing_provider_block_in_defaults():
+    """Provider with no entry in provider_settings_defaults falls through to
+    task_type_provider_overrides and payload. Missing across all three layers
+    returns empty dict, not None or error."""
+    from types import SimpleNamespace
+    from app.max_plan_pool import resolve_task_provider_settings
+
+    # Provider absent from defaults
+    runtime_config = {
+        "provider_settings_defaults": {"anthropic": {"effort": "medium"}},
+        "task_type_provider_overrides": {"review": {"openai": {"reasoning_effort": "high"}}},
+    }
+    task = SimpleNamespace(payloads=[{"type": "review"}], context={})
+    assert resolve_task_provider_settings(task, runtime_config, "openai") == {"reasoning_effort": "high"}
+    # Gemini absent from both layers → empty bag
+    assert resolve_task_provider_settings(task, runtime_config, "gemini") == {}
+
+
+def test_schema_validator_enforces_required_keys():
+    """Schema `required: [...]` is enforced by _validate_against_schema.
+
+    Providers don't use `required` yet, but this guards future schemas that do.
+    """
+    from app.providers.base import _validate_against_schema
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["model"],
+        "properties": {
+            "model": {"type": "string"},
+            "effort": {"type": "string"},
+        },
+    }
+    _validate_against_schema({"model": "x", "effort": "low"}, schema, path="")
+    with pytest.raises(ValueError, match="missing required keys: model"):
+        _validate_against_schema({"effort": "low"}, schema, path="")
+
+
+# ---------------------------------------------------------------------------
+# Deep merge semantics
+# ---------------------------------------------------------------------------
+
+def test_merge_settings_later_wins_for_scalars():
+    result = merge_settings(
+        {"model": "opus", "effort": "low"},
+        {"effort": "high"},
+    )
+    assert result == {"model": "opus", "effort": "high"}
+
+
+def test_merge_settings_deep_merges_nested_objects():
+    result = merge_settings(
+        {"advisor": {"enabled": False, "model": "claude-opus-4-7"}},
+        {"advisor": {"enabled": True}},
+    )
+    assert result["advisor"] == {"enabled": True, "model": "claude-opus-4-7"}
+
+
+def test_merge_settings_replaces_arrays_wholesale():
+    result = merge_settings(
+        {"betas": ["a", "b"]},
+        {"betas": ["c"]},
+    )
+    assert result["betas"] == ["c"]
+
+
+def test_merge_settings_skips_none_and_empty():
+    result = merge_settings(None, {"model": "opus"}, None, {})
+    assert result == {"model": "opus"}
+
+
+# ---------------------------------------------------------------------------
+# CLI translation
+# ---------------------------------------------------------------------------
+
+def test_anthropic_cli_translation_emits_model_and_effort():
+    provider = get_provider(LLMProviderName.ANTHROPIC)
+    translation = provider.settings_to_cli({"model": "claude-opus-4-7", "effort": "high"})
+    assert "--model" in translation.args
+    assert "claude-opus-4-7" in translation.args
+    assert "--effort" in translation.args
+    assert "high" in translation.args
+
+
+def test_anthropic_cli_translation_maps_max_effort_to_xhigh():
+    provider = get_provider(LLMProviderName.ANTHROPIC)
+    translation = provider.settings_to_cli({"effort": "max"})
+    # Claude Code CLI accepts low|medium|high|xhigh, not "max"; adapter coerces.
+    args = list(translation.args)
+    assert "xhigh" in args
+    assert "max" not in args
+
+
+def test_anthropic_cli_translation_advisor_opus_executor_ignored():
+    provider = get_provider(LLMProviderName.ANTHROPIC)
+    translation = provider.settings_to_cli({
+        "model": "claude-opus-4-7",
+        "advisor": {"enabled": True, "model": "claude-opus-4-7"},
+    })
+    # opus executor + opus advisor is a no-op; recorded as unsupported.
+    assert any("advisor.enabled" in u for u in translation.unsupported)
+    assert not translation.prompt_fragments
+
+
+def test_anthropic_cli_translation_advisor_non_opus_emits_prompt_fragment():
+    provider = get_provider(LLMProviderName.ANTHROPIC)
+    translation = provider.settings_to_cli({
+        "model": "claude-sonnet-4-6",
+        "advisor": {"enabled": True, "model": "claude-opus-4-7"},
+    })
+    # Sonnet executor is a valid advisor-pairing target; CLI can't pass the
+    # tool, so fall back to a prompt fragment + log as unsupported.
+    assert translation.prompt_fragments
+    assert any("advisor.enabled" in u for u in translation.unsupported)
+
+
+def test_openai_cli_translation_emits_config_overrides():
+    provider = get_provider(LLMProviderName.OPENAI)
+    translation = provider.settings_to_cli({
+        "model": "gpt-5.4",
+        "reasoning_effort": "high",
+        "verbosity": "low",
+        "service_tier": "flex",
+    })
+    args = list(translation.args)
+    assert args[:2] == ["-m", "gpt-5.4"]
+    # Each -c flag is followed by key=value; the set of emitted pairs is what we assert.
+    config_flags = [args[i + 1] for i, a in enumerate(args) if a == "-c"]
+    assert 'model_reasoning_effort="high"' in config_flags
+    assert 'model_verbosity="low"' in config_flags
+    assert 'service_tier="flex"' in config_flags
+
+
+def test_gemini_cli_translation_writes_settings_alias_for_thinking():
+    provider = get_provider(LLMProviderName.GEMINI)
+    translation = provider.settings_to_cli({
+        "model": "gemini-2.5-pro",
+        "thinking_budget": 8192,
+        "temperature": 0.2,
+    })
+    # Gemini CLI has no per-call thinking/temperature flags; must materialize
+    # a settings.json custom alias and invoke `-m <alias>`.
+    assert len(translation.settings_files) == 1
+    settings_file = translation.settings_files[0]
+    assert settings_file.path.endswith(".gemini/settings.json")
+    parsed = json.loads(settings_file.content)
+    alias = next(iter(parsed["modelConfigs"]["customAliases"].values()))
+    assert alias["modelConfig"]["model"] == "gemini-2.5-pro"
+    assert alias["modelConfig"]["generateContentConfig"]["thinkingConfig"]["thinkingBudget"] == 8192
+    assert alias["modelConfig"]["generateContentConfig"]["temperature"] == 0.2
+    # Args should reference the alias, not the raw model.
+    assert "-m" in translation.args
+    m_index = list(translation.args).index("-m")
+    assert translation.args[m_index + 1] != "gemini-2.5-pro"
+
+
+def test_gemini_cli_translation_model_only_uses_direct_flag():
+    provider = get_provider(LLMProviderName.GEMINI)
+    translation = provider.settings_to_cli({"model": "gemini-2.5-flash"})
+    # No generation-config tunables → no settings.json, just -m <model>.
+    assert not translation.settings_files
+    assert list(translation.args) == ["-m", "gemini-2.5-flash"]
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: resolve_task_provider_settings
+# ---------------------------------------------------------------------------
+
+def _make_task(task_type: str, payload_settings: dict | None = None, context_settings: dict | None = None):
+    payload = {"type": task_type}
+    if payload_settings:
+        payload["provider_settings"] = payload_settings
+    ctx = {}
+    if context_settings:
+        ctx["provider_settings"] = context_settings
+    return SimpleNamespace(payloads=[payload], context=ctx)
+
+
+def test_resolve_task_provider_settings_three_layer_merge():
+    from app.max_plan_pool import resolve_task_provider_settings
+
+    runtime_config = {
+        "provider_settings_defaults": {
+            "anthropic": {"model": "claude-opus-4-7", "effort": "medium"},
+        },
+        "task_type_provider_overrides": {
+            "review": {"anthropic": {"effort": "high"}},
+        },
+    }
+    task = _make_task("review", payload_settings={"anthropic": {"permission_mode": "plan"}})
+
+    resolved = resolve_task_provider_settings(task, runtime_config, "anthropic")
+
+    assert resolved["model"] == "claude-opus-4-7"      # from defaults
+    assert resolved["effort"] == "high"                # task-type override wins
+    assert resolved["permission_mode"] == "plan"       # payload wins
+
+
+def test_resolve_task_provider_settings_payload_beats_task_type():
+    from app.max_plan_pool import resolve_task_provider_settings
+
+    runtime_config = {
+        "provider_settings_defaults": {"anthropic": {"model": "claude-opus-4-7"}},
+        "task_type_provider_overrides": {
+            "review": {"anthropic": {"effort": "high"}},
+        },
+    }
+    task = _make_task("review", payload_settings={"anthropic": {"effort": "low"}})
+
+    resolved = resolve_task_provider_settings(task, runtime_config, "anthropic")
+    assert resolved["effort"] == "low"
+
+
+def test_resolve_task_provider_settings_validates_bag():
+    from app.max_plan_pool import resolve_task_provider_settings
+
+    runtime_config = {
+        "provider_settings_defaults": {"anthropic": {"effort": "medium"}},
+    }
+    task = _make_task("review", payload_settings={"anthropic": {"bogus": 1}})
+
+    with pytest.raises(ValueError, match="unknown key"):
+        resolve_task_provider_settings(task, runtime_config, "anthropic")
+
+
+def test_resolve_task_provider_settings_empty_when_nothing_configured():
+    from app.max_plan_pool import resolve_task_provider_settings
+
+    runtime_config = {}
+    task = _make_task("review")
+    assert resolve_task_provider_settings(task, runtime_config, "anthropic") == {}
+
+
+# ---------------------------------------------------------------------------
+# build_agent_secret_manifest integration
+# ---------------------------------------------------------------------------
+
+def test_manifest_serializes_settings_bag_and_cli_translation():
+    import uuid as _uuid
+    from app.compute import build_agent_secret_manifest
+
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="vm-test",
+        task_id=_uuid.uuid4(),
+        oauth_token="sk-ant-oat01-test",
+        task_type="review",
+        provider="anthropic",
+        auth_mode="oauth",
+        model="claude-opus-4-7",
+        execution_mode="default",
+        provider_settings={"model": "claude-opus-4-7", "effort": "high"},
+    )
+    env = manifest["env"]
+    parsed_settings = json.loads(env["LLM_SETTINGS"])
+    assert parsed_settings == {"model": "claude-opus-4-7", "effort": "high"}
+    assert "LLM_CLI_TRANSLATION" in env
+    translation = json.loads(env["LLM_CLI_TRANSLATION"])
+    assert "--effort" in translation["args"]
+    assert "high" in translation["args"]
+    assert manifest["metadata"]["provider_settings"] == {"model": "claude-opus-4-7", "effort": "high"}
+
+
+def test_manifest_gemini_materializes_settings_file():
+    import uuid as _uuid
+    from app.compute import build_agent_secret_manifest
+
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="vm-test",
+        task_id=_uuid.uuid4(),
+        task_type="research",
+        provider="gemini",
+        auth_mode="api_key",
+        model="gemini-2.5-pro",
+        execution_mode="default",
+        provider_settings={"model": "gemini-2.5-pro", "thinking_budget": 4096},
+    )
+    paths = [f["path"] for f in manifest["files"]]
+    assert any(p.endswith(".gemini/settings.json") for p in paths)
+
+
+def test_manifest_without_settings_omits_llm_settings_env():
+    import uuid as _uuid
+    from app.compute import build_agent_secret_manifest
+
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="vm-test",
+        task_id=_uuid.uuid4(),
+        oauth_token="sk-ant-oat01-test",
+        task_type="review",
+        provider="anthropic",
+        auth_mode="oauth",
+        model="claude-opus-4-7",
+        execution_mode="default",
+    )
+    assert "LLM_SETTINGS" not in manifest["env"]
+    assert "LLM_CLI_TRANSLATION" not in manifest["env"]

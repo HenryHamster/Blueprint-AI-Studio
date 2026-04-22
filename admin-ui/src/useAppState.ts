@@ -118,8 +118,9 @@ export function useAppState() {
     autoArchiveMaxTerminalTasksPerProject, autoArchiveIntervalMinutes,
     notificationConfig,
     providerTierModelMap, taskTypeProviderPreference, taskTypeModelPreferences,
-    providerExecutionModes, providerModeCapabilities, taskTypeExecutionDefaults,
+    providerSelectionMode,
     crossProviderFallbackEnabled, providers,
+    providerSettingsDefaults, taskTypeProviderOverrides,
     buildConfig, setBuildConfig,
     fetchSettings,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
@@ -127,8 +128,9 @@ export function useAppState() {
     connectGitHub,
     updateAgentPromptSuffixes,
     updateProviderTierModels, updateTaskTypeProviderPreferences, updateTaskTypeModelPreferenceConfig,
-    updateTaskTypeExecutionDefaultConfig, updateCrossProviderFallback,
-    syncTaskTypeDefaults,
+    updateProviderSelectionMode,
+    updateCrossProviderFallback,
+    updateProviderSettingsDefaults, updateTaskTypeProviderOverrides,
     updateMaxVMs, updateMaxRetries, updateRequireApprovalGates,
     updateAutoArchiveEnabled, updateAutoArchiveTerminalAfterDays,
     updateAutoArchiveMaxTerminalTasksPerProject, updateAutoArchiveIntervalMinutes,
@@ -892,11 +894,12 @@ export function useAppState() {
         headers: await authHeaders(),
       });
       if (!res.ok) {
-        if (res.status === 404) {
-          addToast('Auto-detection not yet available', 'info');
-        } else {
-          addToast('Detection failed', 'error');
-        }
+        let msg = 'Detection failed';
+        try {
+          const err = await res.json();
+          if (err?.detail) msg = err.detail;
+        } catch { /* ignore parse errors */ }
+        addToast(msg, 'error');
         return;
       }
       const data = await res.json();
@@ -904,7 +907,7 @@ export function useAppState() {
       addToast('Build config detected', 'success');
       fetchProjects(true);
     } catch {
-      addToast('Auto-detection not yet available', 'info');
+      addToast('Detection failed', 'error');
     }
   };
 
@@ -1033,7 +1036,7 @@ export function useAppState() {
     showSettings, settingsRef, handleToggleSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
     autonomousResearchIntervalMinutes, directionCooldownMinutes, strategicResearchFrequency,
-    updateMaxVMs, updateMaxRetries, updateRequireApprovalGates, handleUpdateMaxAutonomousRate, syncTaskTypeDefaults,
+    updateMaxVMs, updateMaxRetries, updateRequireApprovalGates, handleUpdateMaxAutonomousRate,
     requireApprovalGates,
     autoArchiveEnabled, autoArchiveTerminalAfterDays,
     autoArchiveMaxTerminalTasksPerProject, autoArchiveIntervalMinutes,
@@ -1055,10 +1058,13 @@ export function useAppState() {
     newAccountAutoDisableAfterRateLimits, setNewAccountAutoDisableAfterRateLimits,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits, updateAccountCaps,
     providerTierModelMap, taskTypeProviderPreference, taskTypeModelPreferences,
-    providerExecutionModes, providerModeCapabilities, taskTypeExecutionDefaults,
+    providerSelectionMode,
     crossProviderFallbackEnabled, providers,
+    providerSettingsDefaults, taskTypeProviderOverrides,
     updateProviderTierModels, updateTaskTypeProviderPreferences, updateTaskTypeModelPreferenceConfig,
-    updateTaskTypeExecutionDefaultConfig, updateCrossProviderFallback,
+    updateProviderSelectionMode,
+    updateCrossProviderFallback,
+    updateProviderSettingsDefaults, updateTaskTypeProviderOverrides,
     // Orchestrator
     handleRestartOrchestrator,
     // GitHub

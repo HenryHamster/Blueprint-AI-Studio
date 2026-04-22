@@ -82,14 +82,32 @@ def test_heartbeat_stale_cutoff_large_scope_default_is_900s():
 
 
 def test_heartbeat_stale_cutoff_effort_from_task_type_fallback():
-    """Effort resolves from task_type_efforts when not explicit in context."""
+    """Effort falls back to the Anthropic settings bag when not explicit in context."""
     class _T:
         context = {"scope": "small", "type": "strategic_review"}
         first_payload = None
 
-    now = datetime(2026, 1, 1, 12, 0, 0)
-    # strategic_review -> "max" effort -> 720s floor > 300s small scope
-    assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=720)
+    # Isolate from other tests that may have mutated runtime_config via PATCH.
+    original_overrides = _runtime_config.get("task_type_provider_overrides")
+    original_defaults = _runtime_config.get("provider_settings_defaults")
+    try:
+        _runtime_config["provider_settings_defaults"] = {"anthropic": {"effort": "medium"}}
+        _runtime_config["task_type_provider_overrides"] = {
+            "strategic_review": {"anthropic": {"effort": "max"}},
+        }
+        now = datetime(2026, 1, 1, 12, 0, 0)
+        # strategic_review override sets effort=max → 720s floor overrides the
+        # 300s small-scope threshold.
+        assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=720)
+    finally:
+        if original_overrides is None:
+            _runtime_config.pop("task_type_provider_overrides", None)
+        else:
+            _runtime_config["task_type_provider_overrides"] = original_overrides
+        if original_defaults is None:
+            _runtime_config.pop("provider_settings_defaults", None)
+        else:
+            _runtime_config["provider_settings_defaults"] = original_defaults
 
 
 def test_heartbeat_stale_cutoff_unknown_effort_uses_scope_threshold():

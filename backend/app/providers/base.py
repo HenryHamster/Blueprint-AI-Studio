@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from app.models import LLMAuthMode, LLMProviderName
@@ -25,6 +25,26 @@ class FileMaterial:
 class SecretMaterial:
     env: dict[str, str]
     files: tuple[FileMaterial, ...] = ()
+
+
+@dataclass(frozen=True)
+class CLITranslation:
+    """Output of settings_to_cli(): what the agent runner should apply to a CLI invocation.
+
+    - `env`: extra environment variables to set for the subprocess (merged with secret env).
+    - `args`: ordered CLI flags to append after the base invocation.
+    - `settings_files`: files to materialize on disk before invocation (e.g., ~/.gemini/settings.json).
+    - `prompt_fragments`: strings to prepend/append to the system prompt as fallback for knobs
+      the CLI cannot express natively (advisor mode, tool_choice on Codex, etc).
+    - `unsupported`: knob names from the settings bag that produced no native translation.
+      Logged by the runner; operators use this to know when a setting is being silently dropped.
+    """
+
+    env: dict[str, str] = field(default_factory=dict)
+    args: tuple[str, ...] = ()
+    settings_files: tuple[FileMaterial, ...] = ()
+    prompt_fragments: tuple[str, ...] = ()
+    unsupported: tuple[str, ...] = ()
 
 
 class LLMProvider(ABC):
@@ -63,6 +83,32 @@ class LLMProvider(ABC):
         provider_metadata: Mapping[str, Any] | None = None,
     ) -> SecretMaterial:
         raise NotImplementedError
+
+    def settings_schema(self) -> dict[str, Any]:
+        """JSON-schema-shaped declaration of this provider's tunable knobs.
+
+        Consumed by the admin API to drive dynamic UI rendering, and by
+        validate_settings() to reject unknown keys / enum violations.
+        Default: empty schema (provider exposes no knobs).
+        """
+        return {"type": "object", "properties": {}, "additionalProperties": False}
+
+    def validate_settings(self, bag: Mapping[str, Any]) -> dict[str, Any]:
+        """Validate a settings bag against settings_schema().
+
+        Returns a cleaned copy with only recognized keys and coerced types.
+        Raises ValueError on enum violations or structural mismatch. Unknown
+        top-level keys are rejected (fail-closed) so typos don't silently no-op.
+        """
+        return _validate_against_schema(bag or {}, self.settings_schema(), path="")
+
+    def settings_to_cli(self, bag: Mapping[str, Any]) -> CLITranslation:
+        """Translate a validated settings bag into CLI env/args/files/fallbacks.
+
+        Default implementation returns an empty translation. Providers override
+        to map their specific knobs onto their CLI's surface.
+        """
+        return CLITranslation()
 
     def account_has_credentials(self, account: Mapping[str, Any] | Any) -> bool:
         secret_blob_ref = _account_value(account, "secret_blob_ref")
@@ -122,3 +168,103 @@ def tier_model_from_runtime_config(
     if isinstance(configured, Mapping) and configured.get(tier):
         return configured[tier]
     return defaults.get(tier)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight schema validator for provider settings bags.
+#
+# Supports: type (object/string/integer/number/boolean/array), enum, properties,
+# additionalProperties (bool), items (for arrays), default. Not a full JSON
+# Schema implementation — just enough to validate typed bags without a dep.
+# Raises ValueError with a dotted path on any violation. Unknown keys are
+# rejected when additionalProperties is False (default).
+# ---------------------------------------------------------------------------
+def _validate_against_schema(value: Any, schema: Mapping[str, Any], *, path: str) -> Any:
+    if not isinstance(schema, Mapping):
+        return value
+    expected = schema.get("type")
+    if expected == "object":
+        if value is None:
+            value = {}
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{path or '<root>'}: expected object, got {type(value).__name__}")
+        props = schema.get("properties") or {}
+        extra_ok = schema.get("additionalProperties", False)
+        required = schema.get("required") or ()
+        cleaned: dict[str, Any] = {}
+        for key, raw in dict(value).items():
+            if key in props:
+                sub_path = f"{path}.{key}" if path else key
+                cleaned[key] = _validate_against_schema(raw, props[key], path=sub_path)
+            elif extra_ok:
+                cleaned[key] = raw
+            else:
+                raise ValueError(f"{path or '<root>'}: unknown key {key!r}")
+        missing = [key for key in required if key not in cleaned]
+        if missing:
+            raise ValueError(f"{path or '<root>'}: missing required keys: {', '.join(missing)}")
+        return cleaned
+    if expected == "string":
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"{path}: expected string")
+        enum = schema.get("enum")
+        if enum is not None and value not in enum:
+            raise ValueError(f"{path}: value {value!r} not in allowed values {list(enum)}")
+        return value
+    if expected == "integer":
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{path}: expected integer")
+        return value
+    if expected == "number":
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{path}: expected number")
+        return value
+    if expected == "boolean":
+        if value is None:
+            return None
+        if not isinstance(value, bool):
+            raise ValueError(f"{path}: expected boolean")
+        return value
+    if expected == "array":
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError(f"{path}: expected array")
+        items = schema.get("items")
+        if items is None:
+            return list(value)
+        return [
+            _validate_against_schema(item, items, path=f"{path}[{i}]")
+            for i, item in enumerate(value)
+        ]
+    return value
+
+
+def merge_settings(*bags: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Deep-merge a sequence of settings bags (later bags win).
+
+    Used to compose provider_settings_defaults → task_type_provider_overrides →
+    payload.provider_settings. Nested objects are merged recursively; scalars,
+    arrays, and None values from later bags replace earlier ones wholesale.
+    """
+    result: dict[str, Any] = {}
+    for bag in bags:
+        if not bag:
+            continue
+        _deep_merge_into(result, bag)
+    return result
+
+
+def _deep_merge_into(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+    for key, value in source.items():
+        existing = target.get(key)
+        if isinstance(existing, dict) and isinstance(value, Mapping):
+            _deep_merge_into(existing, value)
+        else:
+            target[key] = value

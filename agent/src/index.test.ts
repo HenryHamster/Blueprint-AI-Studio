@@ -49,7 +49,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
 import type WebSocket from 'ws';
 
@@ -742,6 +742,54 @@ describe('provider runner prompt transport', () => {
     expect(command.promptInput).toBe('stdin');
     expect(command.args).toEqual(['--approval-mode=yolo', '-o', 'text', '-m', 'gemini-2.5-pro']);
     expect(command.args.join(' ')).not.toContain('Very long prompt body');
+  });
+});
+
+// ── LLM_CLI_TRANSLATION parsing ───────────────────────────────────────────────
+// The runtime consumes a JSON-encoded translation blob from the backend's
+// settings-bag resolver. Validate parsing is tolerant of missing fields and
+// fails-safe to null on malformed JSON so legacy dispatch still works.
+describe('parseLLMCliTranslation', () => {
+  const originalEnv = process.env.LLM_CLI_TRANSLATION;
+
+  afterEach(() => {
+    if (originalEnv === undefined) delete process.env.LLM_CLI_TRANSLATION;
+    else process.env.LLM_CLI_TRANSLATION = originalEnv;
+  });
+
+  it('returns null when env var is absent', () => {
+    delete process.env.LLM_CLI_TRANSLATION;
+    expect(parseLLMCliTranslation()).toBeNull();
+  });
+
+  it('parses a valid translation', () => {
+    process.env.LLM_CLI_TRANSLATION = JSON.stringify({
+      env: { FOO: 'bar' },
+      args: ['--model', 'claude-opus-4-7', '--effort', 'high'],
+      prompt_fragments: ['Plan carefully.'],
+      unsupported: ['advisor.enabled (fallback: prompt fragment only)'],
+    });
+    const parsed = parseLLMCliTranslation();
+    expect(parsed).not.toBeNull();
+    expect(parsed!.args).toEqual(['--model', 'claude-opus-4-7', '--effort', 'high']);
+    expect(parsed!.env).toEqual({ FOO: 'bar' });
+    expect(parsed!.prompt_fragments).toEqual(['Plan carefully.']);
+    expect(parsed!.unsupported[0]).toMatch(/advisor/);
+  });
+
+  it('tolerates missing fields with safe defaults', () => {
+    process.env.LLM_CLI_TRANSLATION = JSON.stringify({ args: ['-m', 'gpt-5'] });
+    const parsed = parseLLMCliTranslation();
+    expect(parsed).not.toBeNull();
+    expect(parsed!.args).toEqual(['-m', 'gpt-5']);
+    expect(parsed!.env).toEqual({});
+    expect(parsed!.prompt_fragments).toEqual([]);
+    expect(parsed!.unsupported).toEqual([]);
+  });
+
+  it('returns null on malformed JSON (fail-safe to legacy dispatch)', () => {
+    process.env.LLM_CLI_TRANSLATION = '{not valid json';
+    expect(parseLLMCliTranslation()).toBeNull();
   });
 });
 

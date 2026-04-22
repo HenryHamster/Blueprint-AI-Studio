@@ -1,0 +1,380 @@
+import { useMemo, useState } from 'react';
+import type {
+  ProviderCatalogEntry,
+  ProviderName,
+  ProviderSettingsBag,
+  ProviderSettingsDefaults,
+  TaskTypeProviderOverrides,
+} from '../types/settings';
+
+// JSON-Schema subset we render — mirrors backend providers/base.py:_validate_against_schema.
+interface SchemaNode {
+  type?: 'object' | 'string' | 'integer' | 'number' | 'boolean' | 'array';
+  enum?: readonly (string | number)[];
+  properties?: Record<string, SchemaNode>;
+  additionalProperties?: boolean;
+  items?: SchemaNode;
+  default?: unknown;
+}
+
+type UpdateDefaults = (value: ProviderSettingsDefaults) => void | Promise<void>;
+type UpdateOverrides = (value: TaskTypeProviderOverrides) => void | Promise<void>;
+
+interface Props {
+  providers: Record<string, ProviderCatalogEntry>;
+  providerSettingsDefaults: ProviderSettingsDefaults;
+  taskTypeProviderOverrides: TaskTypeProviderOverrides;
+  onUpdateDefaults: UpdateDefaults;
+  onUpdateOverrides: UpdateOverrides;
+}
+
+// Full list of known task types (matches backend payload_schemas.py::TaskType).
+// Not worth fetching — these change rarely and matching the backend list in one
+// place keeps the UI predictable.
+const TASK_TYPES = [
+  'create', 'review', 'fix', 'plan', 'research',
+  'strategic_review', 'design_doc_update', 'security_audit',
+  'qa', 'deps', 'docs', 'migrate', 'smoketest',
+  'refactor', 'debug', 'perf', 'investigate',
+] as const;
+
+export function ProviderSettingsPanel({
+  providers,
+  providerSettingsDefaults,
+  taskTypeProviderOverrides,
+  onUpdateDefaults,
+  onUpdateOverrides,
+}: Props) {
+  const [scope, setScope] = useState<'defaults' | 'overrides'>('defaults');
+  const [selectedProvider, setSelectedProvider] = useState<ProviderName>('anthropic');
+  const [selectedTaskType, setSelectedTaskType] = useState<string>('review');
+
+  const providerNames = Object.keys(providers) as ProviderName[];
+  const currentSchema = providers[selectedProvider]?.settings_schema;
+
+  const effectiveBag: ProviderSettingsBag = useMemo(() => {
+    if (scope === 'defaults') {
+      return providerSettingsDefaults[selectedProvider] ?? {};
+    }
+    return taskTypeProviderOverrides[selectedTaskType]?.[selectedProvider] ?? {};
+  }, [scope, selectedProvider, selectedTaskType, providerSettingsDefaults, taskTypeProviderOverrides]);
+
+  const handleBagChange = (newBag: ProviderSettingsBag) => {
+    if (scope === 'defaults') {
+      const next: ProviderSettingsDefaults = {
+        ...providerSettingsDefaults,
+        [selectedProvider]: newBag,
+      };
+      void onUpdateDefaults(next);
+    } else {
+      // Empty bag means no override for this (task, provider) — prune the key
+      // so the backend doesn't store a dead entry that shadows defaults.
+      const existingForType = taskTypeProviderOverrides[selectedTaskType] ?? {};
+      const prunedForType = Object.fromEntries(
+        Object.entries(existingForType).filter(([prov]) => prov !== selectedProvider),
+      ) as Partial<Record<ProviderName, ProviderSettingsBag>>;
+      if (Object.keys(newBag).length > 0) {
+        prunedForType[selectedProvider] = newBag;
+      }
+      const prunedOverrides = Object.fromEntries(
+        Object.entries(taskTypeProviderOverrides).filter(([tt]) => tt !== selectedTaskType),
+      ) as TaskTypeProviderOverrides;
+      if (Object.keys(prunedForType).length > 0) {
+        prunedOverrides[selectedTaskType] = prunedForType;
+      }
+      void onUpdateOverrides(prunedOverrides);
+    }
+  };
+
+  if (providerNames.length === 0) {
+    return (
+      <div className="text-xs text-neutral-500">
+        Loading provider catalog…
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="text-xs text-neutral-400 leading-relaxed">
+        Per-provider dispatch knobs (model, effort, thinking, caching, advisor…). The
+        settings bag is three-layered: provider defaults &rarr; per-task-type overrides
+        &rarr; per-task payload overrides. Changes here persist on save.
+      </div>
+
+      {/* Scope tabs: Defaults | Overrides */}
+      <div className="flex items-center gap-2 border-b border-neutral-800 pb-2">
+        <ScopeTab active={scope === 'defaults'} onClick={() => setScope('defaults')}>
+          Defaults
+        </ScopeTab>
+        <ScopeTab active={scope === 'overrides'} onClick={() => setScope('overrides')}>
+          Task-type overrides
+        </ScopeTab>
+      </div>
+
+      {scope === 'overrides' && (
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-neutral-400 w-20 shrink-0">Task type</label>
+          <select
+            value={selectedTaskType}
+            onChange={e => setSelectedTaskType(e.target.value)}
+            className="flex-1 bg-neutral-900 border border-neutral-700 rounded px-2 py-1.5 text-xs text-neutral-100"
+          >
+            {TASK_TYPES.map(t => (
+              <option key={t} value={t}>{t}</option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {/* Provider tabs */}
+      <div className="flex items-center gap-1">
+        {providerNames.map(name => (
+          <button
+            key={name}
+            onClick={() => setSelectedProvider(name)}
+            className={`px-3 py-1.5 rounded text-xs transition-colors ${
+              selectedProvider === name
+                ? 'bg-neutral-800 text-neutral-100 border border-neutral-700'
+                : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/50 border border-transparent'
+            }`}
+          >
+            {name}
+          </button>
+        ))}
+      </div>
+
+      {/* Schema-driven form */}
+      {currentSchema ? (
+        <SchemaForm
+          schema={currentSchema as SchemaNode}
+          value={effectiveBag}
+          onChange={handleBagChange}
+          allowInherit={scope === 'overrides'}
+        />
+      ) : (
+        <div className="text-xs text-neutral-500">
+          Provider {selectedProvider} has no declared settings schema.
+        </div>
+      )}
+
+      {scope === 'overrides' && Object.keys(effectiveBag).length === 0 && (
+        <div className="text-[11px] text-neutral-500 italic">
+          No overrides for {selectedTaskType} / {selectedProvider}. Fields below
+          will create an override when you set them.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScopeTab({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`px-3 py-1.5 rounded text-xs transition-colors ${
+        active
+          ? 'bg-neutral-800 text-neutral-100'
+          : 'text-neutral-400 hover:text-neutral-200'
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+// ─── Schema renderer ────────────────────────────────────────────────────────
+// Walks an object schema's properties, rendering each field by type/enum.
+// The top-level schema must be `type: object`; nested objects recurse.
+// `allowInherit=true` (overrides pane) gives each field an "override" checkbox;
+// unchecked fields are absent from the bag (inherit defaults at dispatch).
+
+interface SchemaFormProps {
+  schema: SchemaNode;
+  value: ProviderSettingsBag;
+  onChange: (next: ProviderSettingsBag) => void;
+  allowInherit: boolean;
+}
+
+function SchemaForm({ schema, value, onChange, allowInherit }: SchemaFormProps) {
+  if (schema.type !== 'object' || !schema.properties) {
+    return null;
+  }
+  const properties = schema.properties;
+  const keys = Object.keys(properties);
+  return (
+    <div className="space-y-2">
+      {keys.map(key => {
+        const propSchema = properties[key];
+        const present = key in value;
+        const currentVal = value[key];
+        return (
+          <FieldRow
+            key={key}
+            label={humanizeKey(key)}
+            schema={propSchema}
+            value={currentVal}
+            present={present}
+            allowInherit={allowInherit}
+            onChange={(next, removed) => {
+              if (removed) {
+                const pruned = Object.fromEntries(
+                  Object.entries(value).filter(([k]) => k !== key),
+                ) as ProviderSettingsBag;
+                onChange(pruned);
+              } else {
+                onChange({ ...value, [key]: next });
+              }
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+interface FieldRowProps {
+  label: string;
+  schema: SchemaNode;
+  value: unknown;
+  present: boolean;
+  allowInherit: boolean;
+  onChange: (value: unknown, removed?: boolean) => void;
+}
+
+function FieldRow({ label, schema, value, present, allowInherit, onChange }: FieldRowProps) {
+  const overridden = present;
+  const effectiveDisabled = allowInherit && !overridden;
+
+  const toggleOverride = () => {
+    if (overridden) {
+      onChange(undefined, true);
+    } else {
+      // Seeding default depending on shape so the control is usable immediately.
+      let seed: unknown = '';
+      if (schema.type === 'boolean') seed = false;
+      else if (schema.type === 'integer' || schema.type === 'number') seed = 0;
+      else if (schema.enum && schema.enum.length > 0) seed = schema.enum[0];
+      else if (schema.type === 'array') seed = [];
+      else if (schema.type === 'object') seed = {};
+      onChange(seed);
+    }
+  };
+
+  return (
+    <div className="grid grid-cols-[160px_1fr_auto] gap-3 items-start py-1.5">
+      <label className="text-xs text-neutral-400 pt-1.5 font-mono truncate" title={label}>
+        {label}
+      </label>
+      <div className={`${effectiveDisabled ? 'opacity-40 pointer-events-none' : ''}`}>
+        <Field schema={schema} value={value} onChange={onChange} />
+      </div>
+      {allowInherit && (
+        <button
+          onClick={toggleOverride}
+          className={`text-[10px] px-2 py-1 rounded border ${
+            overridden
+              ? 'border-emerald-700 text-emerald-300 bg-emerald-950/30'
+              : 'border-neutral-700 text-neutral-500 hover:text-neutral-300'
+          }`}
+          title={overridden ? 'Remove override (inherit default)' : 'Create override'}
+        >
+          {overridden ? 'override' : 'inherit'}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// Renders the appropriate control for one schema node. Nested objects render
+// recursively inside a bordered box.
+function Field({ schema, value, onChange }: { schema: SchemaNode; value: unknown; onChange: (v: unknown) => void }) {
+  // String with enum -> select
+  if (schema.enum && schema.enum.length > 0 && (schema.type === 'string' || schema.type === undefined)) {
+    return (
+      <select
+        value={(value as string | number) ?? ''}
+        onChange={e => onChange(e.target.value)}
+        className="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
+      >
+        {schema.enum.map(opt => (
+          <option key={String(opt)} value={opt}>{String(opt)}</option>
+        ))}
+      </select>
+    );
+  }
+
+  if (schema.type === 'boolean') {
+    return (
+      <button
+        onClick={() => onChange(!value)}
+        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${value ? 'bg-emerald-600' : 'bg-neutral-700'}`}
+      >
+        <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${value ? 'translate-x-[18px]' : 'translate-x-[3px]'}`} />
+      </button>
+    );
+  }
+
+  if (schema.type === 'integer' || schema.type === 'number') {
+    return (
+      <input
+        type="number"
+        value={(value as number) ?? ''}
+        step={schema.type === 'integer' ? 1 : 'any'}
+        onChange={e => {
+          const raw = e.target.value;
+          if (raw === '') { onChange(undefined); return; }
+          const n = schema.type === 'integer' ? parseInt(raw, 10) : parseFloat(raw);
+          if (!Number.isNaN(n)) onChange(n);
+        }}
+        className="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
+      />
+    );
+  }
+
+  if (schema.type === 'array' && schema.items?.type === 'string') {
+    // Comma-separated editor. Arrays of scalars are the only shape we expose
+    // so far (Anthropic.betas). Expand to richer editors when we surface more.
+    const arr = Array.isArray(value) ? (value as string[]) : [];
+    return (
+      <input
+        type="text"
+        value={arr.join(', ')}
+        onChange={e => {
+          const parts = e.target.value.split(',').map(s => s.trim()).filter(Boolean);
+          onChange(parts);
+        }}
+        placeholder="comma-separated"
+        className="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100 font-mono"
+      />
+    );
+  }
+
+  if (schema.type === 'object' && schema.properties) {
+    const asBag = (typeof value === 'object' && value !== null) ? value as ProviderSettingsBag : {};
+    return (
+      <div className="border border-neutral-800 rounded p-2 space-y-1.5 bg-neutral-900/30">
+        <SchemaForm
+          schema={schema}
+          value={asBag}
+          onChange={next => onChange(next)}
+          allowInherit={false}
+        />
+      </div>
+    );
+  }
+
+  // Fallback: free-text string
+  return (
+    <input
+      type="text"
+      value={(value as string) ?? ''}
+      onChange={e => onChange(e.target.value || undefined)}
+      className="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
+    />
+  );
+}
+
+function humanizeKey(key: string): string {
+  return key.replace(/_/g, ' ');
+}

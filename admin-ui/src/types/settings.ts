@@ -37,7 +37,26 @@ export interface ProviderCatalogEntry {
   supported_execution_modes: string[];
   execution_modes: string[];
   mode_capabilities: Record<string, ProviderModeCapabilities>;
+  // JSON-Schema-shaped declaration of this provider's tunable settings bag.
+  // Consumed by ProviderSettingsPanel to render a dynamic knob editor; shape
+  // is provider-defined and validated server-side.
+  settings_schema?: {
+    type: 'object';
+    additionalProperties?: boolean;
+    properties: Record<string, unknown>;
+  };
 }
+
+// Opaque per-provider settings bag. Shape varies by provider (see each
+// provider's settings_schema). Validated server-side; UI treats as a
+// generic record until the schema-driven renderer consumes it.
+export type ProviderSettingsBag = Record<string, unknown>;
+
+// { "anthropic": {...}, "openai": {...}, "gemini": {...} }
+export type ProviderSettingsDefaults = Partial<Record<ProviderName, ProviderSettingsBag>>;
+
+// { "review": { "anthropic": { effort: "high" } }, ... }
+export type TaskTypeProviderOverrides = Record<string, Partial<Record<ProviderName, ProviderSettingsBag>>>;
 
 export interface ModelPreference {
   provider: ProviderName;

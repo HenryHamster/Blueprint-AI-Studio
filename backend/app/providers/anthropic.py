@@ -5,6 +5,7 @@ from typing import Any, Mapping
 
 from app.models import LLMAuthMode, LLMProviderName
 from app.providers.base import (
+    CLITranslation,
     LLMProvider,
     SecretMaterial,
     ValidationResult,
@@ -63,9 +64,6 @@ class AnthropicProvider(LLMProvider):
         self.ensure_supported_auth_mode(auth_mode)
         return ()
 
-    def supported_execution_modes(self) -> tuple[str, ...]:
-        return ("default", "advisor")
-
     def secret_material(
         self,
         secret: str | None,
@@ -76,3 +74,116 @@ class AnthropicProvider(LLMProvider):
         if auth_mode == LLMAuthMode.API_KEY:
             return SecretMaterial(env={"ANTHROPIC_API_KEY": secret or ""})
         return SecretMaterial(env={"CLAUDE_CODE_OAUTH_TOKEN": secret or ""})
+
+    def settings_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "model": {
+                    "type": "string",
+                    "enum": [
+                        "claude-opus-4-7",
+                        "claude-sonnet-4-6",
+                        "claude-haiku-4-5-20251001",
+                    ],
+                },
+                "effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "xhigh", "max"],
+                },
+                "thinking_summary": {
+                    "type": "string",
+                    "enum": ["summarized", "omitted"],
+                },
+                "max_budget_usd": {"type": "number"},
+                "permission_mode": {
+                    "type": "string",
+                    "enum": ["default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto"],
+                },
+                "fallback_model": {
+                    "type": "string",
+                    "enum": [
+                        "claude-opus-4-7",
+                        "claude-sonnet-4-6",
+                        "claude-haiku-4-5-20251001",
+                    ],
+                },
+                "betas": {"type": "array", "items": {"type": "string"}},
+                "advisor": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "model": {
+                            "type": "string",
+                            "enum": ["claude-opus-4-7"],
+                        },
+                    },
+                },
+            },
+        }
+
+    def settings_to_cli(self, bag: Mapping[str, Any]) -> CLITranslation:
+        args: list[str] = []
+        env: dict[str, str] = {}
+        prompt_fragments: list[str] = []
+        unsupported: list[str] = []
+
+        model = bag.get("model")
+        if isinstance(model, str):
+            args += ["--model", model]
+
+        effort = bag.get("effort")
+        if isinstance(effort, str):
+            # Claude Code CLI accepts low|medium|high|xhigh (not "max") as of v2.1.
+            # "max" maps to xhigh to stay within the CLI's vocabulary.
+            cli_effort = "xhigh" if effort == "max" else effort
+            args += ["--effort", cli_effort]
+
+        fallback_model = bag.get("fallback_model")
+        if isinstance(fallback_model, str):
+            args += ["--fallback-model", fallback_model]
+
+        permission_mode = bag.get("permission_mode")
+        if isinstance(permission_mode, str):
+            args += ["--permission-mode", permission_mode]
+
+        max_budget = bag.get("max_budget_usd")
+        if isinstance(max_budget, (int, float)) and max_budget > 0:
+            args += ["--max-budget-usd", str(max_budget)]
+
+        betas = bag.get("betas")
+        if isinstance(betas, list) and betas:
+            # --betas takes space-separated values; only applies to API-key auth.
+            args += ["--betas", *betas]
+
+        advisor = bag.get("advisor") or {}
+        if isinstance(advisor, Mapping) and advisor.get("enabled"):
+            # Claude Code CLI does not expose the advisor tool directly, and the
+            # executor model must be non-opus for pairing to make sense. When
+            # configured we append a prompt fragment so the executor at least
+            # behaves advisor-ish, and log it as unsupported for observability.
+            if model == "claude-opus-4-7":
+                unsupported.append("advisor.enabled (ignored: executor is opus-4-7)")
+            else:
+                prompt_fragments.append(
+                    "An opus-class advisor is available in principle, but the "
+                    "advisor_20260301 beta tool is not passable via this CLI. "
+                    "Plan carefully up front; state assumptions explicitly before "
+                    "committing to non-trivial approaches."
+                )
+                unsupported.append("advisor.enabled (fallback: prompt fragment only)")
+
+        thinking_summary = bag.get("thinking_summary")
+        if thinking_summary is not None:
+            # Claude Code exposes `showThinkingSummaries` only in settings.json,
+            # which we don't materialize per-call; log and move on.
+            unsupported.append("thinking_summary (settings.json only)")
+
+        return CLITranslation(
+            env=env,
+            args=tuple(args),
+            prompt_fragments=tuple(prompt_fragments),
+            unsupported=tuple(unsupported),
+        )

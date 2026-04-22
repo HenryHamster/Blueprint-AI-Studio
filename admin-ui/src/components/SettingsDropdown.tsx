@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { SettingsAdvancedSection } from './SettingsAdvancedSection';
 import { SettingsNotificationsSection } from './SettingsNotificationsSection';
 import type { NotificationConfig } from './SettingsNotificationsSection';
+import { ProviderSettingsPanel } from './ProviderSettingsPanel';
 import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
 import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
 import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
@@ -9,7 +10,7 @@ import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImp
 import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench, Tag, HelpCircle, Plus, ChevronDown, ChevronUp } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
 export type { MaxPlanAccount } from '../types/settings';
-import type { AuthMode, DeployState, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName } from '../types/settings';
+import type { AuthMode, DeployState, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsDefaults, TaskTypeProviderOverrides } from '../types/settings';
 import { DeploySection } from './SettingsDeploySection';
 
 
@@ -54,11 +55,8 @@ interface SettingsDropdownProps {
   onUpdateDirectionCooldownMinutes: (value: number) => void;
   strategicResearchFrequency: number;
   onUpdateStrategicResearchFrequency: (value: number) => void;
-  onSyncTaskTypeDefaults: () => void;
   healthCheckUrls: string[];
   onUpdateHealthCheckUrls: (urls: string[]) => void;
-  agentPromptSuffixes: Record<string, string>;
-  onUpdateAgentPromptSuffixes: (suffixes: Record<string, string>) => void;
   githubAccount: string | null;
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
@@ -86,18 +84,12 @@ interface SettingsDropdownProps {
   onAddAccount: () => void;
   onUpdateAccountCaps: (id: string, caps: { daily_task_cap?: number | null; max_concurrent_tasks?: number | null; auto_disable_after_rate_limits?: number | null }) => void;
   providerTierModelMap: Record<string, Record<string, string>>;
-  taskTypeProviderPreference: Record<string, ProviderName[]>;
   taskTypeModelPreferences: Record<string, ModelPreference[]>;
-  providerExecutionModes: Record<string, string[]>;
-  providerModeCapabilities: Record<string, Record<string, Record<string, boolean | number | string | null>>>;
-  taskTypeExecutionDefaults: Record<string, string>;
-  crossProviderFallbackEnabled: boolean;
   providers: Record<string, ProviderCatalogEntry>;
-  onUpdateProviderTierModels: (value: Record<string, Record<string, string>>) => Promise<void>;
-  onUpdateTaskTypeProviderPreferences: (value: Record<string, ProviderName[]>) => Promise<void>;
-  onUpdateTaskTypeModelPreferences: (value: Record<string, ModelPreference[]>) => Promise<void>;
-  onUpdateTaskTypeExecutionDefaults: (value: Record<string, string>) => Promise<void>;
-  onUpdateCrossProviderFallback: (value: boolean) => Promise<void>;
+  providerSettingsDefaults: ProviderSettingsDefaults;
+  taskTypeProviderOverrides: TaskTypeProviderOverrides;
+  onUpdateProviderSettingsDefaults: (value: ProviderSettingsDefaults) => Promise<void>;
+  onUpdateTaskTypeProviderOverrides: (value: TaskTypeProviderOverrides) => Promise<void>;
   refreshInterval: number;
   onUpdateRefreshInterval: (value: number) => void;
   pageSize: number;
@@ -156,33 +148,8 @@ const REFRESH_PRESETS = [
 const PAGE_PRESETS = [25, 50, 100, 200];
 const ALL_PAGE_SIZE = 500;
 
-const TASK_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'security_audit', 'qa', 'deps', 'docs', 'smoketest', 'debug', 'perf', 'investigate', 'rollup', 'strategic_review', 'design_doc_update'] as const;
-type TaskType = typeof TASK_TYPES[number];
 const PROVIDER_ORDER: ProviderName[] = ['anthropic', 'openai', 'gemini'];
 
-type Tier = 'haiku' | 'sonnet' | 'opus';
-const TIER_ORDER: Tier[] = ['haiku', 'sonnet', 'opus'];
-const TIER_LABEL: Record<Tier, string> = { haiku: 'Fast', sonnet: 'Balanced', opus: 'Smart' };
-const TIER_HINT: Record<Tier, string> = {
-  haiku: 'Cheap and quick, best for routine tasks.',
-  sonnet: 'Good default — solid reasoning at reasonable cost.',
-  opus: 'Deepest reasoning, saved for heavy lifting.',
-};
-
-const TASK_CATEGORIES: { id: 'think' | 'build' | 'check'; label: string; hint: string; types: TaskType[] }[] = [
-  { id: 'think', label: 'Think', hint: 'Plan, research, investigate — reasoning-heavy.',
-    types: ['research', 'plan', 'strategic_review', 'design_doc_update', 'investigate', 'debug'] },
-  { id: 'build', label: 'Build', hint: 'Write or change code.',
-    types: ['create', 'fix', 'refactor', 'migrate'] },
-  { id: 'check', label: 'Check', hint: 'Review, verify, maintain.',
-    types: ['review', 'security_audit', 'qa', 'perf', 'smoketest', 'docs', 'deps', 'rollup'] },
-];
-const CATEGORY_DEFAULT_TIER: Record<'think' | 'build' | 'check', Tier> = {
-  think: 'opus', build: 'sonnet', check: 'sonnet',
-};
-const CATEGORY_DEFAULT_EFFORT: Record<'think' | 'build' | 'check', string> = {
-  think: 'high', build: 'medium', check: 'medium',
-};
 const FALLBACK_AUTH_MODES: Record<ProviderName, AuthMode[]> = {
   anthropic: ['oauth', 'api_key'],
   openai: ['api_key', 'oauth'],
@@ -246,17 +213,11 @@ const CREDENTIAL_GUIDES: Record<string, CredentialGuide> = {
   },
 };
 
-const ALL_PROMPT_SUFFIX_TYPES = [
-  'create', 'review', 'fix', 'plan', 'research', 'security_audit', 'qa',
-  'docs', 'deps', 'smoketest', 'debug', 'perf', 'refactor', 'migrate',
-  'investigate', 'rollup', 'strategic_review', 'design_doc_update',
-] as const;
-
-type SectionId = 'general' | 'task-types' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation';
+type SectionId = 'general' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation';
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
-  { id: 'task-types', label: 'Task Types', icon: ListChecks },
+  { id: 'provider-settings', label: 'Provider Settings', icon: ListChecks, adminOnly: true },
   { id: 'orchestrator', label: 'Orchestrator', icon: Server, adminOnly: true },
   { id: 'deploy', label: 'Deploy & Health', icon: Shield, adminOnly: true },
   { id: 'accounts', label: 'Accounts', icon: User },
@@ -316,11 +277,8 @@ export function SettingsDropdown({
   onUpdateDirectionCooldownMinutes,
   strategicResearchFrequency,
   onUpdateStrategicResearchFrequency,
-  onSyncTaskTypeDefaults,
   healthCheckUrls,
   onUpdateHealthCheckUrls,
-  agentPromptSuffixes,
-  onUpdateAgentPromptSuffixes,
   githubAccount,
   onConnectGitHub,
   maxPlanAccounts,
@@ -348,18 +306,12 @@ export function SettingsDropdown({
   onAddAccount,
   onUpdateAccountCaps,
   providerTierModelMap,
-  taskTypeProviderPreference,
   taskTypeModelPreferences,
-  providerExecutionModes,
-  providerModeCapabilities,
-  taskTypeExecutionDefaults,
-  crossProviderFallbackEnabled,
   providers,
-  onUpdateProviderTierModels,
-  onUpdateTaskTypeProviderPreferences,
-  onUpdateTaskTypeModelPreferences,
-  onUpdateTaskTypeExecutionDefaults,
-  onUpdateCrossProviderFallback,
+  providerSettingsDefaults,
+  taskTypeProviderOverrides,
+  onUpdateProviderSettingsDefaults,
+  onUpdateTaskTypeProviderOverrides,
   refreshInterval,
   onUpdateRefreshInterval,
   pageSize,
@@ -407,8 +359,6 @@ export function SettingsDropdown({
   const [vmInputVal, setVmInputVal] = useState(String(maxConcurrentVMs));
   const [retriesInputVal, setRetriesInputVal] = useState(String(maxRetries));
   const [autonomousRateInputVal, setAutonomousRateInputVal] = useState(String(maxAutonomousTasksPerHour));
-  const [expandedSuffixType, setExpandedSuffixType] = useState<string | null>(null);
-  const [suffixDraft, setSuffixDraft] = useState('');
 
   // Global model/effort defaults
   const [defaultModel, setDefaultModel] = useState<string>(
@@ -419,26 +369,7 @@ export function SettingsDropdown({
   );
 
 
-  // Per-task-type overrides
-  const [taskTypeModels, setTaskTypeModels] = useState<Record<TaskType, string>>(() => {
-    const result = {} as Record<TaskType, string>;
-    for (const t of TASK_TYPES) {
-      result[t] = JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeModel:${t}`) ?? 'null') ?? '';
-    }
-    return result;
-  });
-  const [taskTypeEfforts, setTaskTypeEfforts] = useState<Record<TaskType, string>>(() => {
-    const result = {} as Record<TaskType, string>;
-    for (const t of TASK_TYPES) {
-      result[t] = JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeEffort:${t}`) ?? 'null') ?? '';
-    }
-    return result;
-  });
   const [healthCheckUrlsInput, setHealthCheckUrlsInput] = useState(() => healthCheckUrls.join('\n'));
-  const [taskTypeRoutingDrafts, setTaskTypeRoutingDrafts] = useState<Record<TaskType, string>>({} as Record<TaskType, string>);
-  const [taskTypeModelPrefDrafts, setTaskTypeModelPrefDrafts] = useState<Record<TaskType, string>>({} as Record<TaskType, string>);
-  const [providerTierDrafts, setProviderTierDrafts] = useState<Record<string, Record<string, string>>>({});
-  const [showAdvancedTaskTypes, setShowAdvancedTaskTypes] = useState(false);
   const [showAddAccountForm, setShowAddAccountForm] = useState(false);
   const [showAddAccountCaps, setShowAddAccountCaps] = useState(false);
   const [expandedAccountCaps, setExpandedAccountCaps] = useState<string | null>(null);
@@ -460,19 +391,6 @@ export function SettingsDropdown({
       setNewAccountAuthMode(availableAuthModes[0]);
     }
   }, [newAccountAuthMode, newAccountProvider, providers, setNewAccountAuthMode]);
-  useEffect(() => {
-    const drafts = {} as Record<TaskType, string>;
-    for (const type of TASK_TYPES) drafts[type] = (taskTypeProviderPreference[type] ?? []).join(', ');
-    setTaskTypeRoutingDrafts(drafts);
-  }, [taskTypeProviderPreference]);
-  useEffect(() => {
-    const drafts = {} as Record<TaskType, string>;
-    for (const type of TASK_TYPES) {
-      drafts[type] = (taskTypeModelPreferences[type] ?? []).map(pref => `${pref.provider}:${pref.model}`).join('\n');
-    }
-    setTaskTypeModelPrefDrafts(drafts);
-  }, [taskTypeModelPreferences]);
-  useEffect(() => { setProviderTierDrafts(providerTierModelMap); }, [providerTierModelMap]);
 
   // Close on Escape
   useEffect(() => {
@@ -489,12 +407,10 @@ export function SettingsDropdown({
     (!s.adminOnly || isAdmin) && (!s.projectOnly || selectedProjectId !== null)
   );
   const providerNames = Object.keys(providers).length > 0 ? (Object.keys(providers) as ProviderName[]) : PROVIDER_ORDER;
-  const allModes = Array.from(new Set(Object.values(providerExecutionModes).flat())).filter(Boolean);
   const providerSelectOptions = providerNames.filter(Boolean);
   const allModelOptions = Array.from(new Set([
     ...Object.values(providerTierModelMap).flatMap(providerMap => Object.values(providerMap || {})),
     ...Object.values(taskTypeModelPreferences).flatMap(prefs => prefs.map(pref => pref.model)),
-    ...Object.values(taskTypeModels).filter(Boolean),
   ])).filter(Boolean).sort();
   const requiredMetadataFields = providers[newAccountProvider]?.auth_modes?.[newAccountAuthMode]?.required_metadata_fields ?? [];
   const newAccountAuthModes = (Object.keys(providers[newAccountProvider]?.auth_modes ?? {}) as AuthMode[]).length > 0
@@ -512,48 +428,6 @@ export function SettingsDropdown({
       : newAccountAuthMode === 'api_key'
       ? 'Anthropic API key'
       : 'OAuth token';
-
-  function normalizeProviderCsv(value: string): ProviderName[] {
-    return value
-      .split(',')
-      .map(v => v.trim())
-      .filter((v): v is ProviderName => providerSelectOptions.includes(v as ProviderName))
-      .filter((v, idx, arr) => arr.indexOf(v) === idx);
-  }
-
-  function parseModelPreferenceLines(value: string): ModelPreference[] {
-    return value
-      .split('\n')
-      .map(line => line.trim())
-      .filter(Boolean)
-      .map(line => {
-        const [provider, ...rest] = line.split(':');
-        return { provider: provider.trim() as ProviderName, model: rest.join(':').trim() };
-      })
-      .filter(pref => providerSelectOptions.includes(pref.provider) && pref.model);
-  }
-
-  function handleProviderRoutingBlur(type: TaskType) {
-    const next = normalizeProviderCsv(taskTypeRoutingDrafts[type] ?? '');
-    void onUpdateTaskTypeProviderPreferences({ ...taskTypeProviderPreference, [type]: next });
-  }
-
-  function handleModelPreferenceBlur(type: TaskType) {
-    const next = parseModelPreferenceLines(taskTypeModelPrefDrafts[type] ?? '');
-    void onUpdateTaskTypeModelPreferences({ ...taskTypeModelPreferences, [type]: next });
-  }
-
-  function updateTierModel(providerName: string, tier: string, value: string, persist = false) {
-    const next = {
-      ...providerTierDrafts,
-      [providerName]: {
-        ...(providerTierDrafts[providerName] ?? {}),
-        [tier]: value,
-      },
-    };
-    setProviderTierDrafts(next);
-    if (persist) void onUpdateProviderTierModels(next);
-  }
 
   // --- Section renderers ---
 
@@ -778,375 +652,6 @@ export function SettingsDropdown({
       </div>
     );
   }
-
-  function modelToTier(model: string): Tier | null {
-    if (!model) return null;
-    for (const providerMap of Object.values(providerTierModelMap)) {
-      for (const tier of TIER_ORDER) {
-        if (providerMap?.[tier] === model) return tier;
-      }
-    }
-    return null;
-  }
-
-  function tierToModel(tier: Tier): string {
-    for (const p of providerSelectOptions) {
-      const m = providerTierModelMap[p]?.[tier];
-      if (m) return m;
-    }
-    for (const map of Object.values(providerTierModelMap)) {
-      if (map?.[tier]) return map[tier];
-    }
-    return '';
-  }
-
-  function categoryTier(types: TaskType[]): Tier | 'mixed' | 'custom' | 'default' {
-    const tiers = new Set<string>();
-    for (const t of types) {
-      const model = taskTypeModels[t] ?? '';
-      if (!model) { tiers.add('default'); continue; }
-      const tier = modelToTier(model);
-      tiers.add(tier ?? 'custom');
-    }
-    if (tiers.size === 0) return 'default';
-    if (tiers.size > 1) return 'mixed';
-    const only = [...tiers][0];
-    if (only === 'default' || only === 'custom') return only;
-    return only as Tier;
-  }
-
-  function categoryEffort(types: TaskType[]): string | 'mixed' {
-    const efforts = new Set<string>();
-    for (const t of types) efforts.add(taskTypeEfforts[t] ?? '');
-    if (efforts.size > 1) return 'mixed';
-    return [...efforts][0] ?? '';
-  }
-
-  function applyCategoryTier(types: TaskType[], tier: Tier | '') {
-    const model = tier ? tierToModel(tier) : '';
-    const next = { ...taskTypeModels };
-    for (const t of types) {
-      next[t] = model;
-      localStorage.setItem(`blueprint-admin:taskTypeModel:${t}`, JSON.stringify(model));
-    }
-    setTaskTypeModels(next);
-    setTimeout(onSyncTaskTypeDefaults, 0);
-  }
-
-  function applyCategoryEffort(types: TaskType[], effort: string) {
-    const next = { ...taskTypeEfforts };
-    for (const t of types) {
-      next[t] = effort;
-      localStorage.setItem(`blueprint-admin:taskTypeEffort:${t}`, JSON.stringify(effort));
-    }
-    setTaskTypeEfforts(next);
-    setTimeout(onSyncTaskTypeDefaults, 0);
-  }
-
-  function overrideCount(): number {
-    let n = 0;
-    for (const t of TASK_TYPES) {
-      if ((taskTypeExecutionDefaults[t] && taskTypeExecutionDefaults[t] !== 'default')
-        || (taskTypeProviderPreference[t] && taskTypeProviderPreference[t].length > 0)
-        || (taskTypeModelPreferences[t] && taskTypeModelPreferences[t].length > 0)) n++;
-    }
-    return n;
-  }
-
-  function renderTaskTypes() {
-    const overrides = overrideCount();
-    return (
-      <div className="space-y-6">
-        {/* Categories — primary UX */}
-        <div>
-          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">By category</h3>
-          <p className="text-[11px] text-neutral-500 mb-3">Pick a tier and effort for a group of task types at once. Tier maps to a concrete model via Provider Routing below.</p>
-          <div className="space-y-2">
-            {TASK_CATEGORIES.map(cat => {
-              const tier = categoryTier(cat.types);
-              const effort = categoryEffort(cat.types);
-              const tierVal = tier === 'mixed' || tier === 'custom' || tier === 'default' ? '' : tier;
-              return (
-                <div key={cat.id} className="bg-neutral-900 border border-neutral-800 rounded-lg p-3">
-                  <div className="flex items-center justify-between gap-4">
-                    <div className="min-w-0">
-                      <div className="flex items-baseline gap-2">
-                        <span className="text-sm font-medium text-neutral-200">{cat.label}</span>
-                        <span className="text-[11px] text-neutral-500">{cat.types.length} types</span>
-                      </div>
-                      <div className="text-[11px] text-neutral-500">{cat.hint}</div>
-                      <div className="text-[10px] text-neutral-600 mt-0.5 truncate">{cat.types.map(t => t.replace('_', ' ')).join(', ')}</div>
-                    </div>
-                    <div className="flex gap-2 shrink-0">
-                      <div>
-                        <div className="text-[10px] text-neutral-500 mb-1">Tier</div>
-                        <select
-                          value={tierVal}
-                          onChange={e => applyCategoryTier(cat.types, e.target.value as Tier | '')}
-                          className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 min-w-[110px]"
-                        >
-                          <option value="">
-                            {tier === 'mixed' ? 'Mixed' : tier === 'custom' ? 'Custom' : 'Orchestrator default'}
-                          </option>
-                          {TIER_ORDER.map(t => (
-                            <option key={t} value={t}>{TIER_LABEL[t]}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div>
-                        <div className="text-[10px] text-neutral-500 mb-1">Effort</div>
-                        <select
-                          value={effort === 'mixed' ? '' : effort}
-                          onChange={e => applyCategoryEffort(cat.types, e.target.value)}
-                          className="bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 min-w-[90px]"
-                        >
-                          <option value="">{effort === 'mixed' ? 'Mixed' : 'Default'}</option>
-                          <option value="low">low</option>
-                          <option value="medium">medium</option>
-                          <option value="high">high</option>
-                          <option value="max">max</option>
-                        </select>
-                      </div>
-                    </div>
-                  </div>
-                  {(tier !== 'mixed' && tier !== 'custom' && tier !== 'default') && (
-                    <div className="text-[10px] text-neutral-600 mt-2">{TIER_HINT[tier]}</div>
-                  )}
-                  <div className="mt-2 flex gap-3 text-[10px] text-neutral-600">
-                    <button
-                      onClick={() => applyCategoryTier(cat.types, CATEGORY_DEFAULT_TIER[cat.id])}
-                      className="hover:text-neutral-300 transition-colors"
-                    >
-                      Reset tier to {TIER_LABEL[CATEGORY_DEFAULT_TIER[cat.id]]}
-                    </button>
-                    <span className="text-neutral-800">·</span>
-                    <button
-                      onClick={() => applyCategoryEffort(cat.types, CATEGORY_DEFAULT_EFFORT[cat.id])}
-                      className="hover:text-neutral-300 transition-colors"
-                    >
-                      Reset effort to {CATEGORY_DEFAULT_EFFORT[cat.id]}
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* Provider Routing — defines what each tier resolves to */}
-        <div>
-          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">Provider Routing</h3>
-          <p className="text-[11px] text-neutral-500 mb-3">Concrete model each tier resolves to, per provider. The orchestrator picks from the left-most provider that has the tier configured.</p>
-          <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-4 space-y-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-sm text-neutral-200">Cross-provider fallback</div>
-                <div className="text-[11px] text-neutral-500">If the preferred provider is exhausted, fall back to the next configured one.</div>
-              </div>
-              <Toggle enabled={crossProviderFallbackEnabled} onChange={v => { void onUpdateCrossProviderFallback(v); }} />
-            </div>
-            <div className="grid grid-cols-3 gap-3">
-              {providerSelectOptions.map(providerName => (
-                <div key={providerName} className="bg-neutral-950 border border-neutral-800 rounded-lg p-3">
-                  <div className="text-xs font-medium text-neutral-300 capitalize mb-2">{providerName}</div>
-                  <div className="space-y-2">
-                    {TIER_ORDER.slice().reverse().map(tier => (
-                      <label key={tier} className="block">
-                        <div className="text-[10px] text-neutral-500 mb-1">{TIER_LABEL[tier]} <span className="text-neutral-700">({tier})</span></div>
-                        <input
-                          value={providerTierDrafts[providerName]?.[tier] ?? ''}
-                          onChange={e => updateTierModel(providerName, tier, e.target.value)}
-                          onBlur={e => updateTierModel(providerName, tier, e.target.value, true)}
-                          placeholder={tier === 'opus' ? 'e.g. claude-opus-4-7' : tier === 'sonnet' ? 'e.g. claude-sonnet-4-6' : 'e.g. claude-haiku-4-5'}
-                          className="w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                        />
-                      </label>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        {/* Per-task overrides — collapsed by default */}
-        <div>
-          <button
-            onClick={() => setShowAdvancedTaskTypes(v => !v)}
-            className="w-full flex items-center justify-between bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded-lg px-4 py-2.5 transition-colors"
-          >
-            <div className="text-left">
-              <div className="text-xs font-semibold text-neutral-300 uppercase tracking-wider">Per-task overrides</div>
-              <div className="text-[11px] text-neutral-500 mt-0.5">
-                {overrides > 0
-                  ? `${overrides} task type${overrides === 1 ? '' : 's'} with execution mode, provider, or concrete model overrides.`
-                  : 'Only change this if you need to pin a specific model or execution mode for one task type.'}
-              </div>
-            </div>
-            <span className="text-[10px] text-neutral-600">{showAdvancedTaskTypes ? '\u25B2' : '\u25BC'}</span>
-          </button>
-          {showAdvancedTaskTypes && (
-            <div className="mt-3 grid grid-cols-2 gap-3">
-              {TASK_TYPES.map(type => {
-                const currentTier = modelToTier(taskTypeModels[type] ?? '');
-                return (
-                  <div key={type} className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2.5">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="text-xs font-medium text-neutral-300 capitalize">{type.replace('_', ' ')}</div>
-                      <div className="text-[10px] text-neutral-600">
-                        {currentTier ? TIER_LABEL[currentTier] : taskTypeModels[type] ? 'Custom' : 'Default'}
-                        {taskTypeEfforts[type] && <span> · {taskTypeEfforts[type]}</span>}
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-2 gap-2">
-                      <div>
-                        <div className="text-[10px] text-neutral-500 mb-1">Model</div>
-                        <select
-                          value={taskTypeModels[type]}
-                          onChange={e => {
-                            const val = e.target.value;
-                            setTaskTypeModels(prev => ({ ...prev, [type]: val }));
-                            localStorage.setItem(`blueprint-admin:taskTypeModel:${type}`, JSON.stringify(val));
-                            setTimeout(onSyncTaskTypeDefaults, 0);
-                          }}
-                          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                        >
-                          <option value="">default</option>
-                          {allModelOptions.map(model => (
-                            <option key={model} value={model}>{model}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div>
-                        <div className="text-[10px] text-neutral-500 mb-1">Effort</div>
-                        <select
-                          value={taskTypeEfforts[type]}
-                          onChange={e => {
-                            const val = e.target.value;
-                            setTaskTypeEfforts(prev => ({ ...prev, [type]: val }));
-                            localStorage.setItem(`blueprint-admin:taskTypeEffort:${type}`, JSON.stringify(val));
-                            setTimeout(onSyncTaskTypeDefaults, 0);
-                          }}
-                          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                        >
-                          <option value="">default</option>
-                          <option value="low">low</option>
-                          <option value="medium">medium</option>
-                          <option value="high">high</option>
-                          <option value="max">max</option>
-                        </select>
-                      </div>
-                    </div>
-                    <div className="mt-3 space-y-2">
-                      <div>
-                        <div className="text-[10px] text-neutral-500 mb-1">Execution mode</div>
-                        <select
-                          value={taskTypeExecutionDefaults[type] ?? 'default'}
-                          onChange={e => {
-                            void onUpdateTaskTypeExecutionDefaults({ ...taskTypeExecutionDefaults, [type]: e.target.value });
-                          }}
-                          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                        >
-                          {allModes.map(mode => (
-                            <option key={mode} value={mode}>{mode}</option>
-                          ))}
-                        </select>
-                        {providerModeCapabilities.anthropic?.[taskTypeExecutionDefaults[type] ?? 'default']?.read_only_preferred && (
-                          <div className="text-[10px] text-blue-400 mt-1">Prefers read-only/advisory execution when supported.</div>
-                        )}
-                      </div>
-                      <div>
-                        <div className="text-[10px] text-neutral-500 mb-1">Provider order</div>
-                        <input
-                          value={taskTypeRoutingDrafts[type] ?? ''}
-                          onChange={e => setTaskTypeRoutingDrafts(prev => ({ ...prev, [type]: e.target.value }))}
-                          onBlur={() => handleProviderRoutingBlur(type)}
-                          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                          placeholder="anthropic, openai, gemini"
-                        />
-                      </div>
-                      <div>
-                        <div className="text-[10px] text-neutral-500 mb-1">Concrete model priority</div>
-                        <textarea
-                          value={taskTypeModelPrefDrafts[type] ?? ''}
-                          onChange={e => setTaskTypeModelPrefDrafts(prev => ({ ...prev, [type]: e.target.value }))}
-                          onBlur={() => handleModelPreferenceBlur(type)}
-                          rows={2}
-                          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none"
-                          placeholder={'openai:gpt-5\nanthropic:claude-opus-4-7'}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-
-        {/* Prompt suffixes */}
-        <div>
-          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">Prompt Suffixes</h3>
-          <p className="text-[11px] text-neutral-600 mb-3">Appended to the agent prompt for each task type. Keep under 500 chars.</p>
-          <div className="grid grid-cols-2 gap-2">
-            {ALL_PROMPT_SUFFIX_TYPES.map(type => {
-              const isOpen = expandedSuffixType === type;
-              const savedValue = agentPromptSuffixes[type] ?? '';
-              const draft = isOpen ? suffixDraft : savedValue;
-              const charCount = draft.length;
-              return (
-                <div key={type} className={`border border-neutral-800 rounded-lg overflow-hidden ${isOpen ? 'col-span-2' : ''}`}>
-                  <button
-                    className="w-full flex items-center justify-between px-3 py-2 bg-neutral-900 hover:bg-neutral-800 transition-colors text-left"
-                    onClick={() => {
-                      if (isOpen) {
-                        if (suffixDraft !== savedValue) {
-                          onUpdateAgentPromptSuffixes({ ...agentPromptSuffixes, [type]: suffixDraft });
-                        }
-                        setExpandedSuffixType(null);
-                      } else {
-                        if (expandedSuffixType && suffixDraft !== (agentPromptSuffixes[expandedSuffixType] ?? '')) {
-                          onUpdateAgentPromptSuffixes({ ...agentPromptSuffixes, [expandedSuffixType]: suffixDraft });
-                        }
-                        setExpandedSuffixType(type);
-                        setSuffixDraft(savedValue);
-                      }
-                    }}
-                  >
-                    <span className="text-xs text-neutral-300 capitalize">{type.replace('_', ' ')}</span>
-                    <span className="flex items-center gap-1.5">
-                      {savedValue && <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />}
-                      <span className="text-[10px] text-neutral-600">{isOpen ? '\u25B2' : '\u25BC'}</span>
-                    </span>
-                  </button>
-                  {isOpen && (
-                    <div className="px-3 pb-3 bg-neutral-900">
-                      <textarea
-                        value={suffixDraft}
-                        onChange={e => setSuffixDraft(e.target.value)}
-                        onBlur={() => {
-                          if (suffixDraft !== savedValue) {
-                            onUpdateAgentPromptSuffixes({ ...agentPromptSuffixes, [type]: suffixDraft });
-                          }
-                        }}
-                        rows={3}
-                        className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-none mt-2"
-                        placeholder={`Additional instructions for ${type} tasks\u2026`}
-                      />
-                      <div className={`text-[10px] text-right mt-1 ${charCount > 500 ? 'text-red-400' : 'text-neutral-600'}`}>
-                        {charCount}/500
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   function renderOrchestrator() {
     return (
       <div className="space-y-6">
@@ -1838,7 +1343,7 @@ export function SettingsDropdown({
         buildConfig={buildConfig}
         onSave={onUpdateBuildConfig}
         onDetect={onDetectBuildConfig}
-        detectAvailable={false}
+        detectAvailable={Boolean(selectedProjectOwner && selectedProjectRepo)}
       />
     );
   }
@@ -1866,10 +1371,22 @@ export function SettingsDropdown({
     );
   }
 
+  function renderProviderSettings() {
+    return (
+      <ProviderSettingsPanel
+        providers={providers}
+        providerSettingsDefaults={providerSettingsDefaults}
+        taskTypeProviderOverrides={taskTypeProviderOverrides}
+        onUpdateDefaults={onUpdateProviderSettingsDefaults}
+        onUpdateOverrides={onUpdateTaskTypeProviderOverrides}
+      />
+    );
+  }
+
   function renderActiveSection() {
     switch (activeSection) {
       case 'general': return renderGeneral();
-      case 'task-types': return renderTaskTypes();
+      case 'provider-settings': return renderProviderSettings();
       case 'orchestrator': return renderOrchestrator();
       case 'deploy': return renderDeploy();
       case 'accounts': return renderAccounts();

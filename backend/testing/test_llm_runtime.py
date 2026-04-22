@@ -108,7 +108,10 @@ async def test_select_llm_runtime_for_task_uses_quality_tier_mapping(clean_runti
 
 
 @pytest.mark.asyncio
-async def test_select_llm_runtime_for_task_resolves_execution_mode_per_provider(clean_runtime_pool):
+async def test_select_llm_runtime_for_task_resolves_settings_bag_per_task_type(clean_runtime_pool):
+    """Task-type override in the settings bag surfaces on the resolved
+    LLMSelectionResult. Replaces the old execution_mode test since modes
+    were retired in favor of schema-driven per-provider settings."""
     entry = {
         "id": "acct-anthropic",
         "user_id": _TEST_USER,
@@ -128,8 +131,8 @@ async def test_select_llm_runtime_for_task_resolves_execution_mode_per_provider(
             "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
         },
         "task_type_provider_preference": {"research": ["anthropic"]},
-        "provider_execution_modes": {"anthropic": ["default", "advisor"]},
-        "task_type_execution_defaults": {"research": "advisor"},
+        "provider_settings_defaults": {"anthropic": {"effort": "medium"}},
+        "task_type_provider_overrides": {"research": {"anthropic": {"effort": "high"}}},
     }
 
     result = await select_llm_runtime_for_task(
@@ -139,7 +142,7 @@ async def test_select_llm_runtime_for_task_resolves_execution_mode_per_provider(
     )
 
     assert result is not None
-    assert result.execution_mode == "advisor"
+    assert result.settings == {"effort": "high"}
 
 
 @pytest.mark.asyncio
@@ -318,6 +321,204 @@ async def test_select_llm_runtime_for_task_preserves_unknown_explicit_model(clea
     assert result.account_id == "acct-openai"
 
 
+@pytest.mark.asyncio
+async def test_select_llm_runtime_balanced_mode_picks_less_loaded_provider(clean_runtime_pool):
+    """Balanced mode flattens accounts across listed providers and picks by
+    (health_score, -active_tasks). With zero-history accounts the health score
+    ties, so the provider with fewer active tasks should win — no bias by
+    list order."""
+    busy_anthropic = {
+        "id": "acct-anthropic",
+        "user_id": _TEST_USER,
+        "name": "anthropic",
+        "provider": "anthropic",
+        "auth_mode": "oauth",
+        "oauth_token": "sk-ant-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 3,
+    }
+    idle_openai = {
+        "id": "acct-openai",
+        "user_id": _TEST_USER,
+        "name": "openai",
+        "provider": "openai",
+        "auth_mode": "api_key",
+        "runtime_secret": "sk-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+    }
+    _max_plan_pools.setdefault(_TEST_USER, []).extend([busy_anthropic, idle_openai])
+    _account_by_id[busy_anthropic["id"]] = busy_anthropic
+    _account_by_id[idle_openai["id"]] = idle_openai
+
+    runtime_config = {
+        "provider_selection_mode": "balanced",
+        "provider_tier_model_map": {
+            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
+            "openai": {"opus": "gpt-5", "sonnet": "gpt-4.1", "haiku": "gpt-4o-mini"},
+        },
+        # Anthropic listed first — balanced must NOT honor list order when load differs.
+        "task_type_provider_preference": {"create": ["anthropic", "openai"]},
+    }
+
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=_task(payload={"type": "create", "quality_tier": "opus"}),
+        runtime_config=runtime_config,
+    )
+
+    assert result is not None
+    assert result.provider == "openai"
+    assert result.account_id == "acct-openai"
+    assert result.model == "gpt-5"
+
+
+@pytest.mark.asyncio
+async def test_select_llm_runtime_preferred_mode_honors_list_order(clean_runtime_pool):
+    """Preferred mode tries providers in list order. First listed wins even
+    when it's busier, unless it's fully exhausted."""
+    busy_anthropic = {
+        "id": "acct-anthropic",
+        "user_id": _TEST_USER,
+        "name": "anthropic",
+        "provider": "anthropic",
+        "auth_mode": "oauth",
+        "oauth_token": "sk-ant-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 3,
+    }
+    idle_openai = {
+        "id": "acct-openai",
+        "user_id": _TEST_USER,
+        "name": "openai",
+        "provider": "openai",
+        "auth_mode": "api_key",
+        "runtime_secret": "sk-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+    }
+    _max_plan_pools.setdefault(_TEST_USER, []).extend([busy_anthropic, idle_openai])
+    _account_by_id[busy_anthropic["id"]] = busy_anthropic
+    _account_by_id[idle_openai["id"]] = idle_openai
+
+    runtime_config = {
+        "provider_selection_mode": "preferred",
+        "provider_tier_model_map": {
+            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
+            "openai": {"opus": "gpt-5", "sonnet": "gpt-4.1", "haiku": "gpt-4o-mini"},
+        },
+        "task_type_provider_preference": {"create": ["anthropic", "openai"]},
+    }
+
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=_task(payload={"type": "create", "quality_tier": "opus"}),
+        runtime_config=runtime_config,
+    )
+
+    assert result is not None
+    assert result.provider == "anthropic"
+    assert result.account_id == "acct-anthropic"
+
+
+@pytest.mark.asyncio
+async def test_select_llm_runtime_balanced_mode_honors_narrowed_allow_list(clean_runtime_pool):
+    """Narrowing task_type_provider_preference to one provider must keep that
+    provider even under balanced mode — the mode controls how to pick among
+    listed providers, not which providers are listed."""
+    anthropic = {
+        "id": "acct-anthropic",
+        "user_id": _TEST_USER,
+        "name": "anthropic",
+        "provider": "anthropic",
+        "auth_mode": "oauth",
+        "oauth_token": "sk-ant-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 5,
+    }
+    openai = {
+        "id": "acct-openai",
+        "user_id": _TEST_USER,
+        "name": "openai",
+        "provider": "openai",
+        "auth_mode": "api_key",
+        "runtime_secret": "sk-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+    }
+    _max_plan_pools.setdefault(_TEST_USER, []).extend([anthropic, openai])
+    _account_by_id[anthropic["id"]] = anthropic
+    _account_by_id[openai["id"]] = openai
+
+    runtime_config = {
+        "provider_selection_mode": "balanced",
+        "provider_tier_model_map": {
+            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
+            "openai": {"opus": "gpt-5", "sonnet": "gpt-4.1", "haiku": "gpt-4o-mini"},
+        },
+        # research pinned to anthropic only.
+        "task_type_provider_preference": {"research": ["anthropic"]},
+    }
+
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=_task(payload={"type": "research", "quality_tier": "opus"}),
+        runtime_config=runtime_config,
+    )
+
+    assert result is not None
+    assert result.provider == "anthropic"
+    assert result.account_id == "acct-anthropic"
+
+
+@pytest.mark.asyncio
+async def test_select_llm_runtime_legacy_fallback_false_maps_to_exclusive(clean_runtime_pool):
+    """The legacy cross_provider_fallback_enabled=False boolean should behave
+    as exclusive mode — first listed provider only, no cross-provider pickup."""
+    openai = {
+        "id": "acct-openai",
+        "user_id": _TEST_USER,
+        "name": "openai",
+        "provider": "openai",
+        "auth_mode": "api_key",
+        "runtime_secret": "sk-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+    }
+    _max_plan_pools.setdefault(_TEST_USER, []).append(openai)
+    _account_by_id[openai["id"]] = openai
+
+    runtime_config = {
+        # No provider_selection_mode set — legacy deployment.
+        "cross_provider_fallback_enabled": False,
+        "provider_tier_model_map": {
+            "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
+            "openai": {"opus": "gpt-5", "sonnet": "gpt-4.1", "haiku": "gpt-4o-mini"},
+        },
+        "task_type_provider_preference": {"create": ["anthropic", "openai"]},
+    }
+
+    result = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=_task(payload={"type": "create", "quality_tier": "opus"}),
+        runtime_config=runtime_config,
+    )
+
+    # Anthropic (first listed) is empty, openai is ignored because exclusive
+    # mode trims the preference to [anthropic]. Falls through to the synthetic
+    # stub result with no account.
+    assert result is not None
+    assert result.provider == "anthropic"
+    assert result.account is None
+
+
 def test_clear_task_llm_runtime_context_strips_all_runtime_keys():
     cleared = clear_task_llm_runtime_context({
         "llm_account_id": "acct-1",
@@ -360,14 +561,15 @@ def test_resolve_env_runtime_fallback_prefers_openai_env(monkeypatch):
         execution_mode=None,
         task=_task(payload={"type": "create"}),
         runtime_config={},
-        resolve_execution_mode=lambda task, runtime_config, provider: "default",
     )
 
     assert secret == "sk-test-openai"
     assert provider == "openai"
     assert auth_mode == "api_key"
     assert model == "gpt-5"
-    assert execution_mode == "default"
+    # execution_mode is retired — the fallback round-trips whatever the caller
+    # passed (None here) without resolving anything from runtime_config.
+    assert execution_mode is None
     assert metadata == {}
 
 
@@ -384,14 +586,13 @@ def test_resolve_env_runtime_fallback_reads_openai_oauth_from_codex_home(tmp_pat
         execution_mode=None,
         task=_task(payload={"type": "create"}),
         runtime_config={},
-        resolve_execution_mode=lambda task, runtime_config, provider: "default",
     )
 
     assert secret == '{"access_token":"test"}'
     assert provider == "openai"
     assert auth_mode == "oauth"
     assert model == "gpt-5"
-    assert execution_mode == "default"
+    assert execution_mode is None
     assert metadata == {}
 
 
@@ -408,14 +609,13 @@ def test_resolve_env_runtime_fallback_reads_gemini_service_account(tmp_path, mon
         execution_mode=None,
         task=_task(payload={"type": "research"}),
         runtime_config={},
-        resolve_execution_mode=lambda task, runtime_config, provider: "advisor",
     )
 
     assert '"type":"service_account"' in secret
     assert provider == "gemini"
     assert auth_mode == "service_account"
     assert model == "gemini-2.5-pro"
-    assert execution_mode == "advisor"
+    assert execution_mode is None
     assert metadata == {"project": "demo-project", "location": "us-central1"}
 
 
@@ -432,7 +632,6 @@ def test_resolve_env_runtime_fallback_rejects_gemini_service_account_without_pro
         execution_mode=None,
         task=_task(payload={"type": "research"}),
         runtime_config={},
-        resolve_execution_mode=lambda task, runtime_config, provider: "advisor",
     )
 
     assert secret is None

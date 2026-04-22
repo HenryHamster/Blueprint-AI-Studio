@@ -3,7 +3,7 @@ import { useMemo, useState, useRef, useEffect } from 'react';
 import { Activity, Network, Compass, Microscope, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
-import type { AuthMode, DeployState, ModelPreference, ProviderCatalogEntry, ProviderName } from '../types/settings';
+import type { AuthMode, DeployState, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsDefaults, TaskTypeProviderOverrides } from '../types/settings';
 import type { Task } from '../types/task';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig } from '../types/project';
 
@@ -70,11 +70,8 @@ export interface HeaderBarProps {
   onUpdateDirectionCooldownMinutes: (value: number) => void;
   strategicResearchFrequency: number;
   onUpdateStrategicResearchFrequency: (value: number) => void;
-  onSyncTaskTypeDefaults: () => void;
   healthCheckUrls: string[];
   onUpdateHealthCheckUrls: (urls: string[]) => void;
-  agentPromptSuffixes: Record<string, string>;
-  onUpdateAgentPromptSuffixes: (suffixes: Record<string, string>) => void;
   githubAccount: string | null;
   onConnectGitHub: () => void;
   maxPlanAccounts: MaxPlanAccount[];
@@ -102,18 +99,12 @@ export interface HeaderBarProps {
   onAddAccount: () => void;
   onUpdateAccountCaps: (id: string, caps: { daily_task_cap?: number | null; max_concurrent_tasks?: number | null; auto_disable_after_rate_limits?: number | null }) => void;
   providerTierModelMap: Record<string, Record<string, string>>;
-  taskTypeProviderPreference: Record<string, ProviderName[]>;
   taskTypeModelPreferences: Record<string, ModelPreference[]>;
-  providerExecutionModes: Record<string, string[]>;
-  providerModeCapabilities: Record<string, Record<string, Record<string, boolean | number | string | null>>>;
-  taskTypeExecutionDefaults: Record<string, string>;
-  crossProviderFallbackEnabled: boolean;
   providers: Record<string, ProviderCatalogEntry>;
-  onUpdateProviderTierModels: (value: Record<string, Record<string, string>>) => Promise<void>;
-  onUpdateTaskTypeProviderPreferences: (value: Record<string, ProviderName[]>) => Promise<void>;
-  onUpdateTaskTypeModelPreferences: (value: Record<string, ModelPreference[]>) => Promise<void>;
-  onUpdateTaskTypeExecutionDefaults: (value: Record<string, string>) => Promise<void>;
-  onUpdateCrossProviderFallback: (value: boolean) => Promise<void>;
+  providerSettingsDefaults: ProviderSettingsDefaults;
+  taskTypeProviderOverrides: TaskTypeProviderOverrides;
+  onUpdateProviderSettingsDefaults: (value: ProviderSettingsDefaults) => Promise<void>;
+  onUpdateTaskTypeProviderOverrides: (value: TaskTypeProviderOverrides) => Promise<void>;
   showMetrics: boolean;
   onToggleMetrics: () => void;
   metricsHistory: { timestamp: number; completedCount: number }[];
@@ -212,9 +203,6 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateDirectionCooldownMinutes,
     strategicResearchFrequency,
     onUpdateStrategicResearchFrequency,
-    onSyncTaskTypeDefaults,
-    agentPromptSuffixes,
-    onUpdateAgentPromptSuffixes,
     githubAccount,
     onConnectGitHub,
     maxPlanAccounts,
@@ -242,18 +230,12 @@ export function HeaderBar(props: HeaderBarProps) {
     onAddAccount,
     onUpdateAccountCaps,
     providerTierModelMap,
-    taskTypeProviderPreference,
     taskTypeModelPreferences,
-    providerExecutionModes,
-    providerModeCapabilities,
-    taskTypeExecutionDefaults,
-    crossProviderFallbackEnabled,
     providers,
-    onUpdateProviderTierModels,
-    onUpdateTaskTypeProviderPreferences,
-    onUpdateTaskTypeModelPreferences,
-    onUpdateTaskTypeExecutionDefaults,
-    onUpdateCrossProviderFallback,
+    providerSettingsDefaults,
+    taskTypeProviderOverrides,
+    onUpdateProviderSettingsDefaults,
+    onUpdateTaskTypeProviderOverrides,
     showMetrics,
     onToggleMetrics,
     metricsHistory,
@@ -420,11 +402,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateDirectionCooldownMinutes={onUpdateDirectionCooldownMinutes}
           strategicResearchFrequency={strategicResearchFrequency}
           onUpdateStrategicResearchFrequency={onUpdateStrategicResearchFrequency}
-          onSyncTaskTypeDefaults={onSyncTaskTypeDefaults}
           healthCheckUrls={props.healthCheckUrls}
           onUpdateHealthCheckUrls={props.onUpdateHealthCheckUrls}
-          agentPromptSuffixes={agentPromptSuffixes}
-          onUpdateAgentPromptSuffixes={onUpdateAgentPromptSuffixes}
           githubAccount={githubAccount}
           onConnectGitHub={onConnectGitHub}
           maxPlanAccounts={maxPlanAccounts}
@@ -452,18 +431,12 @@ export function HeaderBar(props: HeaderBarProps) {
           onAddAccount={onAddAccount}
           onUpdateAccountCaps={onUpdateAccountCaps}
           providerTierModelMap={providerTierModelMap}
-          taskTypeProviderPreference={taskTypeProviderPreference}
           taskTypeModelPreferences={taskTypeModelPreferences}
-          providerExecutionModes={providerExecutionModes}
-          providerModeCapabilities={providerModeCapabilities}
-          taskTypeExecutionDefaults={taskTypeExecutionDefaults}
-          crossProviderFallbackEnabled={crossProviderFallbackEnabled}
           providers={providers}
-          onUpdateProviderTierModels={onUpdateProviderTierModels}
-          onUpdateTaskTypeProviderPreferences={onUpdateTaskTypeProviderPreferences}
-          onUpdateTaskTypeModelPreferences={onUpdateTaskTypeModelPreferences}
-          onUpdateTaskTypeExecutionDefaults={onUpdateTaskTypeExecutionDefaults}
-          onUpdateCrossProviderFallback={onUpdateCrossProviderFallback}
+          providerSettingsDefaults={providerSettingsDefaults}
+          taskTypeProviderOverrides={taskTypeProviderOverrides}
+          onUpdateProviderSettingsDefaults={onUpdateProviderSettingsDefaults}
+          onUpdateTaskTypeProviderOverrides={onUpdateTaskTypeProviderOverrides}
           refreshInterval={refreshInterval}
           onUpdateRefreshInterval={onUpdateRefreshInterval}
           pageSize={pageSize}

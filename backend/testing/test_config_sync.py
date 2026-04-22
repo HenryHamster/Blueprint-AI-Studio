@@ -119,22 +119,25 @@ async def test_sync_applies_runtime_config_json():
             "strategic_research_frequency": 9,
             "require_approval_gates": False,
             "max_provision_retries": 5,
-            "task_type_models": {"research": "claude-opus-4-6"},
+            "provider_settings_defaults": {"anthropic": {"effort": "high"}},
+            "task_type_provider_overrides": {"research": {"anthropic": {"effort": "max"}}},
         },
     )
     _shared_state.runtime_config["strategic_research_frequency"] = 6
     _shared_state.runtime_config["require_approval_gates"] = True
     _shared_state.runtime_config["max_provision_retries"] = 3
-    _shared_state.runtime_config["task_type_models"] = {"research": "claude-opus-4-7"}
+    _shared_state.runtime_config["provider_settings_defaults"] = {"anthropic": {"effort": "medium"}}
+    _shared_state.runtime_config["task_type_provider_overrides"] = {}
 
     changed = await sync_runtime_config_from_state(state)
 
     assert _shared_state.runtime_config["strategic_research_frequency"] == 9
     assert _shared_state.runtime_config["require_approval_gates"] is False
     assert _shared_state.runtime_config["max_provision_retries"] == 5
-    assert _shared_state.runtime_config["task_type_models"] == {"research": "claude-opus-4-6"}
+    assert _shared_state.runtime_config["provider_settings_defaults"] == {"anthropic": {"effort": "high"}}
+    assert _shared_state.runtime_config["task_type_provider_overrides"] == {"research": {"anthropic": {"effort": "max"}}}
     for key in (
         "strategic_research_frequency", "require_approval_gates",
-        "max_provision_retries", "task_type_models",
+        "max_provision_retries", "provider_settings_defaults", "task_type_provider_overrides",
     ):
         assert key in changed

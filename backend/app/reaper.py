@@ -90,7 +90,19 @@ def _heartbeat_stale_cutoff(task, now: datetime) -> datetime:
     if not effort:
         task_type = ctx.get("type") or payload.get("type")
         if task_type:
-            effort = _runtime_config.get("task_type_efforts", {}).get(task_type)
+            # Resolve effort from the provider settings bag: merge Anthropic
+            # defaults with any per-task-type override. Reaper needs a scalar
+            # effort to size the heartbeat-stale floor; other providers'
+            # effort-like knobs (reasoning_effort, thinking_budget) aren't
+            # normalized so we look at Anthropic only, which is the dispatch
+            # default.
+            defaults = _runtime_config.get("provider_settings_defaults", {}).get("anthropic", {})
+            overrides = (
+                _runtime_config.get("task_type_provider_overrides", {})
+                .get(task_type, {})
+                .get("anthropic", {})
+            )
+            effort = overrides.get("effort") or defaults.get("effort")
     floor = _HEARTBEAT_EFFORT_FLOORS.get(effort, 0)
     seconds = max(seconds, floor)
     return now - timedelta(seconds=seconds)

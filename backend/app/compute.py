@@ -249,6 +249,7 @@ async def prepare_and_store_agent_secret(
     model: str | None = None,
     execution_mode: str | None = None,
     provider_metadata: dict | None = None,
+    provider_settings: dict | None = None,
 ) -> str | None:
     """Build agent credentials and store them in Secret Manager.
 
@@ -269,6 +270,7 @@ async def prepare_and_store_agent_secret(
         model=model,
         execution_mode=execution_mode,
         provider_metadata=provider_metadata,
+        provider_settings=provider_settings,
     )
     return await asyncio.to_thread(
         _store_agent_secret,
@@ -289,6 +291,7 @@ def build_agent_secret_manifest(
     model: str | None = None,
     execution_mode: str | None = None,
     provider_metadata: dict | None = None,
+    provider_settings: dict | None = None,
 ) -> dict:
     """Build the provider-aware secret manifest consumed by agent startup."""
     agent_jwt = create_agent_token(str(task_id), vm_instance_id, task_type=task_type)
@@ -311,6 +314,21 @@ def build_agent_secret_manifest(
     if claude_config_json:
         files.append(FileMaterial(path="/home/agent/.claude.json", content=claude_config_json, mode="0600"))
 
+    # Translate the resolved provider settings bag into CLI env/args/files/
+    # fallbacks. The agent runner consumes LLM_SETTINGS to apply these to
+    # the subprocess invocation. settings_files are materialized alongside
+    # secret files so providers like Gemini can pre-write a settings.json
+    # with a custom alias before invocation.
+    # Translate the bag even when empty so an explicit `{}` still produces an
+    # LLM_CLI_TRANSLATION env var; that signals to the agent that the backend
+    # speaks the settings-bag protocol. Legacy env-var fallback is reserved
+    # for backends that don't populate provider_settings at all (None).
+    cli_translation = None
+    if provider_settings is not None:
+        cli_translation = provider_impl.settings_to_cli(provider_settings)
+        for material in cli_translation.settings_files:
+            files.append(material)
+
     env = {
         "AGENT_SECRET_TOKEN": agent_jwt,
         "VM_INSTANCE_ID": vm_instance_id,
@@ -323,6 +341,28 @@ def build_agent_secret_manifest(
         env["LLM_MODEL"] = model
     if execution_mode:
         env["LLM_EXECUTION_MODE"] = execution_mode
+    if provider_settings is not None:
+        # Raw settings bag so the agent runner can consume it and, if needed,
+        # re-translate server-side (CLI flag composition lives in the agent
+        # so flag shape changes don't require a backend deploy).
+        env["LLM_SETTINGS"] = json.dumps(provider_settings, separators=(",", ":"))
+    if cli_translation is not None:
+        # Pre-translated CLI shape so a naive runner can apply without
+        # re-implementing the translation layer. Agent code may still prefer
+        # to translate from LLM_SETTINGS for forward-compat.
+        env["LLM_CLI_TRANSLATION"] = json.dumps(
+            {
+                "env": cli_translation.env,
+                "args": list(cli_translation.args),
+                "prompt_fragments": list(cli_translation.prompt_fragments),
+                "unsupported": list(cli_translation.unsupported),
+            },
+            separators=(",", ":"),
+        )
+        # Merge translator-provided env on top of secret env so settings can't
+        # overwrite auth keys. secret_material.env takes precedence.
+        for k, v in cli_translation.env.items():
+            env.setdefault(k, v)
     env.update(secret_material.env)
     return {
         "env": env,
@@ -338,6 +378,7 @@ def build_agent_secret_manifest(
             "auth_mode": auth_mode_enum.value,
             "model": model,
             "execution_mode": execution_mode,
+            "provider_settings": provider_settings or None,
         },
     }
 
@@ -347,7 +388,8 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
                               task_type: str = "", secret_version_name: str | None = None,
                               provider: str | None = None, auth_mode: str | None = None,
                               model: str | None = None, execution_mode: str | None = None,
-                              provider_metadata: dict | None = None):
+                              provider_metadata: dict | None = None,
+                              provider_settings: dict | None = None):
     """
     Provisions an agent. In LOCAL_MODE, spawns a subprocess.
     In production, creates a GCP Compute Engine VM.
@@ -386,11 +428,13 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
             vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json,
             task_type=task_type, provider=provider, auth_mode=auth_mode, model=model,
             execution_mode=execution_mode, provider_metadata=provider_metadata,
+            provider_settings=provider_settings,
         )
     return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json,
                                 task_type=task_type, secret_version_name=secret_version_name,
                                 provider=provider, auth_mode=auth_mode, model=model,
-                                execution_mode=execution_mode, provider_metadata=provider_metadata)
+                                execution_mode=execution_mode, provider_metadata=provider_metadata,
+                                provider_settings=provider_settings)
 
 
 _last_provision_error: _OrderedDict = _OrderedDict()
@@ -439,6 +483,7 @@ async def _provision_local(
     model: str | None = None,
     execution_mode: str | None = None,
     provider_metadata: dict | None = None,
+    provider_settings: dict | None = None,
 ):
     logger.info(f"[LOCAL] Spawning agent subprocess: {vm_instance_id} (Task: {task_id})")
     manifest = build_agent_secret_manifest(
@@ -452,6 +497,7 @@ async def _provision_local(
         model=model,
         execution_mode=execution_mode,
         provider_metadata=provider_metadata,
+        provider_settings=provider_settings,
     )
     env = {**os.environ, **_materialize_local_manifest(vm_instance_id, manifest)}
     env["PAYLOAD_URI"] = payload_uri or ""
@@ -699,7 +745,8 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
                          task_type: str = "", secret_version_name: str | None = None,
                          provider: str | None = None, auth_mode: str | None = None,
                          model: str | None = None, execution_mode: str | None = None,
-                         provider_metadata: dict | None = None):
+                         provider_metadata: dict | None = None,
+                         provider_settings: dict | None = None):
     from google.cloud import compute_v1
 
     logger.info(f"Starting provisioning for VM: {vm_instance_id} (Task: {task_id})")
@@ -712,6 +759,7 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
             vm_instance_id, task_id, oauth_token, claude_config_json, task_type,
             provider=provider, auth_mode=auth_mode, model=model,
             execution_mode=execution_mode, provider_metadata=provider_metadata,
+            provider_settings=provider_settings,
         )
 
     # payload_uri is validated upstream and safe to embed in the startup script
