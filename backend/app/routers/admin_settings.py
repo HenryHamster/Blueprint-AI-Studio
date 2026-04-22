@@ -287,6 +287,8 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             providers = entry.get("providers")
             if not isinstance(providers, list) or not all(isinstance(p, str) for p in providers):
                 raise HTTPException(status_code=400, detail=f"category_routing[{category}].providers must be a list of strings")
+            if not providers:
+                raise HTTPException(status_code=400, detail=f"category_routing[{category}].providers must not be empty — at least one provider is required")
             invalid = [p for p in providers if p not in valid_providers]
             if invalid:
                 raise HTTPException(status_code=400, detail=f"Invalid providers in category_routing[{category}]: {', '.join(invalid)}")
@@ -309,6 +311,8 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                 providers = entry["providers"]
                 if not isinstance(providers, list) or not all(isinstance(p, str) for p in providers):
                     raise HTTPException(status_code=400, detail=f"task_type_routing[{task_type}].providers must be a list of strings")
+                if not providers:
+                    raise HTTPException(status_code=400, detail=f"task_type_routing[{task_type}].providers must not be empty — omit the `providers` key to inherit from the category instead")
                 invalid = [p for p in providers if p not in valid_providers]
                 if invalid:
                     raise HTTPException(status_code=400, detail=f"Invalid providers in task_type_routing[{task_type}]: {', '.join(invalid)}")

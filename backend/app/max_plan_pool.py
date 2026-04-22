@@ -210,11 +210,15 @@ def _category_for_task_type(task_type: str, runtime_config: Mapping[str, Any]) -
 def _routing_entry(raw: Any) -> tuple[list[str] | None, str | None]:
     """Extract (providers, effort) from a {providers, effort} mapping, honoring
     partial entries (either field optional). Returns (None, None) when the
-    input isn't a mapping."""
+    input isn't a mapping. An empty providers list is treated as missing —
+    otherwise resolution would short-circuit to an empty allow-list, which
+    would crash downstream on `provider_preference[0]`."""
     if not isinstance(raw, Mapping):
         return None, None
     providers_raw = raw.get("providers")
     providers = _normalize_provider_list(providers_raw) if providers_raw is not None else None
+    if providers is not None and not providers:
+        providers = None
     effort_raw = raw.get("effort")
     effort = effort_raw.strip() if isinstance(effort_raw, str) and effort_raw.strip() else None
     return providers, effort
@@ -893,6 +897,13 @@ async def select_max_plan_account_balanced(
 
         winner: tuple[Dict[str, Any], str, str | None] | None = None
         if candidates_healthy:
+            # Gate decisively-negative accounts when alternatives exist — but
+            # otherwise rank purely by load. Ranking by health_score across
+            # providers is unfair: a mature anthropic account with 100
+            # completions scores 100 while a brand-new openai account scores 0,
+            # so balanced mode would never pick the new account. Among healthy
+            # candidates we only care about "which is least busy"; health score
+            # is a disqualifier, not a tiebreak.
             if len(candidates_healthy) > 1:
                 qualified = [
                     c for c in candidates_healthy
@@ -900,9 +911,12 @@ async def select_max_plan_account_balanced(
                 ]
                 if qualified:
                     candidates_healthy = qualified
-            winner = max(
+            winner = min(
                 candidates_healthy,
-                key=lambda c: (_compute_health_score(c[0], now), -c[0].get("active_tasks", 0)),
+                # Primary: fewest active_tasks. Tiebreak: deterministic by id
+                # so concurrent selects under the same lock give different
+                # results when load is equal.
+                key=lambda c: (c[0].get("active_tasks", 0), c[0]["id"]),
             )
         elif candidates_probing:
             # Deterministic tiebreak on id — same contract as the single-provider selector.
