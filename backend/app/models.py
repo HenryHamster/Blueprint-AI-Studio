@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
-from sqlalchemy import Column, String, Integer, Index, text, event, Enum as SAEnum
+from sqlalchemy import Column, String, Integer, Index, Text, text, event, Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB
 import logging
 import uuid
@@ -138,15 +138,15 @@ class Project(SQLModel, table=True):
         default_factory=list,
         sa_column=Column(JSONB, nullable=True, default=[]),
     )
-    # Running update — the strategic agent's accumulating narrative of what
-    # has changed in the project, appended to each cycle. Persists across
-    # cycles so the user sees a journal of the project's evolution since
-    # their last check-in. User acknowledges to clear the list + stamp
-    # running_update_acknowledged_at; agent starts a fresh accumulation
-    # after acknowledge. Entry shape: app.problem_model.RunningUpdateEntry.
-    running_update: List[Dict[str, Any]] = Field(
-        default_factory=list,
-        sa_column=Column(JSONB, nullable=True, default=[]),
+    # Running update — a single markdown document the strategic agent
+    # maintains as a living narrative of what the project is and what's
+    # shifting. Rewritten each cycle (not appended) so the user always
+    # sees a clean current view, not a log of per-cycle summaries. User
+    # acknowledges to stamp running_update_acknowledged_at; the document
+    # persists and the agent refines it on the next cycle.
+    running_update: Optional[str] = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
     )
     running_update_acknowledged_at: Optional[datetime] = Field(default=None)
     # Living architectural description maintained by design doc update agent

@@ -573,10 +573,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 session,
                 f"{open_feedback_count} FEEDBACK message(s) remain unaddressed after strategic review — agent may be ignoring user requests",
             )
-        # Per-cycle message post removed: the strategic agent now appends
-        # to project.running_update instead, which persists across cycles
-        # and is cleared when the user acknowledges. Replaces the previous
-        # one-message-per-cycle noise.
+        # Per-cycle message post removed: the strategic agent now maintains
+        # project.running_update as a living markdown document it rewrites
+        # each cycle. Replaces the previous one-message-per-cycle noise.
         await session.commit()
         logger.info(f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions")
         return
@@ -616,7 +615,7 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
 
     new_vision = parsed.get("vision")
     new_problem_model = parsed.get("problem_model")
-    new_running_update_entry = parsed.get("running_update_entry")
+    new_running_update = parsed.get("running_update")
     direction_ops = parsed.get("direction_operations", [])
 
     # Lock project row to prevent concurrent direction/vision mutations
@@ -724,37 +723,19 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         except Exception:
             logger.exception("[STRATEGIC] Failed to apply problem_model update (non-fatal)")
 
-    # Append the agent's running_update entry (if any). The running_update
-    # is the persistent journal of project evolution shown to the user on
-    # check-in; agent appends each cycle, user acknowledges to reset. This
-    # replaces the previous per-cycle message post.
-    if new_running_update_entry and isinstance(new_running_update_entry, dict):
+    # Replace project.running_update with the agent's refined markdown
+    # document. Unlike the old per-cycle append, the document is a living
+    # narrative the agent rewrites each cycle — the user sees a single
+    # clean view of current state, not a log of summaries.
+    if isinstance(new_running_update, str):
         try:
-            from pydantic import ValidationError as _RuValidationError
-
-            from app.problem_model import RunningUpdateEntry, append_running_update
-            try:
-                ru_entry = RunningUpdateEntry.model_validate({
-                    "ts": _utcnow().isoformat(),
-                    "cycle_task_id": str(task.id),
-                    **new_running_update_entry,
-                })
-            except _RuValidationError as ru_err:
-                logger.warning(
-                    f"[STRATEGIC] Task {task.id}: running_update_entry validation failed — "
-                    f"skipping. Error: {ru_err}"
-                )
-            else:
-                project.running_update = append_running_update(
-                    project.running_update, ru_entry
-                )
-                flag_modified(project, "running_update")
-                logger.info(
-                    f"[STRATEGIC] Appended running_update entry for project {project.id} "
-                    f"(log size: {len(project.running_update)})"
-                )
+            project.running_update = new_running_update
+            logger.info(
+                f"[STRATEGIC] Set running_update for project {project.id} "
+                f"(length: {len(new_running_update)} chars)"
+            )
         except Exception:
-            logger.exception("[STRATEGIC] Failed to append running_update (non-fatal)")
+            logger.exception("[STRATEGIC] Failed to set running_update (non-fatal)")
 
     # Append the agent's self_reflection entry (if any) to the project's
     # self_reflection log. The log drives self-improvement on self-repo
@@ -1072,9 +1053,9 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         )
 
     vision_rev = (project.vision or {}).get("revision", "?")
-    # Per-cycle message post removed: the strategic agent now appends to
-    # project.running_update instead, which persists across cycles and is
-    # cleared when the user acknowledges.
+    # Per-cycle message post removed: the strategic agent now maintains
+    # project.running_update as a living markdown document it rewrites each
+    # cycle; the user acknowledges to stamp a read-marker.
     task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} messages, {msgs_resolved} resolved"
     session.add(task)
     await session.commit()  # Single commit: vision + directions + messages + task status

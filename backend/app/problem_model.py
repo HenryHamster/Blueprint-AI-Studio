@@ -309,40 +309,6 @@ SELF_REFLECTION_LOG_MAX = 20
 """Cap on project.self_reflection_log length — older entries are dropped."""
 
 
-RUNNING_UPDATE_MAX = 50
-"""Cap on project.running_update length between acknowledgements. The
-strategic agent should acknowledge-nag the user if this threshold is
-approached without acknowledgement; prevents unbounded accumulation."""
-
-
-class RunningUpdateEntry(BaseModel):
-    """One entry appended to ``project.running_update`` per strategic cycle.
-
-    The running_update is the agent's accumulating journal of what has
-    shifted in the project, persisted across cycles so the user sees a
-    single coherent "what's changed since I last checked in" view. The
-    user acknowledges to clear the list; the agent starts a fresh
-    accumulation on the next cycle.
-    """
-
-    ts: str
-    cycle_task_id: str | None = None
-    """Task id of the strategic cycle that produced this entry."""
-
-    whats_changed: str = ""
-    """Narrative of what shifted this cycle. Prose, titles not IDs."""
-
-    whats_working_on: str = ""
-    """One-line-per-active-gap summary of the current agenda, each labeled
-    with origin (user ask vs on own initiative)."""
-
-    blockers: str = ""
-    """Only populated when pending_user_confirmation items exist."""
-
-    next_up: str = ""
-    """1-2 sentences on where the next cycle is headed."""
-
-
 class SelfReflectionEntry(BaseModel):
     """Agent-written reflection about what was hard this cycle.
 
@@ -434,23 +400,6 @@ def append_self_reflection(
     log.append(entry.model_dump())
     if len(log) > SELF_REFLECTION_LOG_MAX:
         log = log[-SELF_REFLECTION_LOG_MAX:]
-    return log
-
-
-def append_running_update(
-    log_raw: list | None,
-    entry: RunningUpdateEntry,
-) -> list[dict]:
-    """Append a running-update entry, enforcing :data:`RUNNING_UPDATE_MAX`.
-
-    Returns the new list ready for JSONB persistence. Older entries are
-    dropped when the cap is exceeded — but the agent should prompt the
-    user to acknowledge long before that happens.
-    """
-    log = list(log_raw or [])
-    log.append(entry.model_dump())
-    if len(log) > RUNNING_UPDATE_MAX:
-        log = log[-RUNNING_UPDATE_MAX:]
     return log
 
 

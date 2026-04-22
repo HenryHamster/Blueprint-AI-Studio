@@ -194,7 +194,7 @@ class StrategicReviewPayload(_SystemPopulated):
     design_doc: dict[str, Any] | None = None
     vision: dict[str, Any] | None = None
     problem_model: dict[str, Any] | None = None
-    running_update: list[dict[str, Any]] | None = None
+    running_update: str | None = None
     running_update_acknowledged_at: str | None = None
     user_last_active_at: str | None = None
     self_reflection_log: list[dict[str, Any]] | None = None

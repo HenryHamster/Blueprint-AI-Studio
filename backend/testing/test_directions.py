@@ -2867,8 +2867,8 @@ async def test_strategic_api_set_problem_model_rejects_malformed(db_session):
 
 
 @pytest.mark.asyncio
-async def test_strategic_api_append_running_update(db_session):
-    """op=append_running_update validates entry and appends to project.running_update."""
+async def test_strategic_api_set_running_update(db_session):
+    """op=set_running_update with {markdown: str} replaces project.running_update."""
     from httpx import AsyncClient, ASGITransport
     from app.main import app
 
@@ -2877,25 +2877,64 @@ async def test_strategic_api_append_running_update(db_session):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as ac:
+            doc = "## What's going on\nShipping problem_model v1.\n\n## Next\nMerge #103."
             resp = await ac.post("/api/agent/strategic", json={
-                "op": "append_running_update", "task_id": task_id,
-                "data": {
-                    "whats_changed": "Opened a gap for cross-cycle memory (your ask).",
-                    "whats_working_on": "- Strategic memory — direction in review",
-                    "next_up": "Merge the schema migration.",
-                },
+                "op": "set_running_update", "task_id": task_id,
+                "data": {"markdown": doc},
             })
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body["op"] == "append_running_update"
-        assert body["log_size"] == 1
+        assert body["op"] == "set_running_update"
+        assert body["length"] == len(doc)
 
         await db_session.refresh(project)
-        assert len(project.running_update) == 1
-        entry = project.running_update[0]
-        assert entry["whats_changed"].startswith("Opened a gap")
-        assert entry["cycle_task_id"] == task_id
-        assert entry["ts"]  # server-stamped
+        assert project.running_update == doc
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_running_update_requires_markdown_field(db_session):
+    """Missing 'markdown' key (or wrong shape) returns 400."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    _project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post("/api/agent/strategic", json={
+                "op": "set_running_update", "task_id": task_id,
+                "data": {"other_field": "nope"},
+            })
+        assert resp.status_code == 400
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_running_update_replaces(db_session):
+    """Second call replaces the first — it's set, not append."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            await ac.post("/api/agent/strategic", json={
+                "op": "set_running_update", "task_id": task_id,
+                "data": {"markdown": "first"},
+            })
+            resp = await ac.post("/api/agent/strategic", json={
+                "op": "set_running_update", "task_id": task_id,
+                "data": {"markdown": "second"},
+            })
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        assert project.running_update == "second"
     finally:
         _cleanup_strategic_overrides()
 

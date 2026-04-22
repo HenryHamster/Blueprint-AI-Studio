@@ -840,7 +840,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "design_doc": _agent_view_design_doc(project.design_doc),
         "vision": project.vision or {},
         "problem_model": project.problem_model or {},
-        "running_update": project.running_update or [],
+        "running_update": project.running_update or "",
         "running_update_acknowledged_at": (
             project.running_update_acknowledged_at.isoformat()
             if project.running_update_acknowledged_at else None

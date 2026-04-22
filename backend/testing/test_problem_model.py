@@ -11,7 +11,6 @@ from pydantic import ValidationError
 
 from app.problem_model import (
     REVISION_LOG_MAX,
-    RUNNING_UPDATE_MAX,
     SELF_REFLECTION_LOG_MAX,
     Capability,
     Friction,
@@ -19,11 +18,9 @@ from app.problem_model import (
     Intent,
     ProblemModel,
     ProjectContext,
-    RunningUpdateEntry,
     SelfReflectionEntry,
     Source,
     append_revision_log,
-    append_running_update,
     append_self_reflection,
     archive_closed_gaps,
     is_empty,
@@ -434,17 +431,17 @@ def test_design_doc_update_payload_accepts_problem_model():
 
 
 def test_strategic_payload_accepts_running_update_fields():
-    """Payload must transport running_update + acknowledgement + last-user
-    timestamps from spawn to the agent."""
+    """Payload must transport running_update (markdown doc) + acknowledgement
+    + last-user timestamps from spawn to the agent."""
     from app.payload_schemas import StrategicReviewPayload
 
     payload = StrategicReviewPayload.model_validate({
-        "running_update": [{"ts": "2026-04-21T00:00:00", "whats_changed": "x"}],
+        "running_update": "## What's going on\nShipping problem_model v1.",
         "running_update_acknowledged_at": "2026-04-20T00:00:00",
         "user_last_active_at": "2026-04-20T12:00:00",
         "self_reflection_log": [{"ts": "2026-04-19T00:00:00", "what_was_hard": "y"}],
     })
-    assert len(payload.running_update) == 1
+    assert payload.running_update.startswith("## What's going on")
     assert payload.running_update_acknowledged_at == "2026-04-20T00:00:00"
     assert payload.user_last_active_at == "2026-04-20T12:00:00"
     assert len(payload.self_reflection_log) == 1
@@ -556,49 +553,11 @@ def test_append_self_reflection_handles_none_input():
     assert log[0]["what_was_hard"] == "x"
 
 
-def test_running_update_entry_parses_with_minimal_fields():
-    entry = RunningUpdateEntry(ts="2026-04-21T12:00:00")
-    assert entry.whats_changed == ""
-    assert entry.whats_working_on == ""
-    assert entry.blockers == ""
-    assert entry.next_up == ""
-
-
-def test_append_running_update_enforces_cap():
-    log_raw: list = []
-    for i in range(RUNNING_UPDATE_MAX + 5):
-        log_raw = append_running_update(
-            log_raw,
-            RunningUpdateEntry(
-                ts=f"2026-04-{i:02d}T00:00:00",
-                whats_changed=f"shift {i}",
-            ),
-        )
-    assert len(log_raw) == RUNNING_UPDATE_MAX
-    # Oldest dropped, newest retained
-    kept = [e["whats_changed"] for e in log_raw]
-    assert kept[0] == "shift 5"
-    assert kept[-1] == f"shift {RUNNING_UPDATE_MAX + 4}"
-
-
-def test_append_running_update_preserves_structured_entries():
-    """Each appended entry is a full structured dict — narrative fields
-    stay separate so UI can render them section-by-section."""
-    entry = RunningUpdateEntry(
-        ts="2026-04-21T12:00:00",
-        cycle_task_id="t-1",
-        whats_changed="Opened gap g-x; retired d-old.",
-        whats_working_on="- Gap g-x: direction d-new in review [on my own initiative]",
-        blockers="",
-        next_up="Opening the follow-up direction once PR #103 merges.",
-    )
-    log = append_running_update(None, entry)
-    assert len(log) == 1
-    stored = log[0]
-    assert stored["cycle_task_id"] == "t-1"
-    assert stored["whats_changed"].startswith("Opened gap g-x")
-    assert stored["whats_working_on"].startswith("- Gap g-x")
-    assert stored["next_up"].startswith("Opening the follow-up")
+# Removed: RunningUpdateEntry struct, append_running_update(), RUNNING_UPDATE_MAX.
+# running_update is now a single markdown document (Optional[str]) the strategic
+# agent rewrites each cycle — no per-cycle entry schema, no append semantics,
+# no cap to enforce. See test_strategic_payload_accepts_running_update_fields
+# for the current payload shape.
 
 
 def test_source_is_reusable_across_model_elements():

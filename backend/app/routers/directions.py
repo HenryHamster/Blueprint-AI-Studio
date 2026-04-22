@@ -70,7 +70,7 @@ async def get_directions(
         "vision": project.vision or {},
         "design_doc": project.design_doc or {},
         "problem_model": project.problem_model or {},
-        "running_update": project.running_update or [],
+        "running_update": project.running_update or None,
         "running_update_acknowledged_at": (
             project.running_update_acknowledged_at.isoformat()
             if project.running_update_acknowledged_at else None

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, delete
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any, List
 import uuid
 from datetime import timedelta
 from sqlalchemy import func
@@ -67,15 +67,15 @@ async def get_all_projects(
 
 
 class ProjectUpdate(BaseModel):
-    name: Optional[str] = None
-    directions: Optional[List[Dict[str, Any]]] = None
-    vision: Optional[Dict[str, Any]] = None
-    design_doc: Optional[Dict[str, Any]] = None
-    build_config: Optional[Dict[str, Any]] = None
-    autonomous_enabled: Optional[bool] = None
+    name: str | None = None
+    directions: List[Dict[str, Any]] | None = None
+    vision: Dict[str, Any] | None = None
+    design_doc: Dict[str, Any] | None = None
+    build_config: Dict[str, Any] | None = None
+    autonomous_enabled: bool | None = None
     # User-editable subset of problem_model — intent, constraints, context.
     # Gaps / capabilities / friction are agent-owned and not writable here.
-    problem_model_patch: Optional[Dict[str, Any]] = None
+    problem_model_patch: Dict[str, Any] | None = None
 
 
 @router.patch("/projects/{project_id}")
@@ -123,12 +123,14 @@ async def update_project(
         project.design_doc = doc
         flag_modified(project, "design_doc")
     if payload.build_config is not None:
-        from app.schemas import BuildConfig as BuildConfigSchema  # noqa: PLC0415
+        from pydantic import ValidationError
+
+        from app.schemas import BuildConfig as BuildConfigSchema
         try:
             validated = BuildConfigSchema(**payload.build_config) if payload.build_config else BuildConfigSchema()
             project.build_config = validated.model_dump(exclude_none=True)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid build_config structure")
+        except ValidationError as e:
+            raise HTTPException(status_code=400, detail="Invalid build_config structure") from e
         flag_modified(project, "build_config")
 
     if payload.problem_model_patch is not None:
@@ -137,9 +139,9 @@ async def update_project(
         # pending_user_confirmation, revision_log) pass through unchanged.
         # Bump revision, stamp last_updated, mark last_updated_by="user"
         # so the agent can distinguish user edits during its next cycle.
-        from pydantic import ValidationError as _PmValidationError  # noqa: PLC0415
+        from pydantic import ValidationError as _PmValidationError
 
-        from app.problem_model import ProblemModel, parse_problem_model  # noqa: PLC0415
+        from app.problem_model import ProblemModel, parse_problem_model
 
         ALLOWED_USER_FIELDS = {"intent", "context", "constraints"}
         invalid = set(payload.problem_model_patch.keys()) - ALLOWED_USER_FIELDS
@@ -151,8 +153,7 @@ async def update_project(
             )
         current = parse_problem_model(project.problem_model)
         merged_raw: Dict[str, Any] = current.model_dump()
-        for field, value in payload.problem_model_patch.items():
-            merged_raw[field] = value
+        merged_raw.update(payload.problem_model_patch)
         try:
             validated = ProblemModel.model_validate(merged_raw)
         except _PmValidationError as ve:
@@ -169,6 +170,49 @@ async def update_project(
     return project
 
 
+@router.post("/projects/{project_id}/detect-build-config")
+@limiter.limit("10/minute")
+async def detect_project_build_config(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    if not project.github_owner or not project.github_repo:
+        raise HTTPException(status_code=400, detail="Project has no GitHub repository configured")
+
+    from pydantic import ValidationError
+
+    from app.github import get_repo_installation_token
+    from app.routers.admin_onboard import _detect_build_config
+    from app.schemas import BuildConfig as BuildConfigSchema
+
+    token = await get_repo_installation_token(project.github_owner, project.github_repo)
+    if not token:
+        raise HTTPException(status_code=502, detail="No GitHub installation token available for this repo")
+
+    detected = await _detect_build_config(token, project.github_owner, project.github_repo)
+
+    existing = project.build_config or {}
+    if existing.get("git_user_email"):
+        detected["git_user_email"] = existing["git_user_email"]
+    if existing.get("git_user_name"):
+        detected["git_user_name"] = existing["git_user_name"]
+
+    try:
+        validated = BuildConfigSchema(**detected) if detected else BuildConfigSchema()
+        project.build_config = validated.model_dump(exclude_none=True)
+    except ValidationError:
+        # Detection produced a shape the schema doesn't accept — store raw so the user can fix it in the UI
+        project.build_config = detected
+    flag_modified(project, "build_config")
+    await session.commit()
+    await session.refresh(project)
+
+    return {"build_config": project.build_config or {}}
+
+
 @router.post("/projects/{project_id}/running-update/acknowledge")
 @limiter.limit("30/minute")
 async def acknowledge_running_update(
@@ -177,21 +221,18 @@ async def acknowledge_running_update(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Acknowledge the project's running_update, clearing the accumulated
-    entries and stamping the acknowledgement time. The strategic agent
-    starts a fresh accumulation on the next cycle."""
+    """Acknowledge the project's running_update — stamps the read-marker
+    timestamp. The document itself persists; the strategic agent refines
+    it on the next cycle using the acknowledgement timestamp to frame
+    what's new since the user last caught up."""
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
-    cleared_count = len(project.running_update or [])
-    project.running_update = []
     project.running_update_acknowledged_at = _utcnow()
-    flag_modified(project, "running_update")
     session.add(project)
     await session.commit()
     return {
         "status": "acknowledged",
-        "cleared_entries": cleared_count,
         "acknowledged_at": project.running_update_acknowledged_at.isoformat(),
     }
 
@@ -270,7 +311,7 @@ async def get_direction_task_counts(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
-    project = await _get_user_project(project_id, current_user["user_id"], session)
+    await _get_user_project(project_id, current_user["user_id"], session)
 
     result = await session.execute(
         select(Task).where(

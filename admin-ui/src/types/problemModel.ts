@@ -119,16 +119,9 @@ export interface ProblemModel {
   revision_log?: RevisionLogEntry[];
 }
 
-// Running-update accumulating journal — appended each cycle until the user
-// acknowledges to clear it.
-export interface RunningUpdateEntry {
-  ts: string;
-  cycle_task_id?: string | null;
-  whats_changed?: string;
-  whats_working_on?: string;
-  blockers?: string;
-  next_up?: string;
-}
+// Running update — a single markdown document the strategic agent rewrites
+// each cycle as the project's current-state snapshot. Acknowledge stamps a
+// read-marker; the document itself persists and is refined next cycle.
 
 // Self-reflection log — one entry per cycle on self-repo projects.
 export interface SelfReflectionEntry {
@@ -154,7 +147,7 @@ export interface DirectionsEndpointResponse {
   vision: Record<string, unknown>;
   design_doc: Record<string, unknown>;
   problem_model: ProblemModel;
-  running_update: RunningUpdateEntry[];
+  running_update: string | null;
   running_update_acknowledged_at: string | null;
   self_reflection_log: SelfReflectionEntry[];
   is_self_repo: boolean;

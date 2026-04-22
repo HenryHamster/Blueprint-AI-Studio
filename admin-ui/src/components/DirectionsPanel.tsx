@@ -9,7 +9,7 @@ import { AutonomousConfigSection } from './AutonomousConfigSection';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { useAutonomousConfig } from '../hooks/useAutonomousConfig';
 import { formatRelativeTime } from '../utils/directionHelpers';
-import type { ProblemModel, RunningUpdateEntry } from '../types';
+import type { ProblemModel } from '../types';
 
 interface Project {
   id: string;
@@ -109,7 +109,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   const [activeTasks, setActiveTasks] = useState<Record<string, Array<{ id: string; status: string; title: string; latest_status_message?: string }>>>({});
   const [designDoc, setDesignDoc] = useState<Record<string, unknown>>({});
   const [problemModel, setProblemModel] = useState<ProblemModel>({});
-  const [runningUpdate, setRunningUpdate] = useState<RunningUpdateEntry[]>([]);
+  const [runningUpdate, setRunningUpdate] = useState<string | null>(null);
   const [runningUpdateAckAt, setRunningUpdateAckAt] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'directions' | 'problem-model' | 'running-update' | 'design-doc'>('directions');
 
@@ -179,7 +179,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
       setAutonomousEnabled(data.autonomous_enabled ?? false);
       setDesignDoc(data.design_doc ?? {});
       setProblemModel(data.problem_model ?? {});
-      setRunningUpdate(Array.isArray(data.running_update) ? data.running_update : []);
+      setRunningUpdate(typeof data.running_update === 'string' ? data.running_update : null);
       setRunningUpdateAckAt(data.running_update_acknowledged_at ?? null);
       if (countsRes.ok) {
         const countsData = await countsRes.json();
@@ -557,10 +557,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             }`}
           >
             Running Update
-            {runningUpdate.length > 0 && (
-              <span className="ml-1.5 inline-flex items-center justify-center text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded-full px-1.5 py-0.5">
-                {runningUpdate.length}
-              </span>
+            {runningUpdate && runningUpdate.trim() && (
+              <span className="ml-1.5 inline-block w-1.5 h-1.5 rounded-full bg-emerald-400" aria-label="has content" />
             )}
           </button>
           <button
@@ -764,7 +762,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           })()}
 
           {/* Running Update quick-link */}
-          {selectedProjectId && !loading && runningUpdate.length > 0 && (
+          {selectedProjectId && !loading && runningUpdate && runningUpdate.trim() && (
             <div className="mb-5">
               <button
                 onClick={() => setActiveTab('running-update')}
@@ -774,9 +772,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                 <span className="text-[12px] font-bold text-neutral-300 tracking-wide group-hover:text-neutral-100 transition-colors">
                   Running Update
                 </span>
-                <span className="inline-flex items-center justify-center text-[9px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded-full px-1.5 py-0.5 ml-1">
-                  {runningUpdate.length} new
-                </span>
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 ml-1" aria-label="has content" />
               </button>
             </div>
           )}
@@ -953,11 +949,10 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           <div className="flex-1 overflow-hidden">
             <RunningUpdatePanel
               projectId={selectedProjectId}
-              entries={runningUpdate}
+              document={runningUpdate}
               acknowledgedAt={runningUpdateAckAt}
               addToast={addToast}
               onAcknowledged={() => {
-                setRunningUpdate([]);
                 setRunningUpdateAckAt(new Date().toISOString());
               }}
             />

@@ -1315,7 +1315,7 @@ ${hotspotsSection}
     const strategicHelper = `#!/bin/bash
 # Strategic review tool — updates problem_model, running_update, directions,
 # messages via API. Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env.
-OP="\${1:?Usage: strategic set-problem-model|append-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message|spawn-task <json>}"
+OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message|spawn-task <json-or-file>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
@@ -1355,7 +1355,14 @@ _call() {
 
 case "\$OP" in
   set-problem-model)    _call "set_problem_model" ;;
-  append-running-update) _call "append_running_update" ;;
+  set-running-update)
+    # DATA is a path to the markdown file written by the Thinker. Wrap
+    # the file contents as {markdown: "..."} before the usual body build.
+    FILE="\$DATA"
+    [ -f "\$FILE" ] || { echo "[ERROR] set-running-update: file not found: \$FILE" >&2; exit 1; }
+    DATA=\$(jq -Rs '{markdown: .}' < "\$FILE")
+    _call "set_running_update"
+    ;;
   reflect)              _call "reflect" ;;
   pending-confirm)      _call "pending_confirm" ;;
   set-vision)           _call "set_vision" ;;
@@ -1444,9 +1451,9 @@ echo ""
       ? JSON.stringify(problemModel, null, 2)
       : '';
 
-    const runningUpdateEntries = Array.isArray(payload.running_update)
-      ? payload.running_update as Array<Record<string, unknown>>
-      : [];
+    const runningUpdateDoc = typeof payload.running_update === 'string'
+      ? payload.running_update as string
+      : '';
     const runningUpdateAckAt = strVal(payload.running_update_acknowledged_at);
     const userLastActiveAt = strVal(payload.user_last_active_at);
     const selfReflectionEntries = Array.isArray(payload.self_reflection_log)
@@ -1454,19 +1461,11 @@ echo ""
       : [];
     const isSelfRepo = payload.is_self_repo === true;
 
-    const renderRunningUpdateList = (entries: Array<Record<string, unknown>>): string => {
-      if (entries.length === 0) {
-        return '_(running_update is empty — user has acknowledged everything, or this is a fresh project)_';
+    const renderRunningUpdateDoc = (doc: string): string => {
+      if (!doc.trim()) {
+        return '_(running_update is empty — fresh project or nothing written yet. This cycle should populate it.)_';
       }
-      const lines: string[] = [];
-      for (const e of entries) {
-        const ts = strVal(e.ts, '?');
-        const whats = strVal(e.whats_changed).slice(0, 500);
-        lines.push(`### ${ts}`);
-        if (whats) lines.push(whats);
-        lines.push('');
-      }
-      return lines.join('\n').trim();
+      return doc.trim();
     };
 
     const renderReflectionList = (entries: Array<Record<string, unknown>>): string => {
@@ -1509,7 +1508,7 @@ echo ""
       ? `## Your current understanding (problem_model)\n\`\`\`json\n${problemModelJson}\n\`\`\``
       : `## Your current understanding (problem_model)\n_(empty — this is the first cycle. Bootstrap from the other sections below.)_`;
 
-    const runningUpdateSection = `## Running update (appended across cycles since last acknowledgement)\n${renderRunningUpdateList(runningUpdateEntries)}\n\n_Do NOT repeat what's already here — your entry this cycle is additive._`;
+    const runningUpdateSection = `## Running update (living document — rewrite, don't append)\n${renderRunningUpdateDoc(runningUpdateDoc)}\n\n_This is the document the user currently sees. Refine it this cycle — remove stale content, integrate what's new, keep it coherent and short. It's a current snapshot, not a log._`;
 
     const reflectionSection = `## What you previously said was hard\n${renderReflectionList(selfReflectionEntries)}`;
 
@@ -1569,7 +1568,7 @@ Each cycle:
   1. Read your current model and recent reality.
   2. Update the model — open gaps, close resolved ones, upgrade capabilities, record new friction, refine intent if drift warrants.
   3. Propose direction operations tied to gaps.
-  4. Append one entry to the running_update (the user's journal).
+  4. Refine the running_update document (the user's view of current state) — rewrite, don't append.
   5. Optionally reflect on what was hard worth remembering.
 
 # How to think
@@ -1582,7 +1581,7 @@ Each cycle:
 
 **Cite sources when they exist, skip when they don't.** Sources are traceability, not justification. When a gap came from a specific user message, cite it so the user can trace the thread (\`source: {type: "user_message", message_id, excerpt}\`). When a capability became \`working\` because a PR merged, cite the PR (\`source: {type: "shipped_change", pr_number}\`). When a change comes from synthesis across many observations, just say that — don't manufacture a single cause.
 
-**Continuity across cycles is how the user knows you're listening**, not a constraint on what you propose. When a user ask exists, trace it: user message → gap (sourced) → direction(s) → resolution. When it doesn't, operate on your own initiative. Both are first-class — the "What I'm working on" section of your running_update entry shows both types of work, labeled by origin.
+**Continuity across cycles is how the user knows you're listening**, not a constraint on what you propose. When a user ask exists, trace it: user message → gap (sourced) → direction(s) → resolution. When it doesn't, operate on your own initiative. Both are first-class — the "What I'm working on" section of your running_update document shows both types of work, labeled by origin.
 
 **Intent is the yardstick, not metrics.** Merge rate, direction throughput, success rate — proxies. When they disagree with intent, intent wins. A direction that hits its numeric target while leaving the intent no closer is finished, not successful. Some task failures are caused by the pipeline itself — [PROVISION_FAILURE], [RATE_LIMIT], [AGENT_TIMEOUT], [EXTERNAL_API]. These say nothing about direction quality; flag them as pipeline issues, don't penalize the direction.
 
@@ -1598,35 +1597,27 @@ Populate intent from: the existing vision field (if any), the conversation_threa
 
 # Running update: what the user reads
 
-The running_update shown above is a journal the user checks in on. You APPEND one entry per cycle; you don't rewrite prior ones. The user acknowledges (clears) when they've caught up.
+The running_update is a **single living markdown document** the user sees as "the project's current state." It is NOT a log of per-cycle entries — you rewrite it each cycle as a clean snapshot, not by appending. The prior version is shown above; refine it. Remove what's now stale, integrate what's now true, keep it short and coherent.
 
-Your entry has four fields:
+Target length: under 400 words. Keep it a document a human actually wants to read.
 
-**whats_changed** (prose, 1-3 paragraphs) — the running update itself. What shifted in the project's state this cycle — model changes, direction ops, capability upgrades, intent shifts, friction that emerged, gaps that closed. Each entry should make sense to a user reading 1-5 cycles of them in sequence. Use direction TITLES, never IDs. Explain WHY, not just WHAT.
+Suggested sections (use them as markdown \`## \` headers unless the project genuinely needs a different shape):
 
-Good: "Opened a gap for strategic cross-cycle memory (your ask from 3 cycles ago, msg-42). Merged the problem-model schema as PR #103 — capability now partial. Retired the auth-middleware direction after 3 rejected PRs in a row; the approach wasn't landing."
+- **What's going on** — one paragraph prose: what this project is currently about, what just shifted, and why. Use direction titles, never IDs. Explain WHY, not just WHAT. If nothing material shifted this cycle, say so in one sentence and say what you're waiting on. Never pad.
+- **What I'm working on** — bullet list, one line per active gap ordered by priority. Each line: direction title, current status, origin at end of line (\`[from your ask, msg-42]\` or \`[on my own initiative]\`). Always populate — if there are no active gaps, the one line names what you're about to start. Never "no gaps"; that reads as idle.
+- **Blockers** — external-user-action items only (credentials, access, major decisions). One line each. Omit the section entirely if empty. NEVER "should I do X" — those you decide yourself.
+- **Next** — 1-2 sentences where the next cycle is headed.
+
+Good paragraph: "We opened a gap for strategic cross-cycle memory (your ask 3 cycles ago, msg-42). The problem-model schema merged as PR #103 — capability now partial. Retired the auth-middleware direction after 3 rejected PRs; the approach wasn't landing."
 
 Bad: "Created 1 direction, retired 1 direction, vision rev 42."
 
-If very little changed, say so and say why: "Nothing material shifted — still waiting on PR #98 to merge before opening the next front." Never pad.
-
-**whats_working_on** (bullet list) — one line per active gap, ordered by priority. Each line names the direction attempting it, current status, and origin at the end of the line. **ALWAYS include this section.** Origin labels distinguish user asks from your own initiative so the user sees the whole picture either way. If there are no active gaps, write ONE line naming what you're about to start and why — never "no gaps," that reads as idle.
-
-Good lines:
-- "Stabilize tactical review loop — direction 'split review into 2-pass' merged, gap closes next cycle [from your ask, msg-42]"
-- "Strategic cross-cycle memory — direction 'problem model v1' in review as PR #103 [on my own initiative]"
-- "Refactor auth middleware — blocked, no active direction; deprioritizing unless you push back [from your ask, 2 cycles ago]"
-
-**blockers** — only if you have items that require external user action (credentials, access, major decisions). One line each. Leave empty otherwise. NEVER "should I do X" — those you decide yourself.
-
-**next_up** (1-2 sentences) — forward-looking. Where the next cycle is headed.
-
 ## User check-in awareness
 
-Use user_last_active_at and running_update_acknowledged_at to shape your entry:
-- User active recently AND acknowledged recently → they're in the loop; be concise.
-- User hasn't acknowledged in many cycles → write with more context; they'll be catching up on multiple cycles at once.
-- Accumulated running_update has 20+ entries without acknowledgement → say so once, not as nag, as info. They may not know to acknowledge.
+Use user_last_active_at and running_update_acknowledged_at to shape your tone:
+- User active recently AND acknowledged recently → they're in the loop; stay concise.
+- User hasn't acknowledged in many cycles → lean toward a fresh-eyes rewrite; they'll be catching up on a lot. But still keep the doc short, not a backlog.
+- The document is NOT a history of cycles. If you find yourself writing "this cycle we..." / "last cycle we...", refactor it into "the project currently..." / "we just...". The user wants current state, not a changelog.
 
 # What to write
 
@@ -1641,14 +1632,14 @@ For each existing gap: open, progressing, or closed? For each new gap you're ope
 ## 3. Moves
 Directions to retire (one-sentence reason each) and to create (name the gap_id each closes + a success condition that would retire it). Parallel moves are fine and encouraged when non-clashing.
 
-## 4. Running update entry (for the user)
-Write the four fields — whats_changed, whats_working_on, blockers, next_up — following the structure above. This gets appended to the project's running_update journal verbatim.
+## 4. Running update document (for the user)
+Write the full refined running_update as markdown to \`/tmp/running_update_${taskId}.md\` (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
 
 ## 5. Self-reflection (optional)
 Only if something this cycle was hard in a way worth remembering. Fields: what_was_hard, missing_context, proposed_self_improvement. Empty is fine. Don't fill with platitudes.
 
 ## 6. Problem model (full replacement)
-Emit the full updated problem_model as JSON. This is the entire model, not a delta — you're replacing the prior state with a new consistent one. The Executor passes it verbatim to the API.
+Write the full updated problem_model as JSON to \`/tmp/problem_model_${taskId}.json\` (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). This is the entire model, not a delta — you're replacing the prior state with a new consistent one. The Executor reads this file verbatim; if it's missing the cycle fails loudly rather than fabricating.
 
 # Problem model shape (quick reference)
 
@@ -1672,11 +1663,22 @@ Before finishing, write /tmp/research_progress_${taskId}.md — a concise markdo
 
     // ── Pass 2: Executor — translate analysis into API calls ──
     // Short, focused pass. The analysis is done. This just calls the tools.
-    fs.writeFileSync(`${WORKSPACE}/CLAUDE.md`,
-      `# Executor Agent\nYour ONLY job is to call ./strategic and ./design-doc commands.\nDo NOT analyze code. Do NOT write prose. Just run the bash commands.\n`
-    );
+    // Note: do NOT overwrite CLAUDE.md here. The executor needs to inherit the
+    // real project CLAUDE.md so the strategic state it writes is grounded in
+    // the managed project. When CLAUDE.md was stripped to a bare "Executor
+    // Agent" role blurb, the executor hallucinated problem_model content
+    // describing its own role instead of the project.
 
-    const executorPrompt = `You are a strategic executor. Your job is to translate the analysis below into API calls, with JUDGMENT — not blind execution. You decide how the analysis maps to operations.
+    const executorPrompt = `# This task's scope
+
+You are applying a strategic analysis that was already produced by a thinker agent. For THIS task only:
+
+- Don't re-analyze the codebase — the thinker did that. Trust its findings unless they're internally inconsistent.
+- Don't write prose output. Your output is bash commands and their results.
+- You retain judgment: verify the thinker's findings against the analysis, construct alternatives when something is missing or malformed, review before submitting. But keep it bounded — this is application, not re-planning.
+- The project you are managing is described in CLAUDE.md (read it if you need grounding). All strategic state you write (problem_model, vision, directions) describes THAT project — never this execution environment, this prompt, your role, or the ./strategic / ./design-doc commands themselves.
+
+You are a strategic executor. Your job is to translate the analysis below into API calls, with JUDGMENT — not blind execution. You decide how the analysis maps to operations.
 
 ## Ownership
 You own this project's direction. The analysis above is your reasoning — now execute it. If the data clearly supports a change, make it. Don't hedge, don't soften, don't ask permission for things the analysis already answered.
@@ -1696,12 +1698,13 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 
 \`\`\`bash
 # REQUIRED: Update the problem model (the strategic source of truth).
-# Pass the full JSON block from the Thinker's Section 6 verbatim.
-./strategic set-problem-model '<full problem_model JSON>'
+# The Thinker wrote the JSON to /tmp/problem_model_${taskId}.json. Read it verbatim.
+./strategic set-problem-model "$(cat /tmp/problem_model_${taskId}.json)"
 
-# REQUIRED: Append to the user's running journal. Use the four fields from
-# the Thinker's Section 4. Server stamps ts + cycle_task_id.
-./strategic append-running-update '{"whats_changed": "...", "whats_working_on": "- line1\\n- line2", "blockers": "", "next_up": "..."}'
+# REQUIRED: Replace the user's running_update document (a living markdown
+# narrative of current state — NOT a log). The Thinker wrote the full
+# refined doc to /tmp/running_update_${taskId}.md; pass the file path.
+./strategic set-running-update /tmp/running_update_${taskId}.md
 
 # Optional: reflect on what was hard this cycle (only if Section 5 has content).
 ./strategic reflect '{"what_was_hard": "...", "missing_context": "...", "proposed_self_improvement": "..."}'
@@ -1735,9 +1738,17 @@ ${analysisText.slice(0, 50_000)}
 
 # Instructions
 
-1. **Problem model (REQUIRED).** Extract the JSON block from Section 6 of the analysis. Pass it VERBATIM to \`./strategic set-problem-model\`. This is the canonical source of truth — EVERY cycle must emit it. Even when little changed, emit the current model so the revision bumps and the cycle is auditable.
+1. **Problem model (REQUIRED).** Primary path: pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\`. Don't summarize or re-emit — read-and-pass.
 
-2. **Running update (REQUIRED).** Extract the four fields from Section 4 (whats_changed, whats_working_on, blockers, next_up). Emit via \`./strategic append-running-update\`. This is the user's journal entry — never skip it. If blockers is empty, pass an empty string \`""\`.
+   Fallback (use judgment): if the file is missing, empty, or the JSON is malformed, you may construct a corrected problem_model yourself — but ground it STRICTLY in the thinker's analysis below (Sections 1-6) and in the project described by CLAUDE.md. Verify findings against the analysis before writing. If even the analysis is insufficient, call \`./strategic pending-confirm\` with type "major_decision" to surface the gap rather than ship bad state. NEVER describe this execution environment, this prompt, your role, or the ./strategic / ./design-doc commands — the problem_model describes the managed project from CLAUDE.md.
+
+   This is the canonical source of truth — EVERY cycle must emit it so the revision bumps and the cycle is auditable.
+
+2. **Running update (REQUIRED).** Primary path: run \`./strategic set-running-update /tmp/running_update_${taskId}.md\`. The helper reads the file and wraps it as a JSON string for the API — don't try to pass markdown as argv.
+
+   Fallback (use judgment): if the file is missing or empty, you may write the markdown yourself to that path before running the command — but ground it STRICTLY in the thinker's Section 4 and in the project described by CLAUDE.md. Describe the MANAGED PROJECT as a current snapshot (what's going on, what you're working on, blockers, next). Never describe this execution environment, this prompt, your role, or the ./strategic / ./design-doc commands.
+
+   This doc is the user's primary view of the project — never skip it.
 
 3. **Direction ops.** From Section 3, retire first, then create/update. For each create, set \`gap_id\` pointing to the gap_id defined in the problem_model. Parallel moves are fine — file the gap_id and let the orchestrator handle concurrency.
 
@@ -1764,18 +1775,18 @@ ${analysisText.slice(0, 50_000)}
     let { exitCode, allOutput, lastResultText } = await runClaudeCode(executorPrompt, ws, statusRef, model, effort, disallowedTools);
 
     // Post-check: verify the executor actually called ./strategic
-    // set-problem-model AND ./strategic append-running-update. These are
+    // set-problem-model AND ./strategic set-running-update. These are
     // the new canonical required calls — problem_model is the strategic
     // source of truth, running_update is the voice to the user. If either
     // is missing the cycle is incomplete; retry once with a focused prompt.
     try {
       const problemModelSetInOutput = /"op"\s*:\s*"set_problem_model"/.test(allOutput);
-      const runningUpdateAppendedInOutput = /"op"\s*:\s*"append_running_update"/.test(allOutput);
+      const runningUpdateSetInOutput = /"op"\s*:\s*"set_running_update"/.test(allOutput);
 
-      if (exitCode === 0 && (!problemModelSetInOutput || !runningUpdateAppendedInOutput)) {
+      if (exitCode === 0 && (!problemModelSetInOutput || !runningUpdateSetInOutput)) {
         const missing: string[] = [];
         if (!problemModelSetInOutput) missing.push('./strategic set-problem-model');
-        if (!runningUpdateAppendedInOutput) missing.push('./strategic append-running-update');
+        if (!runningUpdateSetInOutput) missing.push('./strategic set-running-update');
         sendLog(ws, `\n[WARNING] Strategic executor completed but required calls missing: ${missing.join(', ')}. Retrying...\n`);
         const retryInstructions = [
           'Your previous attempt did not call one or more REQUIRED commands.',
@@ -1783,8 +1794,8 @@ ${analysisText.slice(0, 50_000)}
           `Missing: ${missing.join(', ')}`,
           '',
           'Run these NOW using data from the analysis:',
-          !problemModelSetInOutput ? "- ./strategic set-problem-model '<full problem_model JSON from Section 6, verbatim>'" : '',
-          !runningUpdateAppendedInOutput ? "- ./strategic append-running-update '{\"whats_changed\":\"...\",\"whats_working_on\":\"...\",\"blockers\":\"\",\"next_up\":\"...\"}'" : '',
+          !problemModelSetInOutput ? `- ./strategic set-problem-model "$(cat /tmp/problem_model_${taskId}.json)"  (if file missing: construct from analysis grounded in the managed project — NEVER self-describe)` : '',
+          !runningUpdateSetInOutput ? `- ./strategic set-running-update /tmp/running_update_${taskId}.md  (if file missing: write a single clean markdown doc to that path first — describe the managed project's current state, NEVER self-describe)` : '',
           '',
           'Nothing else.',
         ].filter(Boolean).join('\n');

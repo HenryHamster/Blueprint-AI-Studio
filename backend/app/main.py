@@ -119,7 +119,7 @@ from app.strategic_constants import (  # noqa: E402
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0043"
+EXPECTED_SCHEMA_REVISION = "0044"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -2182,38 +2182,33 @@ async def strategic_operation(
             "diff": pm_diff,
         })
 
-    elif payload.op == "append_running_update":
-        # Append one entry to project.running_update — the user's journal
-        # that persists across cycles until they acknowledge to clear it.
-        from pydantic import ValidationError as _RuValidationError
-
-        from app.problem_model import RunningUpdateEntry, append_running_update
-        if not isinstance(data, dict):
-            raise HTTPException(status_code=400, detail="running_update entry must be an object")
-        try:
-            entry = RunningUpdateEntry.model_validate({
-                "ts": _utcnow().isoformat(),
-                "cycle_task_id": str(task.id),
-                **data,
-            })
-        except _RuValidationError as ve:
-            raise HTTPException(status_code=400, detail=f"Invalid running_update entry: {ve}") from None
-        project.running_update = append_running_update(project.running_update, entry)
-        flag_modified(project, "running_update")
+    elif payload.op == "set_running_update":
+        # Replace project.running_update with a single markdown document the
+        # strategic agent maintains as a living narrative. Rewritten each
+        # cycle — not appended. User acknowledgement only stamps the
+        # timestamp; the document persists and the agent refines it next
+        # cycle. Expects data = {"markdown": "..."}.
+        doc = data.get("markdown") if isinstance(data, dict) else None
+        if not isinstance(doc, str):
+            raise HTTPException(
+                status_code=400,
+                detail="set_running_update requires data={'markdown': '<string>'}",
+            )
+        project.running_update = doc
         session.add(project)
         ctx = task.context or {}
-        task.context = {**ctx, "_strategic_api_called": True, "_strategic_running_update_appended": True}
+        task.context = {**ctx, "_strategic_api_called": True, "_strategic_running_update_set": True}
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
         logger.info(
-            f"[STRATEGIC API] Appended running_update entry for project {project.id} "
-            f"(log size: {len(project.running_update)})"
+            f"[STRATEGIC API] Set running_update for project {project.id} "
+            f"(length: {len(doc)} chars)"
         )
         return _resp({
             "status": "ok",
-            "op": "append_running_update",
-            "log_size": len(project.running_update),
+            "op": "set_running_update",
+            "length": len(doc),
         })
 
     elif payload.op == "reflect":

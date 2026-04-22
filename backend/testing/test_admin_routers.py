@@ -1609,7 +1609,7 @@ class TestProjectEndpointsSurfaceProblemModel:
         project.problem_model = {
             "intent": {"purpose": "Build X.", "current_focus": "Ship Y."},
         }
-        project.running_update = [{"ts": "2026-04-21T00:00:00", "whats_changed": "x"}]
+        project.running_update = "## Current state\nShipping feature X."
         db_session.add(project)
         await db_session.commit()
 
@@ -1622,7 +1622,7 @@ class TestProjectEndpointsSurfaceProblemModel:
         assert "problem_model" in our
         assert our["problem_model"]["intent"]["purpose"] == "Build X."
         assert "running_update" in our
-        assert len(our["running_update"]) == 1
+        assert our["running_update"].startswith("## Current state")
         assert "running_update_acknowledged_at" in our
         assert "self_reflection_log" in our
 
@@ -1704,17 +1704,16 @@ class TestPatchProblemModel:
 
 
 class TestAcknowledgeRunningUpdate:
-    """Acknowledge endpoint clears the running_update list and stamps
-    running_update_acknowledged_at — the user's way to reset the
-    accumulating strategic journal."""
+    """Acknowledge endpoint stamps running_update_acknowledged_at. The
+    running_update document itself persists — the strategic agent refines
+    it on the next cycle rather than starting fresh."""
 
     @pytest.mark.asyncio
-    async def test_acknowledge_clears_entries(self, client: AsyncClient, db_session):
+    async def test_acknowledge_stamps_timestamp_and_preserves_document(
+        self, client: AsyncClient, db_session
+    ):
         project = await _make_project(db_session)
-        project.running_update = [
-            {"ts": "2026-04-20T00:00:00", "whats_changed": "x"},
-            {"ts": "2026-04-21T00:00:00", "whats_changed": "y"},
-        ]
+        project.running_update = "## Current state\nShipping feature X."
         db_session.add(project)
         await db_session.commit()
 
@@ -1724,15 +1723,15 @@ class TestAcknowledgeRunningUpdate:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "acknowledged"
-        assert data["cleared_entries"] == 2
         assert "acknowledged_at" in data
 
         await db_session.refresh(project)
-        assert project.running_update == []
+        # Document persists — only the timestamp updates.
+        assert project.running_update == "## Current state\nShipping feature X."
         assert project.running_update_acknowledged_at is not None
 
     @pytest.mark.asyncio
-    async def test_acknowledge_empty_is_idempotent(
+    async def test_acknowledge_with_empty_document_still_stamps(
         self, client: AsyncClient, db_session
     ):
         project = await _make_project(db_session)
@@ -1740,7 +1739,10 @@ class TestAcknowledgeRunningUpdate:
             f"/api/admin/projects/{project.id}/running-update/acknowledge"
         )
         assert resp.status_code == 200
-        assert resp.json()["cleared_entries"] == 0
+        assert resp.json()["status"] == "acknowledged"
+
+        await db_session.refresh(project)
+        assert project.running_update_acknowledged_at is not None
 
     @pytest.mark.asyncio
     async def test_acknowledge_requires_project_access(

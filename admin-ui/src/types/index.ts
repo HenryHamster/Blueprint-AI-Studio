@@ -7,6 +7,6 @@ export type {
   ProblemModel, Intent, ProjectContext, Capability, Gap, Friction,
   PendingConfirmation, Source, SourceType, GapSize, GapPriority, GapStatus,
   FrictionStatus, PendingConfirmationType, CapabilityStatus,
-  RunningUpdateEntry, SelfReflectionEntry, ProblemModelPatch,
+  SelfReflectionEntry, ProblemModelPatch,
   DirectionsEndpointResponse, GapHistoryEvent, RevisionLogEntry,
 } from './problemModel';
