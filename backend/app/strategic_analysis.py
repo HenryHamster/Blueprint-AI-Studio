@@ -480,3 +480,67 @@ def _build_strategic_effectiveness(directions: list, vision: dict) -> dict:
         "strategic_failures": vision.get("_strategic_failures", 0),
         "cycles": cycle_metrics,
     }
+
+
+def _compute_prediction_calibration_factor(
+    project, lookback_cycles: int = 5, min_samples: int = 3
+) -> float:
+    """Compute a scaling factor to correct systematic bias in merge predictions.
+
+    Walks the last ``lookback_cycles`` completed strategic cycles that have
+    ``created_predictions`` stored. For each direction whose prediction included
+    a non-zero ``similar_past_merges`` value, computes the ratio of actual
+    current merges to that predicted value. The mean ratio across all such
+    data points is the raw factor.
+
+    When fewer than ``min_samples`` data points are available, the result is
+    blended toward 1.0 proportionally so that sparse history does not produce
+    wild swings. The final value is clipped to [0.5, 1.5].
+
+    Returns:
+        float < 1.0  — predictions have been optimistic (over-predicting merges)
+        float == 1.0 — no history or predictions are well-calibrated
+        float > 1.0  — predictions have been pessimistic (under-predicting merges)
+    """
+    cycle_history = (project.vision or {}).get("_strategic_cycle_history") or []
+    directions_by_id = {
+        d.get("id"): d for d in (project.directions or []) if d.get("id")
+    }
+
+    ratios: list = []
+    cycles_seen = 0
+
+    for entry in reversed(cycle_history):
+        if entry.get("outcome") != "completed":
+            continue
+        created_predictions = entry.get("created_predictions") or {}
+        if not created_predictions:
+            continue
+        cycles_seen += 1
+        if cycles_seen > lookback_cycles:
+            break
+        for direction_id, prediction in created_predictions.items():
+            predicted = prediction.get("similar_past_merges") or 0
+            if predicted <= 0:
+                continue
+            d = directions_by_id.get(direction_id)
+            if d is None:
+                continue
+            history = d.get("research_history") or []
+            agg = d.get("history_aggregate") or {}
+            actual = (
+                sum(h.get("prs_merged", 0) for h in history)
+                + (agg.get("total_prs_merged") or 0)
+            )
+            ratios.append(actual / predicted)
+
+    if not ratios:
+        return 1.0
+
+    raw = sum(ratios) / len(ratios)
+    n = len(ratios)
+    if n < min_samples:
+        weight = n / min_samples
+        raw = weight * raw + (1.0 - weight) * 1.0
+
+    return max(0.5, min(1.5, round(raw, 4)))

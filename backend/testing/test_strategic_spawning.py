@@ -1616,3 +1616,61 @@ async def test_design_doc_update_payload_omits_playbook_archive(db_session):
     dd = payload["design_doc"]
     assert "playbook_archive" not in dd
     assert dd["summary"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_payload_includes_calibration_factor(db_session):
+    """prediction_calibration_factor and note are always present in strategic payload."""
+    project = _make_project(
+        vision={"purpose": "test", "_strategic_cycle_history": []},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    assert "prediction_calibration_factor" in payload
+    assert "prediction_calibration_note" in payload
+    assert isinstance(payload["prediction_calibration_factor"], float)
+    assert isinstance(payload["prediction_calibration_note"], str)
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_calibration_factor_reflects_history(db_session):
+    """Factor < 1.0 when recent cycles consistently over-predicted merges."""
+    directions = [
+        {"id": f"d{i}", "status": "active", "text": f"direction {i}", "priority": "medium",
+         "research_history": [{"prs_merged": 1}]}
+        for i in range(3)
+    ]
+    cycles = [
+        {
+            "cycle_id": f"sc-{i}",
+            "outcome": "completed",
+            "created_direction_ids": [f"d{i}"],
+            "created_predictions": {f"d{i}": {"similar_past_merges": 10}},
+        }
+        for i in range(3)
+    ]
+    project = _make_project(
+        directions=directions,
+        vision={"purpose": "test", "_strategic_cycle_history": cycles},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    factor = payload["prediction_calibration_factor"]
+    assert factor < 1.0, f"Expected factor < 1.0 for over-prediction history, got {factor}"
+    assert "optimistic" in payload["prediction_calibration_note"]

@@ -96,12 +96,17 @@ _PRED_STOPWORDS = {
 }
 
 
-def _build_creation_prediction(direction: dict, project: Project) -> Dict[str, Any]:
+def _build_creation_prediction(
+    direction: dict, project: Project, calibration_factor: float = 1.0
+) -> Dict[str, Any]:
     """Record initial signals available at direction creation time.
 
     Captures text-length-based difficulty proxy, project system maturity, and
     merge history from lexically similar past directions. Used later by
     _build_previous_decision_outcomes to compute calibration error.
+
+    ``calibration_factor`` scales similar_past_merges to correct for historical
+    over/under-prediction bias; computed by _compute_prediction_calibration_factor.
     """
     text = direction.get("text") or ""
     text_len = len(text)
@@ -117,7 +122,7 @@ def _build_creation_prediction(direction: dict, project: Project) -> Dict[str, A
         if isinstance(s, dict) and s.get("status") in ("functional", "mature")
     )
     words = set(text.lower().split()) - _PRED_STOPWORDS
-    similar_past_merges = 0
+    similar_past_merges_raw = 0
     similar_count = 0
     own_id = direction.get("id")
     for d in (project.directions or []):
@@ -127,16 +132,20 @@ def _build_creation_prediction(direction: dict, project: Project) -> Dict[str, A
         if len(words) >= 2 and len(words & other_words) >= 3:
             similar_count += 1
             for h in d.get("research_history") or []:
-                similar_past_merges += h.get("prs_merged", 0)
+                similar_past_merges_raw += h.get("prs_merged", 0)
             agg = d.get("history_aggregate") or {}
-            similar_past_merges += agg.get("total_prs_merged") or 0
-    return {
+            similar_past_merges_raw += agg.get("total_prs_merged") or 0
+    similar_past_merges = round(similar_past_merges_raw * calibration_factor)
+    result: Dict[str, Any] = {
         "estimated_difficulty": estimated_difficulty,
         "text_length": text_len,
         "mature_system_count": mature,
         "similar_direction_count": similar_count,
         "similar_past_merges": similar_past_merges,
     }
+    if calibration_factor != 1.0:
+        result["calibration_factor_applied"] = calibration_factor
+    return result
 
 
 def _build_retirement_metrics(direction: dict) -> Dict[str, Any]:
@@ -154,12 +163,14 @@ def _build_retirement_metrics(direction: dict) -> Dict[str, Any]:
 def _collect_creation_predictions(
     project: Project, direction_ids: list
 ) -> Dict[str, Dict[str, Any]]:
+    from app.strategic_analysis import _compute_prediction_calibration_factor  # noqa: PLC0415
+    calibration_factor = _compute_prediction_calibration_factor(project)
     by_id = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
     result: Dict[str, Dict[str, Any]] = {}
     for did in direction_ids:
         d = by_id.get(did)
         if d is not None:
-            result[did] = _build_creation_prediction(d, project)
+            result[did] = _build_creation_prediction(d, project, calibration_factor=calibration_factor)
     return result
 
 

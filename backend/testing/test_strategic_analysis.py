@@ -1,7 +1,7 @@
-"""Tests for _build_outcome_evaluation in app.strategic_analysis."""
+"""Tests for _build_outcome_evaluation and _compute_prediction_calibration_factor in app.strategic_analysis."""
 import pytest
 from unittest.mock import patch
-from app.strategic_analysis import _build_outcome_evaluation
+from app.strategic_analysis import _build_outcome_evaluation, _compute_prediction_calibration_factor
 from app.direction_metrics import _compute_difficulty_index
 
 
@@ -809,3 +809,171 @@ def test_strategic_effectiveness_keeps_only_last_5_cycles():
     eff = result["strategic_effectiveness"]
     assert eff["cycles_evaluated"] == 5
     assert [c["cycle_id"] for c in eff["cycles"]] == ["c3", "c4", "c5", "c6", "c7"]
+
+
+# ---------------------------------------------------------------------------
+# _compute_prediction_calibration_factor tests
+# ---------------------------------------------------------------------------
+
+class TestPredictionCalibrationFactor:
+    def test_no_history_returns_one(self):
+        project = _make_project(vision={})
+        assert _compute_prediction_calibration_factor(project) == 1.0
+
+    def test_empty_cycle_history_returns_one(self):
+        project = _make_project(vision={"_strategic_cycle_history": []})
+        assert _compute_prediction_calibration_factor(project) == 1.0
+
+    def test_completed_cycles_with_zero_predicted_returns_one(self):
+        project = _make_project(
+            directions=[{"id": "d1", "research_history": [{"prs_merged": 5}]}],
+            vision={
+                "_strategic_cycle_history": [{
+                    "outcome": "completed",
+                    "created_predictions": {"d1": {"similar_past_merges": 0}},
+                }]
+            },
+        )
+        assert _compute_prediction_calibration_factor(project) == 1.0
+
+    def test_insufficient_history_blends_toward_one(self):
+        # 1 data point (< min_samples=3) with ratio=0.0 should blend toward 1.0
+        project = _make_project(
+            directions=[{"id": "d1", "research_history": [{"prs_merged": 0}]}],
+            vision={
+                "_strategic_cycle_history": [{
+                    "outcome": "completed",
+                    "created_predictions": {"d1": {"similar_past_merges": 10}},
+                }]
+            },
+        )
+        factor = _compute_prediction_calibration_factor(project)
+        # With 1 sample, raw=0.0, weight=1/3, blended = (1/3)*0 + (2/3)*1 = 0.667
+        assert 0.6 < factor < 0.8
+
+    def test_systematic_over_prediction_factor_below_one(self):
+        # Three cycles each predicting 10 merges but only 3 happen → ratio 0.3 each
+        directions = [
+            {"id": f"d{i}", "research_history": [{"prs_merged": 3}]}
+            for i in range(3)
+        ]
+        cycles = [
+            {
+                "outcome": "completed",
+                "created_predictions": {f"d{i}": {"similar_past_merges": 10}},
+            }
+            for i in range(3)
+        ]
+        project = _make_project(directions=directions, vision={"_strategic_cycle_history": cycles})
+        factor = _compute_prediction_calibration_factor(project)
+        assert factor < 1.0, f"Expected factor < 1.0 for over-prediction, got {factor}"
+        assert factor >= 0.5
+
+    def test_systematic_under_prediction_factor_above_one(self):
+        # Three cycles each predicting 2 merges but 8 happen → ratio 4.0 each
+        directions = [
+            {"id": f"d{i}", "research_history": [{"prs_merged": 8}]}
+            for i in range(3)
+        ]
+        cycles = [
+            {
+                "outcome": "completed",
+                "created_predictions": {f"d{i}": {"similar_past_merges": 2}},
+            }
+            for i in range(3)
+        ]
+        project = _make_project(directions=directions, vision={"_strategic_cycle_history": cycles})
+        factor = _compute_prediction_calibration_factor(project)
+        assert factor > 1.0, f"Expected factor > 1.0 for under-prediction, got {factor}"
+        assert factor <= 1.5
+
+    def test_extreme_over_prediction_clips_to_minimum(self):
+        # Predict 100, actual 0 → ratio 0.0, well below 0.5 clip floor
+        directions = [
+            {"id": f"d{i}", "research_history": [{"prs_merged": 0}]}
+            for i in range(5)
+        ]
+        cycles = [
+            {
+                "outcome": "completed",
+                "created_predictions": {f"d{i}": {"similar_past_merges": 100}},
+            }
+            for i in range(5)
+        ]
+        project = _make_project(directions=directions, vision={"_strategic_cycle_history": cycles})
+        factor = _compute_prediction_calibration_factor(project)
+        assert factor == 0.5
+
+    def test_extreme_under_prediction_clips_to_maximum(self):
+        # Predict 1, actual 1000 → ratio 1000.0, well above 1.5 clip ceiling
+        directions = [
+            {"id": f"d{i}", "research_history": [{"prs_merged": 1000}]}
+            for i in range(5)
+        ]
+        cycles = [
+            {
+                "outcome": "completed",
+                "created_predictions": {f"d{i}": {"similar_past_merges": 1}},
+            }
+            for i in range(5)
+        ]
+        project = _make_project(directions=directions, vision={"_strategic_cycle_history": cycles})
+        factor = _compute_prediction_calibration_factor(project)
+        assert factor == 1.5
+
+    def test_only_completed_cycles_are_used(self):
+        # Failed/in-progress cycles should be ignored
+        direction = {"id": "d1", "research_history": [{"prs_merged": 1}]}
+        project = _make_project(
+            directions=[direction],
+            vision={
+                "_strategic_cycle_history": [
+                    {
+                        "outcome": "failed",
+                        "created_predictions": {"d1": {"similar_past_merges": 100}},
+                    },
+                    {
+                        "outcome": "completed",
+                        "created_predictions": {"d1": {"similar_past_merges": 1}},
+                    },
+                ]
+            },
+        )
+        # Only the completed cycle matters: actual=1, predicted=1 → ratio=1.0
+        # But 1 sample < min_samples=3 → blends toward 1.0 anyway
+        factor = _compute_prediction_calibration_factor(project)
+        # ratio=1.0, weight=1/3, blended = 1.0
+        assert factor == 1.0
+
+    def test_lookback_respects_cycle_cap(self):
+        # 10 completed cycles, all with ratio=0.1 (over-predicting)
+        # but lookback_cycles=2 means only the last 2 should count
+        directions = [{"id": f"d{i}", "research_history": [{"prs_merged": 1}]} for i in range(10)]
+        cycles = [
+            {
+                "outcome": "completed",
+                "created_predictions": {f"d{i}": {"similar_past_merges": 10}},
+            }
+            for i in range(10)
+        ]
+        project = _make_project(directions=directions, vision={"_strategic_cycle_history": cycles})
+        # With lookback_cycles=2, we get 2 data points, both with ratio=0.1
+        # 2 < min_samples=3 → weight=2/3, blended = (2/3)*0.1 + (1/3)*1.0 ≈ 0.4
+        # Clipped to 0.5
+        factor = _compute_prediction_calibration_factor(project, lookback_cycles=2)
+        assert factor == 0.5  # clipped
+
+    def test_missing_direction_skipped(self):
+        # Direction referenced in prediction no longer exists → skip
+        project = _make_project(
+            directions=[],  # direction removed
+            vision={
+                "_strategic_cycle_history": [
+                    {
+                        "outcome": "completed",
+                        "created_predictions": {"d-gone": {"similar_past_merges": 5}},
+                    }
+                ]
+            },
+        )
+        assert _compute_prediction_calibration_factor(project) == 1.0

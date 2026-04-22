@@ -820,8 +820,17 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     review_effort = _runtime_config.get("task_type_efforts", {}).get("strategic_review") or \
                     _runtime_config.get("task_type_efforts", {}).get("research") or None
 
-    from app.strategic_analysis import _build_outcome_evaluation  # noqa: PLC0415
+    from app.strategic_analysis import _build_outcome_evaluation, _compute_prediction_calibration_factor  # noqa: PLC0415
     last_strategic_at = await _find_last_strategic_cycle_time(project, session)
+    calibration_factor = _compute_prediction_calibration_factor(project)
+    if abs(calibration_factor - 1.0) < 0.05:
+        calibration_note = f"Predictions are well-calibrated (factor {calibration_factor})."
+    elif calibration_factor < 1.0:
+        pct = round((1.0 - calibration_factor) * 100)
+        calibration_note = f"Predictions have been running ~{pct}% optimistic — factor {calibration_factor} applied to future merge estimates."
+    else:
+        pct = round((calibration_factor - 1.0) * 100)
+        calibration_note = f"Predictions have been running ~{pct}% conservative — factor {calibration_factor} applied to future merge estimates."
     recent_interventions = await _build_recent_interventions(
         project, session, last_strategic_at=last_strategic_at
     )
@@ -842,6 +851,8 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "directions_summary": direction_stats,
         "outcome_evaluation": _build_outcome_evaluation(project),
         "recent_interventions": recent_interventions,
+        "prediction_calibration_factor": calibration_factor,
+        "prediction_calibration_note": calibration_note,
         **({"previous_decision_outcomes": _prev_outcomes}
            if (_prev_outcomes := _build_previous_decision_outcomes(project)) else {}),
         **({"anomaly_summary": _anomaly_summary}
