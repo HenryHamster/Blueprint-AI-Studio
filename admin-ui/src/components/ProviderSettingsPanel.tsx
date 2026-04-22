@@ -15,6 +15,11 @@ interface SchemaNode {
   additionalProperties?: boolean;
   items?: SchemaNode;
   default?: unknown;
+  // Extensions used by our settings_schema to drive UX: inline hint copy and
+  // suggested-but-not-required values for free-text fields (rendered as a
+  // <datalist> so the user gets autocomplete without losing custom input).
+  description?: string;
+  examples?: readonly string[];
 }
 
 type UpdateDefaults = (value: ProviderSettingsDefaults) => void | Promise<void>;
@@ -196,6 +201,19 @@ interface SchemaFormProps {
   allowInherit: boolean;
 }
 
+// Cross-field constraints: some fields only make sense in combination with
+// specific values of other fields. Returning a non-null string disables the
+// field in the UI and shows the reason; the backend will also ignore it, but
+// catching it at the UI layer keeps the operator from setting a dead knob.
+function crossFieldLock(key: string, bag: ProviderSettingsBag): string | null {
+  // Anthropic: advisor only makes sense with a non-opus executor, because
+  // opus+opus advisor is silently ignored by settings_to_cli.
+  if (key === 'advisor' && bag.model === 'claude-opus-4-7') {
+    return 'Advisor only applies when the executor model is sonnet or haiku.';
+  }
+  return null;
+}
+
 function SchemaForm({ schema, value, onChange, allowInherit }: SchemaFormProps) {
   if (schema.type !== 'object' || !schema.properties) {
     return null;
@@ -208,6 +226,7 @@ function SchemaForm({ schema, value, onChange, allowInherit }: SchemaFormProps) 
         const propSchema = properties[key];
         const present = key in value;
         const currentVal = value[key];
+        const lockReason = crossFieldLock(key, value);
         return (
           <FieldRow
             key={key}
@@ -216,6 +235,7 @@ function SchemaForm({ schema, value, onChange, allowInherit }: SchemaFormProps) 
             value={currentVal}
             present={present}
             allowInherit={allowInherit}
+            lockReason={lockReason}
             onChange={(next, removed) => {
               if (removed) {
                 const pruned = Object.fromEntries(
@@ -239,12 +259,14 @@ interface FieldRowProps {
   value: unknown;
   present: boolean;
   allowInherit: boolean;
+  lockReason?: string | null;
   onChange: (value: unknown, removed?: boolean) => void;
 }
 
-function FieldRow({ label, schema, value, present, allowInherit, onChange }: FieldRowProps) {
+function FieldRow({ label, schema, value, present, allowInherit, lockReason, onChange }: FieldRowProps) {
   const overridden = present;
-  const effectiveDisabled = allowInherit && !overridden;
+  const locked = Boolean(lockReason);
+  const effectiveDisabled = locked || (allowInherit && !overridden);
 
   const toggleOverride = () => {
     if (overridden) {
@@ -263,13 +285,22 @@ function FieldRow({ label, schema, value, present, allowInherit, onChange }: Fie
 
   return (
     <div className="grid grid-cols-[160px_1fr_auto] gap-3 items-start py-1.5">
-      <label className="text-xs text-neutral-400 pt-1.5 font-mono truncate" title={label}>
+      <label className="text-xs text-neutral-400 pt-1.5 font-mono truncate" title={schema.description || label}>
         {label}
       </label>
       <div className={`${effectiveDisabled ? 'opacity-40 pointer-events-none' : ''}`}>
         <Field schema={schema} value={value} onChange={onChange} />
+        {lockReason ? (
+          <div className="mt-1 text-[11px] text-amber-400 leading-snug italic">
+            {lockReason}
+          </div>
+        ) : schema.description && (
+          <div className="mt-1 text-[11px] text-neutral-500 leading-snug">
+            {schema.description}
+          </div>
+        )}
       </div>
-      {allowInherit && (
+      {allowInherit && !locked && (
         <button
           onClick={toggleOverride}
           className={`text-[10px] px-2 py-1 rounded border ${
@@ -364,14 +395,28 @@ function Field({ schema, value, onChange }: { schema: SchemaNode; value: unknown
     );
   }
 
-  // Fallback: free-text string
+  // Fallback: free-text string. When the schema declares `examples`, wire a
+  // <datalist> so the user gets autocomplete suggestions without losing the
+  // ability to type a custom value (useful for preview-model names, etc).
+  const hasExamples = schema.examples && schema.examples.length > 0;
+  const listId = hasExamples
+    ? `datalist-${schema.examples!.slice(0, 3).join('-').replace(/[^a-zA-Z0-9-]/g, '')}`
+    : undefined;
   return (
-    <input
-      type="text"
-      value={(value as string) ?? ''}
-      onChange={e => onChange(e.target.value || undefined)}
-      className="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
-    />
+    <>
+      <input
+        type="text"
+        value={(value as string) ?? ''}
+        onChange={e => onChange(e.target.value || undefined)}
+        list={listId}
+        className="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
+      />
+      {hasExamples && (
+        <datalist id={listId}>
+          {schema.examples!.map(ex => <option key={ex} value={ex} />)}
+        </datalist>
+      )}
+    </>
   );
 }
 

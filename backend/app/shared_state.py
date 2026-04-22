@@ -108,32 +108,29 @@ runtime_config: Dict = {
             "haiku": "gemini-2.5-flash-lite",
         },
     },
-    # Per-task-type provider allow-list. Defaults to every provider so adding
-    # an account to the pool actually puts it into rotation without requiring
-    # a config change. Narrow a given task type to a single provider (e.g.
-    # {"research": ["anthropic"]}) if merge-rate data shows that's better.
+    # Task-type categories group related types so provider preferences can be
+    # set by batch instead of per-type. Categories are advisory — a task type
+    # not listed here still resolves via _default below.
+    "task_type_categories": {
+        "strategic": ["strategic_review", "design_doc_update", "research", "plan"],
+        "build": ["create", "refactor", "migrate"],
+        "review": ["review", "qa", "security_audit", "perf", "debug", "fix"],
+        "ops": ["docs", "deps", "smoketest"],
+    },
+    # Provider preference by category. Used as a fallback when a task type
+    # doesn't have its own entry in task_type_provider_preference. The
+    # "_default" entry wins when no category match either.
+    "provider_preference_by_category": {
+        "_default": ["anthropic", "openai", "gemini"],
+        # e.g. "build": ["anthropic"] to pin all code-writing tasks.
+    },
+    # Sparse per-task-type overrides — wins over category + _default. Leave
+    # empty to inherit the category/default allow-list for every task type.
     # The list is interpreted by `provider_selection_mode`:
     #   - balanced  → all listed providers' accounts pooled, picked by health + load
     #   - preferred → strict ordering; fall through on exhaustion
     #   - exclusive → first listed provider only, no fallback
-    "task_type_provider_preference": {
-        "strategic_review": ["anthropic", "openai", "gemini"],
-        "design_doc_update": ["anthropic", "openai", "gemini"],
-        "research": ["anthropic", "openai", "gemini"],
-        "create": ["anthropic", "openai", "gemini"],
-        "refactor": ["anthropic", "openai", "gemini"],
-        "plan": ["anthropic", "openai", "gemini"],
-        "review": ["anthropic", "openai", "gemini"],
-        "fix": ["anthropic", "openai", "gemini"],
-        "qa": ["anthropic", "openai", "gemini"],
-        "deps": ["anthropic", "openai", "gemini"],
-        "docs": ["anthropic", "openai", "gemini"],
-        "migrate": ["anthropic", "openai", "gemini"],
-        "security_audit": ["anthropic", "openai", "gemini"],
-        "perf": ["anthropic", "openai", "gemini"],
-        "smoketest": ["anthropic", "openai", "gemini"],
-        "debug": ["anthropic", "openai", "gemini"],
-    },
+    "task_type_provider_preference": {},
     # Optional per-task-type concrete model priority overrides. When present,
     # selection uses these ordered {provider, model} pairs before falling back
     # to provider preference + quality tier resolution.
@@ -347,6 +344,8 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                 for key in (
                     "provider_tier_model_map",
                     "task_type_provider_preference",
+                    "task_type_categories",
+                    "provider_preference_by_category",
                     "task_type_model_preferences",
                     "provider_selection_mode",
                     "cross_provider_fallback_enabled",

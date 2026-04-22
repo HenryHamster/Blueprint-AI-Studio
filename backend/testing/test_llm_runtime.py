@@ -426,6 +426,64 @@ async def test_select_llm_runtime_preferred_mode_honors_list_order(clean_runtime
 
 
 @pytest.mark.asyncio
+async def test_resolve_provider_preference_falls_through_category_to_default(clean_runtime_pool):
+    """Resolution layers (most specific wins): per-task ctx → per-type →
+    category → _default → ALL_PROVIDERS. Verify the category tier by
+    configuring just a category override."""
+    from app.max_plan_pool import resolve_task_provider_preference
+
+    runtime_config = {
+        "task_type_categories": {"build": ["create", "refactor"], "review": ["fix"]},
+        "provider_preference_by_category": {
+            "build": ["anthropic"],
+            "_default": ["anthropic", "openai", "gemini"],
+        },
+        "task_type_provider_preference": {},
+    }
+
+    # "create" is in the "build" category → anthropic only.
+    assert resolve_task_provider_preference(
+        _task(payload={"type": "create"}), runtime_config
+    ) == ["anthropic"]
+
+    # "fix" is in the "review" category, no category-level override → _default.
+    assert resolve_task_provider_preference(
+        _task(payload={"type": "fix"}), runtime_config
+    ) == ["anthropic", "openai", "gemini"]
+
+    # Unknown task type → no category → _default.
+    assert resolve_task_provider_preference(
+        _task(payload={"type": "novel_type"}), runtime_config
+    ) == ["anthropic", "openai", "gemini"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_provider_preference_per_task_override_wins_over_category(clean_runtime_pool):
+    """A per-task-type entry in task_type_provider_preference beats the
+    category-level default even when the category also has a value."""
+    from app.max_plan_pool import resolve_task_provider_preference
+
+    runtime_config = {
+        "task_type_categories": {"build": ["create", "refactor"]},
+        "provider_preference_by_category": {
+            "build": ["anthropic"],
+            "_default": ["anthropic", "openai", "gemini"],
+        },
+        # Per-task narrowing for "create" specifically.
+        "task_type_provider_preference": {"create": ["openai", "anthropic"]},
+    }
+
+    # create → per-task override wins.
+    assert resolve_task_provider_preference(
+        _task(payload={"type": "create"}), runtime_config
+    ) == ["openai", "anthropic"]
+    # refactor → still inherits category since there's no per-task entry.
+    assert resolve_task_provider_preference(
+        _task(payload={"type": "refactor"}), runtime_config
+    ) == ["anthropic"]
+
+
+@pytest.mark.asyncio
 async def test_select_llm_runtime_balanced_mode_honors_narrowed_allow_list(clean_runtime_pool):
     """Narrowing task_type_provider_preference to one provider must keep that
     provider even under balanced mode — the mode controls how to pick among

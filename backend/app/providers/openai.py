@@ -93,40 +93,63 @@ class OpenAIProvider(LLMProvider):
         return SecretMaterial(env={"OPENAI_API_KEY": secret or "", "CODEX_API_KEY": secret or ""})
 
     def settings_schema(self) -> dict[str, Any]:
+        # Intentionally tight surface: only the knobs worth tuning in practice.
+        # Sandbox mode / approval prompts are NOT exposed because anything
+        # other than full-access stalls the agent VM waiting for an operator
+        # that never arrives — handled in settings_to_cli below.
         return {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "model": {"type": "string"},
+                "model": {
+                    "type": "string",
+                    "description": (
+                        "Codex CLI model. Pick a tier default or type a custom name "
+                        "(e.g. a preview model). Leave blank to inherit the tier "
+                        "mapping from provider_tier_model_map."
+                    ),
+                    "examples": ["gpt-5", "gpt-4.1", "gpt-4o-mini"],
+                },
                 "reasoning_effort": {
                     "type": "string",
                     "enum": ["minimal", "low", "medium", "high", "xhigh"],
+                    "description": (
+                        "How much Codex thinks before answering. `minimal`/`low` = fast "
+                        "but shallower; `high`/`xhigh` = deeper planning at higher cost "
+                        "and latency."
+                    ),
                 },
                 "verbosity": {
                     "type": "string",
                     "enum": ["low", "medium", "high"],
-                },
-                "reasoning_summary": {
-                    "type": "string",
-                    "enum": ["auto", "concise", "detailed", "none"],
+                    "description": (
+                        "Output length. `low` for terse completions; `high` when you "
+                        "need prose explanations alongside code."
+                    ),
                 },
                 "service_tier": {
                     "type": "string",
                     "enum": ["flex", "fast"],
+                    "description": (
+                        "`flex` = cheaper but higher latency when OpenAI is under load. "
+                        "`fast` = priority routing at standard price."
+                    ),
                 },
                 "web_search": {
                     "type": "string",
                     "enum": ["disabled", "cached", "live"],
+                    "description": (
+                        "Let Codex fetch web content while solving. `disabled` (offline); "
+                        "`cached` (reuse prior fetches); `live` (fresh, billable)."
+                    ),
                 },
-                "personality": {
-                    "type": "string",
-                    "enum": ["none", "friendly", "pragmatic"],
+                "tool_output_token_limit": {
+                    "type": "integer",
+                    "description": (
+                        "Truncate tool-call output past this many tokens. Guards against "
+                        "a runaway `cat huge_log.txt` blowing the context window."
+                    ),
                 },
-                "sandbox_mode": {
-                    "type": "string",
-                    "enum": ["read-only", "workspace-write", "danger-full-access"],
-                },
-                "tool_output_token_limit": {"type": "integer"},
             },
         }
 
@@ -137,6 +160,11 @@ class OpenAIProvider(LLMProvider):
         model = bag.get("model")
         if isinstance(model, str):
             args += ["-m", model]
+
+        # Agent VMs are ephemeral and isolated — sandboxing inside them would
+        # only stall the agent on permission prompts that nobody is there to
+        # answer. Hardcode the "yolo" mode; don't accept a config override.
+        args += ["-s", "danger-full-access"]
 
         # Codex exposes every non-model knob via -c key=value (TOML override).
         config_pairs: list[tuple[str, str]] = []
@@ -149,10 +177,6 @@ class OpenAIProvider(LLMProvider):
         if isinstance(verbosity, str):
             config_pairs.append(("model_verbosity", f'"{verbosity}"'))
 
-        summary = bag.get("reasoning_summary")
-        if isinstance(summary, str):
-            config_pairs.append(("model_reasoning_summary", f'"{summary}"'))
-
         service_tier = bag.get("service_tier")
         if isinstance(service_tier, str):
             config_pairs.append(("service_tier", f'"{service_tier}"'))
@@ -160,14 +184,6 @@ class OpenAIProvider(LLMProvider):
         web_search = bag.get("web_search")
         if isinstance(web_search, str):
             config_pairs.append(("web_search", f'"{web_search}"'))
-
-        personality = bag.get("personality")
-        if isinstance(personality, str):
-            config_pairs.append(("personality", f'"{personality}"'))
-
-        sandbox_mode = bag.get("sandbox_mode")
-        if isinstance(sandbox_mode, str):
-            args += ["-s", sandbox_mode]
 
         tool_limit = bag.get("tool_output_token_limit")
         if isinstance(tool_limit, int) and tool_limit > 0:

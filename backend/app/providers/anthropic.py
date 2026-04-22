@@ -76,6 +76,9 @@ class AnthropicProvider(LLMProvider):
         return SecretMaterial(env={"CLAUDE_CODE_OAUTH_TOKEN": secret or ""})
 
     def settings_schema(self) -> dict[str, Any]:
+        # Permission mode is intentionally NOT exposed: anything other than
+        # bypassPermissions stalls the agent VM waiting on an approval that
+        # won't come. Hardcoded in settings_to_cli below.
         return {
             "type": "object",
             "additionalProperties": False,
@@ -87,19 +90,28 @@ class AnthropicProvider(LLMProvider):
                         "claude-sonnet-4-6",
                         "claude-haiku-4-5-20251001",
                     ],
+                    "description": (
+                        "Concrete model. Leave blank to inherit the tier mapping from "
+                        "provider_tier_model_map."
+                    ),
                 },
                 "effort": {
                     "type": "string",
                     "enum": ["low", "medium", "high", "xhigh", "max"],
+                    "description": (
+                        "How hard Claude thinks before acting. Higher = deeper planning, "
+                        "more cost, more latency. `max` routes to xhigh at the CLI layer."
+                    ),
                 },
-                "thinking_summary": {
-                    "type": "string",
-                    "enum": ["summarized", "omitted"],
-                },
-                "max_budget_usd": {"type": "number"},
-                "permission_mode": {
-                    "type": "string",
-                    "enum": ["default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto"],
+                "max_budget_usd": {
+                    "type": "number",
+                    "description": (
+                        "Hard stop on token spend for this task. Enforced by Claude "
+                        "Code CLI by multiplying streamed token counts against "
+                        "Anthropic's list prices — it's a real-time cutoff, not a "
+                        "pre-run estimate, but it tracks list prices so negotiated "
+                        "rates will differ. 0 or blank = unlimited."
+                    ),
                 },
                 "fallback_model": {
                     "type": "string",
@@ -108,11 +120,30 @@ class AnthropicProvider(LLMProvider):
                         "claude-sonnet-4-6",
                         "claude-haiku-4-5-20251001",
                     ],
+                    "description": (
+                        "Model to fall back to when the primary is rate-limited. "
+                        "Typically a cheaper tier (e.g. sonnet when opus is over quota)."
+                    ),
                 },
-                "betas": {"type": "array", "items": {"type": "string"}},
+                "betas": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Anthropic beta feature flags (API-key auth only). Comma-"
+                        "separated. Most users leave this empty."
+                    ),
+                },
                 "advisor": {
                     "type": "object",
                     "additionalProperties": False,
+                    "description": (
+                        "Pair a non-opus executor with an opus-class advisor. ONLY "
+                        "meaningful when the executor model is sonnet or haiku — "
+                        "enabling advisor while executor is opus is silently ignored. "
+                        "The Claude Code CLI can't wire a real advisor tool, so we "
+                        "inject a prompt fragment telling the executor an advisor "
+                        "exists in principle."
+                    ),
                     "properties": {
                         "enabled": {"type": "boolean"},
                         "model": {
@@ -145,9 +176,10 @@ class AnthropicProvider(LLMProvider):
         if isinstance(fallback_model, str):
             args += ["--fallback-model", fallback_model]
 
-        permission_mode = bag.get("permission_mode")
-        if isinstance(permission_mode, str):
-            args += ["--permission-mode", permission_mode]
+        # Agent VMs are ephemeral and isolated; any permission mode other than
+        # bypassPermissions stalls the agent waiting for an operator that won't
+        # come. Not user-configurable — hardcode it.
+        args += ["--permission-mode", "bypassPermissions"]
 
         max_budget = bag.get("max_budget_usd")
         if isinstance(max_budget, (int, float)) and max_budget > 0:
@@ -174,12 +206,6 @@ class AnthropicProvider(LLMProvider):
                     "committing to non-trivial approaches."
                 )
                 unsupported.append("advisor.enabled (fallback: prompt fragment only)")
-
-        thinking_summary = bag.get("thinking_summary")
-        if thinking_summary is not None:
-            # Claude Code exposes `showThinkingSummaries` only in settings.json,
-            # which we don't materialize per-call; log and move on.
-            unsupported.append("thinking_summary (settings.json only)")
 
         return CLITranslation(
             env=env,

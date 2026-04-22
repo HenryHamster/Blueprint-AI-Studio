@@ -115,6 +115,12 @@ class GeminiProvider(LLMProvider):
         return SecretMaterial(env={"GEMINI_API_KEY": secret or ""})
 
     def settings_schema(self) -> dict[str, Any]:
+        # Approval mode / sandbox / safety filters / sampling knobs are
+        # intentionally NOT exposed:
+        #  - approval_mode != yolo stalls the agent VM on unanswered prompts
+        #    (hardcoded in settings_to_cli below).
+        #  - sandbox is redundant — the VM is already isolated and disposable.
+        #  - temperature/top_p/safety are rarely touched and add noise.
         return {
             "type": "object",
             "additionalProperties": False,
@@ -130,38 +136,31 @@ class GeminiProvider(LLMProvider):
                         "gemini-3.1-pro-preview",
                         "gemini-3.1-flash-preview",
                     ],
+                    "description": (
+                        "Concrete model. Leave blank to inherit the tier mapping from "
+                        "provider_tier_model_map."
+                    ),
                 },
-                "thinking_budget": {"type": "integer"},
-                "include_thoughts": {"type": "boolean"},
-                "temperature": {"type": "number"},
-                "top_p": {"type": "number"},
-                "max_output_tokens": {"type": "integer"},
-                "approval_mode": {
-                    "type": "string",
-                    "enum": ["default", "auto_edit", "yolo", "plan"],
+                "thinking_budget": {
+                    "type": "integer",
+                    "description": (
+                        "Token budget Gemini spends on internal reasoning before "
+                        "answering. Higher = deeper analysis, more cost and latency."
+                    ),
                 },
-                "sandbox": {"type": "boolean"},
-                "safety": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "harassment": {
-                            "type": "string",
-                            "enum": ["OFF", "BLOCK_NONE", "BLOCK_ONLY_HIGH", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_LOW_AND_ABOVE"],
-                        },
-                        "hate_speech": {
-                            "type": "string",
-                            "enum": ["OFF", "BLOCK_NONE", "BLOCK_ONLY_HIGH", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_LOW_AND_ABOVE"],
-                        },
-                        "sexually_explicit": {
-                            "type": "string",
-                            "enum": ["OFF", "BLOCK_NONE", "BLOCK_ONLY_HIGH", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_LOW_AND_ABOVE"],
-                        },
-                        "dangerous_content": {
-                            "type": "string",
-                            "enum": ["OFF", "BLOCK_NONE", "BLOCK_ONLY_HIGH", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_LOW_AND_ABOVE"],
-                        },
-                    },
+                "include_thoughts": {
+                    "type": "boolean",
+                    "description": (
+                        "Surface Gemini's reasoning trace in the output stream. "
+                        "Useful for debugging weird behavior; noisy for normal runs."
+                    ),
+                },
+                "max_output_tokens": {
+                    "type": "integer",
+                    "description": (
+                        "Hard cap on response length. Keep generous (8k+) unless you "
+                        "really want to truncate."
+                    ),
                 },
             },
         }
@@ -189,31 +188,9 @@ class GeminiProvider(LLMProvider):
         if thinking_config:
             generate_config["thinkingConfig"] = thinking_config
 
-        temperature = bag.get("temperature")
-        if isinstance(temperature, (int, float)):
-            generate_config["temperature"] = temperature
-        top_p = bag.get("top_p")
-        if isinstance(top_p, (int, float)):
-            generate_config["topP"] = top_p
         max_tokens = bag.get("max_output_tokens")
         if isinstance(max_tokens, int):
             generate_config["maxOutputTokens"] = max_tokens
-
-        safety = bag.get("safety")
-        if isinstance(safety, Mapping) and safety:
-            safety_settings = []
-            mapping = {
-                "harassment": "HARM_CATEGORY_HARASSMENT",
-                "hate_speech": "HARM_CATEGORY_HATE_SPEECH",
-                "sexually_explicit": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                "dangerous_content": "HARM_CATEGORY_DANGEROUS_CONTENT",
-            }
-            for key, category in mapping.items():
-                threshold = safety.get(key)
-                if isinstance(threshold, str):
-                    safety_settings.append({"category": category, "threshold": threshold})
-            if safety_settings:
-                generate_config["safetySettings"] = safety_settings
 
         if generate_config and isinstance(model, str):
             # Write a settings.json with a custom alias that layers our generation
@@ -241,13 +218,11 @@ class GeminiProvider(LLMProvider):
         elif isinstance(model, str):
             args += ["-m", model]
 
-        approval_mode = bag.get("approval_mode")
-        if isinstance(approval_mode, str):
-            args += [f"--approval-mode={approval_mode}"]
-
-        sandbox = bag.get("sandbox")
-        if isinstance(sandbox, bool) and sandbox:
-            args += ["--sandbox"]
+        # Agent VMs are ephemeral and isolated; any approval mode other than
+        # yolo stalls the agent on an approval that never arrives. Not user-
+        # configurable — hardcode it. Sandbox intentionally omitted because
+        # the VM itself IS the sandbox.
+        args += ["--approval-mode=yolo"]
 
         return CLITranslation(
             env=env,

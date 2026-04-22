@@ -101,6 +101,8 @@ async def get_settings(
         "autonomous_research_interval_minutes": _runtime_config.get("autonomous_research_interval_minutes", 30),
         "provider_tier_model_map": _runtime_config.get("provider_tier_model_map", {}),
         "task_type_provider_preference": _runtime_config.get("task_type_provider_preference", {}),
+        "task_type_categories": _runtime_config.get("task_type_categories", {}),
+        "provider_preference_by_category": _runtime_config.get("provider_preference_by_category", {}),
         "task_type_model_preferences": _runtime_config.get("task_type_model_preferences", {}),
         "provider_selection_mode": _provider_selection_mode_from_config(_runtime_config),
         "cross_provider_fallback_enabled": _provider_selection_mode_from_config(_runtime_config) in ("balanced", "preferred"),
@@ -267,6 +269,7 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             raise HTTPException(status_code=400, detail="task_type_provider_preference must be a dict")
         valid_providers = {p.value for p in LLMProviderName}
         for task_type, providers in val.items():
+            # "_default" is accepted as a catch-all key for global fallback.
             if not isinstance(task_type, str) or not task_type:
                 raise HTTPException(status_code=400, detail="task_type_provider_preference keys must be non-empty strings")
             if not isinstance(providers, list) or not all(isinstance(p, str) for p in providers):
@@ -275,6 +278,31 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             if invalid:
                 raise HTTPException(status_code=400, detail=f"Invalid providers for {task_type}: {', '.join(invalid)}")
         _runtime_config["task_type_provider_preference"] = val
+    if "task_type_categories" in payload:
+        val = payload["task_type_categories"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="task_type_categories must be a dict")
+        for category, members in val.items():
+            if not isinstance(category, str) or not category or category == "_default":
+                raise HTTPException(status_code=400, detail="task_type_categories keys must be non-empty strings and not '_default'")
+            if not isinstance(members, list) or not all(isinstance(m, str) and m for m in members):
+                raise HTTPException(status_code=400, detail=f"task_type_categories[{category}] must be a list of task-type strings")
+        _runtime_config["task_type_categories"] = val
+    if "provider_preference_by_category" in payload:
+        val = payload["provider_preference_by_category"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="provider_preference_by_category must be a dict")
+        valid_providers = {p.value for p in LLMProviderName}
+        for category, providers in val.items():
+            # "_default" is accepted as the global fallback key.
+            if not isinstance(category, str) or not category:
+                raise HTTPException(status_code=400, detail="provider_preference_by_category keys must be non-empty strings")
+            if not isinstance(providers, list) or not all(isinstance(p, str) for p in providers):
+                raise HTTPException(status_code=400, detail=f"provider_preference_by_category[{category}] must be a list of strings")
+            invalid = [p for p in providers if p not in valid_providers]
+            if invalid:
+                raise HTTPException(status_code=400, detail=f"Invalid providers for category {category}: {', '.join(invalid)}")
+        _runtime_config["provider_preference_by_category"] = val
     if "task_type_model_preferences" in payload:
         val = payload["task_type_model_preferences"]
         if not isinstance(val, dict):
@@ -613,6 +641,8 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                 state.runtime_config_json = {
                     "provider_tier_model_map": _runtime_config.get("provider_tier_model_map", {}),
                     "task_type_provider_preference": _runtime_config.get("task_type_provider_preference", {}),
+                    "task_type_categories": _runtime_config.get("task_type_categories", {}),
+                    "provider_preference_by_category": _runtime_config.get("provider_preference_by_category", {}),
                     "task_type_model_preferences": _runtime_config.get("task_type_model_preferences", {}),
                     "provider_selection_mode": _provider_selection_mode_from_config(_runtime_config),
                     "cross_provider_fallback_enabled": _provider_selection_mode_from_config(_runtime_config) in ("balanced", "preferred"),

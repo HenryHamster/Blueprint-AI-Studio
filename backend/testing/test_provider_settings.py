@@ -5,6 +5,8 @@ async def test_get_settings_includes_provider_scaffolding(client):
     body = res.json()
     assert "provider_tier_model_map" in body
     assert "task_type_provider_preference" in body
+    assert "task_type_categories" in body
+    assert "provider_preference_by_category" in body
     assert "task_type_model_preferences" in body
     assert "provider_selection_mode" in body
     assert body["provider_selection_mode"] in ("balanced", "preferred", "exclusive")
@@ -15,9 +17,12 @@ async def test_get_settings_includes_provider_scaffolding(client):
     assert "provider_settings_defaults" in body
     assert "task_type_provider_overrides" in body
     assert body["provider_tier_model_map"]["anthropic"]["opus"] == "claude-opus-4-7"
-    # Default allow-list is every provider so newly-added accounts get used
-    # without a config change; narrow via admin UI when needed.
-    assert body["task_type_provider_preference"]["create"] == ["anthropic", "openai", "gemini"]
+    # Categories ship with sensible defaults; user can move task types
+    # between them via the admin PATCH endpoint.
+    assert "build" in body["task_type_categories"]
+    assert "create" in body["task_type_categories"]["build"]
+    # _default is the global allow-list that every provider falls back to.
+    assert body["provider_preference_by_category"]["_default"] == ["anthropic", "openai", "gemini"]
     assert "service_account" in body["providers"]["gemini"]["auth_modes"]
     assert body["providers"]["gemini"]["auth_modes"]["service_account"]["required_metadata_fields"] == ["project", "location"]
 
@@ -172,6 +177,45 @@ async def test_patch_settings_legacy_cross_provider_fallback_boolean_shim(client
     body = (await client.get("/api/admin/settings")).json()
     assert body["provider_selection_mode"] == "preferred"
     assert body["cross_provider_fallback_enabled"] is True
+
+
+async def test_patch_settings_accepts_category_preference_edits(client):
+    # Users can rearrange categories + per-category preferences freely.
+    payload = {
+        "task_type_categories": {
+            "coding": ["create", "refactor", "fix"],
+            "analysis": ["research", "review"],
+        },
+        "provider_preference_by_category": {
+            "_default": ["anthropic", "openai", "gemini"],
+            "coding": ["anthropic"],
+            "analysis": ["anthropic", "openai"],
+        },
+    }
+    res = await client.patch("/api/admin/settings", json=payload)
+    assert res.status_code == 200, res.text
+    body = (await client.get("/api/admin/settings")).json()
+    assert body["task_type_categories"]["coding"] == ["create", "refactor", "fix"]
+    assert body["provider_preference_by_category"]["coding"] == ["anthropic"]
+    assert body["provider_preference_by_category"]["_default"] == ["anthropic", "openai", "gemini"]
+
+
+async def test_patch_settings_rejects_reserved_default_key_as_category_name(client):
+    res = await client.patch(
+        "/api/admin/settings",
+        json={"task_type_categories": {"_default": ["create"]}},
+    )
+    assert res.status_code == 400
+    assert "_default" in res.text
+
+
+async def test_patch_settings_rejects_invalid_provider_in_category_preference(client):
+    res = await client.patch(
+        "/api/admin/settings",
+        json={"provider_preference_by_category": {"coding": ["anthropic", "fakeprov"]}},
+    )
+    assert res.status_code == 400
+    assert "fakeprov" in res.text
 
 
 async def test_patch_settings_mode_wins_over_legacy_boolean_in_same_payload(client):

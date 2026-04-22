@@ -180,24 +180,70 @@ ALL_PROVIDERS: tuple[str, ...] = tuple(p.value for p in LLMProviderName)
 _VALID_SELECTION_MODES: frozenset[str] = frozenset({"balanced", "preferred", "exclusive"})
 
 
+def _normalize_provider_list(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    values = [_normalize_provider_name(v) for v in raw]
+    return [v for v in values if v]
+
+
+def _category_for_task_type(task_type: str, runtime_config: Mapping[str, Any]) -> str | None:
+    """Return the first category whose member list contains ``task_type``.
+
+    task_type_categories is ``{category_name: [task_types...]}``. The first
+    match wins — categories are expected to partition task types, but if a
+    user's config overlaps we pick deterministically by dict order.
+    """
+    categories = runtime_config.get("task_type_categories", {}) or {}
+    if not isinstance(categories, Mapping):
+        return None
+    for cat_name, members in categories.items():
+        if not isinstance(cat_name, str) or not isinstance(members, list):
+            continue
+        if task_type in members:
+            return cat_name
+    return None
+
+
 def resolve_task_provider_preference(task: Any, runtime_config: Mapping[str, Any]) -> list[str]:
+    """Resolve the provider allow-list for a task, walking the config layers.
+
+    Order (most specific wins):
+      1. task.context.provider_preference — per-task explicit override
+      2. task_type_provider_preference[task_type] — per-task-type override
+      3. provider_preference_by_category[category_of(task_type)] — batch config
+      4. provider_preference_by_category["_default"] — global default
+      5. task_type_provider_preference["_default"] — legacy global default key
+      6. ALL_PROVIDERS — safety net so new accounts get used out of the box
+    """
     ctx = _task_context(task)
-    explicit = ctx.get("provider_preference")
-    if isinstance(explicit, list):
-        values = [_normalize_provider_name(v) for v in explicit]
-        resolved = [v for v in values if v]
-        if resolved:
-            return resolved
+    resolved = _normalize_provider_list(ctx.get("provider_preference"))
+    if resolved:
+        return resolved
+
     task_type = _task_type(task)
-    configured = (runtime_config.get("task_type_provider_preference", {}) or {}).get(task_type)
-    if isinstance(configured, list):
-        values = [_normalize_provider_name(v) for v in configured]
-        resolved = [v for v in values if v]
+    per_type = runtime_config.get("task_type_provider_preference", {}) or {}
+    if isinstance(per_type, Mapping):
+        resolved = _normalize_provider_list(per_type.get(task_type))
         if resolved:
             return resolved
-    # Default allow-list is every provider so newly-added accounts get used
-    # without a config change. Narrow via task_type_provider_preference if a
-    # given task type is better served by a subset.
+
+    by_category = runtime_config.get("provider_preference_by_category", {}) or {}
+    if isinstance(by_category, Mapping):
+        category = _category_for_task_type(task_type, runtime_config)
+        if category:
+            resolved = _normalize_provider_list(by_category.get(category))
+            if resolved:
+                return resolved
+        resolved = _normalize_provider_list(by_category.get("_default"))
+        if resolved:
+            return resolved
+
+    if isinstance(per_type, Mapping):
+        resolved = _normalize_provider_list(per_type.get("_default"))
+        if resolved:
+            return resolved
+
     return list(ALL_PROVIDERS)
 
 

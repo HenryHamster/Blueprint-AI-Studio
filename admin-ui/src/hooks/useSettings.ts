@@ -40,6 +40,8 @@ export function useSettings(addToast: AddToast) {
   });
   const [providerTierModelMap, setProviderTierModelMap] = useState<Record<string, Record<string, string>>>({});
   const [taskTypeProviderPreference, setTaskTypeProviderPreference] = useState<Record<string, ProviderName[]>>({});
+  const [taskTypeCategories, setTaskTypeCategories] = useState<Record<string, string[]>>({});
+  const [providerPreferenceByCategory, setProviderPreferenceByCategory] = useState<Record<string, ProviderName[]>>({});
   const [taskTypeModelPreferences, setTaskTypeModelPreferences] = useState<Record<string, ModelPreference[]>>({});
   const [providerSelectionMode, setProviderSelectionMode] = useState<'balanced' | 'preferred' | 'exclusive'>('balanced');
   const [crossProviderFallbackEnabled, setCrossProviderFallbackEnabled] = useState(true);
@@ -70,6 +72,8 @@ export function useSettings(addToast: AddToast) {
         setMaxPlanAccounts(data.max_plan_accounts || []);
         setProviderTierModelMap(data.provider_tier_model_map ?? {});
         setTaskTypeProviderPreference(data.task_type_provider_preference ?? {});
+        setTaskTypeCategories(data.task_type_categories ?? {});
+        setProviderPreferenceByCategory(data.provider_preference_by_category ?? {});
         setTaskTypeModelPreferences(data.task_type_model_preferences ?? {});
         const rawMode = data.provider_selection_mode;
         const resolvedMode: 'balanced' | 'preferred' | 'exclusive' =
@@ -270,6 +274,30 @@ export function useSettings(addToast: AddToast) {
       console.error('Failed to update provider preference:', err);
       setTaskTypeProviderPreference(prev);
       addToast('Failed to update provider preference', 'error');
+    }
+  };
+
+  const updateTaskTypeCategories = async (value: Record<string, string[]>) => {
+    const prev = taskTypeCategories;
+    setTaskTypeCategories(value);
+    try {
+      await patchSettings({ task_type_categories: value });
+    } catch (err) {
+      console.error('Failed to update task-type categories:', err);
+      setTaskTypeCategories(prev);
+      addToast('Failed to update task-type categories', 'error');
+    }
+  };
+
+  const updateProviderPreferenceByCategory = async (value: Record<string, ProviderName[]>) => {
+    const prev = providerPreferenceByCategory;
+    setProviderPreferenceByCategory(value);
+    try {
+      await patchSettings({ provider_preference_by_category: value });
+    } catch (err) {
+      console.error('Failed to update provider preference by category:', err);
+      setProviderPreferenceByCategory(prev);
+      addToast('Failed to update category provider preference', 'error');
     }
   };
 
@@ -569,6 +597,7 @@ export function useSettings(addToast: AddToast) {
     autoArchiveMaxTerminalTasksPerProject, autoArchiveIntervalMinutes,
     notificationConfig,
     providerTierModelMap, taskTypeProviderPreference, taskTypeModelPreferences,
+    taskTypeCategories, providerPreferenceByCategory,
     providerSelectionMode,
     crossProviderFallbackEnabled, providers,
     providerSettingsDefaults, setProviderSettingsDefaults,
@@ -581,6 +610,7 @@ export function useSettings(addToast: AddToast) {
     connectGitHub,
     updateAgentPromptSuffixes,
     updateProviderTierModels, updateTaskTypeProviderPreferences, updateTaskTypeModelPreferenceConfig,
+    updateTaskTypeCategories, updateProviderPreferenceByCategory,
     updateProviderSelectionMode,
     updateCrossProviderFallback,
     updateProviderSettingsDefaults, updateTaskTypeProviderOverrides,

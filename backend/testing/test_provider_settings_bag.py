@@ -60,21 +60,35 @@ def test_openai_schema_rejects_invalid_reasoning_effort():
         provider.validate_settings({"reasoning_effort": "extreme"})
 
 
-def test_gemini_schema_accepts_nested_safety():
+def test_gemini_schema_accepts_core_knobs():
+    # Safety filters, temperature, top_p, approval_mode and sandbox were
+    # removed from the user-facing schema: safety/sampling are rarely touched
+    # and add noise; approval_mode/sandbox must always resolve to the fully-
+    # permissive flag (hardcoded in settings_to_cli) because anything else
+    # stalls the ephemeral agent VM waiting on an operator.
     provider = get_provider(LLMProviderName.GEMINI)
     validated = provider.validate_settings({
         "model": "gemini-2.5-pro",
         "thinking_budget": 4096,
-        "temperature": 0.3,
-        "safety": {"harassment": "BLOCK_ONLY_HIGH"},
+        "include_thoughts": False,
+        "max_output_tokens": 8192,
     })
-    assert validated["safety"]["harassment"] == "BLOCK_ONLY_HIGH"
+    assert validated["thinking_budget"] == 4096
+    assert validated["include_thoughts"] is False
 
 
-def test_gemini_schema_rejects_unknown_safety_category():
+def test_gemini_schema_rejects_removed_safety_key():
     provider = get_provider(LLMProviderName.GEMINI)
     with pytest.raises(ValueError, match="unknown key"):
-        provider.validate_settings({"safety": {"something_else": "OFF"}})
+        provider.validate_settings({"safety": {"harassment": "OFF"}})
+
+
+def test_gemini_schema_rejects_removed_sampling_keys():
+    provider = get_provider(LLMProviderName.GEMINI)
+    with pytest.raises(ValueError, match="unknown key"):
+        provider.validate_settings({"temperature": 0.5})
+    with pytest.raises(ValueError, match="unknown key"):
+        provider.validate_settings({"top_p": 0.9})
 
 
 def test_schema_validator_accepts_null_values_for_optional_scalars():
@@ -175,9 +189,11 @@ def test_manifest_includes_translation_even_when_bag_is_empty_dict():
         provider_settings={},
     )
     assert manifest["env"]["LLM_SETTINGS"] == "{}"
-    # Translation is present but args list is empty since no knobs to translate.
     translation = json.loads(manifest["env"]["LLM_CLI_TRANSLATION"])
-    assert translation["args"] == []
+    # Even with an empty bag the CLI args always include the hardcoded
+    # permission-mode flag — anything less stalls the agent VM on approval
+    # prompts that won't come.
+    assert translation["args"] == ["--permission-mode", "bypassPermissions"]
 
 
 def test_resolve_settings_handles_missing_provider_block_in_defaults():
@@ -319,10 +335,10 @@ def test_gemini_cli_translation_writes_settings_alias_for_thinking():
     translation = provider.settings_to_cli({
         "model": "gemini-2.5-pro",
         "thinking_budget": 8192,
-        "temperature": 0.2,
+        "max_output_tokens": 4096,
     })
-    # Gemini CLI has no per-call thinking/temperature flags; must materialize
-    # a settings.json custom alias and invoke `-m <alias>`.
+    # Gemini CLI has no per-call thinking flags; must materialize a
+    # settings.json custom alias and invoke `-m <alias>`.
     assert len(translation.settings_files) == 1
     settings_file = translation.settings_files[0]
     assert settings_file.path.endswith(".gemini/settings.json")
@@ -330,19 +346,22 @@ def test_gemini_cli_translation_writes_settings_alias_for_thinking():
     alias = next(iter(parsed["modelConfigs"]["customAliases"].values()))
     assert alias["modelConfig"]["model"] == "gemini-2.5-pro"
     assert alias["modelConfig"]["generateContentConfig"]["thinkingConfig"]["thinkingBudget"] == 8192
-    assert alias["modelConfig"]["generateContentConfig"]["temperature"] == 0.2
+    assert alias["modelConfig"]["generateContentConfig"]["maxOutputTokens"] == 4096
     # Args should reference the alias, not the raw model.
     assert "-m" in translation.args
     m_index = list(translation.args).index("-m")
     assert translation.args[m_index + 1] != "gemini-2.5-pro"
+    # Approval mode is hardcoded to yolo on every Gemini invocation.
+    assert "--approval-mode=yolo" in translation.args
 
 
 def test_gemini_cli_translation_model_only_uses_direct_flag():
     provider = get_provider(LLMProviderName.GEMINI)
     translation = provider.settings_to_cli({"model": "gemini-2.5-flash"})
     # No generation-config tunables → no settings.json, just -m <model>.
+    # Approval-mode is always yolo — a stalled VM helps nobody.
     assert not translation.settings_files
-    assert list(translation.args) == ["-m", "gemini-2.5-flash"]
+    assert list(translation.args) == ["-m", "gemini-2.5-flash", "--approval-mode=yolo"]
 
 
 # ---------------------------------------------------------------------------
@@ -370,13 +389,16 @@ def test_resolve_task_provider_settings_three_layer_merge():
             "review": {"anthropic": {"effort": "high"}},
         },
     }
-    task = _make_task("review", payload_settings={"anthropic": {"permission_mode": "plan"}})
+    # Use max_budget_usd for the payload-layer demonstration; permission_mode
+    # used to live here but was retired — it's now hardcoded in the CLI
+    # translation so users can't accidentally stall an agent VM.
+    task = _make_task("review", payload_settings={"anthropic": {"max_budget_usd": 5.0}})
 
     resolved = resolve_task_provider_settings(task, runtime_config, "anthropic")
 
     assert resolved["model"] == "claude-opus-4-7"      # from defaults
     assert resolved["effort"] == "high"                # task-type override wins
-    assert resolved["permission_mode"] == "plan"       # payload wins
+    assert resolved["max_budget_usd"] == 5.0           # payload wins
 
 
 def test_resolve_task_provider_settings_payload_beats_task_type():
