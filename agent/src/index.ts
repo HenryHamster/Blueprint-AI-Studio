@@ -1,4 +1,5 @@
 import { spawn, execFileSync } from 'child_process';
+import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import WebSocket from 'ws';
@@ -144,6 +145,64 @@ export class RateLimitError extends Error {
     super(message);
     this.name = 'RateLimitError';
   }
+}
+
+// ── OAuth credential rotation (agent → backend) ──────────────────────────────
+//
+// Some CLIs (currently Codex) refresh their OAuth tokens in-place during a
+// run by rewriting `auth.json`. The refreshed token lives only on the
+// ephemeral VM unless we propagate it back to the backend — on the next
+// task, the backend would re-push the pre-refresh token and the upstream
+// provider may reject it (invalid_grant) if it rotated the refresh token
+// on the last use.
+//
+// hashFileOrNull + the module-level `initialOAuthAuthHash` let us detect
+// the in-run mutation cheaply and skip the POST when nothing changed.
+
+const OAUTH_AUTH_PATH_BY_PROVIDER: Partial<Record<ProviderName, string>> = {
+  openai: '/opt/agent/openai/auth.json',
+};
+
+function hashFileOrNull(path: string): string | null {
+  try {
+    const raw = fs.readFileSync(path);
+    return createHash('sha256').update(raw).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+let initialOAuthAuthHash: string | null = null;
+
+export function recordInitialOAuthAuthHash(): void {
+  const path = OAUTH_AUTH_PATH_BY_PROVIDER[PROVIDER];
+  if (!path || AUTH_MODE !== 'oauth') {
+    initialOAuthAuthHash = null;
+    return;
+  }
+  initialOAuthAuthHash = hashFileOrNull(path);
+}
+
+export async function rotateOAuthCredentialsIfChanged(taskId: string): Promise<void> {
+  const path = OAUTH_AUTH_PATH_BY_PROVIDER[PROVIDER];
+  if (!path || AUTH_MODE !== 'oauth') return;
+  if (!fs.existsSync(path)) return;
+  const currentHash = hashFileOrNull(path);
+  if (currentHash === null) return;
+  if (initialOAuthAuthHash !== null && currentHash === initialOAuthAuthHash) {
+    // Unchanged — nothing to rotate.
+    return;
+  }
+  let contents: string;
+  try {
+    contents = fs.readFileSync(path, 'utf-8');
+  } catch (e) {
+    throw new Error(`read ${path} failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  await apiPost('/api/agent/credentials/rotate', { secret: contents, task_id: taskId });
+  // Update the initial hash so a follow-up error path doesn't re-POST the
+  // same blob twice. Defensive; the backend is idempotent regardless.
+  initialOAuthAuthHash = currentHash;
 }
 
 // Thrown when the 45-minute kill timer fires. Carries a distinct failure
@@ -1149,11 +1208,61 @@ export function parseFailingTests(output: string): Set<string> {
       const id = trimmed.slice('FAILED '.length).split(' - ')[0].trim();
       if (id) failing.add(id);
     }
-    // vitest: "✕ test description" or "× test description" or "✗ test description"
+    // vitest: "✕ test description" or "× test description" or "✗ test description".
+    // Fallback only — prefer parseFailingTestsFromVitestJson when available,
+    // since stdout scanning mis-classifies simulated failure output inside
+    // passing tests (a test that verifies failure-formatting logic can print
+    // a mocked "✕ foo" line that this regex matches even though the real
+    // test passed).
     const vitestMatch = trimmed.match(/^[✕✗×]\s+(.+)$/u);
     if (vitestMatch) failing.add(vitestMatch[1].trim());
   }
   return failing;
+}
+
+// Minimal vitest JSON reporter shape — we only need the failed-test names.
+// Full schema at https://vitest.dev/guide/reporters.html#json-reporter; these
+// fields are stable across vitest 2.x/3.x.
+interface VitestJsonReport {
+  testResults?: Array<{
+    name?: string;
+    assertionResults?: Array<{
+      fullName?: string;
+      title?: string;
+      status?: 'passed' | 'failed' | 'skipped' | 'pending' | 'todo';
+    }>;
+  }>;
+}
+
+/**
+ * Extract failing test IDs from a vitest JSON reporter file. Returns the
+ * fullName (or title) of every assertion with status="failed". Preferred
+ * over stdout scanning because stdout can contain false-positive markers
+ * from inside passing tests' mocked output.
+ */
+export function parseFailingTestsFromVitestJson(jsonText: string): Set<string> {
+  const failing = new Set<string>();
+  let parsed: VitestJsonReport;
+  try {
+    parsed = JSON.parse(jsonText) as VitestJsonReport;
+  } catch {
+    return failing;
+  }
+  for (const file of parsed.testResults ?? []) {
+    for (const assertion of file.assertionResults ?? []) {
+      if (assertion.status === 'failed') {
+        const id = (assertion.fullName || assertion.title || '').trim();
+        if (id) failing.add(id);
+      }
+    }
+  }
+  return failing;
+}
+
+function isVitestRunner(cwd: string): boolean {
+  return fs.existsSync(`${cwd}/vitest.config.ts`) ||
+    fs.existsSync(`${cwd}/vitest.config.js`) ||
+    fs.existsSync(`${cwd}/vitest.config.mjs`);
 }
 
 /**
@@ -1305,19 +1414,49 @@ export async function testFixLoop(
     statusRef.value = attempt === 0 ? 'Running test suite...' : `Re-running tests (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})...`;
     sendLog(ws, `Running tests (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})...\n`);
 
-    const failures: string[] = [];
+    // structuredIds is populated for vitest runners from the JSON reporter
+    // output file. When present, baseline comparison uses it as the source
+    // of truth for WHICH tests failed, bypassing stdout pattern matching
+    // (which mis-classifies mocked failure output inside passing tests).
+    const failures: Array<{ label: string; message: string; structuredIds?: Set<string> }> = [];
     const taskId = process.env.TASK_ID || '';
     for (const runner of runners) {
-      try {
-        // Ensure node_modules are present for npm-based runners; runProjectLintChecks
-        // installs them in the normal agent flow but testFixLoop may be called
-        // standalone (e.g. from the Blueprint harness) without that step having run.
-        if (runner.cmd === 'npm' && !fs.existsSync(`${runner.cwd}/node_modules`)) {
-          sendLog(ws, `Installing dependencies for ${runner.label}...\n`);
+      // Setup step: ensure node_modules exist for npm runners. A failure
+      // HERE is NOT a test failure — it's dep-install breakage (registry
+      // flake, lockfile drift, disk, postinstall crash). The Claude fix
+      // loop can't meaningfully repair these, so skip the runner and
+      // keep moving. Previously this was bundled into the same try/catch
+      // as the test run, which made npm ci failures trigger the fix loop
+      // with no hope of success.
+      if (runner.cmd === 'npm' && !fs.existsSync(`${runner.cwd}/node_modules`)) {
+        sendLog(ws, `Installing dependencies for ${runner.label}...\n`);
+        try {
           await execFileAsync('npm', ['ci'], { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+        } catch (installErr) {
+          const msg = installErr instanceof Error ? installErr.message : String(installErr);
+          sendLog(
+            ws,
+            `WARNING: Dependency install failed for [${runner.label}] — ` +
+            `setup error, not a fixable test failure. Skipping runner.\n` +
+            `${msg.slice(0, 500)}\n`,
+          );
+          continue;
         }
+      }
+      // For vitest runners, request the JSON reporter alongside default
+      // (human-readable) output — the JSON file is the authoritative source
+      // of failed-test IDs, stdout is kept for operator diagnosis.
+      const useVitestJson = runner.cmd === 'npm' && isVitestRunner(runner.cwd);
+      const jsonOutputPath = useVitestJson
+        ? `/tmp/vitest-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`
+        : null;
+      const runArgs = jsonOutputPath
+        ? [...runner.args, '--', '--reporter=default', '--reporter=json', `--outputFile=${jsonOutputPath}`]
+        : runner.args;
+
+      try {
         sendHeartbeatSync(taskId, `Running tests [${runner.label}]...`);
-        await execFileAsync(runner.cmd, runner.args, { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+        await execFileAsync(runner.cmd, runArgs, { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
         sendLog(ws, `Tests passed [${runner.label}].\n`);
       } catch (testErr: unknown) {
         // If the runner timed out (killed by the process-group SIGTERM/SIGKILL
@@ -1333,7 +1472,21 @@ export async function testFixLoop(
           continue;
         }
         const msg = testErr instanceof Error ? testErr.message : String(testErr);
-        failures.push(`[${runner.label}]:\n${msg}`);
+        let structuredIds: Set<string> | undefined;
+        if (jsonOutputPath && fs.existsSync(jsonOutputPath)) {
+          try {
+            const jsonText = fs.readFileSync(jsonOutputPath, 'utf-8');
+            structuredIds = parseFailingTestsFromVitestJson(jsonText);
+          } catch {
+            // Fall back to stdout scanning via parseFailingTests downstream.
+          }
+        }
+        failures.push({ label: runner.label, message: msg, structuredIds });
+      } finally {
+        // Don't leave per-run temp files behind (cheap, but they accumulate).
+        if (jsonOutputPath) {
+          try { fs.unlinkSync(jsonOutputPath); } catch { /* already gone */ }
+        }
       }
     }
 
@@ -1342,18 +1495,25 @@ export async function testFixLoop(
       return { passed: true, testFailuresDetected: false };
     }
 
+    // Serialize each failure for operator-facing output. This same format
+    // fed the old pattern matcher; it's still used as a fallback when we
+    // don't have structured IDs (non-vitest runners).
+    const renderFailure = (f: { label: string; message: string }) => `[${f.label}]:\n${f.message}`;
+
     // When baseline is available, separate new failures from pre-existing ones.
     // A failure block is pre-existing when all parsed test IDs within it appear
     // in the baseline. Unparseable failures (size=0) are treated as new (safe default).
-    let fixableFailures = failures;
+    let fixableFailures: Array<{ label: string; message: string; structuredIds?: Set<string> }> = failures;
     let preExistingNote = '';
 
     if (baselineFailures) {
-      const newFailures: string[] = [];
-      const preExistingFailures: string[] = [];
+      const newFailures: typeof failures = [];
+      const preExistingFailures: typeof failures = [];
 
       for (const failure of failures) {
-        const failureIds = parseFailingTests(failure);
+        // Structured IDs (from vitest JSON reporter) win over stdout parsing.
+        // Fall back to parseFailingTests only when JSON wasn't available.
+        const failureIds = failure.structuredIds ?? parseFailingTests(failure.message);
         const isAllPreExisting = failureIds.size > 0 &&
           Array.from(failureIds).every(id => baselineFailures.has(id));
         if (isAllPreExisting) {
@@ -1371,11 +1531,11 @@ export async function testFixLoop(
 
       fixableFailures = newFailures;
       if (preExistingFailures.length > 0) {
-        preExistingNote = `\n\nNote: The following test failures existed BEFORE your changes — do not attempt to fix these:\n${preExistingFailures.join('\n\n').slice(0, 1500)}`;
+        preExistingNote = `\n\nNote: The following test failures existed BEFORE your changes — do not attempt to fix these:\n${preExistingFailures.map(renderFailure).join('\n\n').slice(0, 1500)}`;
       }
     }
 
-    const combinedFailures = fixableFailures.join('\n\n');
+    const combinedFailures = fixableFailures.map(renderFailure).join('\n\n');
     const fingerprint = errorFingerprint(combinedFailures);
     if (prevFingerprint !== null && fingerprint === prevFingerprint) {
       sendLog(ws, `Test failures unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
@@ -1454,6 +1614,7 @@ function buildBaseCliEnv(): Record<string, string> {
     'GOOGLE_APPLICATION_CREDENTIALS',
     'GOOGLE_CLOUD_PROJECT',
     'GOOGLE_CLOUD_LOCATION',
+    'GOOGLE_GENAI_USE_VERTEXAI',
     'ORCHESTRATOR_URL',
     'TASK_ID',
   ]) {
@@ -1506,15 +1667,23 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         return (baseEnv.OPENAI_API_KEY || baseEnv.CODEX_API_KEY) ? [] : ['OPENAI_API_KEY or CODEX_API_KEY'];
       },
       buildRunCommand: (_prompt, model) => {
-        const args = ['exec', '--full-auto'];
-        // When the backend emits a settings-bag translation, it already contains
-        // the -m flag plus any -c model_reasoning_effort/verbosity/etc overrides.
-        // Otherwise fall back to the legacy model arg. Do not pass both to avoid
-        // duplicate -m flags.
+        // --skip-git-repo-check: some task types run outside a git checkout
+        //   (standalone agentic handlers); without this flag Codex refuses
+        //   to start.
+        // Sandbox flag intentionally NOT set here — the backend's settings
+        //   translation emits `-s danger-full-access` (the VM itself is the
+        //   isolation boundary). Do NOT also pass `--full-auto`: it aliases
+        //   `--sandbox workspace-write`, which would conflict with `-s
+        //   danger-full-access` and leave sandbox behavior undefined.
+        const args = ['exec', '--skip-git-repo-check'];
         if (LLM_CLI_TRANSLATION) {
           args.push(...LLM_CLI_TRANSLATION.args);
-        } else if (model) {
-          args.push('-m', model);
+        } else {
+          // Legacy fallback path (no settings-bag from backend): emit the
+          // no-sandbox flag ourselves so we don't fall through to Codex's
+          // default workspace-write sandbox.
+          args.push('-s', 'danger-full-access');
+          if (model) args.push('-m', model);
         }
         return {
           command: 'codex',
@@ -1527,7 +1696,11 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         };
       },
       buildValidationCommand: (model) => {
-        const args = ['exec'];
+        // Validation runs in a non-git cwd (e.g. /tmp or /opt/agent), so
+        // --skip-git-repo-check is mandatory. Sandbox hardcoded to
+        // danger-full-access for the same VM-is-sandbox reasoning as the
+        // run command.
+        const args = ['exec', '--skip-git-repo-check', '-s', 'danger-full-access'];
         if (model) args.push('-m', model);
         args.push('Respond with OK.');
         return { command: 'codex', args, env: baseEnv, timeoutMs: 30_000 };
@@ -1890,6 +2063,11 @@ async function main() {
     }
   }
   log(runner.credentialSummary());
+  // Snapshot the OAuth auth file *before* provider validation runs. Validation
+  // invokes the CLI with the provisioned token, which for Codex may trigger a
+  // refresh immediately; without a baseline hash we'd miss rotations that
+  // happen during validation itself.
+  recordInitialOAuthAuthHash();
   await validateProviderAuth(runner, reportPreClaimFailure, process.env.LLM_MODEL);
   if (PRE_CLAIM_TASK_ID) {
     sendHeartbeatSync(PRE_CLAIM_TASK_ID, 'AGENT_AUTH_OK: provider validation complete');
@@ -2008,6 +2186,14 @@ async function main() {
   } finally {
     stopHeartbeat();
     if (ws) ws.close();
+    // Rotate OAuth creds back to backend if the CLI refreshed them in-place
+    // during the run. Best-effort — failures don't block shutdown. Only
+    // openai/oauth rotates today; other providers no-op server-side.
+    try {
+      await rotateOAuthCredentialsIfChanged(taskId);
+    } catch (e) {
+      log(`OAuth rotation failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+    }
     // Clean up workspace to avoid leaking tokens in git config
     try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch { /* ignore */ }
     // Clean up /tmp files written by Claude Code handlers (task-specific paths)

@@ -49,7 +49,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
 import type WebSocket from 'ws';
 
@@ -380,10 +380,16 @@ describe('runProjectLintChecks', () => {
 
 // Helper: spawn mock that emits close(code) immediately for each spawn call.
 // `failCmds` maps command names to (exitCode, stderr) for failing runners.
+// `npm ci` (dep install) is never failed even when `npm` is in failCmds —
+// testFixLoop now treats install failures as setup errors (not test
+// failures), so tests that want to simulate a failing test run must let
+// the install step succeed.
 function configureSpawnMock(failCmds: Record<string, { exitCode: number; stderr: string }> = {}) {
-  vi.mocked(spawn).mockImplementation((cmd: unknown) => {
+  vi.mocked(spawn).mockImplementation((cmd: unknown, argsRaw: unknown) => {
     const cmdStr = String(cmd);
-    const failure = failCmds[cmdStr];
+    const args = Array.isArray(argsRaw) ? argsRaw.map(String) : [];
+    const isNpmInstall = cmdStr === 'npm' && (args[0] === 'ci' || args[0] === 'install');
+    const failure = isNpmInstall ? undefined : failCmds[cmdStr];
     const stderrCbs: ((d: Buffer) => void)[] = [];
     const proc = {
       pid: 100 + Math.floor(Math.random() * 1000),
@@ -579,19 +585,28 @@ describe('testFixLoop early exit on identical errors', () => {
     const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
     expect(result.passed).toBe(false);
     expect(result.failureSummary).toContain(errorMessage);
-    const npmCalls = vi.mocked(spawn).mock.calls.filter(c => c[0] === 'npm').length;
-    // Early exit after the duplicate on attempt 2: at most 2 test runs
-    expect(npmCalls).toBeLessThanOrEqual(2);
+    // Count ONLY test-run invocations (not the setup `npm ci` install
+    // calls testFixLoop does ahead of each runner). Early exit after the
+    // duplicate on attempt 2: at most 2 test runs.
+    const testRunCalls = vi.mocked(spawn).mock.calls.filter(
+      c => c[0] === 'npm' && Array.isArray(c[1]) && c[1][0] === 'test',
+    ).length;
+    expect(testRunCalls).toBeLessThanOrEqual(2);
   });
 
   it('continues when test errors differ between attempts', async () => {
     const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
     let callCount = 0;
-    vi.mocked(spawn).mockImplementation((cmd: unknown) => {
+    vi.mocked(spawn).mockImplementation((cmd: unknown, argsRaw: unknown) => {
       const cmdStr = String(cmd);
+      const args = Array.isArray(argsRaw) ? argsRaw.map(String) : [];
+      const isNpmInstall = cmdStr === 'npm' && (args[0] === 'ci' || args[0] === 'install');
       const stderrCbs: ((d: Buffer) => void)[] = [];
       let failStderr: string | null = null;
-      if (cmdStr === 'npm') {
+      // Only the test-run (npm test) is simulated as failing. npm ci
+      // (install) succeeds — testFixLoop now classifies install failures
+      // as setup errors, not test failures.
+      if (cmdStr === 'npm' && !isNpmInstall) {
         callCount++;
         failStderr = `FAIL variant ${callCount}`;
       }
@@ -617,9 +632,12 @@ describe('testFixLoop early exit on identical errors', () => {
     });
 
     await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
-    const npmCalls = vi.mocked(spawn).mock.calls.filter(c => c[0] === 'npm').length;
-    // MAX_TEST_FIX_ATTEMPTS = 2, loop runs 3 times when errors differ
-    expect(npmCalls).toBe(3);
+    // Count only test-run invocations, skipping the setup `npm ci` calls.
+    // MAX_TEST_FIX_ATTEMPTS = 2, loop runs 3 times when errors differ.
+    const testRunCalls = vi.mocked(spawn).mock.calls.filter(
+      c => c[0] === 'npm' && Array.isArray(c[1]) && c[1][0] === 'test',
+    ).length;
+    expect(testRunCalls).toBe(3);
   });
 });
 
@@ -731,7 +749,12 @@ describe('provider runner prompt transport', () => {
     const command = runner.buildRunCommand('Very long prompt body', 'gpt-5');
 
     expect(command.promptInput).toBe('stdin');
-    expect(command.args).toEqual(['exec', '--full-auto', '-m', 'gpt-5']);
+    // Codex CLI invocation pins sandbox to danger-full-access at the
+    // translation layer (agent VMs are ephemeral; sandboxing inside them
+    // stalls on approval prompts nobody can answer). `--full-auto` was
+    // the pre-hardcoding alias; today we emit --skip-git-repo-check +
+    // explicit -s danger-full-access.
+    expect(command.args).toEqual(['exec', '--skip-git-repo-check', '-s', 'danger-full-access', '-m', 'gpt-5']);
     expect(command.args.join(' ')).not.toContain('Very long prompt body');
   });
 
@@ -1061,6 +1084,82 @@ describe('parseFailingTests', () => {
     expect(result.has('backend/testing/test_p.py::test_param[case-1]')).toBe(true);
     expect(result.has('backend/testing/test_p.py::test_unicode_ünîcødé')).toBe(true);
     expect(result.has('backend/testing/test_q.py::test_with_space description')).toBe(true);
+  });
+});
+
+// ── parseFailingTestsFromVitestJson ─────────────────────────────────────────
+describe('parseFailingTestsFromVitestJson', () => {
+  it('extracts fullName of every failed assertion', () => {
+    const json = JSON.stringify({
+      testResults: [
+        {
+          name: '/path/foo.test.ts',
+          assertionResults: [
+            { fullName: 'describe A > does X', status: 'failed' },
+            { fullName: 'describe A > does Y', status: 'passed' },
+            { fullName: 'describe A > does Z', status: 'failed' },
+          ],
+        },
+        {
+          name: '/path/bar.test.ts',
+          assertionResults: [
+            { fullName: 'describe B > does W', status: 'failed' },
+          ],
+        },
+      ],
+    });
+    expect(parseFailingTestsFromVitestJson(json)).toEqual(new Set([
+      'describe A > does X',
+      'describe A > does Z',
+      'describe B > does W',
+    ]));
+  });
+
+  it('falls back to title when fullName is missing', () => {
+    const json = JSON.stringify({
+      testResults: [{
+        assertionResults: [
+          { title: 'legacy test', status: 'failed' },
+        ],
+      }],
+    });
+    expect(parseFailingTestsFromVitestJson(json)).toEqual(new Set(['legacy test']));
+  });
+
+  it('ignores passed/skipped/pending assertions', () => {
+    const json = JSON.stringify({
+      testResults: [{
+        assertionResults: [
+          { fullName: 'A', status: 'passed' },
+          { fullName: 'B', status: 'skipped' },
+          { fullName: 'C', status: 'pending' },
+          { fullName: 'D', status: 'todo' },
+        ],
+      }],
+    });
+    expect(parseFailingTestsFromVitestJson(json).size).toBe(0);
+  });
+
+  it('returns empty Set on malformed JSON', () => {
+    expect(parseFailingTestsFromVitestJson('not json').size).toBe(0);
+    expect(parseFailingTestsFromVitestJson('').size).toBe(0);
+  });
+
+  it('ignores simulated failure output in stdout — no false positives from mocked test bodies', () => {
+    // This is the whole point: stdout from a passing vitest test whose body
+    // prints something like "✕ simulated failure" would fool parseFailingTests.
+    // The JSON reporter only records real failures.
+    const json = JSON.stringify({
+      testResults: [{
+        assertionResults: [
+          {
+            fullName: 'testFixLoop > handles simulated failure output',
+            status: 'passed',
+          },
+        ],
+      }],
+    });
+    expect(parseFailingTestsFromVitestJson(json).size).toBe(0);
   });
 });
 
