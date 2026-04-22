@@ -295,6 +295,12 @@ def cascade_disabled_models(model: str) -> tuple:
 # Rolling window for account health score computation
 _HEALTH_WINDOW_SECONDS = 24 * 3600  # 24-hour rolling window
 
+# Accounts whose 24h health score is below this threshold are excluded from
+# the healthy candidate list when at least one alternative exists. Prevents
+# chronically rate-limited accounts from receiving new tasks while still
+# allowing the account to be selected as a last resort (no deadlock).
+_HEALTH_SCORE_DISQUALIFY_THRESHOLD = -4
+
 
 def _compute_health_score(acct: Dict[str, Any], now: datetime | None = None) -> float:
     """Compute a rolling 24h health score. Higher is healthier.
@@ -673,6 +679,13 @@ async def select_max_plan_account(
             _pending_cap_persists.add(acct_id)
 
         if healthy:
+            # Exclude decisively-negative-health-score accounts when alternatives exist.
+            # This prevents chronically rate-limited accounts from receiving new tasks
+            # while still allowing them as last resort if no other account qualifies.
+            if len(healthy) > 1:
+                qualified = [a for a in healthy if _compute_health_score(a, now) >= _HEALTH_SCORE_DISQUALIFY_THRESHOLD]
+                if qualified:
+                    healthy = qualified
             # Prefer accounts with higher health scores (fewer rate limits, more completions).
             # Among equal scores, prefer fewer active tasks for load balancing.
             account = max(healthy, key=lambda a: (_compute_health_score(a), -a.get("active_tasks", 0)))

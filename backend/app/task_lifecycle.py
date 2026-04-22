@@ -576,6 +576,26 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             "_slot_released",
         }
         clone_ctx = {k: v for k, v in child_ctx.items() if k not in _ctx_keys_to_strip}
+
+        # RATE_LIMIT: propagate the quarantine so the clone can't re-select the
+        # same account before its cooldown elapses. agent_status.py already put
+        # the failed account in child_ctx["blacklisted_accounts"] — re-applying
+        # it here closes the gap where _ctx_keys_to_strip would otherwise clear
+        # the list and the clone starts with a blank slate.
+        if failure_class == "RATE_LIMIT":
+            rl_acct_id = child_ctx.get("llm_account_id") or child_ctx.get("max_plan_account_id")
+            if rl_acct_id:
+                prior_bl = list(child_ctx.get("blacklisted_accounts") or [])
+                if rl_acct_id not in prior_bl:
+                    prior_bl.append(rl_acct_id)
+                clone_ctx["blacklisted_accounts"] = prior_bl
+                logger.info(
+                    "[REQUEUE] RATE_LIMIT on account %s — propagating blacklist to clone "
+                    "(total blocked: %d)",
+                    rl_acct_id[:8],
+                    len(prior_bl),
+                )
+
         clone_ctx["_attempt_number"] = attempt + 1
         clone_ctx["_max_attempts"] = MAX_PARENT_REQUEUES + 1
 

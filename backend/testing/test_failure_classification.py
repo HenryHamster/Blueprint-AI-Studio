@@ -23,10 +23,13 @@ from app.failure_classification import (
     TIMEOUT_OOM,
     TIMEOUT_PROCESS_CRASH,
     TIMEOUT_UNKNOWN,
+    _fingerprint_message,
     _timeout_subtype_from_message,
     classify_failure,
     classify_failure_taxonomy,
     classify_timeout_subtype,
+    get_top_residual_fingerprints,
+    record_residual_fingerprint,
     should_trigger_code_defect_investigation,
     should_trigger_review_quality_investigation,
     should_trigger_timeout_investigation,
@@ -491,6 +494,103 @@ class TestShouldTriggerReviewQualityInvestigation:
         t = _task("No heartbeat received", {"direction_id": "d-1"})
         t.payloads = [{"type": "create", "prompt": "p"}]
         assert should_trigger_review_quality_investigation(t) is False
+
+
+class TestFingerprintMessage:
+    def test_strips_uuid(self):
+        fp = _fingerprint_message("task 550e8400-e29b-41d4-a716-446655440000 failed")
+        assert '<id>' in fp
+        assert '550e8400' not in fp
+
+    def test_strips_numbers(self):
+        fp = _fingerprint_message("exit code 137 after 300s")
+        assert '<n>' in fp
+        assert '137' not in fp
+
+    def test_near_duplicates_cluster(self):
+        fp1 = _fingerprint_message("AssertionError: expected 3, got 4")
+        fp2 = _fingerprint_message("AssertionError: expected 9, got 12")
+        assert fp1 == fp2
+
+    def test_empty_returns_empty_string(self):
+        assert _fingerprint_message("") == ""
+
+    def test_truncates_long_messages(self):
+        assert len(_fingerprint_message("x" * 500)) <= 200
+
+
+class TestResidualStore:
+    def setup_method(self):
+        import app.failure_classification as fc
+        fc._residual_store.clear()
+        fc._residual_seen_task_ids.clear()
+
+    def _task_with_id(self, msg: str, task_id: str) -> "Task":
+        t = MagicMock(spec=Task)
+        t.latest_status_message = msg
+        t.context = {}
+        t.id = task_id
+        return t
+
+    def test_record_then_query(self):
+        t = self._task_with_id("AttributeError: NoneType has no attr 'x'", "task-1")
+        record_residual_fingerprint(t)
+        results = get_top_residual_fingerprints(window_seconds=3600)
+        assert len(results) == 1
+        assert results[0]['count'] == 1
+        assert results[0]['task_ids'] == ['task-1']
+
+    def test_dedup_same_task_id(self):
+        t = self._task_with_id("some error", "task-abc")
+        record_residual_fingerprint(t)
+        record_residual_fingerprint(t)
+        results = get_top_residual_fingerprints()
+        assert results[0]['count'] == 1
+
+    def test_near_duplicates_cluster(self):
+        t1 = self._task_with_id("AttributeError: expected 3, got 4", "task-1")
+        t2 = self._task_with_id("AttributeError: expected 9, got 12", "task-2")
+        record_residual_fingerprint(t1)
+        record_residual_fingerprint(t2)
+        results = get_top_residual_fingerprints()
+        assert len(results) == 1
+        assert results[0]['count'] == 2
+
+    def test_classify_failure_fallthrough_records(self):
+        t = self._task_with_id("AttributeError: NoneType has no attr 'x'", "task-ff")
+        result = classify_failure(t)
+        assert result == CODE_ERROR
+        results = get_top_residual_fingerprints()
+        assert any(r['task_ids'] == ['task-ff'] or 'task-ff' in r['task_ids'] for r in results)
+
+    def test_window_filter_excludes_old(self):
+        import app.failure_classification as fc
+        fc._residual_store['old-fp'] = {
+            'count': 5,
+            'first_seen': 0.0,
+            'last_seen': 0.0,
+            'sample_message': 'old error',
+            'task_ids': ['t-old'],
+        }
+        results = get_top_residual_fingerprints(window_seconds=60)
+        assert all(r['fingerprint'] != 'old-fp' for r in results)
+
+    def test_sorted_by_count_descending(self):
+        import app.failure_classification as fc
+        import time
+        now = time.time()
+        fc._residual_store['fp-a'] = {'count': 3, 'first_seen': now, 'last_seen': now, 'sample_message': 'a', 'task_ids': []}
+        fc._residual_store['fp-b'] = {'count': 10, 'first_seen': now, 'last_seen': now, 'sample_message': 'b', 'task_ids': []}
+        results = get_top_residual_fingerprints()
+        assert results[0]['fingerprint'] == 'fp-b'
+        assert results[1]['fingerprint'] == 'fp-a'
+
+    def test_no_record_for_non_code_error(self):
+        t = self._task_with_id("No heartbeat received after 300s", "task-timeout")
+        result = classify_failure(t)
+        assert result == AGENT_TIMEOUT
+        results = get_top_residual_fingerprints()
+        assert not any('task-timeout' in r['task_ids'] for r in results)
 
 
 class TestDeriveFailureStageMigration:

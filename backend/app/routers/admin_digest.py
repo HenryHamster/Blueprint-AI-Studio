@@ -967,6 +967,83 @@ async def get_digest(
     )
 
 
+@router.get("/residual-fingerprints")
+async def get_residual_fingerprints(
+    hours: int = Query(24, ge=1, le=168),
+    top_n: int = Query(10, ge=1, le=50),
+    project_id: uuid.UUID | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return top-N CODE_ERROR fingerprint clusters with no matching classifier.
+
+    Surfaces emerging failure patterns — task failures that reached the default
+    fallthrough in classify_failure() because no keyword bank matched. Groups
+    near-duplicate messages by fingerprint so operators can see what new
+    classifiers are needed next cycle.
+
+    Excludes tasks where the agent explicitly reported a failure_category,
+    since those are known failure modes rather than unclassified residuals.
+    """
+    from app.failure_classification import classify_failure as _cf  # noqa: PLC0415
+    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+
+    window_start = _utcnow() - timedelta(hours=hours)
+    filters = [Task.created_at >= window_start, Task.status == TaskStatus.FAILED]
+    if project_id:
+        filters.append(Task.project_id == project_id)
+
+    result = await session.execute(
+        select(Task)
+        .where(*filters)
+        .options(load_only(
+            Task.id, Task.project_id, Task.latest_status_message,
+            Task.context, Task.created_at,
+        ))
+        .limit(2000)
+    )
+    tasks = list(result.scalars().all())
+
+    clusters: Dict[str, Dict[str, Any]] = {}
+    for task in tasks:
+        if (task.context or {}).get("failure_category"):
+            continue
+        if _cf(task) != "CODE_ERROR":
+            continue
+        msg = task.latest_status_message or ""
+        if not msg:
+            continue
+        fp = _error_fingerprint(msg)
+        entry = clusters.setdefault(fp, {
+            "fingerprint": fp, "count": 0,
+            "most_recent_at": None, "sample_message": msg[:300],
+            "example_task_ids": [],
+        })
+        entry["count"] += 1
+        ts = task.created_at.isoformat() if task.created_at else None
+        if ts and (entry["most_recent_at"] is None or ts > entry["most_recent_at"]):
+            entry["most_recent_at"] = ts
+        if len(entry["example_task_ids"]) < 3:
+            entry["example_task_ids"].append(str(task.id))
+
+    top = sorted(clusters.values(), key=lambda x: x["count"], reverse=True)[:top_n]
+    return {
+        "window_hours": hours,
+        "total_code_error_count": sum(e["count"] for e in clusters.values()),
+        "residual_count": len(clusters),
+        "top_residuals": [
+            {
+                "fingerprint": e["fingerprint"],
+                "count": e["count"],
+                "most_recent_at": e["most_recent_at"],
+                "sample_message": e["sample_message"],
+                "example_task_ids": e["example_task_ids"],
+            }
+            for e in top
+        ],
+    }
+
+
 async def _compute_digest(
     *,
     hours: int,

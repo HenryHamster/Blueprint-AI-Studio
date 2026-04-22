@@ -1681,37 +1681,18 @@ async def orchestrator_worker():
                         if user_pool and ready_provider_accounts:
                             # Accounts exist but all blocked — notify user and skip
                             logger.info(f"[ORCHESTRATOR] All accounts blocked for task {task.id} — skipping (will retry next cycle)")
-                            # Calculate earliest recovery time from account cooldowns
-                            earliest_recovery = None
-                            for acct in ready_provider_accounts:
-                                dm = acct.get('disabled_models', {})
-                                for info in dm.values():
-                                    disabled_at = info.get('at')
-                                    hits = info.get('hits', 1)
-                                    cooldown_min = min(30 * (2 ** (hits - 1)), 240)
-                                    if disabled_at:
-                                        recovery = disabled_at + timedelta(minutes=cooldown_min)
-                                        if earliest_recovery is None or recovery < earliest_recovery:
-                                            earliest_recovery = recovery
-                                # Also check legacy account-level disable
-                                if not acct.get('enabled', True) and acct.get('disabled_at'):
-                                    rl_hits = acct.get('rl_hit_count', 1)
-                                    cooldown_min = min(30 * (2 ** (rl_hits - 1)), 240)
-                                    recovery = acct['disabled_at'] + timedelta(minutes=cooldown_min)
-                                    if earliest_recovery is None or recovery < earliest_recovery:
-                                        earliest_recovery = recovery
+                            from app.max_plan_pool import summarize_pool_state, describe_pool_blockage  # noqa: PLC0415
+                            _pool_summary = summarize_pool_state(task_model, user_id=dispatch_user_id)
+                            earliest_recovery = _pool_summary["earliest_recovery"]
+                            stall_msg = describe_pool_blockage(task_model, user_id=dispatch_user_id)
                             if earliest_recovery:
-                                wait_min = max(0, (earliest_recovery - _utcnow()).total_seconds() / 60)
-                                stall_msg = f'All accounts rate-limited — earliest recovery in {int(wait_min)}min'
                                 stall_delay_minutes = rate_limit_retry_minutes(earliest_recovery)
                             else:
-                                target_runtime = runtime_model or task_model or "requested runtime"
-                                provider_label = runtime_provider or "LLM"
-                                stall_msg = (
-                                    f"No eligible {provider_label} account available for {target_runtime} "
-                                    "— waiting for capacity or retry reset"
-                                )
                                 stall_delay_minutes = 2
+                            logger.info(
+                                "[ORCHESTRATOR] pool_exhausted task=%s model=%s %s",
+                                str(task.id)[:8], task_model, _pool_summary,
+                            )
                             # Retry delay based on earliest known recovery to avoid
                             # hot-looping every 2 min when recovery is hours away.
                             # set_retry_after clamps to RETRY_AFTER_MAX_MINUTES.

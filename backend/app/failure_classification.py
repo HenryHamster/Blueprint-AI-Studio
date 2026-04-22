@@ -1,6 +1,7 @@
 """Task failure classification for deployment monitoring in Blueprint AI Studio."""
 import logging
 import re
+import time
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -392,6 +393,91 @@ def classify_timeout_subtype(task: "Task", logs: Optional[str] = None) -> str:
     return _timeout_subtype_from_message(status_msg + " " + (logs or ""))
 
 
+# Bounded in-memory store for CODE_ERROR fallthrough fingerprints.
+# record_residual_fingerprint() populates it at classify_failure()'s default
+# branch; get_top_residual_fingerprints() is the query API for admin_digest.
+_residual_store: dict[str, dict] = {}
+_residual_seen_task_ids: set[str] = set()
+_RESIDUAL_MAX_FINGERPRINTS = 300
+_RESIDUAL_SEEN_MAX = 20_000
+
+_RE_UUID = re.compile(
+    r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b',
+    re.IGNORECASE,
+)
+_RE_HEX = re.compile(r'\b[0-9a-f]{7,40}\b', re.IGNORECASE)
+_RE_NUM = re.compile(r'\b\d+\b')
+
+
+def _fingerprint_message(msg: str) -> str:
+    """Normalize a status message into a grouping fingerprint.
+
+    Strips UUIDs, hex hashes, and standalone numbers so near-duplicate
+    messages (same error, different task IDs / line numbers) cluster.
+    """
+    s = (msg or "").lower().strip()
+    s = _RE_UUID.sub('<id>', s)
+    s = _RE_HEX.sub('<hash>', s)
+    s = _RE_NUM.sub('<n>', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s[:200]
+
+
+def record_residual_fingerprint(task: "Task") -> None:
+    """Record a CODE_ERROR fallthrough in the residual store.
+
+    The _residual_seen_task_ids dedup set prevents double-counting when
+    classify_failure_taxonomy() calls classify_failure() internally.
+    """
+    task_id = str(getattr(task, 'id', '') or '')
+    if not task_id or task_id in _residual_seen_task_ids:
+        return
+    if len(_residual_seen_task_ids) < _RESIDUAL_SEEN_MAX:
+        _residual_seen_task_ids.add(task_id)
+    msg = task.latest_status_message or ''
+    fp = _fingerprint_message(msg) or '<empty>'
+    now = time.time()
+    if fp in _residual_store:
+        entry = _residual_store[fp]
+        entry['count'] += 1
+        entry['last_seen'] = now
+        if task_id not in entry['task_ids'] and len(entry['task_ids']) < 5:
+            entry['task_ids'].append(task_id)
+    else:
+        if len(_residual_store) >= _RESIDUAL_MAX_FINGERPRINTS:
+            oldest = min(_residual_store, key=lambda k: _residual_store[k]['last_seen'])
+            del _residual_store[oldest]
+        _residual_store[fp] = {
+            'count': 1,
+            'first_seen': now,
+            'last_seen': now,
+            'sample_message': msg[:500],
+            'task_ids': [task_id],
+        }
+
+
+def get_top_residual_fingerprints(window_seconds: int = 86400, top_n: int = 10) -> list[dict]:
+    """Return the top-N residual CODE_ERROR fingerprints within the time window.
+
+    Each result dict contains: fingerprint, count, last_seen (epoch float),
+    sample_message, task_ids (up to 5 examples).
+    """
+    cutoff = time.time() - window_seconds
+    results = [
+        {
+            'fingerprint': fp,
+            'count': entry['count'],
+            'last_seen': entry['last_seen'],
+            'sample_message': entry['sample_message'],
+            'task_ids': entry['task_ids'],
+        }
+        for fp, entry in _residual_store.items()
+        if entry['last_seen'] >= cutoff
+    ]
+    results.sort(key=lambda x: x['count'], reverse=True)
+    return results[:top_n]
+
+
 def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     """Classify a task failure for deployment monitoring.
     Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API"""
@@ -541,5 +627,6 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
     if "superseded" in combined:
         return AGENT_TIMEOUT
 
-    # Default: code error
+    # Default: code error — record fingerprint for residual-pattern analysis
+    record_residual_fingerprint(task)
     return "CODE_ERROR"

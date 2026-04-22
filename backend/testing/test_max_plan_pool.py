@@ -7,6 +7,7 @@ keeping assertions deterministic without fixtures or locks.
 from datetime import datetime, timedelta, timezone
 
 from app.max_plan_pool import (
+    _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
     _HEALTH_WINDOW_SECONDS,
     _account_at_cap,
     _account_available_for_model,
@@ -316,3 +317,31 @@ class TestSummarizePoolState:
             assert summary["earliest_recovery"] is None
         finally:
             self._reset_pools()
+
+
+# ── _HEALTH_SCORE_DISQUALIFY_THRESHOLD constant ──────────────────────────────
+
+class TestHealthScoreDisqualifyThreshold:
+    def test_threshold_is_negative(self):
+        assert _HEALTH_SCORE_DISQUALIFY_THRESHOLD < 0
+
+    def test_score_at_threshold_minus_one_is_below(self):
+        """An account with score below threshold would be filtered when alternatives exist."""
+        now = datetime.utcnow()
+        # Build an account whose health score lands below _HEALTH_SCORE_DISQUALIFY_THRESHOLD.
+        # score = completions - 2*rl_events; 3 rl_events → score = -6, which is below -4.
+        acct = _acct(
+            rl_events=[now - timedelta(hours=i) for i in range(1, 4)],
+        )
+        score = _compute_health_score(acct, now=now)
+        assert score < _HEALTH_SCORE_DISQUALIFY_THRESHOLD
+
+    def test_score_at_threshold_is_eligible(self):
+        """An account with score == threshold is NOT filtered."""
+        now = datetime.utcnow()
+        # score = 0 completions - 2*2 rl_events = -4 == threshold → eligible
+        acct = _acct(
+            rl_events=[now - timedelta(hours=i) for i in range(1, 3)],
+        )
+        score = _compute_health_score(acct, now=now)
+        assert score == _HEALTH_SCORE_DISQUALIFY_THRESHOLD

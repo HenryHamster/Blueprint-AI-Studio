@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { apiFetch } from '../api';
 
 interface RecentInvestigation {
   task_id: string;
@@ -60,10 +61,26 @@ interface InvestigationConversion {
   remediation_spawned?: number;
 }
 
+interface ResidualFingerprint {
+  fingerprint: string;
+  count: number;
+  most_recent_at: string | null;
+  sample_message: string;
+  example_task_ids: string[];
+}
+
+interface ResidualFingerprintsData {
+  window_hours: number;
+  total_code_error_count: number;
+  residual_count: number;
+  top_residuals: ResidualFingerprint[];
+}
+
 export interface RemediationFunnelSectionProps {
   funnel?: RemediationFunnelData | null;
   conversion?: InvestigationConversion | null;
   loading?: boolean;
+  projectId?: string | null;
 }
 
 const FAILURE_CLASS_COLORS: Record<string, string> = {
@@ -123,8 +140,19 @@ function truncate(s: string, n: number): string {
   return s.slice(0, n).trimEnd() + '…';
 }
 
-export function RemediationFunnelSection({ funnel, conversion, loading }: RemediationFunnelSectionProps) {
+export function RemediationFunnelSection({ funnel, conversion, loading, projectId }: RemediationFunnelSectionProps) {
   const [investigationsOpen, setInvestigationsOpen] = useState(false);
+  const [residuals, setResiduals] = useState<ResidualFingerprintsData | null>(null);
+  const [residualsOpen, setResidualsOpen] = useState(false);
+
+  useEffect(() => {
+    const qs = projectId ? `?hours=24&top_n=10&project_id=${encodeURIComponent(projectId)}` : '?hours=24&top_n=10';
+    apiFetch(`/api/admin/residual-fingerprints${qs}`)
+      .then(r => r.ok ? r.json() : null)
+      .then((data: ResidualFingerprintsData | null) => { if (data) setResiduals(data); })
+      .catch(() => {});
+  }, [projectId]);
+
   if (loading) {
     return (
       <section>
@@ -499,6 +527,49 @@ export function RemediationFunnelSection({ funnel, conversion, loading }: Remedi
           </div>
         );
       })()}
+
+      {residuals && residuals.top_residuals.length > 0 && (
+        <div className="mt-2 bg-neutral-900/50 border border-amber-800/30 rounded-lg">
+          <button
+            type="button"
+            onClick={() => setResidualsOpen(v => !v)}
+            className="w-full flex items-center justify-between px-3 py-2 text-left"
+            aria-expanded={residualsOpen}
+          >
+            <span className="text-[10px] text-amber-500/80 uppercase tracking-wide">
+              Unclassified CODE_ERROR patterns — {residuals.top_residuals.length} clusters · {residuals.total_code_error_count} occurrences (last {residuals.window_hours}h)
+            </span>
+            <span className="text-[10px] text-neutral-500">{residualsOpen ? '▾' : '▸'}</span>
+          </button>
+          {residualsOpen && (
+            <div className="px-3 pb-3 space-y-2">
+              {residuals.top_residuals.map(r => (
+                <div key={r.fingerprint} className="border border-neutral-800/40 rounded p-2">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="font-mono text-[10px] bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded shrink-0">
+                      {r.count}×
+                    </span>
+                    <span className="text-[10px] text-neutral-500 shrink-0">{relativeTime(r.most_recent_at)}</span>
+                    <span className="font-mono text-[9px] text-neutral-600 truncate flex-1">{r.fingerprint}</span>
+                  </div>
+                  <div className="text-[11px] text-neutral-400 leading-snug mb-1.5">{truncate(r.sample_message, 140)}</div>
+                  <div className="flex gap-2 flex-wrap">
+                    {r.example_task_ids.map(id => (
+                      <a
+                        key={id}
+                        href={`/tasks/${id}`}
+                        className="font-mono text-[9px] text-neutral-500 hover:text-neutral-300 underline underline-offset-2"
+                      >
+                        {id.slice(0, 8)}
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </section>
   );
 }

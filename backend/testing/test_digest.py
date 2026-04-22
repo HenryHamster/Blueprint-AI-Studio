@@ -4824,3 +4824,81 @@ async def test_stash_projected_task_fields_works_for_orm_loaded_tasks(db_session
 
     assert loaded.first_payload == {"type": "research"}
     assert _derive_completed_at(loaded) == datetime.fromisoformat(projected_completed_at)
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/residual-fingerprints tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_residual_fingerprints_empty(client: AsyncClient):
+    """No tasks → empty residuals list."""
+    response = await client.get("/api/admin/residual-fingerprints")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_code_error_count"] == 0
+    assert data["residual_count"] == 0
+    assert data["top_residuals"] == []
+
+
+@pytest.mark.asyncio
+async def test_residual_fingerprints_clusters_code_errors(client: AsyncClient, db_session):
+    """FAILED tasks without failure_category cluster by fingerprint; excludes non-CODE_ERROR."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two tasks with nearly identical message — same fingerprint cluster
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message="compilation failed: unexpected token in expression",
+        ))
+    # One task with a different message — second fingerprint
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        latest_status_message="assertion error: value mismatch in test suite",
+    ))
+    # Task with failure_category set — excluded from residuals
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        latest_status_message="compilation failed: unexpected token in expression",
+        context={"failure_category": "CODE_ERROR"},
+    ))
+    # PROVISION_FAILURE — classify_failure returns non-CODE_ERROR, excluded
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        latest_status_message="quota exceeded: cpus_all_regions limit reached",
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/residual-fingerprints")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["total_code_error_count"] == 3  # 2 + 1, excludes categorized + provision
+    assert data["residual_count"] == 2
+    top = data["top_residuals"]
+    assert len(top) == 2
+    # First entry has the highest count
+    assert top[0]["count"] == 2
+    assert top[1]["count"] == 1
+    entry = top[0]
+    assert "fingerprint" in entry
+    assert "most_recent_at" in entry
+    assert "sample_message" in entry
+    assert isinstance(entry["example_task_ids"], list)
+    assert len(entry["example_task_ids"]) <= 3
+
+
+@pytest.mark.asyncio
+async def test_residual_fingerprints_requires_auth(unauthenticated_client: AsyncClient):
+    """Endpoint requires admin auth."""
+    response = await unauthenticated_client.get("/api/admin/residual-fingerprints")
+    assert response.status_code in (401, 403)

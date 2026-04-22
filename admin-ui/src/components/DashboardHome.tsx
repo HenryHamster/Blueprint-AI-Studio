@@ -767,6 +767,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               funnel={digest?.remediation_funnel ?? null}
               conversion={digest?.investigation_conversion ?? null}
               loading={loading}
+              projectId={selectedProjectId}
             />
           )}
 

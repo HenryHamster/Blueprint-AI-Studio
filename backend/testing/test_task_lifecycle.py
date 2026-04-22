@@ -782,6 +782,105 @@ async def test_requeue_strips_max_plan_account_id_from_clone(tl_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_requeue_rate_limit_propagates_blacklist_to_clone(tl_db, mocker):
+    """RATE_LIMIT failure: clone carries the failed account in blacklisted_accounts.
+
+    Regression guard: _ctx_keys_to_strip previously cleared blacklisted_accounts on
+    every clone, so the retry could re-pick the same account that just returned 429.
+    """
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="RATE_LIMIT")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "_attempt_number": 1,
+            "llm_account_id": "acct-rl-1234",
+            "blacklisted_accounts": ["acct-rl-1234"],
+        },
+        latest_status_message="Usage limit reached",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    bl = clone.context.get("blacklisted_accounts") or []
+    assert "acct-rl-1234" in bl, f"failed account missing from clone blacklist: {bl}"
+    # llm_account_id must still be stripped (clone gets a fresh account selection)
+    assert "llm_account_id" not in clone.context
+
+
+@pytest.mark.asyncio
+async def test_requeue_rate_limit_adds_account_to_existing_blacklist(tl_db, mocker):
+    """RATE_LIMIT: failed account is appended if not already in prior blacklist."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="RATE_LIMIT")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "_attempt_number": 2,
+            "llm_account_id": "acct-new-fail",
+            # prior blacklist from previous attempt
+            "blacklisted_accounts": ["acct-old-fail"],
+        },
+        latest_status_message="Usage limit reached",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    bl = clone.context.get("blacklisted_accounts") or []
+    assert "acct-old-fail" in bl
+    assert "acct-new-fail" in bl
+
+
+@pytest.mark.asyncio
+async def test_requeue_non_rate_limit_does_not_preserve_blacklist(tl_db, mocker):
+    """CODE_ERROR failures do not carry forward blacklisted_accounts — account was not at fault."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="CODE_ERROR")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "_attempt_number": 1,
+            "llm_account_id": "acct-xyz",
+            "blacklisted_accounts": ["acct-xyz"],
+        },
+        latest_status_message="Tests failed",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.QUEUED)
+    )).scalars().first()
+    assert clone is not None
+    assert not clone.context.get("blacklisted_accounts"), (
+        "blacklisted_accounts should be absent for CODE_ERROR (account was not at fault)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_requeue_agent_timeout_injects_scope_guidance(tl_db, mocker):
     """AGENT_TIMEOUT failure inserts timeout scope-reduction guidance into prompt_suffix."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
