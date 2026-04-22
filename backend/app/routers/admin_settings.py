@@ -100,19 +100,16 @@ async def get_settings(
         "max_global_autonomous_tasks_per_hour": _runtime_config.get("max_global_autonomous_tasks_per_hour", 50),
         "autonomous_research_interval_minutes": _runtime_config.get("autonomous_research_interval_minutes", 30),
         "provider_tier_model_map": _runtime_config.get("provider_tier_model_map", {}),
-        "task_type_provider_preference": _runtime_config.get("task_type_provider_preference", {}),
         "task_type_categories": _runtime_config.get("task_type_categories", {}),
-        "provider_preference_by_category": _runtime_config.get("provider_preference_by_category", {}),
+        "category_routing": _runtime_config.get("category_routing", {}),
+        "task_type_routing": _runtime_config.get("task_type_routing", {}),
         "task_type_model_preferences": _runtime_config.get("task_type_model_preferences", {}),
         "provider_selection_mode": _provider_selection_mode_from_config(_runtime_config),
         "cross_provider_fallback_enabled": _provider_selection_mode_from_config(_runtime_config) in ("balanced", "preferred"),
         "providers": _build_provider_catalog(_runtime_config),
-        # Provider settings bag defaults + per-task-type overrides. Drives the
-        # schema-driven admin UI and the dispatch-time settings resolution.
         "provider_settings_defaults": _runtime_config.get("provider_settings_defaults", {}),
+        "provider_settings_by_effort": _runtime_config.get("provider_settings_by_effort", {}),
         "task_type_provider_overrides": _runtime_config.get("task_type_provider_overrides", {}),
-        "effort_profiles": _runtime_config.get("effort_profiles", {}),
-        "task_type_effort_profile": _runtime_config.get("task_type_effort_profile", {}),
         "health_check_urls": _runtime_config.get("health_check_urls", []),
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
@@ -265,21 +262,6 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                 if not isinstance(model, str) or not model.strip():
                     raise HTTPException(status_code=400, detail=f"Model for {provider_name}/{tier} must be a non-empty string")
         _runtime_config["provider_tier_model_map"] = val
-    if "task_type_provider_preference" in payload:
-        val = payload["task_type_provider_preference"]
-        if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="task_type_provider_preference must be a dict")
-        valid_providers = {p.value for p in LLMProviderName}
-        for task_type, providers in val.items():
-            # "_default" is accepted as a catch-all key for global fallback.
-            if not isinstance(task_type, str) or not task_type:
-                raise HTTPException(status_code=400, detail="task_type_provider_preference keys must be non-empty strings")
-            if not isinstance(providers, list) or not all(isinstance(p, str) for p in providers):
-                raise HTTPException(status_code=400, detail=f"Provider preference for {task_type} must be a list of strings")
-            invalid = [p for p in providers if p not in valid_providers]
-            if invalid:
-                raise HTTPException(status_code=400, detail=f"Invalid providers for {task_type}: {', '.join(invalid)}")
-        _runtime_config["task_type_provider_preference"] = val
     if "task_type_categories" in payload:
         val = payload["task_type_categories"]
         if not isinstance(val, dict):
@@ -290,21 +272,54 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             if not isinstance(members, list) or not all(isinstance(m, str) and m for m in members):
                 raise HTTPException(status_code=400, detail=f"task_type_categories[{category}] must be a list of task-type strings")
         _runtime_config["task_type_categories"] = val
-    if "provider_preference_by_category" in payload:
-        val = payload["provider_preference_by_category"]
+    if "category_routing" in payload:
+        val = payload["category_routing"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="provider_preference_by_category must be a dict")
+            raise HTTPException(status_code=400, detail="category_routing must be a dict")
         valid_providers = {p.value for p in LLMProviderName}
-        for category, providers in val.items():
-            # "_default" is accepted as the global fallback key.
+        valid_effort = {"low", "medium", "high", "max"}
+        for category, entry in val.items():
+            # "_default" allowed as a catch-all.
             if not isinstance(category, str) or not category:
-                raise HTTPException(status_code=400, detail="provider_preference_by_category keys must be non-empty strings")
+                raise HTTPException(status_code=400, detail="category_routing keys must be non-empty strings")
+            if not isinstance(entry, dict):
+                raise HTTPException(status_code=400, detail=f"category_routing[{category}] must be an object with providers/effort")
+            providers = entry.get("providers")
             if not isinstance(providers, list) or not all(isinstance(p, str) for p in providers):
-                raise HTTPException(status_code=400, detail=f"provider_preference_by_category[{category}] must be a list of strings")
+                raise HTTPException(status_code=400, detail=f"category_routing[{category}].providers must be a list of strings")
             invalid = [p for p in providers if p not in valid_providers]
             if invalid:
-                raise HTTPException(status_code=400, detail=f"Invalid providers for category {category}: {', '.join(invalid)}")
-        _runtime_config["provider_preference_by_category"] = val
+                raise HTTPException(status_code=400, detail=f"Invalid providers in category_routing[{category}]: {', '.join(invalid)}")
+            effort = entry.get("effort")
+            if not isinstance(effort, str) or effort not in valid_effort:
+                raise HTTPException(status_code=400, detail=f"category_routing[{category}].effort must be one of {sorted(valid_effort)}")
+        _runtime_config["category_routing"] = val
+    if "task_type_routing" in payload:
+        val = payload["task_type_routing"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="task_type_routing must be a dict")
+        valid_providers = {p.value for p in LLMProviderName}
+        valid_effort = {"low", "medium", "high", "max"}
+        for task_type, entry in val.items():
+            if not isinstance(task_type, str) or not task_type:
+                raise HTTPException(status_code=400, detail="task_type_routing keys must be non-empty strings")
+            if not isinstance(entry, dict) or not entry:
+                raise HTTPException(status_code=400, detail=f"task_type_routing[{task_type}] must be a non-empty object with providers and/or effort")
+            if "providers" in entry:
+                providers = entry["providers"]
+                if not isinstance(providers, list) or not all(isinstance(p, str) for p in providers):
+                    raise HTTPException(status_code=400, detail=f"task_type_routing[{task_type}].providers must be a list of strings")
+                invalid = [p for p in providers if p not in valid_providers]
+                if invalid:
+                    raise HTTPException(status_code=400, detail=f"Invalid providers in task_type_routing[{task_type}]: {', '.join(invalid)}")
+            if "effort" in entry:
+                effort = entry["effort"]
+                if not isinstance(effort, str) or effort not in valid_effort:
+                    raise HTTPException(status_code=400, detail=f"task_type_routing[{task_type}].effort must be one of {sorted(valid_effort)}")
+            extra = [k for k in entry if k not in ("providers", "effort")]
+            if extra:
+                raise HTTPException(status_code=400, detail=f"task_type_routing[{task_type}] has unknown keys: {', '.join(extra)}")
+        _runtime_config["task_type_routing"] = val
     if "task_type_model_preferences" in payload:
         val = payload["task_type_model_preferences"]
         if not isinstance(val, dict):
@@ -396,62 +411,43 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     )
             cleaned_overrides[task_type] = cleaned_per_provider
         _runtime_config["task_type_provider_overrides"] = cleaned_overrides
-    if "effort_profiles" in payload:
-        val = payload["effort_profiles"]
+    if "provider_settings_by_effort" in payload:
+        val = payload["provider_settings_by_effort"]
         if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="effort_profiles must be a dict")
+            raise HTTPException(status_code=400, detail="provider_settings_by_effort must be a dict")
         valid_providers = {p.value for p in LLMProviderName}
-        cleaned_profiles: dict[str, dict[str, dict]] = {}
-        for profile_name, per_provider in val.items():
-            if not isinstance(profile_name, str) or not profile_name or profile_name == "_default":
+        valid_levels = {"low", "medium", "high", "max"}
+        cleaned_matrix: dict[str, dict[str, dict]] = {}
+        for provider_name, per_level in val.items():
+            if provider_name not in valid_providers:
                 raise HTTPException(
                     status_code=400,
-                    detail="effort_profiles keys must be non-empty strings and not '_default'",
+                    detail=f"Invalid provider in provider_settings_by_effort: {provider_name}",
                 )
-            if not isinstance(per_provider, dict):
-                raise HTTPException(status_code=400, detail=f"effort_profiles[{profile_name}] must be a dict")
-            cleaned_per_provider: dict[str, dict] = {}
-            for provider_name, bag in per_provider.items():
-                if provider_name not in valid_providers:
+            if not isinstance(per_level, dict):
+                raise HTTPException(status_code=400, detail=f"provider_settings_by_effort[{provider_name}] must be a dict")
+            cleaned_per_level: dict[str, dict] = {}
+            for level, bag in per_level.items():
+                if level not in valid_levels:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Invalid provider in effort_profiles[{profile_name}]: {provider_name}",
+                        detail=f"Invalid effort level in provider_settings_by_effort[{provider_name}]: {level} (must be one of {sorted(valid_levels)})",
                     )
                 if not isinstance(bag, dict):
                     raise HTTPException(
                         status_code=400,
-                        detail=f"effort_profiles[{profile_name}][{provider_name}] must be a dict",
+                        detail=f"provider_settings_by_effort[{provider_name}][{level}] must be a dict",
                     )
                 provider = get_provider(LLMProviderName(provider_name))
                 try:
-                    cleaned_per_provider[provider_name] = provider.validate_settings(bag)
+                    cleaned_per_level[level] = provider.validate_settings(bag)
                 except ValueError as exc:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"effort_profiles[{profile_name}][{provider_name}]: {exc}",
+                        detail=f"provider_settings_by_effort[{provider_name}][{level}]: {exc}",
                     )
-            cleaned_profiles[profile_name] = cleaned_per_provider
-        _runtime_config["effort_profiles"] = cleaned_profiles
-    if "task_type_effort_profile" in payload:
-        val = payload["task_type_effort_profile"]
-        if not isinstance(val, dict):
-            raise HTTPException(status_code=400, detail="task_type_effort_profile must be a dict")
-        known_profiles = set(_runtime_config.get("effort_profiles", {}) or {})
-        # Include the profile block from this payload so a single PATCH can
-        # create a profile and bind task types to it atomically.
-        if "effort_profiles" in payload and isinstance(payload["effort_profiles"], dict):
-            known_profiles |= set(payload["effort_profiles"].keys())
-        for task_type, profile_name in val.items():
-            if not isinstance(task_type, str) or not task_type:
-                raise HTTPException(status_code=400, detail="task_type_effort_profile keys must be non-empty strings")
-            if not isinstance(profile_name, str) or not profile_name:
-                raise HTTPException(status_code=400, detail=f"task_type_effort_profile[{task_type}] must be a non-empty string")
-            if known_profiles and profile_name not in known_profiles:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"task_type_effort_profile[{task_type}] references undefined profile {profile_name!r}",
-                )
-        _runtime_config["task_type_effort_profile"] = val
+            cleaned_matrix[provider_name] = cleaned_per_level
+        _runtime_config["provider_settings_by_effort"] = cleaned_matrix
     if "agent_prompt_suffixes" in payload:
         val = payload["agent_prompt_suffixes"]
         if not isinstance(val, dict):
@@ -698,16 +694,15 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             try:
                 state.runtime_config_json = {
                     "provider_tier_model_map": _runtime_config.get("provider_tier_model_map", {}),
-                    "task_type_provider_preference": _runtime_config.get("task_type_provider_preference", {}),
                     "task_type_categories": _runtime_config.get("task_type_categories", {}),
-                    "provider_preference_by_category": _runtime_config.get("provider_preference_by_category", {}),
+                    "category_routing": _runtime_config.get("category_routing", {}),
+                    "task_type_routing": _runtime_config.get("task_type_routing", {}),
                     "task_type_model_preferences": _runtime_config.get("task_type_model_preferences", {}),
                     "provider_selection_mode": _provider_selection_mode_from_config(_runtime_config),
                     "cross_provider_fallback_enabled": _provider_selection_mode_from_config(_runtime_config) in ("balanced", "preferred"),
                     "provider_settings_defaults": _runtime_config.get("provider_settings_defaults", {}),
+                    "provider_settings_by_effort": _runtime_config.get("provider_settings_by_effort", {}),
                     "task_type_provider_overrides": _runtime_config.get("task_type_provider_overrides", {}),
-                    "effort_profiles": _runtime_config.get("effort_profiles", {}),
-                    "task_type_effort_profile": _runtime_config.get("task_type_effort_profile", {}),
                     "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
                     "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
                     "health_check_urls": _runtime_config.get("health_check_urls", []),

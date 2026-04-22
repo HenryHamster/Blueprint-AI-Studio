@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { AuthMode, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsDefaults, TaskTypeProviderOverrides } from '../types/settings';
+import type { AuthMode, CategoryRoutingEntry, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import type { NotificationConfig } from '../components/SettingsNotificationsSection';
 import type { BuildConfig } from '../types/project';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
@@ -39,11 +39,10 @@ export function useSettings(addToast: AddToast) {
     throttle_seconds: 30,
   });
   const [providerTierModelMap, setProviderTierModelMap] = useState<Record<string, Record<string, string>>>({});
-  const [taskTypeProviderPreference, setTaskTypeProviderPreference] = useState<Record<string, ProviderName[]>>({});
   const [taskTypeCategories, setTaskTypeCategories] = useState<Record<string, string[]>>({});
-  const [providerPreferenceByCategory, setProviderPreferenceByCategory] = useState<Record<string, ProviderName[]>>({});
-  const [effortProfiles, setEffortProfiles] = useState<Record<string, Partial<Record<ProviderName, Record<string, unknown>>>>>({});
-  const [taskTypeEffortProfile, setTaskTypeEffortProfile] = useState<Record<string, string>>({});
+  const [categoryRouting, setCategoryRouting] = useState<Record<string, CategoryRoutingEntry>>({});
+  const [taskTypeRouting, setTaskTypeRouting] = useState<Record<string, TaskTypeRoutingEntry>>({});
+  const [providerSettingsByEffort, setProviderSettingsByEffort] = useState<ProviderSettingsByEffort>({} as ProviderSettingsByEffort);
   const [taskTypeModelPreferences, setTaskTypeModelPreferences] = useState<Record<string, ModelPreference[]>>({});
   const [providerSelectionMode, setProviderSelectionMode] = useState<'balanced' | 'preferred' | 'exclusive'>('balanced');
   const [crossProviderFallbackEnabled, setCrossProviderFallbackEnabled] = useState(true);
@@ -73,11 +72,10 @@ export function useSettings(addToast: AddToast) {
         setUsingMaxPlan(data.using_max_plan ?? false);
         setMaxPlanAccounts(data.max_plan_accounts || []);
         setProviderTierModelMap(data.provider_tier_model_map ?? {});
-        setTaskTypeProviderPreference(data.task_type_provider_preference ?? {});
         setTaskTypeCategories(data.task_type_categories ?? {});
-        setProviderPreferenceByCategory(data.provider_preference_by_category ?? {});
-        setEffortProfiles(data.effort_profiles ?? {});
-        setTaskTypeEffortProfile(data.task_type_effort_profile ?? {});
+        setCategoryRouting(data.category_routing ?? {});
+        setTaskTypeRouting(data.task_type_routing ?? {});
+        setProviderSettingsByEffort((data.provider_settings_by_effort ?? {}) as ProviderSettingsByEffort);
         setTaskTypeModelPreferences(data.task_type_model_preferences ?? {});
         const rawMode = data.provider_selection_mode;
         const resolvedMode: 'balanced' | 'preferred' | 'exclusive' =
@@ -269,18 +267,6 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
-  const updateTaskTypeProviderPreferences = async (value: Record<string, ProviderName[]>) => {
-    const prev = taskTypeProviderPreference;
-    setTaskTypeProviderPreference(value);
-    try {
-      await patchSettings({ task_type_provider_preference: value });
-    } catch (err) {
-      console.error('Failed to update provider preference:', err);
-      setTaskTypeProviderPreference(prev);
-      addToast('Failed to update provider preference', 'error');
-    }
-  };
-
   const updateTaskTypeCategories = async (value: Record<string, string[]>) => {
     const prev = taskTypeCategories;
     setTaskTypeCategories(value);
@@ -293,39 +279,39 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
-  const updateProviderPreferenceByCategory = async (value: Record<string, ProviderName[]>) => {
-    const prev = providerPreferenceByCategory;
-    setProviderPreferenceByCategory(value);
+  const updateCategoryRouting = async (value: Record<string, CategoryRoutingEntry>) => {
+    const prev = categoryRouting;
+    setCategoryRouting(value);
     try {
-      await patchSettings({ provider_preference_by_category: value });
+      await patchSettings({ category_routing: value });
     } catch (err) {
-      console.error('Failed to update provider preference by category:', err);
-      setProviderPreferenceByCategory(prev);
-      addToast('Failed to update category provider preference', 'error');
+      console.error('Failed to update category routing:', err);
+      setCategoryRouting(prev);
+      addToast('Failed to update category routing', 'error');
     }
   };
 
-  const updateEffortProfiles = async (value: Record<string, Partial<Record<ProviderName, Record<string, unknown>>>>) => {
-    const prev = effortProfiles;
-    setEffortProfiles(value);
+  const updateTaskTypeRouting = async (value: Record<string, TaskTypeRoutingEntry>) => {
+    const prev = taskTypeRouting;
+    setTaskTypeRouting(value);
     try {
-      await patchSettings({ effort_profiles: value });
+      await patchSettings({ task_type_routing: value });
     } catch (err) {
-      console.error('Failed to update effort profiles:', err);
-      setEffortProfiles(prev);
-      addToast('Failed to update effort profiles', 'error');
+      console.error('Failed to update task-type routing:', err);
+      setTaskTypeRouting(prev);
+      addToast('Failed to update task-type routing', 'error');
     }
   };
 
-  const updateTaskTypeEffortProfile = async (value: Record<string, string>) => {
-    const prev = taskTypeEffortProfile;
-    setTaskTypeEffortProfile(value);
+  const updateProviderSettingsByEffort = async (value: ProviderSettingsByEffort) => {
+    const prev = providerSettingsByEffort;
+    setProviderSettingsByEffort(value);
     try {
-      await patchSettings({ task_type_effort_profile: value });
+      await patchSettings({ provider_settings_by_effort: value });
     } catch (err) {
-      console.error('Failed to update task→profile mapping:', err);
-      setTaskTypeEffortProfile(prev);
-      addToast('Failed to update task→profile mapping', 'error');
+      console.error('Failed to update provider settings by effort:', err);
+      setProviderSettingsByEffort(prev);
+      addToast('Failed to update effort matrix', 'error');
     }
   };
 
@@ -624,9 +610,9 @@ export function useSettings(addToast: AddToast) {
     autoArchiveEnabled, autoArchiveTerminalAfterDays,
     autoArchiveMaxTerminalTasksPerProject, autoArchiveIntervalMinutes,
     notificationConfig,
-    providerTierModelMap, taskTypeProviderPreference, taskTypeModelPreferences,
-    taskTypeCategories, providerPreferenceByCategory,
-    effortProfiles, taskTypeEffortProfile,
+    providerTierModelMap, taskTypeModelPreferences,
+    taskTypeCategories, categoryRouting, taskTypeRouting,
+    providerSettingsByEffort,
     providerSelectionMode,
     crossProviderFallbackEnabled, providers,
     providerSettingsDefaults, setProviderSettingsDefaults,
@@ -638,9 +624,9 @@ export function useSettings(addToast: AddToast) {
     updateAccountCaps,
     connectGitHub,
     updateAgentPromptSuffixes,
-    updateProviderTierModels, updateTaskTypeProviderPreferences, updateTaskTypeModelPreferenceConfig,
-    updateTaskTypeCategories, updateProviderPreferenceByCategory,
-    updateEffortProfiles, updateTaskTypeEffortProfile,
+    updateProviderTierModels, updateTaskTypeModelPreferenceConfig,
+    updateTaskTypeCategories, updateCategoryRouting, updateTaskTypeRouting,
+    updateProviderSettingsByEffort,
     updateProviderSelectionMode,
     updateCrossProviderFallback,
     updateProviderSettingsDefaults, updateTaskTypeProviderOverrides,

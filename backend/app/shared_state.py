@@ -108,104 +108,80 @@ runtime_config: Dict = {
             "haiku": "gemini-2.5-flash-lite",
         },
     },
-    # Task-type categories group related types so provider preferences can be
-    # set by batch instead of per-type. Categories are advisory — a task type
-    # not listed here still resolves via _default below.
+    # Task-type categories group related types so one routing entry covers
+    # the whole group. Every task type listed here falls under the matching
+    # category_routing block; unlisted types resolve via category_routing["_default"].
     "task_type_categories": {
         "strategic": ["strategic_review", "design_doc_update", "research", "plan"],
         "build": ["create", "refactor", "migrate"],
         "review": ["review", "qa", "security_audit", "perf", "debug", "fix"],
         "ops": ["docs", "deps", "smoketest"],
     },
-    # Provider preference by category. Used as a fallback when a task type
-    # doesn't have its own entry in task_type_provider_preference. The
-    # "_default" entry wins when no category match either.
-    "provider_preference_by_category": {
-        "_default": ["anthropic", "openai", "gemini"],
-        # e.g. "build": ["anthropic"] to pin all code-writing tasks.
+    # Category routing — single source of truth for both "which providers is
+    # this group allowed to use" and "at what effort level does it run". The
+    # effort value indexes into provider_settings_by_effort below to pick the
+    # concrete settings bag (including model).
+    "category_routing": {
+        "_default": {"providers": ["anthropic", "openai", "gemini"], "effort": "medium"},
+        "strategic": {"providers": ["anthropic", "openai", "gemini"], "effort": "max"},
+        "build": {"providers": ["anthropic", "openai", "gemini"], "effort": "medium"},
+        "review": {"providers": ["anthropic", "openai", "gemini"], "effort": "high"},
+        "ops": {"providers": ["anthropic", "openai", "gemini"], "effort": "low"},
     },
-    # Sparse per-task-type overrides — wins over category + _default. Leave
-    # empty to inherit the category/default allow-list for every task type.
-    # The list is interpreted by `provider_selection_mode`:
-    #   - balanced  → all listed providers' accounts pooled, picked by health + load
-    #   - preferred → strict ordering; fall through on exhaustion
-    #   - exclusive → first listed provider only, no fallback
-    "task_type_provider_preference": {},
+    # Sparse per-task-type routing overrides. Either field optional; the
+    # other inherits from the task's category. Use for surgical cases like
+    # "route debug tasks to openai at high effort regardless of category".
+    "task_type_routing": {},
     # Optional per-task-type concrete model priority overrides. When present,
     # selection uses these ordered {provider, model} pairs before falling back
     # to provider preference + quality tier resolution.
     "task_type_model_preferences": {},
     # Provider selection mode — controls how the pool chooses across the
-    # providers listed in task_type_provider_preference:
+    # providers listed in category_routing / task_type_routing:
     #   "balanced"  — flatten all accounts across listed providers into one
     #                 pool; pick globally by (health_score, -active_tasks).
-    #                 Adding an account makes it immediately eligible for work.
     #   "preferred" — strict ordering; try each provider in list order, only
     #                 fall through when the earlier provider has no capacity.
     #   "exclusive" — first listed provider only; never fall back cross-provider.
-    # Per-account max_concurrent_tasks/daily_task_cap still apply in every mode.
     "provider_selection_mode": "balanced",
     # DEPRECATED: legacy boolean superseded by provider_selection_mode. Kept
     # readable in GET/PATCH for backwards compat — True ≡ "preferred",
     # False ≡ "exclusive". If both keys are present, mode wins.
     "cross_provider_fallback_enabled": True,
-    # Provider settings bags: canonical source of per-provider dispatch knobs
-    # (effort, verbosity, thinking budget, advisor toggle, etc.). Defaults are
-    # intentionally provider-neutral on model selection — concrete model comes
-    # from `provider_tier_model_map[provider][quality_tier]` unless a bag key
-    # explicitly pins one. Shape per provider is declared by that provider's
-    # settings_schema(); unknown keys are rejected at resolution time.
+    # Per-provider base settings that don't vary by effort (e.g. anthropic
+    # betas). Rarely set — most settings belong in provider_settings_by_effort.
     "provider_settings_defaults": {
         "anthropic": {},
         "openai": {},
         "gemini": {},
     },
-    # Effort profiles: named bundles of per-provider settings. Define what
-    # "low" / "medium" / "high" / "max" means for each provider once, then
-    # just tag each task type with a profile name below — no more per-task
-    # per-provider effort copy-pasting.
-    "effort_profiles": {
-        "low": {
-            "anthropic": {"effort": "low"},
-            "openai": {"reasoning_effort": "low", "verbosity": "low"},
-            "gemini": {"thinking_budget": 1024},
+    # Per-provider effort matrix. Each cell is a settings bag (validated by
+    # the provider's settings_schema) and typically pins a model + the
+    # provider's effort knob. When a task resolves to (provider, effort), the
+    # corresponding cell is merged on top of provider_settings_defaults.
+    "provider_settings_by_effort": {
+        "anthropic": {
+            "low": {"model": "claude-haiku-4-5-20251001", "effort": "low"},
+            "medium": {"model": "claude-sonnet-4-6", "effort": "medium"},
+            "high": {"model": "claude-opus-4-7", "effort": "high"},
+            "max": {"model": "claude-opus-4-7", "effort": "max"},
         },
-        "medium": {
-            "anthropic": {"effort": "medium"},
-            "openai": {"reasoning_effort": "medium", "verbosity": "medium"},
-            "gemini": {"thinking_budget": 4096},
+        "openai": {
+            "low": {"model": "gpt-4o-mini", "reasoning_effort": "low", "verbosity": "low"},
+            "medium": {"model": "gpt-4.1", "reasoning_effort": "medium", "verbosity": "medium"},
+            "high": {"model": "gpt-5", "reasoning_effort": "high", "verbosity": "high"},
+            "max": {"model": "gpt-5", "reasoning_effort": "high", "verbosity": "high"},
         },
-        "high": {
-            "anthropic": {"effort": "high"},
-            "openai": {"reasoning_effort": "high", "verbosity": "high"},
-            "gemini": {"thinking_budget": 16384},
-        },
-        "max": {
-            # Codex CLI tops out at "high"; Anthropic aliases max→xhigh; Gemini
-            # 2.5-pro caps thinking at 32768.
-            "anthropic": {"effort": "max"},
-            "openai": {"reasoning_effort": "high", "verbosity": "high"},
-            "gemini": {"thinking_budget": 32768},
+        "gemini": {
+            "low": {"model": "gemini-2.5-flash-lite", "thinking_budget": 1024},
+            "medium": {"model": "gemini-2.5-flash", "thinking_budget": 4096},
+            "high": {"model": "gemini-2.5-pro", "thinking_budget": 16384},
+            "max": {"model": "gemini-2.5-pro", "thinking_budget": 32768},
         },
     },
-    # Task-type → profile mapping. "_default" applies to any task type without
-    # its own entry. Payload/context can override per-task.
-    "task_type_effort_profile": {
-        "_default": "medium",
-        "strategic_review": "max",
-        "design_doc_update": "max",
-        "research": "high",
-        "security_audit": "high",
-        "perf": "high",
-        "debug": "high",
-        "smoketest": "low",
-        "docs": "low",
-        "deps": "low",
-    },
-    # Sparse per-(task_type, provider) surgical overrides. Used for things
-    # that DON'T fit the profile mental model — e.g. pinning a specific model
-    # for a specific task type. Effort levels should live in profiles; this
-    # layer is for the irregular stuff. Wins over the profile layer.
+    # Sparse per-(task_type, provider) surgical overrides. For cases that
+    # don't fit the matrix — e.g. "when this task type routes to openai,
+    # also force verbosity=low". Wins over the effort matrix.
     "task_type_provider_overrides": {},
     # Per-type extra instructions appended to the agent's base prompt
     # e.g. {"research": "Focus especially on performance bottlenecks.", "qa": "Use pytest only."}
@@ -318,6 +294,94 @@ SCOPE_AWARE_RETRY_BUDGETS: Dict[str, Dict[str, int]] = {
 }
 
 
+def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate legacy routing/effort keys to the unified shape in-place.
+
+    The old shape split the same "which provider + what effort" decision
+    across four dicts (provider_preference_by_category, task_type_provider_preference,
+    effort_profiles, task_type_effort_profile). The new shape collapses
+    them into two:
+      - category_routing[cat] = {"providers": [...], "effort": "..."}
+      - task_type_routing[task_type] = {"providers"?, "effort"?}
+    plus a per-provider effort matrix:
+      - provider_settings_by_effort[provider][level] = bag
+
+    No-op when new keys are already present. Safe to call on every sync.
+    """
+    # Step 1: collapse preferences + profiles into category_routing.
+    if "category_routing" not in config:
+        legacy_pref = config.get("provider_preference_by_category") or {}
+        legacy_task_profile = config.get("task_type_effort_profile") or {}
+        legacy_categories = config.get("task_type_categories") or {}
+        # Default effort from legacy _default mapping, else medium.
+        default_effort = None
+        if isinstance(legacy_task_profile, dict):
+            raw = legacy_task_profile.get("_default")
+            if isinstance(raw, str) and raw:
+                default_effort = raw
+        default_effort = default_effort or "medium"
+        # Category effort: sample from the first member task type's profile.
+        cat_routing: Dict[str, Dict[str, Any]] = {}
+        if isinstance(legacy_pref, dict):
+            for cat, providers in legacy_pref.items():
+                if not isinstance(providers, list):
+                    continue
+                effort = default_effort
+                members = legacy_categories.get(cat) if isinstance(legacy_categories, dict) else None
+                if isinstance(members, list):
+                    for task in members:
+                        if isinstance(legacy_task_profile, dict):
+                            raw = legacy_task_profile.get(task)
+                            if isinstance(raw, str) and raw:
+                                effort = raw
+                                break
+                cat_routing[cat] = {"providers": list(providers), "effort": effort}
+        if "_default" not in cat_routing:
+            default_providers = (
+                (legacy_pref.get("_default") if isinstance(legacy_pref, dict) else None)
+                or ["anthropic", "openai", "gemini"]
+            )
+            cat_routing["_default"] = {"providers": list(default_providers), "effort": default_effort}
+        if cat_routing:
+            config["category_routing"] = cat_routing
+
+    # Step 2: collapse per-task preference + profile into task_type_routing.
+    if "task_type_routing" not in config:
+        legacy_task_pref = config.get("task_type_provider_preference") or {}
+        legacy_task_profile = config.get("task_type_effort_profile") or {}
+        task_routing: Dict[str, Dict[str, Any]] = {}
+        if isinstance(legacy_task_pref, dict):
+            for task, providers in legacy_task_pref.items():
+                if task == "_default" or not isinstance(providers, list):
+                    continue
+                task_routing.setdefault(task, {})["providers"] = list(providers)
+        if isinstance(legacy_task_profile, dict):
+            for task, profile in legacy_task_profile.items():
+                if task == "_default" or not isinstance(profile, str):
+                    continue
+                task_routing.setdefault(task, {})["effort"] = profile
+        if task_routing:
+            config["task_type_routing"] = task_routing
+
+    # Step 3: flip effort_profiles[profile][provider] into
+    # provider_settings_by_effort[provider][level]. Keep model-less bags as-is.
+    if "provider_settings_by_effort" not in config:
+        legacy_profiles = config.get("effort_profiles") or {}
+        if isinstance(legacy_profiles, dict):
+            matrix: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            for level, per_provider in legacy_profiles.items():
+                if level == "_default" or not isinstance(per_provider, dict):
+                    continue
+                for provider, bag in per_provider.items():
+                    if not isinstance(bag, dict):
+                        continue
+                    matrix.setdefault(provider, {})[level] = dict(bag)
+            if matrix:
+                config["provider_settings_by_effort"] = matrix
+
+    return config
+
+
 async def sync_runtime_config_from_state(state) -> list[str]:
     """Apply persisted DeploymentState values to in-memory runtime_config.
 
@@ -371,14 +435,17 @@ async def sync_runtime_config_from_state(state) -> list[str]:
         try:
             config_json = getattr(state, "runtime_config_json", None)
             if config_json and isinstance(config_json, dict):
+                # Translate any legacy-shape keys to the new shape in-place so
+                # downstream readers never see the old layout. Safe to call
+                # every sync — no-ops when new keys are already present.
+                config_json = _migrate_legacy_provider_config(dict(config_json))
                 for key in (
                     "provider_tier_model_map",
-                    "task_type_provider_preference",
                     "task_type_categories",
-                    "provider_preference_by_category",
+                    "category_routing",
+                    "task_type_routing",
                     "task_type_model_preferences",
-                    "effort_profiles",
-                    "task_type_effort_profile",
+                    "provider_settings_by_effort",
                     "provider_selection_mode",
                     "cross_provider_fallback_enabled",
                     "agent_prompt_suffixes",

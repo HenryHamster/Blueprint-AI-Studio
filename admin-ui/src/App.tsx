@@ -396,14 +396,12 @@ export default function App() {
         onUpdateProviderSelectionMode={s.updateProviderSelectionMode}
         taskTypeCategories={s.taskTypeCategories}
         onUpdateTaskTypeCategories={s.updateTaskTypeCategories}
-        providerPreferenceByCategory={s.providerPreferenceByCategory}
-        onUpdateProviderPreferenceByCategory={s.updateProviderPreferenceByCategory}
-        taskTypeProviderPreference={s.taskTypeProviderPreference}
-        onUpdateTaskTypeProviderPreferences={s.updateTaskTypeProviderPreferences}
-        effortProfiles={s.effortProfiles}
-        onUpdateEffortProfiles={s.updateEffortProfiles}
-        taskTypeEffortProfile={s.taskTypeEffortProfile}
-        onUpdateTaskTypeEffortProfile={s.updateTaskTypeEffortProfile}
+        categoryRouting={s.categoryRouting}
+        onUpdateCategoryRouting={s.updateCategoryRouting}
+        taskTypeRouting={s.taskTypeRouting}
+        onUpdateTaskTypeRouting={s.updateTaskTypeRouting}
+        providerSettingsByEffort={s.providerSettingsByEffort}
+        onUpdateProviderSettingsByEffort={s.updateProviderSettingsByEffort}
         showMetrics={s.showMetrics}
         onToggleMetrics={() => s.setShowMetrics(prev => !prev)}
         metricsHistory={s.metricsHistory}

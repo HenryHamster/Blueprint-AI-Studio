@@ -1,5 +1,22 @@
 export type ProviderName = 'anthropic' | 'openai' | 'gemini';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
+export type EffortLevel = 'low' | 'medium' | 'high' | 'max';
+export const EFFORT_LEVELS: readonly EffortLevel[] = ['low', 'medium', 'high', 'max'];
+
+export interface CategoryRoutingEntry {
+  providers: ProviderName[];
+  effort: EffortLevel;
+}
+
+export interface TaskTypeRoutingEntry {
+  providers?: ProviderName[];
+  effort?: EffortLevel;
+}
+
+export type ProviderSettingsByEffort = Record<
+  ProviderName,
+  Partial<Record<EffortLevel, Record<string, unknown>>>
+>;
 
 export interface DeployState {
   status: string;

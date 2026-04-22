@@ -436,64 +436,136 @@ def test_resolve_task_provider_settings_empty_when_nothing_configured():
     assert resolve_task_provider_settings(task, runtime_config, "anthropic") == {}
 
 
-def test_resolve_task_provider_settings_applies_effort_profile():
-    """Profile layer fills in effort for the task's task_type → profile mapping."""
+def test_resolve_task_provider_settings_applies_effort_matrix():
+    """The effort matrix provides per-(provider, level) bags that include
+    model + the provider's effort knob. category_routing picks the level."""
     from app.max_plan_pool import resolve_task_provider_settings
 
     runtime_config = {
-        "effort_profiles": {
-            "medium": {"anthropic": {"effort": "medium"}},
-            "max": {"anthropic": {"effort": "max"}},
+        "task_type_categories": {"strategic": ["strategic_review"]},
+        "category_routing": {
+            "_default": {"providers": ["anthropic"], "effort": "medium"},
+            "strategic": {"providers": ["anthropic"], "effort": "max"},
         },
-        "task_type_effort_profile": {
-            "_default": "medium",
-            "strategic_review": "max",
+        "provider_settings_by_effort": {
+            "anthropic": {
+                "medium": {"model": "claude-sonnet-4-6", "effort": "medium"},
+                "max": {"model": "claude-opus-4-7", "effort": "max"},
+            },
         },
     }
-    # strategic_review → "max" profile → effort=max
+    # strategic_review → "strategic" category → max cell → opus + effort=max
     assert resolve_task_provider_settings(
         _make_task("strategic_review"), runtime_config, "anthropic"
-    ) == {"effort": "max"}
-    # create → _default "medium" profile → effort=medium
+    ) == {"model": "claude-opus-4-7", "effort": "max"}
+    # create → no category → _default medium → sonnet + effort=medium
     assert resolve_task_provider_settings(
         _make_task("create"), runtime_config, "anthropic"
-    ) == {"effort": "medium"}
+    ) == {"model": "claude-sonnet-4-6", "effort": "medium"}
 
 
-def test_resolve_task_provider_settings_payload_profile_overrides_task_type():
-    """Payload-level effort_profile wins over the task_type → profile mapping."""
+def test_resolve_task_provider_settings_payload_effort_overrides_category():
+    """payload.effort wins over task_type_routing and category_routing."""
     from app.max_plan_pool import resolve_task_provider_settings
 
     runtime_config = {
-        "effort_profiles": {
-            "low": {"anthropic": {"effort": "low"}},
-            "max": {"anthropic": {"effort": "max"}},
+        "task_type_categories": {"strategic": ["strategic_review"]},
+        "category_routing": {"strategic": {"providers": ["anthropic"], "effort": "max"}},
+        "provider_settings_by_effort": {
+            "anthropic": {
+                "low": {"model": "claude-haiku-4-5-20251001", "effort": "low"},
+                "max": {"model": "claude-opus-4-7", "effort": "max"},
+            },
         },
-        "task_type_effort_profile": {"strategic_review": "max"},
     }
     task = SimpleNamespace(
-        payloads=[{"type": "strategic_review", "effort_profile": "low"}],
+        payloads=[{"type": "strategic_review", "effort": "low"}],
         context={},
     )
-    assert resolve_task_provider_settings(task, runtime_config, "anthropic") == {"effort": "low"}
+    assert resolve_task_provider_settings(task, runtime_config, "anthropic") == {
+        "model": "claude-haiku-4-5-20251001",
+        "effort": "low",
+    }
 
 
-def test_resolve_task_provider_settings_surgical_override_beats_profile():
-    """task_type_provider_overrides wins over the profile layer — surgical
-    overrides are for the irregular cases that don't fit the profile model."""
+def test_resolve_task_provider_settings_surgical_override_beats_matrix():
+    """task_type_provider_overrides wins over the matrix — surgical overrides
+    are for cases that don't fit the per-effort shape."""
     from app.max_plan_pool import resolve_task_provider_settings
 
     runtime_config = {
-        "effort_profiles": {"medium": {"anthropic": {"effort": "medium"}}},
-        "task_type_effort_profile": {"_default": "medium"},
+        "task_type_categories": {"ops": ["docs"]},
+        "category_routing": {"ops": {"providers": ["anthropic"], "effort": "medium"}},
+        "provider_settings_by_effort": {
+            "anthropic": {"medium": {"model": "claude-sonnet-4-6", "effort": "medium"}},
+        },
         "task_type_provider_overrides": {
             "docs": {"anthropic": {"model": "claude-haiku-4-5-20251001"}},
         },
     }
-    # Effort comes from profile; model comes from surgical override.
+    # Effort comes from matrix; model comes from surgical override.
     assert resolve_task_provider_settings(
         _make_task("docs"), runtime_config, "anthropic"
-    ) == {"effort": "medium", "model": "claude-haiku-4-5-20251001"}
+    ) == {"model": "claude-haiku-4-5-20251001", "effort": "medium"}
+
+
+def test_resolve_task_routing_layers():
+    """Most-specific wins: payload > context > task_type_routing >
+    category_routing > category_routing[_default] > ALL_PROVIDERS."""
+    from app.max_plan_pool import resolve_task_routing
+
+    runtime_config = {
+        "task_type_categories": {"build": ["create", "refactor"]},
+        "category_routing": {
+            "_default": {"providers": ["anthropic"], "effort": "medium"},
+            "build": {"providers": ["anthropic", "openai"], "effort": "high"},
+        },
+        "task_type_routing": {"debug": {"providers": ["openai"], "effort": "max"}},
+    }
+    # No category, no override → _default
+    assert resolve_task_routing(_make_task("qa"), runtime_config) == {
+        "providers": ["anthropic"], "effort": "medium",
+    }
+    # In "build" category → category routing wins
+    assert resolve_task_routing(_make_task("create"), runtime_config) == {
+        "providers": ["anthropic", "openai"], "effort": "high",
+    }
+    # task_type_routing override wins over category
+    assert resolve_task_routing(_make_task("debug"), runtime_config) == {
+        "providers": ["openai"], "effort": "max",
+    }
+    # payload.effort wins
+    task = SimpleNamespace(
+        payloads=[{"type": "create", "effort": "low"}],
+        context={},
+    )
+    assert resolve_task_routing(task, runtime_config) == {
+        "providers": ["anthropic", "openai"], "effort": "low",
+    }
+
+
+def test_resolve_task_routing_partial_override_inherits_other_field():
+    """A task_type_routing entry with only `effort` inherits providers from
+    the category, and vice versa."""
+    from app.max_plan_pool import resolve_task_routing
+
+    runtime_config = {
+        "task_type_categories": {"ops": ["docs"]},
+        "category_routing": {"ops": {"providers": ["anthropic", "gemini"], "effort": "medium"}},
+        "task_type_routing": {
+            "docs": {"effort": "low"},  # only override effort
+            "smoketest": {"providers": ["gemini"]},  # only override providers
+        },
+    }
+    # docs: providers inherited from ops category, effort overridden
+    assert resolve_task_routing(_make_task("docs"), runtime_config) == {
+        "providers": ["anthropic", "gemini"], "effort": "low",
+    }
+    # smoketest: effort inherited from _default (ops doesn't contain smoketest), providers overridden
+    # No _default in this config; falls through to ALL_PROVIDERS effort=medium
+    result = resolve_task_routing(_make_task("smoketest"), runtime_config)
+    assert result["providers"] == ["gemini"]
+    assert result["effort"] == "medium"
 
 
 # ---------------------------------------------------------------------------

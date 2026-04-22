@@ -3,7 +3,7 @@ import { useMemo, useState, useRef, useEffect } from 'react';
 import { Activity, Network, Compass, Microscope, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
-import type { AuthMode, DeployState, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsDefaults, TaskTypeProviderOverrides } from '../types/settings';
+import type { AuthMode, CategoryRoutingEntry, DeployState, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import type { Task } from '../types/task';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig } from '../types/project';
 
@@ -109,14 +109,12 @@ export interface HeaderBarProps {
   onUpdateProviderSelectionMode: (mode: 'balanced' | 'preferred' | 'exclusive') => Promise<void>;
   taskTypeCategories: Record<string, string[]>;
   onUpdateTaskTypeCategories: (value: Record<string, string[]>) => Promise<void>;
-  providerPreferenceByCategory: Record<string, ProviderName[]>;
-  onUpdateProviderPreferenceByCategory: (value: Record<string, ProviderName[]>) => Promise<void>;
-  taskTypeProviderPreference: Record<string, ProviderName[]>;
-  onUpdateTaskTypeProviderPreferences: (value: Record<string, ProviderName[]>) => Promise<void>;
-  effortProfiles: Record<string, Partial<Record<ProviderName, Record<string, unknown>>>>;
-  onUpdateEffortProfiles: (value: Record<string, Partial<Record<ProviderName, Record<string, unknown>>>>) => Promise<void>;
-  taskTypeEffortProfile: Record<string, string>;
-  onUpdateTaskTypeEffortProfile: (value: Record<string, string>) => Promise<void>;
+  categoryRouting: Record<string, CategoryRoutingEntry>;
+  onUpdateCategoryRouting: (value: Record<string, CategoryRoutingEntry>) => Promise<void>;
+  taskTypeRouting: Record<string, TaskTypeRoutingEntry>;
+  onUpdateTaskTypeRouting: (value: Record<string, TaskTypeRoutingEntry>) => Promise<void>;
+  providerSettingsByEffort: ProviderSettingsByEffort;
+  onUpdateProviderSettingsByEffort: (value: ProviderSettingsByEffort) => Promise<void>;
   showMetrics: boolean;
   onToggleMetrics: () => void;
   metricsHistory: { timestamp: number; completedCount: number }[];
@@ -249,14 +247,12 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateProviderSelectionMode,
     taskTypeCategories,
     onUpdateTaskTypeCategories,
-    providerPreferenceByCategory,
-    onUpdateProviderPreferenceByCategory,
-    taskTypeProviderPreference,
-    onUpdateTaskTypeProviderPreferences,
-    effortProfiles,
-    onUpdateEffortProfiles,
-    taskTypeEffortProfile,
-    onUpdateTaskTypeEffortProfile,
+    categoryRouting,
+    onUpdateCategoryRouting,
+    taskTypeRouting,
+    onUpdateTaskTypeRouting,
+    providerSettingsByEffort,
+    onUpdateProviderSettingsByEffort,
     taskTypeProviderOverrides,
     onUpdateProviderSettingsDefaults,
     onUpdateTaskTypeProviderOverrides,
@@ -462,14 +458,12 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateProviderSelectionMode={onUpdateProviderSelectionMode}
           taskTypeCategories={taskTypeCategories}
           onUpdateTaskTypeCategories={onUpdateTaskTypeCategories}
-          providerPreferenceByCategory={providerPreferenceByCategory}
-          onUpdateProviderPreferenceByCategory={onUpdateProviderPreferenceByCategory}
-          taskTypeProviderPreference={taskTypeProviderPreference}
-          onUpdateTaskTypeProviderPreferences={onUpdateTaskTypeProviderPreferences}
-          effortProfiles={effortProfiles}
-          onUpdateEffortProfiles={onUpdateEffortProfiles}
-          taskTypeEffortProfile={taskTypeEffortProfile}
-          onUpdateTaskTypeEffortProfile={onUpdateTaskTypeEffortProfile}
+          categoryRouting={categoryRouting}
+          onUpdateCategoryRouting={onUpdateCategoryRouting}
+          taskTypeRouting={taskTypeRouting}
+          onUpdateTaskTypeRouting={onUpdateTaskTypeRouting}
+          providerSettingsByEffort={providerSettingsByEffort}
+          onUpdateProviderSettingsByEffort={onUpdateProviderSettingsByEffort}
           taskTypeProviderOverrides={taskTypeProviderOverrides}
           onUpdateProviderSettingsDefaults={onUpdateProviderSettingsDefaults}
           onUpdateTaskTypeProviderOverrides={onUpdateTaskTypeProviderOverrides}

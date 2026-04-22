@@ -178,6 +178,8 @@ def infer_quality_tier_for_model(
 
 ALL_PROVIDERS: tuple[str, ...] = tuple(p.value for p in LLMProviderName)
 _VALID_SELECTION_MODES: frozenset[str] = frozenset({"balanced", "preferred", "exclusive"})
+VALID_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "max")
+DEFAULT_EFFORT_LEVEL = "medium"
 
 
 def _normalize_provider_list(raw: Any) -> list[str]:
@@ -205,46 +207,117 @@ def _category_for_task_type(task_type: str, runtime_config: Mapping[str, Any]) -
     return None
 
 
-def resolve_task_provider_preference(task: Any, runtime_config: Mapping[str, Any]) -> list[str]:
-    """Resolve the provider allow-list for a task, walking the config layers.
+def _routing_entry(raw: Any) -> tuple[list[str] | None, str | None]:
+    """Extract (providers, effort) from a {providers, effort} mapping, honoring
+    partial entries (either field optional). Returns (None, None) when the
+    input isn't a mapping."""
+    if not isinstance(raw, Mapping):
+        return None, None
+    providers_raw = raw.get("providers")
+    providers = _normalize_provider_list(providers_raw) if providers_raw is not None else None
+    effort_raw = raw.get("effort")
+    effort = effort_raw.strip() if isinstance(effort_raw, str) and effort_raw.strip() else None
+    return providers, effort
 
-    Order (most specific wins):
-      1. task.context.provider_preference — per-task explicit override
-      2. task_type_provider_preference[task_type] — per-task-type override
-      3. provider_preference_by_category[category_of(task_type)] — batch config
-      4. provider_preference_by_category["_default"] — global default
-      5. task_type_provider_preference["_default"] — legacy global default key
-      6. ALL_PROVIDERS — safety net so new accounts get used out of the box
+
+def _ensure_migrated(runtime_config: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Translate any legacy routing/effort keys to the new shape at read time.
+
+    Keeps the hot path cheap (no-op when new keys already present) and lets
+    callers pass a legacy-shaped dict without going through sync. Lazy import
+    avoids a module-level cycle with app.shared_state.
     """
+    if not isinstance(runtime_config, Mapping):
+        return runtime_config
+    has_new = any(
+        k in runtime_config
+        for k in ("category_routing", "task_type_routing", "provider_settings_by_effort")
+    )
+    has_legacy = any(
+        k in runtime_config
+        for k in (
+            "provider_preference_by_category",
+            "task_type_provider_preference",
+            "task_type_effort_profile",
+            "effort_profiles",
+        )
+    )
+    if has_new or not has_legacy:
+        return runtime_config
+    from app.shared_state import _migrate_legacy_provider_config  # noqa: PLC0415
+    return _migrate_legacy_provider_config(dict(runtime_config))
+
+
+def resolve_task_routing(task: Any, runtime_config: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve ``{providers, effort}`` for a task, most-specific first.
+
+    Order:
+      1. payload.provider_preference / payload.effort — per-task explicit
+      2. context.provider_preference / context.effort — per-task context
+      3. task_type_routing[task_type] — surgical per-task-type override
+      4. category_routing[category_of(task_type)] — category batch config
+      5. category_routing["_default"] — global default
+      6. fallback: {providers: ALL_PROVIDERS, effort: "medium"}
+
+    Providers and effort resolve independently — a partial entry at one
+    layer doesn't shadow the other at a less specific layer.
+    """
+    runtime_config = _ensure_migrated(runtime_config)
+    providers: list[str] | None = None
+    effort: str | None = None
+
     ctx = _task_context(task)
-    resolved = _normalize_provider_list(ctx.get("provider_preference"))
-    if resolved:
-        return resolved
+    payloads = getattr(task, "payloads", None) or []
+    payload = payloads[0] if payloads else {}
+
+    # Layer 1+2: per-task payload/context — payload wins.
+    for source in (payload if isinstance(payload, Mapping) else None, ctx):
+        if not isinstance(source, Mapping):
+            continue
+        if providers is None:
+            candidate = _normalize_provider_list(source.get("provider_preference"))
+            if candidate:
+                providers = candidate
+        if effort is None:
+            raw = source.get("effort")
+            if isinstance(raw, str) and raw.strip():
+                effort = raw.strip()
 
     task_type = _task_type(task)
-    per_type = runtime_config.get("task_type_provider_preference", {}) or {}
-    if isinstance(per_type, Mapping):
-        resolved = _normalize_provider_list(per_type.get(task_type))
-        if resolved:
-            return resolved
 
-    by_category = runtime_config.get("provider_preference_by_category", {}) or {}
-    if isinstance(by_category, Mapping):
+    # Layer 3: task_type_routing[task_type]
+    task_routing_all = runtime_config.get("task_type_routing", {}) or {}
+    if isinstance(task_routing_all, Mapping):
+        cand_providers, cand_effort = _routing_entry(task_routing_all.get(task_type))
+        if providers is None and cand_providers:
+            providers = cand_providers
+        if effort is None and cand_effort:
+            effort = cand_effort
+
+    # Layer 4+5: category_routing[category] → category_routing["_default"]
+    category_routing_all = runtime_config.get("category_routing", {}) or {}
+    if isinstance(category_routing_all, Mapping):
         category = _category_for_task_type(task_type, runtime_config)
-        if category:
-            resolved = _normalize_provider_list(by_category.get(category))
-            if resolved:
-                return resolved
-        resolved = _normalize_provider_list(by_category.get("_default"))
-        if resolved:
-            return resolved
+        for key in (category, "_default"):
+            if providers is not None and effort is not None:
+                break
+            if not key:
+                continue
+            cand_providers, cand_effort = _routing_entry(category_routing_all.get(key))
+            if providers is None and cand_providers:
+                providers = cand_providers
+            if effort is None and cand_effort:
+                effort = cand_effort
 
-    if isinstance(per_type, Mapping):
-        resolved = _normalize_provider_list(per_type.get("_default"))
-        if resolved:
-            return resolved
+    return {
+        "providers": providers if providers is not None else list(ALL_PROVIDERS),
+        "effort": effort if effort is not None else DEFAULT_EFFORT_LEVEL,
+    }
 
-    return list(ALL_PROVIDERS)
+
+def resolve_task_provider_preference(task: Any, runtime_config: Mapping[str, Any]) -> list[str]:
+    """Thin back-compat shim — returns just the provider list."""
+    return resolve_task_routing(task, runtime_config)["providers"]
 
 
 def resolve_task_model_preferences(task: Any, runtime_config: Mapping[str, Any]) -> list[dict[str, str]]:
@@ -295,39 +368,6 @@ def cross_provider_fallback_enabled(runtime_config: Mapping[str, Any]) -> bool:
     return provider_selection_mode(runtime_config) in ("balanced", "preferred")
 
 
-def resolve_task_effort_profile(task: Any, runtime_config: Mapping[str, Any]) -> str | None:
-    """Resolve the effort-profile name for a task.
-
-    Order (most specific wins):
-      1. payload.effort_profile
-      2. context.effort_profile
-      3. task_type_effort_profile[task_type]
-      4. task_type_effort_profile["_default"]
-    Returns None when nothing is configured — caller then skips the profile
-    layer entirely instead of inventing a default.
-    """
-    if not isinstance(runtime_config, Mapping):
-        return None
-    ctx = _task_context(task)
-    payloads = getattr(task, "payloads", None) or []
-    payload = payloads[0] if payloads else {}
-    for candidate in (
-        payload.get("effort_profile") if isinstance(payload, Mapping) else None,
-        ctx.get("effort_profile"),
-    ):
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-    mapping = runtime_config.get("task_type_effort_profile", {}) or {}
-    if not isinstance(mapping, Mapping):
-        return None
-    task_type = _task_type(task)
-    for key in (task_type, "_default"):
-        value = mapping.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
 def resolve_task_provider_settings(
     task: Any,
     runtime_config: Mapping[str, Any],
@@ -336,29 +376,31 @@ def resolve_task_provider_settings(
     """Resolve the provider-specific settings bag for a task.
 
     Five-layer deep-merge (later wins):
-      1. provider_settings_defaults[provider] — base bag (provider-agnostic floor)
-      2. effort_profiles[profile][provider]   — named effort bundle chosen via
-         task_type_effort_profile / payload.effort_profile
+      1. provider_settings_defaults[provider] — effort-independent base
+      2. provider_settings_by_effort[provider][effort] — per-effort matrix
+         cell (includes model). ``effort`` comes from resolve_task_routing.
       3. task_type_provider_overrides[task_type][provider] — surgical overrides
-         (e.g. pinning a specific model for a task type)
-      4. context.provider_settings[provider]  — per-task context override
-      5. payload.provider_settings[provider]  — per-task payload override
+      4. context.provider_settings[provider] — per-task context override
+      5. payload.provider_settings[provider] — per-task payload override
 
     Validated against provider.settings_schema() before return. Unknown keys
     raise ValueError (fail-closed — typos should be loud).
     """
+    runtime_config = _ensure_migrated(runtime_config)
     defaults_all = runtime_config.get("provider_settings_defaults", {}) or {}
-    profiles_all = runtime_config.get("effort_profiles", {}) or {}
+    matrix_all = runtime_config.get("provider_settings_by_effort", {}) or {}
     overrides_all = runtime_config.get("task_type_provider_overrides", {}) or {}
 
     base = defaults_all.get(provider_name) if isinstance(defaults_all, Mapping) else None
 
-    profile_bag = None
-    profile_name = resolve_task_effort_profile(task, runtime_config)
-    if profile_name and isinstance(profiles_all, Mapping):
-        profile = profiles_all.get(profile_name)
-        if isinstance(profile, Mapping):
-            profile_bag = profile.get(provider_name)
+    effort_bag = None
+    effort = resolve_task_routing(task, runtime_config)["effort"]
+    if isinstance(matrix_all, Mapping):
+        per_provider = matrix_all.get(provider_name)
+        if isinstance(per_provider, Mapping):
+            candidate = per_provider.get(effort)
+            if isinstance(candidate, Mapping):
+                effort_bag = candidate
 
     task_type = _task_type(task)
     task_override = overrides_all.get(task_type) if isinstance(overrides_all, Mapping) else None
@@ -372,7 +414,7 @@ def resolve_task_provider_settings(
     payload_bag = payload_settings.get(provider_name) if isinstance(payload_settings, Mapping) else None
     ctx_bag = ctx_settings.get(provider_name) if isinstance(ctx_settings, Mapping) else None
 
-    merged = merge_settings(base, profile_bag, type_bag, ctx_bag, payload_bag)
+    merged = merge_settings(base, effort_bag, type_bag, ctx_bag, payload_bag)
     if not merged:
         return {}
     provider = get_provider(provider_name)

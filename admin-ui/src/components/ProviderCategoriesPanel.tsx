@@ -1,12 +1,16 @@
 import { useMemo, useState } from 'react';
 import { Plus, X, HelpCircle } from 'lucide-react';
-import type { ProviderCatalogEntry, ProviderName } from '../types/settings';
+import type {
+  CategoryRoutingEntry,
+  EffortLevel,
+  ProviderCatalogEntry,
+  ProviderName,
+  TaskTypeRoutingEntry,
+} from '../types/settings';
+import { EFFORT_LEVELS } from '../types/settings';
 
-// Task-type list must match backend payload_schemas.py::TaskType. Unassigned
-// types show up in the "Uncategorized" strip so nothing silently loses its
-// allow-list. `investigate` is intentionally omitted — it exists in the enum
-// but no spawner wires it, so surfacing it here would just create a
-// permanently-uncategorized entry.
+// Must match backend payload_schemas.py::TaskType. `investigate` is omitted —
+// exists in the enum but no spawner wires it.
 const ALL_TASK_TYPES = [
   'create', 'review', 'fix', 'plan', 'research',
   'strategic_review', 'design_doc_update', 'security_audit',
@@ -14,15 +18,14 @@ const ALL_TASK_TYPES = [
   'refactor', 'debug', 'perf',
 ] as const;
 
+const DEFAULT_CATEGORY_KEY = '_default';
 type SelectionMode = 'balanced' | 'preferred' | 'exclusive';
 
 const MODE_DESCRIPTIONS: Record<SelectionMode, string> = {
-  balanced: 'Pool accounts across all listed providers; pick globally by health + current load. Adding an account immediately puts it into rotation.',
-  preferred: 'Try providers in list order; fall through to the next only when the earlier one is exhausted.',
-  exclusive: 'Use the first listed provider only; never fall back cross-provider.',
+  balanced: 'Pool accounts across listed providers; pick by health + current load. Adding an account immediately puts it into rotation.',
+  preferred: 'Try providers in list order; fall through to the next only when the earlier is exhausted.',
+  exclusive: 'Use the first listed provider only; never fall back.',
 };
-
-const DEFAULT_CATEGORY_KEY = '_default';
 
 interface Props {
   providers: Record<string, ProviderCatalogEntry>;
@@ -30,10 +33,10 @@ interface Props {
   onUpdateSelectionMode: (mode: SelectionMode) => void | Promise<void>;
   taskTypeCategories: Record<string, string[]>;
   onUpdateTaskTypeCategories: (value: Record<string, string[]>) => void | Promise<void>;
-  providerPreferenceByCategory: Record<string, ProviderName[]>;
-  onUpdateProviderPreferenceByCategory: (value: Record<string, ProviderName[]>) => void | Promise<void>;
-  taskTypeProviderPreference: Record<string, ProviderName[]>;
-  onUpdateTaskTypeProviderPreferences: (value: Record<string, ProviderName[]>) => void | Promise<void>;
+  categoryRouting: Record<string, CategoryRoutingEntry>;
+  onUpdateCategoryRouting: (value: Record<string, CategoryRoutingEntry>) => void | Promise<void>;
+  taskTypeRouting: Record<string, TaskTypeRoutingEntry>;
+  onUpdateTaskTypeRouting: (value: Record<string, TaskTypeRoutingEntry>) => void | Promise<void>;
 }
 
 export function ProviderCategoriesPanel({
@@ -42,16 +45,17 @@ export function ProviderCategoriesPanel({
   onUpdateSelectionMode,
   taskTypeCategories,
   onUpdateTaskTypeCategories,
-  providerPreferenceByCategory,
-  onUpdateProviderPreferenceByCategory,
-  taskTypeProviderPreference,
-  onUpdateTaskTypeProviderPreferences,
+  categoryRouting,
+  onUpdateCategoryRouting,
+  taskTypeRouting,
+  onUpdateTaskTypeRouting,
 }: Props) {
   const providerNames = Object.keys(providers) as ProviderName[];
   const [newCategoryName, setNewCategoryName] = useState('');
 
-  // Which task types aren't claimed by any category? They still resolve via
-  // the _default preference, but calling them out keeps the config honest.
+  const omit = <T,>(obj: Record<string, T>, key: string): Record<string, T> =>
+    Object.fromEntries(Object.entries(obj).filter(([k]) => k !== key));
+
   const uncategorized = useMemo(() => {
     const claimed = new Set<string>();
     Object.values(taskTypeCategories).forEach(members => {
@@ -60,33 +64,39 @@ export function ProviderCategoriesPanel({
     return ALL_TASK_TYPES.filter(t => !claimed.has(t));
   }, [taskTypeCategories]);
 
-  const defaultProviders: ProviderName[] = providerPreferenceByCategory[DEFAULT_CATEGORY_KEY] ?? providerNames;
-
-  const setCategoryMembers = (category: string, members: string[]) => {
-    const next = { ...taskTypeCategories, [category]: members };
-    void onUpdateTaskTypeCategories(next);
+  const defaultEntry: CategoryRoutingEntry = categoryRouting[DEFAULT_CATEGORY_KEY] ?? {
+    providers: providerNames,
+    effort: 'medium',
   };
 
-  const omit = <T,>(obj: Record<string, T>, key: string): Record<string, T> =>
-    Object.fromEntries(Object.entries(obj).filter(([k]) => k !== key));
+  const setCategoryEntry = (category: string, entry: CategoryRoutingEntry) => {
+    void onUpdateCategoryRouting({ ...categoryRouting, [category]: entry });
+  };
+
+  const setCategoryMembers = (category: string, members: string[]) => {
+    void onUpdateTaskTypeCategories({ ...taskTypeCategories, [category]: members });
+  };
 
   const renameCategory = (oldName: string, newName: string) => {
     if (!newName || newName === oldName || newName === DEFAULT_CATEGORY_KEY) return;
-    if (taskTypeCategories[newName]) return;
-    const nextCategories = Object.fromEntries(
+    if (taskTypeCategories[newName] || categoryRouting[newName]) return;
+    const renamedCats = Object.fromEntries(
       Object.entries(taskTypeCategories).map(([k, v]) => [k === oldName ? newName : k, v]),
     );
-    void onUpdateTaskTypeCategories(nextCategories);
-    if (providerPreferenceByCategory[oldName]) {
-      const nextPrefs = { ...omit(providerPreferenceByCategory, oldName), [newName]: providerPreferenceByCategory[oldName] };
-      void onUpdateProviderPreferenceByCategory(nextPrefs);
+    void onUpdateTaskTypeCategories(renamedCats);
+    if (categoryRouting[oldName]) {
+      const renamedRouting = {
+        ...omit(categoryRouting, oldName),
+        [newName]: categoryRouting[oldName],
+      };
+      void onUpdateCategoryRouting(renamedRouting);
     }
   };
 
   const deleteCategory = (category: string) => {
     void onUpdateTaskTypeCategories(omit(taskTypeCategories, category));
-    if (providerPreferenceByCategory[category]) {
-      void onUpdateProviderPreferenceByCategory(omit(providerPreferenceByCategory, category));
+    if (categoryRouting[category]) {
+      void onUpdateCategoryRouting(omit(categoryRouting, category));
     }
   };
 
@@ -95,11 +105,13 @@ export function ProviderCategoriesPanel({
     if (!name || name === DEFAULT_CATEGORY_KEY || taskTypeCategories[name]) return;
     setNewCategoryName('');
     void onUpdateTaskTypeCategories({ ...taskTypeCategories, [name]: [] });
+    void onUpdateCategoryRouting({
+      ...categoryRouting,
+      [name]: { providers: defaultEntry.providers, effort: defaultEntry.effort },
+    });
   };
 
   const moveTaskType = (taskType: string, toCategory: string | null) => {
-    // Remove from whichever category currently owns it; add to the destination
-    // when toCategory is non-null (null = make it uncategorized).
     const next: Record<string, string[]> = {};
     Object.entries(taskTypeCategories).forEach(([cat, members]) => {
       next[cat] = (members || []).filter(m => m !== taskType);
@@ -111,20 +123,11 @@ export function ProviderCategoriesPanel({
     void onUpdateTaskTypeCategories(next);
   };
 
-  const setCategoryProviders = (category: string, providers: ProviderName[]) => {
-    const next = { ...providerPreferenceByCategory, [category]: providers };
-    void onUpdateProviderPreferenceByCategory(next);
-  };
-
-  const clearCategoryProviders = (category: string) => {
-    void onUpdateProviderPreferenceByCategory(omit(providerPreferenceByCategory, category));
-  };
-
-  const setTaskTypeOverride = (taskType: string, providers: ProviderName[] | null) => {
-    if (providers === null || providers.length === 0) {
-      void onUpdateTaskTypeProviderPreferences(omit(taskTypeProviderPreference, taskType));
+  const setTaskOverride = (taskType: string, entry: TaskTypeRoutingEntry | null) => {
+    if (!entry || (entry.providers === undefined && entry.effort === undefined)) {
+      void onUpdateTaskTypeRouting(omit(taskTypeRouting, taskType));
     } else {
-      void onUpdateTaskTypeProviderPreferences({ ...taskTypeProviderPreference, [taskType]: providers });
+      void onUpdateTaskTypeRouting({ ...taskTypeRouting, [taskType]: entry });
     }
   };
 
@@ -134,7 +137,7 @@ export function ProviderCategoriesPanel({
       <div>
         <div className="flex items-center gap-1.5 mb-2">
           <h3 className="text-xs font-semibold text-neutral-200">Selection mode</h3>
-          <HintIcon text="Controls how the pool picks among accounts listed for a task. Per-task overrides below still win." />
+          <HintIcon text="Controls how the pool picks accounts across providers listed for a task." />
         </div>
         <div className="flex items-center gap-1 border border-neutral-800 rounded p-1 w-fit">
           {(['balanced', 'preferred', 'exclusive'] as SelectionMode[]).map(mode => (
@@ -157,25 +160,28 @@ export function ProviderCategoriesPanel({
         </div>
       </div>
 
-      {/* Default allow-list */}
-      <div className="border border-neutral-800 rounded p-3 bg-neutral-900/30">
-        <div className="flex items-center gap-1.5 mb-2">
-          <span className="text-xs font-semibold text-neutral-200 font-mono">_default</span>
-          <HintIcon text="Fallback allow-list used by any task type not assigned to a category, or a category without its own preference. Uncheck a provider to exclude it globally." />
-        </div>
-        <ProviderChecklist
-          providers={providerNames}
-          selected={defaultProviders}
-          onChange={values => setCategoryProviders(DEFAULT_CATEGORY_KEY, values)}
-        />
-      </div>
+      {/* Default category */}
+      <CategoryCard
+        name={DEFAULT_CATEGORY_KEY}
+        isDefault
+        members={[]}
+        allTaskTypes={ALL_TASK_TYPES as unknown as string[]}
+        taskTypeCategories={taskTypeCategories}
+        providerNames={providerNames}
+        entry={defaultEntry}
+        onRename={() => { /* default can't be renamed */ }}
+        onDelete={() => { /* default can't be deleted */ }}
+        onAddMember={() => { /* default has no explicit members */ }}
+        onRemoveMember={() => { /* n/a */ }}
+        onEntryChange={entry => setCategoryEntry(DEFAULT_CATEGORY_KEY, entry)}
+      />
 
-      {/* Categories */}
+      {/* User-defined categories */}
       <div>
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-1.5">
             <h3 className="text-xs font-semibold text-neutral-200">Categories</h3>
-            <HintIcon text="Group task types so a batch can share the same provider allow-list. Types can live in only one category; unassigned types fall back to _default." />
+            <HintIcon text="Group task types so one entry controls providers + effort for the whole group. Types can live in only one category; unassigned types resolve via _default above." />
           </div>
           <div className="flex items-center gap-1">
             <input
@@ -189,7 +195,6 @@ export function ProviderCategoriesPanel({
             <button
               onClick={addCategory}
               className="inline-flex items-center gap-1 px-2 py-1 rounded border border-neutral-700 text-neutral-300 hover:bg-neutral-800 text-xs"
-              title="Add category"
             >
               <Plus className="w-3 h-3" /> add
             </button>
@@ -205,14 +210,12 @@ export function ProviderCategoriesPanel({
               allTaskTypes={ALL_TASK_TYPES as unknown as string[]}
               taskTypeCategories={taskTypeCategories}
               providerNames={providerNames}
-              preference={providerPreferenceByCategory[category] ?? null}
-              defaultProviders={defaultProviders}
+              entry={categoryRouting[category] ?? { providers: defaultEntry.providers, effort: defaultEntry.effort }}
               onRename={newName => renameCategory(category, newName)}
               onDelete={() => deleteCategory(category)}
               onAddMember={taskType => moveTaskType(taskType, category)}
               onRemoveMember={taskType => setCategoryMembers(category, members.filter(m => m !== taskType))}
-              onPreferenceChange={values => setCategoryProviders(category, values)}
-              onPreferenceClear={() => clearCategoryProviders(category)}
+              onEntryChange={entry => setCategoryEntry(category, entry)}
             />
           ))}
         </div>
@@ -230,12 +233,12 @@ export function ProviderCategoriesPanel({
       <div>
         <div className="flex items-center gap-1.5 mb-2">
           <h3 className="text-xs font-semibold text-neutral-200">Per-task overrides</h3>
-          <HintIcon text="Wins over category + _default for a specific task type. Leave empty to inherit from the category." />
+          <HintIcon text="Surgical per-task-type overrides. Either field optional: override just the providers, just the effort, or both. Inherits whatever isn't overridden from the task's category." />
         </div>
         <TaskOverrideTable
           providerNames={providerNames}
-          overrides={taskTypeProviderPreference}
-          onSet={setTaskTypeOverride}
+          overrides={taskTypeRouting}
+          onSet={setTaskOverride}
         />
       </div>
     </div>
@@ -264,11 +267,7 @@ function ProviderChecklist({
   onChange: (values: ProviderName[]) => void;
 }) {
   const toggle = (name: ProviderName) => {
-    if (selected.includes(name)) {
-      onChange(selected.filter(p => p !== name));
-    } else {
-      onChange([...selected, name]);
-    }
+    onChange(selected.includes(name) ? selected.filter(p => p !== name) : [...selected, name]);
   };
   return (
     <div className="flex items-center gap-2 flex-wrap">
@@ -292,34 +291,49 @@ function ProviderChecklist({
   );
 }
 
+function EffortSelect({
+  value,
+  onChange,
+  allowEmpty,
+}: {
+  value: EffortLevel | '';
+  onChange: (value: EffortLevel | '') => void;
+  allowEmpty?: boolean;
+}) {
+  return (
+    <select
+      value={value}
+      onChange={e => onChange(e.target.value as EffortLevel | '')}
+      className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
+    >
+      {allowEmpty && <option value="">(inherit)</option>}
+      {EFFORT_LEVELS.map(l => <option key={l} value={l}>{l}</option>)}
+    </select>
+  );
+}
+
 interface CategoryCardProps {
   name: string;
+  isDefault?: boolean;
   members: string[];
   allTaskTypes: string[];
   taskTypeCategories: Record<string, string[]>;
   providerNames: ProviderName[];
-  preference: ProviderName[] | null;
-  defaultProviders: ProviderName[];
+  entry: CategoryRoutingEntry;
   onRename: (newName: string) => void;
   onDelete: () => void;
   onAddMember: (taskType: string) => void;
   onRemoveMember: (taskType: string) => void;
-  onPreferenceChange: (values: ProviderName[]) => void;
-  onPreferenceClear: () => void;
+  onEntryChange: (entry: CategoryRoutingEntry) => void;
 }
 
 function CategoryCard({
-  name, members, allTaskTypes, taskTypeCategories,
-  providerNames, preference, defaultProviders,
-  onRename, onDelete, onAddMember, onRemoveMember,
-  onPreferenceChange, onPreferenceClear,
+  name, isDefault, members, allTaskTypes, taskTypeCategories,
+  providerNames, entry,
+  onRename, onDelete, onAddMember, onRemoveMember, onEntryChange,
 }: CategoryCardProps) {
   const [editingName, setEditingName] = useState(name);
-  // Task types available to add: not already members of THIS category. Adding
-  // from another category is allowed (moveTaskType handles the steal).
   const addable = allTaskTypes.filter(t => !members.includes(t));
-  const hasOwnPreference = preference !== null;
-  const effectivePreference = preference ?? defaultProviders;
 
   const currentOwner = (taskType: string): string | null => {
     for (const [cat, list] of Object.entries(taskTypeCategories)) {
@@ -331,75 +345,81 @@ function CategoryCard({
   return (
     <div className="border border-neutral-800 rounded p-3 bg-neutral-900/30 space-y-2">
       <div className="flex items-center justify-between gap-2">
-        <input
-          value={editingName}
-          onChange={e => setEditingName(e.target.value)}
-          onBlur={() => { if (editingName !== name) onRename(editingName); }}
-          onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
-          className="bg-transparent border border-transparent hover:border-neutral-800 focus:border-neutral-700 rounded px-1.5 py-0.5 text-xs font-semibold text-neutral-200 font-mono focus:outline-none"
-        />
-        <button
-          onClick={onDelete}
-          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-neutral-500 hover:text-red-400 hover:bg-red-950/30"
-          title="Delete category (task types fall back to _default)"
-        >
-          <X className="w-3 h-3" /> remove
-        </button>
-      </div>
-
-      <div className="flex items-center gap-1.5 flex-wrap">
-        {members.map(m => (
-          <span
-            key={m}
-            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-700 bg-neutral-800/60 text-[11px] text-neutral-200 font-mono"
-          >
-            {m}
-            <button
-              onClick={() => onRemoveMember(m)}
-              className="text-neutral-500 hover:text-red-400"
-              title="Remove from category (→ uncategorized)"
-            >
-              <X className="w-3 h-3" />
-            </button>
-          </span>
-        ))}
-        {addable.length > 0 && (
-          <select
-            value=""
-            onChange={e => { if (e.target.value) onAddMember(e.target.value); }}
-            className="bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-[11px] text-neutral-300"
-          >
-            <option value="">+ add task type</option>
-            {addable.map(t => {
-              const owner = currentOwner(t);
-              return (
-                <option key={t} value={t}>
-                  {t}{owner ? `  (moves from ${owner})` : ''}
-                </option>
-              );
-            })}
-          </select>
-        )}
-      </div>
-
-      <div className="flex items-center gap-2 pt-1 border-t border-neutral-800/70">
-        <div className="text-[10px] text-neutral-500 shrink-0">providers:</div>
-        <ProviderChecklist
-          providers={providerNames}
-          selected={effectivePreference}
-          onChange={onPreferenceChange}
-        />
-        {hasOwnPreference ? (
-          <button
-            onClick={onPreferenceClear}
-            className="text-[10px] text-neutral-500 hover:text-neutral-200 ml-auto shrink-0"
-            title="Remove this category's preference (inherit _default)"
-          >
-            reset to _default
-          </button>
+        {isDefault ? (
+          <span className="text-xs font-semibold text-neutral-200 font-mono px-1.5 py-0.5">{name}</span>
         ) : (
-          <span className="text-[10px] text-neutral-600 ml-auto shrink-0 italic">inheriting _default</span>
+          <input
+            value={editingName}
+            onChange={e => setEditingName(e.target.value)}
+            onBlur={() => { if (editingName !== name) onRename(editingName); }}
+            onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+            className="bg-transparent border border-transparent hover:border-neutral-800 focus:border-neutral-700 rounded px-1.5 py-0.5 text-xs font-semibold text-neutral-200 font-mono focus:outline-none"
+          />
         )}
+        {!isDefault && (
+          <button
+            onClick={onDelete}
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-neutral-500 hover:text-red-400 hover:bg-red-950/30"
+            title="Delete category (task types fall back to _default)"
+          >
+            <X className="w-3 h-3" /> remove
+          </button>
+        )}
+      </div>
+
+      {!isDefault && (
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {members.map(m => (
+            <span
+              key={m}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-neutral-700 bg-neutral-800/60 text-[11px] text-neutral-200 font-mono"
+            >
+              {m}
+              <button
+                onClick={() => onRemoveMember(m)}
+                className="text-neutral-500 hover:text-red-400"
+                title="Remove from category (→ uncategorized)"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </span>
+          ))}
+          {addable.length > 0 && (
+            <select
+              value=""
+              onChange={e => { if (e.target.value) onAddMember(e.target.value); }}
+              className="bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5 text-[11px] text-neutral-300"
+            >
+              <option value="">+ add task type</option>
+              {addable.map(t => {
+                const owner = currentOwner(t);
+                return (
+                  <option key={t} value={t}>
+                    {t}{owner ? `  (moves from ${owner})` : ''}
+                  </option>
+                );
+              })}
+            </select>
+          )}
+        </div>
+      )}
+
+      <div className="flex items-center gap-3 pt-1 border-t border-neutral-800/70">
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] text-neutral-500 shrink-0">providers:</span>
+          <ProviderChecklist
+            providers={providerNames}
+            selected={entry.providers}
+            onChange={values => onEntryChange({ ...entry, providers: values })}
+          />
+        </div>
+        <div className="flex items-center gap-2 ml-auto">
+          <span className="text-[10px] text-neutral-500 shrink-0">effort:</span>
+          <EffortSelect
+            value={entry.effort}
+            onChange={value => value && onEntryChange({ ...entry, effort: value })}
+          />
+        </div>
       </div>
     </div>
   );
@@ -411,11 +431,11 @@ function TaskOverrideTable({
   onSet,
 }: {
   providerNames: ProviderName[];
-  overrides: Record<string, ProviderName[]>;
-  onSet: (taskType: string, providers: ProviderName[] | null) => void;
+  overrides: Record<string, TaskTypeRoutingEntry>;
+  onSet: (taskType: string, entry: TaskTypeRoutingEntry | null) => void;
 }) {
   const [newType, setNewType] = useState<string>('');
-  const entries = Object.entries(overrides).filter(([k]) => k !== '_default');
+  const entries = Object.entries(overrides);
   const eligibleToAdd = ALL_TASK_TYPES.filter(t => !(t in overrides));
 
   return (
@@ -425,17 +445,28 @@ function TaskOverrideTable({
           No overrides. Add one below to pin a specific task type.
         </div>
       )}
-      {entries.map(([taskType, providers]) => (
+      {entries.map(([taskType, entry]) => (
         <div key={taskType} className="px-3 py-2 flex items-center gap-3">
-          <code className="text-[11px] text-neutral-200 w-32 shrink-0 font-mono truncate">{taskType}</code>
-          <ProviderChecklist
-            providers={providerNames}
-            selected={providers}
-            onChange={values => onSet(taskType, values)}
-          />
+          <code className="text-[11px] text-neutral-200 w-28 shrink-0 font-mono truncate">{taskType}</code>
+          <div className="flex items-center gap-1.5">
+            <span className="text-[10px] text-neutral-500">providers:</span>
+            <ProviderChecklist
+              providers={providerNames}
+              selected={entry.providers ?? []}
+              onChange={values => onSet(taskType, { ...entry, providers: values.length ? values : undefined })}
+            />
+          </div>
+          <div className="flex items-center gap-1.5 ml-auto">
+            <span className="text-[10px] text-neutral-500">effort:</span>
+            <EffortSelect
+              value={entry.effort ?? ''}
+              onChange={value => onSet(taskType, { ...entry, effort: value || undefined })}
+              allowEmpty
+            />
+          </div>
           <button
             onClick={() => onSet(taskType, null)}
-            className="ml-auto text-[10px] text-neutral-500 hover:text-red-400 shrink-0"
+            className="text-[10px] text-neutral-500 hover:text-red-400 shrink-0"
             title="Remove override (inherit category)"
           >
             remove
@@ -453,7 +484,7 @@ function TaskOverrideTable({
             {eligibleToAdd.map(t => <option key={t} value={t}>{t}</option>)}
           </select>
           <button
-            onClick={() => { if (newType) { onSet(newType, providerNames); setNewType(''); } }}
+            onClick={() => { if (newType) { onSet(newType, { providers: providerNames }); setNewType(''); } }}
             disabled={!newType}
             className="inline-flex items-center gap-1 px-2 py-1 rounded border border-neutral-700 text-neutral-300 hover:bg-neutral-800 text-[11px] disabled:opacity-40"
           >

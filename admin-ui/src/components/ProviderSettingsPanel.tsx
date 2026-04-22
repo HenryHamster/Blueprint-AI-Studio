@@ -1,11 +1,14 @@
 import { useMemo, useState } from 'react';
 import type {
+  EffortLevel,
   ProviderCatalogEntry,
   ProviderName,
   ProviderSettingsBag,
+  ProviderSettingsByEffort,
   ProviderSettingsDefaults,
   TaskTypeProviderOverrides,
 } from '../types/settings';
+import { EFFORT_LEVELS } from '../types/settings';
 
 // JSON-Schema subset we render — mirrors backend providers/base.py:_validate_against_schema.
 interface SchemaNode {
@@ -29,8 +32,10 @@ interface Props {
   providers: Record<string, ProviderCatalogEntry>;
   providerSettingsDefaults: ProviderSettingsDefaults;
   taskTypeProviderOverrides: TaskTypeProviderOverrides;
+  providerSettingsByEffort: ProviderSettingsByEffort;
   onUpdateDefaults: UpdateDefaults;
   onUpdateOverrides: UpdateOverrides;
+  onUpdateProviderSettingsByEffort: (value: ProviderSettingsByEffort) => void | Promise<void>;
 }
 
 // Full list of known task types (matches backend payload_schemas.py::TaskType).
@@ -48,48 +53,59 @@ export function ProviderSettingsPanel({
   providers,
   providerSettingsDefaults,
   taskTypeProviderOverrides,
+  providerSettingsByEffort,
   onUpdateDefaults,
   onUpdateOverrides,
+  onUpdateProviderSettingsByEffort,
 }: Props) {
-  const [scope, setScope] = useState<'defaults' | 'overrides'>('defaults');
+  const [scope, setScope] = useState<'matrix' | 'defaults' | 'overrides'>('matrix');
   const [selectedProvider, setSelectedProvider] = useState<ProviderName>('anthropic');
   const [selectedTaskType, setSelectedTaskType] = useState<string>('review');
+  const [matrixLevel, setMatrixLevel] = useState<EffortLevel>('medium');
 
   const providerNames = Object.keys(providers) as ProviderName[];
   const currentSchema = providers[selectedProvider]?.settings_schema;
 
   const effectiveBag: ProviderSettingsBag = useMemo(() => {
+    if (scope === 'matrix') {
+      return (providerSettingsByEffort[selectedProvider]?.[matrixLevel] ?? {}) as ProviderSettingsBag;
+    }
     if (scope === 'defaults') {
       return providerSettingsDefaults[selectedProvider] ?? {};
     }
     return taskTypeProviderOverrides[selectedTaskType]?.[selectedProvider] ?? {};
-  }, [scope, selectedProvider, selectedTaskType, providerSettingsDefaults, taskTypeProviderOverrides]);
+  }, [scope, selectedProvider, selectedTaskType, matrixLevel, providerSettingsDefaults, taskTypeProviderOverrides, providerSettingsByEffort]);
 
   const handleBagChange = (newBag: ProviderSettingsBag) => {
-    if (scope === 'defaults') {
-      const next: ProviderSettingsDefaults = {
-        ...providerSettingsDefaults,
-        [selectedProvider]: newBag,
-      };
-      void onUpdateDefaults(next);
-    } else {
-      // Empty bag means no override for this (task, provider) — prune the key
-      // so the backend doesn't store a dead entry that shadows defaults.
-      const existingForType = taskTypeProviderOverrides[selectedTaskType] ?? {};
-      const prunedForType = Object.fromEntries(
-        Object.entries(existingForType).filter(([prov]) => prov !== selectedProvider),
-      ) as Partial<Record<ProviderName, ProviderSettingsBag>>;
-      if (Object.keys(newBag).length > 0) {
-        prunedForType[selectedProvider] = newBag;
-      }
-      const prunedOverrides = Object.fromEntries(
-        Object.entries(taskTypeProviderOverrides).filter(([tt]) => tt !== selectedTaskType),
-      ) as TaskTypeProviderOverrides;
-      if (Object.keys(prunedForType).length > 0) {
-        prunedOverrides[selectedTaskType] = prunedForType;
-      }
-      void onUpdateOverrides(prunedOverrides);
+    if (scope === 'matrix') {
+      const existingForProvider = providerSettingsByEffort[selectedProvider] ?? {};
+      const nextForProvider = { ...existingForProvider, [matrixLevel]: newBag };
+      const next = {
+        ...providerSettingsByEffort,
+        [selectedProvider]: nextForProvider,
+      } as ProviderSettingsByEffort;
+      void onUpdateProviderSettingsByEffort(next);
+      return;
     }
+    if (scope === 'defaults') {
+      void onUpdateDefaults({ ...providerSettingsDefaults, [selectedProvider]: newBag });
+      return;
+    }
+    // overrides: prune empty (provider, task) bags so defaults/matrix show through.
+    const existingForType = taskTypeProviderOverrides[selectedTaskType] ?? {};
+    const prunedForType = Object.fromEntries(
+      Object.entries(existingForType).filter(([prov]) => prov !== selectedProvider),
+    ) as Partial<Record<ProviderName, ProviderSettingsBag>>;
+    if (Object.keys(newBag).length > 0) {
+      prunedForType[selectedProvider] = newBag;
+    }
+    const prunedOverrides = Object.fromEntries(
+      Object.entries(taskTypeProviderOverrides).filter(([tt]) => tt !== selectedTaskType),
+    ) as TaskTypeProviderOverrides;
+    if (Object.keys(prunedForType).length > 0) {
+      prunedOverrides[selectedTaskType] = prunedForType;
+    }
+    void onUpdateOverrides(prunedOverrides);
   };
 
   if (providerNames.length === 0) {
@@ -103,13 +119,18 @@ export function ProviderSettingsPanel({
   return (
     <div className="space-y-4">
       <div className="text-xs text-neutral-400 leading-relaxed">
-        Per-provider dispatch knobs (model, effort, thinking, caching, advisor…). The
-        settings bag is three-layered: provider defaults &rarr; per-task-type overrides
-        &rarr; per-task payload overrides. Changes here persist on save.
+        Per-provider dispatch settings. <b>Effort matrix</b> is the main knob:
+        each (provider, effort level) cell defines the model + settings used
+        when a task routes there. <b>Defaults</b> is the effort-independent
+        base (rarely needed). <b>Overrides</b> pin per-(task, provider) tweaks
+        that win over the matrix.
       </div>
 
-      {/* Scope tabs: Defaults | Overrides */}
+      {/* Scope tabs: Matrix | Defaults | Overrides */}
       <div className="flex items-center gap-2 border-b border-neutral-800 pb-2">
+        <ScopeTab active={scope === 'matrix'} onClick={() => setScope('matrix')}>
+          Effort matrix
+        </ScopeTab>
         <ScopeTab active={scope === 'defaults'} onClick={() => setScope('defaults')}>
           Defaults
         </ScopeTab>
@@ -117,6 +138,27 @@ export function ProviderSettingsPanel({
           Task-type overrides
         </ScopeTab>
       </div>
+
+      {scope === 'matrix' && (
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-neutral-400 w-20 shrink-0">Effort level</label>
+          <div className="flex items-center gap-1">
+            {EFFORT_LEVELS.map(level => (
+              <button
+                key={level}
+                onClick={() => setMatrixLevel(level)}
+                className={`px-2.5 py-1 rounded text-xs transition-colors ${
+                  matrixLevel === level
+                    ? 'bg-emerald-900/40 text-emerald-300 border border-emerald-800'
+                    : 'text-neutral-400 hover:text-neutral-200 border border-transparent'
+                }`}
+              >
+                {level}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {scope === 'overrides' && (
         <div className="flex items-center gap-2">
