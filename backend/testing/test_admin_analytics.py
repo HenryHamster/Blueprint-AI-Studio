@@ -265,9 +265,11 @@ class TestAdminRecordFailureResult:
         shared_state.direction_failure_streaks.pop(direction_id, None)
 
     @pytest.mark.asyncio
-    async def test_agent_timeout_does_not_touch_code_failure_streak(self, _reset_task_results):
-        """Infra classes (AGENT_TIMEOUT) are tracked on a separate counter and
-        do not increment the direction's code-failure streak."""
+    async def test_agent_timeout_does_not_touch_direction_streak(self, _reset_task_results):
+        """Infra failures (AGENT_TIMEOUT, RATE_LIMIT, PROVISION_FAILURE, etc.)
+        are platform noise — not the direction's fault. They must not
+        increment any direction streak or hold flag. Deploy monitoring
+        still records them (for overall pipeline health)."""
         from app.admin import _record_failure_result
         from app.models import Task, TaskStatus
         from app.routers.agent_status import _recorded_task_ids
@@ -287,12 +289,11 @@ class TestAdminRecordFailureResult:
 
         _record_failure_result(task, "AGENT_TIMEOUT")
 
-        streak = shared_state.direction_failure_streaks.get(direction_id)
-        assert streak is not None
-        assert streak["consecutive_failures"] == 0
-        assert streak["consecutive_infra_failures"] == 1
-        assert streak["last_failure_class"] == "AGENT_TIMEOUT"
-        assert streak["held"] is False
+        # Direction may have no streak entry at all, or one with zero counters.
+        streak = shared_state.direction_failure_streaks.get(direction_id, {})
+        assert streak.get("consecutive_failures", 0) == 0
+        assert not streak.get("held")
+        # Deploy monitoring still captures the failure (pipeline-level signal).
         results = list(shared_state.deploy_monitoring["task_results"])
         assert len(results) == 1
         assert results[0][2] == "AGENT_TIMEOUT"

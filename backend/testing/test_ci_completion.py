@@ -1054,13 +1054,15 @@ async def test_merge_failure_hard_cap_records_deploy_monitoring_result(db_sessio
         f"Expected a failure entry in deploy_monitoring.task_results, got {results}"
     )
     assert str(task.id) in _recorded_task_ids
-    # Direction health tracking must also see this failure
+    # Direction health hook should still be called (proves the merge-hard-cap
+    # path wired it up), but the merge hard-cap is classified as EXTERNAL_API
+    # (infra) and infra failures no longer bump direction counters — they're
+    # platform noise, not the direction's fault. setdefault leaves a zeroed
+    # streak entry as evidence the hook ran.
     streak = direction_failure_streaks.get(direction_id)
     assert streak is not None, "record_direction_result should register a streak entry"
-    # Merge hard-cap is classified as EXTERNAL_API (infra), not CODE_ERROR — so the
-    # failure lands on the infra counter. Either counter being non-zero proves the
-    # direction-health hook saw this failure.
-    assert (streak["consecutive_failures"] + streak.get("consecutive_infra_failures", 0)) >= 1
+    assert not streak["held"]
+    assert streak["consecutive_failures"] == 0
 
 
 # ---------------------------------------------------------------------------
