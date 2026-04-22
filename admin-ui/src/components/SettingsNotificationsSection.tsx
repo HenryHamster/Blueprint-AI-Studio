@@ -17,6 +17,7 @@ const EVENT_OPTIONS: { key: string; label: string; description: string; defaultO
   { key: 'BUDGET_EXCEEDED', label: 'Budget Exceeded', description: 'When projected cost exceeds budget ceiling', defaultOn: false },
   { key: 'AUTO_FIX_SPAWNED', label: 'CI Auto-Fix Spawned', description: 'When Blueprint auto-spawns a fix task for a CI failure', defaultOn: false },
   { key: 'AUTO_FIX_MERGED', label: 'CI Auto-Fix Merged', description: 'When a Blueprint auto-remediation fix PR is merged', defaultOn: false },
+  { key: 'DIRECTION_MILESTONE', label: 'Direction Milestone', description: 'When a direction is auto-completed, auto-paused, or auto-retired', defaultOn: true },
 ];
 
 interface SettingsNotificationsSectionProps {

@@ -335,6 +335,31 @@ async def test_post_direction_milestone_message_truncates_text(db_session):
 
 
 @pytest.mark.asyncio
+async def test_post_direction_milestone_message_fires_webhook(db_session):
+    """Creating the milestone message also fires DIRECTION_MILESTONE via the external webhook."""
+    project_id = uuid.uuid4()
+    dispatch_mock = AsyncMock()
+    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+        await post_direction_milestone_message(
+            db_session, project_id,
+            direction_text="Improve search relevance",
+            milestone="auto-completed",
+            reason="Saturated with 5 PRs",
+            direction_id="d-abc123",
+        )
+        import asyncio as _asyncio  # noqa: PLC0415
+        await _asyncio.sleep(0)
+    dispatch_mock.assert_called_once()
+    args, _ = dispatch_mock.call_args
+    assert args[0] == project_id
+    assert args[1] == "DIRECTION_MILESTONE"
+    assert args[2]["direction_text"] == "Improve search relevance"
+    assert args[2]["milestone"] == "auto-completed"
+    assert args[2]["reason"] == "Saturated with 5 PRs"
+    assert args[2]["direction_id"] == "d-abc123"
+
+
+@pytest.mark.asyncio
 async def test_post_cycle_summary_message(db_session):
     project_id = uuid.uuid4()
     msg = await post_cycle_summary_message(

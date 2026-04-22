@@ -357,10 +357,17 @@ async def apply_post_spawn_state(
                                 ),
                             )
                             session.add(alert)
-                            # Auto-completed message was noisy. The Alert above
-                            # captures the same info; the next strategic cycle's
-                            # cycle_summary can narrate the completion if worth
-                            # surfacing to the user.
+                            try:
+                                from app.notification_dispatch import post_direction_milestone_message  # noqa: PLC0415
+                                await post_direction_milestone_message(
+                                    session, task.project_id,
+                                    direction_text=d.get("text", ""),
+                                    milestone="auto-completed",
+                                    reason=d["auto_completed_reason"],
+                                    direction_id=did,
+                                )
+                            except Exception as _notify_exc:
+                                logger.warning(f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}")
 
             project.directions = directions
             flag_modified(project, "directions")

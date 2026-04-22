@@ -3,8 +3,9 @@ import { X, CheckCircle, XCircle, Microscope, Rocket, ExternalLink, Loader2, Clo
 import { List, useDynamicRowHeight, type RowComponentProps } from 'react-window';
 import { apiFetch, API_BASE_URL } from '../api';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
-import { isSafeUrl } from './TaskCard';
+import { isSafeUrl, FAILURE_CLASS_CONFIG } from './TaskCard';
 import type { Task } from './TaskCard';
+import { TAXONOMY_LABELS, TAXONOMY_COLORS } from './taxonomyConstants';
 
 export type ActivityEventType = 'TASK_COMPLETED' | 'TASK_FAILED' | 'RESEARCH_FINDINGS' | 'DEPLOY_EVENT' | 'TASK_IN_PROGRESS';
 
@@ -30,6 +31,8 @@ export interface ActivityEvent {
   scope?: string | null;
   direction_id?: string | null;
   review_iterations?: number | null;
+  failure_class?: string | null;
+  taxonomy?: string | null;
 }
 
 interface ActivityFeedProps {
@@ -205,6 +208,24 @@ function FeedRow({
                     title="Review iterations"
                   >
                     {event.review_iterations} review{event.review_iterations !== 1 ? 's' : ''}
+                  </span>
+                )}
+
+                {event.type === 'TASK_FAILED' && event.failure_class && FAILURE_CLASS_CONFIG[event.failure_class] && (
+                  <span
+                    className={`shrink-0 text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded ${FAILURE_CLASS_CONFIG[event.failure_class].color}`}
+                    title={FAILURE_CLASS_CONFIG[event.failure_class].hint}
+                  >
+                    {FAILURE_CLASS_CONFIG[event.failure_class].label}
+                  </span>
+                )}
+
+                {event.type === 'TASK_FAILED' && event.taxonomy && TAXONOMY_LABELS[event.taxonomy] && (
+                  <span
+                    className={`shrink-0 text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[event.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}
+                    title={TAXONOMY_LABELS[event.taxonomy]}
+                  >
+                    {TAXONOMY_LABELS[event.taxonomy]}
                   </span>
                 )}
 

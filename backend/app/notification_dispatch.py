@@ -311,10 +311,11 @@ async def post_direction_milestone_message(
     milestone: str,
     reason: str,
     task_id: Optional[uuid.UUID] = None,
+    direction_id: Optional[str] = None,
 ) -> ProjectMessage:
     """Post a message for direction lifecycle milestones (auto-completed, auto-paused, auto-retired)."""
     summary = f"Direction {milestone}: {direction_text[:80]} — {reason}"
-    return await post_event_message(
+    msg = await post_event_message(
         session,
         project_id,
         event_type="direction_milestone",
@@ -322,6 +323,17 @@ async def post_direction_milestone_message(
         context={"milestone": milestone, "direction_text": direction_text[:120], "reason": reason},
         task_id=task_id,
     )
+    asyncio.ensure_future(dispatch_external_notification(
+        project_id,
+        "DIRECTION_MILESTONE",
+        {
+            "direction_text": direction_text[:120],
+            "milestone": milestone,
+            "reason": reason,
+            "direction_id": direction_id,
+        },
+    ))
+    return msg
 
 
 async def post_cycle_summary_message(

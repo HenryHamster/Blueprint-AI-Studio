@@ -2,7 +2,7 @@
 import pytest
 from httpx import AsyncClient
 
-from app.models import Project, ProjectMember, Task, TaskStatus
+from app.models import Project, ProjectMember, Task, TaskStatus, Artifact, ArtifactType
 
 
 TEST_USER_ID = "test-user-123"
@@ -77,3 +77,38 @@ async def test_completed_task_missing_context_fields_are_none(
     assert ev["scope"] is None
     assert ev["direction_id"] is None
     assert ev["review_iterations"] is None
+
+
+@pytest.mark.asyncio
+async def test_failed_task_includes_failure_class_and_taxonomy(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        title="Failed task",
+        latest_status_message="AGENT_TIMEOUT: timed out",
+        context={"failure_class": "AGENT_TIMEOUT"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.ERROR_LOG,
+        logs="agent timed out after 3600s",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/activity")
+    assert resp.status_code == 200
+    events = resp.json()["events"]
+    failed = [e for e in events if e["type"] == "TASK_FAILED"]
+    assert len(failed) == 1
+    ev = failed[0]
+    assert ev["failure_class"] is not None
+    assert ev["taxonomy"] is not None
+    assert ev["error_summary"] is not None

@@ -65,7 +65,7 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
     return {
         "webhook_url": "",
         "webhook_url_configured": bool(config.get("webhook_url")),
-        "enabled_events": config.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED"]),
+        "enabled_events": config.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE"]),
         "throttle_seconds": config.get("throttle_seconds", 30),
     }
 
@@ -127,7 +127,7 @@ async def get_settings(
         "notification_config": _build_notification_config_response(
             _runtime_config.get("notification_config", {
                 "webhook_url": "",
-                "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED"],
+                "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE"],
                 "throttle_seconds": 30,
             }),
             is_admin=current_user.get("role") == "admin",
@@ -567,9 +567,9 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         _VALID_NOTIFICATION_EVENTS = frozenset([
             "TASK_FAILED", "TASK_COMPLETED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT",
             "PR_MERGED", "BUDGET_EXCEEDED", "AUTO_FIX_SPAWNED", "AUTO_FIX_MERGED",
-            "AUTO_FIX_ESCALATED", "REMEDIATION_ESCALATED",
+            "AUTO_FIX_ESCALATED", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE",
         ])
-        enabled_events = val.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED"])
+        enabled_events = val.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE"])
         if not isinstance(enabled_events, list):
             raise HTTPException(status_code=400, detail="notification_config.enabled_events must be a list")
         invalid_events = [e for e in enabled_events if e not in _VALID_NOTIFICATION_EVENTS]

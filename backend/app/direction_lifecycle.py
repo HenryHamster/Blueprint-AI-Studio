@@ -759,10 +759,17 @@ async def _process_direction_lifecycle(
                         )
             logger.info(f"[AUTONOMOUS] Auto-paused direction {did}: {pause_reason}")
             auto_paused_any = True
-            # Auto-pause messages were noisy ("Direction auto-paused: X — reason").
-            # The next strategic cycle's agent-authored cycle_summary should
-            # mention paused directions that matter; the direction UI already
-            # reflects pause status. Dropping the auto-message here.
+            try:
+                from app.notification_dispatch import post_direction_milestone_message  # noqa: PLC0415
+                await post_direction_milestone_message(
+                    session, project.id,
+                    direction_text=d.get("text", ""),
+                    milestone="auto-paused",
+                    reason=pause_reason,
+                    direction_id=did,
+                )
+            except Exception as _notify_exc:
+                logger.warning(f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}")
             try:
                 if _is_code_failure_pause_reason(pause_reason):
                     await _spawn_direction_diagnosis(project, d, pause_reason, session)
@@ -797,10 +804,17 @@ async def _process_direction_lifecycle(
                     ),
                 )
                 session.add(alert)
-                # Auto-retire message was noisy. The Alert above (INFO
-                # severity) carries the same information into the alerts
-                # surface; the next strategic cycle can cite the retirement
-                # in its cycle_summary if it's worth surfacing to the user.
+                try:
+                    from app.notification_dispatch import post_direction_milestone_message  # noqa: PLC0415
+                    await post_direction_milestone_message(
+                        session, project.id,
+                        direction_text=d.get("text", ""),
+                        milestone="auto-retired",
+                        reason=d["auto_completed_reason"],
+                        direction_id=did,
+                    )
+                except Exception as _notify_exc:
+                    logger.warning(f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}")
                 directions_modified = True
             else:
                 # Spawn diagnosis research so the agent can investigate the failure
