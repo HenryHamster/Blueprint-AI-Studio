@@ -113,6 +113,10 @@ export interface HeaderBarProps {
   onUpdateProviderPreferenceByCategory: (value: Record<string, ProviderName[]>) => Promise<void>;
   taskTypeProviderPreference: Record<string, ProviderName[]>;
   onUpdateTaskTypeProviderPreferences: (value: Record<string, ProviderName[]>) => Promise<void>;
+  effortProfiles: Record<string, Partial<Record<ProviderName, Record<string, unknown>>>>;
+  onUpdateEffortProfiles: (value: Record<string, Partial<Record<ProviderName, Record<string, unknown>>>>) => Promise<void>;
+  taskTypeEffortProfile: Record<string, string>;
+  onUpdateTaskTypeEffortProfile: (value: Record<string, string>) => Promise<void>;
   showMetrics: boolean;
   onToggleMetrics: () => void;
   metricsHistory: { timestamp: number; completedCount: number }[];
@@ -249,6 +253,10 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateProviderPreferenceByCategory,
     taskTypeProviderPreference,
     onUpdateTaskTypeProviderPreferences,
+    effortProfiles,
+    onUpdateEffortProfiles,
+    taskTypeEffortProfile,
+    onUpdateTaskTypeEffortProfile,
     taskTypeProviderOverrides,
     onUpdateProviderSettingsDefaults,
     onUpdateTaskTypeProviderOverrides,
@@ -458,6 +466,10 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateProviderPreferenceByCategory={onUpdateProviderPreferenceByCategory}
           taskTypeProviderPreference={taskTypeProviderPreference}
           onUpdateTaskTypeProviderPreferences={onUpdateTaskTypeProviderPreferences}
+          effortProfiles={effortProfiles}
+          onUpdateEffortProfiles={onUpdateEffortProfiles}
+          taskTypeEffortProfile={taskTypeEffortProfile}
+          onUpdateTaskTypeEffortProfile={onUpdateTaskTypeEffortProfile}
           taskTypeProviderOverrides={taskTypeProviderOverrides}
           onUpdateProviderSettingsDefaults={onUpdateProviderSettingsDefaults}
           onUpdateTaskTypeProviderOverrides={onUpdateTaskTypeProviderOverrides}

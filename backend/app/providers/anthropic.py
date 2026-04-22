@@ -36,6 +36,17 @@ class AnthropicProvider(LLMProvider):
     name = LLMProviderName.ANTHROPIC
     supported_auth_modes = (LLMAuthMode.OAUTH, LLMAuthMode.API_KEY)
 
+    def validate_settings(self, bag: Mapping[str, Any]) -> dict[str, Any]:
+        cleaned = super().validate_settings(bag)
+        model = cleaned.get("model")
+        fallback = cleaned.get("fallback_model")
+        if model and fallback and model == fallback:
+            raise ValueError(
+                f"fallback_model {fallback!r} must differ from model {model!r} — "
+                "Claude Code CLI cannot fall back to the same tier that's rate-limited."
+            )
+        return cleaned
+
     def validate_secret(
         self,
         raw: str,
@@ -121,8 +132,11 @@ class AnthropicProvider(LLMProvider):
                         "claude-haiku-4-5-20251001",
                     ],
                     "description": (
-                        "Model to fall back to when the primary is rate-limited. "
-                        "Typically a cheaper tier (e.g. sonnet when opus is over quota)."
+                        "Anthropic-only. Claude Code CLI's --fallback-model flag: "
+                        "used when the primary is rate-limited. Pick a different tier "
+                        "than `model` (e.g. sonnet when opus is over quota). OpenAI "
+                        "and Gemini don't have a CLI-level equivalent — cross-provider "
+                        "fallback is handled at the pool layer instead."
                     ),
                 },
                 "betas": {

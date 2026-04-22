@@ -42,6 +42,8 @@ export function useSettings(addToast: AddToast) {
   const [taskTypeProviderPreference, setTaskTypeProviderPreference] = useState<Record<string, ProviderName[]>>({});
   const [taskTypeCategories, setTaskTypeCategories] = useState<Record<string, string[]>>({});
   const [providerPreferenceByCategory, setProviderPreferenceByCategory] = useState<Record<string, ProviderName[]>>({});
+  const [effortProfiles, setEffortProfiles] = useState<Record<string, Partial<Record<ProviderName, Record<string, unknown>>>>>({});
+  const [taskTypeEffortProfile, setTaskTypeEffortProfile] = useState<Record<string, string>>({});
   const [taskTypeModelPreferences, setTaskTypeModelPreferences] = useState<Record<string, ModelPreference[]>>({});
   const [providerSelectionMode, setProviderSelectionMode] = useState<'balanced' | 'preferred' | 'exclusive'>('balanced');
   const [crossProviderFallbackEnabled, setCrossProviderFallbackEnabled] = useState(true);
@@ -74,6 +76,8 @@ export function useSettings(addToast: AddToast) {
         setTaskTypeProviderPreference(data.task_type_provider_preference ?? {});
         setTaskTypeCategories(data.task_type_categories ?? {});
         setProviderPreferenceByCategory(data.provider_preference_by_category ?? {});
+        setEffortProfiles(data.effort_profiles ?? {});
+        setTaskTypeEffortProfile(data.task_type_effort_profile ?? {});
         setTaskTypeModelPreferences(data.task_type_model_preferences ?? {});
         const rawMode = data.provider_selection_mode;
         const resolvedMode: 'balanced' | 'preferred' | 'exclusive' =
@@ -298,6 +302,30 @@ export function useSettings(addToast: AddToast) {
       console.error('Failed to update provider preference by category:', err);
       setProviderPreferenceByCategory(prev);
       addToast('Failed to update category provider preference', 'error');
+    }
+  };
+
+  const updateEffortProfiles = async (value: Record<string, Partial<Record<ProviderName, Record<string, unknown>>>>) => {
+    const prev = effortProfiles;
+    setEffortProfiles(value);
+    try {
+      await patchSettings({ effort_profiles: value });
+    } catch (err) {
+      console.error('Failed to update effort profiles:', err);
+      setEffortProfiles(prev);
+      addToast('Failed to update effort profiles', 'error');
+    }
+  };
+
+  const updateTaskTypeEffortProfile = async (value: Record<string, string>) => {
+    const prev = taskTypeEffortProfile;
+    setTaskTypeEffortProfile(value);
+    try {
+      await patchSettings({ task_type_effort_profile: value });
+    } catch (err) {
+      console.error('Failed to update task→profile mapping:', err);
+      setTaskTypeEffortProfile(prev);
+      addToast('Failed to update task→profile mapping', 'error');
     }
   };
 
@@ -598,6 +626,7 @@ export function useSettings(addToast: AddToast) {
     notificationConfig,
     providerTierModelMap, taskTypeProviderPreference, taskTypeModelPreferences,
     taskTypeCategories, providerPreferenceByCategory,
+    effortProfiles, taskTypeEffortProfile,
     providerSelectionMode,
     crossProviderFallbackEnabled, providers,
     providerSettingsDefaults, setProviderSettingsDefaults,
@@ -611,6 +640,7 @@ export function useSettings(addToast: AddToast) {
     updateAgentPromptSuffixes,
     updateProviderTierModels, updateTaskTypeProviderPreferences, updateTaskTypeModelPreferenceConfig,
     updateTaskTypeCategories, updateProviderPreferenceByCategory,
+    updateEffortProfiles, updateTaskTypeEffortProfile,
     updateProviderSelectionMode,
     updateCrossProviderFallback,
     updateProviderSettingsDefaults, updateTaskTypeProviderOverrides,

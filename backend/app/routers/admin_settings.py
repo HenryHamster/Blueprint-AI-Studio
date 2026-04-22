@@ -111,6 +111,8 @@ async def get_settings(
         # schema-driven admin UI and the dispatch-time settings resolution.
         "provider_settings_defaults": _runtime_config.get("provider_settings_defaults", {}),
         "task_type_provider_overrides": _runtime_config.get("task_type_provider_overrides", {}),
+        "effort_profiles": _runtime_config.get("effort_profiles", {}),
+        "task_type_effort_profile": _runtime_config.get("task_type_effort_profile", {}),
         "health_check_urls": _runtime_config.get("health_check_urls", []),
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
@@ -394,6 +396,62 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     )
             cleaned_overrides[task_type] = cleaned_per_provider
         _runtime_config["task_type_provider_overrides"] = cleaned_overrides
+    if "effort_profiles" in payload:
+        val = payload["effort_profiles"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="effort_profiles must be a dict")
+        valid_providers = {p.value for p in LLMProviderName}
+        cleaned_profiles: dict[str, dict[str, dict]] = {}
+        for profile_name, per_provider in val.items():
+            if not isinstance(profile_name, str) or not profile_name or profile_name == "_default":
+                raise HTTPException(
+                    status_code=400,
+                    detail="effort_profiles keys must be non-empty strings and not '_default'",
+                )
+            if not isinstance(per_provider, dict):
+                raise HTTPException(status_code=400, detail=f"effort_profiles[{profile_name}] must be a dict")
+            cleaned_per_provider: dict[str, dict] = {}
+            for provider_name, bag in per_provider.items():
+                if provider_name not in valid_providers:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid provider in effort_profiles[{profile_name}]: {provider_name}",
+                    )
+                if not isinstance(bag, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"effort_profiles[{profile_name}][{provider_name}] must be a dict",
+                    )
+                provider = get_provider(LLMProviderName(provider_name))
+                try:
+                    cleaned_per_provider[provider_name] = provider.validate_settings(bag)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"effort_profiles[{profile_name}][{provider_name}]: {exc}",
+                    )
+            cleaned_profiles[profile_name] = cleaned_per_provider
+        _runtime_config["effort_profiles"] = cleaned_profiles
+    if "task_type_effort_profile" in payload:
+        val = payload["task_type_effort_profile"]
+        if not isinstance(val, dict):
+            raise HTTPException(status_code=400, detail="task_type_effort_profile must be a dict")
+        known_profiles = set(_runtime_config.get("effort_profiles", {}) or {})
+        # Include the profile block from this payload so a single PATCH can
+        # create a profile and bind task types to it atomically.
+        if "effort_profiles" in payload and isinstance(payload["effort_profiles"], dict):
+            known_profiles |= set(payload["effort_profiles"].keys())
+        for task_type, profile_name in val.items():
+            if not isinstance(task_type, str) or not task_type:
+                raise HTTPException(status_code=400, detail="task_type_effort_profile keys must be non-empty strings")
+            if not isinstance(profile_name, str) or not profile_name:
+                raise HTTPException(status_code=400, detail=f"task_type_effort_profile[{task_type}] must be a non-empty string")
+            if known_profiles and profile_name not in known_profiles:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"task_type_effort_profile[{task_type}] references undefined profile {profile_name!r}",
+                )
+        _runtime_config["task_type_effort_profile"] = val
     if "agent_prompt_suffixes" in payload:
         val = payload["agent_prompt_suffixes"]
         if not isinstance(val, dict):
@@ -648,6 +706,8 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "cross_provider_fallback_enabled": _provider_selection_mode_from_config(_runtime_config) in ("balanced", "preferred"),
                     "provider_settings_defaults": _runtime_config.get("provider_settings_defaults", {}),
                     "task_type_provider_overrides": _runtime_config.get("task_type_provider_overrides", {}),
+                    "effort_profiles": _runtime_config.get("effort_profiles", {}),
+                    "task_type_effort_profile": _runtime_config.get("task_type_effort_profile", {}),
                     "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
                     "autonomous_periodic_tasks": _runtime_config.get("autonomous_periodic_tasks", {}),
                     "health_check_urls": _runtime_config.get("health_check_urls", []),

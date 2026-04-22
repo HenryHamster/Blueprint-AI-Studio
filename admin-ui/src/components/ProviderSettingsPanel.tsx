@@ -34,13 +34,14 @@ interface Props {
 }
 
 // Full list of known task types (matches backend payload_schemas.py::TaskType).
-// Not worth fetching — these change rarely and matching the backend list in one
-// place keeps the UI predictable.
+// `investigate` is omitted — it exists in the enum but no spawner wires it,
+// so surfacing it here would just mislead operators into configuring a dead
+// code path.
 const TASK_TYPES = [
   'create', 'review', 'fix', 'plan', 'research',
   'strategic_review', 'design_doc_update', 'security_audit',
   'qa', 'deps', 'docs', 'migrate', 'smoketest',
-  'refactor', 'debug', 'perf', 'investigate',
+  'refactor', 'debug', 'perf',
 ] as const;
 
 export function ProviderSettingsPanel({

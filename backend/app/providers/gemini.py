@@ -143,9 +143,13 @@ class GeminiProvider(LLMProvider):
                 },
                 "thinking_budget": {
                     "type": "integer",
+                    "minimum": 0,
+                    "maximum": 32768,
                     "description": (
                         "Token budget Gemini spends on internal reasoning before "
-                        "answering. Higher = deeper analysis, more cost and latency."
+                        "answering. 0 disables thinking entirely. Higher = deeper "
+                        "analysis, more cost and latency. Per-model hard caps apply; "
+                        "gemini-2.5-pro supports up to 32768."
                     ),
                 },
                 "include_thoughts": {

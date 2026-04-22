@@ -112,11 +112,11 @@ class OpenAIProvider(LLMProvider):
                 },
                 "reasoning_effort": {
                     "type": "string",
-                    "enum": ["minimal", "low", "medium", "high", "xhigh"],
+                    "enum": ["minimal", "low", "medium", "high"],
                     "description": (
-                        "How much Codex thinks before answering. `minimal`/`low` = fast "
-                        "but shallower; `high`/`xhigh` = deeper planning at higher cost "
-                        "and latency."
+                        "How much Codex thinks before answering. `minimal`/`low` = "
+                        "fast but shallower; `high` = deeper planning at higher cost "
+                        "and latency. Codex CLI has no level above `high`."
                     ),
                 },
                 "verbosity": {
@@ -139,8 +139,12 @@ class OpenAIProvider(LLMProvider):
                     "type": "string",
                     "enum": ["disabled", "cached", "live"],
                     "description": (
-                        "Let Codex fetch web content while solving. `disabled` (offline); "
-                        "`cached` (reuse prior fetches); `live` (fresh, billable)."
+                        "Let Codex fetch web content while solving. Works for both "
+                        "API-key and ChatGPT OAuth auth modes (routed via Codex TOML "
+                        "config). `disabled` (offline); `cached` (reuse prior "
+                        "fetches); `live` (fresh fetches on every task — API-key mode "
+                        "incurs per-search charges, OAuth mode counts against your "
+                        "ChatGPT subscription quota)."
                     ),
                 },
                 "tool_output_token_limit": {

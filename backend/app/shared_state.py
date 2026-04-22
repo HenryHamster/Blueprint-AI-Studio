@@ -156,27 +156,57 @@ runtime_config: Dict = {
     # explicitly pins one. Shape per provider is declared by that provider's
     # settings_schema(); unknown keys are rejected at resolution time.
     "provider_settings_defaults": {
-        "anthropic": {"effort": "medium"},
-        "openai": {"reasoning_effort": "medium", "verbosity": "medium"},
+        "anthropic": {},
+        "openai": {},
         "gemini": {},
     },
-    # Sparse per-(task_type, provider) overrides. Deep-merged over provider
-    # defaults at dispatch time. Only record actual deviations here so a later
-    # change to the default propagates everywhere that didn't opt out. A
-    # task-type with no entry inherits defaults verbatim. Bags may set
-    # provider-specific model overrides when a task deserves a specific model
-    # (e.g. {"gemini": {"model": "gemini-2.5-flash"}} to pin a cheap provider).
-    "task_type_provider_overrides": {
-        "strategic_review": {"anthropic": {"effort": "max"}},
-        "design_doc_update": {"anthropic": {"effort": "max"}},
-        "research": {"anthropic": {"effort": "high"}},
-        "security_audit": {"anthropic": {"effort": "high"}},
-        "perf": {"anthropic": {"effort": "high"}},
-        "debug": {"anthropic": {"effort": "high"}},
-        "smoketest": {"anthropic": {"effort": "low"}},
-        "docs": {"anthropic": {"effort": "low"}},
-        "deps": {"anthropic": {"effort": "low"}},
+    # Effort profiles: named bundles of per-provider settings. Define what
+    # "low" / "medium" / "high" / "max" means for each provider once, then
+    # just tag each task type with a profile name below — no more per-task
+    # per-provider effort copy-pasting.
+    "effort_profiles": {
+        "low": {
+            "anthropic": {"effort": "low"},
+            "openai": {"reasoning_effort": "low", "verbosity": "low"},
+            "gemini": {"thinking_budget": 1024},
+        },
+        "medium": {
+            "anthropic": {"effort": "medium"},
+            "openai": {"reasoning_effort": "medium", "verbosity": "medium"},
+            "gemini": {"thinking_budget": 4096},
+        },
+        "high": {
+            "anthropic": {"effort": "high"},
+            "openai": {"reasoning_effort": "high", "verbosity": "high"},
+            "gemini": {"thinking_budget": 16384},
+        },
+        "max": {
+            # Codex CLI tops out at "high"; Anthropic aliases max→xhigh; Gemini
+            # 2.5-pro caps thinking at 32768.
+            "anthropic": {"effort": "max"},
+            "openai": {"reasoning_effort": "high", "verbosity": "high"},
+            "gemini": {"thinking_budget": 32768},
+        },
     },
+    # Task-type → profile mapping. "_default" applies to any task type without
+    # its own entry. Payload/context can override per-task.
+    "task_type_effort_profile": {
+        "_default": "medium",
+        "strategic_review": "max",
+        "design_doc_update": "max",
+        "research": "high",
+        "security_audit": "high",
+        "perf": "high",
+        "debug": "high",
+        "smoketest": "low",
+        "docs": "low",
+        "deps": "low",
+    },
+    # Sparse per-(task_type, provider) surgical overrides. Used for things
+    # that DON'T fit the profile mental model — e.g. pinning a specific model
+    # for a specific task type. Effort levels should live in profiles; this
+    # layer is for the irregular stuff. Wins over the profile layer.
+    "task_type_provider_overrides": {},
     # Per-type extra instructions appended to the agent's base prompt
     # e.g. {"research": "Focus especially on performance bottlenecks.", "qa": "Use pytest only."}
     "agent_prompt_suffixes": {},
@@ -347,6 +377,8 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "task_type_categories",
                     "provider_preference_by_category",
                     "task_type_model_preferences",
+                    "effort_profiles",
+                    "task_type_effort_profile",
                     "provider_selection_mode",
                     "cross_provider_fallback_enabled",
                     "agent_prompt_suffixes",

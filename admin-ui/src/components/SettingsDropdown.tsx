@@ -4,6 +4,7 @@ import { SettingsNotificationsSection } from './SettingsNotificationsSection';
 import type { NotificationConfig } from './SettingsNotificationsSection';
 import { ProviderSettingsPanel } from './ProviderSettingsPanel';
 import { ProviderCategoriesPanel } from './ProviderCategoriesPanel';
+import { ProviderEffortProfilesPanel } from './ProviderEffortProfilesPanel';
 import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
 import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
 import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
@@ -100,6 +101,10 @@ interface SettingsDropdownProps {
   onUpdateProviderPreferenceByCategory: (value: Record<string, ProviderName[]>) => Promise<void>;
   taskTypeProviderPreference: Record<string, ProviderName[]>;
   onUpdateTaskTypeProviderPreferences: (value: Record<string, ProviderName[]>) => Promise<void>;
+  effortProfiles: Record<string, Partial<Record<ProviderName, Record<string, unknown>>>>;
+  onUpdateEffortProfiles: (value: Record<string, Partial<Record<ProviderName, Record<string, unknown>>>>) => Promise<void>;
+  taskTypeEffortProfile: Record<string, string>;
+  onUpdateTaskTypeEffortProfile: (value: Record<string, string>) => Promise<void>;
   refreshInterval: number;
   onUpdateRefreshInterval: (value: number) => void;
   pageSize: number;
@@ -223,11 +228,12 @@ const CREDENTIAL_GUIDES: Record<string, CredentialGuide> = {
   },
 };
 
-type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation';
+type SectionId = 'general' | 'provider-routing' | 'effort-profiles' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation';
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
   { id: 'provider-routing', label: 'Provider Routing', icon: GitBranch, adminOnly: true },
+  { id: 'effort-profiles', label: 'Effort Profiles', icon: Sliders, adminOnly: true },
   { id: 'provider-settings', label: 'Provider Settings', icon: ListChecks, adminOnly: true },
   { id: 'orchestrator', label: 'Orchestrator', icon: Server, adminOnly: true },
   { id: 'deploy', label: 'Deploy & Health', icon: Shield, adminOnly: true },
@@ -331,6 +337,10 @@ export function SettingsDropdown({
   onUpdateProviderPreferenceByCategory,
   taskTypeProviderPreference,
   onUpdateTaskTypeProviderPreferences,
+  effortProfiles,
+  onUpdateEffortProfiles,
+  taskTypeEffortProfile,
+  onUpdateTaskTypeEffortProfile,
   refreshInterval,
   onUpdateRefreshInterval,
   pageSize,
@@ -1418,10 +1428,22 @@ export function SettingsDropdown({
     );
   }
 
+  function renderEffortProfiles() {
+    return (
+      <ProviderEffortProfilesPanel
+        effortProfiles={effortProfiles}
+        onUpdateEffortProfiles={onUpdateEffortProfiles}
+        taskTypeEffortProfile={taskTypeEffortProfile}
+        onUpdateTaskTypeEffortProfile={onUpdateTaskTypeEffortProfile}
+      />
+    );
+  }
+
   function renderActiveSection() {
     switch (activeSection) {
       case 'general': return renderGeneral();
       case 'provider-routing': return renderProviderRouting();
+      case 'effort-profiles': return renderEffortProfiles();
       case 'provider-settings': return renderProviderSettings();
       case 'orchestrator': return renderOrchestrator();
       case 'deploy': return renderDeploy();

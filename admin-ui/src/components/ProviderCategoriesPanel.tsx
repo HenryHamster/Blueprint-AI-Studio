@@ -4,12 +4,14 @@ import type { ProviderCatalogEntry, ProviderName } from '../types/settings';
 
 // Task-type list must match backend payload_schemas.py::TaskType. Unassigned
 // types show up in the "Uncategorized" strip so nothing silently loses its
-// allow-list.
+// allow-list. `investigate` is intentionally omitted — it exists in the enum
+// but no spawner wires it, so surfacing it here would just create a
+// permanently-uncategorized entry.
 const ALL_TASK_TYPES = [
   'create', 'review', 'fix', 'plan', 'research',
   'strategic_review', 'design_doc_update', 'security_audit',
   'qa', 'deps', 'docs', 'migrate', 'smoketest',
-  'refactor', 'debug', 'perf', 'investigate',
+  'refactor', 'debug', 'perf',
 ] as const;
 
 type SelectionMode = 'balanced' | 'preferred' | 'exclusive';

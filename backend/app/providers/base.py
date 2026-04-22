@@ -218,12 +218,24 @@ def _validate_against_schema(value: Any, schema: Mapping[str, Any], *, path: str
             return None
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{path}: expected integer")
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            raise ValueError(f"{path}: {value} < minimum {minimum}")
+        if isinstance(maximum, (int, float)) and value > maximum:
+            raise ValueError(f"{path}: {value} > maximum {maximum}")
         return value
     if expected == "number":
         if value is None:
             return None
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"{path}: expected number")
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            raise ValueError(f"{path}: {value} < minimum {minimum}")
+        if isinstance(maximum, (int, float)) and value > maximum:
+            raise ValueError(f"{path}: {value} > maximum {maximum}")
         return value
     if expected == "boolean":
         if value is None:

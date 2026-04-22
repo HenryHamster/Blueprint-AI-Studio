@@ -436,6 +436,66 @@ def test_resolve_task_provider_settings_empty_when_nothing_configured():
     assert resolve_task_provider_settings(task, runtime_config, "anthropic") == {}
 
 
+def test_resolve_task_provider_settings_applies_effort_profile():
+    """Profile layer fills in effort for the task's task_type → profile mapping."""
+    from app.max_plan_pool import resolve_task_provider_settings
+
+    runtime_config = {
+        "effort_profiles": {
+            "medium": {"anthropic": {"effort": "medium"}},
+            "max": {"anthropic": {"effort": "max"}},
+        },
+        "task_type_effort_profile": {
+            "_default": "medium",
+            "strategic_review": "max",
+        },
+    }
+    # strategic_review → "max" profile → effort=max
+    assert resolve_task_provider_settings(
+        _make_task("strategic_review"), runtime_config, "anthropic"
+    ) == {"effort": "max"}
+    # create → _default "medium" profile → effort=medium
+    assert resolve_task_provider_settings(
+        _make_task("create"), runtime_config, "anthropic"
+    ) == {"effort": "medium"}
+
+
+def test_resolve_task_provider_settings_payload_profile_overrides_task_type():
+    """Payload-level effort_profile wins over the task_type → profile mapping."""
+    from app.max_plan_pool import resolve_task_provider_settings
+
+    runtime_config = {
+        "effort_profiles": {
+            "low": {"anthropic": {"effort": "low"}},
+            "max": {"anthropic": {"effort": "max"}},
+        },
+        "task_type_effort_profile": {"strategic_review": "max"},
+    }
+    task = SimpleNamespace(
+        payloads=[{"type": "strategic_review", "effort_profile": "low"}],
+        context={},
+    )
+    assert resolve_task_provider_settings(task, runtime_config, "anthropic") == {"effort": "low"}
+
+
+def test_resolve_task_provider_settings_surgical_override_beats_profile():
+    """task_type_provider_overrides wins over the profile layer — surgical
+    overrides are for the irregular cases that don't fit the profile model."""
+    from app.max_plan_pool import resolve_task_provider_settings
+
+    runtime_config = {
+        "effort_profiles": {"medium": {"anthropic": {"effort": "medium"}}},
+        "task_type_effort_profile": {"_default": "medium"},
+        "task_type_provider_overrides": {
+            "docs": {"anthropic": {"model": "claude-haiku-4-5-20251001"}},
+        },
+    }
+    # Effort comes from profile; model comes from surgical override.
+    assert resolve_task_provider_settings(
+        _make_task("docs"), runtime_config, "anthropic"
+    ) == {"effort": "medium", "model": "claude-haiku-4-5-20251001"}
+
+
 # ---------------------------------------------------------------------------
 # build_agent_secret_manifest integration
 # ---------------------------------------------------------------------------

@@ -295,6 +295,39 @@ def cross_provider_fallback_enabled(runtime_config: Mapping[str, Any]) -> bool:
     return provider_selection_mode(runtime_config) in ("balanced", "preferred")
 
 
+def resolve_task_effort_profile(task: Any, runtime_config: Mapping[str, Any]) -> str | None:
+    """Resolve the effort-profile name for a task.
+
+    Order (most specific wins):
+      1. payload.effort_profile
+      2. context.effort_profile
+      3. task_type_effort_profile[task_type]
+      4. task_type_effort_profile["_default"]
+    Returns None when nothing is configured — caller then skips the profile
+    layer entirely instead of inventing a default.
+    """
+    if not isinstance(runtime_config, Mapping):
+        return None
+    ctx = _task_context(task)
+    payloads = getattr(task, "payloads", None) or []
+    payload = payloads[0] if payloads else {}
+    for candidate in (
+        payload.get("effort_profile") if isinstance(payload, Mapping) else None,
+        ctx.get("effort_profile"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    mapping = runtime_config.get("task_type_effort_profile", {}) or {}
+    if not isinstance(mapping, Mapping):
+        return None
+    task_type = _task_type(task)
+    for key in (task_type, "_default"):
+        value = mapping.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def resolve_task_provider_settings(
     task: Any,
     runtime_config: Mapping[str, Any],
@@ -302,18 +335,31 @@ def resolve_task_provider_settings(
 ) -> dict[str, Any]:
     """Resolve the provider-specific settings bag for a task.
 
-    Three-layer deep-merge:
-      1. provider_settings_defaults[provider]  — base bag
-      2. task_type_provider_overrides[task_type][provider]  — sparse delta
-      3. payload.provider_settings[provider] / context.provider_settings[provider]
-         — per-task override
+    Five-layer deep-merge (later wins):
+      1. provider_settings_defaults[provider] — base bag (provider-agnostic floor)
+      2. effort_profiles[profile][provider]   — named effort bundle chosen via
+         task_type_effort_profile / payload.effort_profile
+      3. task_type_provider_overrides[task_type][provider] — surgical overrides
+         (e.g. pinning a specific model for a task type)
+      4. context.provider_settings[provider]  — per-task context override
+      5. payload.provider_settings[provider]  — per-task payload override
 
     Validated against provider.settings_schema() before return. Unknown keys
     raise ValueError (fail-closed — typos should be loud).
     """
     defaults_all = runtime_config.get("provider_settings_defaults", {}) or {}
+    profiles_all = runtime_config.get("effort_profiles", {}) or {}
     overrides_all = runtime_config.get("task_type_provider_overrides", {}) or {}
+
     base = defaults_all.get(provider_name) if isinstance(defaults_all, Mapping) else None
+
+    profile_bag = None
+    profile_name = resolve_task_effort_profile(task, runtime_config)
+    if profile_name and isinstance(profiles_all, Mapping):
+        profile = profiles_all.get(profile_name)
+        if isinstance(profile, Mapping):
+            profile_bag = profile.get(provider_name)
+
     task_type = _task_type(task)
     task_override = overrides_all.get(task_type) if isinstance(overrides_all, Mapping) else None
     type_bag = task_override.get(provider_name) if isinstance(task_override, Mapping) else None
@@ -326,7 +372,7 @@ def resolve_task_provider_settings(
     payload_bag = payload_settings.get(provider_name) if isinstance(payload_settings, Mapping) else None
     ctx_bag = ctx_settings.get(provider_name) if isinstance(ctx_settings, Mapping) else None
 
-    merged = merge_settings(base, type_bag, ctx_bag, payload_bag)
+    merged = merge_settings(base, profile_bag, type_bag, ctx_bag, payload_bag)
     if not merged:
         return {}
     provider = get_provider(provider_name)

@@ -89,9 +89,15 @@ async def test_get_settings_includes_provider_settings_defaults(client):
     body = res.json()
     assert "provider_settings_defaults" in body
     assert "task_type_provider_overrides" in body
-    # Seeded defaults from shared_state.py — effort-only, no hardcoded models.
-    assert body["provider_settings_defaults"]["anthropic"].get("effort") == "medium"
-    assert "model" not in body["provider_settings_defaults"]["anthropic"]
+    assert "effort_profiles" in body
+    assert "task_type_effort_profile" in body
+    # provider_settings_defaults is the provider-agnostic floor; effort levels
+    # live in effort_profiles (defined once per provider) rather than being
+    # copy-pasted into every task-type override.
+    assert isinstance(body["provider_settings_defaults"]["anthropic"], dict)
+    assert body["effort_profiles"]["medium"]["anthropic"]["effort"] == "medium"
+    assert body["task_type_effort_profile"]["_default"] == "medium"
+    assert body["task_type_effort_profile"]["strategic_review"] == "max"
 
 
 async def test_patch_settings_accepts_valid_provider_settings_bag(client):
@@ -177,6 +183,50 @@ async def test_patch_settings_legacy_cross_provider_fallback_boolean_shim(client
     body = (await client.get("/api/admin/settings")).json()
     assert body["provider_selection_mode"] == "preferred"
     assert body["cross_provider_fallback_enabled"] is True
+
+
+async def test_patch_settings_accepts_effort_profiles_and_task_mapping(client):
+    payload = {
+        "effort_profiles": {
+            "medium": {
+                "anthropic": {"effort": "medium"},
+                "openai": {"reasoning_effort": "medium", "verbosity": "medium"},
+                "gemini": {"thinking_budget": 4096},
+            },
+            "premium": {
+                "anthropic": {"effort": "xhigh"},
+                "openai": {"reasoning_effort": "high"},
+                "gemini": {"thinking_budget": 16384},
+            },
+        },
+        "task_type_effort_profile": {
+            "_default": "medium",
+            "strategic_review": "premium",
+        },
+    }
+    res = await client.patch("/api/admin/settings", json=payload)
+    assert res.status_code == 200, res.text
+    body = (await client.get("/api/admin/settings")).json()
+    assert body["effort_profiles"]["premium"]["gemini"]["thinking_budget"] == 16384
+    assert body["task_type_effort_profile"]["strategic_review"] == "premium"
+
+
+async def test_patch_settings_rejects_unknown_profile_in_task_mapping(client):
+    res = await client.patch(
+        "/api/admin/settings",
+        json={"task_type_effort_profile": {"create": "does_not_exist"}},
+    )
+    assert res.status_code == 400
+    assert "undefined profile" in res.text.lower() or "does_not_exist" in res.text
+
+
+async def test_patch_settings_rejects_reserved_default_key_as_profile_name(client):
+    res = await client.patch(
+        "/api/admin/settings",
+        json={"effort_profiles": {"_default": {"anthropic": {"effort": "high"}}}},
+    )
+    assert res.status_code == 400
+    assert "_default" in res.text
 
 
 async def test_patch_settings_accepts_category_preference_edits(client):

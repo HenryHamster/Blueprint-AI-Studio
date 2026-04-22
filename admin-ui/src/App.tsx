@@ -400,6 +400,10 @@ export default function App() {
         onUpdateProviderPreferenceByCategory={s.updateProviderPreferenceByCategory}
         taskTypeProviderPreference={s.taskTypeProviderPreference}
         onUpdateTaskTypeProviderPreferences={s.updateTaskTypeProviderPreferences}
+        effortProfiles={s.effortProfiles}
+        onUpdateEffortProfiles={s.updateEffortProfiles}
+        taskTypeEffortProfile={s.taskTypeEffortProfile}
+        onUpdateTaskTypeEffortProfile={s.updateTaskTypeEffortProfile}
         showMetrics={s.showMetrics}
         onToggleMetrics={() => s.setShowMetrics(prev => !prev)}
         metricsHistory={s.metricsHistory}
