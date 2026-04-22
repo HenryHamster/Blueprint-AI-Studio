@@ -105,6 +105,14 @@ export interface HeaderBarProps {
   taskTypeProviderOverrides: TaskTypeProviderOverrides;
   onUpdateProviderSettingsDefaults: (value: ProviderSettingsDefaults) => Promise<void>;
   onUpdateTaskTypeProviderOverrides: (value: TaskTypeProviderOverrides) => Promise<void>;
+  providerSelectionMode: 'balanced' | 'preferred' | 'exclusive';
+  onUpdateProviderSelectionMode: (mode: 'balanced' | 'preferred' | 'exclusive') => Promise<void>;
+  taskTypeCategories: Record<string, string[]>;
+  onUpdateTaskTypeCategories: (value: Record<string, string[]>) => Promise<void>;
+  providerPreferenceByCategory: Record<string, ProviderName[]>;
+  onUpdateProviderPreferenceByCategory: (value: Record<string, ProviderName[]>) => Promise<void>;
+  taskTypeProviderPreference: Record<string, ProviderName[]>;
+  onUpdateTaskTypeProviderPreferences: (value: Record<string, ProviderName[]>) => Promise<void>;
   showMetrics: boolean;
   onToggleMetrics: () => void;
   metricsHistory: { timestamp: number; completedCount: number }[];
@@ -233,6 +241,14 @@ export function HeaderBar(props: HeaderBarProps) {
     taskTypeModelPreferences,
     providers,
     providerSettingsDefaults,
+    providerSelectionMode,
+    onUpdateProviderSelectionMode,
+    taskTypeCategories,
+    onUpdateTaskTypeCategories,
+    providerPreferenceByCategory,
+    onUpdateProviderPreferenceByCategory,
+    taskTypeProviderPreference,
+    onUpdateTaskTypeProviderPreferences,
     taskTypeProviderOverrides,
     onUpdateProviderSettingsDefaults,
     onUpdateTaskTypeProviderOverrides,
@@ -434,6 +450,14 @@ export function HeaderBar(props: HeaderBarProps) {
           taskTypeModelPreferences={taskTypeModelPreferences}
           providers={providers}
           providerSettingsDefaults={providerSettingsDefaults}
+          providerSelectionMode={providerSelectionMode}
+          onUpdateProviderSelectionMode={onUpdateProviderSelectionMode}
+          taskTypeCategories={taskTypeCategories}
+          onUpdateTaskTypeCategories={onUpdateTaskTypeCategories}
+          providerPreferenceByCategory={providerPreferenceByCategory}
+          onUpdateProviderPreferenceByCategory={onUpdateProviderPreferenceByCategory}
+          taskTypeProviderPreference={taskTypeProviderPreference}
+          onUpdateTaskTypeProviderPreferences={onUpdateTaskTypeProviderPreferences}
           taskTypeProviderOverrides={taskTypeProviderOverrides}
           onUpdateProviderSettingsDefaults={onUpdateProviderSettingsDefaults}
           onUpdateTaskTypeProviderOverrides={onUpdateTaskTypeProviderOverrides}

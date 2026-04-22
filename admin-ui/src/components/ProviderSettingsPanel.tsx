@@ -284,19 +284,26 @@ function FieldRow({ label, schema, value, present, allowInherit, lockReason, onC
   };
 
   return (
-    <div className="grid grid-cols-[160px_1fr_auto] gap-3 items-start py-1.5">
-      <label className="text-xs text-neutral-400 pt-1.5 font-mono truncate" title={schema.description || label}>
-        {label}
-      </label>
+    <div className="grid grid-cols-[160px_1fr_auto] gap-3 items-center py-1.5">
+      <div className="flex items-center gap-1.5 pt-1.5">
+        <label className="text-xs text-neutral-400 font-mono truncate" title={label}>
+          {label}
+        </label>
+        {schema.description && (
+          <span
+            className="inline-flex items-center justify-center w-4 h-4 rounded-full border border-neutral-700 text-[9px] text-neutral-500 hover:text-neutral-200 hover:border-neutral-500 cursor-help select-none"
+            title={schema.description}
+            aria-label={`Help: ${schema.description}`}
+          >
+            ?
+          </span>
+        )}
+      </div>
       <div className={`${effectiveDisabled ? 'opacity-40 pointer-events-none' : ''}`}>
         <Field schema={schema} value={value} onChange={onChange} />
-        {lockReason ? (
+        {lockReason && (
           <div className="mt-1 text-[11px] text-amber-400 leading-snug italic">
             {lockReason}
-          </div>
-        ) : schema.description && (
-          <div className="mt-1 text-[11px] text-neutral-500 leading-snug">
-            {schema.description}
           </div>
         )}
       </div>

@@ -3,6 +3,7 @@ import { SettingsAdvancedSection } from './SettingsAdvancedSection';
 import { SettingsNotificationsSection } from './SettingsNotificationsSection';
 import type { NotificationConfig } from './SettingsNotificationsSection';
 import { ProviderSettingsPanel } from './ProviderSettingsPanel';
+import { ProviderCategoriesPanel } from './ProviderCategoriesPanel';
 import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
 import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
 import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
@@ -90,6 +91,15 @@ interface SettingsDropdownProps {
   taskTypeProviderOverrides: TaskTypeProviderOverrides;
   onUpdateProviderSettingsDefaults: (value: ProviderSettingsDefaults) => Promise<void>;
   onUpdateTaskTypeProviderOverrides: (value: TaskTypeProviderOverrides) => Promise<void>;
+  // Provider routing (mode + categories + per-task override allow-lists)
+  providerSelectionMode: 'balanced' | 'preferred' | 'exclusive';
+  onUpdateProviderSelectionMode: (mode: 'balanced' | 'preferred' | 'exclusive') => Promise<void>;
+  taskTypeCategories: Record<string, string[]>;
+  onUpdateTaskTypeCategories: (value: Record<string, string[]>) => Promise<void>;
+  providerPreferenceByCategory: Record<string, ProviderName[]>;
+  onUpdateProviderPreferenceByCategory: (value: Record<string, ProviderName[]>) => Promise<void>;
+  taskTypeProviderPreference: Record<string, ProviderName[]>;
+  onUpdateTaskTypeProviderPreferences: (value: Record<string, ProviderName[]>) => Promise<void>;
   refreshInterval: number;
   onUpdateRefreshInterval: (value: number) => void;
   pageSize: number;
@@ -213,10 +223,11 @@ const CREDENTIAL_GUIDES: Record<string, CredentialGuide> = {
   },
 };
 
-type SectionId = 'general' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation';
+type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation';
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
+  { id: 'provider-routing', label: 'Provider Routing', icon: GitBranch, adminOnly: true },
   { id: 'provider-settings', label: 'Provider Settings', icon: ListChecks, adminOnly: true },
   { id: 'orchestrator', label: 'Orchestrator', icon: Server, adminOnly: true },
   { id: 'deploy', label: 'Deploy & Health', icon: Shield, adminOnly: true },
@@ -312,6 +323,14 @@ export function SettingsDropdown({
   taskTypeProviderOverrides,
   onUpdateProviderSettingsDefaults,
   onUpdateTaskTypeProviderOverrides,
+  providerSelectionMode,
+  onUpdateProviderSelectionMode,
+  taskTypeCategories,
+  onUpdateTaskTypeCategories,
+  providerPreferenceByCategory,
+  onUpdateProviderPreferenceByCategory,
+  taskTypeProviderPreference,
+  onUpdateTaskTypeProviderPreferences,
   refreshInterval,
   onUpdateRefreshInterval,
   pageSize,
@@ -1383,9 +1402,26 @@ export function SettingsDropdown({
     );
   }
 
+  function renderProviderRouting() {
+    return (
+      <ProviderCategoriesPanel
+        providers={providers}
+        selectionMode={providerSelectionMode}
+        onUpdateSelectionMode={onUpdateProviderSelectionMode}
+        taskTypeCategories={taskTypeCategories}
+        onUpdateTaskTypeCategories={onUpdateTaskTypeCategories}
+        providerPreferenceByCategory={providerPreferenceByCategory}
+        onUpdateProviderPreferenceByCategory={onUpdateProviderPreferenceByCategory}
+        taskTypeProviderPreference={taskTypeProviderPreference}
+        onUpdateTaskTypeProviderPreferences={onUpdateTaskTypeProviderPreferences}
+      />
+    );
+  }
+
   function renderActiveSection() {
     switch (activeSection) {
       case 'general': return renderGeneral();
+      case 'provider-routing': return renderProviderRouting();
       case 'provider-settings': return renderProviderSettings();
       case 'orchestrator': return renderOrchestrator();
       case 'deploy': return renderDeploy();

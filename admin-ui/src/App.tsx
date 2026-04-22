@@ -392,6 +392,14 @@ export default function App() {
         taskTypeProviderOverrides={s.taskTypeProviderOverrides}
         onUpdateProviderSettingsDefaults={s.updateProviderSettingsDefaults}
         onUpdateTaskTypeProviderOverrides={s.updateTaskTypeProviderOverrides}
+        providerSelectionMode={s.providerSelectionMode}
+        onUpdateProviderSelectionMode={s.updateProviderSelectionMode}
+        taskTypeCategories={s.taskTypeCategories}
+        onUpdateTaskTypeCategories={s.updateTaskTypeCategories}
+        providerPreferenceByCategory={s.providerPreferenceByCategory}
+        onUpdateProviderPreferenceByCategory={s.updateProviderPreferenceByCategory}
+        taskTypeProviderPreference={s.taskTypeProviderPreference}
+        onUpdateTaskTypeProviderPreferences={s.updateTaskTypeProviderPreferences}
         showMetrics={s.showMetrics}
         onToggleMetrics={() => s.setShowMetrics(prev => !prev)}
         metricsHistory={s.metricsHistory}
