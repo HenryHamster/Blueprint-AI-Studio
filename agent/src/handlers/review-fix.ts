@@ -254,6 +254,47 @@ export function buildMigrationConflictGuidance(c: MigrationConflict): string {
   );
 }
 
+// ── PR-body metadata footer ───────────────────────────────────────────────────
+// Builds a compact badge-style footer appended/updated in the GitHub PR body
+// after each review-fix iteration. Exported for testing; callers should treat
+// patchPrBodyMeta as best-effort and swallow its errors.
+export function buildBlueprintPrFooter(opts: {
+  iterations?: number;
+  directionId?: string;
+  directionTitle?: string;
+}): string {
+  const parts: string[] = [];
+  if (opts.iterations && opts.iterations > 1) parts.push(`${opts.iterations} iterations`);
+  if (opts.directionId) {
+    const title = opts.directionTitle
+      ? `${opts.directionTitle.slice(0, 60)} (${opts.directionId})`
+      : opts.directionId;
+    parts.push(`direction: ${title}`);
+  }
+  if (parts.length === 0) return '';
+  return `<!-- blueprint:meta -->\n*${parts.join(' · ')}*`;
+}
+
+async function patchPrBodyMeta(
+  ghToken: string, owner: string, repo: string, prNumber: number, footer: string,
+): Promise<void> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
+    headers: { Authorization: `token ${ghToken}`, Accept: 'application/vnd.github+json' },
+  });
+  if (!res.ok) return;
+  const { body } = await res.json() as { body?: string };
+  const current = body || '';
+  const marker = '<!-- blueprint:meta -->';
+  const updated = current.includes(marker)
+    ? current.slice(0, current.indexOf(marker)) + footer
+    : `${current}\n\n${footer}`;
+  await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
+    method: 'PATCH',
+    headers: { Authorization: `token ${ghToken}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body: updated }),
+  });
+}
+
 // Medium-scope priority hint based on which subsystem the PR touches. The
 // reviewer otherwise weights every checklist section equally, accumulating
 // off-target findings (e.g. SQL injection notes on agent-only TypeScript
@@ -1132,6 +1173,16 @@ export async function handleFix(
       execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
       await pushForceWithLeaseRetrying(branch, ws);
       sendLog(ws, `Pushed fixes to ${branch}\n`);
+
+      // Best-effort: annotate the PR body with iteration/direction context so
+      // reviewers on GitHub see strategic metadata without leaving the PR page.
+      const fixCtxForMeta = (task.context as Record<string, unknown> | undefined) || {};
+      const prFooter = buildBlueprintPrFooter({
+        iterations: iteration,
+        directionId: fixCtxForMeta.direction_id as string | undefined,
+        directionTitle: fixCtxForMeta.direction_title as string | undefined,
+      });
+      if (prFooter) patchPrBodyMeta(ghToken, owner, repo, prNumber, prFooter).catch(() => { /* best-effort */ });
 
       await persistAndPostStatus(taskId, {
         task_id: taskId, status: 'COMPLETED', artifact_type: 'GIT_COMMIT',

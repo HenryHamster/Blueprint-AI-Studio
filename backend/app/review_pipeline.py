@@ -1126,6 +1126,12 @@ async def _spawn_pipeline_task(
         if not k.startswith('_') and k != 'review_loop'
     }
     propagated_ctx['scope'] = propagated_scope
+    # Propagate direction title (text snippet) so agent PR-body footers can
+    # show a human-readable label alongside the direction ID.
+    if direction_data and not propagated_ctx.get('direction_title'):
+        _dir_text = (direction_data.get("text") or "").strip()
+        if _dir_text:
+            propagated_ctx['direction_title'] = _dir_text[:80]
     # Carry forward the create task's self-review outcome so the review agent
     # can see which files were verified (truncated_files_read) and whether the
     # self-review was marked incomplete, and focus attention on blind spots

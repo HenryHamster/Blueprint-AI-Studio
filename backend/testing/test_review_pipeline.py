@@ -3959,3 +3959,78 @@ async def test_mid_budget_injects_narrow_focus_without_cap_reduction(db_session,
     assert ctx_cap == baseline, (
         f"Mid-budget directive must not reduce cap: baseline={baseline}, got={ctx_cap}"
     )
+
+
+# ── direction_title propagation ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_direction_title_propagated_to_spawned_task(db_session, mocker):
+    """When the source task's direction has text, _spawn_pipeline_task must inject
+    direction_title (truncated to 80 chars) into the spawned task's context so
+    that agent PR-body footers can display a human-readable direction label."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    direction_id = "dir-title-test"
+    direction_text = "Reduce average review iteration count per merged PR per direction"
+
+    project = await _make_db_project(db_session)
+    project.directions = [{"id": direction_id, "text": direction_text, "status": "active"}]
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 555, "branch": "feat/t", "base_branch": "main"}],
+        context={"scope": "small", "direction_id": direction_id},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, spawned = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=555, branch="feat/t", base_branch="main",
+    )
+
+    assert spawned is True and result is not None
+    assert (result.context or {}).get("direction_title") == direction_text[:80], (
+        f"direction_title must be propagated from direction.text[:80]; "
+        f"got {(result.context or {}).get('direction_title')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direction_title_not_set_when_no_direction_text(db_session, mocker):
+    """When the direction entry has no text, direction_title must not be injected
+    into the spawned task context (omit rather than show empty string)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    direction_id = "dir-no-text"
+    project = await _make_db_project(db_session)
+    project.directions = [{"id": direction_id, "status": "active"}]
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 556, "branch": "feat/u", "base_branch": "main"}],
+        context={"scope": "small", "direction_id": direction_id},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, spawned = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=556, branch="feat/u", base_branch="main",
+    )
+
+    assert spawned is True and result is not None
+    assert "direction_title" not in (result.context or {}), (
+        "direction_title must not be set when direction has no text"
+    )

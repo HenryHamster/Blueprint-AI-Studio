@@ -55,6 +55,82 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
+# VM cost rates ($/sec) — mirror admin.py to avoid cross-module import
+_SPOT_RATE_PER_SEC = 0.020 / 3600
+_ON_DEMAND_RATE_PER_SEC = 0.067 / 3600
+
+# Shared marker used by both the TypeScript agent handler (review-fix.ts
+# buildBlueprintPrFooter) and this Python helper so either side can update
+# the same block without leaving duplicates.
+BLUEPRINT_PR_META_MARKER = "<!-- blueprint:meta -->"
+
+
+def _estimated_task_cost_usd(task: Task) -> Optional[float]:
+    """Return the VM cost for a task, or None when timing data is incomplete."""
+    if not task.vm_provisioned_at or not task.vm_stopped_at:
+        return None
+    rate = _SPOT_RATE_PER_SEC if task.vm_spot else _ON_DEMAND_RATE_PER_SEC
+    return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
+
+
+def build_blueprint_pr_footer(
+    task: Task,
+    *,
+    iteration_count: Optional[int] = None,
+    direction_title: Optional[str] = None,
+) -> str:
+    """Build a badge-style footer string for a Blueprint PR body.
+
+    Omits any field whose data is absent so callers need not pre-filter.
+    Uses BLUEPRINT_PR_META_MARKER so the block can be replaced idempotently.
+    """
+    ctx = task.context or {}
+    parts: list[str] = []
+
+    cost = _estimated_task_cost_usd(task)
+    if cost is not None:
+        parts.append(f"${cost:.2f}")
+
+    if iteration_count and iteration_count > 1:
+        parts.append(f"{iteration_count} iterations")
+
+    direction_id = ctx.get("direction_id")
+    if direction_id:
+        label = (
+            f"{direction_title[:60]} ({direction_id})"
+            if direction_title
+            else str(direction_id)
+        )
+        parts.append(f"direction: {label}")
+
+    if not parts:
+        return ""
+    return f"{BLUEPRINT_PR_META_MARKER}\n*{' · '.join(parts)}*"
+
+
+async def patch_pr_body_with_blueprint_meta(
+    gh_token: str, owner: str, repo: str, pr_number: int, footer: str,
+) -> None:
+    """Best-effort: append or replace the blueprint:meta footer in a GitHub PR body."""
+    import httpx  # noqa: PLC0415
+    headers = {"Authorization": f"Bearer {gh_token}", "Accept": "application/vnd.github+json"}
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+            headers=headers,
+        )
+        if not resp.is_success:
+            return
+        current = resp.json().get("body") or ""
+        idx = current.find(BLUEPRINT_PR_META_MARKER)
+        updated = (current[:idx] + footer) if idx >= 0 else f"{current}\n\n{footer}"
+        await client.patch(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"body": updated},
+        )
+
+
 def _compute_first_attempt_succeeded(attempt_count: int, status: "TaskStatus") -> bool:
     """Return True if the task completed successfully on its first attempt (attempt_count <= 1)."""
     return attempt_count <= 1 and status == TaskStatus.COMPLETED

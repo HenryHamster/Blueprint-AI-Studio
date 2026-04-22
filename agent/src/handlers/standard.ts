@@ -1440,7 +1440,18 @@ Return nothing — just write the files.`;
     if (issueReference) {
       prBody += `${issueReference}\n\n`;
     }
-    prBody += `---\n*Automated by Blueprint Agent*`;
+    const bpDirCtx = task.direction_context as Record<string, unknown> | undefined;
+    const bpDirTitle = strVal(bpDirCtx?.title).slice(0, 80);
+    const bpDirId = strVal(ctx.direction_id);
+    const bpBadgeParts: string[] = [];
+    if (bpDirTitle || bpDirId) {
+      const dirLabel = bpDirTitle && bpDirId
+        ? `${bpDirTitle} (\`${bpDirId}\`)`
+        : bpDirTitle || `\`${bpDirId}\``;
+      bpBadgeParts.push(`direction: ${dirLabel}`);
+    }
+    const bpBadge = bpBadgeParts.length > 0 ? `\n\n${bpBadgeParts.join(' · ')}` : '';
+    prBody += `---\n*Automated by Blueprint Agent*${bpBadge}`;
 
     const prUrl = await pushAndCreatePR(owner, repo, taskId, workBranch, baseBranch, `${prTitlePrefix} ${taskTitle}`, prBody, ws, statusRef);
     const commitHash = git(['rev-parse', 'HEAD']);

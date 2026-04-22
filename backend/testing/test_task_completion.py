@@ -10,8 +10,11 @@ Covers:
 - _ensure_branch: retry/backoff, token refresh, exists-verification, terminal failure
 """
 import json
+import uuid
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import AsyncMock
 
 from fastapi import HTTPException
 
@@ -37,6 +40,9 @@ from app.task_completion import (
     _calculate_remediation_scope,
     _record_regression_signal_if_matching,
     _maybe_escalate_exhausted_followups,
+    build_blueprint_pr_footer,
+    patch_pr_body_with_blueprint_meta,
+    BLUEPRINT_PR_META_MARKER,
 )
 from app.strategic_constants import STRATEGIC_RATIONALE_MAX
 from app.models import Alert, AlertSeverity, TaskStatus
@@ -4388,4 +4394,188 @@ class TestEscalateExhaustedFollowupsAlert:
             _sa_select(Alert).where(Alert.project_id == project.id)
         )).scalars().all()
         assert not any("Follow-up escalation" in a.title for a in alerts)
+
+
+# ── build_blueprint_pr_footer ────────────────────────────────────────────────
+
+class TestBuildBlueprintPrFooter:
+    """Pure-function tests for the PR-body metadata footer builder."""
+
+    def _task_with_timing(self, seconds: float = 3600.0, spot: bool = False):
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        return make_task(
+            vm_provisioned_at=now - timedelta(seconds=seconds),
+            vm_stopped_at=now,
+            vm_spot=spot,
+            context={},
+        )
+
+    def test_cost_included_when_timing_present(self):
+        task = self._task_with_timing(3600.0, spot=False)
+        footer = build_blueprint_pr_footer(task)
+        assert "$" in footer
+
+    def test_cost_on_demand_rate(self):
+        task = self._task_with_timing(3600.0, spot=False)
+        footer = build_blueprint_pr_footer(task)
+        # 3600s * (0.067/3600) = $0.067
+        assert "$0.07" in footer
+
+    def test_cost_spot_rate(self):
+        task = self._task_with_timing(3600.0, spot=True)
+        footer = build_blueprint_pr_footer(task)
+        # 3600s * (0.020/3600) = $0.020
+        assert "$0.02" in footer
+
+    def test_cost_omitted_when_no_start_time(self):
+        task = make_task(vm_provisioned_at=None, vm_stopped_at=None, context={})
+        footer = build_blueprint_pr_footer(task, iteration_count=3)
+        assert "$" not in footer
+        assert "3 iterations" in footer
+
+    def test_iterations_gt_one_included(self):
+        task = make_task(context={})
+        footer = build_blueprint_pr_footer(task, iteration_count=3)
+        assert "3 iterations" in footer
+
+    def test_iterations_one_omitted(self):
+        task = make_task(context={})
+        footer = build_blueprint_pr_footer(task, iteration_count=1)
+        assert "iteration" not in footer
+
+    def test_iterations_zero_omitted(self):
+        task = make_task(context={})
+        footer = build_blueprint_pr_footer(task, iteration_count=0)
+        assert "iteration" not in footer
+
+    def test_direction_id_included(self):
+        task = make_task(context={"direction_id": "d-abc123"})
+        footer = build_blueprint_pr_footer(task)
+        assert "d-abc123" in footer
+        assert "direction:" in footer
+
+    def test_direction_title_and_id_both_shown(self):
+        task = make_task(context={"direction_id": "d-abc123"})
+        footer = build_blueprint_pr_footer(task, direction_title="PR clarity metric")
+        assert "PR clarity metric" in footer
+        assert "d-abc123" in footer
+
+    def test_long_direction_title_truncated(self):
+        task = make_task(context={"direction_id": "d-xyz"})
+        long_title = "A" * 80
+        footer = build_blueprint_pr_footer(task, direction_title=long_title)
+        assert "A" * 60 in footer
+        assert "A" * 61 not in footer
+
+    def test_no_direction_omits_direction_field(self):
+        task = make_task(context={})
+        footer = build_blueprint_pr_footer(task, iteration_count=2)
+        assert "direction:" not in footer
+
+    def test_returns_empty_when_no_data(self):
+        task = make_task(context={})
+        assert build_blueprint_pr_footer(task) == ""
+
+    def test_uses_blueprint_meta_marker(self):
+        task = make_task(context={"direction_id": "d-abc"})
+        footer = build_blueprint_pr_footer(task)
+        assert footer.startswith(BLUEPRINT_PR_META_MARKER)
+
+    def test_all_fields_combined(self):
+        task = self._task_with_timing(1800.0, spot=False)
+        task.context = {"direction_id": "d-xyz"}
+        footer = build_blueprint_pr_footer(task, iteration_count=2, direction_title="My Direction")
+        assert "$" in footer
+        assert "2 iterations" in footer
+        assert "My Direction" in footer
+        assert "d-xyz" in footer
+        assert BLUEPRINT_PR_META_MARKER in footer
+
+
+# ── patch_pr_body_with_blueprint_meta ────────────────────────────────────────
+
+class TestPatchPrBodyWithBlueprintMeta:
+    """Tests for the async GitHub PR body patcher."""
+
+    @pytest.mark.asyncio
+    async def test_appends_footer_when_no_existing_marker(self):
+        mock_response = MagicMock()
+        mock_response.is_success = True
+        mock_response.json.return_value = {"body": "Existing PR body."}
+        patched_body = None
+
+        async def mock_get(*args, **kwargs):
+            return mock_response
+
+        async def mock_patch(*args, **kwargs):
+            nonlocal patched_body
+            patched_body = kwargs.get("json", {}).get("body")
+            return MagicMock(is_success=True)
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = mock_get
+            mock_client.patch = mock_patch
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+            await patch_pr_body_with_blueprint_meta("tok", "owner", "repo", 1, "<!-- blueprint:meta -->\n*$0.05*")
+
+        assert patched_body is not None
+        assert "<!-- blueprint:meta -->" in patched_body
+        assert "Existing PR body." in patched_body
+
+    @pytest.mark.asyncio
+    async def test_replaces_existing_marker_block(self):
+        old_body = "PR summary.\n\n<!-- blueprint:meta -->\n*old content*"
+        mock_response = MagicMock()
+        mock_response.is_success = True
+        mock_response.json.return_value = {"body": old_body}
+        patched_body = None
+
+        async def mock_get(*args, **kwargs):
+            return mock_response
+
+        async def mock_patch(*args, **kwargs):
+            nonlocal patched_body
+            patched_body = kwargs.get("json", {}).get("body")
+            return MagicMock(is_success=True)
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = mock_get
+            mock_client.patch = mock_patch
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+            await patch_pr_body_with_blueprint_meta("tok", "owner", "repo", 1, "<!-- blueprint:meta -->\n*new content*")
+
+        assert patched_body is not None
+        assert "new content" in patched_body
+        assert "old content" not in patched_body
+
+    @pytest.mark.asyncio
+    async def test_returns_early_on_get_failure(self):
+        mock_response = MagicMock()
+        mock_response.is_success = False
+        patch_called = False
+
+        async def mock_get(*args, **kwargs):
+            return mock_response
+
+        async def mock_patch(*args, **kwargs):
+            nonlocal patch_called
+            patch_called = True
+            return MagicMock()
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = mock_get
+            mock_client.patch = mock_patch
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+            await patch_pr_body_with_blueprint_meta("tok", "owner", "repo", 1, "<!-- blueprint:meta -->\n*x*")
+
+        assert not patch_called
 

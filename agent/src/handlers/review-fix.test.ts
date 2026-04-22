@@ -62,7 +62,7 @@ vi.mock('child_process', () => ({
 import fs from 'fs';
 import { execFileSync } from 'child_process';
 import * as indexMod from '../index.js';
-import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS, annotateResolvedIssues, detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying, detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix.js';
+import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS, annotateResolvedIssues, detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying, detectMigrationConflict, buildMigrationConflictGuidance, buildBlueprintPrFooter } from './review-fix.js';
 
 const statusRef = () => ({ value: '' });
 
@@ -1074,6 +1074,106 @@ describe('detectMigrationConflict', () => {
     );
     expect(result.detected).toBe(true);
     expect(result.prMigrations).toEqual(['backend/alembic/versions/0050_add_foo.py']);
+  });
+});
+
+describe('buildBlueprintPrFooter', () => {
+  it('returns empty string when no meaningful data', () => {
+    expect(buildBlueprintPrFooter({})).toBe('');
+  });
+
+  it('returns empty string for iterations=1 (single pass is not noteworthy)', () => {
+    expect(buildBlueprintPrFooter({ iterations: 1 })).toBe('');
+  });
+
+  it('includes iteration count when > 1', () => {
+    const result = buildBlueprintPrFooter({ iterations: 3 });
+    expect(result).toContain('3 iterations');
+    expect(result).toContain('<!-- blueprint:meta -->');
+  });
+
+  it('includes direction ID alone when no title provided', () => {
+    const result = buildBlueprintPrFooter({ directionId: 'd-abc123' });
+    expect(result).toContain('direction: d-abc123');
+    expect(result).not.toContain('undefined');
+  });
+
+  it('includes direction title with ID when both present', () => {
+    const result = buildBlueprintPrFooter({ directionId: 'd-abc', directionTitle: 'PR clarity' });
+    expect(result).toContain('PR clarity (d-abc)');
+  });
+
+  it('truncates long direction titles to 60 characters', () => {
+    const longTitle = 'x'.repeat(80);
+    const result = buildBlueprintPrFooter({ directionId: 'd-x', directionTitle: longTitle });
+    expect(result).toContain('x'.repeat(60));
+    expect(result).not.toContain('x'.repeat(61));
+  });
+
+  it('combines iterations and direction in a single footer line', () => {
+    const result = buildBlueprintPrFooter({ iterations: 2, directionId: 'd-abc', directionTitle: 'PR clarity' });
+    expect(result).toMatch(/2 iterations · direction: PR clarity \(d-abc\)/);
+    expect(result).toContain('<!-- blueprint:meta -->');
+  });
+});
+
+describe('handleFix — PR body annotation after push', () => {
+  it('calls GitHub PATCH to annotate PR body when push succeeds and direction_id is set', async () => {
+    // Make git rev-parse return different local/remote heads so push path runs.
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'rev-parse' && args[1] === 'HEAD') return 'abc';
+      if (args && args[0] === 'rev-parse') return 'def'; // remote head differs
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    const fetchCalls: string[] = [];
+    global.fetch = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
+      fetchCalls.push(`${opts?.method ?? 'GET'} ${url}`);
+      if ((opts?.method ?? 'GET') === 'GET' || opts?.method === undefined) {
+        return Promise.resolve({ ok: true, json: async () => ({ body: 'existing body' }) });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    }) as unknown as typeof fetch;
+
+    await handleFix(
+      'task-meta-patch',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 42, prompt: 'fix the issue' },
+      { context: { scope: 'small', direction_id: 'd-test', review_loop: { iteration: 2 } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    // Give the fire-and-forget promise a tick to run.
+    await new Promise(r => setTimeout(r, 0));
+
+    const patchCall = fetchCalls.find(c => c.startsWith('PATCH'));
+    expect(patchCall).toBeTruthy();
+    expect(patchCall).toContain('/pulls/42');
+  });
+
+  it('skips PR body annotation when footer would be empty (no direction, iterations=1)', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'rev-parse' && args[1] === 'HEAD') return 'abc';
+      if (args && args[0] === 'rev-parse') return 'def';
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    const fetchCalls: string[] = [];
+    global.fetch = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
+      fetchCalls.push(`${opts?.method ?? 'GET'} ${url}`);
+      return Promise.resolve({ ok: true, json: async () => ({ title: 'PR title', body: 'body' }) });
+    }) as unknown as typeof fetch;
+
+    await handleFix(
+      'task-meta-skip',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 43, prompt: 'fix it' },
+      { context: { scope: 'small', review_loop: { iteration: 1 } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    await new Promise(r => setTimeout(r, 0));
+
+    const patchCall = fetchCalls.find(c => c.startsWith('PATCH') && c.includes('/pulls/43'));
+    expect(patchCall).toBeUndefined();
   });
 });
 

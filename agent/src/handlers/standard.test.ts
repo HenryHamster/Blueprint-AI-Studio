@@ -279,6 +279,46 @@ describe('handleCreate configuration', () => {
     const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
     expect(prBodyArg).not.toContain('Closes');
   });
+
+  it('includes direction title and id in PR footer when both are set', async () => {
+    const { git } = await import('../index.js');
+    vi.mocked(git).mockReturnValueOnce('M src/foo.ts');
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' });
+    const task = { title: 'My Task', description: '', direction_context: { title: 'PR clarity' }, context: { direction_id: 'd-abc12345' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).toContain('direction: PR clarity (`d-abc12345`)');
+  });
+
+  it('includes direction id alone in PR footer when title is absent', async () => {
+    const { git } = await import('../index.js');
+    vi.mocked(git).mockReturnValueOnce('M src/foo.ts');
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' });
+    const task = { title: 'My Task', description: '', context: { direction_id: 'd-abc12345' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).toContain('direction:');
+    expect(prBodyArg).toContain('d-abc12345');
+  });
+
+  it('omits direction from PR footer when no direction context is set', async () => {
+    const { git } = await import('../index.js');
+    vi.mocked(git).mockReturnValueOnce('M src/foo.ts');
+    const validJson = '{"verdict":"PASS","checks_performed":[],"issues_found":0}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' });
+    const task = { title: 'My Task', description: '' };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).not.toContain('direction:');
+  });
 });
 
 describe('handleRefactor configuration', () => {
