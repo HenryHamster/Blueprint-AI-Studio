@@ -940,6 +940,12 @@ async def orchestrator_worker():
                         })
                     except Exception:
                         logger.exception("[ORCHESTRATOR] Failed to broadcast health_gate_throttle")
+                    # Sleep before retrying so we don't tight-loop the gate check
+                    # at ~50 cycles/sec, which spams logs and trips the cycle-hung
+                    # monitor (no cycle ever "completes" because we keep continuing).
+                    # ORCHESTRATOR_THROTTLE_SECONDS matches the failure-rate gate
+                    # at line 877 — both back off the same way.
+                    await asyncio.sleep(ORCHESTRATOR_THROTTLE_SECONDS)
                     continue
 
                 # Reconcile Max Plan active_tasks counters from DB each cycle.
@@ -1647,11 +1653,13 @@ async def orchestrator_worker():
                     runtime_model = task_model
                     runtime_execution_mode = None
                     runtime_provider_metadata = None
+                    runtime_provider_settings: dict | None = None
                     if runtime_selection:
                         runtime_provider = runtime_selection.provider
                         runtime_auth_mode = runtime_selection.auth_mode
                         runtime_model = runtime_selection.model or runtime_model
                         runtime_execution_mode = runtime_selection.execution_mode
+                        runtime_provider_settings = runtime_selection.settings
                     account = runtime_selection.account if runtime_selection else None
                     if account:
                         account_id = account["id"]
@@ -1887,7 +1895,8 @@ async def orchestrator_worker():
                                                     llm_auth_mode: str | None,
                                                     llm_model: str | None,
                                                     llm_execution_mode: str | None,
-                                                    llm_provider_metadata: dict | None):
+                                                    llm_provider_metadata: dict | None,
+                                                    llm_provider_settings: dict | None):
                         success = False
                         try:
                             t_type = (payloads[0] or {}).get("type", "") if payloads else ""
@@ -1910,6 +1919,7 @@ async def orchestrator_worker():
                                     vm_id, t_id, secret_value, config_json, t_type,
                                     provider=llm_provider, auth_mode=llm_auth_mode, model=llm_model,
                                     execution_mode=llm_execution_mode, provider_metadata=llm_provider_metadata,
+                                    provider_settings=llm_provider_settings,
                                 ),
                             )
 
@@ -1918,7 +1928,8 @@ async def orchestrator_worker():
                                                                task_type=t_type, secret_version_name=secret_version_name,
                                                                provider=llm_provider, auth_mode=llm_auth_mode,
                                                                model=llm_model, execution_mode=llm_execution_mode,
-                                                               provider_metadata=llm_provider_metadata)
+                                                               provider_metadata=llm_provider_metadata,
+                                                               provider_settings=llm_provider_settings)
                             if success:
                                 # Verify the task still wants this VM — stale recovery may have
                                 # requeued the task with a new vm_id while we were provisioning.
@@ -2094,6 +2105,7 @@ async def orchestrator_worker():
                         task.payloads, runtime_secret, claude_config_json, account_id,
                         runtime_provider, runtime_auth_mode, runtime_model,
                         runtime_execution_mode, runtime_provider_metadata,
+                        runtime_provider_settings,
                     ))
                     _provision_coroutines[str(task.id)] = provision_coro
                     provision_coro.add_done_callback(lambda _, tid=str(task.id): _provision_coroutines.pop(tid, None))
