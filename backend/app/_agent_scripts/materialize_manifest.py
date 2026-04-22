@@ -88,7 +88,21 @@ def main(argv: list[str]) -> int:
         uid, gid = _lookup_uid_gid("agent")
         for item in files:
             path = pathlib.Path(item["path"])
+            # Parent dirs created by mkdir here are owned by root (this
+            # script runs as root in the VM startup). If the CLI later
+            # runs as `agent` and writes siblings into the same dir —
+            # e.g. gemini CLI drops ~/.gemini/projects.json next to our
+            # ~/.gemini/settings.json — it hits EACCES on the root-owned
+            # 0755 dir. Chown every directory we create so the CLI owns
+            # its config dir.
+            missing_parents: list[pathlib.Path] = []
+            ancestor = path.parent
+            while not ancestor.exists():
+                missing_parents.append(ancestor)
+                ancestor = ancestor.parent
             path.parent.mkdir(parents=True, exist_ok=True)
+            for created in missing_parents:
+                os.chown(created, uid, gid)
             path.write_text(item.get("content", "") or "", encoding="utf-8")
             os.chmod(path, int(item.get("mode", "0600"), 8))
             os.chown(path, uid, gid)

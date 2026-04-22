@@ -132,6 +132,87 @@ class TestFileMaterialization:
         assert materialize_manifest.main(["m", str(manifest), str(env_out)]) == 0
         assert target.read_text(encoding="utf-8") == ""
 
+    def test_created_parent_dirs_are_chowned_to_agent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Regression: the Gemini CLI writes projects.json into the same
+        ~/.gemini/ dir where we pre-place settings.json. Our mkdir runs
+        as root, so without an explicit chown the CLI (running as agent)
+        gets EACCES trying to create siblings.
+        """
+        chowned: list[tuple[str, int, int]] = []
+        real_chown = os.chown
+
+        def _recording_chown(path, uid, gid):
+            chowned.append((str(path), uid, gid))
+            real_chown(path, uid, gid)
+
+        monkeypatch.setattr(os, "chown", _recording_chown)
+        monkeypatch.setattr(
+            materialize_manifest,
+            "_lookup_uid_gid",
+            lambda _user: (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0),
+        )
+
+        # Two levels of missing parents — simulates /home/agent/.gemini/sub/x
+        nested = tmp_path / "home_agent" / ".gemini" / "settings.json"
+        manifest = _write_manifest(
+            tmp_path,
+            env={},
+            files=[{"path": str(nested), "content": "{}", "mode": "0600"}],
+        )
+        env_out = tmp_path / "agent.env"
+        assert materialize_manifest.main(["m", str(manifest), str(env_out)]) == 0
+
+        chowned_paths = {entry[0] for entry in chowned}
+        assert str(nested.parent) in chowned_paths, (
+            f"parent dir {nested.parent} should have been chowned; "
+            f"got {sorted(chowned_paths)}"
+        )
+        assert str(nested.parent.parent) in chowned_paths, (
+            "grandparent dir should also have been chowned when we created it"
+        )
+        assert str(nested) in chowned_paths
+
+    def test_existing_parent_dirs_are_not_chowned(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Dirs that already exist shouldn't be touched — don't stomp
+        on the real /home/agent/ ownership, for instance.
+        """
+        chowned: list[tuple[str, int, int]] = []
+        real_chown = os.chown
+
+        def _recording_chown(path, uid, gid):
+            chowned.append((str(path), uid, gid))
+            real_chown(path, uid, gid)
+
+        monkeypatch.setattr(os, "chown", _recording_chown)
+        monkeypatch.setattr(
+            materialize_manifest,
+            "_lookup_uid_gid",
+            lambda _user: (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0),
+        )
+
+        # Parent already exists — simulates /home/agent/.claude.json
+        # where /home/agent/ is owned by the agent user already.
+        existing_parent = tmp_path / "existing"
+        existing_parent.mkdir()
+        target = existing_parent / "file.json"
+        manifest = _write_manifest(
+            tmp_path,
+            env={},
+            files=[{"path": str(target), "content": "{}", "mode": "0600"}],
+        )
+        env_out = tmp_path / "agent.env"
+        assert materialize_manifest.main(["m", str(manifest), str(env_out)]) == 0
+
+        chowned_paths = {entry[0] for entry in chowned}
+        assert str(existing_parent) not in chowned_paths, (
+            "existing parent should not be re-chowned"
+        )
+        assert str(target) in chowned_paths
+
 
 class TestNssBypass:
     def test_lookup_reads_passwd_not_pwd_module(
