@@ -6780,3 +6780,153 @@ async def test_direction_score_prefers_higher_acceptance_rate(db_session, mocker
         )
     finally:
         _runtime_config["max_parallel_research_per_project"] = old_val
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _spawn_residual_fingerprint_remediation
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture()
+def _clear_residual_state():
+    """Clear residual fingerprint store and cooldown dict between tests."""
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _residual_remediation_cooldowns
+    _residual_store.clear()
+    _residual_remediation_cooldowns.clear()
+    yield
+    _residual_store.clear()
+    _residual_remediation_cooldowns.clear()
+
+
+@pytest.mark.asyncio
+async def test_residual_fingerprint_remediation_spawns_task(db_session, _clear_residual_state):
+    """Top residual fingerprint spawns a create task with auto_remediation context."""
+    import time
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+
+    project = Project(
+        name="Residual Remediation Spawn",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-remfp001")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fp = "fp_test_error_abc123"
+    sample_msg = "TypeError: cannot read property 'x' of undefined"
+    task_id_str = str(uuid.uuid4())
+    _residual_store[fp] = {
+        "count": 5,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "sample_message": sample_msg,
+        "task_ids": [task_id_str],
+    }
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 1
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    create_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "create"]
+    assert len(create_tasks) == 1
+    t = create_tasks[0]
+    assert t.context["auto_remediation"] is True
+    assert sample_msg in t.first_payload["prompt"]
+    assert t.context["spawned_by"] == "residual_fingerprint_remediation"
+    assert t.context["error_fingerprint"] == fp
+
+
+@pytest.mark.asyncio
+async def test_residual_fingerprint_remediation_cooldown_blocks_respawn(db_session, _clear_residual_state):
+    """Active cooldown prevents re-spawning for the same fingerprint."""
+    import time
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation, _residual_remediation_cooldowns
+
+    project = Project(
+        name="Residual Cooldown Block",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-remcool01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fp = "fp_cooldown_test_xyz"
+    _residual_store[fp] = {
+        "count": 3,
+        "first_seen": time.time() - 7200,
+        "last_seen": time.time(),
+        "sample_message": "some error",
+        "task_ids": [],
+    }
+    # Seed cooldown as if spawned just now
+    _residual_remediation_cooldowns[f"{project.id}:{fp}"] = time.time()
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 0
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    assert len(result.scalars().all()) == 0
+
+
+@pytest.mark.asyncio
+async def test_residual_fingerprint_remediation_cooldown_expired_allows_respawn(db_session, _clear_residual_state):
+    """Expired cooldown (>24 h ago) allows a new remediation task to be spawned."""
+    import time
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation, _residual_remediation_cooldowns
+
+    project = Project(
+        name="Residual Cooldown Expired",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-remexp001")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fp = "fp_expired_cooldown_xyz"
+    _residual_store[fp] = {
+        "count": 4,
+        "first_seen": time.time() - 90000,
+        "last_seen": time.time(),
+        "sample_message": "expired error pattern",
+        "task_ids": [],
+    }
+    # Seed expired cooldown (25 hours ago, past the 24 h default window)
+    _residual_remediation_cooldowns[f"{project.id}:{fp}"] = time.time() - 90000
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 1
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    create_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "create"]
+    assert len(create_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_residual_fingerprint_remediation_skipped_when_no_fingerprints(db_session, _clear_residual_state):
+    """Empty residual store → no task spawned."""
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+
+    project = Project(
+        name="Residual Empty Store",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-rempty001")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 0
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    assert len(result.scalars().all()) == 0

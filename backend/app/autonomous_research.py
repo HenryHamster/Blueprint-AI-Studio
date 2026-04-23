@@ -10,6 +10,7 @@ This module handles all aspects of autonomous research task spawning:
 import asyncio
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -34,6 +35,10 @@ logger = logging.getLogger(__name__)
 # Per-project lock to prevent concurrent _spawn_research_task calls
 # (post-merge hook and idle check can race on the same project)
 _spawn_locks: dict[str, asyncio.Lock] = {}
+
+# Cooldown tracking for residual-fingerprint remediation spawns.
+# Key: "{project_id}:{fingerprint}", value: epoch float of last spawn time.
+_residual_remediation_cooldowns: dict[str, float] = {}
 
 
 def _get_spawn_lock(project_id: str) -> asyncio.Lock:
@@ -1448,6 +1453,83 @@ async def _spawn_review_convergence_investigation(
     return True
 
 
+async def _spawn_residual_fingerprint_remediation(project: Project, session: AsyncSession) -> int:
+    """Spawn a create-type remediation task for the top uncooled residual CODE_ERROR fingerprint.
+
+    Scans get_top_residual_fingerprints() and spawns at most one create task per
+    call — the highest-count fingerprint whose per-project cooldown has expired.
+    The cooldown (default 24 h, configurable via residual_remediation_cooldown_hours)
+    prevents re-spawning while a prior remediation is still live or recently merged.
+    Returns the number of tasks spawned (0 or 1).
+    """
+    from app.failure_classification import get_top_residual_fingerprints  # noqa: PLC0415
+
+    fingerprints = get_top_residual_fingerprints(window_seconds=86400, top_n=10)
+    if not fingerprints:
+        return 0
+
+    cooldown_hours = _runtime_config.get("residual_remediation_cooldown_hours", 24)
+    cooldown_seconds = cooldown_hours * 3600
+    now = time.time()
+    project_id_str = str(project.id)
+
+    for fp_entry in fingerprints:
+        fp = fp_entry["fingerprint"]
+        cooldown_key = f"{project_id_str}:{fp}"
+        if now - _residual_remediation_cooldowns.get(cooldown_key, 0.0) < cooldown_seconds:
+            continue
+
+        sample_message = fp_entry.get("sample_message", "(no message)")
+        task_ids = fp_entry.get("task_ids") or []
+        task_ids_str = ", ".join(str(t) for t in task_ids[:5])
+
+        prompt = (
+            f"Residual CODE_ERROR fingerprint '{fp}' has been seen "
+            f"{fp_entry.get('count', '?')} time(s) in the last 24 hours without "
+            f"being classified by the pipeline. Investigate and fix the root cause.\n\n"
+            f"Sample error message:\n{sample_message}\n\n"
+            f"Affected task IDs (up to 5): {task_ids_str or '(none recorded)'}\n\n"
+            f"Open a fix PR that resolves the underlying code defect causing these failures."
+        )
+        payload = validate_internal_payload(
+            {"type": "create", "prompt": prompt, "base_branch": "main"},
+            "autonomous_research:residual_fingerprint_remediation",
+        )
+        new_task = Task(
+            project_id=project.id,
+            title=f"Remediate residual fingerprint: {fp[:60]}",
+            description=f"Auto-spawned remediation for residual CODE_ERROR fingerprint {fp[:40]}",
+            payloads=[payload],
+            context={
+                "auto_remediation": True,
+                "spawned_by": "residual_fingerprint_remediation",
+                "error_fingerprint": fp,
+                "sample_message": sample_message[:500],
+                "task_ids": task_ids,
+            },
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(new_task)
+        session.add(TaskHistory(
+            task_id=new_task.id, action="SPAWNED",
+            details={
+                "spawned_by": "RESIDUAL_FINGERPRINT_REMEDIATION",
+                "error_fingerprint": fp,
+            },
+        ))
+        _residual_remediation_cooldowns[cooldown_key] = now
+        logger.info(
+            f"[AUTO REMEDIATION] Spawned create task {new_task.id} for residual "
+            f"fingerprint {fp[:40]} (project {project.id})"
+        )
+        await session.commit()
+        return 1
+
+    return 0
+
+
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
     from app.anomaly_detection import _expire_stale_proposals, _check_anomaly_proposals  # noqa: PLC0415
@@ -1501,6 +1583,7 @@ async def _check_idle_research():
                 await _check_anomaly_proposals(project, session)
                 # Auto-spawn investigation tasks for any directions placed on hold
                 await _spawn_direction_hold_investigation(project, session)
+                await _spawn_residual_fingerprint_remediation(project, session)
                 await session.commit()
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)
