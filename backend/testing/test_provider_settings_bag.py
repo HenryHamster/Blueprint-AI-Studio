@@ -71,13 +71,19 @@ def test_anthropic_cli_emits_fallback_model_when_different():
 def test_openai_schema_accepts_known_knobs():
     provider = get_provider(LLMProviderName.OPENAI)
     validated = provider.validate_settings({
-        "model": "gpt-5.4-mini",
+        "model": "gpt-5",
         "reasoning_effort": "minimal",
         "verbosity": "low",
         "service_tier": "flex",
     })
     assert validated["reasoning_effort"] == "minimal"
     assert validated["verbosity"] == "low"
+
+
+def test_openai_schema_rejects_unknown_model():
+    provider = get_provider(LLMProviderName.OPENAI)
+    with pytest.raises(ValueError):
+        provider.validate_settings({"model": "gpt-5.4-mini"})
 
 
 def test_openai_schema_rejects_invalid_reasoning_effort():

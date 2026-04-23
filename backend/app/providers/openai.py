@@ -201,12 +201,29 @@ class OpenAIProvider(LLMProvider):
             "properties": {
                 "model": {
                     "type": "string",
+                    # Kept in sync with the Codex CLI supported model list. When
+                    # OpenAI ships a new family (or promotes a preview to GA),
+                    # add the id here so admins can pick it from the matrix
+                    # dropdown without typing. Leave blank in a settings bag to
+                    # inherit the tier mapping from provider_tier_model_map.
+                    "enum": [
+                        "gpt-5",
+                        "gpt-5-codex",
+                        "gpt-5-mini",
+                        "gpt-5-nano",
+                        "gpt-4.1",
+                        "gpt-4o",
+                        "gpt-4o-mini",
+                        "o3",
+                        "o3-pro",
+                        "o3-mini",
+                        "o4-mini",
+                        "o4-mini-high",
+                    ],
                     "description": (
-                        "Codex CLI model. Pick a tier default or type a custom name "
-                        "(e.g. a preview model). Leave blank to inherit the tier "
+                        "Codex CLI model. Leave blank to inherit the tier "
                         "mapping from provider_tier_model_map."
                     ),
-                    "examples": ["gpt-5", "gpt-4.1", "gpt-4o-mini"],
                 },
                 "reasoning_effort": {
                     "type": "string",
