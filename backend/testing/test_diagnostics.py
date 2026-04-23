@@ -74,7 +74,10 @@ class TestClassifyStuckFailure:
         return t
 
     def test_provision_keywords(self):
-        for kw in ["provision error", "quota exceeded", "vm failed to start", "connection refused", "sshd failed", "startup script failed"]:
+        # NB: "quota exceeded" alone used to match the provision bank, but
+        # bare "quota" was removed because it mis-caught LLM-provider quota
+        # errors. Use a specific GCP-quota phrase that still routes here.
+        for kw in ["provision error", "CPUS_ALL_REGIONS quota exceeded", "vm failed to start", "connection refused", "sshd failed", "startup script failed"]:
             assert _classify_stuck_failure(self._task_with_message(kw)) == "PROVISION_FAILURE", kw
 
     def test_provision_keywords_previously_missing(self):

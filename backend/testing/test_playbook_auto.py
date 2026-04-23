@@ -85,7 +85,7 @@ async def test_three_failures_trigger_auto_entry(db_session: AsyncSession):
     """3 FAILED tasks with the same failure_class and keyword overlap creates an auto-entry."""
     project = await _make_project(db_session)
 
-    common_msg = "provision quota exceeded cpus zone failure"
+    common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
     t1 = await _make_failed_task(db_session, project.id, status_message=common_msg)
     t2 = await _make_failed_task(db_session, project.id, status_message=common_msg)
     # t3 is the "current" task passed to _check_recurring_failures
@@ -109,7 +109,7 @@ async def test_two_failures_do_not_trigger_entry(db_session: AsyncSession):
     """Only 2 failures with the same class — below the threshold of 3 — should not create entry."""
     project = await _make_project(db_session)
 
-    common_msg = "provision quota exceeded cpus zone failure"
+    common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
     t1 = await _make_failed_task(db_session, project.id, status_message=common_msg)
     # t2 is the "current" task
     t2 = await _make_failed_task(db_session, project.id, status_message=common_msg)
@@ -126,7 +126,7 @@ async def test_duplicate_detection_prevents_recreation(db_session: AsyncSession)
     """When a matching auto-entry already exists, a second run updates it rather than adding a new key."""
     project = await _make_project(db_session)
 
-    common_msg = "provision quota exceeded cpus zone failure"
+    common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
     t1 = await _make_failed_task(db_session, project.id, status_message=common_msg)
     t2 = await _make_failed_task(db_session, project.id, status_message=common_msg)
     t3 = await _make_failed_task(db_session, project.id, status_message=common_msg)
@@ -156,7 +156,7 @@ async def test_cap_of_five_is_respected(db_session: AsyncSession):
     project = await _make_project(db_session, design_doc=dict(prefilled))
 
     # 3 failures that would normally trigger a new entry
-    common_msg = "provision quota exceeded cpus zone failure"
+    common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
     t1 = await _make_failed_task(db_session, project.id, status_message=common_msg)
     t2 = await _make_failed_task(db_session, project.id, status_message=common_msg)
     t3 = await _make_failed_task(db_session, project.id, status_message=common_msg)
@@ -173,7 +173,7 @@ async def test_applicable_types_reflect_task_types(db_session: AsyncSession):
     """applicable_types on the auto-entry contains the types of the failing tasks."""
     project = await _make_project(db_session)
 
-    common_msg = "provision quota exceeded cpus zone failure"
+    common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
     t1 = await _make_failed_task(db_session, project.id, status_message=common_msg, task_type="create")
     t2 = await _make_failed_task(db_session, project.id, status_message=common_msg, task_type="fix")
     t3 = await _make_failed_task(db_session, project.id, status_message=common_msg, task_type="create")
@@ -197,7 +197,7 @@ async def test_old_failures_outside_7_day_window_ignored(db_session: AsyncSessio
     """Failures older than 7 days are not counted toward the pattern threshold."""
     project = await _make_project(db_session)
 
-    common_msg = "provision quota exceeded cpus zone failure"
+    common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
     # 2 old failures (> 7 days ago)
     t1 = await _make_failed_task(db_session, project.id, status_message=common_msg, age_days=8)
     t2 = await _make_failed_task(db_session, project.id, status_message=common_msg, age_days=8)

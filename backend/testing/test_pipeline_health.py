@@ -121,7 +121,7 @@ async def test_failure_distribution_uses_classify_failure_categories():
                   latest_status_message="AttributeError: NoneType has no attribute"),
         # PROVISION_FAILURE
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=3),
-                  latest_status_message="gcp quota exceeded for zone us-central1"),
+                  latest_status_message="CPUS_ALL_REGIONS quota exceeded for zone us-central1"),
         # RATE_LIMIT
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=4),
                   latest_status_message="API Error: Rate limit reached"),
@@ -198,7 +198,7 @@ async def test_failure_distribution_top_3_only():
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=3),
                   latest_status_message="NameError"),
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=4),
-                  latest_status_message="gcp quota exceeded"),  # PROVISION_FAILURE x2
+                  latest_status_message="CPUS_ALL_REGIONS quota exceeded"),  # PROVISION_FAILURE x2
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=5),
                   latest_status_message="vm startup failed network"),
         make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=6),
