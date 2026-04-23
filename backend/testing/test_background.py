@@ -1598,8 +1598,14 @@ async def test_reaper_rate_limit_requeue_without_burning_retry_budget(reaper_db,
     assert "rl-acct-123" in (ctx.get("blacklisted_accounts") or [])
     # Account ID cleared so orchestrator picks a fresh one
     assert "max_plan_account_id" not in ctx
-    # disable_account_model must have been called to block re-selection
-    mock_disable.assert_called_once_with("rl-acct-123", "claude-sonnet-4-6")
+    # disable_account_model must have been called to block re-selection.
+    # Reaper plumbs structured rate-limit signal (retry_after_seconds, kind)
+    # through; on a generic Anthropic rate-limit message the signal resolves
+    # to the baseline (no retry hint, plain rate_limit kind).
+    mock_disable.assert_called_once_with(
+        "rl-acct-123", "claude-sonnet-4-6",
+        retry_after_seconds=None, kind="rate_limit",
+    )
 
 
 @pytest.mark.asyncio
@@ -1667,7 +1673,10 @@ async def test_reaper_rate_limit_disable_account_model_retry_succeeds(reaper_db,
     _common_reaper_mocks(mocker)
     call_count = 0
 
-    async def _disable_side_effect(acct_id, model):
+    async def _disable_side_effect(acct_id, model, **kwargs):
+        # Accept the retry_after_seconds/kind kwargs that the reaper now plumbs
+        # through — they aren't asserted here; this test only cares about retry
+        # behavior on transient failures.
         nonlocal call_count
         call_count += 1
         if call_count == 1:

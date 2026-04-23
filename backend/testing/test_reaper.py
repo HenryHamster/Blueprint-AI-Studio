@@ -580,7 +580,12 @@ async def test_rate_limit_requeue_blacklists_account_and_skips_budget(
     assert "max_plan_account_id" not in ctx
     assert "retry_after" not in ctx, "stale retry_after must be cleared on rate-limit requeue"
     assert "provision_failures" not in ctx
-    disable_mock.assert_awaited_with("acct-123", "sonnet")
+    # reaper plumbs structured rate-limit signal (retry_after_seconds, kind) through;
+    # on a generic Anthropic rate-limit message, the signal resolves to the baseline
+    # (no retry hint, plain rate_limit kind).
+    disable_mock.assert_awaited_with(
+        "acct-123", "sonnet", retry_after_seconds=None, kind="rate_limit"
+    )
 
 
 # ── Non-provision failure classification & retry delay selection ─────────
