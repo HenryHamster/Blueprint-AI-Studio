@@ -1479,33 +1479,71 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
         if now - _residual_remediation_cooldowns.get(cooldown_key, 0.0) < cooldown_seconds:
             continue
 
-        sample_message = fp_entry.get("sample_message", "(no message)")
-        sample_status = fp_entry.get("sample_status", "") or ""
+        # Prefer the list-of-samples when present (added so fingerprints
+        # accumulate distinct error-line variations across tasks); fall
+        # back to the single legacy fields.
+        sample_messages = fp_entry.get("sample_messages") or (
+            [fp_entry["sample_message"]] if fp_entry.get("sample_message") else []
+        )
+        sample_statuses = fp_entry.get("sample_statuses") or (
+            [fp_entry["sample_status"]] if fp_entry.get("sample_status") else []
+        )
         task_ids = fp_entry.get("task_ids") or []
         task_ids_str = ", ".join(str(t) for t in task_ids[:5])
 
-        # Status context is secondary — it's the agent heartbeat at failure
-        # time (e.g. "Cloning repo…"), useful for humans to know what stage
-        # the failure hit but not the error itself. Include it only if it
-        # differs from the error line, labeled as context.
-        status_block = (
-            f"\n\nAgent status when this failure hit (context, not the error):\n{sample_status}"
-            if sample_status and sample_status.strip() != sample_message.strip()
-            else ""
+        # Render each bucket as a numbered list when we have >1 sample, or
+        # a single block when we have one. Capped list already from the
+        # residual store; just join.
+        def _render_samples(label: str, samples: list[str]) -> str:
+            samples = [s for s in samples if s]
+            if not samples:
+                return ""
+            if len(samples) == 1:
+                return f"\n\n{label}:\n{samples[0]}"
+            bodies = "\n\n".join(f"[{i + 1}] {s}" for i, s in enumerate(samples))
+            return f"\n\n{label} ({len(samples)} variations across affected tasks):\n{bodies}"
+
+        samples_block = _render_samples("Sample error message(s)", sample_messages)
+        # Status context — show only those that differ from the error lines.
+        distinct_statuses = [
+            s for s in sample_statuses
+            if s and not any(s.strip() == m.strip() for m in sample_messages)
+        ]
+        status_block = _render_samples(
+            "Agent status when these failures hit (context, not the error)",
+            distinct_statuses,
         )
+
         prompt = (
-            f"Residual CODE_ERROR fingerprint '{fp}' has been seen "
-            f"{fp_entry.get('count', '?')} time(s) in the last 24 hours without "
-            f"being classified by the pipeline. Investigate and fix the root cause.\n\n"
-            f"Sample error message:\n{sample_message}"
+            f"You are spawned as an auto-remediation task. A CODE_ERROR "
+            f"fingerprint has been recurring on main for {fp_entry.get('count', '?')} "
+            f"task(s) in the last 24 hours and nothing in the pipeline has "
+            f"fixed it. Your job is to investigate and open a fix PR.\n\n"
+            f"IMPORTANT — read this carefully:\n"
+            f"- This bug exists on main TODAY. It is not caused by your "
+            f"changes. Your job is to fix it.\n"
+            f"- The default 'don't touch pre-existing failures' instinct "
+            f"DOES NOT APPLY here. You are EXPLICITLY authorized (and "
+            f"expected) to edit unrelated-looking code, test mocks, "
+            f"fixtures, or imports when the error points there.\n"
+            f"- Common causes: missing exports on test mocks, stale "
+            f"fixtures, recent refactors that broke unrelated tests, "
+            f"missing migration, imports pointing at a moved file.\n"
+            f"- First, reproduce the error locally — run the relevant test "
+            f"suite and confirm you see the failure before editing.\n"
+            f"- Do NOT fix by silencing, skipping, weakening assertions, "
+            f"or try/except-wrapping errors. Find and fix the real cause.\n\n"
+            f"Fingerprint: '{fp}'"
+            f"{samples_block}"
             f"{status_block}\n\n"
             f"Affected task IDs (up to 5): {task_ids_str or '(none recorded)'}\n\n"
-            f"Open a fix PR that resolves the underlying code defect causing these failures."
+            f"Open a fix PR that resolves the underlying code defect."
         )
         payload = validate_internal_payload(
             {"type": "create", "prompt": prompt, "base_branch": "main"},
             "autonomous_research:residual_fingerprint_remediation",
         )
+        primary_sample = sample_messages[0] if sample_messages else ""
         new_task = Task(
             project_id=project.id,
             title=f"Remediate residual fingerprint: {fp[:60]}",
@@ -1515,7 +1553,7 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
                 "auto_remediation": True,
                 "spawned_by": "residual_fingerprint_remediation",
                 "error_fingerprint": fp,
-                "sample_message": sample_message[:500],
+                "sample_message": primary_sample[:500],
                 "task_ids": task_ids,
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",

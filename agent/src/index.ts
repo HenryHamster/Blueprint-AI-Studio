@@ -1566,23 +1566,56 @@ export async function testFixLoop(
     const fingerprint = errorFingerprint(combinedFailures);
     if (prevFingerprint !== null && fingerprint === prevFingerprint) {
       sendLog(ws, `Test failures unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
-      const failureSummary = combinedFailures.slice(0, 2000);
+      const failureSummary = combinedFailures.slice(-8000);
       return { passed: false, testFailuresDetected: true, failureSummary };
     }
     prevFingerprint = fingerprint;
     if (attempt < MAX_TEST_FIX_ATTEMPTS) {
       const preExistingHint = preExistingNote ? ' (pre-existing failures excluded)' : '';
-      sendLog(ws, `Tests failed (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})${preExistingHint}:\n${combinedFailures.slice(0, 3000)}\nClaude will attempt to fix...\n`);
+      sendLog(ws, `Tests failed (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})${preExistingHint}:\n${combinedFailures.slice(-5000)}\nClaude will attempt to fix...\n`);
       const analysisSections = analysisContext ? condensedAnalysisSections(analysisContext) : '';
       const analysisPrefix = analysisSections ? `## Module Analysis\n\n${analysisSections}\n\n` : '';
+      // Broader, investigation-first prompt. The previous "These tests
+      // broke because of your changes" framing made Claude presume
+      // self-caused regressions and miss pre-existing failures on main
+      // (missing mock exports, stale fixtures, outdated imports) that
+      // are just as valid to fix. Give it agency to consider either.
+      //
+      // The explicit "pre-existing bugs are fair game" language is
+      // load-bearing: Claude Code's default disposition is to leave
+      // pre-existing issues alone unless told otherwise. This task says
+      // otherwise.
+      const guidance = (
+        `Tests are failing. Investigate and fix them.\n\n` +
+        `Scope note (important): Claude Code's default is to avoid ` +
+        `touching "unrelated" pre-existing bugs. That default DOES NOT ` +
+        `apply here. On this task, pre-existing failures on main are ` +
+        `fair game to fix. Edit test mocks, fixtures, imports, or ` +
+        `implementation code wherever the root cause actually lives.\n\n` +
+        `Causes to consider:\n` +
+        `- Code your changes introduced (fix the code, or the test if ` +
+        `it asserts the wrong thing).\n` +
+        `- Pre-existing issues on main nobody has fixed yet: missing ` +
+        `mock exports (e.g. "No 'foo' export is defined on the mock" ` +
+        `→ add 'foo' to the mock), stale fixtures, outdated imports, ` +
+        `recently-renamed functions the tests still reference.\n` +
+        `- Flakiness or environmental issues (note them; don't chase).\n\n` +
+        `Do NOT silence, skip, or weaken assertions to make tests pass. ` +
+        `Do NOT revert your task's intent unless the test was correctly ` +
+        `catching a real bug.`
+      );
+      // Slice from the tail: test output puts setup/boilerplate at the
+      // head and the actual failure line at the end. 5000 chars is
+      // enough to carry a diagnostic traceback or a handful of failed
+      // assertions without drowning the agent in noise.
       const fixPrompt = baselineFailures
-        ? `${analysisPrefix}These tests broke because of your changes. Fix ONLY these newly-broken tests:\n\n${combinedFailures.slice(0, 4000)}${preExistingNote.slice(0, 1000)}`
-        : `${analysisPrefix}Refactoring broke these tests. Fix ONLY to restore passing tests without reverting the refactor's intent:\n\n${combinedFailures.slice(0, 5000)}`;
+        ? `${analysisPrefix}${guidance}\n\nFailures to fix:\n\n${combinedFailures.slice(-5000)}${preExistingNote.slice(-1500)}`
+        : `${analysisPrefix}${guidance}\n\nAll test failures (baseline skipped — pre-existing failures are also fair game on this task):\n\n${combinedFailures.slice(-5000)}`;
       await runClaudeCode(fixPrompt, ws, statusRef, model, effort);
       git(['add', '-A']);
     } else {
       sendLog(ws, `WARNING: Tests still failing after ${MAX_TEST_FIX_ATTEMPTS} fix attempts. Proceeding with commit.\n`);
-      const failureSummary = combinedFailures.slice(0, 2000);
+      const failureSummary = combinedFailures.slice(-8000);
       return { passed: false, testFailuresDetected: true, failureSummary };
     }
   }

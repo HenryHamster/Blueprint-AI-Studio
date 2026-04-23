@@ -526,12 +526,25 @@ def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
     fingerprint_source = err_line or status_msg
     fp = _fingerprint_message(fingerprint_source) or '<empty>'
     now = time.time()
+    trimmed_sample = fingerprint_source[:500]
+    trimmed_status = status_msg[:500]
     if fp in _residual_store:
         entry = _residual_store[fp]
         entry['count'] += 1
         entry['last_seen'] = now
         if task_id not in entry['task_ids'] and len(entry['task_ids']) < 5:
             entry['task_ids'].append(task_id)
+        # Accumulate distinct samples across tasks that share this
+        # fingerprint. The fingerprint is a normalized clustering key —
+        # individual task error lines can still vary (line numbers,
+        # param values, adjacent context) and each variation is useful
+        # signal for the remediation agent. Cap at 5 distinct entries.
+        samples = entry.setdefault('sample_messages', [entry.get('sample_message', '')])
+        if trimmed_sample and trimmed_sample not in samples and len(samples) < 5:
+            samples.append(trimmed_sample)
+        statuses = entry.setdefault('sample_statuses', [entry.get('sample_status', '')])
+        if trimmed_status and trimmed_status not in statuses and len(statuses) < 5:
+            statuses.append(trimmed_status)
     else:
         if len(_residual_store) >= _RESIDUAL_MAX_FINGERPRINTS:
             oldest = min(_residual_store, key=lambda k: _residual_store[k]['last_seen'])
@@ -540,11 +553,14 @@ def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
             'count': 1,
             'first_seen': now,
             'last_seen': now,
-            # Primary "what went wrong" text (error line when extractable).
-            'sample_message': fingerprint_source[:500],
-            # Original agent status at failure time — kept for operator
-            # context when the error line is terse or cryptic.
-            'sample_status': status_msg[:500],
+            # First/primary samples — kept for backward-compat with code
+            # that reads `sample_message`/`sample_status`.
+            'sample_message': trimmed_sample,
+            'sample_status': trimmed_status,
+            # Distinct-sample lists (up to 5 each) built as additional
+            # tasks hit this fingerprint. Richer context for remediation.
+            'sample_messages': [trimmed_sample] if trimmed_sample else [],
+            'sample_statuses': [trimmed_status] if trimmed_status else [],
             'task_ids': [task_id],
         }
 
@@ -565,6 +581,8 @@ def get_top_residual_fingerprints(window_seconds: int = 86400, top_n: int = 10) 
             'last_seen': entry['last_seen'],
             'sample_message': entry['sample_message'],
             'sample_status': entry.get('sample_status', ''),
+            'sample_messages': entry.get('sample_messages', [entry['sample_message']]),
+            'sample_statuses': entry.get('sample_statuses', [entry.get('sample_status', '')]),
             'task_ids': entry['task_ids'],
         }
         for fp, entry in _residual_store.items()

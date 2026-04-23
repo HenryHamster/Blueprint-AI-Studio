@@ -251,8 +251,17 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   // Capture test baseline on main branch so the test fix loop can distinguish
   // pre-existing failures from newly-broken tests. Scoped to related_files to stay fast.
+  //
+  // EXCEPTION: auto-remediation tasks deliberately skip baseline capture —
+  // their WHOLE JOB is to fix whatever's broken on main, pre-existing or
+  // otherwise. A baseline that excludes broken-main tests would make the
+  // remediation into a no-op: Claude would see "pre-existing failures, don't
+  // touch" and give up. We want it to see all failures and fix them.
+  const isAutoRemediation = Boolean(
+    (task.context as Record<string, unknown> | undefined)?.auto_remediation
+  );
   let baselineFailures: Set<string> | undefined;
-  if (captureBaseline && runTestFix && baseBranch === 'main') {
+  if (captureBaseline && runTestFix && baseBranch === 'main' && !isAutoRemediation) {
     const relatedFiles = (
       (payload.related_files as string[] | undefined) ||
       ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
@@ -260,6 +269,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     );
     const captured = await captureTestBaseline(ws, statusRef, buildConfig, relatedFiles);
     baselineFailures = captured ?? undefined;
+  } else if (isAutoRemediation) {
+    sendLog(ws, '[Baseline] Skipped — this is an auto-remediation task; all failures are fair game.\n');
   }
 
   const fileTree = buildFileTree(ws);
@@ -639,7 +650,7 @@ Return nothing — just write the files.`;
         failure_category: 'build_failed',
         changed_files: changedPaths.slice(0, 50),
         ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
-        ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
+        ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(-5000) } : {}),
       });
       return;
     }
@@ -655,7 +666,7 @@ Return nothing — just write the files.`;
         failure_category: 'test_failed',
         changed_files: changedPaths.slice(0, 50),
         ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
-        ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
+        ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(-5000) } : {}),
         ...(analysisContext ? { analysis_plan: analysisContext.slice(0, 5000) } : {}),
       });
       return;
@@ -1080,7 +1091,7 @@ Return nothing — just write the files.`;
                 failure_category: 'build_failed',
                 changed_files: changedPaths.slice(0, 50),
                 ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
-                ...(postReviewTestResult.failureSummary ? { test_failure_summary: postReviewTestResult.failureSummary.slice(0, 5000) } : {}),
+                ...(postReviewTestResult.failureSummary ? { test_failure_summary: postReviewTestResult.failureSummary.slice(-5000) } : {}),
               });
               return;
             }
@@ -1095,7 +1106,7 @@ Return nothing — just write the files.`;
                 failure_category: 'test_failed_after_self_review',
                 changed_files: changedPaths.slice(0, 50),
                 ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
-                ...(postReviewTestResult.failureSummary ? { test_failure_summary: postReviewTestResult.failureSummary.slice(0, 5000) } : {}),
+                ...(postReviewTestResult.failureSummary ? { test_failure_summary: postReviewTestResult.failureSummary.slice(-5000) } : {}),
               });
               return;
             }
@@ -1298,7 +1309,7 @@ Return nothing — just write the files.`;
       changed_files: changedPaths.slice(0, 50),
       ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
       ...(selfReviewOutcome ? { self_review_outcome: selfReviewOutcome } : {}),
-      ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
+      ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(-5000) } : {}),
       ...(analysisContext ? { analysis_plan: analysisContext.slice(0, 5000) } : {}),
     });
   } else if (exitCode === 0) {

@@ -985,7 +985,7 @@ export async function handleFix(
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
         logs: `Test suite could not run (setup failure — not a fixable test failure):\n${fixTestFailureSummary ?? 'unknown'}`,
         failure_category: 'build_failed',
-        ...(fixTestFailureSummary ? { test_failure_summary: fixTestFailureSummary.slice(0, 5000) } : {}),
+        ...(fixTestFailureSummary ? { test_failure_summary: fixTestFailureSummary.slice(-5000) } : {}),
       });
       return;
     }
@@ -1001,7 +1001,7 @@ export async function handleFix(
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
         logs: failedLogs,
         failure_category: 'test_failed',
-        ...(fixTestFailureSummary ? { test_failure_summary: fixTestFailureSummary.slice(0, 5000) } : {}),
+        ...(fixTestFailureSummary ? { test_failure_summary: fixTestFailureSummary.slice(-5000) } : {}),
       });
       return;
     }

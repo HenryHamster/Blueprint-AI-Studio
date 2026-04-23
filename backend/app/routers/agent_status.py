@@ -577,8 +577,13 @@ async def update_agent_status(
     # Preserve logs as status message when:
     # - no artifact is created (e.g., "no changes" completion), OR
     # - task is failing (artifact-bearing failures must not silently lose diagnostic text)
+    # Keep the LAST 8000 chars — errors (stack traces, failed assertions,
+    # the actual diagnostic line like "No 'foo' export is defined on the
+    # '…' mock") almost always land at the tail of test/build output.
+    # Head-slicing (previous 2000-char cap) was clipping off the useful
+    # part and leaving boilerplate ("RUN v2.1.9", setup noise).
     if payload.logs and (not payload.artifact_type or payload.status == TaskStatus.FAILED):
-        task.latest_status_message = payload.logs[:2000]
+        task.latest_status_message = payload.logs[-8000:]
     if payload.failure_category:
         from app.failure_classification import normalize_agent_failure_category  # noqa: PLC0415
         ctx = dict(task.context or {})
