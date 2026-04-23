@@ -789,12 +789,13 @@ describe('provider runner prompt transport', () => {
     const command = runner.buildRunCommand('Very long prompt body', 'gpt-5');
 
     expect(command.promptInput).toBe('stdin');
-    // Codex CLI invocation pins sandbox to danger-full-access at the
-    // translation layer (agent VMs are ephemeral; sandboxing inside them
-    // stalls on approval prompts nobody can answer). `--full-auto` was
-    // the pre-hardcoding alias; today we emit --skip-git-repo-check +
-    // explicit -s danger-full-access.
-    expect(command.args).toEqual(['exec', '--skip-git-repo-check', '-s', 'danger-full-access', '-m', 'gpt-5']);
+    // Codex CLI invocation uses the canonical bypass flag at the legacy
+    // fallback path — disables approval policy and sandbox in one knob,
+    // equivalent to Claude's --dangerously-skip-permissions. Agent VMs
+    // are ephemeral; sandboxing inside them stalls on approval prompts
+    // nobody can answer. `--full-auto` is explicitly avoided since it
+    // aliases --sandbox workspace-write and would override the bypass.
+    expect(command.args).toEqual(['exec', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', '-m', 'gpt-5']);
     expect(command.args.join(' ')).not.toContain('Very long prompt body');
   });
 
@@ -805,6 +806,10 @@ describe('provider runner prompt transport', () => {
     expect(command.promptInput).toBe('stdin');
     expect(command.args).toEqual(['--approval-mode=yolo', '-o', 'text', '-m', 'gemini-2.5-pro']);
     expect(command.args.join(' ')).not.toContain('Very long prompt body');
+    // Sandbox disabled via env var since Gemini's approval-mode and
+    // sandbox are separate knobs (YOLO auto-enables docker sandbox
+    // unless GEMINI_SANDBOX=false pins it off).
+    expect(command.env?.GEMINI_SANDBOX).toBe('false');
   });
 });
 

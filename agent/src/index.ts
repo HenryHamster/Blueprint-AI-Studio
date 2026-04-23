@@ -1697,19 +1697,22 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         // --skip-git-repo-check: some task types run outside a git checkout
         //   (standalone agentic handlers); without this flag Codex refuses
         //   to start.
-        // Sandbox flag intentionally NOT set here — the backend's settings
-        //   translation emits `-s danger-full-access` (the VM itself is the
-        //   isolation boundary). Do NOT also pass `--full-auto`: it aliases
-        //   `--sandbox workspace-write`, which would conflict with `-s
-        //   danger-full-access` and leave sandbox behavior undefined.
+        // Sandbox/approval flags intentionally NOT set here — the backend's
+        //   settings translation emits them (typically `-s danger-full-access`
+        //   or the canonical `--dangerously-bypass-approvals-and-sandbox`).
+        //   The VM itself is the isolation boundary. Do NOT pass `--full-auto`:
+        //   it aliases `--sandbox workspace-write` which would override a
+        //   bypass and leave sandbox behavior undefined.
         const args = ['exec', '--skip-git-repo-check'];
         if (LLM_CLI_TRANSLATION) {
           args.push(...LLM_CLI_TRANSLATION.args);
         } else {
           // Legacy fallback path (no settings-bag from backend): emit the
-          // no-sandbox flag ourselves so we don't fall through to Codex's
-          // default workspace-write sandbox.
-          args.push('-s', 'danger-full-access');
+          // canonical bypass flag — disables both approval policy and
+          // sandbox in one knob. Equivalent to Claude's
+          // --dangerously-skip-permissions and documented for externally
+          // hardened environments.
+          args.push('--dangerously-bypass-approvals-and-sandbox');
           if (model) args.push('-m', model);
         }
         return {
@@ -1749,6 +1752,13 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         // won't emit; keep them here. Settings-bag translation carries -m
         // (alias if thinking/temp are configured, else raw model) plus any
         // sandbox/approval overrides the operator set explicitly.
+        // Gemini needs TWO knobs — approval-mode and sandbox are separate:
+        //   --approval-mode=yolo      auto-approves tool calls
+        //   GEMINI_SANDBOX=false      disables the outer docker/podman
+        //                             sandbox that YOLO would auto-enable
+        //                             (also turns off the workspace path
+        //                             gate that blocks writes to /tmp/*).
+        // The VM itself is the isolation boundary, so both are safe.
         const args = ['-o', 'text'];
         const translationArgs = LLM_CLI_TRANSLATION?.args ?? [];
         const hasApprovalOverride = translationArgs.some(a => typeof a === 'string' && a.startsWith('--approval-mode'));
@@ -1758,10 +1768,11 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         } else if (model) {
           args.push('-m', model);
         }
+        const geminiEnv = { ...baseEnv, GEMINI_SANDBOX: 'false' };
         return {
           command: 'gemini',
           args,
-          env: baseEnv,
+          env: geminiEnv,
           outputMode: 'text',
           timeoutMs: claudeTimeoutForEffort(undefined),
           promptInput: 'stdin',
@@ -1771,7 +1782,8 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
       buildValidationCommand: (model) => {
         const args = ['-o', 'text', '-p', 'Respond with OK.'];
         if (model) args.push('-m', model);
-        return { command: 'gemini', args, env: baseEnv, timeoutMs: 30_000 };
+        const geminiEnv = { ...baseEnv, GEMINI_SANDBOX: 'false' };
+        return { command: 'gemini', args, env: geminiEnv, timeoutMs: 30_000 };
       },
     };
   }
