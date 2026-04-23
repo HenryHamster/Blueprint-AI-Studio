@@ -21,6 +21,12 @@ _API_KEY_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "quota exceeded. check your plan and billing",
     "rate limit reached for",
     "please try again in",
+    # Added from verbatim 429 bodies observed in codex-cli / openai-python:
+    "you exceeded your current quota",
+    "insufficient_quota",
+    "exceeded the rate limit, please slow down",
+    "please try again after",
+    "rate_limit_exceeded",
 )
 
 _OAUTH_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
@@ -31,6 +37,30 @@ _OAUTH_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "insufficient_quota",
     "usage_not_included",
     "rate_limit_exceeded",
+    # ChatGPT-plan Codex UI strings (OAuth mode only). Codex CLI pipes these
+    # through stderr when the plan window or credit pool is exhausted.
+    "you're out of codex messages",
+    "your rate limit resets on",
+    "add credits or upgrade to pro",
+    "you've hit your usage limit. visit",
+    "manage or purchase credits",
+)
+
+# Subset of the patterns above that mean "billing/quota wall, not a transient
+# rate limit". These get a longer flat cooldown in max_plan_pool and a distinct
+# admin-UI alert so operators know to top up credits, not wait it out.
+_API_KEY_QUOTA_EXHAUSTED_PATTERNS: tuple[str, ...] = (
+    "quota exceeded. check your plan and billing",
+    "you exceeded your current quota",
+    "insufficient_quota",
+)
+
+_OAUTH_QUOTA_EXHAUSTED_PATTERNS: tuple[str, ...] = (
+    "insufficient_quota",
+    "usage_not_included",
+    "you're out of codex messages",
+    "add credits or upgrade to pro",
+    "manage or purchase credits",
 )
 
 _DEFAULT_TIER_MODELS = {
@@ -84,6 +114,12 @@ class OpenAIProvider(LLMProvider):
         if auth_mode == LLMAuthMode.OAUTH:
             return _OAUTH_RATE_LIMIT_PATTERNS
         return _API_KEY_RATE_LIMIT_PATTERNS
+
+    def quota_exhausted_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
+        self.ensure_supported_auth_mode(auth_mode)
+        if auth_mode == LLMAuthMode.OAUTH:
+            return _OAUTH_QUOTA_EXHAUSTED_PATTERNS
+        return _API_KEY_QUOTA_EXHAUSTED_PATTERNS
 
     def required_metadata_fields(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
         self.ensure_supported_auth_mode(auth_mode)

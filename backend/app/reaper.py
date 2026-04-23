@@ -430,13 +430,21 @@ async def reaper_service():
                             _rl_task_type = (task.first_payload or {}).get("type", "create")
                             rl_model = _runtime_config.get("task_type_models", {}).get(_rl_task_type)
                         if rl_acct_id and rl_model:
+                            # classify_failure() wrote the structured signal into task.context
+                            # on the line above; pass it through so reaper-path cooldowns honor
+                            # retry hints and quota-exhausted flat curves the same way.
+                            _reaper_ctx = task.context or {}
+                            _reaper_kwargs = {
+                                "retry_after_seconds": _reaper_ctx.get("rate_limit_retry_after_seconds"),
+                                "kind": _reaper_ctx.get("rate_limit_kind") or "rate_limit",
+                            }
                             try:
-                                await disable_account_model(rl_acct_id, rl_model)
+                                await disable_account_model(rl_acct_id, rl_model, **_reaper_kwargs)
                             except Exception as _disable_err:
                                 logger.warning(f"[REAPER] disable_account_model failed for {rl_acct_id}/{rl_model}: {_disable_err}; retrying in 1s")
                                 await asyncio.sleep(1)
                                 try:
-                                    await disable_account_model(rl_acct_id, rl_model)
+                                    await disable_account_model(rl_acct_id, rl_model, **_reaper_kwargs)
                                 except Exception as _disable_err2:
                                     logger.error(
                                         f"[REAPER] disable_account_model retry also failed for {rl_acct_id}/{rl_model}: {_disable_err2}. "

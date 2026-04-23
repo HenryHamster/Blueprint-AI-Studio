@@ -9,12 +9,15 @@ from datetime import datetime, timedelta, timezone
 from app.max_plan_pool import (
     _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
     _HEALTH_WINDOW_SECONDS,
+    _QUOTA_EXHAUSTED_COOLDOWN_SECONDS,
     _account_at_cap,
     _account_available_for_model,
     _compute_health_score,
+    _cooldown_seconds_for_info,
     _daily_reset_if_elapsed,
     _normalize_rl_model,
     _prune_health_events,
+    _serialize_disabled_model_info,
     cascade_disabled_models,
     describe_pool_blockage,
     get_account_health_stats,
@@ -345,3 +348,78 @@ class TestHealthScoreDisqualifyThreshold:
         )
         score = _compute_health_score(acct, now=now)
         assert score == _HEALTH_SCORE_DISQUALIFY_THRESHOLD
+
+
+# ── _cooldown_seconds_for_info ───────────────────────────────────────────────
+
+class TestCooldownSecondsForInfo:
+    def test_exponential_curve_default(self):
+        # hits=1 → 30 min
+        assert _cooldown_seconds_for_info({"hits": 1}) == 30 * 60
+        # hits=2 → 60 min
+        assert _cooldown_seconds_for_info({"hits": 2}) == 60 * 60
+        # hits=5 → capped at 240 min
+        assert _cooldown_seconds_for_info({"hits": 5}) == 240 * 60
+        # hits=10 → still capped
+        assert _cooldown_seconds_for_info({"hits": 10}) == 240 * 60
+
+    def test_quota_exhausted_flat_24h(self):
+        """Billing-wall accounts get a flat 24h cooldown regardless of hit count."""
+        assert _cooldown_seconds_for_info(
+            {"hits": 1, "kind": "quota_exhausted"}
+        ) == _QUOTA_EXHAUSTED_COOLDOWN_SECONDS
+        # Even high hit counts stay flat at 24h (not the 4h exponential cap).
+        assert _cooldown_seconds_for_info(
+            {"hits": 99, "kind": "quota_exhausted"}
+        ) == _QUOTA_EXHAUSTED_COOLDOWN_SECONDS
+
+    def test_retry_after_seconds_is_floor(self):
+        """Server-provided retry hint lifts the exponential cooldown when larger."""
+        # hits=1 → exponential=1800s. Hint of 3600s should win.
+        assert _cooldown_seconds_for_info(
+            {"hits": 1, "retry_after_seconds": 3600}
+        ) == 3600
+        # Hint smaller than exponential is ignored.
+        assert _cooldown_seconds_for_info(
+            {"hits": 1, "retry_after_seconds": 60}
+        ) == 30 * 60
+        # Non-numeric hint is ignored.
+        assert _cooldown_seconds_for_info(
+            {"hits": 1, "retry_after_seconds": "unknown"}
+        ) == 30 * 60
+
+
+# ── _serialize_disabled_model_info ──────────────────────────────────────────
+
+class TestSerializeDisabledModelInfo:
+    def test_minimal_entry(self):
+        at = datetime(2026, 4, 22, 3, 0, tzinfo=timezone.utc)
+        out = _serialize_disabled_model_info({"hits": 2, "at": at})
+        assert out == {"hits": 2, "at": at.isoformat()}
+
+    def test_preserves_quota_exhausted_kind(self):
+        at = datetime(2026, 4, 22, 3, 0, tzinfo=timezone.utc)
+        out = _serialize_disabled_model_info(
+            {"hits": 1, "at": at, "kind": "quota_exhausted"}
+        )
+        assert out["kind"] == "quota_exhausted"
+
+    def test_preserves_positive_retry_hint(self):
+        at = datetime(2026, 4, 22, 3, 0, tzinfo=timezone.utc)
+        out = _serialize_disabled_model_info(
+            {"hits": 1, "at": at, "retry_after_seconds": 120}
+        )
+        assert out["retry_after_seconds"] == 120
+
+    def test_omits_zero_or_negative_retry_hint(self):
+        at = datetime(2026, 4, 22, 3, 0, tzinfo=timezone.utc)
+        out = _serialize_disabled_model_info(
+            {"hits": 1, "at": at, "retry_after_seconds": 0}
+        )
+        assert "retry_after_seconds" not in out
+
+    def test_omits_unknown_kind(self):
+        """Only quota_exhausted is preserved; rate_limit is implicit (omitted)."""
+        at = datetime(2026, 4, 22, 3, 0, tzinfo=timezone.utc)
+        out = _serialize_disabled_model_info({"hits": 1, "at": at, "kind": "rate_limit"})
+        assert "kind" not in out

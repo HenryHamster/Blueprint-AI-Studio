@@ -633,10 +633,20 @@ async def load_max_plan_pool():
                     at_str = info.get("at")
                     if at_str:
                         at_dt = datetime.fromisoformat(at_str)
-                        hits = info.get("hits", 1)
-                        cooldown_minutes = min(30 * (2 ** (hits - 1)), 240)
-                        if (now - at_dt).total_seconds() < cooldown_minutes * 60:
-                            restored_dm[model_name] = {"hits": hits, "at": at_dt}
+                        restored_info: dict[str, Any] = {
+                            "hits": info.get("hits", 1),
+                            "at": at_dt,
+                        }
+                        # Preserve structured fields (kind, retry_after_seconds)
+                        # across restarts so quota_exhausted accounts aren't
+                        # silently demoted to an exponential-rate-limit cooldown.
+                        if info.get("kind") == "quota_exhausted":
+                            restored_info["kind"] = "quota_exhausted"
+                        hint = info.get("retry_after_seconds")
+                        if isinstance(hint, (int, float)) and hint > 0:
+                            restored_info["retry_after_seconds"] = int(hint)
+                        if (now - at_dt).total_seconds() < _cooldown_seconds_for_info(restored_info):
+                            restored_dm[model_name] = restored_info
                 if restored_dm:
                     entry["disabled_models"] = restored_dm
                     logger.info(f"[STARTUP] Restored rate-limit state for {acct.name}: {list(restored_dm.keys())}")
@@ -677,6 +687,48 @@ def _account_at_cap(acct: dict) -> str | None:
     return None
 
 
+_QUOTA_EXHAUSTED_COOLDOWN_SECONDS = 24 * 60 * 60  # flat 24h for billing walls
+
+
+def _serialize_disabled_model_info(info: dict) -> dict:
+    """JSON-safe snapshot of a disabled_models entry for DB persistence.
+
+    Only emits fields that are set. `at` becomes an ISO string; numeric
+    retry_after_seconds is preserved; string kind is preserved.
+    """
+    out: dict[str, Any] = {
+        "hits": info.get("hits", 1),
+        "at": info["at"].isoformat(),
+    }
+    if info.get("kind") == "quota_exhausted":
+        out["kind"] = "quota_exhausted"
+    hint = info.get("retry_after_seconds")
+    if isinstance(hint, (int, float)) and hint > 0:
+        out["retry_after_seconds"] = int(hint)
+    return out
+
+
+def _cooldown_seconds_for_info(info: dict) -> int:
+    """Compute remaining-effective cooldown window (seconds) for a disabled_models entry.
+
+    Rules:
+    - kind="quota_exhausted" → flat 24h. These are billing walls; the
+      exponential-backoff curve doesn't apply because the error doesn't
+      resolve on clock.
+    - Otherwise exponential: min(30 * 2^(hits-1), 240) minutes.
+    - Server-provided retry_after_seconds is treated as a floor — we never
+      shorten below it, and we never extend below the exponential value.
+    """
+    if info.get("kind") == "quota_exhausted":
+        return _QUOTA_EXHAUSTED_COOLDOWN_SECONDS
+    hits = info.get("hits", 1)
+    exponential = min(30 * (2 ** (hits - 1)), 240) * 60
+    hint = info.get("retry_after_seconds")
+    if isinstance(hint, (int, float)) and hint > exponential:
+        return int(hint)
+    return exponential
+
+
 def _account_state_for_model(acct: dict, model: str | None, now: datetime | None = None) -> str:
     """Derive the circuit-breaker state for an (account, model) pair.
 
@@ -711,8 +763,7 @@ def _account_state_for_model(acct: dict, model: str | None, now: datetime | None
     at_dt = info.get("at")
     if at_dt is None:
         return "unavailable"
-    hits = info.get("hits", 1)
-    cooldown_seconds = min(30 * (2 ** (hits - 1)), 240) * 60
+    cooldown_seconds = _cooldown_seconds_for_info(info)
     now = now or _utcnow()
     if (now - at_dt).total_seconds() < cooldown_seconds:
         return "unavailable"
@@ -754,8 +805,7 @@ def summarize_pool_state(model: str | None, user_id: str | None = None) -> Dict[
         if info is None and norm_model is None and dm:
             info = next(iter(dm.values()))
         if info and info.get("at") is not None:
-            hits = info.get("hits", 1)
-            cooldown_seconds = min(30 * (2 ** (hits - 1)), 240) * 60
+            cooldown_seconds = _cooldown_seconds_for_info(info)
             recovery = info["at"] + timedelta(seconds=cooldown_seconds)
             if recovery > now:
                 rate_limited += 1
@@ -827,7 +877,7 @@ async def _persist_rate_limit_state(acct_id: str) -> None:
         dm = acct.get("disabled_models") or {}
         db_acct.rate_limit_state = {
             "disabled_models": {
-                m: {"hits": i["hits"], "at": i["at"].isoformat()}
+                m: _serialize_disabled_model_info(i)
                 for m, i in dm.items()
             }
         } if dm else None
@@ -1157,13 +1207,28 @@ async def release_max_plan_account(account_id: str):
             account["active_tasks"] = max(0, account["active_tasks"] - 1)
 
 
-async def disable_account_model(acct_id: str, model: str) -> None:
+async def disable_account_model(
+    acct_id: str,
+    model: str,
+    *,
+    retry_after_seconds: int | None = None,
+    kind: str = "rate_limit",
+) -> None:
     """Mark an account's cascade of models as rate-limited and persist.
 
     Called from both agent_status.py (when the agent POSTs a RATE_LIMIT failure)
     and reaper.py (when the agent's pre-flight dies without POSTing). Both paths
     must update disabled_models so the orchestrator's blacklist pruning
     preserves the entry on the next dispatch cycle.
+
+    - `retry_after_seconds`: server-provided retry floor parsed from the error
+      body (Gemini's `Please retry in 39s`, OpenAI's `try again after 60s`).
+      When present, cooldown is `max(parsed_hint_minutes, exponential)` so a
+      tighter server hint never shortens our backoff below the computed value,
+      and a long hint is respected.
+    - `kind="quota_exhausted"`: billing wall (insufficient_quota, out-of-credits).
+      Uses a flat 24h cooldown instead of exponential — these don't resolve on
+      clock, they need operator action (refill credits / raise budget).
 
     Acquires _max_plan_pool_lock. On DB persist failure, appends to
     _pending_rl_persists for retry (same contract as clear_rate_limit_state_on_success).
@@ -1183,6 +1248,10 @@ async def disable_account_model(acct_id: str, model: str) -> None:
             info = dm.setdefault(m, {"hits": 0})
             info["hits"] += 1
             info["at"] = now
+            if kind == "quota_exhausted":
+                info["kind"] = "quota_exhausted"
+            if retry_after_seconds is not None:
+                info["retry_after_seconds"] = int(retry_after_seconds)
         # Record rate-limit event for rolling health score
         _prune_health_events(acct, now)
         acct.setdefault("rl_events", []).append(now)
@@ -1191,11 +1260,27 @@ async def disable_account_model(acct_id: str, model: str) -> None:
         # non-empty: cascade_disabled_models always returns at least one entry.
         primary_key = cascade[0]
         primary_hits = dm[primary_key]["hits"]
-        cooldown = min(30 * (2 ** (primary_hits - 1)), 240) * random.uniform(0.85, 1.15)
-        logger.warning(
-            f"[POOL] Account {acct['name']} disabled models {list(cascade)} "
-            f"(primary {primary_key} hit #{primary_hits}, cooldown {cooldown:.0f}min)"
-        )
+        if kind == "quota_exhausted":
+            # Flat 24h — billing walls don't resolve on clock. Operator action
+            # (refill credits / raise budget) is required; a short cooldown
+            # would just cycle the same error.
+            cooldown = 24 * 60
+            logger.warning(
+                f"[POOL] Account {acct['name']} QUOTA EXHAUSTED on models {list(cascade)} "
+                f"(primary {primary_key}, flat 24h cooldown — refill required)"
+            )
+        else:
+            cooldown = min(30 * (2 ** (primary_hits - 1)), 240) * random.uniform(0.85, 1.15)
+            if retry_after_seconds is not None:
+                hint_minutes = retry_after_seconds / 60.0
+                if hint_minutes > cooldown:
+                    cooldown = hint_minutes
+            logger.warning(
+                f"[POOL] Account {acct['name']} disabled models {list(cascade)} "
+                f"(primary {primary_key} hit #{primary_hits}, cooldown {cooldown:.0f}min"
+                + (f", server-hinted {retry_after_seconds}s" if retry_after_seconds else "")
+                + ")"
+            )
 
         auto_disable_threshold = acct.get("auto_disable_after_rate_limits")
         if auto_disable_threshold is not None and primary_hits >= int(auto_disable_threshold):
@@ -1298,7 +1383,7 @@ async def recheck_disabled_accounts():
                         dm = acct.get("disabled_models", {})
                         db_acct.rate_limit_state = {
                             "disabled_models": {
-                                m: {"hits": i["hits"], "at": i["at"].isoformat()}
+                                m: _serialize_disabled_model_info(i)
                                 for m, i in dm.items()
                             }
                         } if dm else None

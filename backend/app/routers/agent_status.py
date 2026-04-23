@@ -907,7 +907,16 @@ async def update_agent_status(
                             # Only disable a specific model when we know which one hit the limit.
                             # cascade_disabled_models() inside the helper handles tier cascading
                             # (Opus 429 → sonnet + haiku disabled too).
-                            await disable_account_model(acct_id, model)
+                            # classify_failure() wrote rate_limit_kind + rate_limit_retry_after_seconds
+                            # into task.context; pass them through so quota-exhausted accounts get
+                            # the flat 24h cooldown and server-provided retry hints are honored.
+                            _rl_ctx = task.context or {}
+                            await disable_account_model(
+                                acct_id,
+                                model,
+                                retry_after_seconds=_rl_ctx.get("rate_limit_retry_after_seconds"),
+                                kind=_rl_ctx.get("rate_limit_kind") or "rate_limit",
+                            )
                         # EXTERNAL_API: don't disable account (transient outage)
 
                     # Track API failure retries to prevent infinite loops

@@ -1,17 +1,92 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from app.models import LLMAuthMode, LLMProviderName
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class ValidationResult:
     secret: str
     provider_metadata: dict[str, Any]
+
+
+# Cap for parsed retry-hint values. Providers sometimes emit absurd delays
+# ("please retry in 99999s"), so treat 4h as a sanity ceiling — matches the
+# existing exponential-backoff cap in max_plan_pool.disable_account_model.
+_RETRY_HINT_MAX_SECONDS = 4 * 3600
+
+
+@dataclass(frozen=True)
+class RateLimitSignal:
+    """Structured result of classifying a rate-limit error string.
+
+    - `kind="rate_limit"` is a transient throttle — exponential backoff resolves it.
+    - `kind="quota_exhausted"` is a billing/quota wall — needs operator action
+      (refill credits, raise monthly budget). Pool should cool down longer and
+      admin UI should surface it distinctly from a temporary 429.
+    - `retry_after_seconds` is a server-provided floor parsed from the error
+      body (Gemini `Please retry in 39s`, OpenAI `try again after 60.6 seconds`).
+      None when no hint is present. Capped at 4h as a sanity ceiling.
+    - `matched_pattern` is the substring that matched — useful for logs and
+      observability.
+    """
+
+    kind: Literal["rate_limit", "quota_exhausted"]
+    retry_after_seconds: int | None
+    matched_pattern: str
+
+
+# One shared regex for retry-hint parsing across providers. Matches phrasing
+# observed in real OpenAI / Gemini / Codex bodies:
+#   "please retry in 39.8s", "please try again in 1.574s",
+#   "please try again after 60.616 seconds", "retry after 30 seconds",
+#   "try again in 2 minutes"
+# Clock-time forms ("resets on 2:49 PM", "try again at Apr 17th") are
+# intentionally NOT parsed — we can't convert to a delta without trusting
+# the client clock, and a wrong value is worse than no hint.
+_RETRY_HINT_RE = re.compile(
+    r"(?:please\s+)?(?:retry|try again)(?:\s+after|\s+in)?\s+"
+    r"(?P<value>\d+(?:\.\d+)?)\s*"
+    r"(?P<unit>seconds?|secs?|s|minutes?|mins?|m|hours?|h)\b",
+    re.IGNORECASE,
+)
+
+
+def parse_retry_hint_seconds(text: str) -> int | None:
+    """Extract a server-provided retry delay from an error string.
+
+    Returns None if no hint is present or the parsed value is non-positive.
+    Bare unit-less numbers (e.g. "retry in 30") are not matched — the unit is
+    required to avoid misreading version numbers or token counts.
+    """
+    if not text:
+        return None
+    match = _RETRY_HINT_RE.search(text)
+    if not match:
+        return None
+    try:
+        value = float(match.group("value"))
+    except (TypeError, ValueError):
+        return None
+    unit = (match.group("unit") or "s").lower()
+    if unit.startswith("h"):
+        seconds = value * 3600
+    elif unit.startswith("m") and not unit.startswith("ms"):
+        # "m" / "min" / "minutes" — "ms" isn't in the regex vocabulary but guard anyway.
+        seconds = value * 60
+    else:
+        seconds = value
+    if seconds <= 0:
+        return None
+    return int(min(seconds, _RETRY_HINT_MAX_SECONDS))
 
 
 @dataclass(frozen=True)
@@ -67,6 +142,75 @@ class LLMProvider(ABC):
     @abstractmethod
     def rate_limit_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
         raise NotImplementedError
+
+    # Patterns that mean "billing/quota wall, not a transient rate limit".
+    # Subset of rate_limit_patterns() — anything in this set is tagged
+    # kind="quota_exhausted" by classify_rate_limit_signal(). Default empty:
+    # providers opt in by overriding. Must be lowercase, substring-safe.
+    def quota_exhausted_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
+        return ()
+
+    def classify_rate_limit_signal(
+        self, auth_mode: LLMAuthMode, text: str
+    ) -> RateLimitSignal | None:
+        """Scan a combined status+logs string for a rate-limit signature.
+
+        Returns None when no pattern matches. Otherwise returns a
+        RateLimitSignal with:
+        - kind="quota_exhausted" if the match is in quota_exhausted_patterns()
+          (permanent billing wall — needs operator action)
+        - kind="rate_limit" otherwise (transient throttle)
+        - retry_after_seconds parsed from the full text via parse_retry_hint_seconds
+
+        Base implementation is a plain substring scan driven by
+        rate_limit_patterns(). Providers override only when they need custom
+        logic beyond the pattern lists.
+        """
+        if not text:
+            return None
+        lowered = text.lower()
+        try:
+            patterns = self.rate_limit_patterns(auth_mode)
+        except Exception:
+            logger.exception(
+                "[PROVIDER] rate_limit_patterns failed for %s/%s",
+                getattr(self, "name", "?"),
+                auth_mode,
+            )
+            return None
+        quota_patterns: tuple[str, ...] = ()
+        try:
+            quota_patterns = self.quota_exhausted_patterns(auth_mode)
+        except Exception:
+            logger.exception(
+                "[PROVIDER] quota_exhausted_patterns failed for %s/%s",
+                getattr(self, "name", "?"),
+                auth_mode,
+            )
+            quota_patterns = ()
+        # Quota-exhausted patterns win when both lists match. Real 429 bodies
+        # often contain a quota_exhausted marker alongside a generic
+        # "quota exceeded for metric" — we want the billing-wall signal to
+        # drive the flat 24h cooldown, not the shorter exponential.
+        matched: str | None = None
+        kind: Literal["rate_limit", "quota_exhausted"] = "rate_limit"
+        for pattern in quota_patterns:
+            if pattern and pattern in lowered:
+                matched = pattern
+                kind = "quota_exhausted"
+                break
+        if matched is None:
+            for pattern in patterns:
+                if pattern and pattern in lowered:
+                    matched = pattern
+                    break
+        if matched is None:
+            return None
+        return RateLimitSignal(
+            kind=kind,
+            retry_after_seconds=parse_retry_hint_seconds(lowered),
+            matched_pattern=matched,
+        )
 
     @abstractmethod
     def required_metadata_fields(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:

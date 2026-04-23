@@ -33,13 +33,40 @@ _API_KEY_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "resource has been exhausted",
     "resource_exhausted",
     "please wait and try again later",
+    # Added from verbatim Gemini CLI / Developer API / Code Assist bodies:
+    "quota exceeded for quota metric",
+    "quota exceeded for metric",
+    "you've exceeded the rate limit",
+    "you exceeded your current quota, please check your plan and billing details",
+    "please retry in",
+    "to increase your limits, request a quota increase",
+    # Code Assist backend auto-falls back to flash and emits this message;
+    # treat it as a rate-limit hit on whatever tier was originally requested.
+    "switching to the gemini-2.5-flash model",
 )
 
 _SERVICE_ACCOUNT_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "resource has been exhausted",
     "resource_exhausted",
     "ratelimitexceeded",
+    # Vertex AI-specific:
+    "quota exceeded for metric",
+    "resource exhausted. please try again later",
+    "please refer to https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429",
 )
+
+# Gemini doesn't have a clean billing-wall signal the way OpenAI does — most
+# free-tier exhaustion is framed as "quota exceeded for metric" which is the
+# same wording used for transient per-minute quotas. We tag the API-key
+# "you exceeded your current quota, please check your plan" body as quota-
+# exhausted because that phrasing only appears on paid-account billing walls;
+# everything else stays as rate_limit so a transient 429 doesn't cause a 24h
+# cooldown.
+_API_KEY_QUOTA_EXHAUSTED_PATTERNS: tuple[str, ...] = (
+    "you exceeded your current quota, please check your plan and billing details",
+)
+
+_SERVICE_ACCOUNT_QUOTA_EXHAUSTED_PATTERNS: tuple[str, ...] = ()
 
 _DEFAULT_TIER_MODELS = {
     "opus": "gemini-2.5-pro",
@@ -103,6 +130,12 @@ class GeminiProvider(LLMProvider):
         if auth_mode == LLMAuthMode.SERVICE_ACCOUNT:
             return _SERVICE_ACCOUNT_RATE_LIMIT_PATTERNS
         return _API_KEY_RATE_LIMIT_PATTERNS
+
+    def quota_exhausted_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
+        self.ensure_supported_auth_mode(auth_mode)
+        if auth_mode == LLMAuthMode.SERVICE_ACCOUNT:
+            return _SERVICE_ACCOUNT_QUOTA_EXHAUSTED_PATTERNS
+        return _API_KEY_QUOTA_EXHAUSTED_PATTERNS
 
     def required_metadata_fields(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
         self.ensure_supported_auth_mode(auth_mode)

@@ -2,7 +2,7 @@
 import logging
 import re
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.models import Task
@@ -10,29 +10,66 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _task_rate_limit_patterns(task: "Task") -> tuple[str, ...]:
-    from app.max_plan_pool import RATE_LIMIT_PATTERNS, get_task_llm_auth_mode, get_task_llm_provider  # noqa: PLC0415
-    from app.models import LLMAuthMode, LLMProviderName  # noqa: PLC0415
-    from app.providers.registry import get_provider  # noqa: PLC0415
+def _resolve_task_provider_auth(task: "Task"):
+    """Resolve (provider, auth_mode) enums for a task, or (None, None) on any failure.
+
+    Shared entry point for both _task_rate_limit_patterns (legacy tuple-of-strings)
+    and _task_rate_limit_signal (structured result). Keeps the provider/auth-mode
+    lookup logic in one place.
+    """
+    from app.max_plan_pool import get_task_llm_auth_mode, get_task_llm_provider
+    from app.models import LLMAuthMode, LLMProviderName
 
     provider_raw = get_task_llm_provider(task)
     auth_mode_raw = get_task_llm_auth_mode(task)
     if not provider_raw or not auth_mode_raw:
-        return tuple(RATE_LIMIT_PATTERNS)
+        return None, None
     try:
-        provider = LLMProviderName(provider_raw)
-        auth_mode = LLMAuthMode(auth_mode_raw)
+        return LLMProviderName(provider_raw), LLMAuthMode(auth_mode_raw)
     except ValueError:
+        return None, None
+
+
+def _task_rate_limit_patterns(task: "Task") -> tuple[str, ...]:
+    from app.max_plan_pool import RATE_LIMIT_PATTERNS
+    from app.providers.registry import get_provider
+
+    provider, auth_mode = _resolve_task_provider_auth(task)
+    if provider is None or auth_mode is None:
         return tuple(RATE_LIMIT_PATTERNS)
     try:
         return get_provider(provider).rate_limit_patterns(auth_mode)
     except Exception:
         logger.exception(
             "[FAILURE_CLASS] Failed to resolve rate-limit patterns for provider=%s auth_mode=%s",
-            provider_raw,
-            auth_mode_raw,
+            provider,
+            auth_mode,
         )
         return tuple(RATE_LIMIT_PATTERNS)
+
+
+def _task_rate_limit_signal(task: "Task", combined: str):
+    """Return a RateLimitSignal for the task+text, or None.
+
+    Uses the task's provider/auth_mode to pick the right classifier. When
+    provider/auth_mode are unresolvable (e.g. legacy task without structured
+    context), falls back to None — callers treat that as "legacy rate-limit
+    match" with no kind/retry info. Never raises.
+    """
+    from app.providers.registry import get_provider
+
+    provider, auth_mode = _resolve_task_provider_auth(task)
+    if provider is None or auth_mode is None:
+        return None
+    try:
+        return get_provider(provider).classify_rate_limit_signal(auth_mode, combined)
+    except Exception:
+        logger.exception(
+            "[FAILURE_CLASS] classify_rate_limit_signal failed for provider=%s auth_mode=%s",
+            provider,
+            auth_mode,
+        )
+        return None
 
 
 # Canonical failure classes that the classifier and rollups use.
@@ -203,9 +240,7 @@ def should_trigger_code_defect_investigation(task: "Task") -> bool:
         return False
     if classify_failure(task) != CODE_ERROR:
         return False
-    if classify_failure_taxonomy(task) != TAXONOMY_CODE_DEFECT:
-        return False
-    return True
+    return classify_failure_taxonomy(task) == TAXONOMY_CODE_DEFECT
 
 
 # AGENT_TIMEOUT sub-types that indicate a code-caused failure (resource exhaustion
@@ -302,7 +337,7 @@ def worst_child_failure_category(children: list["Task"]) -> str:
     return best_cat
 
 
-def persist_failure_category(task: "Task", failure_class: str, logs: Optional[str] = None) -> None:
+def persist_failure_category(task: "Task", failure_class: str, logs: str | None = None) -> None:
     """Write ``failure_class`` onto ``task.context['failure_category']`` in place.
 
     All terminal-FAILED code paths must call this (or write the key themselves)
@@ -321,7 +356,7 @@ def persist_failure_category(task: "Task", failure_class: str, logs: Optional[st
     task.context = ctx
 
 
-def normalize_agent_failure_category(raw: Optional[str], task: "Task") -> str:
+def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
     """Canonicalize an agent-reported ``failure_category`` label to an uppercase class name.
 
     The agent posts lowercase short labels (``rate_limited``, ``claude_code_failed``, …)
@@ -387,7 +422,7 @@ def _timeout_subtype_from_message(combined: str) -> str:
     return TIMEOUT_UNKNOWN
 
 
-def classify_timeout_subtype(task: "Task", logs: Optional[str] = None) -> str:
+def classify_timeout_subtype(task: "Task", logs: str | None = None) -> str:
     """Return a sub-type label for an AGENT_TIMEOUT failure."""
     status_msg = task.latest_status_message or ""
     return _timeout_subtype_from_message(status_msg + " " + (logs or ""))
@@ -478,7 +513,7 @@ def get_top_residual_fingerprints(window_seconds: int = 86400, top_n: int = 10) 
     return results[:top_n]
 
 
-def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
+def classify_failure(task: "Task", logs: str | None = None) -> str:
     """Classify a task failure for deployment monitoring.
     Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API"""
 
@@ -554,6 +589,20 @@ def classify_failure(task: "Task", logs: Optional[str] = None) -> str:
 
     # Claude API rate limit — exact Claude Code / Anthropic API error strings only.
     # See RATE_LIMIT_PATTERNS docstring for why broad keywords were removed.
+    # Prefer structured signal (provider + kind + retry-hint) when resolvable;
+    # fall back to legacy pattern-list scan for tasks without provider context.
+    signal = _task_rate_limit_signal(task, combined)
+    if signal is not None:
+        try:
+            ctx = dict(task.context or {})
+            ctx["rate_limit_kind"] = signal.kind
+            if signal.retry_after_seconds is not None:
+                ctx["rate_limit_retry_after_seconds"] = signal.retry_after_seconds
+            ctx["rate_limit_matched_pattern"] = signal.matched_pattern
+            task.context = ctx
+        except Exception:
+            logger.exception("[FAILURE_CLASS] Failed to persist rate_limit_* keys")
+        return "RATE_LIMIT"
     rate_limit_patterns = _task_rate_limit_patterns(task)
     if any(kw in combined for kw in rate_limit_patterns):
         return "RATE_LIMIT"
