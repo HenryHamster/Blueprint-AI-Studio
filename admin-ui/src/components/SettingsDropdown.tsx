@@ -8,7 +8,7 @@ import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
 import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
 import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig } from '../types/project';
-import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench, Tag, HelpCircle, Plus, ChevronDown, ChevronUp } from 'lucide-react';
+import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench, Tag, HelpCircle, Plus, ChevronDown, ChevronUp, RefreshCw } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
 export type { MaxPlanAccount } from '../types/settings';
 import type { AuthMode, CategoryRoutingEntry, DeployState, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
@@ -64,6 +64,7 @@ interface SettingsDropdownProps {
   onToggleAccount: (id: string, enabled: boolean) => void;
   onRemoveAccount: (id: string) => void;
   onResetRateLimits: (id: string) => void;
+  onRefreshAccountModels: (id: string) => void;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
   newAccountProvider: ProviderName;
@@ -298,6 +299,7 @@ export function SettingsDropdown({
   onToggleAccount,
   onRemoveAccount,
   onResetRateLimits,
+  onRefreshAccountModels,
   newAccountName,
   setNewAccountName,
   newAccountProvider,
@@ -972,9 +974,15 @@ export function SettingsDropdown({
                       <div className="text-[11px] text-neutral-500 font-mono">
                         {a.active_tasks} active
                         {tokenAge && <span className={`ml-2 ${isExpiring ? 'text-amber-400' : ''}`}>&middot; token {tokenAge}</span>}
-                        {a.provider_metadata?.project && <span className="ml-2">&middot; {a.provider_metadata.project}</span>}
-                        {a.provider_metadata?.location && <span className="ml-2">@ {a.provider_metadata.location}</span>}
+                        {a.provider_metadata?.project && typeof a.provider_metadata.project === 'string' && <span className="ml-2">&middot; {a.provider_metadata.project}</span>}
+                        {a.provider_metadata?.location && typeof a.provider_metadata.location === 'string' && <span className="ml-2">@ {a.provider_metadata.location}</span>}
                       </div>
+                      {accountSupportsAvailabilityCheck(a) && (
+                        <AccountAvailabilityLine
+                          account={a}
+                          onRefresh={() => onRefreshAccountModels(a.id)}
+                        />
+                      )}
                     </div>
                     <button
                       onClick={() => {
@@ -1401,6 +1409,7 @@ export function SettingsDropdown({
         providerSettingsDefaults={providerSettingsDefaults}
         taskTypeProviderOverrides={taskTypeProviderOverrides}
         providerSettingsByEffort={providerSettingsByEffort}
+        maxPlanAccounts={maxPlanAccounts}
         onUpdateDefaults={onUpdateProviderSettingsDefaults}
         onUpdateOverrides={onUpdateTaskTypeProviderOverrides}
         onUpdateProviderSettingsByEffort={onUpdateProviderSettingsByEffort}
@@ -1517,6 +1526,96 @@ export function SettingsDropdown({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+
+// Model-availability line for account list rows.
+//
+// Shows how many models this specific API key can see, split GA vs preview
+// (Gemini only — OpenAI doesn't have a stable preview/GA distinction we can
+// label without guessing). Surfaces the refresh timestamp + any cached
+// error string from the last probe, plus a manual refresh icon.
+//
+// Only rendered for providers/modes where list_available_models is wired
+// in the backend — gating via `accountSupportsAvailabilityCheck`.
+
+// Keep in sync with backend/app/providers/gemini.py::_GEMINI_PREVIEW_MODELS.
+// Frontend-duplicated because rendering the GA/preview split shouldn't
+// require a network round trip to the backend on every settings-panel open.
+const GEMINI_PREVIEW_MODEL_IDS = new Set<string>([
+  'gemini-3-pro-preview',
+  'gemini-3-flash-preview',
+  'gemini-3.1-pro-preview',
+  'gemini-3.1-flash-preview',
+]);
+
+function accountSupportsAvailabilityCheck(account: MaxPlanAccount): boolean {
+  // Backend only implements list_available_models for API-key auth on
+  // Gemini + OpenAI today (Anthropic doesn't gate models per key; Gemini
+  // service-account needs OAuth2 token minting not yet wired).
+  if (account.auth_mode !== 'api_key') return false;
+  return account.provider === 'gemini' || account.provider === 'openai';
+}
+
+function AccountAvailabilityLine({
+  account,
+  onRefresh,
+}: {
+  account: MaxPlanAccount;
+  onRefresh: () => void;
+}) {
+  const metadata = account.provider_metadata || {};
+  const models = Array.isArray(metadata.available_models) ? metadata.available_models : null;
+  const refreshedAtRaw = typeof metadata.available_models_refreshed_at === 'string'
+    ? metadata.available_models_refreshed_at
+    : null;
+  const error = typeof metadata.available_models_error === 'string'
+    ? metadata.available_models_error
+    : null;
+
+  const refreshedAt = refreshedAtRaw ? parseTimestamp(refreshedAtRaw) : null;
+  const refreshedAgo = refreshedAt ? timeAgo(refreshedAt) : null;
+
+  let body: React.ReactNode;
+  if (models === null && !error) {
+    body = <span className="text-neutral-600 italic">availability unchecked</span>;
+  } else if (models === null && error) {
+    body = <span className="text-amber-500/70" title={error}>check failed &mdash; {error.length > 60 ? error.slice(0, 60) + '...' : error}</span>;
+  } else if (models !== null) {
+    const isGemini = account.provider === 'gemini';
+    const preview = isGemini ? models.filter(m => GEMINI_PREVIEW_MODEL_IDS.has(m)) : [];
+    const modelTitle = models.length > 0 ? models.join(', ') : '(none)';
+    body = (
+      <span title={modelTitle}>
+        <span className="text-neutral-400">{models.length} model{models.length === 1 ? '' : 's'} visible</span>
+        {isGemini && preview.length > 0 && (
+          <span className="ml-1.5 text-violet-400" title={`Preview-gated models visible on this key: ${preview.join(', ')}`}>
+            &middot; {preview.length} preview
+          </span>
+        )}
+        {isGemini && models.length > 0 && preview.length === 0 && (
+          <span className="ml-1.5 text-neutral-600" title="No preview models visible — preview requests will fall back to GA counterparts">
+            &middot; no preview access
+          </span>
+        )}
+        {refreshedAgo && <span className="ml-1.5 text-neutral-600">&middot; {refreshedAgo}</span>}
+      </span>
+    );
+  }
+
+  return (
+    <div className="text-[11px] font-mono flex items-center gap-1.5 mt-0.5">
+      {body}
+      <button
+        type="button"
+        onClick={onRefresh}
+        title="Re-check which models this key can see"
+        className="text-neutral-600 hover:text-neutral-300 transition-colors p-0.5 rounded shrink-0"
+      >
+        <RefreshCw className="w-3 h-3" />
+      </button>
     </div>
   );
 }

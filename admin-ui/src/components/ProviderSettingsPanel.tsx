@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import type {
   EffortLevel,
+  MaxPlanAccount,
   ProviderCatalogEntry,
   ProviderName,
   ProviderSettingsBag,
@@ -9,6 +10,16 @@ import type {
   TaskTypeProviderOverrides,
 } from '../types/settings';
 import { EFFORT_LEVELS } from '../types/settings';
+
+// Keep in sync with backend/app/providers/gemini.py::_GEMINI_PREVIEW_MODELS
+// and _PREVIEW_TO_GA_FALLBACK. When the backend adds a preview model (or
+// promotes one to GA), update both halves of this mapping.
+const GEMINI_PREVIEW_FALLBACK: Record<string, string> = {
+  'gemini-3-pro-preview': 'gemini-2.5-pro',
+  'gemini-3-flash-preview': 'gemini-2.5-flash',
+  'gemini-3.1-pro-preview': 'gemini-2.5-pro',
+  'gemini-3.1-flash-preview': 'gemini-2.5-flash',
+};
 
 // JSON-Schema subset we render — mirrors backend providers/base.py:_validate_against_schema.
 interface SchemaNode {
@@ -33,6 +44,7 @@ interface Props {
   providerSettingsDefaults: ProviderSettingsDefaults;
   taskTypeProviderOverrides: TaskTypeProviderOverrides;
   providerSettingsByEffort: ProviderSettingsByEffort;
+  maxPlanAccounts: MaxPlanAccount[];
   onUpdateDefaults: UpdateDefaults;
   onUpdateOverrides: UpdateOverrides;
   onUpdateProviderSettingsByEffort: (value: ProviderSettingsByEffort) => void | Promise<void>;
@@ -54,6 +66,7 @@ export function ProviderSettingsPanel({
   providerSettingsDefaults,
   taskTypeProviderOverrides,
   providerSettingsByEffort,
+  maxPlanAccounts,
   onUpdateDefaults,
   onUpdateOverrides,
   onUpdateProviderSettingsByEffort,
@@ -204,6 +217,15 @@ export function ProviderSettingsPanel({
         <div className="text-xs text-neutral-500">
           Provider {selectedProvider} has no declared settings schema.
         </div>
+      )}
+
+      {/* Preview-model fallback warning. Only relevant for Gemini today —
+          OpenAI's preview gating doesn't have a clean GA fallback map. */}
+      {selectedProvider === 'gemini' && (
+        <PreviewFallbackBanner
+          selectedModel={typeof effectiveBag.model === 'string' ? effectiveBag.model : null}
+          accounts={maxPlanAccounts}
+        />
       )}
 
       {scope === 'overrides' && Object.keys(effectiveBag).length === 0 && (
@@ -472,4 +494,89 @@ function Field({ schema, value, onChange }: { schema: SchemaNode; value: unknown
 
 function humanizeKey(key: string): string {
   return key.replace(/_/g, ' ');
+}
+
+
+// Preview-model fallback banner.
+//
+// When the operator picks a Gemini preview model, we partition their Gemini
+// accounts into three buckets by looking at the cached `available_models`:
+//   - will-run:       model is listed → task runs with the preview model
+//   - will-fallback:  model is NOT listed → dispatcher swaps to GA counterpart
+//                     (gemini-3.1-pro-preview → gemini-2.5-pro, etc)
+//   - unknown:        account hasn't been probed yet → may or may not work
+//                     (fail-open at dispatch time)
+//
+// The banner only renders when there's something actionable to surface:
+// either at least one account will fall back, or we have no idea what any
+// of the accounts can see. A fully-green "all accounts have access" state
+// is silent — no banner clutter for the happy path.
+function PreviewFallbackBanner({
+  selectedModel,
+  accounts,
+}: {
+  selectedModel: string | null;
+  accounts: MaxPlanAccount[];
+}) {
+  if (!selectedModel || !(selectedModel in GEMINI_PREVIEW_FALLBACK)) {
+    return null;
+  }
+  const ga = GEMINI_PREVIEW_FALLBACK[selectedModel];
+
+  const gemini = accounts.filter(
+    a => a.provider === 'gemini' && a.auth_mode === 'api_key' && a.enabled,
+  );
+  if (gemini.length === 0) {
+    return null;
+  }
+
+  const willRun: MaxPlanAccount[] = [];
+  const willFallback: MaxPlanAccount[] = [];
+  const unknown: MaxPlanAccount[] = [];
+  for (const a of gemini) {
+    const md = a.provider_metadata || {};
+    const models = Array.isArray(md.available_models) ? md.available_models : null;
+    if (models === null) {
+      unknown.push(a);
+    } else if (models.includes(selectedModel)) {
+      willRun.push(a);
+    } else {
+      willFallback.push(a);
+    }
+  }
+
+  // Happy path: every enabled Gemini key has been probed and every one of them
+  // has access to the preview model. Don't render anything.
+  if (willFallback.length === 0 && unknown.length === 0) {
+    return null;
+  }
+
+  const nameList = (accts: MaxPlanAccount[]) => accts.map(a => a.name).join(', ');
+
+  return (
+    <div className="border border-amber-900/60 bg-amber-950/20 rounded p-3 text-[11px] space-y-1.5">
+      <div className="text-amber-300 font-medium">
+        {selectedModel} is a preview model — dispatcher will fall back to{' '}
+        <span className="font-mono">{ga}</span> for accounts without preview access.
+      </div>
+      {willFallback.length > 0 && (
+        <div className="text-amber-200/80">
+          <span className="text-amber-400">{willFallback.length}/{gemini.length}</span> account{willFallback.length === 1 ? '' : 's'} will fall back:{' '}
+          <span className="font-mono text-neutral-300">{nameList(willFallback)}</span>
+        </div>
+      )}
+      {willRun.length > 0 && (
+        <div className="text-neutral-400">
+          <span className="text-emerald-400">{willRun.length}/{gemini.length}</span> will run the preview model:{' '}
+          <span className="font-mono">{nameList(willRun)}</span>
+        </div>
+      )}
+      {unknown.length > 0 && (
+        <div className="text-neutral-500">
+          <span className="text-neutral-400">{unknown.length}/{gemini.length}</span> not yet probed (click refresh on the account row to check):{' '}
+          <span className="font-mono">{nameList(unknown)}</span>
+        </div>
+      )}
+    </div>
+  );
 }

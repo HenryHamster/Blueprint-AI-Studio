@@ -225,6 +225,31 @@ export function useSettings(addToast: AddToast) {
     } catch (err) { console.error('Failed to reset rate limits:', err); addToast('Failed to reset rate limits', 'error'); }
   };
 
+  const refreshAccountModels = async (id: string) => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/max-plan-accounts/${id}/refresh-models`, {
+        method: 'POST', headers: await authHeaders(),
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const modelCount = Array.isArray(data?.available_models) ? data.available_models.length : null;
+        const err = typeof data?.error === 'string' ? data.error : null;
+        if (err) {
+          addToast(`Refresh failed: ${err}`, 'error');
+        } else if (modelCount !== null) {
+          addToast(`Found ${modelCount} model${modelCount === 1 ? '' : 's'} on this key`, 'success');
+        } else {
+          addToast('Model availability refreshed', 'success');
+        }
+        fetchSettings();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        const detail = typeof data?.detail === 'string' ? data.detail : null;
+        addToast(detail ? `Refresh failed: ${detail}` : `Refresh failed (HTTP ${res.status})`, 'error');
+      }
+    } catch (err) { console.error('Failed to refresh account models:', err); addToast('Failed to refresh account models', 'error'); }
+  };
+
   const connectGitHub = async () => {
     try {
       const redirectUri = window.location.origin;
@@ -621,6 +646,7 @@ export function useSettings(addToast: AddToast) {
     // Handlers
     fetchSettings,
     addMaxPlanAccount, removeMaxPlanAccount, toggleMaxPlanAccount, resetAccountRateLimits,
+    refreshAccountModels,
     updateAccountCaps,
     connectGitHub,
     updateAgentPromptSuffixes,

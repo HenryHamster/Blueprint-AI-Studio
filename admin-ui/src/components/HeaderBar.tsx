@@ -78,6 +78,7 @@ export interface HeaderBarProps {
   onToggleAccount: (id: string, enabled: boolean) => void;
   onRemoveAccount: (id: string) => void;
   onResetRateLimits: (id: string) => void;
+  onRefreshAccountModels: (id: string) => void;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
   newAccountProvider: ProviderName;
@@ -219,6 +220,7 @@ export function HeaderBar(props: HeaderBarProps) {
     onToggleAccount,
     onRemoveAccount,
     onResetRateLimits,
+    onRefreshAccountModels,
     newAccountName,
     setNewAccountName,
     newAccountProvider,
@@ -430,6 +432,7 @@ export function HeaderBar(props: HeaderBarProps) {
           onToggleAccount={onToggleAccount}
           onRemoveAccount={onRemoveAccount}
           onResetRateLimits={onResetRateLimits}
+          onRefreshAccountModels={onRefreshAccountModels}
           newAccountName={newAccountName}
           setNewAccountName={setNewAccountName}
           newAccountProvider={newAccountProvider}

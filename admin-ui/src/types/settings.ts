@@ -80,6 +80,21 @@ export interface ModelPreference {
   model: string;
 }
 
+// Per-account provider metadata. Carries both static config (Gemini
+// service-account project/location) and the cached model-availability
+// snapshot populated by the backend's refresh-models endpoint.
+// `available_models` is absent until a successful refresh — missing here
+// means "not yet probed", which the dispatcher treats as may-have-access.
+export interface ProviderMetadata {
+  project?: string;
+  location?: string;
+  available_models?: string[];
+  available_models_refreshed_at?: string;
+  available_models_error?: string | null;
+  // Forward-compat: provider adapters may stash provider-specific keys.
+  [key: string]: unknown;
+}
+
 export interface MaxPlanAccount {
   id: string;
   name: string;
@@ -89,7 +104,7 @@ export interface MaxPlanAccount {
   token_created_at: string | null;
   provider: ProviderName;
   auth_mode: AuthMode;
-  provider_metadata?: Record<string, string>;
+  provider_metadata?: ProviderMetadata;
   rl_hit_count?: number;
   disabled_models?: Record<string, { hits: number; at: string | null }>;
   daily_task_cap?: number | null;
