@@ -199,7 +199,14 @@ def test_manifest_omits_translation_when_settings_produces_empty_bag():
 def test_manifest_includes_translation_even_when_bag_is_empty_dict():
     """An empty dict is a valid bag (=no overrides, inherit all); the manifest
     should still emit LLM_SETTINGS='{}' so the agent knows the backend is
-    speaking the new protocol and doesn't fall back to legacy-only mode."""
+    speaking the new protocol and doesn't fall back to legacy-only mode.
+
+    Since compute.py injects the caller-supplied `model` into the bag before
+    settings_to_cli (so compatibility gates see a concrete model), the
+    translation picks up `--model <model>` even when the input bag was
+    empty. `LLM_SETTINGS` continues to reflect the input bag exactly so
+    downstream logging/audit can tell what the operator wrote vs what
+    compute synthesized."""
     import json
     import uuid as _uuid
     from app.compute import build_agent_secret_manifest
@@ -214,12 +221,17 @@ def test_manifest_includes_translation_even_when_bag_is_empty_dict():
         model="claude-opus-4-7",
         provider_settings={},
     )
+    # LLM_SETTINGS tracks the input bag verbatim — the model merge happens
+    # only on the copy passed to settings_to_cli, so operators see the
+    # distinction between "operator-set" and "compute-synthesized" values.
     assert manifest["env"]["LLM_SETTINGS"] == "{}"
     translation = json.loads(manifest["env"]["LLM_CLI_TRANSLATION"])
-    # Even with an empty bag the CLI args always include the hardcoded
-    # permission-mode flag — anything less stalls the agent VM on approval
-    # prompts that won't come.
-    assert translation["args"] == ["--permission-mode", "bypassPermissions"]
+    # Hardcoded permission flag is always present; the model flag now also
+    # lands because compute injects the effective model into the bag.
+    assert translation["args"] == [
+        "--model", "claude-opus-4-7",
+        "--permission-mode", "bypassPermissions",
+    ]
 
 
 def test_resolve_settings_handles_missing_provider_block_in_defaults():

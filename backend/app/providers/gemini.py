@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Mapping
 
@@ -15,6 +16,8 @@ from app.providers.base import (
     tier_model_from_runtime_config,
     validate_required_metadata_fields,
 )
+
+logger = logging.getLogger(__name__)
 
 _GEMINI_SETTINGS_ALIAS = "blueprint-runtime"
 # Gemini CLI looks up custom aliases from $HOME/.gemini/settings.json and does
@@ -89,6 +92,74 @@ _THINKING_BUDGET_CAPS = {
     "gemini-3.1-flash-preview": 24576,
 }
 _THINKING_BUDGET_DEFAULT_CAP = 32768
+
+
+# Model availability classifications. Used to surface advisory markers in
+# `unsupported` when the settings bag resolves to a model whose availability
+# depends on external state (preview access on the API key, GA rollout,
+# deprecation). The CLI invocation still goes out as-is — these are signals
+# for observability, not hard blocks, because a preview flag doesn't mean
+# unavailable (the key may have preview access) and an unknown model may be
+# a freshly released variant we haven't added yet.
+#
+# When Google promotes a preview model to GA, move it from
+# `_GEMINI_PREVIEW_MODELS` into `_GEMINI_GA_MODELS`. When a new family lands,
+# add it to `_GEMINI_GA_MODELS` (and `_THINKING_BUDGET_CAPS` above). The
+# settings-schema enum in `GeminiProvider.settings_schema` must stay in sync
+# — test_gemini_known_models_match_budget_caps enforces that.
+_GEMINI_GA_MODELS: frozenset[str] = frozenset({
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+})
+_GEMINI_PREVIEW_MODELS: frozenset[str] = frozenset({
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-preview",
+})
+
+
+# Preview→GA fallback map. When a task targets a preview model but none of
+# the pool's API keys have preview access (list_available_models filtered
+# them all out), the dispatcher swaps to the GA counterpart rather than
+# failing. Pick by capability class: pro preview degrades to 2.5-pro,
+# flash preview degrades to 2.5-flash. No mapping ⇒ no fallback ⇒ dispatch
+# fails loudly so the operator knows to enable preview access somewhere.
+# Keep in sync with _GEMINI_PREVIEW_MODELS — a preview model without an
+# entry here is intentional (we'd rather fail than silently run a wrong
+# class of model), but every entry in `_GEMINI_PREVIEW_MODELS` that has a
+# natural counterpart should be mapped.
+_PREVIEW_TO_GA_FALLBACK: dict[str, str] = {
+    "gemini-3-pro-preview": "gemini-2.5-pro",
+    "gemini-3-flash-preview": "gemini-2.5-flash",
+    "gemini-3.1-pro-preview": "gemini-2.5-pro",
+    "gemini-3.1-flash-preview": "gemini-2.5-flash",
+}
+
+
+_GEMINI_API_KEY_LIST_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+_MODEL_LISTING_TIMEOUT_SECONDS = 5.0
+
+
+def _gemini_model_availability(model: str | None) -> str | None:
+    """Return `"ga"`, `"preview"`, `"unknown"`, or None (when no model given).
+
+    Preview means the model exists on Google's side but requires preview
+    access on the API key/project; without that access the CLI returns
+    404 `ModelNotFoundError` from the v1beta endpoint. `"unknown"` means
+    the model isn't in our registered lists — could be a freshly released
+    variant or a typo. None when no model is supplied (caller shouldn't
+    emit a marker).
+    """
+    if not isinstance(model, str) or not model.strip():
+        return None
+    normalized = model.strip()
+    if normalized in _GEMINI_GA_MODELS:
+        return "ga"
+    if normalized in _GEMINI_PREVIEW_MODELS:
+        return "preview"
+    return "unknown"
 
 
 class GeminiProvider(LLMProvider):
@@ -233,6 +304,27 @@ class GeminiProvider(LLMProvider):
 
         model = bag.get("model")
 
+        # Availability advisory: 3.x preview models exist on Google's side but
+        # their v1beta endpoint returns 404 `ModelNotFoundError` when the key
+        # lacks preview access. Unknown model IDs — typos or freshly released
+        # variants we haven't registered — also warrant a marker so the
+        # inevitable 404 is easy to diagnose from the recorded translation.
+        # This is advisory only; the CLI invocation still goes out as-is
+        # because preview access is legitimate, just per-key.
+        availability = _gemini_model_availability(model)
+        if availability == "preview":
+            unsupported.append(
+                f"model={model!r} is a preview model; a v1beta "
+                f"ModelNotFoundError on dispatch means the API key lacks "
+                f"preview access"
+            )
+        elif availability == "unknown":
+            unsupported.append(
+                f"model={model!r} is not in the known-availability list; "
+                f"verify with GET /v1beta/models or add to "
+                f"_GEMINI_GA_MODELS / _GEMINI_PREVIEW_MODELS"
+            )
+
         # Assemble generation config for an alias entry in ~/.gemini/settings.json.
         # Gemini CLI has almost no per-invocation knobs; any tunable beyond model
         # requires a settings.json alias plus `-m <alias>`.
@@ -302,3 +394,71 @@ class GeminiProvider(LLMProvider):
             settings_files=tuple(settings_files),
             unsupported=tuple(unsupported),
         )
+
+    async def list_available_models(
+        self,
+        secret: str | None,
+        auth_mode: LLMAuthMode,
+        provider_metadata: Mapping[str, Any] | None = None,
+    ) -> list[str] | None:
+        """List model IDs this Gemini key can call.
+
+        Hits `GET /v1beta/models?key=<key>` and strips the `models/` prefix
+        from each entry. Used to decide which pool accounts are eligible for
+        a given model (especially preview models whose access is gated per
+        project/key).
+
+        Service-account mode not yet implemented: it would need OAuth2
+        token minting from the SA JSON to call Vertex AI's publisher-models
+        endpoint, which adds complexity and a `google-auth` dependency.
+        Falls back to None (unknown) until that's wired; SA accounts will
+        simply skip the filter and be tried for any model.
+        """
+        self.ensure_supported_auth_mode(auth_mode)
+        if auth_mode != LLMAuthMode.API_KEY or not secret:
+            return None
+        try:
+            import httpx
+        except ImportError:
+            logger.warning("[GEMINI] httpx unavailable; skipping list_available_models")
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=_MODEL_LISTING_TIMEOUT_SECONDS) as client:
+                resp = await client.get(
+                    _GEMINI_API_KEY_LIST_MODELS_URL,
+                    params={"key": secret, "pageSize": 1000},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:  # noqa: BLE001 — returning None is the contract
+            # Log at info (not warning): a transient failure here is
+            # recoverable on the next refresh and shouldn't page operators.
+            logger.info(
+                "[GEMINI] list_available_models failed: %s (returning None = unknown)",
+                exc,
+            )
+            return None
+
+        ids: list[str] = []
+        for entry in data.get("models") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            name = entry.get("name")
+            # Response shape: {"name": "models/gemini-2.5-pro", ...}
+            if isinstance(name, str) and name.startswith("models/"):
+                ids.append(name[len("models/"):])
+        # Sort for stable diffs when operators inspect stored snapshots.
+        return sorted(set(ids))
+
+    def fallback_model(self, model: str | None) -> str | None:
+        """Return the GA counterpart for a Gemini preview model.
+
+        Invoked by the dispatcher when the requested preview model is
+        unavailable on every account in the pool. Picks by capability
+        class (pro/flash) so the fallback stays in the same performance
+        bracket — not a strictly equivalent swap, but close enough that
+        quality degrades gracefully rather than the task failing outright.
+        """
+        if not isinstance(model, str):
+            return None
+        return _PREVIEW_TO_GA_FALLBACK.get(model.strip())

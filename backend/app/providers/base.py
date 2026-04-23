@@ -254,6 +254,50 @@ class LLMProvider(ABC):
         """
         return CLITranslation()
 
+    async def list_available_models(
+        self,
+        secret: str | None,
+        auth_mode: LLMAuthMode,
+        provider_metadata: Mapping[str, Any] | None = None,
+    ) -> list[str] | None:
+        """Return the list of model IDs this account/key can call.
+
+        Providers override with a list-models API call so callers can filter
+        pool accounts by what the key actually has access to (Gemini preview
+        gating, OpenAI org flags, etc).
+
+        Contract:
+        - Returns a concrete list (possibly empty) when the call succeeded.
+        - Returns None when the provider doesn't expose a list endpoint, the
+          auth mode isn't supported, or the call failed. Callers must treat
+          None as "unknown — don't filter against it"; a failed refresh must
+          not starve a functional account.
+        - Never raises. All I/O and parse errors log + return None.
+        - Short timeout (~5s). Long timeouts here stall account-save/refresh
+          and, if wired into dispatch, stall the whole pool selector.
+
+        Default implementation returns None (no listing capability).
+        """
+        return None
+
+    def fallback_model(self, model: str | None) -> str | None:
+        """Return the logical GA counterpart for a preview/restricted model.
+
+        Used by the dispatcher when a task requests a model that none of the
+        keys in the pool can access: rather than fail the task outright,
+        swap to a stable counterpart (e.g. `gemini-3.1-pro-preview`
+        →`gemini-2.5-pro`) so work continues with a quality downgrade. The
+        downgrade is logged and recorded on the task context.
+
+        Returns None when:
+        - `model` is not a preview/restricted model, or
+        - no counterpart is registered.
+
+        Default implementation returns None (no fallback defined). Providers
+        override with the preview→GA map for their family.
+        """
+        return None
+
     def account_has_credentials(self, account: Mapping[str, Any] | Any) -> bool:
         secret_blob_ref = _account_value(account, "secret_blob_ref")
         oauth_token = _account_value(account, "oauth_token")

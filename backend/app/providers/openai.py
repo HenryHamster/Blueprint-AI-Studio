@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Mapping
 
@@ -14,6 +15,11 @@ from app.providers.base import (
     tier_model_from_runtime_config,
     validate_required_metadata_fields,
 )
+
+logger = logging.getLogger(__name__)
+
+_OPENAI_LIST_MODELS_URL = "https://api.openai.com/v1/models"
+_MODEL_LISTING_TIMEOUT_SECONDS = 5.0
 
 _API_KEY_RE = re.compile(r"sk-[A-Za-z0-9_\-]+")
 
@@ -68,6 +74,45 @@ _DEFAULT_TIER_MODELS = {
     "sonnet": "gpt-4.1",
     "haiku": "gpt-4o-mini",
 }
+
+
+# Models that accept `service_tier="flex"` on the OpenAI Responses API.
+# Sending flex to a non-flex model (e.g. gpt-4.1, gpt-4o-mini) returns a 400
+# `Unsupported service_tier: flex`. Codex CLI passes our -c override verbatim,
+# so we have to gate at the adapter layer before the request leaves the VM.
+#
+# Prefix-matched so variants within a family inherit support without a code
+# change (gpt-5-mini, o3-pro, o4-mini-high, …). Explicit excludes carry
+# documented exceptions — gpt-5-nano ships without flex per OpenAI docs. Keep
+# these narrow: when a new family adds flex support, add its prefix here; when
+# a family loses support (rare), add to the excludes set. Unknown models
+# fail closed — we'd rather surface one warning than one silent 400.
+_FLEX_SUPPORTED_PREFIXES: tuple[str, ...] = (
+    "gpt-5",
+    "o3",
+    "o4-mini",
+)
+_FLEX_EXCLUDED_MODELS: frozenset[str] = frozenset({
+    "gpt-5-nano",
+})
+
+
+def _model_supports_flex(model: str | None) -> bool:
+    """Return True when the given OpenAI model id accepts service_tier=flex.
+
+    Case-insensitive prefix match against `_FLEX_SUPPORTED_PREFIXES`, minus
+    any entries in `_FLEX_EXCLUDED_MODELS`. Unknown or empty model names
+    return False — we fail closed so an unseen model id can't trigger a 400
+    at dispatch time.
+    """
+    if not isinstance(model, str):
+        return False
+    normalized = model.strip().lower()
+    if not normalized:
+        return False
+    if normalized in _FLEX_EXCLUDED_MODELS:
+        return False
+    return any(normalized.startswith(prefix) for prefix in _FLEX_SUPPORTED_PREFIXES)
 
 
 class OpenAIProvider(LLMProvider):
@@ -231,7 +276,19 @@ class OpenAIProvider(LLMProvider):
 
         service_tier = bag.get("service_tier")
         if isinstance(service_tier, str):
-            config_pairs.append(("service_tier", f'"{service_tier}"'))
+            if service_tier == "flex" and not _model_supports_flex(model):
+                # Dropping instead of erroring: admin-level defaults can stamp
+                # service_tier=flex across the matrix, and a per-task tier
+                # downgrade (opus → sonnet → gpt-4.1) would otherwise turn
+                # every sonnet task into a hard 400. The unsupported marker
+                # surfaces the drop in observability.
+                unsupported.append(
+                    f"service_tier=flex requires a flex-capable model "
+                    f"(gpt-5, gpt-5-mini, o3, o4-mini); effective model "
+                    f"{model!r} — dropped"
+                )
+            else:
+                config_pairs.append(("service_tier", f'"{service_tier}"'))
 
         web_search = bag.get("web_search")
         if isinstance(web_search, str):
@@ -248,3 +305,51 @@ class OpenAIProvider(LLMProvider):
             args=tuple(args),
             unsupported=tuple(unsupported),
         )
+
+    async def list_available_models(
+        self,
+        secret: str | None,
+        auth_mode: LLMAuthMode,
+        provider_metadata: Mapping[str, Any] | None = None,
+    ) -> list[str] | None:
+        """List model IDs this OpenAI key can call.
+
+        Hits `GET /v1/models` with bearer auth. OpenAI org-level flags can
+        scope which models an API key sees (preview access, beta tiers,
+        fine-tuned models); the caller uses the result to skip accounts
+        that don't list a required model.
+
+        OAuth (Codex) mode: the ChatGPT-plan access token isn't generally
+        accepted on `/v1/models`, so we skip it and return None (unknown).
+        """
+        self.ensure_supported_auth_mode(auth_mode)
+        if auth_mode != LLMAuthMode.API_KEY or not secret:
+            return None
+        try:
+            import httpx
+        except ImportError:
+            logger.warning("[OPENAI] httpx unavailable; skipping list_available_models")
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=_MODEL_LISTING_TIMEOUT_SECONDS) as client:
+                resp = await client.get(
+                    _OPENAI_LIST_MODELS_URL,
+                    headers={"Authorization": f"Bearer {secret}"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:  # noqa: BLE001 — returning None is the contract
+            logger.info(
+                "[OPENAI] list_available_models failed: %s (returning None = unknown)",
+                exc,
+            )
+            return None
+
+        ids: list[str] = []
+        for entry in data.get("data") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            mid = entry.get("id")
+            if isinstance(mid, str) and mid:
+                ids.append(mid)
+        return sorted(set(ids))

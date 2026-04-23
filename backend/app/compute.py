@@ -13,7 +13,6 @@ import threading
 from collections import OrderedDict as _OrderedDict, deque as _deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +149,7 @@ AGENT_IMAGE_FAMILY = os.getenv("AGENT_IMAGE_FAMILY", f"projects/{GCP_PROJECT_ID}
 # Scripts baked into the startup script as base64 blobs. Loaded at module
 # import time so a missing file fails fast instead of during VM provisioning.
 # See backend/app/_agent_scripts/__init__.py for rationale.
-import base64 as _base64  # noqa: E402, PLC0415
+import base64 as _base64
 
 _AGENT_SCRIPTS_DIR = Path(__file__).parent / "_agent_scripts"
 _MATERIALIZE_MANIFEST_B64 = _base64.b64encode(
@@ -200,7 +199,7 @@ def _validate_image_family() -> None:
         logger.exception("[STARTUP] Image family validation failed")
         raise RuntimeError(f"AGENT_IMAGE_FAMILY '{AGENT_IMAGE_FAMILY}' not found: {e}")
 
-_image_family_valid: Optional[bool] = None  # None = not yet checked, True/False = result
+_image_family_valid: bool | None = None  # None = not yet checked, True/False = result
 _image_family_last_check: float = 0.0
 _IMAGE_FAMILY_RECHECK_INTERVAL: float = 300.0  # Retry validation every 5 min if failed
 
@@ -323,11 +322,22 @@ def build_agent_secret_manifest(
     # LLM_CLI_TRANSLATION env var; that signals to the agent that the backend
     # speaks the settings-bag protocol. Legacy env-var fallback is reserved
     # for backends that don't populate provider_settings at all (None).
+    #
+    # Inject the resolved `model` argument into the bag before translation
+    # when the bag didn't already carry one. Compatibility gates (OpenAI
+    # service_tier=flex, Gemini preview-access) key on the effective model,
+    # and resolve_task_provider_settings only populates `bag["model"]` when
+    # a layer explicitly set it — tier-mapped defaults take the separate
+    # `model` arg path. Without this merge, those gates would see None on
+    # the common "no explicit model, tier-mapped fallback" code path and
+    # fail closed on every invocation.
     cli_translation = None
     if provider_settings is not None:
-        cli_translation = provider_impl.settings_to_cli(provider_settings)
-        for material in cli_translation.settings_files:
-            files.append(material)
+        effective_bag: dict = dict(provider_settings)
+        if model and not effective_bag.get("model"):
+            effective_bag["model"] = model
+        cli_translation = provider_impl.settings_to_cli(effective_bag)
+        files.extend(cli_translation.settings_files)
 
     env = {
         "AGENT_SECRET_TOKEN": agent_jwt,
@@ -469,7 +479,7 @@ async def cleanup_orphaned_vms(active_vm_ids: list[str]):
     return await _cleanup_gcp(active_vm_ids)
 
 
-async def cleanup_old_images(keep: int, family: Optional[str] = None, project: Optional[str] = None, dry_run: bool = False) -> dict:
+async def cleanup_old_images(keep: int, family: str | None = None, project: str | None = None, dry_run: bool = False) -> dict:
     """Delete oldest custom images in `family`, retaining the `keep` most recent.
 
     GCP enforces a per-project image quota; without pruning, each Packer build leaves the
@@ -517,7 +527,7 @@ async def cleanup_old_images(keep: int, family: Optional[str] = None, project: O
             "would_delete": [im.name for im in to_delete],
         }
 
-    def _delete_one(name: str) -> Optional[str]:
+    def _delete_one(name: str) -> str | None:
         try:
             client = compute_v1.ImagesClient()
             client.delete(project=proj, image=name)
@@ -681,7 +691,7 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
     # IAM policy ETags and produce Aborted/409, which previously crashed VM
     # provisioning. Also short-circuits when the SA is already bound so reused
     # secrets don't accumulate duplicate bindings.
-    from google.api_core.exceptions import Aborted  # noqa: PLC0415
+    from google.api_core.exceptions import Aborted
     agent_sa_member = f"serviceAccount:{AGENT_SERVICE_ACCOUNT_EMAIL}"
     max_retries = 5
     for attempt in range(max_retries):
@@ -1696,7 +1706,7 @@ def record_zone_failure(zone: str, reason: str = "HEARTBEAT_STARVATION") -> None
         )
 
 
-def soonest_zone_recovery() -> Optional[datetime]:
+def soonest_zone_recovery() -> datetime | None:
     """Return the earliest zone cooldown expiry, or None if a zone is available."""
     now = datetime.now(timezone.utc)
     soonest = None

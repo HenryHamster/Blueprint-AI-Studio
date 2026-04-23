@@ -629,6 +629,13 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
 
     # External API failures — GitHub, Claude API outages, DNS/TLS/network errors.
     # Also catches branch creation failures (GitHub API errors from _ensure_branch).
+    # Provider model-config rejections (model-not-found, unsupported service_tier,
+    # unsupported-auth-for-model) land here too: they're upstream 400s on the
+    # provider's model surface, not code defects, so we don't want them
+    # penalizing direction health or triggering code-defect investigations.
+    # The OpenAI/Gemini adapters gate known-bad combinations at settings_to_cli
+    # time, but the classifier is the last line of defense if a new
+    # incompatibility lands before the gate list is updated.
     if ("failed to create" in combined and "branch" in combined) or \
        any(kw in combined for kw in ["api.github.com", "api.anthropic.com",
                                       "500 internal server error",
@@ -643,7 +650,14 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
                                       "rollup pr creation failed",
                                       "staging branch",
                                       "401", "unauthorized", "bad credentials",
-                                      "token expired", "token invalid", "token revoked"]):
+                                      "token expired", "token invalid", "token revoked",
+                                      # Provider model/config rejections — upstream 400s, not code defects.
+                                      "modelnotfounderror",
+                                      "model not found",
+                                      "is not found for api version",
+                                      "is not supported for generatecontent",
+                                      "unsupported service_tier",
+                                      "unsupported value: 'service_tier'"]):
         return "EXTERNAL_API"
 
     # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM.

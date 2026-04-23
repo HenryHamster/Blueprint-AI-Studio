@@ -222,6 +222,16 @@ class TestClassifyFailureExternalApi:
         "Bad credentials returned from GitHub",
         "token expired",
         "Error: Overloaded",
+        # Provider model-config rejections — upstream 400s (not code defects,
+        # not rate limits, not auth failures). Our OpenAI/Gemini adapter
+        # gates known-bad combos at settings_to_cli but the classifier is
+        # the safety net for unknown incompatibilities that slip through.
+        "ModelNotFoundError: models/gemini-3.1-flash-preview is not found for API version v1beta",
+        "model not found: gpt-5-experimental",
+        "is not found for API version v1beta, or is not supported for generateContent",
+        "is not supported for generateContent",
+        "Unsupported service_tier: flex",
+        "400: Unsupported value: 'service_tier' does not support 'flex' with this model",
     ])
     def test_external_api_keywords(self, msg):
         assert classify_failure(_task(msg)) == EXTERNAL_API

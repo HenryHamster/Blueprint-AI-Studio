@@ -278,13 +278,61 @@ async def add_max_plan_account(
     async with _max_plan_pool_lock:
         _max_plan_pools.setdefault(current_user["user_id"], []).append(entry)
         _account_by_id[str(db_account.id)] = entry
+
+    # Kick off an availability probe in the background so the operator gets
+    # the visible-models list on this key populated automatically — no need
+    # to remember to click "refresh" after each add. Best-effort: any failure
+    # just stashes an error string; the admin UI can retry via the explicit
+    # refresh endpoint.
+    await _best_effort_refresh_availability(entry, db_account.id, normalized_secret)
+
     return {
         "id": str(db_account.id),
         "name": db_account.name,
         "provider": db_account.provider.value,
         "auth_mode": db_account.auth_mode.value,
+        "available_models": (entry.get("provider_metadata") or {}).get("available_models"),
         "message": "Account added to pool",
     }
+
+
+async def _best_effort_refresh_availability(
+    mem_account: Dict[str, Any],
+    account_uuid: uuid.UUID,
+    secret: str | None,
+) -> None:
+    """Refresh `available_models` on a freshly created/updated account.
+
+    Runs inline (not a background task) so the admin sees the result in the
+    add-account response — tempting to fire-and-forget but a 5s network call
+    is acceptable here and avoids task-lifetime / connection-pool weirdness.
+    Failures are swallowed: the stored error string and timestamp on
+    provider_metadata are the operator-facing signal.
+    """
+    from app.account_model_availability import refresh_account_available_models
+    from app.database import AsyncSessionLocal
+
+    try:
+        await refresh_account_available_models(mem_account, secret=secret)
+    except Exception:
+        logger.exception("[POOL] availability refresh raised unexpectedly; continuing")
+        return
+
+    # Persist whatever landed on mem_account back to the DB row.
+    metadata = mem_account.get("provider_metadata") or {}
+    try:
+        async with AsyncSessionLocal() as persist_session:
+            row = await persist_session.get(MaxPlanAccount, account_uuid)
+            if row is not None:
+                row.provider_metadata = dict(metadata) or None
+                row.updated_at = _utcnow()
+                persist_session.add(row)
+                await persist_session.commit()
+    except Exception:
+        logger.exception(
+            "[POOL] persisting availability metadata failed for account %s; "
+            "keeping in-memory copy only", account_uuid,
+        )
 
 
 @router.delete("/max-plan-accounts/{account_id}")
@@ -475,6 +523,20 @@ async def update_max_plan_account(
                     db_account.token_created_at.isoformat() if db_account.token_created_at else None
                 )
 
+    # When the secret/provider/auth-mode change, the prior availability snapshot
+    # is no longer valid — re-probe so the dispatcher's filter stays accurate.
+    secret_or_identity_changed = (
+        normalized_secret is not None
+        or "provider" in payload
+        or "auth_mode" in payload
+    )
+    if secret_or_identity_changed and mem_account is not None:
+        await _best_effort_refresh_availability(
+            mem_account,
+            db_account.id,
+            normalized_secret or mem_account.get("runtime_secret"),
+        )
+
     return {
         "id": account_id,
         "name": db_account.name,
@@ -484,6 +546,7 @@ async def update_max_plan_account(
         "daily_task_cap": db_account.daily_task_cap,
         "max_concurrent_tasks": db_account.max_concurrent_tasks,
         "auto_disable_after_rate_limits": db_account.auto_disable_after_rate_limits,
+        "available_models": ((mem_account or {}).get("provider_metadata") or {}).get("available_models") if mem_account else None,
     }
 
 
@@ -526,3 +589,75 @@ async def reset_account_rate_limits(
 
     logger.info(f"[POOL] Rate-limit state reset for account {db_account.name} ({account_id}) by user {current_user['user_id']}")
     return {"message": f"Rate-limit state cleared for account {db_account.name}"}
+
+
+@router.post("/max-plan-accounts/{account_id}/refresh-models")
+@limiter.limit("10/minute")
+async def refresh_account_model_availability(
+    request: Request,
+    account_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Probe the provider's list-models endpoint for this account and cache
+    the visible-models list on ``provider_metadata``.
+
+    Operator-facing: the refresh is rate-limited and bypasses the background
+    sweep, so admins can trigger a fresh check right after adding a key.
+    Returns the matrix: available_models, refreshed_at, error (if any),
+    plus ``known_preview`` (models the provider family recognizes as preview
+    — useful for "which preview models does this key cover?" UI).
+    """
+    from app.account_model_availability import refresh_account_available_models
+    from app.max_plan_pool import _account_by_id, _max_plan_pool_lock
+    from app.providers.gemini import _GEMINI_PREVIEW_MODELS
+
+    try:
+        acct_uuid = uuid.UUID(account_id)
+    except ValueError as exc:
+        raise _bad_request("Invalid account ID") from exc
+
+    db_account = await session.get(MaxPlanAccount, acct_uuid)
+    if not db_account or db_account.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    mem_account = _account_by_id.get(account_id)
+    if not mem_account:
+        raise HTTPException(status_code=409, detail="Account not loaded in pool; restart or re-add")
+
+    # The in-memory account carries `runtime_secret` — the raw secret or a
+    # Secret-Manager-resolved string, populated at pool load. When that's None
+    # (Secret Manager fetch failed at load), refresh_account_available_models
+    # stashes an error and returns None rather than blindly trying to use the
+    # secret_blob_ref which would typically be a `projects/.../secrets/...`
+    # path, not the key itself.
+    runtime_secret = mem_account.get("runtime_secret")
+    models = await refresh_account_available_models(mem_account, secret=runtime_secret)
+
+    # Persist whatever landed on the in-memory dict (could be a fresh list,
+    # could be just an error stash) back to the DB row. We do this even on
+    # None result so the `available_models_error` string reaches operators.
+    updated_metadata = mem_account.get("provider_metadata") or {}
+    async with _max_plan_pool_lock:
+        db_account.provider_metadata = dict(updated_metadata) or None
+        db_account.updated_at = _utcnow()
+        session.add(db_account)
+        await session.commit()
+
+    known_preview = sorted(
+        m for m in (models or []) if m in _GEMINI_PREVIEW_MODELS
+    ) if db_account.provider == LLMProviderName.GEMINI else []
+
+    logger.info(
+        "[POOL] refresh-models for account %s: %s",
+        account_id,
+        f"{len(models)} models" if models is not None else f"failed ({updated_metadata.get('available_models_error')})",
+    )
+
+    return {
+        "id": account_id,
+        "available_models": updated_metadata.get("available_models"),
+        "refreshed_at": updated_metadata.get("available_models_refreshed_at"),
+        "error": updated_metadata.get("available_models_error"),
+        "known_preview_models_visible": known_preview,
+    }

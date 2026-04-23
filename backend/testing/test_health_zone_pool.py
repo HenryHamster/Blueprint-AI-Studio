@@ -10,7 +10,6 @@ from datetime import datetime, timedelta, timezone
 from httpx import AsyncClient, ASGITransport
 
 import app.shared_state as _shared_state
-import app.main as _main_module
 import app.orchestrator as _orch_module
 from app.main import app
 from app.max_plan_pool import (
@@ -956,6 +955,38 @@ class TestCircuitBreaker:
     def test_state_healthy_with_no_disables(self, clean_max_plan_pool):
         acct = {"id": "a1", "name": "clean", "enabled": True, "oauth_token": "sk-ant-test"}
         assert _account_state_for_model(acct, OPUS) == "healthy"
+
+    def test_state_unavailable_when_availability_excludes_model(self, clean_max_plan_pool):
+        """account_has_model returns False (confirmed not in visible-models)
+        → skip the account for this model so dispatch doesn't 404."""
+        acct = {
+            "id": "a1", "name": "gemini-ga-only", "enabled": True,
+            "oauth_token": "AIza-x",
+            "provider_metadata": {
+                "available_models": ["gemini-2.5-pro", "gemini-2.5-flash"],
+            },
+        }
+        assert _account_state_for_model(acct, "gemini-3.1-pro-preview") == "unavailable"
+
+    def test_state_healthy_when_availability_includes_model(self, clean_max_plan_pool):
+        acct = {
+            "id": "a1", "name": "preview-ok", "enabled": True,
+            "oauth_token": "AIza-x",
+            "provider_metadata": {
+                "available_models": ["gemini-2.5-pro", "gemini-3.1-pro-preview"],
+            },
+        }
+        assert _account_state_for_model(acct, "gemini-3.1-pro-preview") == "healthy"
+
+    def test_state_healthy_when_availability_unknown(self, clean_max_plan_pool):
+        """Unknown availability must NOT skip — fail open. Otherwise a failed
+        refresh would starve every account that wasn't probed yet."""
+        acct = {
+            "id": "a1", "name": "not-probed", "enabled": True,
+            "oauth_token": "AIza-x",
+            "provider_metadata": {},  # no available_models key
+        }
+        assert _account_state_for_model(acct, "gemini-3.1-pro-preview") == "healthy"
 
     def test_state_unavailable_within_cooldown(self, clean_max_plan_pool):
         # hits=1 → 30min cooldown. 10 min ago → still cooling.

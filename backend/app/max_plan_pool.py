@@ -14,7 +14,7 @@ import logging
 import random
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Mapping
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -248,7 +248,7 @@ def _ensure_migrated(runtime_config: Mapping[str, Any]) -> Mapping[str, Any]:
     )
     if has_new or not has_legacy:
         return runtime_config
-    from app.shared_state import _migrate_legacy_provider_config  # noqa: PLC0415
+    from app.shared_state import _migrate_legacy_provider_config
     return _migrate_legacy_provider_config(dict(runtime_config))
 
 
@@ -743,11 +743,26 @@ def _account_state_for_model(acct: dict, model: str | None, now: datetime | None
     state. The mark path (agent_status.py) writes all cascade entries up-front
     (Opus 429 → opus, sonnet, haiku entries); the clear path (on success)
     removes the cascade scope. Each entry is independent.
+
+    Also skips accounts that are confirmed NOT to have the requested model
+    via the availability cache (e.g. Gemini preview access isn't enabled on
+    this key). Accounts with unknown availability (never probed or probe
+    failed) are treated as may-have-access and go through the normal
+    healthy/probing path — we fail open so a failed refresh doesn't starve
+    a key that actually works.
     """
     if not _account_runtime_ready(acct):
         return "unavailable"
     if not acct.get("enabled", True):
         return "unavailable"
+    # Availability filter: only consult when we have a concrete model.
+    # account_has_model returns True, False, or None (unknown); False is
+    # the only value that forces a skip.
+    if model is not None:
+        from app.account_model_availability import account_has_model
+
+        if account_has_model(acct, model) is False:
+            return "unavailable"
     dm = acct.get("disabled_models") or {}
     if not dm:
         return "healthy"
@@ -847,6 +862,48 @@ def _extract_task_model(task: Any) -> str | None:
     if payloads:
         return payloads[0].get("model")
     return None
+
+
+def _record_model_fallback(
+    task: Any,
+    *,
+    requested: str,
+    effective: str,
+    provider_name: str,
+    reason: str,
+) -> None:
+    """Record a preview→GA (or equivalent) model fallback on task.context.
+
+    Written at dispatch when the pool had no account with access to the
+    requested model and the provider exposes a fallback. Keeps the record
+    visible in the admin UI and in the task's context audit trail so a
+    silently-downgraded task doesn't confuse an operator expecting preview
+    output quality.
+
+    Shape:
+        context.model_fallback = {
+            "requested": "gemini-3.1-pro-preview",
+            "effective": "gemini-2.5-pro",
+            "provider": "gemini",
+            "reason": "no_account_with_preview_access",
+            "at": "2026-04-22T14:53:00+00:00",
+        }
+    """
+    try:
+        ctx = dict(getattr(task, "context", {}) or {})
+        ctx["model_fallback"] = {
+            "requested": requested,
+            "effective": effective,
+            "provider": provider_name,
+            "reason": reason,
+            "at": _utcnow().isoformat(),
+        }
+        task.context = ctx
+    except Exception:
+        logger.exception(
+            "[LLM_SELECT] Failed to record model_fallback on task %s",
+            getattr(task, "id", "?"),
+        )
 
 
 def resolve_task_quality_tier(task: Any, runtime_config: Mapping[str, Any]) -> str:
@@ -1066,6 +1123,33 @@ async def select_llm_runtime_for_task(
     quality_tier = resolve_task_quality_tier(task, runtime_config)
     explicit_provider = get_task_llm_provider(task) or infer_provider_for_model(explicit_model, runtime_config)
 
+    # If the inferred explicit_provider isn't allowed by the resolved
+    # routing, drop the pin so category_routing wins. Catches:
+    #   - legacy payload hints (research findings historically embedded
+    #     "model": "claude-opus-4-7" which anchored children to anthropic
+    #     regardless of user config)
+    #   - stale ctx.llm_provider from a prior claim after the operator
+    #     changed provider_preference
+    # User-explicit pins still work: if they set payload.provider_preference
+    # to include anthropic, it stays in the preference list.
+    if (
+        explicit_provider
+        and provider_preference
+        and explicit_provider not in provider_preference
+    ):
+        logger.info(
+            f"[LLM_SELECT] Dropping explicit model pin "
+            f"(model={explicit_model}, inferred_provider={explicit_provider}) "
+            f"— not in routing preference={provider_preference}. "
+            f"Falling back to routing-based selection."
+        )
+        explicit_model = None
+        explicit_provider = None
+        if model_preferences:
+            model_preferences = [
+                p for p in model_preferences if p.get("provider") in provider_preference
+            ]
+
     if not allow_fallback:
         if model_preferences:
             model_preferences = model_preferences[:1]
@@ -1170,6 +1254,43 @@ async def select_llm_runtime_for_task(
                 account=account,
                 settings=resolve_task_provider_settings(task, runtime_config, provider_name),
             )
+
+        # Preview→GA fallback: if the requested model has a GA counterpart
+        # (e.g. gemini-3.1-pro-preview → gemini-2.5-pro) and no account had
+        # preview access for the requested one, try the counterpart before
+        # moving on to the next provider. Recorded on task.context so the
+        # admin UI / logs surface the downgrade explicitly — silently
+        # running a different tier than the user asked for is a trust-losing
+        # failure mode.
+        fallback = provider.fallback_model(model)
+        if fallback and fallback != model:
+            account = await select_max_plan_account(
+                user_id=user_id,
+                model=fallback,
+                blacklist=blacklist,
+                provider=provider_name,
+            )
+            if account:
+                logger.warning(
+                    "[LLM_SELECT] No pool account has %s; falling back to GA "
+                    "counterpart %s on %s. Recorded on task.context.model_fallback.",
+                    model, fallback, provider_name,
+                )
+                _record_model_fallback(
+                    task,
+                    requested=model,
+                    effective=fallback,
+                    provider_name=provider_name,
+                    reason="no_account_with_preview_access",
+                )
+                return LLMSelectionResult(
+                    provider=provider_name,
+                    auth_mode=_normalize_auth_mode(account.get("auth_mode")) or LLMAuthMode.OAUTH.value,
+                    model=fallback,
+                    quality_tier=quality_tier,
+                    account=account,
+                    settings=resolve_task_provider_settings(task, runtime_config, provider_name),
+                )
 
     if explicit_provider and explicit_model:
         return LLMSelectionResult(
