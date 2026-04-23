@@ -638,9 +638,20 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
     # "provision" is matched via _PROVISION_PHRASE_RE so benign mentions like
     # "No heartbeat received after 300s since provisioning" (heartbeat timeout, not
     # provision failure) don't get misclassified.
+    #
+    # NOTE: Bare "quota" used to be in this bank, but it's far too greedy —
+    # Gemini/OpenAI/Anthropic quota-exhausted errors also contain "quota"
+    # and were being misclassified as PROVISION_FAILURE, which bypasses
+    # the rate-limit requeue path in agent_status.py (RATE_LIMIT/
+    # EXTERNAL_API get no-retry-burn requeue; PROVISION_FAILURE burns
+    # attempt_count). Result: a Gemini daily-quota hit would eat all 3
+    # retries in one sitting. Rely on the specific GCP quota keywords
+    # (cpus_all_regions, in_use_addresses) and `compute.googleapis.com`
+    # for actual provisioning-quota errors; LLM-provider quota errors
+    # fall through to the rate-limit signal detection below.
     if _PROVISION_PHRASE_RE.search(combined) or any(
         kw in combined for kw in [
-            "quota", "cpus_all_regions", "in_use_addresses",
+            "cpus_all_regions", "in_use_addresses",
             "vm failed to start",
             "connection refused", "connection reset by peer",
             "timed out waiting for operation", "sshd", "startup script",

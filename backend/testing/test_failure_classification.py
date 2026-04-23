@@ -293,6 +293,44 @@ class TestClassifyFailureRateLimit:
         Claude phrases may disable the account."""
         assert classify_failure(_task("HTTP 429 from upstream service")) == CODE_ERROR
 
+    def test_gemini_daily_quota_exhaustion_not_misclassified_as_provision(self):
+        """Regression: Gemini CLI quota-exhaustion was being misclassified as
+        PROVISION_FAILURE because the provision bank contained a bare 'quota'
+        keyword that shadowed LLM-provider quota errors. That bypassed the
+        rate-limit requeue path in agent_status.py and burned attempt_count,
+        permanently failing the task after 3 retries instead of waiting out
+        the provider's cooldown window."""
+        # Verbatim Gemini CLI TerminalQuotaError body (with cause.message).
+        gemini_err = (
+            "TerminalQuotaError: You have exhausted your daily quota on this model. "
+            "You exceeded your current quota, please check your plan and billing details. "
+            "Quota exceeded for metric: generativelanguage.googleapis.com/"
+            "generate_requests_per_model_per_day, limit: 250, model: gemini-3.1-pro. "
+            "Please retry in 27m12s."
+        )
+        # Must NOT be PROVISION_FAILURE (that's GCP compute-quota territory).
+        task = _task(
+            gemini_err,
+            ctx={"llm_provider": "gemini", "llm_auth_mode": "api_key"},
+        )
+        result = classify_failure(task, logs=gemini_err)
+        assert result != PROVISION_FAILURE, (
+            "Gemini quota-exhausted must not route through PROVISION_FAILURE "
+            "(which burns retries); expected RATE_LIMIT or EXTERNAL_API."
+        )
+
+    def test_openai_quota_phrase_not_misclassified_as_provision(self):
+        """Same regression for OpenAI's quota bodies — they include the
+        generic phrase 'You exceeded your current quota' that was eaten by
+        the bare 'quota' match in the provision bank."""
+        openai_err = (
+            "Error: 429 You exceeded your current quota, please check your plan "
+            "and billing details."
+        )
+        task = _task(openai_err, ctx={"llm_provider": "openai", "llm_auth_mode": "api_key"})
+        result = classify_failure(task, logs=openai_err)
+        assert result != PROVISION_FAILURE
+
 
 class TestClassifyFailureScopeOverflow:
     def test_agent_reported_scope_overflow(self):
