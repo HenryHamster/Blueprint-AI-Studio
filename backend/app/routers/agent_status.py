@@ -61,8 +61,24 @@ router = APIRouter()
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
 
 
-def record_task_result(success: bool, failure_class: str = "", task_id: str = "", task_type: str = ""):
-    """Record a task result for deployment monitoring. Deduplicates by task_id."""
+def record_task_result(
+    success: bool,
+    failure_class: str = "",
+    task_id: str = "",
+    task_type: str = "",
+    task_context: dict | None = None,
+):
+    """Record a task result for deployment monitoring. Deduplicates by task_id.
+
+    When `task_context` carries `auto_remediation: True`, the recorded
+    task_type is overridden to `auto_remediation` so these tasks don't
+    pollute the per-type failure-rate gate on their underlying type
+    (typically `create`). Auto-remediation tasks have a fundamentally
+    different risk profile — they're spawned to fix known-broken code on
+    main, so their failure rate is expected to run higher than fresh
+    feature work. Bundling them into the generic `create` bucket
+    cascades those failures into a gate that blocks normal create tasks.
+    """
     from app.shared_state import deploy_monitoring
     # Deduplicate: only record one result per task
     if task_id:
@@ -72,6 +88,10 @@ def record_task_result(success: bool, failure_class: str = "", task_id: str = ""
         # Keep the set bounded
         if len(_recorded_task_ids) > 200:
             _recorded_task_ids.clear()
+
+    # Override the bucket when the task was auto-spawned remediation.
+    if task_context and task_context.get("auto_remediation"):
+        task_type = "auto_remediation"
 
     entry = (_utcnow().isoformat(), "success" if success else "failure", failure_class, task_type)
     deploy_monitoring["task_results"].append(entry)  # deque(maxlen=100) handles cap automatically
@@ -868,7 +888,7 @@ async def update_agent_status(
             _direction_id = str((task.context or {}).get("direction_id") or "")
             _project_id = str(task.project_id) if task.project_id else ""
             if payload.status == TaskStatus.COMPLETED:
-                record_task_result(success=True, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
+                record_task_result(success=True, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}))
                 _shared_state.tasks_completed_total += 1
                 if _direction_id:
                     _shared_state.record_direction_result(
@@ -893,7 +913,7 @@ async def update_agent_status(
                 failure_class = classify_failure(task, payload.logs)
                 from app.failure_classification import persist_failure_category  # noqa: PLC0415
                 persist_failure_category(task, failure_class)
-                record_task_result(success=False, failure_class=failure_class, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
+                record_task_result(success=False, failure_class=failure_class, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}))
                 _shared_state.tasks_failed_total += 1
                 if _direction_id:
                     _shared_state.record_direction_result(

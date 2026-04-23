@@ -581,7 +581,7 @@ async def _attempt_merge_with_retry_and_escalation(
                 from app.shared_state import record_direction_result  # noqa: PLC0415
                 _fc = classify_failure(task)
                 persist_failure_category(task, _fc)
-                record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
+                record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}))
                 _direction_id = str((task.context or {}).get("direction_id") or "")
                 if _direction_id:
                     record_direction_result(

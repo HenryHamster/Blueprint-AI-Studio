@@ -1460,12 +1460,38 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
     call — the highest-count fingerprint whose per-project cooldown has expired.
     The cooldown (default 24 h, configurable via residual_remediation_cooldown_hours)
     prevents re-spawning while a prior remediation is still live or recently merged.
+
+    Global concurrency cap: if there are already `max_concurrent_auto_remediations`
+    (default 2) auto-remediation tasks active or queued, skip spawning. Prevents
+    the queue from ballooning when many distinct fingerprints accumulate, e.g.
+    when an ambient bug on main causes every task to fail in a slightly
+    different place and each surface-level error gets its own fingerprint.
+
     Returns the number of tasks spawned (0 or 1).
     """
     from app.failure_classification import get_top_residual_fingerprints  # noqa: PLC0415
+    from sqlalchemy import cast, func, select, String  # noqa: PLC0415
 
     fingerprints = get_top_residual_fingerprints(window_seconds=86400, top_n=10)
     if not fingerprints:
+        return 0
+
+    # Global cap check. Active = QUEUED | PROVISIONING | IN_PROGRESS tasks
+    # whose context marks them as auto_remediation. Reading from JSONB with
+    # a cast to text + containment works across PG / SQLite fixtures.
+    max_concurrent = int(_runtime_config.get("max_concurrent_auto_remediations", 2))
+    active_stmt = select(func.count()).select_from(Task).where(
+        Task.project_id == project.id,
+        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+        cast(Task.context, String).like('%"auto_remediation": true%'),
+    )
+    active_count = (await session.execute(active_stmt)).scalar() or 0
+    if active_count >= max_concurrent:
+        logger.info(
+            "[AUTO REMEDIATION] %d active/queued auto-remediation task(s) "
+            "already at or above cap (%d); skipping spawn (project %s).",
+            active_count, max_concurrent, project.id,
+        )
         return 0
 
     cooldown_hours = _runtime_config.get("residual_remediation_cooldown_hours", 24)
