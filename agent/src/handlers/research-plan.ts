@@ -4,6 +4,7 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
   persistAndPostStatus, cloneWithRetry, runClaudeCode,
+  getProviderRunner,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { extractJsonObject, extractJsonArray } from '../json-extract.js';
@@ -686,7 +687,7 @@ Rules:
 
 ${DEFAULT_TOOL_GUIDANCE}`;
 
-  statusRef.value = 'Running Claude Code for planning...';
+  statusRef.value = `Running ${getProviderRunner().displayName} for planning...`;
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef, model, effort, disallowedTools);
 
   // Prefer reading plan from /tmp/ file (avoids output truncation), fall back to output parsing

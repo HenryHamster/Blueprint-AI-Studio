@@ -5,6 +5,7 @@ import {
   persistAndPostStatus, git, gitCommit, setupWorkspace, pushAndCreatePR,
   runClaudeCode, lintFixLoop, testFixLoop, captureTestBaseline, matchesRateLimit,
   runProjectLintChecks, condensedAnalysisSections, sendHeartbeatSync,
+  getProviderRunner,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
@@ -411,7 +412,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   const finalPromptWithTree = fileTree + analysisContext + finalPrompt;
 
-  statusRef.value = 'Running Claude Code...';
+  statusRef.value = `Running ${getProviderRunner().displayName}...`;
   // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
   const baseCommit = git(['rev-parse', 'HEAD']);
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(finalPromptWithTree, ws, statusRef, model, effort, disallowedTools);
