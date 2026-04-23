@@ -1037,3 +1037,120 @@ async def test_auto_archive_skips_non_terminal(svc_db):
 
     await svc_db.refresh(queued)
     assert queued.archived is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cleanup_old_images — image family pruner
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _mk_image(name: str, ts: str):
+    """Lightweight stand-in for google.cloud.compute_v1.Image — just needs .name/.creation_timestamp."""
+    im = MagicMock()
+    im.name = name
+    im.creation_timestamp = ts
+    return im
+
+
+@pytest.mark.asyncio
+async def test_cleanup_old_images_deletes_oldest_beyond_keep(mocker):
+    """cleanup_old_images should delete only images past the keep-N boundary, newest-first sort."""
+    from app import compute as _compute
+
+    images = [
+        _mk_image("img-2026-04-15", "2026-04-15T10:00:00.000-00:00"),
+        _mk_image("img-2026-04-10", "2026-04-10T10:00:00.000-00:00"),
+        _mk_image("img-2026-04-05", "2026-04-05T10:00:00.000-00:00"),
+        _mk_image("img-2026-04-01", "2026-04-01T10:00:00.000-00:00"),
+        _mk_image("img-2026-03-25", "2026-03-25T10:00:00.000-00:00"),
+    ]
+    mock_client = MagicMock()
+    mock_client.list.return_value = iter(images)
+    mock_client.delete = MagicMock(return_value=None)
+    mocker.patch("google.cloud.compute_v1.ImagesClient", return_value=mock_client)
+    mocker.patch.object(_compute, "LOCAL_MODE", False)
+
+    result = await _compute.cleanup_old_images(keep=2, family="blueprint-agent", project="my-proj")
+
+    assert result["total"] == 5
+    assert result["kept"] == 2
+    assert result["deleted"] == 3
+    assert result["failed"] == []
+    deleted_names = sorted([c.kwargs["image"] for c in mock_client.delete.call_args_list])
+    assert deleted_names == ["img-2026-03-25", "img-2026-04-01", "img-2026-04-05"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_old_images_noop_when_at_or_below_keep(mocker):
+    """If total images <= keep, no delete calls should fire."""
+    from app import compute as _compute
+
+    mock_client = MagicMock()
+    mock_client.list.return_value = iter([
+        _mk_image("img-1", "2026-04-15T10:00:00.000-00:00"),
+        _mk_image("img-2", "2026-04-10T10:00:00.000-00:00"),
+    ])
+    mock_client.delete = MagicMock()
+    mocker.patch("google.cloud.compute_v1.ImagesClient", return_value=mock_client)
+    mocker.patch.object(_compute, "LOCAL_MODE", False)
+
+    result = await _compute.cleanup_old_images(keep=5, family="blueprint-agent", project="my-proj")
+
+    assert result["deleted"] == 0
+    assert result["kept"] == 2
+    mock_client.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_old_images_dry_run_does_not_delete(mocker):
+    """dry_run=True must return the planned list but never call delete."""
+    from app import compute as _compute
+
+    images = [_mk_image(f"img-{i}", f"2026-04-{i:02d}T10:00:00.000-00:00") for i in range(1, 6)]
+    mock_client = MagicMock()
+    mock_client.list.return_value = iter(images)
+    mock_client.delete = MagicMock()
+    mocker.patch("google.cloud.compute_v1.ImagesClient", return_value=mock_client)
+    mocker.patch.object(_compute, "LOCAL_MODE", False)
+
+    result = await _compute.cleanup_old_images(keep=2, family="blueprint-agent", project="my-proj", dry_run=True)
+
+    assert result["dry_run"] is True
+    assert result["deleted"] == 0
+    assert len(result["would_delete"]) == 3
+    mock_client.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_old_images_rejects_keep_less_than_one():
+    """keep < 1 must raise — we must retain at least one image for VM provisioning."""
+    from app import compute as _compute
+
+    with pytest.raises(ValueError):
+        await _compute.cleanup_old_images(keep=0, family="blueprint-agent", project="my-proj")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_old_images_collects_per_image_failures(mocker):
+    """A delete failure on one image must not abort the sweep; failures are aggregated."""
+    from app import compute as _compute
+
+    images = [_mk_image(f"img-{i}", f"2026-04-{i:02d}T10:00:00.000-00:00") for i in range(1, 6)]
+    mock_client = MagicMock()
+    mock_client.list.return_value = iter(images)
+
+    def _delete_side_effect(**kwargs):
+        if kwargs["image"] == "img-2":  # one of the images we expect to delete
+            raise RuntimeError("permissionDenied")
+        return None
+
+    mock_client.delete = MagicMock(side_effect=_delete_side_effect)
+    mocker.patch("google.cloud.compute_v1.ImagesClient", return_value=mock_client)
+    mocker.patch.object(_compute, "LOCAL_MODE", False)
+
+    result = await _compute.cleanup_old_images(keep=2, family="blueprint-agent", project="my-proj")
+
+    assert result["deleted"] == 2
+    assert len(result["failed"]) == 1
+    assert result["failed"][0]["name"] == "img-2"
+    assert "permissionDenied" in result["failed"][0]["error"]

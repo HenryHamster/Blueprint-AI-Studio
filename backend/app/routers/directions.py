@@ -579,11 +579,12 @@ async def trigger_strategic_cycle(
         }
         title = f"Architecture review: {project.name}"
     elif phase == "strategic_review":
-        # Build direction stats
+        # Build direction stats — include both active and proposed so the
+        # strategic agent can approve/reject pending proposals.
         from app.strategic_analysis import _build_outcome_evaluation
-        all_active = [d for d in (project.directions or []) if d.get("status") == "active"]
+        reviewable = [d for d in (project.directions or []) if d.get("status") in ("active", "proposed")]
         direction_stats = []
-        for d in all_active:
+        for d in reviewable:
             history = d.get("research_history", [])
             agg = d.get("history_aggregate", {})
             total_cycles = len(history) + (agg.get("total_cycles") or 0)
@@ -598,6 +599,13 @@ async def trigger_strategic_cycle(
                 stat["completion_criteria"] = d["completion_criteria"]
             if d.get("category"):
                 stat["category"] = d["category"]
+            if d.get("status") == "proposed":
+                if d.get("proposed_by"):
+                    stat["proposed_by"] = str(d["proposed_by"])
+                if d.get("proposal_rationale"):
+                    stat["proposal_rationale"] = d["proposal_rationale"]
+                if d.get("proposed_at"):
+                    stat["proposed_at"] = d["proposed_at"]
             direction_stats.append(stat)
         # Unified conversation thread — last 30 messages chronologically
         thread_result = await session.execute(

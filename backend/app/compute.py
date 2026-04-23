@@ -469,6 +469,75 @@ async def cleanup_orphaned_vms(active_vm_ids: list[str]):
     return await _cleanup_gcp(active_vm_ids)
 
 
+async def cleanup_old_images(keep: int, family: Optional[str] = None, project: Optional[str] = None, dry_run: bool = False) -> dict:
+    """Delete oldest custom images in `family`, retaining the `keep` most recent.
+
+    GCP enforces a per-project image quota; without pruning, each Packer build leaves the
+    previous images behind and eventually provisioning fails with quota errors. This function
+    lists images in the family sorted by creationTimestamp and issues delete for everything
+    past the `keep` boundary. Running VMs already booted from those images are unaffected —
+    Compute Engine only references the source image at instance-create time.
+
+    Returns a dict with: total (in family), deleted (count), kept, failed, dry_run.
+    """
+    if keep < 1:
+        raise ValueError("keep must be >= 1 (must retain at least one image for VM provisioning)")
+    if LOCAL_MODE:
+        return {"total": 0, "deleted": 0, "kept": 0, "failed": [], "dry_run": dry_run, "skipped": "local_mode"}
+
+    from google.cloud import compute_v1
+
+    fam_input = family or AGENT_IMAGE_FAMILY
+    fam_name = fam_input.split("/")[-1]
+    proj = project or GCP_PROJECT_ID
+    if fam_input.startswith("projects/"):
+        parts = fam_input.split("/")
+        proj = parts[1]
+
+    def _list_and_sort():
+        client = compute_v1.ImagesClient()
+        # Filter by family; API does not accept server-side sort, so we sort locally.
+        req = compute_v1.ListImagesRequest(project=proj, filter=f"family={fam_name}")
+        images = list(client.list(request=req))
+        # Newest first (ISO-8601 timestamps sort lexically).
+        images.sort(key=lambda im: im.creation_timestamp or "", reverse=True)
+        return images
+
+    images = await asyncio.to_thread(_list_and_sort)
+    total = len(images)
+    if total <= keep:
+        return {"total": total, "deleted": 0, "kept": total, "failed": [], "dry_run": dry_run}
+
+    to_delete = images[keep:]
+    failed: list[dict] = []
+
+    if dry_run:
+        return {
+            "total": total, "deleted": 0, "kept": keep, "failed": [], "dry_run": True,
+            "would_delete": [im.name for im in to_delete],
+        }
+
+    def _delete_one(name: str) -> Optional[str]:
+        try:
+            client = compute_v1.ImagesClient()
+            client.delete(project=proj, image=name)
+            return None
+        except Exception as e:
+            return str(e)[:300]
+
+    deleted = 0
+    for im in to_delete:
+        err = await asyncio.to_thread(_delete_one, im.name)
+        if err:
+            failed.append({"name": im.name, "error": err})
+            logger.warning(f"[IMAGE CLEANUP] Failed to delete {im.name}: {err}")
+        else:
+            deleted += 1
+            logger.info(f"[IMAGE CLEANUP] Deleted {im.name}")
+
+    return {"total": total, "deleted": deleted, "kept": keep, "failed": failed, "dry_run": False}
+
+
 # ─── Local Mode Implementation ──────────────────────────────────────────────
 
 async def _provision_local(

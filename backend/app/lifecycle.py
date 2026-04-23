@@ -58,7 +58,7 @@ async def lifespan(app):
         _send_webhook_notification,
     )
     from app.reaper import reaper_service
-    from app.services import gcp_cleanup_service, secret_reconciliation_service, stale_branch_cleanup_service, auto_archive_service
+    from app.services import gcp_cleanup_service, gcp_image_cleanup_service, secret_reconciliation_service, stale_branch_cleanup_service, auto_archive_service
     from app.max_plan_pool import load_max_plan_pool
     from app.orchestrator import orchestrator_worker
     from app.shared_state import runtime_config_sync_service
@@ -85,6 +85,9 @@ async def lifespan(app):
     # Start the GCP Cleanup Service background task
     gcp_cleanup_task = asyncio.create_task(gcp_cleanup_service())
 
+    # Start the GCP Image Pruner (keeps agent image family under the per-project quota)
+    gcp_image_cleanup_task = asyncio.create_task(gcp_image_cleanup_service())
+
     # Start Secret Reconciliation Service (orphaned agent-creds-* cleanup)
     secret_recon_task = asyncio.create_task(secret_reconciliation_service())
 
@@ -106,6 +109,7 @@ async def lifespan(app):
     _bg_tasks["orchestrator"] = orchestrator_task
     _bg_tasks["reaper"] = reaper_task
     _bg_tasks["gcp_cleanup"] = gcp_cleanup_task
+    _bg_tasks["gcp_image_cleanup"] = gcp_image_cleanup_task
     _bg_tasks["secret_reconciliation"] = secret_recon_task
     _bg_tasks["stale_branch_cleanup"] = stale_branch_task
     _bg_tasks["auto_archive"] = auto_archive_task
@@ -119,6 +123,7 @@ async def lifespan(app):
             "orchestrator": orchestrator_worker,
             "reaper": reaper_service,
             "gcp_cleanup": gcp_cleanup_service,
+            "gcp_image_cleanup": gcp_image_cleanup_service,
             "secret_reconciliation": secret_reconciliation_service,
             "stale_branch_cleanup": stale_branch_cleanup_service,
             "auto_archive": auto_archive_service,
@@ -236,7 +241,7 @@ async def lifespan(app):
 
     yield
     # Shutdown: graceful cleanup with timeout to let in-flight operations finish
-    tasks_to_cancel = [reaper_task, gcp_cleanup_task, secret_recon_task, stale_branch_task, orchestrator_task, config_sync_task, monitor_task]
+    tasks_to_cancel = [reaper_task, gcp_cleanup_task, gcp_image_cleanup_task, secret_recon_task, stale_branch_task, orchestrator_task, config_sync_task, monitor_task]
     for t in tasks_to_cancel:
         t.cancel()
     try:

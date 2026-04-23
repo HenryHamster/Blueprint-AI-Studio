@@ -75,6 +75,53 @@ async def gcp_cleanup_service():
             break
 
 
+async def gcp_image_cleanup_service():
+    """Hourly pruner for the agent VM image family.
+
+    Packer adds one new image to the `blueprint-agent` family per build; without pruning,
+    these accumulate until GCP's per-project image quota is exhausted and VM provisioning
+    starts failing. This service keeps only the `max_retained_images` most recent.
+    """
+    from app.compute import cleanup_old_images, AGENT_IMAGE_FAMILY
+    from app.shared_state import runtime_config as _runtime_config
+
+    # Initial delay so startup isn't racing image validation and DB init.
+    try:
+        await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        logger.info("[IMAGE CLEANUP] Service shutting down during initial delay.")
+        return
+
+    while True:
+        try:
+            keep = int(_runtime_config.get("max_retained_images", 10))
+            if keep < 1:
+                logger.warning(f"[IMAGE CLEANUP] max_retained_images={keep} invalid; skipping cycle")
+            else:
+                result = await asyncio.wait_for(
+                    cleanup_old_images(keep=keep, family=AGENT_IMAGE_FAMILY),
+                    timeout=600,
+                )
+                if result.get("deleted") or result.get("failed"):
+                    logger.info(
+                        f"[IMAGE CLEANUP] total={result.get('total')} deleted={result.get('deleted')} "
+                        f"kept={result.get('kept')} failed={len(result.get('failed') or [])}"
+                    )
+        except asyncio.CancelledError:
+            logger.info("[IMAGE CLEANUP] Service shutting down.")
+            break
+        except asyncio.TimeoutError:
+            logger.exception("[IMAGE CLEANUP] Cycle timed out after 600s")
+        except Exception as e:
+            logger.error(f"[IMAGE CLEANUP] Error: {e}", exc_info=True)
+
+        try:
+            await asyncio.sleep(3600)  # Hourly — images accumulate slowly
+        except asyncio.CancelledError:
+            logger.info("[IMAGE CLEANUP] Service shutting down.")
+            break
+
+
 async def secret_reconciliation_service():
     """Periodic cleanup of orphaned agent credential secrets (every 30 min)."""
     from app.compute import reconcile_orphaned_secrets
