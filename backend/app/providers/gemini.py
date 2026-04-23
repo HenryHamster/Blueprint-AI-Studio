@@ -410,8 +410,10 @@ class GeminiProvider(LLMProvider):
             if has_level:
                 thinking_config["thinkingLevel"] = raw_level
                 if has_budget:
-                    # Co-setting would 400 the API; prefer level (primary
-                    # knob for 3.x per Google docs) and drop budget.
+                    # Co-setting would 400 the API ("You can only set only
+                    # one of thinking budget and thinking level"); prefer
+                    # level (primary knob for 3.x per Google docs) and
+                    # drop budget.
                     unsupported.append(
                         f"thinking_budget + thinking_level both set on "
                         f"Gemini 3.x ({model!r}); Gemini API rejects the "
@@ -419,20 +421,21 @@ class GeminiProvider(LLMProvider):
                         f"of thinking_level"
                     )
             elif has_budget:
-                # No level configured — fall back to back-compat budget.
-                cap = _THINKING_BUDGET_CAPS.get(model, _THINKING_BUDGET_DEFAULT_CAP)
-                budget = raw_budget
-                if budget > cap:
-                    unsupported.append(
-                        f"thinking_budget={budget} > cap {cap} for model "
-                        f"{model!r}; clamped"
-                    )
-                    budget = cap
+                # On 3.x without thinking_level: DROP thinking_budget
+                # entirely. Google's "back-compat" claim doesn't survive
+                # contact with Gemini CLI routing — empirically the API
+                # returns 400 even when only thinkingBudget is present in
+                # our settings.json, indicating the CLI injects a default
+                # thinkingLevel for 3.x models and stacks our budget on
+                # top. Rather than fight it, fall back to Gemini CLI's
+                # internal default and surface a marker so operators
+                # configure thinking_level explicitly if they want control.
                 unsupported.append(
-                    f"thinking_budget on Gemini 3.x ({model!r}) is back-compat "
-                    f"only and may behave unexpectedly — prefer thinking_level"
+                    f"thinking_budget is unreliable on Gemini 3.x "
+                    f"({model!r}) — Gemini CLI's internal routing "
+                    f"conflicts with it. Dropped; configure thinking_level "
+                    f"for explicit control on 3.x"
                 )
-                thinking_config["thinkingBudget"] = budget
         else:
             # Unknown model family (not in GA or 3.x sets). Emit whatever's
             # set but don't combine; if both, prefer level as the newer knob.

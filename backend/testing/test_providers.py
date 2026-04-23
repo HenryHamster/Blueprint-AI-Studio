@@ -486,26 +486,30 @@ class TestGeminiThinkingConfig:
             for u in translation.unsupported
         ), f"expected 2.5-mismatch marker, got {translation.unsupported}"
 
-    def test_budget_on_3x_model_emits_but_warns(self):
-        """Back-compat: thinkingBudget on 3.x still flows through when
-        level isn't set, with an advisory marker."""
+    def test_budget_on_3x_model_dropped_with_marker(self):
+        """Stricter than Google's docs suggest: on 3.x, thinking_budget
+        is dropped entirely because Gemini CLI appears to inject its own
+        default thinkingLevel that conflicts with budget. Operators need
+        to use thinking_level for explicit control on 3.x."""
         provider = get_provider(LLMProviderName.GEMINI)
         translation = provider.settings_to_cli({
             "model": "gemini-3.1-pro-preview",
             "thinking_budget": 4096,
         })
-        assert translation.settings_files
-        payload = json.loads(translation.settings_files[0].content)
-        thinking = (
-            payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
-            ["modelConfig"]["generateContentConfig"]["thinkingConfig"]
-        )
-        assert thinking["thinkingBudget"] == 4096
-        assert "thinkingLevel" not in thinking
+        # No thinkingConfig should be emitted — the CLI's default takes over.
+        if translation.settings_files:
+            payload = json.loads(translation.settings_files[0].content)
+            cfg = (
+                payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
+                ["modelConfig"]["generateContentConfig"]
+            )
+            tc = cfg.get("thinkingConfig", {})
+            assert "thinkingBudget" not in tc
+            assert "thinkingLevel" not in tc
         assert any(
-            "thinking_budget on Gemini 3.x" in u and "back-compat" in u
+            "thinking_budget" in u and "3.x" in u and "unreliable" in u
             for u in translation.unsupported
-        ), f"expected 3.x-backcompat marker, got {translation.unsupported}"
+        ), f"expected 3.x-budget-dropped marker, got {translation.unsupported}"
 
     def test_budget_and_level_both_set_on_3x_drops_budget(self):
         """Gemini API rejects the combination with 400 `You can only set
