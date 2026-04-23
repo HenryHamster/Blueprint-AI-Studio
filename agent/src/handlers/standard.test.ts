@@ -26,6 +26,7 @@ vi.mock('../index.js', () => ({
   runProjectLintChecks: vi.fn(),
   cloneWithRetry: vi.fn(),
   sendHeartbeatSync: vi.fn(),
+  getProviderRunner: vi.fn().mockReturnValue({ displayName: 'Claude Code' }),
 }));
 
 vi.mock('../prompt.js', () => ({
