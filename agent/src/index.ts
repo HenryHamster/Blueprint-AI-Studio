@@ -1208,13 +1208,27 @@ export function parseFailingTests(output: string): Set<string> {
       const id = trimmed.slice('FAILED '.length).split(' - ')[0].trim();
       if (id) failing.add(id);
     }
+    // vitest file-level failure line: " FAIL  src/foo.test.ts > suite > test"
+    // (the default reporter emits one per failing file/test, leading space
+    // trims away). This was silently missing from the prior parser —
+    // vitest does NOT use "FAILED" (the pytest word) and doesn't always
+    // use ✕ markers for per-test failures, so a vitest baseline run
+    // with real failures was reporting 0.
+    //
+    // Tightened to `FAIL` + 2+ spaces + non-space body to avoid false
+    // positives from test-output lines like `FAIL reason: expected...`
+    // (tests that verify failure-formatting can emit FAIL as part of
+    // their own stdout). JSON reporter remains the primary path — this
+    // is only a fallback.
+    const vitestFailMatch = trimmed.match(/^FAIL\s{2,}(\S.*)$/);
+    if (vitestFailMatch) failing.add(vitestFailMatch[1]);
     // vitest: "✕ test description" or "× test description" or "✗ test description".
     // Fallback only — prefer parseFailingTestsFromVitestJson when available,
     // since stdout scanning mis-classifies simulated failure output inside
     // passing tests (a test that verifies failure-formatting logic can print
     // a mocked "✕ foo" line that this regex matches even though the real
     // test passed).
-    const vitestMatch = trimmed.match(/^[✕✗×]\s+(.+)$/u);
+    const vitestMatch = trimmed.match(/^[✕✗×⨯]\s+(.+)$/u);
     if (vitestMatch) failing.add(vitestMatch[1].trim());
   }
   return failing;
@@ -1309,10 +1323,24 @@ export async function captureTestBaseline(
   const taskId = process.env.TASK_ID || '';
 
   for (const runner of runners) {
+    // For vitest, request the JSON reporter so we can extract failing
+    // test names authoritatively — the stdout parser historically missed
+    // vitest's " FAIL" format, producing a "0 pre-existing failures"
+    // baseline even when the suite had many. When JSON is available it's
+    // the source of truth; stdout is a fallback for runners (pytest) that
+    // don't emit a comparable JSON report at this runner-invocation layer.
+    const useVitestJson = runner.cmd === 'npm' && isVitestRunner(runner.cwd);
+    const jsonOutputPath = useVitestJson
+      ? `/tmp/vitest-baseline-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`
+      : null;
+    const runArgs = jsonOutputPath
+      ? [...runner.args, '--', '--reporter=default', '--reporter=json', `--outputFile=${jsonOutputPath}`]
+      : runner.args;
+
     try {
       sendHeartbeatSync(taskId, `Baseline test run [${runner.label}]...`);
       const runnerTimeout = isDockerRunner(runner) ? TEST_BASELINE_DOCKER_TIMEOUT : timeoutMs;
-      await execFileAsync(runner.cmd, runner.args, {
+      await execFileAsync(runner.cmd, runArgs, {
         cwd: runner.cwd,
         timeoutMs: runnerTimeout,
       });
@@ -1331,8 +1359,52 @@ export async function captureTestBaseline(
         return null;
       }
       const msg = err instanceof Error ? err.message : String(err);
-      const parsed = parseFailingTests(msg);
-      parsed.forEach(f => baselineFailures.add(f));
+      // Prefer JSON reporter output when available — authoritative and
+      // format-stable across vitest 2.x/3.x.
+      let parsedFromJson = false;
+      if (jsonOutputPath && fs.existsSync(jsonOutputPath)) {
+        try {
+          const jsonText = fs.readFileSync(jsonOutputPath, 'utf-8');
+          const parsed = parseFailingTestsFromVitestJson(jsonText);
+          if (parsed.size > 0) {
+            parsed.forEach(f => baselineFailures.add(f));
+            parsedFromJson = true;
+          } else if (jsonText.includes('"numFailedTests":0') || jsonText.includes('"success":true')) {
+            // JSON reporter says 0 failures but the process exited non-zero.
+            // That's a non-test issue (setup error, runner crash); fall
+            // through to stdout parser to surface whatever broke.
+            parsedFromJson = false;
+          } else {
+            // JSON loaded but extraction returned empty — fall back to
+            // stdout so we don't silently treat a broken suite as passing.
+            parsedFromJson = false;
+          }
+        } catch {
+          // JSON file unreadable/malformed — fall through to stdout.
+        }
+      }
+      if (!parsedFromJson) {
+        const parsed = parseFailingTests(msg);
+        parsed.forEach(f => baselineFailures.add(f));
+        // If BOTH paths came up empty despite the process exiting
+        // non-zero, something's wrong — log loudly so an operator can
+        // investigate rather than silently treating it as a clean baseline.
+        if (baselineFailures.size === 0) {
+          sendLog(
+            ws,
+            `WARNING: Test baseline for [${runner.label}] exited non-zero ` +
+            `but neither JSON reporter nor stdout parser extracted any ` +
+            `failures. Proceeding without baseline — treat any failures ` +
+            `in the fix loop as potentially pre-existing.\n`,
+          );
+          return null;
+        }
+      }
+    } finally {
+      // Best-effort cleanup of the baseline JSON file.
+      if (jsonOutputPath) {
+        try { fs.unlinkSync(jsonOutputPath); } catch { /* ignore */ }
+      }
     }
   }
 

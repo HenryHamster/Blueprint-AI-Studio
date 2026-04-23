@@ -1130,6 +1130,42 @@ describe('parseFailingTests', () => {
     expect(result.has('backend/testing/test_p.py::test_unicode_ünîcødé')).toBe(true);
     expect(result.has('backend/testing/test_q.py::test_with_space description')).toBe(true);
   });
+
+  it('parses vitest "FAIL  path > suite > test" stdout lines (default reporter)', () => {
+    // Regression: prior parser missed vitest's " FAIL " format and
+    // returned 0 failures for a real 125-failure vitest run on main —
+    // which then leaked into the fix loop as "newly broken by the
+    // agent's changes."
+    const output = [
+      ' FAIL  src/handlers/standard.test.ts > renders the right CLI name',
+      ' FAIL  src/prompt.test.ts > appends DEFAULT_TOOL_GUIDANCE',
+      ' PASS  src/index.test.ts > parses options',
+    ].join('\n');
+    const result = parseFailingTests(output);
+    expect(result.has('src/handlers/standard.test.ts > renders the right CLI name')).toBe(true);
+    expect(result.has('src/prompt.test.ts > appends DEFAULT_TOOL_GUIDANCE')).toBe(true);
+    expect(result.size).toBe(2);
+  });
+
+  it('does NOT match single-space "FAIL reason:" (test-output false positive)', () => {
+    // A test that verifies failure-formatting logic can print lines like
+    // `FAIL reason: expected X got Y` from its own stdout. Those must
+    // not be treated as baseline failures. The tighter "FAIL + 2+
+    // spaces" regex guards against this.
+    const output = [
+      'FAIL reason: expected true got false',
+      'FAIL: some output from a passing test',
+      ' FAIL something (only one trailing space)',
+    ].join('\n');
+    const result = parseFailingTests(output);
+    expect(result.size).toBe(0);
+  });
+
+  it('matches vitest "⨯" (U+2A2F) marker in addition to ✕/✗/×', () => {
+    const output = '⨯ some test failed';
+    const result = parseFailingTests(output);
+    expect(result).toEqual(new Set(['some test failed']));
+  });
 });
 
 // ── parseFailingTestsFromVitestJson ─────────────────────────────────────────
