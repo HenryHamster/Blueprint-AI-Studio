@@ -88,6 +88,13 @@ runtime_config: Dict = {
     "max_autonomous_tasks_per_hour": 12,
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
+    # Auto-remediation governors (residual CODE_ERROR fingerprint spawner).
+    # Global cap on concurrent/queued auto-remediation tasks prevents queue
+    # ballooning when many distinct fingerprints accumulate. Cooldown is
+    # per-fingerprint and blocks re-spawn for the same fingerprint while a
+    # prior remediation is in flight or recently resolved.
+    "max_concurrent_auto_remediations": 2,
+    "residual_remediation_cooldown_hours": 24,
     # Future-facing provider tier map used by multi-provider selection. v1 keeps
     # Anthropic as the only dispatch path but persists the structure now so v2
     # can enable provider-aware resolution without another config shape change.

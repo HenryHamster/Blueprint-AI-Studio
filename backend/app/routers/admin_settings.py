@@ -99,6 +99,8 @@ async def get_settings(
         "max_autonomous_tasks_per_hour": _runtime_config["max_autonomous_tasks_per_hour"],
         "max_global_autonomous_tasks_per_hour": _runtime_config.get("max_global_autonomous_tasks_per_hour", 50),
         "autonomous_research_interval_minutes": _runtime_config.get("autonomous_research_interval_minutes", 30),
+        "max_concurrent_auto_remediations": _runtime_config.get("max_concurrent_auto_remediations", 2),
+        "residual_remediation_cooldown_hours": _runtime_config.get("residual_remediation_cooldown_hours", 24),
         "provider_tier_model_map": _runtime_config.get("provider_tier_model_map", {}),
         "task_type_categories": _runtime_config.get("task_type_categories", {}),
         "category_routing": _runtime_config.get("category_routing", {}),
@@ -245,6 +247,22 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 1440):
             raise HTTPException(status_code=400, detail="autonomous_research_interval_minutes must be between 1 and 1440")
         _runtime_config["autonomous_research_interval_minutes"] = val
+    if "max_concurrent_auto_remediations" in payload:
+        try:
+            val = int(payload["max_concurrent_auto_remediations"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="max_concurrent_auto_remediations must be a number")
+        if not (0 <= val <= 20):
+            raise HTTPException(status_code=400, detail="max_concurrent_auto_remediations must be between 0 and 20")
+        _runtime_config["max_concurrent_auto_remediations"] = val
+    if "residual_remediation_cooldown_hours" in payload:
+        try:
+            val = int(payload["residual_remediation_cooldown_hours"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="residual_remediation_cooldown_hours must be a number")
+        if not (1 <= val <= 720):
+            raise HTTPException(status_code=400, detail="residual_remediation_cooldown_hours must be between 1 and 720")
+        _runtime_config["residual_remediation_cooldown_hours"] = val
     if "provider_tier_model_map" in payload:
         val = payload["provider_tier_model_map"]
         if not isinstance(val, dict):

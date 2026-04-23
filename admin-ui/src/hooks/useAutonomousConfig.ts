@@ -11,6 +11,8 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
   const [configIntervalMinutes, setConfigIntervalMinutes] = useState<number>(60);
   const [configMaxParallel, setConfigMaxParallel] = useState<number>(3);
   const [configMaxTasksPerHour, setConfigMaxTasksPerHour] = useState<number>(10);
+  const [configMaxConcurrentAutoRemediations, setConfigMaxConcurrentAutoRemediations] = useState<number>(2);
+  const [configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours] = useState<number>(24);
   const [autonomousConfigOpen, setAutonomousConfigOpen] = useState(false);
   const [savingConfigField, setSavingConfigField] = useState<string | null>(null);
   const [cooldownMinutes, setCooldownMinutes] = useState<number>(240);
@@ -39,7 +41,28 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
       if (data.autonomous_research_interval_minutes != null) setConfigIntervalMinutes(data.autonomous_research_interval_minutes);
       if (data.max_parallel_research_per_project != null) setConfigMaxParallel(data.max_parallel_research_per_project);
       if (data.max_autonomous_tasks_per_hour != null) setConfigMaxTasksPerHour(data.max_autonomous_tasks_per_hour);
+      if (data.max_concurrent_auto_remediations != null) setConfigMaxConcurrentAutoRemediations(data.max_concurrent_auto_remediations);
+      if (data.residual_remediation_cooldown_hours != null) setConfigResidualRemediationCooldownHours(data.residual_remediation_cooldown_hours);
     } catch { /* ignore */ }
+  }
+
+  async function clearResidualFingerprints(): Promise<number | null> {
+    setError(null);
+    try {
+      const h = await authHeaders();
+      const res = await fetch(`${API_BASE_URL}/api/admin/residual-fingerprints/clear`, {
+        method: 'POST', headers: h,
+      });
+      if (!res.ok) throw new Error('Failed to clear fingerprints');
+      const data = await res.json();
+      const cleared = typeof data.cleared === 'number' ? data.cleared : 0;
+      addToast(`Cleared ${cleared} residual fingerprint${cleared === 1 ? '' : 's'}.`, 'success');
+      return cleared;
+    } catch {
+      setError('Failed to clear residual fingerprints.');
+      addToast('Failed to clear fingerprints', 'error');
+      return null;
+    }
   }
 
   async function saveConfigField(field: string, value: number) {
@@ -64,11 +87,14 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
     configIntervalMinutes, setConfigIntervalMinutes,
     configMaxParallel, setConfigMaxParallel,
     configMaxTasksPerHour, setConfigMaxTasksPerHour,
+    configMaxConcurrentAutoRemediations, setConfigMaxConcurrentAutoRemediations,
+    configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours,
     autonomousConfigOpen, setAutonomousConfigOpen,
     savingConfigField,
     cooldownMinutes,
     fetchCooldownSetting,
     fetchSettings,
     saveConfigField,
+    clearResidualFingerprints,
   };
 }

@@ -1044,6 +1044,24 @@ async def get_residual_fingerprints(
     }
 
 
+@router.post("/residual-fingerprints/clear")
+async def clear_residual_fingerprints(
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """Wipe the in-memory residual fingerprint store.
+
+    Used when the store is polluted (bad fingerprints from a prior
+    misclassification regime) and needs to be reset. Returns the count
+    of fingerprints removed. Does NOT touch the DB — only clears what's
+    tracked in-memory for auto-remediation spawn decisions.
+    """
+    from app.failure_classification import _residual_store, _residual_seen_task_ids  # noqa: PLC0415
+    count = len(_residual_store)
+    _residual_store.clear()
+    _residual_seen_task_ids.clear()
+    return {"cleared": count}
+
+
 async def _compute_digest(
     *,
     hours: int,

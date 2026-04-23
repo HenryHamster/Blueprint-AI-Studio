@@ -625,10 +625,15 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                 setConfigMaxParallel={config.setConfigMaxParallel}
                 configMaxTasksPerHour={config.configMaxTasksPerHour}
                 setConfigMaxTasksPerHour={config.setConfigMaxTasksPerHour}
+                configMaxConcurrentAutoRemediations={config.configMaxConcurrentAutoRemediations}
+                setConfigMaxConcurrentAutoRemediations={config.setConfigMaxConcurrentAutoRemediations}
+                configResidualRemediationCooldownHours={config.configResidualRemediationCooldownHours}
+                setConfigResidualRemediationCooldownHours={config.setConfigResidualRemediationCooldownHours}
                 autonomousConfigOpen={config.autonomousConfigOpen}
                 setAutonomousConfigOpen={config.setAutonomousConfigOpen}
                 savingConfigField={config.savingConfigField}
                 saveConfigField={config.saveConfigField}
+                clearResidualFingerprints={config.clearResidualFingerprints}
               />
             </>
           )}
