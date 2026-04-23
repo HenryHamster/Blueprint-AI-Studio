@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from app.models import LLMAuthMode, LLMProviderName
@@ -70,10 +72,11 @@ def test_gemini_service_account_materializes_credentials_file():
 
     assert material.env["GOOGLE_APPLICATION_CREDENTIALS"] == "/opt/agent/gemini/sa.json"
     assert material.env["GOOGLE_CLOUD_PROJECT"] == "demo"
-    # Without this env var, Gemini CLI's getAuthTypeFromEnv returns undefined
-    # and validateNonInteractiveAuth throws on every invocation. Regression
-    # test for the SA-mode dispatch failure.
-    assert material.env["GOOGLE_GENAI_USE_VERTEXAI"] == "true"
+    assert material.env["GOOGLE_CLOUD_LOCATION"] == "us-central1"
+    # GOOGLE_GENAI_USE_VERTEXAI is a Google GenAI SDK flag, not a Gemini CLI
+    # flag — Gemini CLI picks the Vertex path from standard GCP auth env
+    # vars. Regression guard: never set it, even if historical code did.
+    assert "GOOGLE_GENAI_USE_VERTEXAI" not in material.env
     assert material.files[0].path == "/opt/agent/gemini/sa.json"
 
 
@@ -344,9 +347,8 @@ class TestAnthropic1MContext:
 class TestGeminiPreviewAdvisory:
     @pytest.mark.parametrize("model", [
         "gemini-3.1-pro-preview",
-        "gemini-3.1-flash-preview",
-        "gemini-3-pro-preview",
         "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite-preview",
     ])
     def test_preview_models_emit_advisory(self, model):
         provider = get_provider(LLMProviderName.GEMINI)
@@ -383,10 +385,9 @@ class TestGeminiPreviewAdvisory:
 
 class TestGeminiFallbackModel:
     @pytest.mark.parametrize("preview,ga", [
-        ("gemini-3-pro-preview", "gemini-2.5-pro"),
-        ("gemini-3-flash-preview", "gemini-2.5-flash"),
-        ("gemini-3.1-pro-preview", "gemini-2.5-pro"),
-        ("gemini-3.1-flash-preview", "gemini-2.5-flash"),
+        ("gemini-3.1-pro-preview",        "gemini-2.5-pro"),
+        ("gemini-3-flash-preview",        "gemini-2.5-flash"),
+        ("gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite"),
     ])
     def test_preview_falls_back_to_ga_counterpart(self, preview, ga):
         provider = get_provider(LLMProviderName.GEMINI)
@@ -397,6 +398,129 @@ class TestGeminiFallbackModel:
         # GA models aren't "restricted" — they already work, so there's
         # nothing to fall back from.
         assert provider.fallback_model("gemini-2.5-pro") is None
+
+
+# ---------------------------------------------------------------------------
+# Gemini thinking-config bifurcation — 2.5 uses thinkingBudget (int),
+# 3.x uses thinkingLevel (enum). Mismatched pairings surface as markers
+# rather than silent drops.
+# ---------------------------------------------------------------------------
+
+class TestGeminiThinkingConfig:
+    def test_budget_on_25_model_emits_clean(self):
+        provider = get_provider(LLMProviderName.GEMINI)
+        translation = provider.settings_to_cli({
+            "model": "gemini-2.5-pro",
+            "thinking_budget": 4096,
+        })
+        # Check the settings.json file payload — it's where the thinking
+        # config lands (Gemini CLI has no per-invocation flag).
+        assert translation.settings_files
+        payload = json.loads(translation.settings_files[0].content)
+        thinking = (
+            payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
+            ["modelConfig"]["generateContentConfig"]["thinkingConfig"]
+        )
+        assert thinking["thinkingBudget"] == 4096
+        # No 3.x-mismatch marker on a 2.5 model.
+        assert not any(
+            "back-compat" in u for u in translation.unsupported
+        )
+
+    def test_level_on_3x_preview_emits_clean(self):
+        provider = get_provider(LLMProviderName.GEMINI)
+        translation = provider.settings_to_cli({
+            "model": "gemini-3.1-pro-preview",
+            "thinking_level": "high",
+        })
+        assert translation.settings_files
+        payload = json.loads(translation.settings_files[0].content)
+        thinking = (
+            payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
+            ["modelConfig"]["generateContentConfig"]["thinkingConfig"]
+        )
+        assert thinking["thinkingLevel"] == "high"
+        # No 2.5-mismatch marker on a 3.x model.
+        assert not any(
+            "thinking_level on Gemini 2.5" in u for u in translation.unsupported
+        )
+
+    def test_level_on_25_model_dropped_with_marker(self):
+        provider = get_provider(LLMProviderName.GEMINI)
+        translation = provider.settings_to_cli({
+            "model": "gemini-2.5-pro",
+            "thinking_level": "high",
+        })
+        # thinking_level is dropped on 2.5; settings_files is only emitted
+        # when generate_config is non-empty, so this specific bag ends up
+        # with no thinking config at all.
+        if translation.settings_files:
+            payload = json.loads(translation.settings_files[0].content)
+            tc = (
+                payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
+                ["modelConfig"]["generateContentConfig"]
+                .get("thinkingConfig", {})
+            )
+            assert "thinkingLevel" not in tc
+        assert any(
+            "thinking_level on Gemini 2.5" in u and "dropped" in u
+            for u in translation.unsupported
+        ), f"expected 2.5-mismatch marker, got {translation.unsupported}"
+
+    def test_budget_on_3x_model_emits_but_warns(self):
+        """Back-compat: thinkingBudget on 3.x still flows through to the
+        CLI, but we surface Google's doc note about unexpected behavior."""
+        provider = get_provider(LLMProviderName.GEMINI)
+        translation = provider.settings_to_cli({
+            "model": "gemini-3.1-pro-preview",
+            "thinking_budget": 4096,
+        })
+        assert translation.settings_files
+        payload = json.loads(translation.settings_files[0].content)
+        thinking = (
+            payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
+            ["modelConfig"]["generateContentConfig"]["thinkingConfig"]
+        )
+        assert thinking["thinkingBudget"] == 4096
+        assert any(
+            "thinking_budget on Gemini 3.x" in u and "back-compat" in u
+            for u in translation.unsupported
+        ), f"expected 3.x-backcompat marker, got {translation.unsupported}"
+
+
+# ---------------------------------------------------------------------------
+# Gemini legacy aliases — Google retired gemini-3-pro-preview on 2026-03-09
+# and repointed the name to gemini-3.1-pro-preview. Admins with old configs
+# shouldn't hard-fail; rewrite silently with a marker.
+# ---------------------------------------------------------------------------
+
+class TestGeminiLegacyAliases:
+    def test_3_pro_preview_rewrites_to_3_1(self):
+        provider = get_provider(LLMProviderName.GEMINI)
+        translation = provider.settings_to_cli({
+            "model": "gemini-3-pro-preview",
+        })
+        # The -m flag should carry either the aliased model or an alias
+        # name; for this bag (no generate_config), we expect bare -m with
+        # the rewritten ID.
+        args = list(translation.args)
+        m_idx = args.index("-m")
+        assert args[m_idx + 1] == "gemini-3.1-pro-preview"
+        assert any(
+            "retired" in u and "gemini-3.1-pro-preview" in u
+            for u in translation.unsupported
+        ), f"expected retirement marker, got {translation.unsupported}"
+
+    def test_live_model_not_rewritten(self):
+        provider = get_provider(LLMProviderName.GEMINI)
+        translation = provider.settings_to_cli({
+            "model": "gemini-3.1-pro-preview",
+        })
+        args = list(translation.args)
+        m_idx = args.index("-m")
+        assert args[m_idx + 1] == "gemini-3.1-pro-preview"
+        # No retirement marker on a live model.
+        assert not any("retired" in u for u in translation.unsupported)
         assert provider.fallback_model("gemini-2.5-flash") is None
 
     def test_none_and_empty_return_none(self):

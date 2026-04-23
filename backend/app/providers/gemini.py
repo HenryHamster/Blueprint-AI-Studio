@@ -86,10 +86,9 @@ _THINKING_BUDGET_CAPS = {
     "gemini-2.5-pro": 32768,
     "gemini-2.5-flash": 24576,
     "gemini-2.5-flash-lite": 24576,
-    "gemini-3-pro-preview": 32768,
     "gemini-3-flash-preview": 24576,
     "gemini-3.1-pro-preview": 32768,
-    "gemini-3.1-flash-preview": 24576,
+    "gemini-3.1-flash-lite-preview": 24576,
 }
 _THINKING_BUDGET_DEFAULT_CAP = 32768
 
@@ -113,28 +112,43 @@ _GEMINI_GA_MODELS: frozenset[str] = frozenset({
     "gemini-2.5-flash-lite",
 })
 _GEMINI_PREVIEW_MODELS: frozenset[str] = frozenset({
-    "gemini-3-pro-preview",
-    "gemini-3-flash-preview",
     "gemini-3.1-pro-preview",
-    "gemini-3.1-flash-preview",
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
 })
+
+# Gemini 3.x text models. Matters because the thinking surface bifurcated:
+# 3.x uses `thinkingLevel` (minimal|low|medium|high) as the primary knob,
+# while 2.5 uses `thinkingBudget` (int). thinkingBudget on 3.x is
+# back-compat only and may behave unexpectedly on 3 Pro per Google's docs.
+_GEMINI_3_X_MODELS: frozenset[str] = frozenset({
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
+})
+
+
+# Retired/renamed preview IDs Google has repointed to live equivalents.
+# Applied at settings_to_cli time before the model hits the CLI, with an
+# `unsupported` marker so operators notice their config is on a redirect.
+# gemini-3-pro-preview was shut down 2026-03-09 and now resolves to
+# gemini-3.1-pro-preview per Google's deprecation notice.
+_LEGACY_MODEL_ALIASES: dict[str, str] = {
+    "gemini-3-pro-preview": "gemini-3.1-pro-preview",
+}
 
 
 # Preview→GA fallback map. When a task targets a preview model but none of
 # the pool's API keys have preview access (list_available_models filtered
 # them all out), the dispatcher swaps to the GA counterpart rather than
 # failing. Pick by capability class: pro preview degrades to 2.5-pro,
-# flash preview degrades to 2.5-flash. No mapping ⇒ no fallback ⇒ dispatch
-# fails loudly so the operator knows to enable preview access somewhere.
-# Keep in sync with _GEMINI_PREVIEW_MODELS — a preview model without an
-# entry here is intentional (we'd rather fail than silently run a wrong
-# class of model), but every entry in `_GEMINI_PREVIEW_MODELS` that has a
-# natural counterpart should be mapped.
+# flash preview degrades to 2.5-flash, flash-lite preview to 2.5-flash-lite.
+# No mapping ⇒ no fallback ⇒ dispatch fails loudly so the operator knows to
+# enable preview access somewhere. Keep in sync with _GEMINI_PREVIEW_MODELS.
 _PREVIEW_TO_GA_FALLBACK: dict[str, str] = {
-    "gemini-3-pro-preview": "gemini-2.5-pro",
-    "gemini-3-flash-preview": "gemini-2.5-flash",
-    "gemini-3.1-pro-preview": "gemini-2.5-pro",
-    "gemini-3.1-flash-preview": "gemini-2.5-flash",
+    "gemini-3.1-pro-preview":        "gemini-2.5-pro",
+    "gemini-3-flash-preview":        "gemini-2.5-flash",
+    "gemini-3.1-flash-lite-preview": "gemini-2.5-flash-lite",
 }
 
 
@@ -224,16 +238,15 @@ class GeminiProvider(LLMProvider):
         metadata = dict(provider_metadata or {})
         if auth_mode == LLMAuthMode.SERVICE_ACCOUNT:
             secret_path = "/opt/agent/gemini/sa.json"
-            # GOOGLE_GENAI_USE_VERTEXAI is the switch Gemini CLI inspects in
-            # getAuthTypeFromEnv; without it the CLI can't pick the Vertex
-            # path from GOOGLE_APPLICATION_CREDENTIALS alone and
-            # validateNonInteractiveAuth throws on every invocation.
+            # Gemini CLI picks the Vertex path from ADC / service-account
+            # creds plus GOOGLE_CLOUD_PROJECT + GOOGLE_CLOUD_LOCATION. The
+            # GOOGLE_GENAI_USE_VERTEXAI flag is a Google GenAI SDK switch,
+            # not a Gemini CLI switch — setting it here did nothing.
             return SecretMaterial(
                 env={
                     "GOOGLE_APPLICATION_CREDENTIALS": secret_path,
                     "GOOGLE_CLOUD_PROJECT": str(metadata.get("project") or ""),
                     "GOOGLE_CLOUD_LOCATION": str(metadata.get("location") or ""),
-                    "GOOGLE_GENAI_USE_VERTEXAI": "true",
                 },
                 files=(FileMaterial(path=secret_path, content=secret or "", mode="0600"),),
             )
@@ -256,10 +269,9 @@ class GeminiProvider(LLMProvider):
                         "gemini-2.5-pro",
                         "gemini-2.5-flash",
                         "gemini-2.5-flash-lite",
-                        "gemini-3-pro-preview",
-                        "gemini-3-flash-preview",
                         "gemini-3.1-pro-preview",
-                        "gemini-3.1-flash-preview",
+                        "gemini-3-flash-preview",
+                        "gemini-3.1-flash-lite-preview",
                     ],
                     "description": (
                         "Concrete model. Leave blank to inherit the tier mapping from "
@@ -272,9 +284,23 @@ class GeminiProvider(LLMProvider):
                     "maximum": 32768,
                     "description": (
                         "Token budget Gemini spends on internal reasoning before "
-                        "answering. 0 disables thinking entirely. Higher = deeper "
-                        "analysis, more cost and latency. Per-model hard caps apply; "
-                        "gemini-2.5-pro supports up to 32768."
+                        "answering. Primary control for Gemini 2.5: 0 disables "
+                        "thinking (flash/flash-lite only; pro floor is 128). Higher "
+                        "= deeper analysis, more cost and latency. On Gemini 3.x "
+                        "this is back-compat only and may behave unexpectedly on "
+                        "3 Pro — prefer `thinking_level` there."
+                    ),
+                },
+                "thinking_level": {
+                    "type": "string",
+                    "enum": ["minimal", "low", "medium", "high"],
+                    "description": (
+                        "Gemini 3.x thinking intensity. Replaces `thinking_budget` "
+                        "for 3.x models where budget is backward-compat-only. 3.1 "
+                        "Pro cannot fully disable thinking; `minimal` is the "
+                        "closest approximation on all 3.x variants. Ignored on 2.5 "
+                        "models with an unsupported marker — use `thinking_budget` "
+                        "there."
                     ),
                 },
                 "include_thoughts": {
@@ -311,6 +337,17 @@ class GeminiProvider(LLMProvider):
 
         model = bag.get("model")
 
+        # Legacy alias rewrite: Google has shut down certain preview IDs and
+        # repointed them to live equivalents. Rewrite before anything else
+        # keys off the model so downstream logic sees the live ID.
+        if isinstance(model, str) and model in _LEGACY_MODEL_ALIASES:
+            aliased = _LEGACY_MODEL_ALIASES[model]
+            unsupported.append(
+                f"model={model!r} retired; redirected to {aliased!r} "
+                f"(Google repointed the name)"
+            )
+            model = aliased
+
         # Availability advisory: 3.x preview models exist on Google's side but
         # their v1beta endpoint returns 404 `ModelNotFoundError` when the key
         # lacks preview access. Unknown model IDs — typos or freshly released
@@ -338,6 +375,9 @@ class GeminiProvider(LLMProvider):
         generate_config: dict[str, Any] = {}
         thinking_config: dict[str, Any] = {}
 
+        is_3x = isinstance(model, str) and model in _GEMINI_3_X_MODELS
+        is_25 = isinstance(model, str) and model in _GEMINI_GA_MODELS
+
         thinking_budget = bag.get("thinking_budget")
         if isinstance(thinking_budget, int):
             # Per-model cap: schema permits up to 32768 (pro's limit), but
@@ -352,7 +392,28 @@ class GeminiProvider(LLMProvider):
                     f"{model!r}; clamped"
                 )
                 thinking_budget = cap
+            if is_3x:
+                # Google docs: thinkingBudget on 3.x is back-compat only and
+                # may behave unexpectedly on 3 Pro. Emit anyway (the CLI
+                # accepts it) but surface the advisory.
+                unsupported.append(
+                    f"thinking_budget on Gemini 3.x ({model!r}) is back-compat "
+                    f"only and may behave unexpectedly — prefer thinking_level"
+                )
             thinking_config["thinkingBudget"] = thinking_budget
+
+        thinking_level = bag.get("thinking_level")
+        if isinstance(thinking_level, str):
+            if is_25:
+                # 2.5 family doesn't speak thinkingLevel. Drop with marker;
+                # admin should be using thinking_budget here.
+                unsupported.append(
+                    f"thinking_level on Gemini 2.5 ({model!r}) is ignored; "
+                    f"use thinking_budget instead — dropped"
+                )
+            else:
+                thinking_config["thinkingLevel"] = thinking_level
+
         include_thoughts = bag.get("include_thoughts")
         if isinstance(include_thoughts, bool):
             thinking_config["includeThoughts"] = include_thoughts
