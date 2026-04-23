@@ -665,7 +665,11 @@ MODULE_SIZE_LIMITS = {
     "compute.py": 2500,
     "github.py": 2000,
     "routers/admin_settings.py": 3000,
-    "routers/admin_analytics.py": 3200,
+    "routers/admin_analytics.py": 800,
+    "routers/admin_digest.py": 4200,
+    "routers/admin_pool_accounts.py": 900,
+    "max_plan_pool.py": 2100,
+    "anomaly_detection.py": 2000,
     "routers/agent.py": 2300,
     "services.py": 1700,
     "routers/agent_status.py": 1550,
@@ -724,6 +728,18 @@ class TestBackendModuleSizeGuardrails:
     def test_admin_analytics(self):
         self._check_module("routers/admin_analytics.py")
 
+    def test_admin_digest(self):
+        self._check_module("routers/admin_digest.py")
+
+    def test_admin_pool_accounts(self):
+        self._check_module("routers/admin_pool_accounts.py")
+
+    def test_max_plan_pool(self):
+        self._check_module("max_plan_pool.py")
+
+    def test_anomaly_detection(self):
+        self._check_module("anomaly_detection.py")
+
     def test_agent_router(self):
         self._check_module("routers/agent.py")
 
@@ -771,6 +787,9 @@ FRONTEND_SIZE_LIMITS = {
     "components/PipelineView.tsx": 1200,
     "components/DashboardHome.tsx": 1500,
     "components/MessagesPanel.tsx": 1000,
+    "components/MetricsDashboard.tsx": 500,
+    "components/ProjectDashboard.tsx": 300,
+    "components/HealthOverviewCard.tsx": 250,
 }
 
 
@@ -836,6 +855,15 @@ class TestFrontendSizeGuardrails:
 
     def test_messages_panel(self):
         self._check_frontend("components/MessagesPanel.tsx")
+
+    def test_metrics_dashboard(self):
+        self._check_frontend("components/MetricsDashboard.tsx")
+
+    def test_project_dashboard(self):
+        self._check_frontend("components/ProjectDashboard.tsx")
+
+    def test_health_overview_card(self):
+        self._check_frontend("components/HealthOverviewCard.tsx")
 
 
 # ── Failure Classification Taxonomy ────────────────────────────────────────
