@@ -6,6 +6,7 @@ Extracted from app.main to reduce module size.
 import asyncio
 import logging
 import os
+import warnings
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict
@@ -49,6 +50,23 @@ async def lifespan(app):
             datefmt='%Y-%m-%dT%H:%M:%S',
             force=True,
         )
+    # Route Python warnings (RuntimeWarning, DeprecationWarning, etc.) through the
+    # logging system so they get a proper severity in Cloud Logging. Otherwise
+    # they're written raw to stderr with no severity tag and end up classified as
+    # INFO/DEFAULT, invisible to the orchestrator-errors dashboard which filters
+    # severity>=ERROR. RuntimeWarnings in particular almost always indicate real
+    # bugs (unawaited coroutines, sync code in async contexts) so they're elevated
+    # to ERROR; everything else stays at WARNING.
+    _warnings_logger = logging.getLogger("py.warnings")
+
+    def _show_warning_via_logger(message, category, filename, lineno, file=None, line=None):
+        formatted = warnings.formatwarning(message, category, filename, lineno, line).rstrip()
+        if issubclass(category, RuntimeWarning):
+            _warnings_logger.error(formatted)
+        else:
+            _warnings_logger.warning(formatted)
+
+    warnings.showwarning = _show_warning_via_logger
     logger.info("[STARTUP] Logging configured — app logs now visible in Cloud Logging")
 
     # Late imports to avoid circular dependency with app.main
@@ -119,6 +137,10 @@ async def lifespan(app):
     async def _monitor_background_tasks():
         tasks = _bg_tasks
         restart_state: Dict[str, Dict] = {}  # name -> {attempts, last_restart}
+        # When the watchdog cancels a hung task, it stashes the reason here so the
+        # death-detection branch below can include it in the alert/log instead of
+        # the useless "Exception: None" that a bare cancellation produces.
+        cancel_reasons: Dict[str, str] = {}
         task_factories = {
             "orchestrator": orchestrator_worker,
             "reaper": reaper_service,
@@ -161,14 +183,25 @@ async def lifespan(app):
                                 f"[MONITOR] Orchestrator appears hung — {reason}. "
                                 f"Cancelling task so restart path re-spawns it."
                             )
+                            cancel_reasons["orchestrator"] = f"watchdog cancelled: {reason}"
                             orch_task.cancel()
                 except Exception as wd_exc:
                     logger.warning(f"[MONITOR] Watchdog check failed: {wd_exc}")
                 for name, t in list(tasks.items()):
                     if t.done():
                         exc = t.exception() if not t.cancelled() else None
-                        logger.error(f"[MONITOR] Background task '{name}' DIED! Exception: {exc}")
-                        asyncio.create_task(_send_webhook_notification("SERVICE_CRASHED", f"Background service crashed: {name}", str(exc)[:500]))
+                        # A bare cancellation (t.cancelled() with no exception) is
+                        # almost always our own watchdog firing — surface the reason
+                        # we stashed at cancel time instead of the misleading "None".
+                        cancel_reason = cancel_reasons.pop(name, None)
+                        if exc is not None:
+                            cause_str = str(exc)[:500]
+                        elif cancel_reason:
+                            cause_str = cancel_reason
+                        else:
+                            cause_str = "task cancelled (no exception)"
+                        logger.error(f"[MONITOR] Background task '{name}' DIED! Cause: {cause_str}")
+                        asyncio.create_task(_send_webhook_notification("SERVICE_CRASHED", f"Background service crashed: {name}", cause_str))
                         try:
                             async with AsyncSessionLocal() as alert_session:
                                 projects = (await alert_session.execute(
@@ -189,7 +222,7 @@ async def lifespan(app):
                                         project_id=project.id,
                                         severity=AlertSeverity.ERROR,
                                         title=alert_title,
-                                        message=f"Background service '{name}' crashed with: {str(exc)[:300]}. Auto-restarting with backoff.",
+                                        message=f"Background service '{name}' crashed with: {cause_str[:300]}. Auto-restarting with backoff.",
                                     )
                                     alert_session.add(alert)
                                 await alert_session.commit()

@@ -36,6 +36,53 @@ def _estimated_cost_usd(task: Task) -> Optional[float]:
 logger = logging.getLogger(__name__)
 
 
+async def _terminal_cleanup_bg(
+    parent_task_id: str,
+    parent_vm_id: Optional[str],
+    parent_acct_id: Optional[str],
+    children_cleanup: List[tuple],
+    force_kill: bool,
+):
+    """Run the slow VM/account cleanup for an admin-driven terminal transition.
+
+    Scheduled via BackgroundTasks so the request handler can return immediately
+    after the status writes commit. Holding a DB session through the 5s graceful
+    shutdown sleep + serial GCE deletes used to starve the orchestrator's
+    connection pool when the user cancelled tasks in bulk.
+
+    `children_cleanup` is a list of (task_id_str, vm_id_or_none, acct_id_or_none).
+    """
+    from app.main import _ensure_vm_deleted
+    from app.max_plan_pool import release_max_plan_account
+
+    if parent_vm_id:
+        if not force_kill:
+            # Wait for the agent's next heartbeat to return 4xx so it shuts down
+            # gracefully before we kill the VM out from under it.
+            await asyncio.sleep(5)
+        try:
+            await _ensure_vm_deleted(parent_vm_id, reason="admin_terminal")
+        except Exception as exc:
+            logger.warning(f"[ADMIN] BG cleanup: VM delete failed for parent={parent_task_id} vm={parent_vm_id}: {exc}")
+    if parent_acct_id:
+        try:
+            await release_max_plan_account(parent_acct_id)
+        except Exception as exc:
+            logger.warning(f"[ADMIN] BG cleanup: account release failed for parent={parent_task_id} acct={parent_acct_id}: {exc}")
+
+    for child_task_id, child_vm_id, child_acct_id in children_cleanup:
+        if child_vm_id:
+            try:
+                await _ensure_vm_deleted(child_vm_id, reason="parent_cancelled")
+            except Exception as exc:
+                logger.warning(f"[ADMIN] BG cleanup: VM delete failed for child={child_task_id} vm={child_vm_id}: {exc}")
+        if child_acct_id:
+            try:
+                await release_max_plan_account(child_acct_id)
+            except Exception as exc:
+                logger.warning(f"[ADMIN] BG cleanup: account release failed for child={child_task_id} acct={child_acct_id}: {exc}")
+
+
 def _record_failure_result(task: Task, failure_class: str) -> None:
     """Record a task failure for deployment monitoring and direction health.
 
@@ -1115,20 +1162,16 @@ async def modify_task(
             if new_status in (TaskStatus.CANCELLED, TaskStatus.FAILED):
                 task.requires_approval = False
 
-            # Delete VM and release account when moving to terminal state
+            # Capture cleanup info for terminal transitions; the actual VM delete
+            # + account release happens in the background after the response is
+            # sent, so the request handler doesn't hold its DB session through
+            # 5s sleeps and serial GCE calls (which previously starved the
+            # orchestrator's connection pool during bulk cancellations).
+            parent_vm_id_for_bg: Optional[str] = None
+            parent_acct_id_for_bg: Optional[str] = None
             if new_status in (TaskStatus.CANCELLED, TaskStatus.FAILED) and task.vm_instance_id:
-                from app.main import _ensure_vm_deleted
-                if not force_kill:
-                    # Graceful: commit terminal status first so agent's next heartbeat
-                    # returns 4xx, triggering graceful shutdown (5s wind-down)
-                    session.add(task)
-                    await session.commit()
-                    await asyncio.sleep(5)
-                await _ensure_vm_deleted(task, reason="admin_terminal")
-                acct_id = (task.context or {}).get("max_plan_account_id")
-                if acct_id:
-                    from app.max_plan_pool import release_max_plan_account
-                    await release_max_plan_account(acct_id)
+                parent_vm_id_for_bg = task.vm_instance_id
+                parent_acct_id_for_bg = (task.context or {}).get("max_plan_account_id")
 
             # For low-priority tasks cancelled by user, store suppress_until so the
             # orchestrator can skip re-proposals for 180 days without expanding the dedup window
@@ -1141,10 +1184,11 @@ async def modify_task(
                     flag_modified(task, "context")
                     logger.info(f"[ADMIN] Set suppress_until={suppress_until} on cancelled low-priority task {task.id}")
 
-            # Cascade cancellation to active children
+            # Cascade cancellation to active children — only the cheap status
+            # updates run synchronously; VM deletes + account releases are
+            # deferred to the same background task.
+            children_cleanup_for_bg: List[tuple] = []
             if new_status == TaskStatus.CANCELLED:
-                from app.main import _ensure_vm_deleted as _cancel_vm
-                from app.max_plan_pool import release_max_plan_account as _cancel_release
                 active_children = (await session.execute(
                     select(Task).where(
                         Task.parent_task_id == task.id,
@@ -1154,14 +1198,24 @@ async def modify_task(
                 for child in active_children:
                     child.status = TaskStatus.CANCELLED
                     child.requires_approval = False
-                    if child.vm_instance_id:
-                        await _cancel_vm(child, reason="parent_cancelled")
-                    child_acct = (child.context or {}).get("max_plan_account_id")
-                    if child_acct:
-                        await _cancel_release(child_acct)
+                    children_cleanup_for_bg.append((
+                        str(child.id),
+                        child.vm_instance_id,
+                        (child.context or {}).get("max_plan_account_id"),
+                    ))
                     session.add(child)
                 if active_children:
                     logger.info(f"[ADMIN] Cascaded CANCELLED to {len(active_children)} children of task {task.id}")
+
+            if parent_vm_id_for_bg or parent_acct_id_for_bg or children_cleanup_for_bg:
+                background_tasks.add_task(
+                    _terminal_cleanup_bg,
+                    parent_task_id=str(task.id),
+                    parent_vm_id=parent_vm_id_for_bg,
+                    parent_acct_id=parent_acct_id_for_bg,
+                    children_cleanup=children_cleanup_for_bg,
+                    force_kill=force_kill,
+                )
 
             # Reset retry state when manually re-queuing a task
             if new_status == TaskStatus.QUEUED:
