@@ -441,19 +441,58 @@ _RE_UUID = re.compile(
     re.IGNORECASE,
 )
 _RE_HEX = re.compile(r'\b[0-9a-f]{7,40}\b', re.IGNORECASE)
+# Accept decimal memory readings ([10.5mb], [10.5MB cg:512.4MB]) — the old
+# integer-only prefix regex let decimal variants slip through as distinct
+# fingerprints, creating one "residual CODE_ERROR" per memory reading.
+_RE_MEM_PREFIX = re.compile(
+    r'^\s*\[\d+(?:\.\d+)?\s*(?:mb|gb|kb|b)'
+    r'(?:\s+cg:\d+(?:\.\d+)?\s*(?:mb|gb|kb|b))?\]\s*',
+    re.IGNORECASE,
+)
+# Generic size/duration tokens with unit adjacency — these don't hit word
+# boundaries (digit adjacent to letter) so _RE_NUM can't reach them. Strip
+# before numbering so "10.5mb" and "10.4mb" collapse together rather than
+# leaving stray "5mb"/"4mb" differentiators.
+_RE_SIZE_TOKEN = re.compile(
+    r'\b\d+(?:\.\d+)?\s*(?:mb|gb|kb|ms|s)\b',
+    re.IGNORECASE,
+)
 _RE_NUM = re.compile(r'\b\d+\b')
-_RE_MEM_PREFIX = re.compile(r'^\s*\[\d+mb(?: cg:\d+mb)?\]\s*', re.IGNORECASE)
+
+
+def _extract_error_signature(logs: str | None) -> str:
+    """Pull the most fingerprint-able line out of an error log blob.
+
+    Prefers lines matching typical error shapes (Error/Exception/Traceback/
+    assertion/FAIL). Returns the first such line found, trimmed. Empty
+    string when logs are missing or have no recognizable error line —
+    callers fall back to latest_status_message in that case.
+    """
+    if not logs:
+        return ''
+    for line in logs.splitlines():
+        low = line.strip().lower()
+        if not low:
+            continue
+        if any(kw in low for kw in (
+            'error:', 'exception', 'traceback', 'assertionerror',
+            'fail:', 'failed:', ' fail ', 'no such ', 'cannot ',
+        )):
+            return line.strip()[:500]
+    return ''
 
 
 def _fingerprint_message(msg: str) -> str:
-    """Normalize a status message into a grouping fingerprint.
+    """Normalize a status/error message into a grouping fingerprint.
 
-    Strips UUIDs, hex hashes, and standalone numbers so near-duplicate
-    messages (same error, different task IDs / line numbers) cluster.
-    Also strips memory prefixes like [16mb] or [16mb cg:512mb].
+    Strips memory/size/duration tokens, UUIDs, hex hashes, and standalone
+    numbers so near-duplicate messages (same error, different task IDs,
+    different memory readings, different line numbers) cluster into a
+    single fingerprint instead of spawning redundant remediations.
     """
     s = (msg or "").lower().strip()
     s = _RE_MEM_PREFIX.sub('', s)
+    s = _RE_SIZE_TOKEN.sub('<size>', s)
     s = _RE_UUID.sub('<id>', s)
     s = _RE_HEX.sub('<hash>', s)
     s = _RE_NUM.sub('<n>', s)
@@ -461,19 +500,31 @@ def _fingerprint_message(msg: str) -> str:
     return s[:200]
 
 
-def record_residual_fingerprint(task: "Task") -> None:
+def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
     """Record a CODE_ERROR fallthrough in the residual store.
 
     The _residual_seen_task_ids dedup set prevents double-counting when
     classify_failure_taxonomy() calls classify_failure() internally.
+
+    When `logs` contains an error-shaped line (Traceback/Error/Exception/
+    FAIL/…), fingerprints on that signature instead of on
+    latest_status_message. The status message is often a routine agent
+    heartbeat (e.g. `[10.5MB] Cloning…`) that happened to be current
+    when classification ran, which makes per-task fingerprints spurious.
     """
     task_id = str(getattr(task, 'id', '') or '')
     if not task_id or task_id in _residual_seen_task_ids:
         return
     if len(_residual_seen_task_ids) < _RESIDUAL_SEEN_MAX:
         _residual_seen_task_ids.add(task_id)
-    msg = task.latest_status_message or ''
-    fp = _fingerprint_message(msg) or '<empty>'
+    status_msg = task.latest_status_message or ''
+    err_line = _extract_error_signature(logs)
+    # Fingerprint source: error line when available, status message as
+    # fallback. Status message is still retained in the store as context
+    # for human operators (shown in admin UI / remediation prompt) — we
+    # just don't let it drive the group-by.
+    fingerprint_source = err_line or status_msg
+    fp = _fingerprint_message(fingerprint_source) or '<empty>'
     now = time.time()
     if fp in _residual_store:
         entry = _residual_store[fp]
@@ -489,7 +540,11 @@ def record_residual_fingerprint(task: "Task") -> None:
             'count': 1,
             'first_seen': now,
             'last_seen': now,
-            'sample_message': msg[:500],
+            # Primary "what went wrong" text (error line when extractable).
+            'sample_message': fingerprint_source[:500],
+            # Original agent status at failure time — kept for operator
+            # context when the error line is terse or cryptic.
+            'sample_status': status_msg[:500],
             'task_ids': [task_id],
         }
 
@@ -498,7 +553,9 @@ def get_top_residual_fingerprints(window_seconds: int = 86400, top_n: int = 10) 
     """Return the top-N residual CODE_ERROR fingerprints within the time window.
 
     Each result dict contains: fingerprint, count, last_seen (epoch float),
-    sample_message, task_ids (up to 5 examples).
+    sample_message (error-line or status fallback), sample_status (original
+    agent heartbeat at failure time — kept as human context even though it
+    doesn't drive the fingerprint), task_ids (up to 5 examples).
     """
     cutoff = time.time() - window_seconds
     results = [
@@ -507,6 +564,7 @@ def get_top_residual_fingerprints(window_seconds: int = 86400, top_n: int = 10) 
             'count': entry['count'],
             'last_seen': entry['last_seen'],
             'sample_message': entry['sample_message'],
+            'sample_status': entry.get('sample_status', ''),
             'task_ids': entry['task_ids'],
         }
         for fp, entry in _residual_store.items()
@@ -693,6 +751,9 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
     if "superseded" in combined:
         return AGENT_TIMEOUT
 
-    # Default: code error — record fingerprint for residual-pattern analysis
-    record_residual_fingerprint(task)
+    # Default: code error — record fingerprint for residual-pattern analysis.
+    # Pass `logs` so the fingerprint keys on the actual error signature
+    # (Traceback/Error/FAIL line) when available, not on whatever agent
+    # heartbeat happened to be in latest_status_message.
+    record_residual_fingerprint(task, logs=logs)
     return "CODE_ERROR"

@@ -523,6 +523,23 @@ class TestFingerprintMessage:
         assert _fingerprint_message(msg1) == "using tool: bash"
         assert _fingerprint_message(msg2) == "using tool: bash"
 
+    def test_strips_decimal_memory_prefixes(self):
+        """Regression: the residual-fingerprint spawner was producing one
+        fingerprint per decimal memory reading ([10.5MB] / [10.4MB] / …)
+        because the old prefix regex required integer-only `\\d+mb`."""
+        msg1 = "[10.5mb] clone complete, configuring workspace..."
+        msg2 = "[10.4mb] clone complete, configuring workspace..."
+        msg3 = "[10.5MB cg:512.4MB] clone complete, configuring workspace..."
+        assert _fingerprint_message(msg1) == _fingerprint_message(msg2)
+        assert _fingerprint_message(msg2) == _fingerprint_message(msg3)
+        assert "mb" not in _fingerprint_message(msg1)
+
+    def test_strips_embedded_size_tokens(self):
+        """Size tokens mid-message ('15.4MB' not as prefix) collapse too."""
+        msg1 = "rss 15.4mb heap 12.1mb after retry"
+        msg2 = "rss 15.6mb heap 12.3mb after retry"
+        assert _fingerprint_message(msg1) == _fingerprint_message(msg2)
+
     def test_near_duplicates_cluster(self):
         fp1 = _fingerprint_message("AssertionError: expected 3, got 4")
         fp2 = _fingerprint_message("AssertionError: expected 9, got 12")
@@ -578,6 +595,32 @@ class TestResidualStore:
         assert result == CODE_ERROR
         results = get_top_residual_fingerprints()
         assert any(r['task_ids'] == ['task-ff'] or 'task-ff' in r['task_ids'] for r in results)
+
+    def test_fingerprint_prefers_error_line_over_status_message(self):
+        """Regression: status messages were dominating the fingerprint
+        even when structured error text was available in the logs."""
+        t1 = self._task_with_id("[10.5mb] Cloning repo...", "task-A")
+        t2 = self._task_with_id("[10.4mb] Rebasing onto main...", "task-B")
+        # Same error in logs — different status heartbeats. Should cluster.
+        err_logs = "TypeError: getProviderRunner is not a function\n  at handleCreate"
+        record_residual_fingerprint(t1, logs=err_logs)
+        record_residual_fingerprint(t2, logs=err_logs)
+        results = get_top_residual_fingerprints()
+        assert len(results) == 1, f"expected 1 fingerprint, got {len(results)}"
+        assert results[0]['count'] == 2
+
+    def test_status_message_retained_as_context(self):
+        """Even when fingerprint is driven by the error line, the agent
+        status at failure time is still stored for human display."""
+        t = self._task_with_id("[12.3mb] Running tests...", "task-status")
+        err_logs = "AssertionError: expected true to be false"
+        record_residual_fingerprint(t, logs=err_logs)
+        results = get_top_residual_fingerprints()
+        assert len(results) == 1
+        # sample_message = error line (fingerprint source)
+        assert "AssertionError" in results[0]['sample_message']
+        # sample_status = original heartbeat (human context)
+        assert "Running tests" in results[0].get('sample_status', '')
 
     def test_window_filter_excludes_old(self):
         import app.failure_classification as fc

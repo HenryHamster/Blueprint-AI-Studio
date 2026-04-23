@@ -1480,14 +1480,25 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
             continue
 
         sample_message = fp_entry.get("sample_message", "(no message)")
+        sample_status = fp_entry.get("sample_status", "") or ""
         task_ids = fp_entry.get("task_ids") or []
         task_ids_str = ", ".join(str(t) for t in task_ids[:5])
 
+        # Status context is secondary — it's the agent heartbeat at failure
+        # time (e.g. "Cloning repo…"), useful for humans to know what stage
+        # the failure hit but not the error itself. Include it only if it
+        # differs from the error line, labeled as context.
+        status_block = (
+            f"\n\nAgent status when this failure hit (context, not the error):\n{sample_status}"
+            if sample_status and sample_status.strip() != sample_message.strip()
+            else ""
+        )
         prompt = (
             f"Residual CODE_ERROR fingerprint '{fp}' has been seen "
             f"{fp_entry.get('count', '?')} time(s) in the last 24 hours without "
             f"being classified by the pipeline. Investigate and fix the root cause.\n\n"
-            f"Sample error message:\n{sample_message}\n\n"
+            f"Sample error message:\n{sample_message}"
+            f"{status_block}\n\n"
             f"Affected task IDs (up to 5): {task_ids_str or '(none recorded)'}\n\n"
             f"Open a fix PR that resolves the underlying code defect causing these failures."
         )
