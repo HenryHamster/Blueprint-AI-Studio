@@ -1161,7 +1161,7 @@ def test_get_dispatch_health_snapshot_degrades_when_primary_provider_down_but_fa
 def test_get_dispatch_health_snapshot_uses_task_type_models_to_infer_required_provider():
     _shared_state.runtime_config["task_type_provider_preference"] = {}
     _shared_state.runtime_config["task_type_model_preferences"] = {}
-    _shared_state.runtime_config["task_type_models"] = {"create": "gpt-5"}
+    _shared_state.runtime_config["task_type_models"] = {"create": "gpt-5.4"}
     _shared_state.runtime_config["cross_provider_fallback_enabled"] = False
 
     ext = {

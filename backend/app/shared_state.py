@@ -98,9 +98,9 @@ runtime_config: Dict = {
             "haiku": "claude-haiku-4-5-20251001",
         },
         "openai": {
-            "opus": "gpt-5",
-            "sonnet": "gpt-5-mini",
-            "haiku": "gpt-5-nano",
+            "opus": "gpt-5.4",
+            "sonnet": "gpt-5.3-codex",
+            "haiku": "gpt-5.4-mini",
         },
         "gemini": {
             "opus": "gemini-2.5-pro",
@@ -173,10 +173,10 @@ runtime_config: Dict = {
             # review (high) gets medium so review comments can explain.
             # strategic (max) gets high because the prose *is* the deliverable
             # (design docs, research, plans).
-            "low": {"model": "gpt-5-mini", "reasoning_effort": "low", "verbosity": "low"},
-            "medium": {"model": "gpt-5-mini", "reasoning_effort": "medium", "verbosity": "low"},
-            "high": {"model": "gpt-5", "reasoning_effort": "high", "verbosity": "medium"},
-            "max": {"model": "gpt-5", "reasoning_effort": "high", "verbosity": "high"},
+            "low": {"model": "gpt-5.4-mini", "reasoning_effort": "low", "verbosity": "low"},
+            "medium": {"model": "gpt-5.4-mini", "reasoning_effort": "medium", "verbosity": "low"},
+            "high": {"model": "gpt-5.4", "reasoning_effort": "high", "verbosity": "medium"},
+            "max": {"model": "gpt-5.4", "reasoning_effort": "xhigh", "verbosity": "high"},
         },
         "gemini": {
             "low": {"model": "gemini-2.5-flash-lite", "thinking_budget": 1024},

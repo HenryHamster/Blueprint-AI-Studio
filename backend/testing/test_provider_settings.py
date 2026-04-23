@@ -26,7 +26,7 @@ async def test_get_settings_includes_provider_scaffolding(client):
     assert body["category_routing"]["_default"]["effort"] in ("low", "medium", "high", "max")
     # Effort matrix ships with sensible per-(provider, level) bags including model.
     assert body["provider_settings_by_effort"]["anthropic"]["medium"]["model"] == "claude-sonnet-4-6"
-    assert body["provider_settings_by_effort"]["openai"]["low"]["model"] == "gpt-5-mini"
+    assert body["provider_settings_by_effort"]["openai"]["low"]["model"] == "gpt-5.4-mini"
     assert "service_account" in body["providers"]["gemini"]["auth_modes"]
     assert body["providers"]["gemini"]["auth_modes"]["service_account"]["required_metadata_fields"] == ["project", "location"]
 
@@ -47,7 +47,7 @@ async def test_patch_settings_accepts_routing_and_matrix(client):
     payload = {
         "provider_tier_model_map": {
             "anthropic": {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"},
-            "openai": {"opus": "gpt-5", "sonnet": "gpt-4.1", "haiku": "gpt-4o-mini"},
+            "openai": {"opus": "gpt-5.4", "sonnet": "gpt-5.3-codex", "haiku": "gpt-5.4-mini"},
             "gemini": {"opus": "gemini-2.5-pro", "sonnet": "gemini-2.5-flash", "haiku": "gemini-2.5-flash-lite"},
         },
         "category_routing": {
@@ -60,7 +60,7 @@ async def test_patch_settings_accepts_routing_and_matrix(client):
         },
         "task_type_model_preferences": {
             "create": [
-                {"provider": "openai", "model": "gpt-5"},
+                {"provider": "openai", "model": "gpt-5.4"},
                 {"provider": "anthropic", "model": "claude-opus-4-7"},
             ],
         },
@@ -108,24 +108,24 @@ async def test_patch_settings_accepts_effort_matrix_with_model_per_level(client)
     payload = {
         "provider_settings_by_effort": {
             "openai": {
-                "low": {"model": "gpt-4o-mini", "reasoning_effort": "low"},
-                "medium": {"model": "gpt-4.1", "reasoning_effort": "medium"},
-                "high": {"model": "gpt-5", "reasoning_effort": "high"},
-                "max": {"model": "gpt-5", "reasoning_effort": "high", "verbosity": "high"},
+                "low": {"model": "gpt-5.4-mini", "reasoning_effort": "low"},
+                "medium": {"model": "gpt-5.4-mini", "reasoning_effort": "medium"},
+                "high": {"model": "gpt-5.4", "reasoning_effort": "high"},
+                "max": {"model": "gpt-5.4", "reasoning_effort": "xhigh", "verbosity": "high"},
             },
         },
     }
     res = await client.patch("/api/admin/settings", json=payload)
     assert res.status_code == 200, res.text
     body = (await client.get("/api/admin/settings")).json()
-    assert body["provider_settings_by_effort"]["openai"]["high"]["model"] == "gpt-5"
+    assert body["provider_settings_by_effort"]["openai"]["high"]["model"] == "gpt-5.4"
     assert body["provider_settings_by_effort"]["openai"]["max"]["verbosity"] == "high"
 
 
 async def test_patch_settings_rejects_unknown_effort_level_in_matrix(client):
     res = await client.patch(
         "/api/admin/settings",
-        json={"provider_settings_by_effort": {"openai": {"ludicrous": {"model": "gpt-5"}}}},
+        json={"provider_settings_by_effort": {"openai": {"ludicrous": {"model": "gpt-5.4"}}}},
     )
     assert res.status_code == 400
     assert "ludicrous" in res.text or "effort level" in res.text

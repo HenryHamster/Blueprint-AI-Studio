@@ -147,11 +147,7 @@ def test_providers_expose_default_execution_mode_only():
 # ---------------------------------------------------------------------------
 
 class TestOpenAIFlexGate:
-    @pytest.mark.parametrize("model", [
-        "gpt-5", "gpt-5-mini", "o3", "o3-pro", "o4-mini", "o4-mini-high",
-        # Case-insensitive prefix match so spot-casing variants survive.
-        "GPT-5", "O4-Mini",
-    ])
+    @pytest.mark.parametrize("model", ["gpt-5.4", "gpt-5.4-mini"])
     def test_flex_passes_through_on_supported_models(self, model):
         provider = get_provider(LLMProviderName.OPENAI)
         translation = provider.settings_to_cli({
@@ -166,11 +162,9 @@ class TestOpenAIFlexGate:
         assert not any("service_tier=flex" in u for u in translation.unsupported)
 
     @pytest.mark.parametrize("model", [
-        "gpt-4.1",        # gpt-4 family — not flex-capable
-        "gpt-4o-mini",    # gpt-4 family — not flex-capable
-        "gpt-5-nano",     # explicit-excludes match — nano drops flex per docs
-        "gpt-5-codex",    # explicit-excludes — codex variant drops flex per docs
-        "gpt-4",          # legacy
+        "gpt-5.3-codex",        # codex variants — no flex column in OpenAI pricing
+        "gpt-5.3-codex-spark",  # spark — likewise
+        "gpt-5.2",              # prior frontier — not in current flex table
     ])
     def test_flex_dropped_on_unsupported_models(self, model):
         provider = get_provider(LLMProviderName.OPENAI)
@@ -189,15 +183,9 @@ class TestOpenAIFlexGate:
         ), f"expected dropped-flex marker for {model}, got {translation.unsupported}"
 
     def test_flex_dropped_when_model_unknown(self):
-        """Unknown model → fail closed (drop flex). Better one warning than
-        a silent 400 at dispatch time."""
+        """Unknown model → fail closed (drop flex)."""
         provider = get_provider(LLMProviderName.OPENAI)
-        translation = provider.settings_to_cli({
-            "service_tier": "flex",
-            # no model → the effective-model injection in compute.py normally
-            # fills this in, but we still want the gate to fail closed if a
-            # settings_to_cli caller forgets.
-        })
+        translation = provider.settings_to_cli({"service_tier": "flex"})
         config_flags = [
             translation.args[i + 1]
             for i, a in enumerate(translation.args) if a == "-c"
@@ -205,45 +193,14 @@ class TestOpenAIFlexGate:
         assert 'service_tier="flex"' not in config_flags
         assert any("service_tier=flex" in u for u in translation.unsupported)
 
-    def test_fast_not_gated_by_flex_check(self):
-        """service_tier=fast is a distinct tier (priority routing) with its
-        own model rules; the flex gate must not accidentally drop it."""
-        provider = get_provider(LLMProviderName.OPENAI)
-        translation = provider.settings_to_cli({
-            "model": "gpt-4.1",
-            "service_tier": "fast",
-        })
-        config_flags = [
-            translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-c"
-        ]
-        assert 'service_tier="fast"' in config_flags
-
-    def test_flex_dropped_on_oauth_even_with_flex_capable_model(self):
-        """flex is API-key-billing-only — ChatGPT subscriptions 400 even on
-        flex-capable models (gpt-5, etc). The auth_mode gate must fire
-        regardless of model compatibility."""
+    def test_flex_passes_on_oauth_with_flex_capable_model(self):
+        """Flex is model-gated, not auth-gated — OAuth on a flex-capable
+        model passes through. Regression: earlier overcorrection gated
+        flex on OAuth unconditionally."""
         provider = get_provider(LLMProviderName.OPENAI)
         translation = provider.settings_to_cli(
-            {"model": "gpt-5", "service_tier": "flex"},
+            {"model": "gpt-5.4", "service_tier": "flex"},
             auth_mode=LLMAuthMode.OAUTH,
-        )
-        config_flags = [
-            translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-c"
-        ]
-        assert 'service_tier="flex"' not in config_flags
-        assert any(
-            "OAuth" in u and "flex" in u for u in translation.unsupported
-        ), f"expected OAuth-flex marker, got {translation.unsupported}"
-
-    def test_flex_still_passes_on_api_key_with_flex_capable_model(self):
-        """API-key auth on a flex-capable model is the happy path — must
-        not regress when the OAuth gate was added."""
-        provider = get_provider(LLMProviderName.OPENAI)
-        translation = provider.settings_to_cli(
-            {"model": "gpt-5", "service_tier": "flex"},
-            auth_mode=LLMAuthMode.API_KEY,
         )
         config_flags = [
             translation.args[i + 1]
@@ -253,66 +210,79 @@ class TestOpenAIFlexGate:
 
 
 # ---------------------------------------------------------------------------
-# OpenAI OAuth-unsupported model gate — regression for `The '<model>' model
-# is not supported when using Codex with a ChatGPT account.` 400 on
-# gpt-5-codex, which is API-key-billing-only but remains a valid admin
-# choice (e.g. a pool that mixes OAuth and API-key OpenAI accounts).
+# OpenAI fast service_tier gate — regression for ChatGPT-subscription-only
+# Fast-mode routing. API-key auth 400s on fast since it consumes Fast-mode
+# credits that don't exist on pay-as-you-go billing.
 # ---------------------------------------------------------------------------
 
-class TestOpenAIOAuthModelGate:
-    def test_gpt5_codex_swapped_to_gpt5_on_oauth(self):
+class TestOpenAIFastGate:
+    def test_fast_passes_on_oauth(self):
         provider = get_provider(LLMProviderName.OPENAI)
         translation = provider.settings_to_cli(
-            {"model": "gpt-5-codex"},
+            {"model": "gpt-5.4", "service_tier": "fast"},
             auth_mode=LLMAuthMode.OAUTH,
         )
-        # -m gpt-5 should be emitted (swap), not -m gpt-5-codex.
-        m_flags = [
+        config_flags = [
             translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-m"
+            for i, a in enumerate(translation.args) if a == "-c"
         ]
-        assert m_flags == ["gpt-5"], f"expected -m gpt-5, got {m_flags}"
-        assert any(
-            "gpt-5-codex" in u and "swapped" in u and "gpt-5" in u
-            for u in translation.unsupported
-        ), f"expected swap marker, got {translation.unsupported}"
+        assert 'service_tier="fast"' in config_flags
 
-    def test_gpt5_codex_preserved_on_api_key(self):
-        """API-key auth runs gpt-5-codex fine — the OAuth swap must not
-        fire in API-key mode."""
+    def test_fast_dropped_on_api_key(self):
         provider = get_provider(LLMProviderName.OPENAI)
         translation = provider.settings_to_cli(
-            {"model": "gpt-5-codex"},
+            {"model": "gpt-5.4", "service_tier": "fast"},
             auth_mode=LLMAuthMode.API_KEY,
         )
-        m_flags = [
+        config_flags = [
             translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-m"
+            for i, a in enumerate(translation.args) if a == "-c"
         ]
-        assert m_flags == ["gpt-5-codex"]
+        assert 'service_tier="fast"' not in config_flags
+        assert any(
+            "service_tier=fast" in u and "OAuth" in u
+            for u in translation.unsupported
+        ), f"expected OAuth-fast marker, got {translation.unsupported}"
 
-    def test_oauth_available_model_passes_through(self):
+    def test_fast_dropped_without_auth_mode(self):
+        """Legacy callers that don't pass auth_mode default to the
+        conservative API-key interpretation — fast drops."""
         provider = get_provider(LLMProviderName.OPENAI)
-        translation = provider.settings_to_cli(
-            {"model": "gpt-5"},
-            auth_mode=LLMAuthMode.OAUTH,
-        )
-        m_flags = [
+        translation = provider.settings_to_cli({"model": "gpt-5.4", "service_tier": "fast"})
+        config_flags = [
             translation.args[i + 1]
-            for i, a in enumerate(translation.args) if a == "-m"
+            for i, a in enumerate(translation.args) if a == "-c"
         ]
-        assert m_flags == ["gpt-5"]
+        assert 'service_tier="fast"' not in config_flags
 
-    def test_fallback_model_maps_gpt5_codex_to_gpt5(self):
-        """fallback_model() is called by the dispatcher when no pool
-        account can serve the requested model — mirrors Gemini's
-        preview→GA fallback pattern."""
+
+# ---------------------------------------------------------------------------
+# OpenAI reasoning_effort + tier map — exercise the xhigh value that the
+# current Codex CLI accepts (was capped at `high` in earlier schemas) and
+# confirm the tier map resolves to current picker-visible models.
+# ---------------------------------------------------------------------------
+
+class TestOpenAITierAndEffort:
+    @pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh"])
+    def test_reasoning_effort_passes_through(self, effort):
+        """All five reasoning levels are accepted at translation; per-model
+        compat gaps surface as runtime 400s (deferred to model/list)."""
         provider = get_provider(LLMProviderName.OPENAI)
-        assert provider.fallback_model("gpt-5-codex") == "gpt-5"
-        assert provider.fallback_model("GPT-5-CODEX") == "gpt-5"
-        # Models without a registered fallback return None.
-        assert provider.fallback_model("gpt-5") is None
-        assert provider.fallback_model(None) is None
+        translation = provider.settings_to_cli({
+            "model": "gpt-5.4",
+            "reasoning_effort": effort,
+        })
+        config_flags = [
+            translation.args[i + 1]
+            for i, a in enumerate(translation.args) if a == "-c"
+        ]
+        assert f'model_reasoning_effort="{effort}"' in config_flags
+
+    def test_tier_map_resolves_to_current_picker_models(self):
+        provider = get_provider(LLMProviderName.OPENAI)
+        assert provider.tier_to_model("opus", {}) == "gpt-5.4"
+        assert provider.tier_to_model("sonnet", {}) == "gpt-5.3-codex"
+        assert provider.tier_to_model("haiku", {}) == "gpt-5.4-mini"
 
 
 # ---------------------------------------------------------------------------

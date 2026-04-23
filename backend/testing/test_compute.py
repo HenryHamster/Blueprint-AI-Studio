@@ -171,7 +171,7 @@ class TestAgentSecretManifest:
             task_type="create",
             provider="openai",
             auth_mode="oauth",
-            model="gpt-5",
+            model="gpt-5.4",
         )
 
         assert manifest["env"]["PROVIDER"] == "openai"

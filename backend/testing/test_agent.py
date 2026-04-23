@@ -129,7 +129,7 @@ async def test_agent_status_update_persists_runtime_identity(client: AsyncClient
         "failure_category": "rate_limited",
         "provider": "openai",
         "auth_mode": "api_key",
-        "model": "gpt-5",
+        "model": "gpt-5.4",
         "execution_mode": "default",
     }
     resp = await client.post("/api/agent/status", json=payload, headers=headers)
@@ -138,7 +138,7 @@ async def test_agent_status_update_persists_runtime_identity(client: AsyncClient
     await db_session.refresh(task)
     assert task.context["llm_provider"] == "openai"
     assert task.context["llm_auth_mode"] == "api_key"
-    assert task.context["llm_model"] == "gpt-5"
+    assert task.context["llm_model"] == "gpt-5.4"
     assert task.context["llm_execution_mode"] == "default"
     assert task.context["failure_category"] == "RATE_LIMIT"
 

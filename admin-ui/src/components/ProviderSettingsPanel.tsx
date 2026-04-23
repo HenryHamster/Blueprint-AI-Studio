@@ -21,19 +21,17 @@ const GEMINI_PREVIEW_FALLBACK: Record<string, string> = {
   'gemini-3.1-flash-preview': 'gemini-2.5-flash',
 };
 
-// Mirrors backend/app/providers/openai.py::_FLEX_SUPPORTED_PREFIXES +
-// _FLEX_EXCLUDED_MODELS. Kept in sync by convention — when the backend
-// gains/loses flex support for a family, update both sides. Unknown model →
-// fail closed (no flex) so an operator doesn't stamp a guaranteed-400 config.
-const OPENAI_FLEX_PREFIXES: readonly string[] = ['gpt-5', 'o3', 'o4-mini'];
-const OPENAI_FLEX_EXCLUDES: ReadonlySet<string> = new Set(['gpt-5-nano', 'gpt-5-codex']);
+// Mirrors backend/app/providers/openai.py::_FLEX_SUPPORTED_MODELS. Kept in
+// sync by convention — when the backend gains/loses flex support for a
+// model, update both sides. Unknown model → fail closed (no flex) so an
+// operator doesn't stamp a guaranteed-400 config.
+const OPENAI_FLEX_SUPPORTED: ReadonlySet<string> = new Set(['gpt-5.4', 'gpt-5.4-mini']);
 
 function openaiModelSupportsFlex(model: unknown): boolean {
   if (typeof model !== 'string') return false;
   const n = model.trim().toLowerCase();
   if (!n) return false;
-  if (OPENAI_FLEX_EXCLUDES.has(n)) return false;
-  return OPENAI_FLEX_PREFIXES.some(p => n.startsWith(p));
+  return OPENAI_FLEX_SUPPORTED.has(n);
 }
 
 // JSON-Schema subset we render — mirrors backend providers/base.py:_validate_against_schema.
@@ -300,10 +298,11 @@ function crossFieldLock(key: string, bag: ProviderSettingsBag): string | null {
 // drops incompatible values at dispatch; this just keeps the admin from
 // picking something we know will be dropped.
 function crossFieldEnumDisable(key: string, bag: ProviderSettingsBag): Record<string, string> {
-  // OpenAI: service_tier=flex only works on flex-capable models. Sending flex
-  // to a non-flex model (gpt-4.1, gpt-4o-mini, gpt-5-codex, …) returns a 400
-  // `Unsupported service_tier: flex` — mirror the backend's _model_supports_flex
-  // gate so the picker never offers flex for an incompatible model.
+  // OpenAI: service_tier=flex only works on flex-capable models (gpt-5.4,
+  // gpt-5.4-mini). Sending flex to anything else returns a 400
+  // `Unsupported service_tier: flex` — mirror the backend's
+  // _model_supports_flex gate so the picker never offers flex for an
+  // incompatible model.
   if (key === 'service_tier' && !openaiModelSupportsFlex(bag.model)) {
     const modelLabel = typeof bag.model === 'string' && bag.model ? `\`${bag.model}\`` : 'the selected model';
     return { flex: `${modelLabel} does not accept service_tier=flex.` };

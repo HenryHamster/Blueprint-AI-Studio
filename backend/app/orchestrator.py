@@ -406,7 +406,7 @@ _CRITICAL_EXTERNAL_DEPS = ("github_api", "dispatch_api", "gcp")
 
 _ENV_FALLBACK_DEFAULT_MODELS = {
     "anthropic": "claude-opus-4-7",
-    "openai": "gpt-5",
+    "openai": "gpt-5.4",
     "gemini": "gemini-2.5-pro",
 }
 
