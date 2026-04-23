@@ -1545,10 +1545,9 @@ export function SettingsDropdown({
 // Frontend-duplicated because rendering the GA/preview split shouldn't
 // require a network round trip to the backend on every settings-panel open.
 const GEMINI_PREVIEW_MODEL_IDS = new Set<string>([
-  'gemini-3-pro-preview',
-  'gemini-3-flash-preview',
   'gemini-3.1-pro-preview',
-  'gemini-3.1-flash-preview',
+  'gemini-3-flash-preview',
+  'gemini-3.1-flash-lite-preview',
 ]);
 
 function accountSupportsAvailabilityCheck(account: MaxPlanAccount): boolean {

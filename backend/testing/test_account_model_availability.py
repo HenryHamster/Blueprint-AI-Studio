@@ -105,14 +105,14 @@ class TestGeminiListAvailableModels:
 class TestOpenAIListAvailableModels:
     @pytest.mark.asyncio
     async def test_api_key_parses_data_ids(self, mocker):
-        """v1/models response: {"data":[{"id":"gpt-5", ...}, ...]}."""
+        """v1/models response: {"data":[{"id":"gpt-5.4", ...}, ...]}."""
         provider = get_provider(LLMProviderName.OPENAI)
         mock_resp = mocker.MagicMock(status_code=200)
         mock_resp.json = mocker.MagicMock(return_value={
             "data": [
-                {"id": "gpt-5", "object": "model"},
-                {"id": "o3-mini"},
-                {"id": "gpt-4.1"},
+                {"id": "gpt-5.4", "object": "model"},
+                {"id": "gpt-5.4-mini"},
+                {"id": "gpt-5.3-codex"},
                 {"no_id": True},  # malformed; skip
             ]
         })
@@ -126,7 +126,7 @@ class TestOpenAIListAvailableModels:
         models = await provider.list_available_models(
             "sk-proj-abc", LLMAuthMode.API_KEY, {}
         )
-        assert models == ["gpt-4.1", "gpt-5", "o3-mini"]
+        assert models == ["gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini"]
 
     @pytest.mark.asyncio
     async def test_oauth_mode_returns_none(self):
