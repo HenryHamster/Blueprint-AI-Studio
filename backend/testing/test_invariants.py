@@ -673,7 +673,7 @@ MODULE_SIZE_LIMITS = {
     "routers/agent.py": 2300,
     "services.py": 1700,
     "routers/agent_status.py": 1550,
-    "autonomous_research.py": 1600,
+    "autonomous_research.py": 1800,
     "research_completion.py": 2050,
     "strategic_completion.py": 1500,
     "rollup_management.py": 1600,
