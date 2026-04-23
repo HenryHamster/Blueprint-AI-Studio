@@ -1592,7 +1592,7 @@ function AccountAvailabilityLine({
         <span className="text-neutral-400">{models.length} model{models.length === 1 ? '' : 's'} visible</span>
         {isGemini && preview.length > 0 && (
           <span className="ml-1.5 text-violet-400" title={`Preview-gated models visible on this key: ${preview.join(', ')}`}>
-            &middot; {preview.length} preview
+            &middot; {preview.length} preview model{preview.length === 1 ? '' : 's'}
           </span>
         )}
         {isGemini && models.length > 0 && preview.length === 0 && (
