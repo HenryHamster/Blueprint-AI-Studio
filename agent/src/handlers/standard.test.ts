@@ -847,7 +847,11 @@ describe('self-review phase', () => {
     expect(outcome.parse_failed).toBeUndefined();
   });
 
-  it('derives checks_performed from check_results keys and overrides verdict to FAIL when any check failed', async () => {
+  it('derives checks_performed from check_results keys and respects agent verdict even when a check failed', async () => {
+    // When the agent reports PASS but check_results contains a passed:false
+    // sub-check, we record a verdict_check_mismatch category for the human
+    // reviewer but no longer override the agent's verdict — the agent is in
+    // a better position to weigh ambiguous sub-checks than a hard override.
     const { getMandatoryChecks } = await import('../prompt.js');
     vi.mocked(getMandatoryChecks).mockReturnValue(['test_coverage', 'type_safety']);
     const reviewJson = JSON.stringify({
@@ -867,19 +871,20 @@ describe('self-review phase', () => {
       .mockReturnValue('');            // remaining
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'FAILED',
+    const completedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
     );
-    expect(statusCall).toBeDefined();
-    const payload = statusCall![1] as Record<string, unknown>;
-    expect(payload.failure_category).toBe('self_review_rejected');
+    expect(completedCall).toBeDefined();
+    const payload = completedCall![1] as Record<string, unknown>;
     const outcome = payload.self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.check_results).toEqual({ test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing type annotation' } });
     expect(outcome.checks_performed).toEqual(['test_coverage', 'type_safety']);
-    expect(outcome.verdict).toBe('FAIL');
-    expect(outcome.parse_failed).toBeUndefined();
-    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+    // Agent's PASS verdict is respected — no forced flip to FAIL.
+    expect(outcome.verdict).toBe('PASS');
+    // Mismatch is recorded so humans reviewing the PR can see the inconsistency.
+    expect(outcome.categories).toEqual(expect.arrayContaining(['verdict_check_mismatch']));
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
   });
 
   it('marks self_review_failed when self-review output contains no JSON', async () => {
@@ -1113,10 +1118,14 @@ describe('self-review phase', () => {
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 
-  it('forces verdict to FAIL when check_results has passed:false but agent reported PASS, and blocks PR via retry-then-FAIL gate', async () => {
+  it('does not retry on verdict/check_results mismatch — records the mismatch category but proceeds to PR with agent verdict', async () => {
+    // Previously, an agent PASS verdict combined with a passed:false sub-check
+    // triggered a retry loop and eventually forced a FAIL. That hard rule kept
+    // killing ambitious tasks where the agent had weighed an ambiguous sub-check
+    // and decided it was acceptable. We now record the mismatch category so the
+    // human reviewer sees it, but proceed to PR with the agent's verdict.
     const { getMandatoryChecks } = await import('../prompt.js');
     vi.mocked(getMandatoryChecks).mockReturnValue(['test_coverage', 'type_safety']);
-    // Pass 1: inconsistent PASS with a failed check → parseFailed=true, verdict forced to FAIL
     const inconsistentJson = JSON.stringify({
       verdict: 'PASS',
       check_results: { test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing return type' } },
@@ -1125,19 +1134,9 @@ describe('self-review phase', () => {
       files_reviewed: 2,
       truncated_files_read: [],
     });
-    // Retry: agent corrects to FAIL verdict consistent with failed check
-    const retryJson = JSON.stringify({
-      verdict: 'FAIL',
-      check_results: { test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing return type' } },
-      checks_performed: ['test_coverage', 'type_safety'],
-      issues_found: 1,
-      files_reviewed: 2,
-      truncated_files_read: [],
-    });
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // main task
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${inconsistentJson}\n\`\`\``, lastResultText: '' }) // pass 1: inconsistent
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${retryJson}\n\`\`\``, lastResultText: '' }); // retry: consistent FAIL
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: `\`\`\`json\n${inconsistentJson}\n\`\`\``, lastResultText: '' }); // pass 1
     vi.mocked(git)
       .mockReturnValueOnce('')         // baseCommit
       .mockReturnValueOnce('M file')   // hasChanges
@@ -1150,12 +1149,20 @@ describe('self-review phase', () => {
       .mockReturnValue('');
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    // Retry produces consistent FAIL → FAIL gate blocks PR creation.
-    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+    // No FAIL status — PR should proceed.
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
       TASK_ID,
-      expect.objectContaining({ status: 'FAILED', failure_category: 'self_review_rejected' }),
+      expect.objectContaining({ status: 'FAILED' }),
     );
-    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+    // No retry triggered — only main task call + single self-review call.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const completed = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+    );
+    const outcome = (completed![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    expect(outcome.verdict).toBe('PASS');
+    expect(outcome.categories).toEqual(expect.arrayContaining(['verdict_check_mismatch']));
   });
 
   it('re-runs testFixLoop after self-review applies fixes (handleCreate, main branch)', async () => {
@@ -1963,15 +1970,15 @@ describe('lint failure handling', () => {
   });
 });
 
-// ── Scope overflow gate ───────────────────────────────────────────────────────
-describe('scope overflow gate', () => {
+// ── Scope overflow warning (soft-mode) ────────────────────────────────────────
+// Scope overflow no longer hard-fails small- or medium-scope tasks. It only
+// surfaces as a warning in the PR body so a human reviewer can judge whether
+// the file set is too broad — hard gates were killing ambitious tasks that
+// legitimately needed broader changes.
+describe('scope overflow warning (soft-mode)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // Reset testFixLoop to passing so a test from a prior describe block doesn't bleed over
-    // (vi.clearAllMocks keeps implementations — only call history is cleared).
     vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: false, passed: true });
-    // Git call order: rev-parse HEAD (baseCommit), status --porcelain (diff), rev-parse HEAD (currentHead).
-    // currentHead === baseCommit → no committed paths, only uncommitted ones from porcelain output.
     vi.mocked(git)
       .mockReturnValueOnce('')   // baseCommit (rev-parse HEAD)
       .mockReturnValueOnce(      // status --porcelain → 7 changed files
@@ -1980,18 +1987,14 @@ describe('scope overflow gate', () => {
       .mockReturnValue('');      // currentHead + all remaining
   });
 
-  it('marks small-scope task as FAILED with scope_overflow when changed files exceed threshold', async () => {
+  it('does not fail a small-scope task even when changed files exceed the threshold — proceeds to PR', async () => {
     const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
       TASK_ID,
-      expect.objectContaining({
-        status: 'FAILED',
-        failure_category: 'scope_overflow',
-        scope_gate_triggered: 'small_overflow',
-      }),
+      expect.objectContaining({ failure_category: 'scope_overflow' }),
     );
-    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
   });
 
   it('does not fail a medium-scope task when changed files exceed the small threshold', async () => {
@@ -2003,7 +2006,16 @@ describe('scope overflow gate', () => {
     );
   });
 
-  it('excludes test files when counting against small-scope overflow threshold', async () => {
+  it('surfaces a scope overflow warning in the PR body when non-test files exceed the threshold', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).toContain('Scope Overflow Warning');
+    expect(prBodyArg).toContain('7 non-test files');
+  });
+
+  it('does not surface a scope overflow warning when only test files push the count over', async () => {
     vi.mocked(git)
       .mockReset()
       .mockReturnValueOnce('')  // baseCommit
@@ -2014,111 +2026,9 @@ describe('scope overflow gate', () => {
       .mockReturnValue('');
     const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
-      TASK_ID,
-      expect.objectContaining({ failure_category: 'scope_overflow' }),
-    );
-  });
-
-  it('still fails small-scope task when non-test files alone exceed threshold', async () => {
-    vi.mocked(git)
-      .mockReset()
-      .mockReturnValueOnce('')  // baseCommit
-      // 7 production files, no test files → still exceeds threshold of 6
-      .mockReturnValueOnce(
-        'M src/file1.ts\nM src/file2.ts\nM src/file3.ts\nM src/file4.ts\nM src/file5.ts\nM src/file6.ts\nM src/file7.ts',
-      )
-      .mockReturnValue('');
-    const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
-    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.objectContaining({ status: 'FAILED', failure_category: 'scope_overflow' }),
-    );
-  });
-});
-
-// ── Scope trim prompt framing ─────────────────────────────────────────────────
-describe('scope trim prompt', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.mocked(parseAnalysisPlanFiles).mockReset();
-    vi.mocked(parseAnalysisPlanTestFiles).mockReset();
-    vi.mocked(parseAnalysisPlanTestFiles).mockReturnValue([]);
-    vi.mocked(parseAnalysisPlanVerifyFiles).mockReset();
-    vi.mocked(parseAnalysisPlanVerifyFiles).mockReturnValue([]);
-    vi.mocked(lintFixLoop).mockResolvedValue(true);
-    vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: false, passed: true });
-  });
-
-  it('uses neutral language for unplanned files and omits bias phrasing', async () => {
-    // Plan targets 2 files; implementation touches 11 → trips medium overflow (threshold = 10).
-    vi.mocked(parseAnalysisPlanFiles).mockReturnValue(['planned1.ts', 'planned2.ts']);
-    const files11 = Array.from({ length: 11 }, (_, i) => `M src/file${i}.ts`).join('\n');
-    const trimJson = '```json\n' + JSON.stringify({
-      assessment: 'all essential',
-      essential_files: Array.from({ length: 11 }, (_, i) => `src/file${i}.ts`),
-      files_to_revert: [],
-      all_essential_justification: 'every file is necessary',
-    }) + '\n```';
-    vi.mocked(runClaudeCode)
-      .mockReset()
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- planned1.ts\n- planned2.ts' }) // analysis
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })  // implementation
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: trimJson, lastResultText: '' })  // scope trim
-      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
-    vi.mocked(git)
-      .mockReset()
-      .mockReturnValueOnce('')           // baseCommit
-      .mockReturnValueOnce(files11)       // status --porcelain
-      .mockReturnValueOnce('')           // currentHead (same as baseCommit)
-      .mockReturnValue('');
-
-    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
-    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    const trimPrompt = vi.mocked(runClaudeCode).mock.calls[2][0];
-    // Bias phrasing against unplanned files must be gone.
-    expect(trimPrompt).not.toContain('likely non-essential');
-    expect(trimPrompt).not.toContain('default to reverting');
-    // Plan section should still exist and now frame unplanned files neutrally.
-    expect(trimPrompt).toContain('Pre-Implementation Plan');
-    expect(trimPrompt).toContain('evaluate each file on its own merit');
-    expect(trimPrompt).toContain('Implementation often reveals necessary changes');
-  });
-
-  it('includes Implementation notes from commit messages when commits exist', async () => {
-    vi.mocked(parseAnalysisPlanFiles).mockReturnValue(['planned1.ts', 'planned2.ts']);
-    const files11 = Array.from({ length: 11 }, (_, i) => `M src/file${i}.ts`).join('\n');
-    const trimJson = '```json\n' + JSON.stringify({
-      assessment: 'all essential', essential_files: [], files_to_revert: [],
-      all_essential_justification: 'every file is necessary',
-    }) + '\n```';
-    vi.mocked(runClaudeCode)
-      .mockReset()
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '**Files to change**\n- planned1.ts' })
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' })
-      .mockResolvedValueOnce({ exitCode: 0, allOutput: trimJson, lastResultText: '' })
-      .mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
-    // Simulate commits by making currentHead differ from baseCommit, so the log call fires.
-    vi.mocked(git)
-      .mockReset()
-      .mockReturnValueOnce('base-sha')           // baseCommit
-      .mockReturnValueOnce(files11)               // status --porcelain
-      .mockReturnValueOnce('head-sha')           // currentHead (differs → commits exist)
-      .mockReturnValueOnce('1\t0\tsrc/file0.ts') // numstat for fileChangeDetails
-      .mockReturnValueOnce('src/file0.ts')       // diff --name-only for committedPaths
-      .mockReturnValueOnce('1\t0\tsrc/file0.ts') // numstat for diffSummary
-      .mockReturnValueOnce('A\tsrc/file0.ts')   // name-status for diffSummary
-      .mockReturnValueOnce('feat: discovered dependency on helper.ts\nfixes wiring\n---') // git log for implementation notes
-      .mockReturnValue('');
-
-    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
-    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-
-    const trimPrompt = vi.mocked(runClaudeCode).mock.calls[2][0];
-    expect(trimPrompt).toContain('Implementation notes');
-    expect(trimPrompt).toContain('discovered dependency on helper.ts');
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).not.toContain('Scope Overflow Warning');
   });
 });
 
@@ -2174,25 +2084,20 @@ describe('handleRefactor blocking gates', () => {
   });
 });
 
-// ── Post-self-review scope overflow gate ─────────────────────────────────────
-describe('post-self-review scope overflow gate', () => {
+// ── Scope overflow warning in PR body (post self-review) ─────────────────────
+// The post-self-review hard gate was removed: it used to block PR creation
+// after ~8-10 min of successful lint/test/self-review when file count still
+// exceeded the scope threshold. That killed ambitious tasks that legitimately
+// needed broader changes. Now the overflow just surfaces as a warning in the
+// PR body so the human reviewer can judge it.
+describe('scope overflow warning in PR body (post self-review)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  /**
-   * Builds a git mock sequence for the standard path where:
-   * - baseCommit === currentHead (no committed changes)
-   * - hasChanges = true (uncommitted diff = 'M file')
-   * - self-review runs but applies no fixes (headBefore === headAfter)
-   * - postReviewDiff = the provided string
-   */
-  function setupGitMocksWithPostReviewDiff(postReviewDiff: string): void {
-    // Restore mocks that other test suites may have permanently overridden
+  function setupGitMocks(diff: string): void {
     vi.mocked(lintFixLoop).mockResolvedValue(true);
     vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: false, passed: true });
-    // Return valid self-review JSON covering all mandatory checks (union across all scopes)
-    // so the self-review gate passes and the scope overflow check is reached.
     const validSelfReviewOutput = '```json\n' + JSON.stringify({
       verdict: 'PASS',
       checks_performed: ['correctness', 'test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'data_model_safety', 'import_verification'],
@@ -2203,89 +2108,57 @@ describe('post-self-review scope overflow gate', () => {
     vi.mocked(runClaudeCode).mockReset().mockResolvedValue({ exitCode: 0, allOutput: validSelfReviewOutput, lastResultText: '' });
     vi.mocked(git)
       .mockReset()
-      .mockReturnValueOnce('')          // 1: baseCommit (rev-parse HEAD)
-      .mockReturnValueOnce('M file')    // 2: hasChanges (status --porcelain)
-      .mockReturnValueOnce('')          // 3: currentHead (same as baseCommit)
-      .mockReturnValueOnce('')          // 4: uncommittedDiff for self-review (diff HEAD)
-      .mockReturnValueOnce('abc123')    // 5: headBeforeReview
-      .mockReturnValueOnce('')          // 6: statusBeforeReview
-      .mockReturnValueOnce('abc123')    // 7: headAfterReview (same → no fixes)
-      .mockReturnValueOnce('')          // 8: statusAfterReview (same → no fixes)
-      .mockReturnValueOnce(postReviewDiff) // 9: postReviewDiff (scope overflow check)
+      .mockReturnValueOnce('')        // baseCommit
+      .mockReturnValueOnce(diff)      // hasChanges (status --porcelain — drives changedPaths)
+      .mockReturnValueOnce('')        // currentHead (same as baseCommit)
+      .mockReturnValueOnce('')        // uncommittedDiff for self-review
+      .mockReturnValueOnce('abc123')  // headBeforeReview
+      .mockReturnValueOnce('')        // statusBeforeReview
+      .mockReturnValueOnce('abc123')  // headAfterReview (same → no fixes)
+      .mockReturnValueOnce('')        // statusAfterReview
       .mockReturnValue('');
   }
 
-  it('blocks PR and reports scope_overflow when medium task exceeds threshold after self-review', async () => {
-    // medium threshold = 10; provide 11 files
+  it('does not block PR when medium task exceeds threshold — surfaces warning in PR body instead', async () => {
     const files11 = Array.from({ length: 11 }, (_, i) => `M src/file${i}.ts`).join('\n');
-    setupGitMocksWithPostReviewDiff(files11);
+    setupGitMocks(files11);
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.objectContaining({
-        status: 'FAILED',
-        failure_category: 'scope_overflow',
-        scope_gate_triggered: 'post_review_overflow',
-      }),
-    );
-    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
-  });
-
-  it('includes threshold and file count in failure log for scope overflow', async () => {
-    const files11 = Array.from({ length: 11 }, (_, i) => `M src/file${i}.ts`).join('\n');
-    setupGitMocksWithPostReviewDiff(files11);
-    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
-    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const failedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'FAILED',
-    );
-    expect(failedCall).toBeDefined();
-    const logs = (failedCall![1] as Record<string, unknown>).logs as string;
-    expect(logs).toContain('11');
-    expect(logs).toContain('10');
-  });
-
-  it('does not block PR when medium task is within threshold after self-review', async () => {
-    // medium threshold = 10; provide 5 files
-    const files5 = Array.from({ length: 5 }, (_, i) => `M src/file${i}.ts`).join('\n');
-    setupGitMocksWithPostReviewDiff(files5);
-    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
-    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
     expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
       TASK_ID,
       expect.objectContaining({ failure_category: 'scope_overflow' }),
     );
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).toContain('Scope Overflow Warning');
+    expect(prBodyArg).toContain('11 non-test files');
   });
 
-  it('blocks PR and reports scope_overflow when small task exceeds threshold after self-review', async () => {
-    // small threshold = 6; provide 7 files
+  it('does not surface a warning when the medium task is within threshold', async () => {
+    const files5 = Array.from({ length: 5 }, (_, i) => `M src/file${i}.ts`).join('\n');
+    setupGitMocks(files5);
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).not.toContain('Scope Overflow Warning');
+  });
+
+  it('does not block PR when small task exceeds threshold — surfaces warning in PR body instead', async () => {
     const files7 = Array.from({ length: 7 }, (_, i) => `M src/file${i}.ts`).join('\n');
-    setupGitMocksWithPostReviewDiff(files7);
+    setupGitMocks(files7);
     const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.objectContaining({ status: 'FAILED', failure_category: 'scope_overflow' }),
-    );
-    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
-  });
-
-  it('does not block PR when task has no scope set', async () => {
-    const files11 = Array.from({ length: 11 }, (_, i) => `M src/file${i}.ts`).join('\n');
-    setupGitMocksWithPostReviewDiff(files11);
-    const task = { title: 'Task', description: '', context: {}, project_context: {} };
-    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
     expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
       TASK_ID,
       expect.objectContaining({ failure_category: 'scope_overflow' }),
     );
+    expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).toContain('Scope Overflow Warning');
   });
 
-  it('excludes test files from post-self-review scope overflow count', async () => {
-    // medium threshold = 10; 3 prod files + 9 test files = 12 total, but only 3 non-test
+  it('does not surface a warning for test-heavy diffs — test files are excluded from the count', async () => {
     const mixedFiles = [
       'M src/prod1.ts', 'M src/prod2.ts', 'M src/prod3.ts',
       'M src/prod1.test.ts', 'M src/prod2.test.ts', 'M src/prod3.test.ts',
@@ -2293,30 +2166,12 @@ describe('post-self-review scope overflow gate', () => {
       'M src/__tests__/c.ts', 'M src/__tests__/d.ts',
       'M src/helper.spec.ts', 'M src/util.spec.tsx',
     ].join('\n');
-    setupGitMocksWithPostReviewDiff(mixedFiles);
+    setupGitMocks(mixedFiles);
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
-    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
-      TASK_ID,
-      expect.objectContaining({ failure_category: 'scope_overflow' }),
-    );
-  });
-
-  it('still blocks PR when non-test files alone exceed post-self-review threshold', async () => {
-    // medium threshold = 10; 11 non-test files + 3 test files → still blocks
-    const tooManyProd = [
-      ...Array.from({ length: 11 }, (_, i) => `M src/prod${i}.ts`),
-      'M src/prod0.test.ts', 'M testing/test_a.py', 'M src/__tests__/c.ts',
-    ].join('\n');
-    setupGitMocksWithPostReviewDiff(tooManyProd);
-    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
-    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
-      TASK_ID,
-      expect.objectContaining({ status: 'FAILED', failure_category: 'scope_overflow' }),
-    );
-    expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    expect(prBodyArg).not.toContain('Scope Overflow Warning');
   });
 });
 

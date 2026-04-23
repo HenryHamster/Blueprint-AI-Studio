@@ -970,15 +970,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         needs_approval = False
 
         direction_id = finding.get("direction_id")
-        # Apply per-type model/effort overrides — take the higher of finding vs config
-        _model_rank = {"claude-opus-4-7": 4, "claude-opus-4-6": 3, "claude-sonnet-4-6": 2, "claude-haiku-4-5-20251001": 1}
+        # Ignore finding.model: it's a legacy anthropic-only hint that
+        # silently anchored children to a provider regardless of the
+        # operator's category_routing. Model resolution is the
+        # orchestrator's job (via provider_preference + effort matrix).
+        # Operator-level pins via runtime_config.task_type_models still
+        # flow through.
+        finding_model = _runtime_config.get("task_type_models", {}).get(task_type)
         _effort_rank = {"max": 4, "high": 3, "medium": 2, "low": 1}
-        finding_model = finding.get('model')
-        config_model = _runtime_config.get("task_type_models", {}).get(task_type)
-        if finding_model and config_model:
-            finding_model = finding_model if _model_rank.get(finding_model, 0) >= _model_rank.get(config_model, 0) else config_model
-        elif config_model:
-            finding_model = config_model
         finding_effort = finding.get('effort')
         config_effort = _runtime_config.get("task_type_efforts", {}).get(task_type)
         if finding_effort and config_effort:

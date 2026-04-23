@@ -185,7 +185,10 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     session.add(task)
 
     parent_payload = task.first_payload
-    model = parent_payload.get('model')
+    # Don't inherit the plan task's resolved model — that was picked by
+    # balanced selection for THIS task's run and would anchor every child
+    # to the same provider regardless of the operator's category_routing.
+    # Let the orchestrator resolve each child fresh from routing.
     effort = parent_payload.get('effort')
     plan_parent_context = {
         "parent_task_id": str(task.id),
@@ -201,7 +204,6 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         full_prompt = prompt_text + ("\n\nKey files to review or modify:\n" + "\n".join(f"- {f}" for f in related_files)) if related_files else prompt_text
         create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
         subtask_priority = TASK_PRIORITY_MAP.get(subtask_def.get("priority", "medium"), 50)
-        subtask_model = subtask_def.get('model') or model
         subtask_effort = subtask_def.get('effort') or effort
         child_scope = subtask_def.get('scope', 'small')
         # Scope-aware effort floor: small subtasks run cheaper, large subtasks
@@ -216,6 +218,12 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         _allowed_types = {'create', 'refactor', 'migrate', 'qa'}
         raw_type = subtask_def.get('type', 'create')
         subtask_type = raw_type if raw_type in _allowed_types else 'create'
+        # Ignore subtask_def.model and parent plan model — legacy hints
+        # that anchored every child to one provider regardless of the
+        # operator's category_routing. Respect operator-level
+        # task_type_models pins only; orchestrator resolves per child
+        # from routing otherwise.
+        subtask_model = _runtime_config.get("task_type_models", {}).get(subtask_type)
         child = Task(
             project_id=task.project_id,
             title=subtask_def.get("title", "Untitled subtask"),

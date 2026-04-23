@@ -463,163 +463,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       ? `This task has scope "${taskScope}" (expected few files) but ${nonTestChangedPaths.length} non-test files were changed (${changedPaths.length} total including tests), exceeding the ${overflowThreshold}-file threshold. Changed files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`
       : undefined;
     if (scopeOverflowWarning) {
-      sendLog(ws, `\nWARNING: Scope overflow detected — ${nonTestChangedPaths.length} non-test files changed for a "${taskScope}" task (threshold: ${overflowThreshold}, ${changedPaths.length} total including tests).\n`);
-    }
-
-    // ── Scope Trim Enforcement (medium-scope only) ────────────────────────────
-    // For medium tasks exceeding the file threshold, prompt the agent to evaluate
-    // which files are essential and automatically revert non-essential ones before
-    // lint/test/self-review. Large tasks are not subject to this enforcement.
-    const scopeTrimReverted: string[] = [];
-    let scopeTrimJustification: string | undefined;
-    if (taskScope === 'medium' && scopeOverflowWarning) {
-      sendLog(ws, '\nEnforcing scope limits — prompting agent to identify non-essential files...\n');
-      statusRef.value = 'Trimming scope overflow...';
-
-      const fileStatsLines = changedPaths.map(f => {
-        const stats = diffSummary.find(d => d.file === f);
-        return stats
-          ? `- ${f} (+${stats.additions}/-${stats.deletions}, ${stats.change_type})`
-          : `- ${f}`;
-      }).join('\n');
-
-      const plannedFilesForTrim = analysisContext ? parseAnalysisPlanFiles(analysisContext) : [];
-      const planSection = plannedFilesForTrim.length > 0
-        ? `\n## Pre-Implementation Plan — Files to change\n${plannedFilesForTrim.map(f => `- ${f}`).join('\n')}\n\nYour pre-implementation plan targeted these files. Implementation often reveals necessary changes that were not anticipated during planning, so treat files outside the plan neutrally — evaluate each file on its own merit based on whether it is required for the task to work correctly.\n`
-        : '';
-
-      let implementationNotes = '';
-      if (currentHead !== baseCommit) {
-        try {
-          const commitLog = git(['log', '--format=%s%n%b%n---', `${baseCommit}..HEAD`]).trim();
-          if (commitLog) {
-            implementationNotes = `\n## Implementation notes — recent commit messages\n${commitLog.slice(0, 2000)}\n`;
-          }
-        } catch { /* ignore log errors */ }
-      }
-
-      const scopeTrimPrompt = `You are reviewing the scope of a completed implementation task to remove non-essential file changes before creating a PR.
-
-## Original Task
-${rawPrompt.slice(0, 3000)}
-${planSection}${implementationNotes}
-## Changed Files (${changedPaths.length} files, threshold: ${overflowThreshold})
-${fileStatsLines}
-
-## Instructions
-Review each changed file and classify it as ESSENTIAL or NON-ESSENTIAL based on the original task${plannedFilesForTrim.length > 0 ? ' and pre-implementation plan' : ''} above.
-
-A file is ESSENTIAL only if it is directly required to implement what was asked.
-Revert files that are: formatting-only changes, style cleanups not requested, tangential refactors, or test files for code you did not change.
-
-If ALL files are truly necessary for a legitimate cross-cutting change, you may keep them all but MUST provide a specific per-file justification explaining why each file is required.
-
-Output ONLY a JSON object in a \`\`\`json code fence:
-\`\`\`json
-{
-  "assessment": "Brief explanation of what was trimmed and why",
-  "essential_files": ["file1.ts", "file2.py"],
-  "files_to_revert": ["file3.ts"],
-  "all_essential_justification": "Only populate if files_to_revert is empty — specific reason every file is required",
-  "per_file_justification": {"file1.ts": "Required for X because...", "file2.py": "Required for Y because..."}
-}
-\`\`\``;
-
-      const { exitCode: trimExitCode, allOutput: trimOutput } = await runClaudeCode(
-        scopeTrimPrompt, ws, statusRef, model, effort,
-        ['Write', 'Edit', 'NotebookEdit'],
-      );
-
-      if (trimExitCode === 0) {
-        const trimResult = extractSelfReviewJson(trimOutput);
-        const filesToRevert = Array.isArray(trimResult?.files_to_revert)
-          ? (trimResult.files_to_revert as unknown[]).filter((f): f is string => typeof f === 'string')
-          : [];
-
-        if (filesToRevert.length > 0) {
-          sendLog(ws, `\nReverting ${filesToRevert.length} non-essential file(s):\n`);
-          for (const fileToRevert of filesToRevert) {
-            if (!changedPaths.includes(fileToRevert)) continue;
-            try {
-              // Restore file to its state at baseCommit (works for modified files)
-              execFileSync('git', ['-C', WORKSPACE, 'checkout', baseCommit, '--', fileToRevert], { encoding: 'utf-8' });
-              sendLog(ws, `  Reverted: ${fileToRevert}\n`);
-              scopeTrimReverted.push(fileToRevert);
-            } catch {
-              // File did not exist at baseCommit — it is new, remove it
-              try {
-                execFileSync('git', ['-C', WORKSPACE, 'rm', '-f', '--', fileToRevert], { encoding: 'utf-8' });
-                sendLog(ws, `  Removed (new file): ${fileToRevert}\n`);
-                scopeTrimReverted.push(fileToRevert);
-              } catch {
-                try {
-                  execFileSync('rm', ['-f', `${WORKSPACE}/${fileToRevert}`], { encoding: 'utf-8' });
-                  sendLog(ws, `  Deleted (untracked): ${fileToRevert}\n`);
-                  scopeTrimReverted.push(fileToRevert);
-                } catch (err3) {
-                  const msg = err3 instanceof Error ? err3.message : String(err3);
-                  sendLog(ws, `  WARNING: Could not revert ${fileToRevert}: ${msg}\n`);
-                }
-              }
-            }
-          }
-          // Remove reverted files from changedPaths so downstream steps (lint, test, self-review) skip them
-          const revertedSet = new Set(scopeTrimReverted);
-          changedPaths.splice(0, changedPaths.length, ...changedPaths.filter(f => !revertedSet.has(f)));
-          sendLog(ws, `Scope trim complete: ${changedPaths.length} file(s) remaining.\n`);
-        } else {
-          sendLog(ws, 'Scope trim: agent determined all files are essential.\n');
-        }
-        if (typeof trimResult?.all_essential_justification === 'string' && (trimResult.all_essential_justification as string).trim()) {
-          scopeTrimJustification = trimResult.all_essential_justification as string;
-        }
-      } else {
-        sendLog(ws, 'WARNING: Scope trim evaluation could not complete — proceeding with all files.\n');
-      }
-    }
-
-    // ── Post-trim overflow gate (medium-scope only) ───────────────────────────
-    // If scope trim was attempted but the remaining non-test file count is still
-    // above the medium threshold, fail fast — the post-self-review overflow gate
-    // would catch this anyway after ~8-10 min of wasted lint/test/self-review.
-    if (
-      taskScope === 'medium'
-      && scopeOverflowWarning
-      && scopeTrimReverted.length > 0
-      && overflowThreshold !== undefined
-    ) {
-      const postTrimNonTest = changedPaths.filter(p => !isTestFile(p));
-      if (postTrimNonTest.length > overflowThreshold) {
-        sendLog(ws, `\nScope overflow: scope trim reverted ${scopeTrimReverted.length} file(s) but ${postTrimNonTest.length} non-test files still exceed the ${overflowThreshold}-file medium threshold. Failing fast to avoid wasted lint/test/self-review cycles.\n`);
-        await persistAndPostStatus(taskId, {
-          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-          logs: `Scope overflow after trim: ${postTrimNonTest.length} non-test files remain for a medium-scope task (threshold: ${overflowThreshold}, ${changedPaths.length} total including tests). Scope trim reverted ${scopeTrimReverted.length} file(s) but could not bring the count within budget. Retry should split this task into smaller subtasks.\n\nChanged files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`,
-          failure_category: 'scope_overflow',
-          scope_gate_triggered: 'scope_trim_overflow',
-          scope_trim_reverted: scopeTrimReverted,
-          changed_files: changedPaths.slice(0, 50),
-          ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
-        });
-        return;
-      }
-    }
-
-    // ── Scope overflow gate (small-scope tasks only) ─────────────────────────────
-    // Small tasks that touch too many files waste review cycles — fail fast so the
-    // retry can focus on fewer files. Run before lint/test loops to avoid wasting
-    // cycles on tasks that are guaranteed to be rejected. Medium tasks legitimately
-    // touch more files, so keep the existing warning-only behaviour for them.
-    if (taskScope === 'small' && scopeOverflowWarning) {
-      sendLog(ws, `\nScope overflow: failing small-scope task — ${nonTestChangedPaths.length} non-test files changed exceeds the ${overflowThreshold}-file threshold. Retry should focus on the single most critical change and limit to 1-3 files.\n`);
-      await persistAndPostStatus(taskId, {
-        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-        logs: `Scope overflow: ${nonTestChangedPaths.length} non-test files changed for a small-scope task (threshold: ${overflowThreshold}, ${changedPaths.length} total including tests). Retry guidance: focus on the single most critical change and limit to 1-3 files.\n\nChanged files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`,
-        failure_category: 'scope_overflow',
-        scope_gate_triggered: 'small_overflow',
-        changed_files: changedPaths.slice(0, 50),
-        ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
-      });
-      return;
+      sendLog(ws, `\nWARNING: Scope overflow detected — ${nonTestChangedPaths.length} non-test files changed for a "${taskScope}" task (threshold: ${overflowThreshold}, ${changedPaths.length} total including tests). Proceeding; the warning will be surfaced in the PR body for human review.\n`);
     }
 
     // ── Migration Completeness Check ──────────────────────────────────────────
@@ -1076,15 +920,14 @@ Return nothing — just write the files.`;
           parsedTruncatedFiles = Array.isArray(parsed.truncated_files_read) ? parsed.truncated_files_read as string[] : [];
 
           // Extract check_results if present and derive checks_performed from
-          // its keys when the agent omitted that field.
+          // its keys when the agent omitted that field. We record a
+          // verdict_check_mismatch category when the agent's verdict
+          // contradicts its own check_results so the human reviewer can see
+          // the disagreement, but we no longer override the agent's verdict —
+          // the agent is in a better position to weigh ambiguous sub-checks
+          // than a hard rule here.
           if (parsed.check_results && typeof parsed.check_results === 'object' && !Array.isArray(parsed.check_results)) {
             parsedCheckResults = parsed.check_results as Record<string, { passed: boolean; issue?: string }>;
-            // When the agent provided an explicit checks_performed array alongside
-            // a verdict that contradicts check_results, that's a higher-signal
-            // inconsistency worth retrying so the agent self-corrects. When
-            // checks_performed was omitted, derive it silently and just flip the
-            // verdict to FAIL — no retry needed for a pure formatting miss.
-            const hadExplicitChecks = parsedChecks !== undefined;
             if (!parsedChecks) {
               parsedChecks = Object.keys(parsedCheckResults);
             }
@@ -1092,11 +935,7 @@ Return nothing — just write the files.`;
               .filter(([, r]) => r && r.passed === false)
               .map(([id]) => id);
             if (failedCheckIds.length > 0 && parsedVerdict !== 'FAIL') {
-              if (hadExplicitChecks) {
-                reviewCategories.push('verdict_check_mismatch');
-                parseFailed = true;
-              }
-              parsedVerdict = 'FAIL';
+              reviewCategories.push('verdict_check_mismatch');
             }
           }
 
@@ -1304,18 +1143,14 @@ Return nothing — just write the files.`;
                 const retryMissing = mandatory.filter(m => !retryChecks?.includes(m));
                 if (retryChecks && retryMissing.length === 0) {
                   retryValid = true;
-                  let retryVerdict = typeof retryParsed.verdict === 'string' ? retryParsed.verdict : undefined;
+                  const retryVerdict = typeof retryParsed.verdict === 'string' ? retryParsed.verdict : undefined;
                   const retryCheckResults = retryParsed.check_results && typeof retryParsed.check_results === 'object' && !Array.isArray(retryParsed.check_results)
                     ? retryParsed.check_results as Record<string, { passed: boolean; issue?: string }>
                     : undefined;
-                  // Re-enforce verdict/check_results consistency on retry response.
+                  // Respect the agent's verdict on the retry. If it still
+                  // disagrees with its own check_results, the mismatch is
+                  // already recorded in reviewCategories for humans to see.
                   if (retryCheckResults) {
-                    const retryFailedIds = Object.entries(retryCheckResults)
-                      .filter(([, r]) => r && r.passed === false)
-                      .map(([id]) => id);
-                    if (retryFailedIds.length > 0 && retryVerdict !== 'FAIL') {
-                      retryVerdict = 'FAIL';
-                    }
                     selfReviewOutcome!.check_results = retryCheckResults;
                   }
                   if (retryVerdict !== undefined) selfReviewOutcome!.verdict = retryVerdict;
@@ -1348,35 +1183,6 @@ Return nothing — just write the files.`;
             return;
           }
         }
-      }
-    }
-
-    // ── Guard: Post-self-review scope overflow check ─────────────────────────
-    // Re-count changed files after self-review (which may have trimmed files).
-    // If count still exceeds the threshold, block PR creation. Test files are
-    // excluded from the count since they are essential for merge quality.
-    if (overflowThreshold !== undefined) {
-      const postReviewCommittedPaths = currentHead !== baseCommit
-        ? git(['diff', '--name-only', `${baseCommit}..HEAD`]).split('\n').filter(Boolean)
-        : [];
-      const postReviewDiff = git(['status', '--porcelain']);
-      const postReviewUncommitted = postReviewDiff.length > 0
-        ? postReviewDiff.split('\n').map((l: string) => l.trim().split(/\s+/).pop() || '').filter(Boolean)
-        : [];
-      const postReviewPaths = [...new Set([...postReviewCommittedPaths, ...postReviewUncommitted])];
-      const postReviewNonTestPaths = postReviewPaths.filter((f: string) => !isTestFile(f));
-      if (postReviewNonTestPaths.length > overflowThreshold) {
-        const fileList = postReviewPaths.map((f: string) => `- ${f}`).join('\n');
-        const failureLog = `Scope overflow: ${postReviewNonTestPaths.length} non-test files changed for a "${taskScope}" task (threshold: ${overflowThreshold}, ${postReviewPaths.length} total including tests).\n\nChanged files:\n${fileList}\n\nTrim unrelated files and retry with a focused change set.`;
-        sendLog(ws, `\nScope overflow gate: ${postReviewNonTestPaths.length} non-test files changed (threshold: ${overflowThreshold}) — blocking PR creation.\n`);
-        await persistAndPostStatus(taskId, {
-          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-          logs: failureLog,
-          failure_category: 'scope_overflow',
-          scope_gate_triggered: 'post_review_overflow',
-          changed_files: postReviewPaths.slice(0, 50),
-        });
-        return;
       }
     }
 
@@ -1457,10 +1263,8 @@ Return nothing — just write the files.`;
       const testDetail = !testsPassed && testFailureSummary ? `\n\n<details><summary>Failing tests</summary>\n\n\`\`\`\n${testFailureSummary.slice(0, 1000)}\n\`\`\`\n</details>` : '';
       prBody += `## Test Results\n\n${testSummary}${testDetail}\n\n`;
     }
-    if (scopeTrimReverted.length > 0) {
-      prBody += `## Scope Trim Applied\n\n${scopeTrimReverted.length} non-essential file(s) were automatically reverted before PR creation:\n${scopeTrimReverted.map(f => `- ${f}`).join('\n')}\n\n`;
-    } else if (scopeOverflowWarning) {
-      prBody += `## ⚠️ Scope Overflow Warning\n\n${scopeOverflowWarning}\n\n${scopeTrimJustification ? `**Agent justification (all files kept):** ${scopeTrimJustification}\n\n` : 'Please verify that all changed files are necessary for this task.\n\n'}`;
+    if (scopeOverflowWarning) {
+      prBody += `## ⚠️ Scope Overflow Warning\n\n${scopeOverflowWarning}\n\nPlease verify that all changed files are necessary for this task.\n\n`;
     }
     if (selfReviewOutcome) {
       const reviewStatus = selfReviewOutcome.fixes_applied
@@ -1495,7 +1299,6 @@ Return nothing — just write the files.`;
       ...(selfReviewOutcome ? { self_review_outcome: selfReviewOutcome } : {}),
       ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
       ...(analysisContext ? { analysis_plan: analysisContext.slice(0, 5000) } : {}),
-      ...(scopeTrimReverted.length > 0 ? { scope_gate_triggered: 'scope_trim', scope_trim_reverted: scopeTrimReverted } : {}),
     });
   } else if (exitCode === 0) {
     await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: noChangesMessage });
