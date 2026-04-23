@@ -196,14 +196,33 @@ class TestOpenAIFlexGate:
         assert 'service_tier="flex"' not in config_flags
         assert any("service_tier=flex" in u for u in translation.unsupported)
 
-    def test_flex_passes_on_oauth_with_flex_capable_model(self):
-        """Flex is model-gated, not auth-gated — OAuth on a flex-capable
-        model passes through. Regression: earlier overcorrection gated
-        flex on OAuth unconditionally."""
+    def test_flex_dropped_on_oauth_regardless_of_model(self):
+        """Empirical regression: OpenAI's Responses API rejects flex on
+        ChatGPT-subscription auth with 400 `Unsupported service_tier: flex`
+        even on a flex-capable model like gpt-5.4. Flex is an API-key
+        billing tier with no ChatGPT-credits equivalent."""
         provider = get_provider(LLMProviderName.OPENAI)
         translation = provider.settings_to_cli(
             {"model": "gpt-5.4", "service_tier": "flex"},
             auth_mode=LLMAuthMode.OAUTH,
+        )
+        config_flags = [
+            translation.args[i + 1]
+            for i, a in enumerate(translation.args) if a == "-c"
+        ]
+        assert 'service_tier="flex"' not in config_flags
+        assert any(
+            "service_tier=flex" in u and "OAuth" in u
+            for u in translation.unsupported
+        ), f"expected OAuth-flex marker, got {translation.unsupported}"
+
+    def test_flex_passes_on_api_key_with_flex_capable_model(self):
+        """API-key auth on a flex-capable model is the happy path — must
+        not regress when the OAuth gate tightens."""
+        provider = get_provider(LLMProviderName.OPENAI)
+        translation = provider.settings_to_cli(
+            {"model": "gpt-5.4", "service_tier": "flex"},
+            auth_mode=LLMAuthMode.API_KEY,
         )
         config_flags = [
             translation.args[i + 1]
@@ -468,8 +487,8 @@ class TestGeminiThinkingConfig:
         ), f"expected 2.5-mismatch marker, got {translation.unsupported}"
 
     def test_budget_on_3x_model_emits_but_warns(self):
-        """Back-compat: thinkingBudget on 3.x still flows through to the
-        CLI, but we surface Google's doc note about unexpected behavior."""
+        """Back-compat: thinkingBudget on 3.x still flows through when
+        level isn't set, with an advisory marker."""
         provider = get_provider(LLMProviderName.GEMINI)
         translation = provider.settings_to_cli({
             "model": "gemini-3.1-pro-preview",
@@ -482,10 +501,55 @@ class TestGeminiThinkingConfig:
             ["modelConfig"]["generateContentConfig"]["thinkingConfig"]
         )
         assert thinking["thinkingBudget"] == 4096
+        assert "thinkingLevel" not in thinking
         assert any(
             "thinking_budget on Gemini 3.x" in u and "back-compat" in u
             for u in translation.unsupported
         ), f"expected 3.x-backcompat marker, got {translation.unsupported}"
+
+    def test_budget_and_level_both_set_on_3x_drops_budget(self):
+        """Gemini API rejects the combination with 400 `You can only set
+        only one of thinking budget and thinking level`. On 3.x, prefer
+        the newer thinkingLevel knob and drop thinkingBudget."""
+        provider = get_provider(LLMProviderName.GEMINI)
+        translation = provider.settings_to_cli({
+            "model": "gemini-3.1-pro-preview",
+            "thinking_budget": 4096,
+            "thinking_level": "high",
+        })
+        assert translation.settings_files
+        payload = json.loads(translation.settings_files[0].content)
+        thinking = (
+            payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
+            ["modelConfig"]["generateContentConfig"]["thinkingConfig"]
+        )
+        assert thinking == {"thinkingLevel": "high"}
+        assert any(
+            "thinking_budget" in u and "thinking_level" in u
+            and "dropped" in u
+            for u in translation.unsupported
+        ), f"expected budget-dropped marker, got {translation.unsupported}"
+
+    def test_budget_and_level_both_set_on_25_drops_level(self):
+        """On 2.5, prefer thinking_budget (the supported knob) and drop
+        thinking_level with marker. Prevents the same API-reject pattern."""
+        provider = get_provider(LLMProviderName.GEMINI)
+        translation = provider.settings_to_cli({
+            "model": "gemini-2.5-pro",
+            "thinking_budget": 4096,
+            "thinking_level": "high",
+        })
+        assert translation.settings_files
+        payload = json.loads(translation.settings_files[0].content)
+        thinking = (
+            payload["modelConfigs"]["customAliases"]["blueprint-runtime"]
+            ["modelConfig"]["generateContentConfig"]["thinkingConfig"]
+        )
+        assert thinking == {"thinkingBudget": 4096}
+        assert any(
+            "thinking_level on Gemini 2.5" in u and "dropped" in u
+            for u in translation.unsupported
+        ), f"expected level-dropped marker, got {translation.unsupported}"
 
 
 # ---------------------------------------------------------------------------

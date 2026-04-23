@@ -378,41 +378,81 @@ class GeminiProvider(LLMProvider):
         is_3x = isinstance(model, str) and model in _GEMINI_3_X_MODELS
         is_25 = isinstance(model, str) and model in _GEMINI_GA_MODELS
 
-        thinking_budget = bag.get("thinking_budget")
-        if isinstance(thinking_budget, int):
-            # Per-model cap: schema permits up to 32768 (pro's limit), but
-            # flash and flash-lite cap at 24576 — over-budget requests get
-            # INVALID_ARGUMENT from the API. Clamp silently rather than
-            # raise so admin UI overrides don't wedge dispatch; record the
-            # clamp in unsupported so the operator can see it.
-            cap = _THINKING_BUDGET_CAPS.get(model, _THINKING_BUDGET_DEFAULT_CAP) if isinstance(model, str) else _THINKING_BUDGET_DEFAULT_CAP
-            if thinking_budget > cap:
-                unsupported.append(
-                    f"thinking_budget={thinking_budget} > cap {cap} for model "
-                    f"{model!r}; clamped"
-                )
-                thinking_budget = cap
-            if is_3x:
-                # Google docs: thinkingBudget on 3.x is back-compat only and
-                # may behave unexpectedly on 3 Pro. Emit anyway (the CLI
-                # accepts it) but surface the advisory.
-                unsupported.append(
-                    f"thinking_budget on Gemini 3.x ({model!r}) is back-compat "
-                    f"only and may behave unexpectedly — prefer thinking_level"
-                )
-            thinking_config["thinkingBudget"] = thinking_budget
+        raw_budget = bag.get("thinking_budget")
+        raw_level = bag.get("thinking_level")
+        has_budget = isinstance(raw_budget, int)
+        has_level = isinstance(raw_level, str)
 
-        thinking_level = bag.get("thinking_level")
-        if isinstance(thinking_level, str):
-            if is_25:
-                # 2.5 family doesn't speak thinkingLevel. Drop with marker;
-                # admin should be using thinking_budget here.
+        # Gemini API rejects requests that set BOTH thinkingBudget and
+        # thinkingLevel ("You can only set only one of thinking budget and
+        # thinking level"). Pick exactly one per model family:
+        #   2.5 → thinking_budget is primary; drop level if also set.
+        #   3.x → thinking_level is primary; drop budget if also set.
+        # A bag with neither is fine — nothing gets emitted.
+        if is_25:
+            if has_budget:
+                cap = _THINKING_BUDGET_CAPS.get(model, _THINKING_BUDGET_DEFAULT_CAP)
+                budget = raw_budget
+                if budget > cap:
+                    unsupported.append(
+                        f"thinking_budget={budget} > cap {cap} for model "
+                        f"{model!r}; clamped"
+                    )
+                    budget = cap
+                thinking_config["thinkingBudget"] = budget
+            if has_level:
+                # 2.5 family doesn't speak thinkingLevel. Drop with marker.
                 unsupported.append(
                     f"thinking_level on Gemini 2.5 ({model!r}) is ignored; "
                     f"use thinking_budget instead — dropped"
                 )
-            else:
-                thinking_config["thinkingLevel"] = thinking_level
+        elif is_3x:
+            if has_level:
+                thinking_config["thinkingLevel"] = raw_level
+                if has_budget:
+                    # Co-setting would 400 the API; prefer level (primary
+                    # knob for 3.x per Google docs) and drop budget.
+                    unsupported.append(
+                        f"thinking_budget + thinking_level both set on "
+                        f"Gemini 3.x ({model!r}); Gemini API rejects the "
+                        f"combination — thinking_budget dropped in favor "
+                        f"of thinking_level"
+                    )
+            elif has_budget:
+                # No level configured — fall back to back-compat budget.
+                cap = _THINKING_BUDGET_CAPS.get(model, _THINKING_BUDGET_DEFAULT_CAP)
+                budget = raw_budget
+                if budget > cap:
+                    unsupported.append(
+                        f"thinking_budget={budget} > cap {cap} for model "
+                        f"{model!r}; clamped"
+                    )
+                    budget = cap
+                unsupported.append(
+                    f"thinking_budget on Gemini 3.x ({model!r}) is back-compat "
+                    f"only and may behave unexpectedly — prefer thinking_level"
+                )
+                thinking_config["thinkingBudget"] = budget
+        else:
+            # Unknown model family (not in GA or 3.x sets). Emit whatever's
+            # set but don't combine; if both, prefer level as the newer knob.
+            if has_level:
+                thinking_config["thinkingLevel"] = raw_level
+                if has_budget:
+                    unsupported.append(
+                        f"thinking_budget + thinking_level both set on "
+                        f"unknown model {model!r}; thinking_budget dropped"
+                    )
+            elif has_budget:
+                cap = _THINKING_BUDGET_CAPS.get(model, _THINKING_BUDGET_DEFAULT_CAP) if isinstance(model, str) else _THINKING_BUDGET_DEFAULT_CAP
+                budget = raw_budget
+                if budget > cap:
+                    unsupported.append(
+                        f"thinking_budget={budget} > cap {cap} for model "
+                        f"{model!r}; clamped"
+                    )
+                    budget = cap
+                thinking_config["thinkingBudget"] = budget
 
         include_thoughts = bag.get("include_thoughts")
         if isinstance(include_thoughts, bool):

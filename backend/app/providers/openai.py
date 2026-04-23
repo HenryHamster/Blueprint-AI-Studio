@@ -288,10 +288,25 @@ class OpenAIProvider(LLMProvider):
 
         service_tier = bag.get("service_tier")
         if isinstance(service_tier, str):
-            if service_tier == "flex" and not _model_supports_flex(model):
-                # Admin-level defaults can stamp flex across the matrix; a
-                # per-task tier downgrade then turns every non-flex-model
-                # task into a hard 400. Drop with marker instead of erroring.
+            if service_tier == "flex" and is_oauth:
+                # Empirical: OpenAI's Responses API rejects service_tier=flex
+                # on ChatGPT-subscription (OAuth) auth with 400 `Unsupported
+                # service_tier: flex` regardless of model. Flex is an
+                # API-key-billing-only pricing tier and has no equivalent on
+                # ChatGPT credits. Official docs are ambiguous here, but the
+                # runtime contradicts any "works on OAuth" reading. Drop with
+                # marker; admins configuring flex for cost savings need an
+                # API-key account in the pool.
+                unsupported.append(
+                    "service_tier=flex is not available on ChatGPT-account "
+                    "(OAuth) auth; dropped"
+                )
+            elif service_tier == "flex" and not _model_supports_flex(model):
+                # Model-level gate for API-key flows: flex is pricing-tier-
+                # gated to specific models (gpt-5.4, gpt-5.4-mini). Admin-
+                # level defaults can stamp flex across the matrix; drop
+                # instead of erroring when a tier downgrade lands on a
+                # non-flex model.
                 unsupported.append(
                     f"service_tier=flex requires a flex-capable model "
                     f"(gpt-5.4, gpt-5.4-mini); effective model "
@@ -299,8 +314,7 @@ class OpenAIProvider(LLMProvider):
                 )
             elif service_tier == "fast" and not is_oauth:
                 # Fast mode is a ChatGPT-subscription-only routing tier that
-                # consumes Fast-mode credits. API-key sessions 400 on it, so
-                # drop with marker rather than letting the request go out.
+                # consumes Fast-mode credits. API-key sessions 400 on it.
                 unsupported.append(
                     "service_tier=fast is only available on ChatGPT-account "
                     "(OAuth) auth; dropped"
