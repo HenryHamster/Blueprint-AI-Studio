@@ -691,12 +691,13 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         logger.warning(f"[STRATEGIC] Skipping strategic review — strategic task already active for {project.id}")
         return False
 
-    # Build direction stats with rich data (same as previous strategic payload).
-    # Include paused directions too — user-paused entries are a strong signal the
-    # strategic agent should respect rather than re-propose.
+    # Build direction stats with rich data. Include `active` + `paused` +
+    # `proposed`: paused entries are a strong user signal the strategic agent
+    # should respect rather than re-propose; proposed entries exist so the
+    # strategic agent can approve/reject them in the same cycle.
     included_directions = [
         d for d in (project.directions or [])
-        if d.get("status") in ("active", "paused")
+        if d.get("status") in ("active", "paused", "proposed")
     ]
     direction_stats = []
     for d in included_directions:
@@ -764,6 +765,13 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
             stat_entry["auto_paused"] = bool(d.get("auto_paused"))
             if d.get("paused_reason"):
                 stat_entry["paused_reason"] = d.get("paused_reason")
+        elif d.get("status") == "proposed":
+            if d.get("proposed_by"):
+                stat_entry["proposed_by"] = str(d["proposed_by"])
+            if d.get("proposal_rationale"):
+                stat_entry["proposal_rationale"] = d["proposal_rationale"]
+            if d.get("proposed_at"):
+                stat_entry["proposed_at"] = d["proposed_at"]
         direction_stats.append(stat_entry)
 
     # Recently rejected proposals (last 30 days) — surfaced so the strategic

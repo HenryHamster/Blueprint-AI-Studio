@@ -526,6 +526,12 @@ async def update_agent_status(
         pending_info = (task.context or {}).get("_post_commit_pending")
         if pending_info and isinstance(pending_info, dict):
             logger.info(f"[PIPELINE] Retrying post-commit for terminal task {task.id} (_post_commit_pending set)")
+            # Release the outer FOR UPDATE SKIP LOCKED row lock before calling
+            # _process_post_commit: it opens a separate session and takes its
+            # own FOR UPDATE (task_lifecycle.py:559) on the same row. Holding
+            # the outer lock deadlocks the inner acquire until lock_timeout
+            # (30s) → LockNotAvailableError → 500 → Cloud Run ContainerError.
+            await session.commit()
             _bind = session.bind
             _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
             try:

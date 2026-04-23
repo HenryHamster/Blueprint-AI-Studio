@@ -2011,6 +2011,116 @@ async def strategic_operation(
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
         return _resp({"status": "ok", "op": "retire_direction", "direction_id": dir_id})
 
+    elif payload.op == "approve_direction":
+        # Approve a proposal from an anomaly detector or research agent:
+        # flip status from 'proposed' to 'active'. Cap check mirrors
+        # the user PATCH flow so the agent can't bust max_active_directions.
+        dir_id = data.get("direction_id")
+        if not dir_id:
+            raise HTTPException(status_code=400, detail="direction_id required")
+        rationale = _cap_str(data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings)
+        directions = list(project.directions or [])
+        target = next((d for d in directions if d.get("id") == dir_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        if target.get("status") != "proposed":
+            return JSONResponse(
+                content=_resp({"status": "skipped", "reason": f"Direction is '{target.get('status')}', not 'proposed'"}),
+                status_code=409,
+            )
+        active_count = sum(1 for d in directions if d.get("status") == "active")
+        max_active = _runtime_config.get("max_active_directions", 5)
+        if active_count >= max_active:
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(
+                content=_resp({"status": "skipped", "reason": f"Direction cap reached: {active_count}/{max_active} active"}),
+                status_code=409,
+            )
+        target["status"] = "active"
+        target["activated_at"] = _utcnow().isoformat()
+        notes = target.get("notes", [])
+        notes.append({
+            "text": f"Approved by strategic review: {rationale}" if rationale else "Approved by strategic review",
+            "added_at": _utcnow().isoformat(),
+        })
+        target["notes"] = _cap_list(notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings)
+        project.directions = directions
+        flag_modified(project, "directions")
+        session.add(project)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_proposals_approved": ctx.get("_strategic_proposals_approved", 0) + 1}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(f"[STRATEGIC API] Approved proposal {dir_id} for project {project.id}")
+        return _resp({"status": "ok", "op": "approve_direction", "direction_id": dir_id})
+
+    elif payload.op == "reject_direction":
+        # Reject a proposal — replace with a tombstone (status='rejected') so the
+        # same text doesn't get re-proposed, and cancel any QUEUED tasks spawned
+        # for it. Mirrors the user DELETE endpoint in routers/directions.py.
+        dir_id = data.get("direction_id")
+        if not dir_id:
+            raise HTTPException(status_code=400, detail="direction_id required")
+        rationale = _cap_str(data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings)
+        directions = list(project.directions or [])
+        target = next((d for d in directions if d.get("id") == dir_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        if target.get("status") != "proposed":
+            return JSONResponse(
+                content=_resp({"status": "skipped", "reason": f"Direction is '{target.get('status')}', not 'proposed'"}),
+                status_code=409,
+            )
+        rejected_text = (target.get("text") or "")[:200].strip()
+        remaining = [d for d in directions if d.get("id") != dir_id]
+        if rejected_text:
+            tombstone = {
+                "id": target["id"],
+                "text": rejected_text,
+                "status": "rejected",
+                "rejected_at": _utcnow().isoformat(),
+                "rejected_by": "strategic",
+                **({"rejection_rationale": rationale} if rationale else {}),
+            }
+            rejected = [d for d in remaining if d.get("status") == "rejected"]
+            non_rejected = [d for d in remaining if d.get("status") != "rejected"]
+            rejected.append(tombstone)
+            rejected = rejected[-20:]
+            remaining = non_rejected + rejected
+        # Cancel QUEUED tasks tied to this direction (same as the user DELETE flow)
+        cancelled_result = await session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.status == TaskStatus.QUEUED,
+                Task.context["direction_id"].as_string() == dir_id,
+            )
+        )
+        cancelled_tasks = cancelled_result.scalars().all()
+        vm_ids_to_delete: List[str] = []
+        for t in cancelled_tasks:
+            t.status = TaskStatus.CANCELLED
+            t.latest_status_message = f"Cancelled: proposal {dir_id} was rejected by strategic review"
+            session.add(t)
+            if t.vm_instance_id:
+                vm_ids_to_delete.append(t.vm_instance_id)
+        project.directions = remaining
+        flag_modified(project, "directions")
+        session.add(project)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_proposals_rejected": ctx.get("_strategic_proposals_rejected", 0) + 1}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        for vm_id in vm_ids_to_delete:
+            await _ensure_vm_deleted(vm_id, reason="proposal_rejected")
+        logger.info(f"[STRATEGIC API] Rejected proposal {dir_id} for project {project.id} (cancelled {len(cancelled_tasks)} tasks)")
+        return _resp({"status": "ok", "op": "reject_direction", "direction_id": dir_id, "cancelled_tasks": len(cancelled_tasks)})
+
     elif payload.op == "create_message":
         raw_content = str(data.get("content", "")).strip()
         if not raw_content:

@@ -3031,6 +3031,277 @@ async def test_strategic_api_pending_confirm_rejects_invalid_type(db_session):
         _cleanup_strategic_overrides()
 
 
+@pytest.mark.asyncio
+async def test_strategic_api_approve_direction_flips_proposed_to_active(db_session, mocker):
+    """POST /api/agent/strategic with op=approve_direction promotes a proposal to active."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    existing_dirs = [
+        {"id": "d-act01", "text": "Existing active", "status": "active", "priority": "medium",
+         "notes": [], "research_history": []},
+        {"id": "d-prop01", "text": "Proposed from research", "status": "proposed", "priority": "high",
+         "proposed_by": "some-task-id", "proposal_rationale": "research found gap",
+         "notes": [], "research_history": []},
+    ]
+    project = Project(
+        name="P-strategic-approve",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=existing_dirs,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={"op": "approve_direction", "task_id": task_id,
+                      "data": {"direction_id": "d-prop01", "rationale": "fits current focus"}},
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["op"] == "approve_direction"
+        assert body["direction_id"] == "d-prop01"
+
+        await db_session.refresh(project)
+        approved = next(d for d in project.directions if d["id"] == "d-prop01")
+        assert approved["status"] == "active"
+        assert "activated_at" in approved
+        assert any("Approved by strategic review" in (n.get("text") or "") for n in approved.get("notes", []))
+
+        await db_session.refresh(task)
+        assert task.context.get("_strategic_proposals_approved") == 1
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_approve_direction_respects_cap(db_session, mocker):
+    """POST /api/agent/strategic approve_direction should 409 when direction cap reached."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+    from app.shared_state import runtime_config as _runtime_config
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    original_cap = _runtime_config.get("max_active_directions")
+    _runtime_config["max_active_directions"] = 2
+    try:
+        existing_dirs = [
+            {"id": f"d-act{i}", "text": f"Active {i}", "status": "active", "priority": "medium",
+             "notes": [], "research_history": []} for i in range(2)
+        ] + [
+            {"id": "d-pend01", "text": "Pending proposal", "status": "proposed", "priority": "high",
+             "proposed_by": "t-x", "notes": [], "research_history": []},
+        ]
+        project = Project(
+            name="P-strategic-approve-cap", user_id="u1",
+            vision={"purpose": "test", "revision": 1}, directions=existing_dirs,
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id, user_id="u1",
+            task_type="strategic_review", status=TaskStatus.IN_PROGRESS,
+            payloads=[{"command": "review"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        task_id = str(task.id)
+
+        async def _override_session():
+            yield db_session
+        app.dependency_overrides[get_session] = _override_session
+        app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/api/agent/strategic",
+                    json={"op": "approve_direction", "task_id": task_id,
+                          "data": {"direction_id": "d-pend01", "rationale": "x"}},
+                )
+            assert resp.status_code == 409, resp.text
+            body = resp.json()
+            assert body["status"] == "skipped"
+            assert "cap" in body.get("reason", "").lower()
+
+            await db_session.refresh(project)
+            still_proposed = next(d for d in project.directions if d["id"] == "d-pend01")
+            assert still_proposed["status"] == "proposed", "Proposal should stay proposed when cap is reached"
+        finally:
+            app.dependency_overrides.pop(get_session, None)
+            app.dependency_overrides.pop(verify_agent_token, None)
+    finally:
+        if original_cap is None:
+            _runtime_config.pop("max_active_directions", None)
+        else:
+            _runtime_config["max_active_directions"] = original_cap
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_approve_direction_rejects_non_proposed(db_session, mocker):
+    """approve_direction should 409 when target direction is not in 'proposed' status."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    existing_dirs = [
+        {"id": "d-act01", "text": "Already active", "status": "active", "priority": "medium",
+         "notes": [], "research_history": []},
+    ]
+    project = Project(
+        name="P-strategic-approve-wrongstatus", user_id="u1",
+        vision={"purpose": "test", "revision": 1}, directions=existing_dirs,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, user_id="u1",
+        task_type="strategic_review", status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={"op": "approve_direction", "task_id": task_id,
+                      "data": {"direction_id": "d-act01", "rationale": "x"}},
+            )
+        assert resp.status_code == 409, resp.text
+        assert "proposed" in resp.json().get("reason", "").lower()
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_reject_direction_creates_tombstone(db_session, mocker):
+    """reject_direction should replace proposal with a 'rejected' tombstone and cancel queued tasks for it."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", return_value=True)
+
+    existing_dirs = [
+        {"id": "d-prop01", "text": "Noisy proposal to reject", "status": "proposed", "priority": "medium",
+         "proposed_by": "t-research", "notes": [], "research_history": []},
+    ]
+    project = Project(
+        name="P-strategic-reject", user_id="u1",
+        vision={"purpose": "test", "revision": 1}, directions=existing_dirs,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Strategic-review task that will issue the reject op
+    strategic_task = Task(
+        project_id=project.id, user_id="u1",
+        task_type="strategic_review", status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    # A QUEUED task tied to the proposal — should get cancelled
+    queued_task = Task(
+        project_id=project.id, user_id="u1",
+        task_type="research", status=TaskStatus.QUEUED,
+        payloads=[{"command": "research"}],
+        context={"direction_id": "d-prop01"},
+        vm_instance_id="vm-prop01",
+    )
+    db_session.add(strategic_task)
+    db_session.add(queued_task)
+    await db_session.commit()
+    await db_session.refresh(strategic_task)
+    await db_session.refresh(queued_task)
+    task_id = str(strategic_task.id)
+
+    async def _override_session():
+        yield db_session
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={"op": "reject_direction", "task_id": task_id,
+                      "data": {"direction_id": "d-prop01", "rationale": "duplicate of existing work"}},
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["op"] == "reject_direction"
+        assert body["cancelled_tasks"] == 1
+
+        await db_session.refresh(project)
+        tombstone = next(d for d in project.directions if d.get("id") == "d-prop01")
+        assert tombstone["status"] == "rejected"
+        assert tombstone.get("rejected_by") == "strategic"
+        assert tombstone.get("rejection_rationale") == "duplicate of existing work"
+
+        await db_session.refresh(queued_task)
+        assert queued_task.status == TaskStatus.CANCELLED
+        assert "d-prop01" in (queued_task.latest_status_message or "")
+
+        await db_session.refresh(strategic_task)
+        assert strategic_task.context.get("_strategic_proposals_rejected") == 1
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Standalone tests for _calibrate_scope (no DB required)
 # ─────────────────────────────────────────────────────────────────────────────
