@@ -97,20 +97,13 @@ jobs:
           path: frontend-status.txt
           key: ci-baseline-frontend-${{ github.sha }}
 
-      - name: Upload frontend status (stable key, main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
-        with:
-          path: frontend-status.txt
-          key: ci-baseline-frontend
-
       - name: Load main baseline (PR only)
         if: github.event_name == 'pull_request' && (steps.build.outcome == 'failure' || steps.lint.outcome == 'failure')
         uses: actions/cache/restore@v4
         with:
           path: frontend-status.txt
-          key: ci-baseline-frontend
-          restore-keys: ci-baseline-frontend
+          key: ci-baseline-frontend-${{ github.sha }}
+          restore-keys: ci-baseline-frontend-
 
       - name: Evaluate result
         if: steps.build.outcome == 'failure' || steps.lint.outcome == 'failure'
@@ -218,20 +211,13 @@ jobs:
           path: backend-status.txt
           key: ci-baseline-backend-${{ github.sha }}
 
-      - name: Upload backend baseline (stable key, main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
-        with:
-          path: backend-status.txt
-          key: ci-baseline-backend
-
       - name: Load main baseline (PR only)
         if: github.event_name == 'pull_request' && steps.run_tests.outcome == 'failure'
         uses: actions/cache/restore@v4
         with:
           path: backend-status.txt
-          key: ci-baseline-backend
-          restore-keys: ci-baseline-backend
+          key: ci-baseline-backend-${{ github.sha }}
+          restore-keys: ci-baseline-backend-
 
       - name: Evaluate test results
         if: steps.run_tests.outcome == 'failure'
@@ -330,20 +316,13 @@ jobs:
           path: agent-status.txt
           key: ci-baseline-agent-${{ github.sha }}
 
-      - name: Upload agent status (stable key, main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
-        with:
-          path: agent-status.txt
-          key: ci-baseline-agent
-
       - name: Load main baseline (PR only)
         if: github.event_name == 'pull_request' && steps.typecheck.outcome == 'failure'
         uses: actions/cache/restore@v4
         with:
           path: agent-status.txt
-          key: ci-baseline-agent
-          restore-keys: ci-baseline-agent
+          key: ci-baseline-agent-${{ github.sha }}
+          restore-keys: ci-baseline-agent-
 
       - name: Evaluate result
         if: steps.typecheck.outcome == 'failure'
