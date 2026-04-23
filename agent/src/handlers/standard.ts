@@ -772,12 +772,31 @@ Return nothing — just write the files.`;
 
     let testFailuresDetected = false;
     let testsPassed = true;
+    let testSetupFailed = false;
     let testFailureSummary: string | undefined;
     if (runTestFix && baseBranch === 'main') {
       const result = await testFixLoop(ws, statusRef, model, effort, buildConfig, baselineFailures, relatedFiles, analysisContext || undefined);
       testFailuresDetected = result.testFailuresDetected;
       testsPassed = result.passed;
+      testSetupFailed = result.setupFailed === true;
       testFailureSummary = result.failureSummary;
+    }
+
+    // Setup failure (npm ci / runner timeout for every runner) means tests
+    // didn't run — we can't verify anything, so fail the task with an
+    // infra category instead of pushing unverified code. Claude was NOT
+    // invoked; this is a platform issue, not a code issue.
+    if (failOnTestFailure && baseBranch === 'main' && testSetupFailed) {
+      sendLog(ws, 'Test setup failed — cannot verify changes, marking task as FAILED.\n');
+      await persistAndPostStatus(taskId, {
+        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+        logs: `Test suite could not run (setup failure — not a fixable test failure):\n${testFailureSummary ?? 'unknown'}`,
+        failure_category: 'build_failed',
+        changed_files: changedPaths.slice(0, 50),
+        ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+        ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(0, 5000) } : {}),
+      });
+      return;
     }
 
     if (failOnTestFailure && baseBranch === 'main' && testFailuresDetected && !testsPassed) {
@@ -1213,6 +1232,18 @@ Return nothing — just write the files.`;
             testsPassed = postReviewTestResult.passed;
             testFailuresDetected = postReviewTestResult.testFailuresDetected;
             if (postReviewTestResult.failureSummary) testFailureSummary = postReviewTestResult.failureSummary;
+            if (postReviewTestResult.setupFailed) {
+              sendLog(ws, '\nTest setup failed after self-review — cannot verify changes, marking task as FAILED.\n');
+              await persistAndPostStatus(taskId, {
+                task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+                logs: `Test suite could not run (setup failure) after self-review fixes:\n${postReviewTestResult.failureSummary ?? 'unknown'}`,
+                failure_category: 'build_failed',
+                changed_files: changedPaths.slice(0, 50),
+                ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
+                ...(postReviewTestResult.failureSummary ? { test_failure_summary: postReviewTestResult.failureSummary.slice(0, 5000) } : {}),
+              });
+              return;
+            }
             if (postReviewTestResult.testFailuresDetected && !postReviewTestResult.passed) {
               sendLog(ws, '\nTests failed after self-review fixes — marking task as FAILED.\n');
               const failedLogs = postReviewTestResult.failureSummary

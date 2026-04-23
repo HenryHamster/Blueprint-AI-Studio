@@ -1383,7 +1383,7 @@ export async function testFixLoop(
   baselineFailures?: Set<string>,
   relatedFiles?: string[],
   analysisContext?: string,
-): Promise<{ passed: boolean; testFailuresDetected: boolean; failureSummary?: string }> {
+): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; failureSummary?: string }> {
   let runners = detectTestRunners(buildConfig);
 
   // Scope-limit to runners relevant to the files being changed. Same logic as
@@ -1419,15 +1419,20 @@ export async function testFixLoop(
     // of truth for WHICH tests failed, bypassing stdout pattern matching
     // (which mis-classifies mocked failure output inside passing tests).
     const failures: Array<{ label: string; message: string; structuredIds?: Set<string> }> = [];
+    // Track setup errors (dep install, spawn timeout) separately from test
+    // failures. If NO runner actually gets to execute tests, we can't
+    // claim tests passed — the result must propagate as a setup failure
+    // so the caller doesn't push unverified code.
+    const setupErrors: Array<{ label: string; message: string }> = [];
+    let ranAnyRunner = false;
     const taskId = process.env.TASK_ID || '';
     for (const runner of runners) {
       // Setup step: ensure node_modules exist for npm runners. A failure
       // HERE is NOT a test failure — it's dep-install breakage (registry
       // flake, lockfile drift, disk, postinstall crash). The Claude fix
-      // loop can't meaningfully repair these, so skip the runner and
-      // keep moving. Previously this was bundled into the same try/catch
-      // as the test run, which made npm ci failures trigger the fix loop
-      // with no hope of success.
+      // loop can't meaningfully repair these; skip this runner but record
+      // the error so we can report "tests couldn't run" when every runner
+      // fails setup.
       if (runner.cmd === 'npm' && !fs.existsSync(`${runner.cwd}/node_modules`)) {
         sendLog(ws, `Installing dependencies for ${runner.label}...\n`);
         try {
@@ -1440,6 +1445,7 @@ export async function testFixLoop(
             `setup error, not a fixable test failure. Skipping runner.\n` +
             `${msg.slice(0, 500)}\n`,
           );
+          setupErrors.push({ label: runner.label, message: `npm ci failed: ${msg}` });
           continue;
         }
       }
@@ -1457,20 +1463,27 @@ export async function testFixLoop(
       try {
         sendHeartbeatSync(taskId, `Running tests [${runner.label}]...`);
         await execFileAsync(runner.cmd, runArgs, { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+        ranAnyRunner = true;
         sendLog(ws, `Tests passed [${runner.label}].\n`);
       } catch (testErr: unknown) {
         // If the runner timed out (killed by the process-group SIGTERM/SIGKILL
         // chain in execFileAsync) or the OS could not spawn the process
-        // (ETIMEDOUT), treat as indeterminate — a Docker build timeout or
-        // spawn failure is not a fixable code failure.
+        // (ETIMEDOUT), treat as a setup error — a Docker build timeout or
+        // spawn failure is not a fixable code failure, but we also can't
+        // claim tests passed.
         const isRunnerTimeout = testErr instanceof Error && (
           (testErr as Error & { killed?: boolean }).killed === true ||
           (testErr as NodeJS.ErrnoException).code === 'ETIMEDOUT'
         );
         if (isRunnerTimeout) {
+          const msg = testErr instanceof Error ? testErr.message : String(testErr);
           sendLog(ws, `WARNING: Test runner [${runner.label}] timed out — skipping.\n`);
+          setupErrors.push({ label: runner.label, message: `runner timeout: ${msg}` });
           continue;
         }
+        // Non-timeout non-zero exit = the runner actually ran the suite
+        // and at least one test failed. Record the failure.
+        ranAnyRunner = true;
         const msg = testErr instanceof Error ? testErr.message : String(testErr);
         let structuredIds: Set<string> | undefined;
         if (jsonOutputPath && fs.existsSync(jsonOutputPath)) {
@@ -1491,6 +1504,20 @@ export async function testFixLoop(
     }
 
     if (failures.length === 0) {
+      // "No failures" is only a pass if we actually ran at least one
+      // runner. If every runner hit setup errors (npm ci / spawn
+      // timeout), tests didn't run — we can't claim they passed, and
+      // there's nothing for Claude to fix. Surface as a distinct
+      // setupFailed state so the caller fails the task with an infra
+      // category instead of merging unverified code.
+      if (!ranAnyRunner && setupErrors.length > 0) {
+        const summary = setupErrors
+          .map(e => `[${e.label}] ${e.message}`)
+          .join('\n\n')
+          .slice(0, 2000);
+        sendLog(ws, `Tests could not run — setup failed for all runners. Not invoking fix loop.\n${summary}\n`);
+        return { passed: false, testFailuresDetected: false, setupFailed: true, failureSummary: summary };
+      }
       sendLog(ws, 'All tests passed.\n');
       return { passed: true, testFailuresDetected: false };
     }

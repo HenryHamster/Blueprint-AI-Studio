@@ -435,6 +435,46 @@ describe('testFixLoop failureSummary', () => {
     expect(result.failureSummary).toBeUndefined();
   });
 
+  it('returns setupFailed=true (not passed) when npm ci fails for every runner', async () => {
+    // Regression: previously npm ci failures were swallowed as "runner
+    // skipped" and the whole call returned `{passed: true}`, which let
+    // the handler push code that was never test-verified. setupFailed
+    // propagates through so standard/review-fix handlers mark the task
+    // FAILED with failure_category='build_failed' instead of merging.
+    const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
+    // Fail ALL npm calls — including ci — to simulate dep-install breakage.
+    vi.mocked(spawn).mockImplementation((cmd: unknown) => {
+      const cmdStr = String(cmd);
+      const stderrCbs: ((d: Buffer) => void)[] = [];
+      const fail = cmdStr === 'npm';
+      const proc = {
+        pid: 100,
+        stderr: { on: vi.fn((event: string, cb: (d: Buffer) => void) => { if (event === 'data') stderrCbs.push(cb); }) },
+        stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') {
+            setImmediate(() => {
+              if (fail) for (const scb of stderrCbs) scb(Buffer.from('npm ERR! registry unreachable'));
+              cb(fail ? 1 : 0);
+            });
+          }
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+
+    const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    expect(result.testFailuresDetected).toBe(false);
+    expect(result.failureSummary).toMatch(/npm ci failed/);
+    // Claude MUST NOT be invoked for setup failures — check that no
+    // `claude` spawn happened even though a runner was configured.
+    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => String(c[0]).includes('claude')).length;
+    expect(claudeCalls).toBe(0);
+  });
+
   it('returns failureSummary with combined failure messages when tests fail after all attempts', async () => {
     const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
     const errorMessage = 'Error: Test suite failed\n  at Object.<anonymous> (test.ts:10:5)';

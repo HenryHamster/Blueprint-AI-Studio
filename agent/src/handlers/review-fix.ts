@@ -974,7 +974,21 @@ export async function handleFix(
       return;
     }
 
-    const { testFailuresDetected: fixTestFailures, passed: fixTestsPassed, failureSummary: fixTestFailureSummary } = await testFixLoop(ws, statusRef, model, effort, buildConfig, fixBaselineFailures);
+    const { testFailuresDetected: fixTestFailures, passed: fixTestsPassed, setupFailed: fixTestSetupFailed, failureSummary: fixTestFailureSummary } = await testFixLoop(ws, statusRef, model, effort, buildConfig, fixBaselineFailures);
+
+    // Setup failure: tests couldn't run at all (npm ci / runner timeout).
+    // Fail the task with a build_failed category — pushing code that was
+    // never test-verified would be worse than failing visibly.
+    if (fixTestSetupFailed) {
+      sendLog(ws, 'Test setup failed during review-fix — cannot verify changes, marking task as FAILED.\n');
+      await persistAndPostStatus(taskId, {
+        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+        logs: `Test suite could not run (setup failure — not a fixable test failure):\n${fixTestFailureSummary ?? 'unknown'}`,
+        failure_category: 'build_failed',
+        ...(fixTestFailureSummary ? { test_failure_summary: fixTestFailureSummary.slice(0, 5000) } : {}),
+      });
+      return;
+    }
 
     // Match standard handler behaviour: if tests still fail after the fix loop,
     // fail the task rather than pushing known-broken code into the review pipeline.
