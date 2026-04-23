@@ -286,6 +286,58 @@ class TestOpenAITierAndEffort:
 
 
 # ---------------------------------------------------------------------------
+# Anthropic 1M context opt-in — regression for the missed capability.
+# The [1m] suffix on the model ID is the documented activation mechanism;
+# model-gated to opus-4-7, opus-4-6, sonnet-4-6.
+# ---------------------------------------------------------------------------
+
+class TestAnthropic1MContext:
+    @pytest.mark.parametrize("model", [
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+    ])
+    def test_1m_suffix_appended_on_compatible_models(self, model):
+        provider = get_provider(LLMProviderName.ANTHROPIC)
+        translation = provider.settings_to_cli({
+            "model": model,
+            "use_1m_context": True,
+        })
+        args = list(translation.args)
+        assert args[args.index("--model") + 1] == f"{model}[1m]"
+        assert not any("use_1m_context" in u for u in translation.unsupported)
+
+    def test_1m_opt_in_on_haiku_drops_suffix_with_marker(self):
+        provider = get_provider(LLMProviderName.ANTHROPIC)
+        translation = provider.settings_to_cli({
+            "model": "claude-haiku-4-5-20251001",
+            "use_1m_context": True,
+        })
+        args = list(translation.args)
+        assert args[args.index("--model") + 1] == "claude-haiku-4-5-20251001"
+        assert any(
+            "use_1m_context" in u and "suffix dropped" in u
+            for u in translation.unsupported
+        ), f"expected 1M-unsupported marker, got {translation.unsupported}"
+
+    def test_1m_default_off_emits_plain_model(self):
+        """Without the opt-in, model goes out plain — no accidental [1m]."""
+        provider = get_provider(LLMProviderName.ANTHROPIC)
+        translation = provider.settings_to_cli({"model": "claude-opus-4-7"})
+        args = list(translation.args)
+        assert args[args.index("--model") + 1] == "claude-opus-4-7"
+
+    def test_1m_explicit_false_emits_plain_model(self):
+        provider = get_provider(LLMProviderName.ANTHROPIC)
+        translation = provider.settings_to_cli({
+            "model": "claude-opus-4-7",
+            "use_1m_context": False,
+        })
+        args = list(translation.args)
+        assert args[args.index("--model") + 1] == "claude-opus-4-7"
+
+
+# ---------------------------------------------------------------------------
 # Gemini preview / unknown model advisory markers.
 # ---------------------------------------------------------------------------
 

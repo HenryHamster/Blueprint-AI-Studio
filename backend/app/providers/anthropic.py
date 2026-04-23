@@ -32,6 +32,17 @@ _DEFAULT_TIER_MODELS = {
 }
 
 
+# Models that accept the `[1m]` suffix for 1M-token context. Per Anthropic
+# docs, 1M is model-gated to the current Opus 4.x and Sonnet 4.6 variants;
+# haiku and older models silently ignore the suffix or error. We drop the
+# suffix with an unsupported marker when the effective model can't use it.
+_1M_CONTEXT_MODELS: frozenset[str] = frozenset({
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+})
+
+
 class AnthropicProvider(LLMProvider):
     name = LLMProviderName.ANTHROPIC
     supported_auth_modes = (LLMAuthMode.OAUTH, LLMAuthMode.API_KEY)
@@ -99,8 +110,22 @@ class AnthropicProvider(LLMProvider):
                     "type": "string",
                     "enum": ["low", "medium", "high", "xhigh", "max"],
                     "description": (
-                        "How hard Claude thinks before acting. Higher = deeper planning, "
-                        "more cost, more latency. `max` routes to xhigh at the CLI layer."
+                        "How hard Claude thinks before acting. Higher = deeper "
+                        "planning, more cost, more latency. All five levels are "
+                        "valid CLI values; per-model caps are handled by Claude "
+                        "Code — unsupported levels on a given model auto-fall-back "
+                        "downward (e.g. `max`/`xhigh` on sonnet-4-6 runs as high)."
+                    ),
+                },
+                "use_1m_context": {
+                    "type": "boolean",
+                    "description": (
+                        "Opt into the 1M-token context window. Appends `[1m]` to "
+                        "the model ID so Claude Code routes to the 1M variant. "
+                        "Requires opus-4-7, opus-4-6, or sonnet-4-6 — haiku "
+                        "ignores the suffix (we drop it with an unsupported "
+                        "marker). 1M costs more and is only worth it when the "
+                        "prompt or exploration genuinely needs the extra window."
                     ),
                 },
                 "max_budget_usd": {
@@ -173,15 +198,26 @@ class AnthropicProvider(LLMProvider):
         unsupported: list[str] = []
 
         model = bag.get("model")
+        use_1m = bool(bag.get("use_1m_context"))
         if isinstance(model, str):
-            args += ["--model", model]
+            if use_1m and model in _1M_CONTEXT_MODELS:
+                args += ["--model", f"{model}[1m]"]
+            elif use_1m:
+                unsupported.append(
+                    f"use_1m_context=true requires a 1M-capable model "
+                    f"(opus-4-7, opus-4-6, sonnet-4-6); effective model "
+                    f"{model!r} — suffix dropped, plain --model sent"
+                )
+                args += ["--model", model]
+            else:
+                args += ["--model", model]
 
         effort = bag.get("effort")
         if isinstance(effort, str):
-            # Claude Code CLI accepts low|medium|high|xhigh (not "max") as of v2.1.
-            # "max" maps to xhigh to stay within the CLI's vocabulary.
-            cli_effort = "xhigh" if effort == "max" else effort
-            args += ["--effort", cli_effort]
+            # Claude Code CLI accepts all five levels (low/medium/high/xhigh/max)
+            # as real distinct values. Unsupported levels on a given model
+            # auto-fall-back downward, so we pass through verbatim.
+            args += ["--effort", effort]
 
         fallback_model = bag.get("fallback_model")
         # Same-tier fallback is a no-op (can't fall back to the rate-limited

@@ -325,13 +325,23 @@ def test_anthropic_cli_translation_emits_model_and_effort():
     assert "high" in translation.args
 
 
-def test_anthropic_cli_translation_maps_max_effort_to_xhigh():
+def test_anthropic_cli_translation_passes_max_effort_verbatim():
     provider = get_provider(LLMProviderName.ANTHROPIC)
     translation = provider.settings_to_cli({"effort": "max"})
-    # Claude Code CLI accepts low|medium|high|xhigh, not "max"; adapter coerces.
+    # Claude Code CLI accepts `max` as a real distinct effort level now
+    # (Opus 4.7 supports it, older models auto-fall-back downward). Don't
+    # normalize — passing verbatim preserves the admin's intent.
     args = list(translation.args)
-    assert "xhigh" in args
-    assert "max" not in args
+    assert "--effort" in args
+    assert args[args.index("--effort") + 1] == "max"
+
+
+def test_anthropic_cli_translation_keeps_xhigh_distinct_from_max():
+    """xhigh and max are distinct CLI levels, not aliases."""
+    provider = get_provider(LLMProviderName.ANTHROPIC)
+    translation = provider.settings_to_cli({"effort": "xhigh"})
+    args = list(translation.args)
+    assert args[args.index("--effort") + 1] == "xhigh"
 
 
 def test_anthropic_cli_translation_advisor_opus_executor_ignored():
