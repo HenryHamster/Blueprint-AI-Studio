@@ -442,6 +442,7 @@ _RE_UUID = re.compile(
 )
 _RE_HEX = re.compile(r'\b[0-9a-f]{7,40}\b', re.IGNORECASE)
 _RE_NUM = re.compile(r'\b\d+\b')
+_RE_MEM_PREFIX = re.compile(r'^\s*\[\d+mb(?: cg:\d+mb)?\]\s*', re.IGNORECASE)
 
 
 def _fingerprint_message(msg: str) -> str:
@@ -449,8 +450,10 @@ def _fingerprint_message(msg: str) -> str:
 
     Strips UUIDs, hex hashes, and standalone numbers so near-duplicate
     messages (same error, different task IDs / line numbers) cluster.
+    Also strips memory prefixes like [16mb] or [16mb cg:512mb].
     """
     s = (msg or "").lower().strip()
+    s = _RE_MEM_PREFIX.sub('', s)
     s = _RE_UUID.sub('<id>', s)
     s = _RE_HEX.sub('<hash>', s)
     s = _RE_NUM.sub('<n>', s)

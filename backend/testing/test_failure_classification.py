@@ -517,6 +517,12 @@ class TestFingerprintMessage:
         assert '<n>' in fp
         assert '137' not in fp
 
+    def test_strips_memory_prefixes(self):
+        msg1 = "[16mb] using tool: bash"
+        msg2 = "[16mb cg:512mb] using tool: bash"
+        assert _fingerprint_message(msg1) == "using tool: bash"
+        assert _fingerprint_message(msg2) == "using tool: bash"
+
     def test_near_duplicates_cluster(self):
         fp1 = _fingerprint_message("AssertionError: expected 3, got 4")
         fp2 = _fingerprint_message("AssertionError: expected 9, got 12")
