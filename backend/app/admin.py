@@ -1158,7 +1158,7 @@ async def modify_task(
                         await _cancel_vm(child, reason="parent_cancelled")
                     child_acct = (child.context or {}).get("max_plan_account_id")
                     if child_acct:
-                        _cancel_release(child_acct)
+                        await _cancel_release(child_acct)
                     session.add(child)
                 if active_children:
                     logger.info(f"[ADMIN] Cascaded CANCELLED to {len(active_children)} children of task {task.id}")
