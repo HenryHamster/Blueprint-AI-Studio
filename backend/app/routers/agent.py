@@ -117,9 +117,11 @@ async def verify_agent_token(
         return payload
 
     # Fast path: known terminated (in-memory, O(1))
-    # Allow status endpoint through — it has its own idempotency guard for retries
+    # Allow status + credentials/rotate endpoints through — agents may post
+    # final status retries and OAuth rotation after the task reaches terminal
+    # state in the DB. Both endpoints are idempotent.
     if task_id in _terminated_task_ids:
-        if request.url.path != "/api/agent/status":
+        if request.url.path not in ("/api/agent/status", "/api/agent/credentials/rotate"):
             raise HTTPException(status_code=401, detail="Task is no longer active")
         return payload
 
@@ -137,8 +139,11 @@ async def verify_agent_token(
             task = await session.get(Task, uuid.UUID(task_id))
             if task and task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
                 _terminated_task_ids[task_id] = time.time()
-                # Allow status endpoint through — agents may retry their own completion POST
-                if request.url.path != "/api/agent/status":
+                # Allow status + credentials/rotate endpoints through —
+                # agents may retry final status POSTs and rotate refreshed
+                # OAuth tokens after the task reaches terminal state in the
+                # DB. Both are idempotent and bounded in scope.
+                if request.url.path not in ("/api/agent/status", "/api/agent/credentials/rotate"):
                     raise HTTPException(status_code=401, detail="Task is no longer active")
             # Task not found in DB — fail open (may not be committed yet, or test scenario)
     except HTTPException:

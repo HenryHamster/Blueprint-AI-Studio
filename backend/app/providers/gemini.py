@@ -47,6 +47,22 @@ _DEFAULT_TIER_MODELS = {
     "haiku": "gemini-2.5-flash-lite",
 }
 
+# Per-model upper bound for thinkingBudget. Sending a higher value triggers
+# an INVALID_ARGUMENT from the Gemini API at runtime. Keep this close to the
+# documented caps; preview models default to the generous pro cap until
+# Google publishes concrete numbers. Flash-lite and flash cap at 24576 per
+# docs as of 2026-04.
+_THINKING_BUDGET_CAPS = {
+    "gemini-2.5-pro": 32768,
+    "gemini-2.5-flash": 24576,
+    "gemini-2.5-flash-lite": 24576,
+    "gemini-3-pro-preview": 32768,
+    "gemini-3-flash-preview": 24576,
+    "gemini-3.1-pro-preview": 32768,
+    "gemini-3.1-flash-preview": 24576,
+}
+_THINKING_BUDGET_DEFAULT_CAP = 32768
+
 
 class GeminiProvider(LLMProvider):
     name = LLMProviderName.GEMINI
@@ -104,11 +120,16 @@ class GeminiProvider(LLMProvider):
         metadata = dict(provider_metadata or {})
         if auth_mode == LLMAuthMode.SERVICE_ACCOUNT:
             secret_path = "/opt/agent/gemini/sa.json"
+            # GOOGLE_GENAI_USE_VERTEXAI is the switch Gemini CLI inspects in
+            # getAuthTypeFromEnv; without it the CLI can't pick the Vertex
+            # path from GOOGLE_APPLICATION_CREDENTIALS alone and
+            # validateNonInteractiveAuth throws on every invocation.
             return SecretMaterial(
                 env={
                     "GOOGLE_APPLICATION_CREDENTIALS": secret_path,
                     "GOOGLE_CLOUD_PROJECT": str(metadata.get("project") or ""),
                     "GOOGLE_CLOUD_LOCATION": str(metadata.get("location") or ""),
+                    "GOOGLE_GENAI_USE_VERTEXAI": "true",
                 },
                 files=(FileMaterial(path=secret_path, content=secret or "", mode="0600"),),
             )
@@ -161,6 +182,8 @@ class GeminiProvider(LLMProvider):
                 },
                 "max_output_tokens": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65536,
                     "description": (
                         "Hard cap on response length. Keep generous (8k+) unless you "
                         "really want to truncate."
@@ -185,6 +208,18 @@ class GeminiProvider(LLMProvider):
 
         thinking_budget = bag.get("thinking_budget")
         if isinstance(thinking_budget, int):
+            # Per-model cap: schema permits up to 32768 (pro's limit), but
+            # flash and flash-lite cap at 24576 — over-budget requests get
+            # INVALID_ARGUMENT from the API. Clamp silently rather than
+            # raise so admin UI overrides don't wedge dispatch; record the
+            # clamp in unsupported so the operator can see it.
+            cap = _THINKING_BUDGET_CAPS.get(model, _THINKING_BUDGET_DEFAULT_CAP) if isinstance(model, str) else _THINKING_BUDGET_DEFAULT_CAP
+            if thinking_budget > cap:
+                unsupported.append(
+                    f"thinking_budget={thinking_budget} > cap {cap} for model "
+                    f"{model!r}; clamped"
+                )
+                thinking_budget = cap
             thinking_config["thinkingBudget"] = thinking_budget
         include_thoughts = bag.get("include_thoughts")
         if isinstance(include_thoughts, bool):

@@ -39,6 +39,7 @@ from app.routers.admin_pool_accounts import router as admin_pool_accounts_router
 from app.routers.admin_project_config import router as admin_project_config_router
 from app.routers.agent import router as agent_router
 from app.routers.agent import verify_agent_token, get_github_token_for_task, invalidate_github_token_cache, _github_token_cache, _has_local_cycle
+from app.routers.agent_credentials import router as agent_credentials_router
 from app.routers.github import router as github_router
 from app.routers.projects import router as projects_router
 from app.routers.directions import router as directions_router
@@ -861,6 +862,7 @@ app.include_router(admin_health_router)
 app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)
 app.include_router(agent_status_router)
+app.include_router(agent_credentials_router)
 app.include_router(admin_onboard_router)
 
 def _get_zone_health_summary() -> dict:

@@ -1,9 +1,14 @@
 import uuid
+from unittest.mock import AsyncMock
+
 import pytest
 from datetime import datetime, timedelta
 from httpx import AsyncClient
 from sqlalchemy import select
-from app.models import Project, Task, TaskStatus, ProjectStatus, ArtifactType, Artifact
+from app.models import (
+    Artifact, ArtifactType, LLMAuthMode, LLMProviderName, MaxPlanAccount,
+    Project, ProjectStatus, Task, TaskStatus,
+)
 from app.auth import create_agent_token
 
 @pytest.mark.smoketest
@@ -5163,3 +5168,166 @@ async def test_agent_claim_injects_direction_narrative(client: AsyncClient, db_s
         "prs_merged": 3,
         "prs_rejected": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# OAuth credential rotation (agent → backend)
+# ---------------------------------------------------------------------------
+
+
+async def _make_openai_oauth_task(db_session) -> tuple[Task, MaxPlanAccount, Project]:
+    project = Project(name="Codex Rotate Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    account = MaxPlanAccount(
+        user_id="test-user-123",
+        name="codex-oauth",
+        provider=LLMProviderName.OPENAI,
+        auth_mode=LLMAuthMode.OAUTH,
+        secret_blob_ref='{"tokens":{"access_token":"old","refresh_token":"rt-old"}}',
+    )
+    db_session.add(account)
+    await db_session.commit()
+    await db_session.refresh(account)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-rotate",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "llm_account_id": str(account.id),
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task, account, project
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_updates_openai_oauth_secret(client: AsyncClient, db_session, mocker):
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/rotate/versions/2"),
+    )
+    task, account, _ = await _make_openai_oauth_task(db_session)
+
+    token = create_agent_token(str(task.id), "agent-vm-rotate")
+    new_blob = '{"tokens":{"access_token":"fresh","refresh_token":"rt-fresh"}}'
+    res = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={"secret": new_blob},
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json() == {"rotated": True}
+
+    await db_session.refresh(account)
+    assert account.secret_blob_ref == "projects/test/secrets/rotate/versions/2"
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_rejects_malformed_secret(client: AsyncClient, db_session):
+    task, _, _ = await _make_openai_oauth_task(db_session)
+
+    token = create_agent_token(str(task.id), "agent-vm-rotate")
+    res = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        # No tokens envelope → should fail the provider's validator. Prior
+        # behavior would have silently stored a broken secret.
+        json={"secret": "{}"},
+    )
+
+    assert res.status_code == 400
+    assert "tokens" in res.text
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_no_op_for_non_openai_oauth(client: AsyncClient, db_session):
+    """Rotation endpoint must be safe to call unconditionally from the agent —
+    a Gemini/SA or Anthropic/OAuth task should get a no-op response, not an
+    error. This keeps the agent-side wiring provider-agnostic."""
+    project = Project(name="Gemini Rotate Noop", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    account = MaxPlanAccount(
+        user_id="test-user-123",
+        name="gemini-sa",
+        provider=LLMProviderName.GEMINI,
+        auth_mode=LLMAuthMode.SERVICE_ACCOUNT,
+        secret_blob_ref="projects/test/secrets/gemini/versions/1",
+        provider_metadata={"project": "demo", "location": "us-central1"},
+    )
+    db_session.add(account)
+    await db_session.commit()
+    await db_session.refresh(account)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-gemini-rotate",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "llm_account_id": str(account.id),
+            "llm_provider": "gemini",
+            "llm_auth_mode": "service_account",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-gemini-rotate")
+    res = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={"secret": "ignored"},
+    )
+    assert res.status_code == 200
+    assert res.json()["rotated"] is False
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_rejects_missing_secret(client: AsyncClient, db_session):
+    task, _, _ = await _make_openai_oauth_task(db_session)
+    token = create_agent_token(str(task.id), "agent-vm-rotate")
+
+    res = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={},
+    )
+    assert res.status_code == 400
+    assert "secret" in res.text
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_allowed_after_task_terminated(client: AsyncClient, db_session, mocker):
+    """Rotation runs in the agent's shutdown finally block — by that point the
+    task may already be in COMPLETED state. verify_agent_token must not 401
+    rotate calls the way it does for other endpoints post-terminal."""
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/rotate-term/versions/3"),
+    )
+    task, _, _ = await _make_openai_oauth_task(db_session)
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-rotate")
+    res = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={"secret": '{"tokens":{"access_token":"post-terminal"}}'},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json() == {"rotated": True}

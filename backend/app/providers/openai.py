@@ -61,7 +61,19 @@ class OpenAIProvider(LLMProvider):
             if not _API_KEY_RE.fullmatch(secret):
                 raise ValueError("OpenAI API key contains invalid characters")
             return ValidationResult(secret=secret, provider_metadata=dict(provider_metadata or {}))
-        parse_json_secret(raw)
+        # OAuth: Codex expects auth.json with a nested `tokens` object.
+        # A plain API key or ChatGPT session cookie will parse as JSON but
+        # Codex will fail opaquely at runtime — reject here with a clear
+        # message instead. Don't over-constrain; Codex tolerates extra keys.
+        parsed = parse_json_secret(raw)
+        tokens = parsed.get("tokens")
+        if not isinstance(tokens, dict):
+            raise ValueError(
+                "Codex OAuth auth.json must contain a 'tokens' object "
+                "(from `codex login` output)"
+            )
+        if not tokens.get("access_token"):
+            raise ValueError("Codex OAuth auth.json missing tokens.access_token")
         return ValidationResult(secret=raw, provider_metadata=dict(provider_metadata or {}))
 
     def tier_to_model(self, tier: str, runtime_config: Mapping[str, Any]) -> str | None:
