@@ -336,7 +336,7 @@ def build_agent_secret_manifest(
         effective_bag: dict = dict(provider_settings)
         if model and not effective_bag.get("model"):
             effective_bag["model"] = model
-        cli_translation = provider_impl.settings_to_cli(effective_bag)
+        cli_translation = provider_impl.settings_to_cli(effective_bag, auth_mode_enum)
         files.extend(cli_translation.settings_files)
 
     env = {

@@ -219,6 +219,101 @@ class TestOpenAIFlexGate:
         ]
         assert 'service_tier="fast"' in config_flags
 
+    def test_flex_dropped_on_oauth_even_with_flex_capable_model(self):
+        """flex is API-key-billing-only — ChatGPT subscriptions 400 even on
+        flex-capable models (gpt-5, etc). The auth_mode gate must fire
+        regardless of model compatibility."""
+        provider = get_provider(LLMProviderName.OPENAI)
+        translation = provider.settings_to_cli(
+            {"model": "gpt-5", "service_tier": "flex"},
+            auth_mode=LLMAuthMode.OAUTH,
+        )
+        config_flags = [
+            translation.args[i + 1]
+            for i, a in enumerate(translation.args) if a == "-c"
+        ]
+        assert 'service_tier="flex"' not in config_flags
+        assert any(
+            "OAuth" in u and "flex" in u for u in translation.unsupported
+        ), f"expected OAuth-flex marker, got {translation.unsupported}"
+
+    def test_flex_still_passes_on_api_key_with_flex_capable_model(self):
+        """API-key auth on a flex-capable model is the happy path — must
+        not regress when the OAuth gate was added."""
+        provider = get_provider(LLMProviderName.OPENAI)
+        translation = provider.settings_to_cli(
+            {"model": "gpt-5", "service_tier": "flex"},
+            auth_mode=LLMAuthMode.API_KEY,
+        )
+        config_flags = [
+            translation.args[i + 1]
+            for i, a in enumerate(translation.args) if a == "-c"
+        ]
+        assert 'service_tier="flex"' in config_flags
+
+
+# ---------------------------------------------------------------------------
+# OpenAI OAuth-unsupported model gate — regression for `The '<model>' model
+# is not supported when using Codex with a ChatGPT account.` 400 on
+# gpt-5-codex, which is API-key-billing-only but remains a valid admin
+# choice (e.g. a pool that mixes OAuth and API-key OpenAI accounts).
+# ---------------------------------------------------------------------------
+
+class TestOpenAIOAuthModelGate:
+    def test_gpt5_codex_swapped_to_gpt5_on_oauth(self):
+        provider = get_provider(LLMProviderName.OPENAI)
+        translation = provider.settings_to_cli(
+            {"model": "gpt-5-codex"},
+            auth_mode=LLMAuthMode.OAUTH,
+        )
+        # -m gpt-5 should be emitted (swap), not -m gpt-5-codex.
+        m_flags = [
+            translation.args[i + 1]
+            for i, a in enumerate(translation.args) if a == "-m"
+        ]
+        assert m_flags == ["gpt-5"], f"expected -m gpt-5, got {m_flags}"
+        assert any(
+            "gpt-5-codex" in u and "swapped" in u and "gpt-5" in u
+            for u in translation.unsupported
+        ), f"expected swap marker, got {translation.unsupported}"
+
+    def test_gpt5_codex_preserved_on_api_key(self):
+        """API-key auth runs gpt-5-codex fine — the OAuth swap must not
+        fire in API-key mode."""
+        provider = get_provider(LLMProviderName.OPENAI)
+        translation = provider.settings_to_cli(
+            {"model": "gpt-5-codex"},
+            auth_mode=LLMAuthMode.API_KEY,
+        )
+        m_flags = [
+            translation.args[i + 1]
+            for i, a in enumerate(translation.args) if a == "-m"
+        ]
+        assert m_flags == ["gpt-5-codex"]
+
+    def test_oauth_available_model_passes_through(self):
+        provider = get_provider(LLMProviderName.OPENAI)
+        translation = provider.settings_to_cli(
+            {"model": "gpt-5"},
+            auth_mode=LLMAuthMode.OAUTH,
+        )
+        m_flags = [
+            translation.args[i + 1]
+            for i, a in enumerate(translation.args) if a == "-m"
+        ]
+        assert m_flags == ["gpt-5"]
+
+    def test_fallback_model_maps_gpt5_codex_to_gpt5(self):
+        """fallback_model() is called by the dispatcher when no pool
+        account can serve the requested model — mirrors Gemini's
+        preview→GA fallback pattern."""
+        provider = get_provider(LLMProviderName.OPENAI)
+        assert provider.fallback_model("gpt-5-codex") == "gpt-5"
+        assert provider.fallback_model("GPT-5-CODEX") == "gpt-5"
+        # Models without a registered fallback return None.
+        assert provider.fallback_model("gpt-5") is None
+        assert provider.fallback_model(None) is None
+
 
 # ---------------------------------------------------------------------------
 # Gemini preview / unknown model advisory markers.

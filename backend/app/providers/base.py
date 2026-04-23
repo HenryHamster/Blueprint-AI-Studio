@@ -246,8 +246,17 @@ class LLMProvider(ABC):
         """
         return _validate_against_schema(bag or {}, self.settings_schema(), path="")
 
-    def settings_to_cli(self, bag: Mapping[str, Any]) -> CLITranslation:
+    def settings_to_cli(
+        self,
+        bag: Mapping[str, Any],
+        auth_mode: LLMAuthMode | None = None,
+    ) -> CLITranslation:
         """Translate a validated settings bag into CLI env/args/files/fallbacks.
+
+        `auth_mode` lets providers gate features that depend on the auth
+        surface — e.g. OpenAI's service_tier=flex and codex-variant models
+        are only reachable on API-key billing, never on ChatGPT-subscription
+        OAuth. Optional for back-compat with callers that don't track mode.
 
         Default implementation returns an empty translation. Providers override
         to map their specific knobs onto their CLI's surface.

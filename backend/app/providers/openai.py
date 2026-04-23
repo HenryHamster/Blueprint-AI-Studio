@@ -70,9 +70,16 @@ _OAUTH_QUOTA_EXHAUSTED_PATTERNS: tuple[str, ...] = (
 )
 
 _DEFAULT_TIER_MODELS = {
+    # Mapped 1:1 onto OpenAI's gpt-5 family sizes. gpt-5-codex was the
+    # historical sonnet default, but it's API-key-only (ChatGPT subscriptions
+    # 400 on it), which made every sonnet-tier task on an OAuth pool hit the
+    # swap path. gpt-5-mini is the natural mid-tier peer and works on both
+    # auth modes; haiku drops to gpt-5-nano to keep the capability gradient
+    # intact. _OAUTH_MODEL_FALLBACK below still covers admins who set
+    # gpt-5-codex explicitly on an OAuth pool.
     "opus": "gpt-5",
-    "sonnet": "gpt-5-codex",
-    "haiku": "gpt-5-mini",
+    "sonnet": "gpt-5-mini",
+    "haiku": "gpt-5-nano",
 }
 
 
@@ -102,6 +109,27 @@ _FLEX_EXCLUDED_MODELS: frozenset[str] = frozenset({
 })
 
 
+# OAuth-unsupported models → OAuth-available counterpart. Codex CLI with a
+# ChatGPT subscription returns 400 `The '<model>' model is not supported
+# when using Codex with a ChatGPT account.` for these variants, which are
+# API-key-billing-only on OpenAI's side. The pool can't filter them out
+# up-front because `list_available_models` returns None for OAuth (the
+# /v1/models endpoint doesn't accept ChatGPT-plan access tokens), so the
+# swap has to happen at settings translation time. Picked by capability
+# class — gpt-5-codex is the sonnet-tier default and its natural OAuth
+# peer is plain gpt-5 (same base model, minus codex tuning). Missing
+# entries fall through: the `-m` flag is dropped and Codex uses its own
+# default, with an unsupported marker recorded for observability.
+#
+# Mirrors the Gemini preview→GA pattern. Keep in sync: a model added to
+# `_OAUTH_UNSUPPORTED_MODELS` should have a counterpart here unless no
+# reasonable OAuth peer exists.
+_OAUTH_MODEL_FALLBACK: dict[str, str] = {
+    "gpt-5-codex": "gpt-5",
+}
+_OAUTH_UNSUPPORTED_MODELS: frozenset[str] = frozenset(_OAUTH_MODEL_FALLBACK.keys())
+
+
 def _model_supports_flex(model: str | None) -> bool:
     """Return True when the given OpenAI model id accepts service_tier=flex.
 
@@ -109,6 +137,10 @@ def _model_supports_flex(model: str | None) -> bool:
     any entries in `_FLEX_EXCLUDED_MODELS`. Unknown or empty model names
     return False — we fail closed so an unseen model id can't trigger a 400
     at dispatch time.
+
+    Note: this checks model eligibility only. `flex` is additionally
+    unavailable on ChatGPT-subscription (OAuth) auth regardless of model;
+    callers must also gate on auth_mode.
     """
     if not isinstance(model, str):
         return False
@@ -118,6 +150,20 @@ def _model_supports_flex(model: str | None) -> bool:
     if normalized in _FLEX_EXCLUDED_MODELS:
         return False
     return any(normalized.startswith(prefix) for prefix in _FLEX_SUPPORTED_PREFIXES)
+
+
+def _model_available_on_oauth(model: str | None) -> bool:
+    """Return False for Codex models that ChatGPT-account auth rejects."""
+    if not isinstance(model, str):
+        return True
+    return model.strip().lower() not in _OAUTH_UNSUPPORTED_MODELS
+
+
+def _oauth_fallback_for(model: str | None) -> str | None:
+    """Return the OAuth-available counterpart for an API-key-only model."""
+    if not isinstance(model, str):
+        return None
+    return _OAUTH_MODEL_FALLBACK.get(model.strip().lower())
 
 
 class OpenAIProvider(LLMProvider):
@@ -272,13 +318,40 @@ class OpenAIProvider(LLMProvider):
             },
         }
 
-    def settings_to_cli(self, bag: Mapping[str, Any]) -> CLITranslation:
+    def settings_to_cli(
+        self,
+        bag: Mapping[str, Any],
+        auth_mode: LLMAuthMode | None = None,
+    ) -> CLITranslation:
         args: list[str] = []
         unsupported: list[str] = []
+        is_oauth = auth_mode == LLMAuthMode.OAUTH
 
         model = bag.get("model")
         if isinstance(model, str):
-            args += ["-m", model]
+            # ChatGPT-subscription auth can't call codex-optimized variants
+            # (gpt-5-codex, …). Swap to the registered OAuth counterpart when
+            # one exists — keeps the admin's tier intent intact (sonnet stays
+            # sonnet-ish) instead of dropping to whatever Codex defaults to.
+            # Missing mapping ⇒ drop -m and let the CLI pick; better than a
+            # guaranteed 400 at dispatch.
+            if is_oauth and not _model_available_on_oauth(model):
+                swap = _oauth_fallback_for(model)
+                if swap:
+                    unsupported.append(
+                        f"model={model!r} is not available on ChatGPT-account "
+                        f"(OAuth) auth; swapped to {swap!r}"
+                    )
+                    args += ["-m", swap]
+                    model = swap
+                else:
+                    unsupported.append(
+                        f"model={model!r} is not available on ChatGPT-account "
+                        f"(OAuth) auth; no fallback registered — -m dropped, "
+                        f"Codex CLI default used"
+                    )
+            else:
+                args += ["-m", model]
 
         # Agent VMs are ephemeral and isolated — sandboxing inside them would
         # only stall the agent on permission prompts that nobody is there to
@@ -298,7 +371,16 @@ class OpenAIProvider(LLMProvider):
 
         service_tier = bag.get("service_tier")
         if isinstance(service_tier, str):
-            if service_tier == "flex" and not _model_supports_flex(model):
+            if service_tier == "flex" and is_oauth:
+                # flex is an API-key-only billing tier. ChatGPT-subscription
+                # accounts get 400 `Unsupported service_tier: flex` regardless
+                # of model, so drop with a marker instead of letting it reach
+                # the wire. Matches the pattern used for model-level gating.
+                unsupported.append(
+                    "service_tier=flex is not available on ChatGPT-account "
+                    "(OAuth) auth; dropped"
+                )
+            elif service_tier == "flex" and not _model_supports_flex(model):
                 # Dropping instead of erroring: admin-level defaults can stamp
                 # service_tier=flex across the matrix, and a per-task tier
                 # downgrade (opus → sonnet → gpt-4.1) would otherwise turn
@@ -375,3 +457,19 @@ class OpenAIProvider(LLMProvider):
             if isinstance(mid, str) and mid:
                 ids.append(mid)
         return sorted(set(ids))
+
+    def fallback_model(self, model: str | None) -> str | None:
+        """Return the OAuth-available counterpart for API-key-only models.
+
+        Invoked by the dispatcher when the requested model is unavailable
+        on every account in the pool — e.g. a tier map that picked
+        gpt-5-codex (API-key-only) but the pool holds only ChatGPT-plan
+        OAuth accounts. Matches Gemini's preview→GA fallback pattern:
+        pick a capability-class peer so quality degrades gracefully
+        rather than the task failing outright. No mapping ⇒ no fallback
+        ⇒ dispatch fails loudly so the operator knows to add an
+        API-key account or reconfigure the tier map.
+        """
+        if not isinstance(model, str):
+            return None
+        return _OAUTH_MODEL_FALLBACK.get(model.strip().lower())

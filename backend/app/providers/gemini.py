@@ -296,7 +296,14 @@ class GeminiProvider(LLMProvider):
             },
         }
 
-    def settings_to_cli(self, bag: Mapping[str, Any]) -> CLITranslation:
+    def settings_to_cli(
+        self,
+        bag: Mapping[str, Any],
+        auth_mode: LLMAuthMode | None = None,
+    ) -> CLITranslation:
+        # auth_mode is accepted for signature parity; Gemini's knobs don't
+        # differ between API-key and OAuth modes in the CLI.
+        del auth_mode
         args: list[str] = []
         env: dict[str, str] = {}
         settings_files: list[FileMaterial] = []

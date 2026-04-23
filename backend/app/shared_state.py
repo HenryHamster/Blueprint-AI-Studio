@@ -99,8 +99,8 @@ runtime_config: Dict = {
         },
         "openai": {
             "opus": "gpt-5",
-            "sonnet": "gpt-5-codex",
-            "haiku": "gpt-5-mini",
+            "sonnet": "gpt-5-mini",
+            "haiku": "gpt-5-nano",
         },
         "gemini": {
             "opus": "gemini-2.5-pro",
@@ -167,9 +167,15 @@ runtime_config: Dict = {
             "max": {"model": "claude-opus-4-7", "effort": "max"},
         },
         "openai": {
+            # Verbosity is graded to task-type category, not capability:
+            # build/ops (low/medium effort) produce code and tool calls, not
+            # prose — terse output saves tokens without losing debug signal.
+            # review (high) gets medium so review comments can explain.
+            # strategic (max) gets high because the prose *is* the deliverable
+            # (design docs, research, plans).
             "low": {"model": "gpt-5-mini", "reasoning_effort": "low", "verbosity": "low"},
-            "medium": {"model": "gpt-5-codex", "reasoning_effort": "medium", "verbosity": "medium"},
-            "high": {"model": "gpt-5", "reasoning_effort": "high", "verbosity": "high"},
+            "medium": {"model": "gpt-5-mini", "reasoning_effort": "medium", "verbosity": "low"},
+            "high": {"model": "gpt-5", "reasoning_effort": "high", "verbosity": "medium"},
             "max": {"model": "gpt-5", "reasoning_effort": "high", "verbosity": "high"},
         },
         "gemini": {

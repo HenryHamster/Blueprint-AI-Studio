@@ -158,7 +158,15 @@ class AnthropicProvider(LLMProvider):
             },
         }
 
-    def settings_to_cli(self, bag: Mapping[str, Any]) -> CLITranslation:
+    def settings_to_cli(
+        self,
+        bag: Mapping[str, Any],
+        auth_mode: LLMAuthMode | None = None,
+    ) -> CLITranslation:
+        # auth_mode is accepted for signature parity; Anthropic exposes the
+        # same knobs regardless of API-key vs OAuth and has no auth-gated
+        # features to enforce here.
+        del auth_mode
         args: list[str] = []
         env: dict[str, str] = {}
         prompt_fragments: list[str] = []
