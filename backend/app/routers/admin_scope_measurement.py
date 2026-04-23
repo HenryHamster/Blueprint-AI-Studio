@@ -35,7 +35,12 @@ def _compute_scope_baselines(tasks: list, lookback_days: int) -> dict:
     bucket: Dict[Tuple[str, str], Dict[str, int]] = defaultdict(lambda: {"created": 0, "merged": 0})
 
     for t in tasks:
-        scope = (t.context or {}).get("scope", "unknown")
+        # `.get("scope", "unknown")` would return None if context has
+        # {"scope": None} (explicit null). Mixing None with str in the
+        # bucket keys makes `sorted(bucket.items())` raise TypeError on
+        # Python 3 ("'<' not supported between NoneType and str"). The
+        # `or` coerces both missing AND null to "unknown".
+        scope = (t.context or {}).get("scope") or "unknown"
         task_date = t.created_at.date() if t.created_at else None
         if task_date is None:
             continue
