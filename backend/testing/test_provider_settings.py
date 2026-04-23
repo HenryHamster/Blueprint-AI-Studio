@@ -26,7 +26,7 @@ async def test_get_settings_includes_provider_scaffolding(client):
     assert body["category_routing"]["_default"]["effort"] in ("low", "medium", "high", "max")
     # Effort matrix ships with sensible per-(provider, level) bags including model.
     assert body["provider_settings_by_effort"]["anthropic"]["medium"]["model"] == "claude-sonnet-4-6"
-    assert body["provider_settings_by_effort"]["openai"]["low"]["model"] == "gpt-4o-mini"
+    assert body["provider_settings_by_effort"]["openai"]["low"]["model"] == "gpt-5-mini"
     assert "service_account" in body["providers"]["gemini"]["auth_modes"]
     assert body["providers"]["gemini"]["auth_modes"]["service_account"]["required_metadata_fields"] == ["project", "location"]
 

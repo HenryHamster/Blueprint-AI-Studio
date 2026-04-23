@@ -166,9 +166,10 @@ class TestOpenAIFlexGate:
         assert not any("service_tier=flex" in u for u in translation.unsupported)
 
     @pytest.mark.parametrize("model", [
-        "gpt-4.1",        # sonnet-tier default
-        "gpt-4o-mini",    # haiku-tier default
+        "gpt-4.1",        # gpt-4 family — not flex-capable
+        "gpt-4o-mini",    # gpt-4 family — not flex-capable
         "gpt-5-nano",     # explicit-excludes match — nano drops flex per docs
+        "gpt-5-codex",    # explicit-excludes — codex variant drops flex per docs
         "gpt-4",          # legacy
     ])
     def test_flex_dropped_on_unsupported_models(self, model):

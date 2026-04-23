@@ -99,8 +99,8 @@ runtime_config: Dict = {
         },
         "openai": {
             "opus": "gpt-5",
-            "sonnet": "gpt-4.1",
-            "haiku": "gpt-4o-mini",
+            "sonnet": "gpt-5-codex",
+            "haiku": "gpt-5-mini",
         },
         "gemini": {
             "opus": "gemini-2.5-pro",
@@ -167,8 +167,8 @@ runtime_config: Dict = {
             "max": {"model": "claude-opus-4-7", "effort": "max"},
         },
         "openai": {
-            "low": {"model": "gpt-4o-mini", "reasoning_effort": "low", "verbosity": "low"},
-            "medium": {"model": "gpt-4.1", "reasoning_effort": "medium", "verbosity": "medium"},
+            "low": {"model": "gpt-5-mini", "reasoning_effort": "low", "verbosity": "low"},
+            "medium": {"model": "gpt-5-codex", "reasoning_effort": "medium", "verbosity": "medium"},
             "high": {"model": "gpt-5", "reasoning_effort": "high", "verbosity": "high"},
             "max": {"model": "gpt-5", "reasoning_effort": "high", "verbosity": "high"},
         },

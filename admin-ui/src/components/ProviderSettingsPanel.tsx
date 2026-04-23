@@ -21,6 +21,21 @@ const GEMINI_PREVIEW_FALLBACK: Record<string, string> = {
   'gemini-3.1-flash-preview': 'gemini-2.5-flash',
 };
 
+// Mirrors backend/app/providers/openai.py::_FLEX_SUPPORTED_PREFIXES +
+// _FLEX_EXCLUDED_MODELS. Kept in sync by convention — when the backend
+// gains/loses flex support for a family, update both sides. Unknown model →
+// fail closed (no flex) so an operator doesn't stamp a guaranteed-400 config.
+const OPENAI_FLEX_PREFIXES: readonly string[] = ['gpt-5', 'o3', 'o4-mini'];
+const OPENAI_FLEX_EXCLUDES: ReadonlySet<string> = new Set(['gpt-5-nano', 'gpt-5-codex']);
+
+function openaiModelSupportsFlex(model: unknown): boolean {
+  if (typeof model !== 'string') return false;
+  const n = model.trim().toLowerCase();
+  if (!n) return false;
+  if (OPENAI_FLEX_EXCLUDES.has(n)) return false;
+  return OPENAI_FLEX_PREFIXES.some(p => n.startsWith(p));
+}
+
 // JSON-Schema subset we render — mirrors backend providers/base.py:_validate_against_schema.
 interface SchemaNode {
   type?: 'object' | 'string' | 'integer' | 'number' | 'boolean' | 'array';
@@ -279,6 +294,23 @@ function crossFieldLock(key: string, bag: ProviderSettingsBag): string | null {
   return null;
 }
 
+// Per-enum-value gating: when some enum options are only valid in combination
+// with another field, return { [enumValue]: reason } so the renderer can
+// disable just those options rather than locking the whole field. Backend
+// drops incompatible values at dispatch; this just keeps the admin from
+// picking something we know will be dropped.
+function crossFieldEnumDisable(key: string, bag: ProviderSettingsBag): Record<string, string> {
+  // OpenAI: service_tier=flex only works on flex-capable models. Sending flex
+  // to a non-flex model (gpt-4.1, gpt-4o-mini, gpt-5-codex, …) returns a 400
+  // `Unsupported service_tier: flex` — mirror the backend's _model_supports_flex
+  // gate so the picker never offers flex for an incompatible model.
+  if (key === 'service_tier' && !openaiModelSupportsFlex(bag.model)) {
+    const modelLabel = typeof bag.model === 'string' && bag.model ? `\`${bag.model}\`` : 'the selected model';
+    return { flex: `${modelLabel} does not accept service_tier=flex.` };
+  }
+  return {};
+}
+
 function SchemaForm({ schema, value, onChange, allowInherit }: SchemaFormProps) {
   if (schema.type !== 'object' || !schema.properties) {
     return null;
@@ -292,6 +324,7 @@ function SchemaForm({ schema, value, onChange, allowInherit }: SchemaFormProps) 
         const present = key in value;
         const currentVal = value[key];
         const lockReason = crossFieldLock(key, value);
+        const disabledEnumValues = crossFieldEnumDisable(key, value);
         return (
           <FieldRow
             key={key}
@@ -301,6 +334,7 @@ function SchemaForm({ schema, value, onChange, allowInherit }: SchemaFormProps) 
             present={present}
             allowInherit={allowInherit}
             lockReason={lockReason}
+            disabledEnumValues={disabledEnumValues}
             onChange={(next, removed) => {
               if (removed) {
                 const pruned = Object.fromEntries(
@@ -325,13 +359,16 @@ interface FieldRowProps {
   present: boolean;
   allowInherit: boolean;
   lockReason?: string | null;
+  disabledEnumValues?: Record<string, string>;
   onChange: (value: unknown, removed?: boolean) => void;
 }
 
-function FieldRow({ label, schema, value, present, allowInherit, lockReason, onChange }: FieldRowProps) {
+function FieldRow({ label, schema, value, present, allowInherit, lockReason, disabledEnumValues, onChange }: FieldRowProps) {
   const overridden = present;
   const locked = Boolean(lockReason);
   const effectiveDisabled = locked || (allowInherit && !overridden);
+  const currentValueDisabledReason =
+    typeof value === 'string' && disabledEnumValues ? disabledEnumValues[value] : undefined;
 
   const toggleOverride = () => {
     if (overridden) {
@@ -365,10 +402,15 @@ function FieldRow({ label, schema, value, present, allowInherit, lockReason, onC
         )}
       </div>
       <div className={`${effectiveDisabled ? 'opacity-40 pointer-events-none' : ''}`}>
-        <Field schema={schema} value={value} onChange={onChange} />
+        <Field schema={schema} value={value} onChange={onChange} disabledEnumValues={disabledEnumValues} />
         {lockReason && (
           <div className="mt-1 text-[11px] text-amber-400 leading-snug italic">
             {lockReason}
+          </div>
+        )}
+        {!lockReason && currentValueDisabledReason && (
+          <div className="mt-1 text-[11px] text-amber-400 leading-snug italic">
+            {currentValueDisabledReason} This value will be dropped at dispatch.
           </div>
         )}
       </div>
@@ -391,7 +433,7 @@ function FieldRow({ label, schema, value, present, allowInherit, lockReason, onC
 
 // Renders the appropriate control for one schema node. Nested objects render
 // recursively inside a bordered box.
-function Field({ schema, value, onChange }: { schema: SchemaNode; value: unknown; onChange: (v: unknown) => void }) {
+function Field({ schema, value, onChange, disabledEnumValues }: { schema: SchemaNode; value: unknown; onChange: (v: unknown) => void; disabledEnumValues?: Record<string, string> }) {
   // String with enum -> select
   if (schema.enum && schema.enum.length > 0 && (schema.type === 'string' || schema.type === undefined)) {
     return (
@@ -400,9 +442,19 @@ function Field({ schema, value, onChange }: { schema: SchemaNode; value: unknown
         onChange={e => onChange(e.target.value)}
         className="w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100"
       >
-        {schema.enum.map(opt => (
-          <option key={String(opt)} value={opt}>{String(opt)}</option>
-        ))}
+        {schema.enum.map(opt => {
+          const reason = disabledEnumValues?.[String(opt)];
+          return (
+            <option
+              key={String(opt)}
+              value={opt}
+              disabled={Boolean(reason)}
+              title={reason}
+            >
+              {String(opt)}{reason ? ' (unsupported)' : ''}
+            </option>
+          );
+        })}
       </select>
     );
   }

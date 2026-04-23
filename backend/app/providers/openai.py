@@ -71,8 +71,8 @@ _OAUTH_QUOTA_EXHAUSTED_PATTERNS: tuple[str, ...] = (
 
 _DEFAULT_TIER_MODELS = {
     "opus": "gpt-5",
-    "sonnet": "gpt-4.1",
-    "haiku": "gpt-4o-mini",
+    "sonnet": "gpt-5-codex",
+    "haiku": "gpt-5-mini",
 }
 
 
@@ -94,6 +94,11 @@ _FLEX_SUPPORTED_PREFIXES: tuple[str, ...] = (
 )
 _FLEX_EXCLUDED_MODELS: frozenset[str] = frozenset({
     "gpt-5-nano",
+    # Codex-optimized premium variant — per OpenAI docs it's not on the flex
+    # tier. Leaving it on the flex-eligible side would reopen the original
+    # "Unsupported service_tier: flex" 400 that the tier remap was meant to
+    # fix, since the sonnet-tier default now routes here.
+    "gpt-5-codex",
 })
 
 
