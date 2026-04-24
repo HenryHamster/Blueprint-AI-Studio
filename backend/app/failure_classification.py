@@ -754,6 +754,9 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
     # "[fatal:" matches agent _crashReport() labels: [FATAL:uncaughtException], [FATAL:unhandledRejection], etc.
     # NOTE: "timed out" and "killed" intentionally omitted — too broad and cause misclassification.
     # Only use specific forms: "execution timed out", "node process killed", "oom killer".
+    # "creating pull request for blueprint/" is the agent's heartbeat during PR push — never an error
+    # message. Tasks that die in this state (OOM, SIGKILL) leave this stale heartbeat as
+    # latest_status_message; they must not create CODE_ERROR fingerprints in the residual store.
     if any(kw in combined for kw in ["no heartbeat", "reaped", "never started",
                                       "execution timed out", "sigterm",
                                       "out of memory", "oom-kill", "memory limit exceeded",
@@ -762,7 +765,8 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
                                       "exit code 124", "exit code 139",
                                       "node process killed",
                                       "oom killer", "killed by", "cgroup",
-                                      "[fatal:", "fatal error", "process crashed"]):
+                                      "[fatal:", "fatal error", "process crashed",
+                                      "creating pull request for blueprint/"]):
         return "AGENT_TIMEOUT"
 
     # Orchestration constraints — dependency waits are not code defects

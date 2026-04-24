@@ -188,6 +188,15 @@ class TestClassifyFailureAgentTimeout:
     def test_timeout_keywords(self, msg):
         assert classify_failure(_task(msg)) == AGENT_TIMEOUT
 
+    def test_pr_creation_heartbeat_is_agent_timeout(self):
+        """Regression: the reaper calls classify_failure before updating latest_status_message.
+        Tasks that die (OOM/SIGKILL) while the agent is creating a PR leave the PR-creation
+        heartbeat as the last status message. Without this pattern, classify_failure falls
+        through to CODE_ERROR and record_residual_fingerprint creates a spurious fingerprint
+        that triggers auto-remediation for a non-existent code defect."""
+        msg = "[13.6MB] Creating pull request for blueprint/task-df8cfed3..."
+        assert classify_failure(_task(msg)) == AGENT_TIMEOUT
+
     def test_cascade_beats_code_error_default(self):
         """A 'Cancelled:' prefix routes to AGENT_TIMEOUT even if tail looks like code."""
         msg = "Cancelled: AssertionError in downstream"
