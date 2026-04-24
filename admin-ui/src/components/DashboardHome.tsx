@@ -18,6 +18,7 @@ import { DirectionAutoPauseWidget } from './DirectionAutoPauseWidget';
 import { PRMonitorSection, type OpenPR } from './PRMonitorSection';
 import { MediumScopeWidget, type MediumScopeMeasurement } from './MediumScopeWidget';
 import { RemediationFunnelSection } from './RemediationFunnelSection';
+import { FailureStageWidget } from './FailureStageWidget';
 import { ScopeConversionRatesSection } from './ScopeConversionRatesSection';
 import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSection';
 import type { Task } from '../types/task';
@@ -188,19 +189,15 @@ interface DigestData {
     forced_restoration_count?: number;
     forced_restored_at?: string | null;
   } | null;
+  first_attempt_success_rate?: {
+    overall?: number | null;
+    trend?: string | null;
+    sample_size?: number | null;
+    first_attempt_by_review_category?: Record<string, number> | null;
+    [key: string]: unknown;
+  } | null;
 }
 
-const STAGE_ORDER = ['provision', 'clone', 'test', 'lint', 'build', 'pr_creation', 'merge', 'review'] as const;
-const STAGE_COLORS: Record<string, string> = {
-  provision: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
-  clone: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
-  test: 'bg-red-500/20 text-red-400 border-red-500/30',
-  lint: 'bg-red-500/20 text-red-400 border-red-500/30',
-  build: 'bg-red-500/20 text-red-400 border-red-500/30',
-  pr_creation: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
-  merge: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
-  review: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
-};
 
 const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
 const TAXONOMY_LABELS: Record<string, string> = {
@@ -220,6 +217,16 @@ const TAXONOMY_STROKE: Record<string, string> = {
   review_quality: '#a855f7',
   infra_related: '#f59e0b',
   code_defect: '#ef4444',
+};
+
+const REVIEW_CAT_ORDER = ['lint', 'type', 'logic', 'scope', 'architecture', 'other'] as const;
+const REVIEW_CAT_COLORS: Record<string, string> = {
+  lint: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  type: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
+  logic: 'bg-red-500/20 text-red-400 border-red-500/30',
+  scope: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
+  architecture: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
+  other: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
 };
 
 interface SparkPoint {
@@ -672,28 +679,36 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           )}
 
           {/* Section 1d: Failure Stage Distribution */}
-          {!loading && digest?.failure_stage_distribution && digest.failure_stage_distribution.total_classified > 0 && (
-            <section>
-              <div className="flex flex-wrap gap-1.5 items-center">
-                <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Stage</span>
-                {STAGE_ORDER.map(stage => {
-                  const count = digest.failure_stage_distribution!.stages[stage];
-                  if (!count) return null;
-                  const isDominant = digest.failure_stage_distribution!.dominant_stage === stage;
-                  const base = STAGE_COLORS[stage] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
-                  const cls = isDominant ? `${base} ring-1 ring-current` : base;
-                  return (
-                    <span key={stage} className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border uppercase ${cls}`} title={`${stage}: ${count}${isDominant ? ' — dominant stage' : ''}`}>
-                      {stage}
-                      <span className="font-bold">{count}</span>
-                    </span>
-                  );
-                })}
-              </div>
-            </section>
-          )}
+          {!loading && <FailureStageWidget distribution={digest?.failure_stage_distribution} />}
 
-          {/* Section 1d2: Cost of Failures */}
+          {/* Section 1d2: Review Rejection Reason Breakdown */}
+          {!loading && (() => {
+            const cats = digest?.first_attempt_success_rate?.first_attempt_by_review_category;
+            if (!cats || Object.keys(cats).length === 0) return null;
+            const ordered = REVIEW_CAT_ORDER.filter(k => cats[k] != null);
+            const extras = Object.keys(cats).filter(k => !REVIEW_CAT_ORDER.includes(k as typeof REVIEW_CAT_ORDER[number]));
+            const allKeys = [...ordered, ...extras];
+            return (
+              <section>
+                <div className="flex flex-wrap gap-1.5 items-center">
+                  <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Review Rejection</span>
+                  {allKeys.map(k => {
+                    const pct = cats[k];
+                    if (pct == null) return null;
+                    const color = REVIEW_CAT_COLORS[k] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+                    return (
+                      <span key={k} className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border ${color}`} title={`${k}: ${Math.round(pct * 100)}% of first-attempt rejections`}>
+                        {k}
+                        <span className="font-bold">{Math.round(pct * 100)}%</span>
+                      </span>
+                    );
+                  })}
+                </div>
+              </section>
+            );
+          })()}
+
+          {/* Section 1d3: Cost of Failures */}
           {!loading && (digest?.total_failed_cost_usd ?? 0) > 0 && (
             <section>
               <div className="flex flex-wrap gap-1.5 items-center">

@@ -931,19 +931,27 @@ def clear_direction_hold(direction_id: str) -> None:
         streak["held_failure_class"] = ""
 
 
-def is_direction_held(direction_id: str) -> tuple[bool, str]:
-    """Return (held, reason) for the direction.
+def get_direction_hold_info(direction_id: str) -> Dict[str, Any]:
+    """Return hold metadata for a direction.
 
-    Checks timeout expiry: if the hold has been active for more than
-    DIRECTION_HOLD_TIMEOUT_HOURS the hold is auto-cleared and (False, '') is returned.
-    Returns (False, '') for unknown directions.
+    Shape:
+      {
+        "held": bool,
+        "reason": str,
+        "held_at": Optional[datetime],
+        "held_until": Optional[datetime],
+      }
+
+    Applies timeout auto-clear semantics identically to is_direction_held.
     """
+    base = {"held": False, "reason": "", "held_at": None, "held_until": None}
     if not direction_id:
-        return False, ""
+        return base
+
     streak = direction_failure_streaks.get(direction_id)
     if not streak or not streak.get("held"):
-        return False, ""
-    # Auto-clear after timeout
+        return base
+
     held_at = streak.get("held_at")
     if held_at and (_utcnow() - held_at).total_seconds() > DIRECTION_HOLD_TIMEOUT_HOURS * 3600:
         streak["held"] = False
@@ -951,17 +959,38 @@ def is_direction_held(direction_id: str) -> tuple[bool, str]:
         streak["held_reason"] = ""
         streak["held_failure_class"] = ""
         logger.info(f"[DIRECTION HEALTH] Direction {direction_id} hold expired (timeout).")
-        return False, ""
+        return base
+
+    held_until = held_at + timedelta(hours=DIRECTION_HOLD_TIMEOUT_HOURS) if held_at else None
     if streak.get("held_reason") == "infra":
         count = streak.get("consecutive_infra_failures", 0)
         fc = streak.get("held_failure_class") or streak["last_failure_class"] or "INFRA"
-        return True, (
+        reason = (
             f"Held: direction has {count} consecutive infra failures "
             f"(last: {fc}) — investigate scope/scale before retrying"
         )
-    count = streak["consecutive_failures"]
-    fc = streak.get("held_failure_class") or streak["last_failure_class"] or "CODE_ERROR"
-    return True, f"Held: direction has {count} consecutive {fc} failures — awaiting investigation"
+    else:
+        count = streak["consecutive_failures"]
+        fc = streak.get("held_failure_class") or streak["last_failure_class"] or "CODE_ERROR"
+        reason = f"Held: direction has {count} consecutive {fc} failures — awaiting investigation"
+
+    return {
+        "held": True,
+        "reason": reason,
+        "held_at": held_at,
+        "held_until": held_until,
+    }
+
+
+def is_direction_held(direction_id: str) -> tuple[bool, str]:
+    """Return (held, reason) for the direction.
+
+    Checks timeout expiry: if the hold has been active for more than
+    DIRECTION_HOLD_TIMEOUT_HOURS the hold is auto-cleared and (False, '') is returned.
+    Returns (False, '') for unknown directions.
+    """
+    info = get_direction_hold_info(direction_id)
+    return bool(info["held"]), str(info["reason"])
 
 
 def get_held_directions() -> Dict[str, Dict]:

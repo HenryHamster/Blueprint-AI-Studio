@@ -379,6 +379,64 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('budget headroom');
   });
 
+  it('renders review_iteration_rolling_median as human-readable guidance in Direction Context', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        review_iteration_rolling_median: 3.5,
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('Recent PRs on this direction averaged 3.5 review iterations');
+    expect(result).toContain('tight scope merges faster');
+  });
+
+  it('appends last-cycle suffix when review_iteration_last_cycle differs from rolling median', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        review_iteration_rolling_median: 2.0,
+        review_iteration_last_cycle: 4.0,
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('averaged 2.0 review iterations (last cycle: 4.0)');
+  });
+
+  it('omits last-cycle suffix when review_iteration_last_cycle equals rolling median', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+        review_iteration_rolling_median: 2.0,
+        review_iteration_last_cycle: 2.0,
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('last cycle');
+  });
+
+  it('omits review iteration line when review_iteration_rolling_median is absent', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        failed_approaches: [],
+        recent_outcomes: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('review iterations');
+  });
+
   it('omits failed annotation in scope merge rates when failed count is zero', () => {
     const task = {
       direction_context: {

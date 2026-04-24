@@ -1088,7 +1088,13 @@ describe('buildBlueprintPrFooter', () => {
 
   it('includes iteration count when > 1', () => {
     const result = buildBlueprintPrFooter({ iterations: 3 });
-    expect(result).toContain('3 iterations');
+    expect(result).toContain('Review iteration 3');
+    expect(result).toContain('<!-- blueprint:meta -->');
+  });
+
+  it('includes max iterations in label when provided', () => {
+    const result = buildBlueprintPrFooter({ iterations: 3, maxIterations: 10 });
+    expect(result).toContain('Review iteration 3 of 10');
     expect(result).toContain('<!-- blueprint:meta -->');
   });
 
@@ -1111,8 +1117,8 @@ describe('buildBlueprintPrFooter', () => {
   });
 
   it('combines iterations and direction in a single footer line', () => {
-    const result = buildBlueprintPrFooter({ iterations: 2, directionId: 'd-abc', directionTitle: 'PR clarity' });
-    expect(result).toMatch(/2 iterations · direction: PR clarity \(d-abc\)/);
+    const result = buildBlueprintPrFooter({ iterations: 2, maxIterations: 12, directionId: 'd-abc', directionTitle: 'PR clarity' });
+    expect(result).toMatch(/Review iteration 2 of 12 · direction: PR clarity \(d-abc\)/);
     expect(result).toContain('<!-- blueprint:meta -->');
   });
 

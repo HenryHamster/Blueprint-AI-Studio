@@ -1573,6 +1573,94 @@ async def test_claim_injects_avg_expansion_ratio_in_scope_success_rates(client: 
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_claim_injects_review_iteration_trend_in_direction_context(client: AsyncClient, db_session):
+    """direction_context includes review_iteration_rolling_median and review_iteration_last_cycle when history has values."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Review Iter Trend Test", user_id="test-user-iter")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "d",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [
+                {"tasks_created": 1, "prs_merged": 1, "median_review_iterations": 1.0},
+                {"tasks_created": 1, "prs_merged": 1, "median_review_iterations": 3.0},
+                {"tasks_created": 1, "prs_merged": 1, "median_review_iterations": 2.0},
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do"}],
+        vm_instance_id="agent-vm-iter-trend",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-iter-trend")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dc = resp.json()["direction_context"]
+    # rolling median of [1.0, 3.0, 2.0] sorted → [1.0, 2.0, 3.0], median = 2.0
+    assert dc["review_iteration_rolling_median"] == 2.0
+    # last cycle value
+    assert dc["review_iteration_last_cycle"] == 2.0
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_direction_context_absent_review_iteration_when_no_history(client: AsyncClient, db_session):
+    """direction_context omits review iteration fields when no cycle has recorded median_review_iterations."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="No Iter History Test", user_id="test-user-no-iter")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "d",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [
+                {"tasks_created": 1, "prs_merged": 1},
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do"}],
+        vm_instance_id="agent-vm-no-iter",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-iter")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dc = resp.json()["direction_context"]
+    assert "review_iteration_rolling_median" not in dc
+    assert "review_iteration_last_cycle" not in dc
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_claim_does_not_inject_direction_context_for_review_task(client: AsyncClient, db_session):
     """Claim endpoint does NOT inject direction_context for review tasks (only create/fix/refactor)."""
     from sqlalchemy.orm.attributes import flag_modified

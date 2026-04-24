@@ -21,6 +21,47 @@ const TAXONOMY_COLORS: Record<string, string> = {
   code_defect: 'bg-red-500/20 text-red-400 border-red-500/30',
 };
 
+type RemediationSummaryRow = {
+  key: string;
+  resultLabel: string;
+  badgeClass: string;
+  fingerprintShort: string | null;
+  timestamp: string | null;
+  fingerprintChange: 'changed' | 'same' | null;
+};
+
+function formatAutoRecoveryLine(heldUntil: string | null | undefined): string | null {
+  if (!heldUntil) return null;
+  const heldUntilDate = parseTimestamp(heldUntil);
+  if (Number.isNaN(heldUntilDate.getTime())) return null;
+
+  const remainingMs = heldUntilDate.getTime() - Date.now();
+  if (remainingMs <= 0) return 'auto-recovery overdue';
+
+  const totalMinutes = Math.ceil(remainingMs / 60000);
+  if (totalMinutes < 60) return `auto-recovers in ${totalMinutes}m`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes > 0 ? `auto-recovers in ${hours}h ${minutes}m` : `auto-recovers in ${hours}h`;
+}
+
+function remediationResultMeta(result: string | null | undefined): Pick<RemediationSummaryRow, 'resultLabel' | 'badgeClass'> {
+  const normalized = (result || '').toLowerCase();
+  if (normalized === 'merged') {
+    return { resultLabel: 'merged', badgeClass: 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400' };
+  }
+  if (normalized === 'failed') {
+    return { resultLabel: 'failed', badgeClass: 'bg-red-950/40 border-red-900/50 text-red-400' };
+  }
+  if (normalized === 'partial_success') {
+    return { resultLabel: 'partial', badgeClass: 'bg-amber-950/40 border-amber-900/50 text-amber-400' };
+  }
+  if (normalized === 'held') {
+    return { resultLabel: 'held', badgeClass: 'bg-red-950/30 border-red-900/50 text-red-300' };
+  }
+  return { resultLabel: normalized || 'pending', badgeClass: 'bg-neutral-900/60 border-neutral-700/60 text-neutral-300' };
+}
+
 export interface DirectionCardProps {
   direction: Direction;
   statusKey: string;
@@ -93,6 +134,39 @@ function DirectionCardImpl({
 }: DirectionCardProps) {
   const forceConfirmRef = useRef<HTMLDivElement | null>(null);
   const [expandedNotes, setExpandedNotes] = useState<Set<number>>(new Set());
+  const [expandedRemediationIds, setExpandedRemediationIds] = useState<Record<string, boolean>>({});
+  const showAllRemediation = Boolean(expandedRemediationIds[d.id]);
+
+  const autoRecoveryLine = useMemo(
+    () => formatAutoRecoveryLine(d.held_until),
+    [d.held_until],
+  );
+
+  const remediationSummaryRows = useMemo<RemediationSummaryRow[]>(() => {
+    const history = Array.isArray(d.remediation_history) ? d.remediation_history : [];
+    if (history.length === 0) return [];
+
+    const sorted = [...history].sort((a, b) => {
+      const aTs = parseTimestamp(a.timestamp ?? '').getTime();
+      const bTs = parseTimestamp(b.timestamp ?? '').getTime();
+      return bTs - aTs;
+    });
+
+    return sorted.slice(0, 3).map((entry, idx) => {
+      const resultMeta = remediationResultMeta(typeof entry.result === 'string' ? entry.result : null);
+      const currentFp = typeof entry.fingerprint === 'string' ? entry.fingerprint : null;
+      const previousFp = typeof sorted[idx + 1]?.fingerprint === 'string' ? sorted[idx + 1]?.fingerprint : null;
+      const fingerprintChange = currentFp && previousFp ? (currentFp === previousFp ? 'same' : 'changed') : null;
+      return {
+        key: entry.task_id || `${entry.timestamp || 'unknown'}-${idx}`,
+        resultLabel: resultMeta.resultLabel,
+        badgeClass: resultMeta.badgeClass,
+        fingerprintShort: currentFp ? currentFp.slice(0, 8) : null,
+        timestamp: typeof entry.timestamp === 'string' ? entry.timestamp : null,
+        fingerprintChange,
+      };
+    });
+  }, [d.remediation_history]);
 
   const lifetimeMetrics = useMemo(() => {
     const history = d.research_history;
@@ -471,6 +545,11 @@ function DirectionCardImpl({
                 <p className="text-[10px] text-red-400/80 leading-relaxed mt-0.5">
                   {d.held_reason || 'Held after repeated failures.'}
                 </p>
+                {autoRecoveryLine && (
+                  <p className="text-[10px] text-red-300/90 leading-relaxed mt-0.5">
+                    {autoRecoveryLine}
+                  </p>
+                )}
               </div>
               <button
                 onClick={(e) => { e.stopPropagation(); void unholdDirection(d.id); }}
@@ -530,6 +609,45 @@ function DirectionCardImpl({
                     );
                   })()}
                 </>
+              )}
+            </div>
+          )}
+          {remediationSummaryRows.length > 0 && (
+            <div className="mt-2">
+              <p className="text-[10px] font-medium uppercase tracking-wider text-neutral-500">
+                Recent remediation attempts
+              </p>
+              <div className="mt-1 space-y-1">
+                {remediationSummaryRows.slice(0, showAllRemediation ? 3 : 2).map((entry) => (
+                  <div key={entry.key} className="text-[10px] text-neutral-400 flex items-center gap-1.5 leading-relaxed">
+                    <span className={`px-1.5 py-0.5 rounded border font-medium ${entry.badgeClass}`}>
+                      {entry.resultLabel}
+                    </span>
+                    {entry.fingerprintShort && (
+                      <span className="font-mono text-neutral-300">
+                        {entry.fingerprintShort}
+                      </span>
+                    )}
+                    {entry.timestamp && (
+                      <span className="text-neutral-500">
+                        {formatRelativeTime(entry.timestamp)}
+                      </span>
+                    )}
+                    {entry.fingerprintChange && (
+                      <span className="text-neutral-600">
+                        fp {entry.fingerprintChange}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+              {remediationSummaryRows.length > 2 && (
+                <button
+                  onClick={() => setExpandedRemediationIds(prev => ({ ...prev, [d.id]: !prev[d.id] }))}
+                  className="mt-1 text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors"
+                >
+                  {showAllRemediation ? 'show less' : 'show more'}
+                </button>
               )}
             </div>
           )}

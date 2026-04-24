@@ -116,6 +116,46 @@ async def test_get_directions_returns_created(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
+async def test_get_directions_includes_hold_timing_fields(client: AsyncClient, mocker):
+    """GET includes held/held_reason plus held_at/held_until for held directions."""
+    import app.shared_state as _ss
+
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Direction A", priority="low")
+    did = direction["id"]
+
+    _ss.direction_failure_streaks.clear()
+    for _ in range(_ss.DIRECTION_HOLD_THRESHOLD):
+        _ss.record_direction_result(did, success=False, failure_class="CODE_ERROR")
+
+    try:
+        resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+        assert resp.status_code == 200
+        payload = resp.json()["directions"][0]
+        assert payload["held"] is True
+        assert payload["held_reason"]
+        assert isinstance(payload["held_at"], str)
+        assert isinstance(payload["held_until"], str)
+    finally:
+        _ss.direction_failure_streaks.clear()
+
+
+@pytest.mark.asyncio
+async def test_get_directions_includes_null_hold_timing_when_not_held(client: AsyncClient, mocker):
+    """GET includes held_at/held_until as null when direction is not held."""
+    project_id = await _deploy_project(client, mocker)
+    await _add_direction(client, project_id, text="Direction A", priority="low")
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    payload = resp.json()["directions"][0]
+    assert payload["held"] is False
+    assert payload["held_reason"] is None
+    assert payload["held_at"] is None
+    assert payload["held_until"] is None
+
+
+@pytest.mark.asyncio
 async def test_unhold_direction_clears_hold(client: AsyncClient, mocker):
     """POST /unhold clears an existing direction hold and reports was_held=True."""
     import app.shared_state as _ss

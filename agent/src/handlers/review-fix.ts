@@ -260,13 +260,19 @@ export function buildMigrationConflictGuidance(c: MigrationConflict): string {
 // patchPrBodyMeta as best-effort and swallow its errors.
 export function buildBlueprintPrFooter(opts: {
   iterations?: number;
+  maxIterations?: number;
   directionId?: string;
   directionTitle?: string;
   provider?: string;
   model?: string;
 }): string {
   const parts: string[] = [];
-  if (opts.iterations && opts.iterations > 1) parts.push(`${opts.iterations} iterations`);
+  if (opts.iterations && opts.iterations > 1) {
+    const iterLabel = opts.maxIterations
+      ? `Review iteration ${opts.iterations} of ${opts.maxIterations}`
+      : `Review iteration ${opts.iterations}`;
+    parts.push(iterLabel);
+  }
   if (opts.directionId) {
     const title = opts.directionTitle
       ? `${opts.directionTitle.slice(0, 60)} (${opts.directionId})`
@@ -1199,6 +1205,7 @@ export async function handleFix(
       const fixCtxForMeta = (task.context as Record<string, unknown> | undefined) || {};
       const prFooter = buildBlueprintPrFooter({
         iterations: iteration,
+        maxIterations,
         directionId: fixCtxForMeta.direction_id as string | undefined,
         directionTitle: fixCtxForMeta.direction_title as string | undefined,
         provider: process.env.PROVIDER,

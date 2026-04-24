@@ -21,6 +21,7 @@ from app.shared_state import (
     record_direction_result,
     clear_direction_hold,
     is_direction_held,
+    get_direction_hold_info,
     get_held_directions,
     get_pipeline_health_snapshot,
     DIRECTION_HOLD_THRESHOLD,
@@ -183,6 +184,39 @@ class TestIsDirectionHeldTimeout:
             record_direction_result(did, success=False, failure_class="CODE_ERROR")
         held, _ = is_direction_held(did)
         assert held
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — get_direction_hold_info
+# ---------------------------------------------------------------------------
+
+class TestGetDirectionHoldInfo:
+    def setup_method(self):
+        _setup()
+
+    def test_returns_held_at_and_held_until_while_held(self):
+        did = _fresh_direction_id()
+        for _ in range(DIRECTION_HOLD_THRESHOLD):
+            record_direction_result(did, success=False, failure_class="CODE_ERROR")
+
+        info = get_direction_hold_info(did)
+        assert info["held"] is True
+        assert info["held_at"] is not None
+        assert info["held_until"] is not None
+        delta = info["held_until"] - info["held_at"]
+        assert int(delta.total_seconds()) == DIRECTION_HOLD_TIMEOUT_HOURS * 3600
+
+    def test_timeout_returns_unheld_info_and_clears_streak(self):
+        did = _fresh_direction_id()
+        for _ in range(DIRECTION_HOLD_THRESHOLD):
+            record_direction_result(did, success=False, failure_class="CODE_ERROR")
+        _ss.direction_failure_streaks[did]["held_at"] = (
+            _ss._utcnow() - timedelta(hours=DIRECTION_HOLD_TIMEOUT_HOURS + 1)
+        )
+
+        info = get_direction_hold_info(did)
+        assert info == {"held": False, "reason": "", "held_at": None, "held_until": None}
+        assert _ss.direction_failure_streaks[did]["held"] is False
 
 
 # ---------------------------------------------------------------------------

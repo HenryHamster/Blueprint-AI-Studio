@@ -33,6 +33,18 @@ export interface ResearchHistoryEntry {
   taxonomy_summary?: Record<string, number> | null;
 }
 
+export interface RemediationHistoryEntry {
+  task_id?: string | null;
+  result?: 'merged' | 'failed' | 'partial_success' | 'held' | 'pending' | string | null;
+  timestamp?: string | null;
+  fingerprint?: string | null;
+  failure_class?: string | null;
+  error_summary?: string | null;
+  held_at?: string | null;
+  partial_success_at?: string | null;
+  [key: string]: unknown;
+}
+
 export interface Direction {
   id: string;
   text: string;
@@ -72,6 +84,8 @@ export interface Direction {
   // held=false.
   held?: boolean;
   held_reason?: string | null;
+  held_at?: string | null;
+  held_until?: string | null;
   // Diagnosis / remediation pipeline state (surfaced from backend direction dict)
   needs_manual_intervention?: boolean;
   diagnosis_in_progress?: boolean;
@@ -80,6 +94,7 @@ export interface Direction {
   remediation_attempts?: number;
   last_remediation_result?: 'merged' | 'failed' | 'pending' | string;
   remediation_monitor_started_at?: string;
+  remediation_history?: RemediationHistoryEntry[];
   /**
    * Productivity score: (merged − 0.5 × rejected) / cycles.
    * Quality-weighted — can go negative when rejections outweigh merges.

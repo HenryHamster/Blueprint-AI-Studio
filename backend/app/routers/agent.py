@@ -1313,6 +1313,15 @@ async def claim_task(
                             ew["sum"] / ew["weight"], 2
                         )
 
+                # Review-iteration trend: rolling median across last 3 cycles + last-cycle value
+                from app.direction_metrics import _compute_rolling_median_review_iterations
+                review_iteration_rolling_median = _compute_rolling_median_review_iterations(direction)
+                review_iteration_last_cycle: float | None = None
+                if history:
+                    last_val = history[-1].get("median_review_iterations")
+                    if isinstance(last_val, (int, float)):
+                        review_iteration_last_cycle = float(last_val)
+
                 # Pull recent failed/cancelled sibling tasks with analysis artifacts
                 prior_analysis_cutoff = _utcnow() - timedelta(days=14)
                 prior_stmt = (
@@ -1516,6 +1525,10 @@ async def claim_task(
                     "top_first_review_issues": direction_top_first_review_issues,
                     "first_attempt_feedback": direction_first_attempt_feedback,
                 }
+                if review_iteration_rolling_median is not None:
+                    response["direction_context"]["review_iteration_rolling_median"] = review_iteration_rolling_median
+                if review_iteration_last_cycle is not None:
+                    response["direction_context"]["review_iteration_last_cycle"] = review_iteration_last_cycle
                 from app.direction_outcomes import summarize_review_quality_feedback
                 review_quality_feedback = summarize_review_quality_feedback(history, dfa_entry)
                 if review_quality_feedback:

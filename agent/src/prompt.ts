@@ -623,6 +623,20 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         dcLines.push(`Cross-directory: ${crossParts.join('; ')} — multi-directory changes are proven to merge in this direction.`);
       }
     }
+    const rollingMedianIter = typeof dirCtx.review_iteration_rolling_median === 'number'
+      ? dirCtx.review_iteration_rolling_median
+      : null;
+    if (rollingMedianIter !== null) {
+      const lastCycleIter = typeof dirCtx.review_iteration_last_cycle === 'number'
+        ? dirCtx.review_iteration_last_cycle
+        : null;
+      const lastCycleSuffix = lastCycleIter !== null && lastCycleIter !== rollingMedianIter
+        ? ` (last cycle: ${lastCycleIter.toFixed(1)})`
+        : '';
+      dcLines.push(
+        `Recent PRs on this direction averaged ${rollingMedianIter.toFixed(1)} review iterations${lastCycleSuffix}; tight scope merges faster.`,
+      );
+    }
     const priorAnalysis = Array.isArray(dirCtx.direction_prior_analysis)
       ? dirCtx.direction_prior_analysis as Array<Record<string, unknown>>
       : [];

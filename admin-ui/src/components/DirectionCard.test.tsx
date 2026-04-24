@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { DirectionCard } from './DirectionCard';
 import type { Direction } from './DirectionsPanel';
@@ -41,6 +41,7 @@ function makeProps(direction: Direction, statusKey = 'active') {
     rejectProposal: vi.fn(),
     reviveProposal: vi.fn(),
     reactivateDirection: vi.fn(),
+    unholdDirection: vi.fn(),
     markDirectionComplete: vi.fn(),
     quickToggleStatus: vi.fn(),
     deleteDirection: vi.fn(),
@@ -61,6 +62,49 @@ function makeProps(direction: Direction, statusKey = 'active') {
 }
 
 describe('DirectionCard diagnosis/remediation section', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-24T12:00:00Z'));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('renders held banner with reason, auto-recovery text, and unhold action', () => {
+    const d = makeDirection({
+      held: true,
+      held_reason: 'Held: direction has 3 consecutive CODE_ERROR failures — awaiting investigation',
+      held_until: '2026-04-24T13:23:00Z',
+    });
+    const props = makeProps(d);
+
+    render(<DirectionCard {...props} />);
+
+    expect(screen.getByText('On hold')).toBeInTheDocument();
+    expect(screen.getByText(/Held: direction has 3 consecutive CODE_ERROR failures/)).toBeInTheDocument();
+    expect(screen.getByText('auto-recovers in 1h 23m')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'unhold' }));
+    expect(props.unholdDirection).toHaveBeenCalledWith('d-1');
+  });
+
+  it('renders overdue text when held_until is in the past', () => {
+    const d = makeDirection({
+      held: true,
+      held_reason: 'Held after repeated failures.',
+      held_until: '2026-04-24T11:59:00Z',
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('auto-recovery overdue')).toBeInTheDocument();
+  });
+
+  it('does not render hold banner for unheld directions', () => {
+    const d = makeDirection({ held: false, held_reason: null });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.queryByText('On hold')).not.toBeInTheDocument();
+  });
+
   it('renders manual-intervention alert when needs_manual_intervention is true', () => {
     const d = makeDirection({
       needs_manual_intervention: true,
@@ -119,6 +163,55 @@ describe('DirectionCard diagnosis/remediation section', () => {
     const badge = screen.getByText(/Remediation 2× · failed/);
     expect(badge).toBeInTheDocument();
     expect(badge.className).toMatch(/red/);
+  });
+
+  it('renders remediation history summary and show-more expansion', () => {
+    const d = makeDirection({
+      remediation_history: [
+        {
+          task_id: 't-3',
+          result: 'failed',
+          fingerprint: 'cccccccc33333333',
+          timestamp: '2026-04-24T10:00:00Z',
+        },
+        {
+          task_id: 't-2',
+          result: 'partial_success',
+          fingerprint: 'bbbbbbbb22222222',
+          timestamp: '2026-04-24T11:00:00Z',
+        },
+        {
+          task_id: 't-1',
+          result: 'merged',
+          fingerprint: 'aaaaaaaa11111111',
+          timestamp: '2026-04-24T11:30:00Z',
+        },
+      ],
+    });
+
+    render(<DirectionCard {...makeProps(d)} />);
+
+    expect(screen.getByText('Recent remediation attempts')).toBeInTheDocument();
+    expect(screen.getByText('merged')).toBeInTheDocument();
+    expect(screen.getByText('aaaaaaaa')).toBeInTheDocument();
+    expect(screen.getByText('partial')).toBeInTheDocument();
+    expect(screen.getByText('bbbbbbbb')).toBeInTheDocument();
+    expect(screen.queryByText('cccccccc')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'show more' }));
+    expect(screen.getByText('cccccccc')).toBeInTheDocument();
+  });
+
+  it('does not render remediation history section when history is missing', () => {
+    const d = makeDirection();
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.queryByText('Recent remediation attempts')).not.toBeInTheDocument();
+  });
+
+  it('does not render remediation history section when history is empty', () => {
+    const d = makeDirection({ remediation_history: [] });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.queryByText('Recent remediation attempts')).not.toBeInTheDocument();
   });
 
   it('renders completion_criteria textarea in edit mode and propagates changes', () => {
