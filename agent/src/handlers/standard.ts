@@ -197,6 +197,17 @@ export function extractSelfReviewJson(output: string): Record<string, unknown> |
   return null;
 }
 
+interface ScopeOverflowContext {
+  overflow_detected: true;
+  task_scope: string;
+  threshold: number;
+  non_test_files_changed: number;
+  total_files_changed: number;
+  changed_files: string[];
+  review_required: true;
+  auto_approve_allowed: false;
+}
+
 async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const {
     taskId, payload, task, ghToken, owner, repo, ws, statusRef,
@@ -471,8 +482,23 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     const taskScope = strVal((task.context as Record<string, unknown> | undefined)?.scope);
     const overflowThreshold = taskScope ? SCOPE_OVERFLOW_THRESHOLDS[taskScope] : undefined;
     const nonTestChangedPaths = changedPaths.filter(p => !isTestFile(p));
-    const scopeOverflowWarning = overflowThreshold !== undefined && nonTestChangedPaths.length > overflowThreshold
+    const scopeOverflowContext: ScopeOverflowContext | undefined = overflowThreshold !== undefined && nonTestChangedPaths.length > overflowThreshold
+      ? {
+          overflow_detected: true,
+          task_scope: taskScope,
+          threshold: overflowThreshold,
+          non_test_files_changed: nonTestChangedPaths.length,
+          total_files_changed: changedPaths.length,
+          changed_files: changedPaths.slice(0, 50),
+          review_required: true,
+          auto_approve_allowed: false,
+        }
+      : undefined;
+    const scopeOverflowWarning = scopeOverflowContext
       ? `This task has scope "${taskScope}" (expected few files) but ${nonTestChangedPaths.length} non-test files were changed (${changedPaths.length} total including tests), exceeding the ${overflowThreshold}-file threshold. Changed files:\n${changedPaths.map(f => `- ${f}`).join('\n')}`
+      : undefined;
+    const scopeOverflowReviewDirective = scopeOverflowContext
+      ? 'Review directive: explicitly assess whether the extra files are one coherent change unit or indicate scope sprawl. If sprawl, call out what should be split.'
       : undefined;
     if (scopeOverflowWarning) {
       sendLog(ws, `\nWARNING: Scope overflow detected — ${nonTestChangedPaths.length} non-test files changed for a "${taskScope}" task (threshold: ${overflowThreshold}, ${changedPaths.length} total including tests). Proceeding; the warning will be surfaced in the PR body for human review.\n`);
@@ -687,6 +713,7 @@ Return nothing — just write the files.`;
       truncated_files_read?: string[];
       parse_failed?: boolean;
       feedback_categories_injected?: string[];
+      scope_overflow?: ScopeOverflowContext;
     } | undefined;
     if (runSelfReview) {
       sendLog(ws, '\nRunning self-review...\n');
@@ -825,7 +852,9 @@ Return nothing — just write the files.`;
         changedFiles,
         reviewIssueDistribution: reviewIssueDist,
         taskScope: selfReviewTaskScope,
-        scopeOverflowWarning,
+        scopeOverflowWarning: scopeOverflowReviewDirective
+          ? `${scopeOverflowWarning}\n\n${scopeOverflowReviewDirective}`
+          : scopeOverflowWarning,
         firstAttemptByCategory: firstAttemptByCat,
         directionFirstAttemptFeedback,
         persistentReviewIssues,
@@ -1196,7 +1225,24 @@ Return nothing — just write the files.`;
           }
         }
       }
+
+      if (scopeOverflowContext && selfReviewOutcome) {
+        selfReviewOutcome.scope_overflow = scopeOverflowContext;
+      }
     }
+
+    const persistedSelfReviewOutcome = selfReviewOutcome ?? (
+      scopeOverflowContext
+        ? {
+            issues_found: false,
+            categories: ['scope_overflow_warning'],
+            fixes_applied: false,
+            passes: 0,
+            total_fixes: 0,
+            scope_overflow: scopeOverflowContext,
+          }
+        : undefined
+    );
 
     git(['add', '-A']);
 
@@ -1314,7 +1360,7 @@ Return nothing — just write the files.`;
       commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
       changed_files: changedPaths.slice(0, 50),
       ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
-      ...(selfReviewOutcome ? { self_review_outcome: selfReviewOutcome } : {}),
+      ...(persistedSelfReviewOutcome ? { self_review_outcome: persistedSelfReviewOutcome } : {}),
       ...(testFailureSummary ? { test_failure_summary: testFailureSummary.slice(-5000) } : {}),
       ...(analysisContext ? { analysis_plan: analysisContext.slice(0, 5000) } : {}),
     });

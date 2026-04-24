@@ -20,6 +20,7 @@ from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 from app.broadcast import broadcast_to_project
 from app.time_utils import _utcnow
+from app.spawn_calibration import _compute_scope_budget_utilization, _compute_scope_overflow_warning  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -209,31 +210,6 @@ def _is_test_file(path: str) -> bool:
     return ".test." in name or ".spec." in name
 
 
-def _compute_scope_budget_utilization(
-    changed_files: list[str] | None, scope: str
-) -> dict | None:
-    """Summarize how close a PR's file count is to its scope budget.
-
-    Returns None when no signal is available (no files known, or unknown scope).
-    ``percentage`` is a whole number (0-100+); callers surface guidance when it
-    crosses ``SCOPE_PRESSURE_WARN_THRESHOLD``.
-    """
-    from app.research_completion import SCOPE_FILE_BUDGETS  # noqa: PLC0415
-    if not changed_files:
-        return None
-    budget_info = SCOPE_FILE_BUDGETS.get(scope) or {}
-    budget = budget_info.get("production_files_max") or budget_info.get("total_files_max")
-    if not budget:
-        return None
-    non_test_count = sum(1 for f in changed_files if not _is_test_file(f))
-    return {
-        "scope": scope,
-        "file_count": len(changed_files),
-        "non_test_file_count": non_test_count,
-        "budget": budget,
-        "percentage": round(non_test_count / budget * 100),
-    }
-
 
 # Minimum direction acceptance rate required to auto-approve a small diff.
 # Directions with poor merge history still get a full review regardless of
@@ -297,6 +273,14 @@ def should_auto_approve_diff(
     changed_files = ctx.get("_pr_changed_files") or []
     if not changed_files:
         return (False, "changed files unknown")
+    overflow_warning = _compute_scope_overflow_warning(changed_files, scope)
+    if overflow_warning:
+        return (
+            False,
+            "scope overflow warning present: "
+            f"{overflow_warning['non_test_file_count']} non-test files > "
+            f"{overflow_warning['threshold']} threshold",
+        )
     non_test_count = sum(1 for f in changed_files if not _is_test_file(f))
     if non_test_count > max_files:
         return (False, f"{non_test_count} non-test files > {max_files}")
@@ -1157,6 +1141,26 @@ async def _spawn_pipeline_task(
     utilization = _compute_scope_budget_utilization(changed_files, propagated_scope)
     if utilization:
         propagated_ctx['scope_budget_utilization'] = utilization
+    overflow_warning = _compute_scope_overflow_warning(changed_files, propagated_scope)
+    if overflow_warning:
+        propagated_ctx['scope_overflow_warned'] = True
+        propagated_ctx['scope_overflow_warning'] = overflow_warning
+        source_ctx_updated = dict(source_ctx)
+        source_ctx_updated['scope_overflow_warned'] = True
+        source_ctx_updated['scope_overflow_warning'] = overflow_warning
+        source_task.context = source_ctx_updated
+        source_ctx = source_ctx_updated
+        if task_type == "review":
+            overflow_instruction = (
+                "Scope-overflow context: this PR exceeded the declared scope file "
+                f"budget ({overflow_warning['non_test_file_count']} non-test files "
+                f"vs threshold {overflow_warning['threshold']}). During review, "
+                "explicitly assess whether the additional files form a coherent, "
+                "necessary unit or indicate scope sprawl that should be deferred."
+            )
+            payload_data["original_prompt"] = (
+                ((payload_data.get("original_prompt") or "").strip() + "\n\n" + overflow_instruction).strip()
+            )
     # Persist the scope-budget hard cap (either newly triggered this spawn or
     # carried forward from a prior spawn) so _max_review_iterations enforces
     # it on subsequent review/fix iterations for this chain.
@@ -1211,6 +1215,7 @@ async def _spawn_pipeline_task(
         **({"review_history": new_review_history} if new_review_history else {}),
         **({"fix_reason": fix_reason} if fix_reason else {}),
         **({"churn_detections": churn_detections} if churn_detections else {}),
+        **({"scope_overflow_warned": True} if overflow_warning else {}),
     }
     new_task = Task(
         project_id=source_task.project_id,

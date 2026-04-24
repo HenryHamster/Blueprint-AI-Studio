@@ -94,7 +94,7 @@ vi.mock('ws', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote } from './standard.js';
 import { setupWorkspace, runClaudeCode, pushAndCreatePR, testFixLoop, captureTestBaseline, git, lintFixLoop, persistAndPostStatus, runProjectLintChecks, sendHeartbeatSync } from '../index.js';
-import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
+import { extractModuleInterfaces, discoverAffectedConsumers, getMandatoryChecks, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildSelfReviewPrompt } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -2014,6 +2014,28 @@ describe('scope overflow warning (soft-mode)', () => {
     const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
     expect(prBodyArg).toContain('Scope Overflow Warning');
     expect(prBodyArg).toContain('7 non-test files');
+  });
+
+  it('persists machine-readable scope overflow context and injects explicit review directive', async () => {
+    const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      ([, body]) => (body as Record<string, unknown>).status === 'COMPLETED',
+    );
+    expect(statusCall).toBeDefined();
+    const statusPayload = statusCall?.[1] as Record<string, unknown> | undefined;
+    const reviewOutcome = statusPayload?.self_review_outcome as Record<string, unknown> | undefined;
+    const overflowCtx = reviewOutcome?.scope_overflow as Record<string, unknown> | undefined;
+    expect(overflowCtx).toMatchObject({
+      overflow_detected: true,
+      task_scope: 'small',
+      non_test_files_changed: 7,
+      review_required: true,
+      auto_approve_allowed: false,
+    });
+    expect(vi.mocked(buildSelfReviewPrompt)).toHaveBeenCalledWith(expect.objectContaining({
+      scopeOverflowWarning: expect.stringContaining('scope sprawl'),
+    }));
   });
 
   it('does not surface a scope overflow warning when only test files push the count over', async () => {

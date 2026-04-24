@@ -421,6 +421,22 @@ class TestShouldAutoApproveSmallDiff:
         skip, _ = should_auto_approve_diff(t, None)
         assert skip is True
 
+    def test_scope_overflow_warning_disables_auto_approve(self):
+        t = self._task(
+            scope="small",
+            files=[
+                "app/a.py", "app/b.py", "app/c.py", "app/d.py",
+                "app/e.py", "app/f.py", "app/g.py",
+            ],
+            diff=[
+                {"file": "app/a.py", "added": 1, "removed": 0},
+                {"file": "app/b.py", "added": 1, "removed": 0},
+            ],
+        )
+        skip, reason = should_auto_approve_diff(t, None)
+        assert skip is False
+        assert "scope overflow warning" in reason
+
     def test_missing_diff_summary_rejected(self):
         t = self._task(files=["app/a.py"])
         skip, reason = should_auto_approve_diff(t, None)
@@ -4035,6 +4051,60 @@ async def test_direction_title_not_set_when_no_direction_text(db_session, mocker
     assert "direction_title" not in (result.context or {}), (
         "direction_title must not be set when direction has no text"
     )
+
+
+@pytest.mark.asyncio
+async def test_scope_overflow_warning_propagates_to_review_context_and_prompt(db_session, mocker):
+    """When changed files exceed scope budget, review tasks should carry a
+    machine-readable overflow signal and explicit coherence-vs-sprawl guidance."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{
+            "type": "create", "pr_number": 991, "branch": "feat/overflow",
+            "base_branch": "main", "prompt": "Implement feature X",
+        }],
+        context={
+            "scope": "small",
+            "_pr_changed_files": [
+                "backend/app/a.py", "backend/app/b.py", "backend/app/c.py",
+                "backend/app/d.py", "backend/app/e.py", "backend/app/f.py",
+                "backend/app/g.py",
+            ],
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, spawned = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=991, branch="feat/overflow", base_branch="main",
+        original_prompt="Implement feature X",
+    )
+
+    assert spawned is True and result is not None
+    ctx = result.context or {}
+    assert ctx.get("scope_overflow_warned") is True
+    overflow = ctx.get("scope_overflow_warning") or {}
+    assert overflow.get("scope") == "small"
+    assert overflow.get("threshold") == 6
+    assert overflow.get("non_test_file_count") == 7
+    assert (ctx.get("review_loop") or {}).get("scope_overflow_warned") is True
+
+    payload = result.first_payload or {}
+    op = payload.get("original_prompt") or ""
+    assert "coherent, necessary unit" in op
+    assert "scope sprawl" in op
+
+    await db_session.refresh(source_task)
+    source_ctx = source_task.context or {}
+    assert source_ctx.get("scope_overflow_warned") is True
+    assert (source_ctx.get("scope_overflow_warning") or {}).get("threshold") == 6
 
 
 # ── post_merge_summary_comment ────────────────────────────────────────────────

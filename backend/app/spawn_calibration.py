@@ -717,3 +717,52 @@ def predict_spawn_success(
         return 0.5  # insufficient data — neutral
 
     return min(1.0, max(0.0, sum(s * w for s, w in zip(signals, weights)) / sum(weights)))
+
+
+def _compute_scope_budget_utilization(
+    changed_files: list[str] | None, scope: str
+) -> dict | None:
+    """Summarize how close a PR's file count is to its scope budget.
+
+    Returns None when no signal is available (no files known, or unknown scope).
+    ``percentage`` is a whole number (0-100+); callers surface guidance when it
+    crosses ``SCOPE_PRESSURE_WARN_THRESHOLD``.
+    """
+    from app.review_pipeline import _is_test_file  # noqa: PLC0415
+    if not changed_files:
+        return None
+    budget_info = SCOPE_FILE_BUDGETS.get(scope) or {}
+    budget = budget_info.get("production_files_max") or budget_info.get("total_files_max")
+    if not budget:
+        return None
+    non_test_count = sum(1 for f in changed_files if not _is_test_file(f))
+    return {
+        "scope": scope,
+        "file_count": len(changed_files),
+        "non_test_file_count": non_test_count,
+        "budget": budget,
+        "percentage": round(non_test_count / budget * 100),
+    }
+
+
+def _compute_scope_overflow_warning(
+    changed_files: list[str] | None, scope: str
+) -> dict | None:
+    """Return machine-readable scope-overflow warning details, if triggered."""
+    from app.review_pipeline import _is_test_file  # noqa: PLC0415
+    if not changed_files:
+        return None
+    budget_info = SCOPE_FILE_BUDGETS.get(scope) or {}
+    threshold = budget_info.get("production_files_max") or budget_info.get("total_files_max")
+    if not threshold:
+        return None
+    non_test_count = sum(1 for f in changed_files if not _is_test_file(f))
+    if non_test_count <= threshold:
+        return None
+    return {
+        "scope": scope,
+        "threshold": threshold,
+        "non_test_file_count": non_test_count,
+        "file_count": len(changed_files),
+        "changed_files": changed_files[:50],
+    }
