@@ -7,11 +7,29 @@ from app.failure_classification import (
     AGENT_TIMEOUT,
     CODE_ERROR,
     EXTERNAL_API,
+    EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY,
+    EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE,
+    EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT,
+    EXTERNAL_API_SUBTYPE_OTHER,
+    EXTERNAL_API_SUBTYPE_PROVIDER_AUTH,
+    EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA,
     MIGRATION_ERROR,
     PROVISION_FAILURE,
     RATE_LIMIT,
     SCOPE_OVERFLOW,
+    _external_api_subtype_from_message,
+    _fingerprint_message,
+    _timeout_subtype_from_message,
+    classify_external_api_subtype,
+    classify_failure,
+    classify_failure_taxonomy,
+    classify_timeout_subtype,
+    get_top_residual_fingerprints,
     persist_failure_category,
+    record_residual_fingerprint,
+    should_trigger_code_defect_investigation,
+    should_trigger_review_quality_investigation,
+    should_trigger_timeout_investigation,
     TAXONOMY_CODE_DEFECT,
     TAXONOMY_INFRA_RELATED,
     TAXONOMY_REVIEW_QUALITY,
@@ -23,16 +41,6 @@ from app.failure_classification import (
     TIMEOUT_OOM,
     TIMEOUT_PROCESS_CRASH,
     TIMEOUT_UNKNOWN,
-    _fingerprint_message,
-    _timeout_subtype_from_message,
-    classify_failure,
-    classify_failure_taxonomy,
-    classify_timeout_subtype,
-    get_top_residual_fingerprints,
-    record_residual_fingerprint,
-    should_trigger_code_defect_investigation,
-    should_trigger_review_quality_investigation,
-    should_trigger_timeout_investigation,
 )
 from app.models import Task
 
@@ -733,3 +741,88 @@ class TestDeriveFailureStageMigration:
         assert _derive_failure_stage(
             "MIGRATION_ERROR", "alembic.util.exc.CommandError: can't locate revision"
         ) == "migration"
+
+
+class TestExternalApiSubtypeFromMessage:
+    def test_db_connectivity(self):
+        assert _external_api_subtype_from_message("psycopg.OperationalError: connection refused") == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+
+    def test_db_connectivity_asyncpg(self):
+        assert _external_api_subtype_from_message("asyncpg.exceptions.ConnectionFailure: too many clients") == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+
+    def test_db_connectivity_could_not_connect(self):
+        assert _external_api_subtype_from_message("could not connect to server: Connection refused") == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+
+    def test_provider_auth_unauthorized(self):
+        assert _external_api_subtype_from_message("401 Unauthorized from api.anthropic.com") == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+
+    def test_provider_auth_bad_credentials(self):
+        assert _external_api_subtype_from_message("Bad credentials returned from GitHub") == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+
+    def test_provider_auth_token_expired(self):
+        assert _external_api_subtype_from_message("token expired, please re-authenticate") == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+
+    def test_github_pr_create(self):
+        assert _external_api_subtype_from_message("failed to create pull request: 422 Unprocessable Entity") == EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE
+
+    def test_github_pr_create_rollup(self):
+        assert _external_api_subtype_from_message("rollup pr creation failed on main") == EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE
+
+    def test_github_pr_create_merge_blocked(self):
+        assert _external_api_subtype_from_message("merge blocked by branch protection rules") == EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE
+
+    def test_provider_quota_overloaded(self):
+        assert _external_api_subtype_from_message("Error: Overloaded") == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+
+    def test_provider_quota_context_length(self):
+        assert _external_api_subtype_from_message("context_length_exceeded on model request") == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+
+    def test_provider_quota_github_rate_limit(self):
+        assert _external_api_subtype_from_message("api.github.com returned 429 too many requests") == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+
+    def test_network_transient_503(self):
+        assert _external_api_subtype_from_message("503 service unavailable from upstream") == EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT
+
+    def test_network_transient_ssl(self):
+        assert _external_api_subtype_from_message("SSL handshake failed during connection") == EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT
+
+    def test_network_transient_dns(self):
+        assert _external_api_subtype_from_message("could not resolve hostname api.example.com") == EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT
+
+    def test_other_fallback(self):
+        assert _external_api_subtype_from_message("some unknown external api error") == EXTERNAL_API_SUBTYPE_OTHER
+
+    def test_empty_is_other(self):
+        assert _external_api_subtype_from_message("") == EXTERNAL_API_SUBTYPE_OTHER
+
+
+class TestClassifyExternalApiSubtype:
+    def test_delegates_to_helper(self):
+        task = _FakeTask("psycopg.OperationalError: connection refused")
+        assert classify_external_api_subtype(task) == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+
+    def test_combines_logs(self):
+        task = _FakeTask("")
+        assert classify_external_api_subtype(task, logs="asyncpg connection failure") == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+
+    def test_none_status(self):
+        task = _FakeTask(None)  # type: ignore[arg-type]
+        assert classify_external_api_subtype(task) == EXTERNAL_API_SUBTYPE_OTHER
+
+
+class TestPersistFailureCategoryExternalApiSubtype:
+    def test_external_api_persists_subtype(self):
+        task = _task("psycopg.OperationalError: connection refused")
+        persist_failure_category(task, EXTERNAL_API)
+        assert task.context["failure_category"] == EXTERNAL_API
+        assert task.context["external_api_subtype"] == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+
+    def test_external_api_persists_auth_subtype(self):
+        task = _task("401 Unauthorized")
+        persist_failure_category(task, EXTERNAL_API)
+        assert task.context["external_api_subtype"] == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+
+    def test_non_external_api_does_not_write_subtype(self):
+        task = _task("No heartbeat received")
+        persist_failure_category(task, AGENT_TIMEOUT)
+        assert "external_api_subtype" not in task.context

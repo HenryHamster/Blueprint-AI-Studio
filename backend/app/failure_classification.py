@@ -353,6 +353,9 @@ def persist_failure_category(task: "Task", failure_class: str, logs: str | None 
     if failure_class == AGENT_TIMEOUT:
         status_msg = task.latest_status_message or ""
         ctx["timeout_subtype"] = _timeout_subtype_from_message(status_msg + " " + (logs or ""))
+    if failure_class == EXTERNAL_API:
+        status_msg = task.latest_status_message or ""
+        ctx["external_api_subtype"] = _external_api_subtype_from_message(status_msg + " " + (logs or ""))
     task.context = ctx
 
 
@@ -426,6 +429,85 @@ def classify_timeout_subtype(task: "Task", logs: str | None = None) -> str:
     """Return a sub-type label for an AGENT_TIMEOUT failure."""
     status_msg = task.latest_status_message or ""
     return _timeout_subtype_from_message(status_msg + " " + (logs or ""))
+
+
+# EXTERNAL_API sub-types — finer breakdown so auto-remediation can apply
+# tailored recovery patterns per failure mode.
+EXTERNAL_API_SUBTYPE_PROVIDER_AUTH = "provider_auth"
+EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA = "provider_quota"
+EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE = "github_pr_create"
+EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY = "db_connectivity"
+EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT = "network_transient"
+EXTERNAL_API_SUBTYPE_OTHER = "other"
+
+
+def _external_api_subtype_from_message(combined: str) -> str:
+    """Route a combined status+logs string to an EXTERNAL_API sub-type label.
+
+    Order matters: specific failure signatures are checked before generic ones.
+    """
+    combined = (combined or "").lower()
+
+    # Database connectivity — checked first because psycopg/asyncpg errors can
+    # contain generic "connection" substrings that would otherwise match network_transient.
+    if any(kw in combined for kw in (
+        "could not connect to server", "connection to server",
+        "database connection", "psycopg", "asyncpg",
+        "operator does not exist",
+    )):
+        return EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+
+    # Provider auth — token/credential failures from any upstream API.
+    if any(kw in combined for kw in (
+        "401", "unauthorized", "bad credentials",
+        "token expired", "token invalid", "token revoked",
+        "authentication failed", "invalid api key",
+    )):
+        return EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+
+    # GitHub PR creation / merge-block failures.
+    if ("failed to create" in combined and "branch" in combined) or \
+       any(kw in combined for kw in (
+           "failed to create pull request", "rollup pr creation failed",
+           "merge blocked", "merge attempt", "merge conflicts",
+           "merge failed", "merge hard-cap", "merge hard cap",
+           "merge check failed", "not mergeable",
+           "repository rule", "rule violations",
+           "required status check", "branch protection",
+       )):
+        return EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE
+
+    # GitHub rate limits.
+    if any(gh_kw in combined for gh_kw in ("github", "api.github.com")) and \
+       any(kw in combined for kw in ("rate limit", "429", "too many requests")):
+        return EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+
+    # Provider quota / rate exhaustion / capacity (non-auth upstream limits).
+    if any(kw in combined for kw in (
+        "overloaded", "rate limit", "429", "too many requests",
+        "context_length_exceeded", "token limit exceeded",
+        "quota exceeded", "resource exhausted",
+    )):
+        return EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+
+    # Transient network / TLS / DNS errors.
+    if any(kw in combined for kw in (
+        "connection timed out", "name resolution failed",
+        "ssl", "certificate",
+        "could not resolve hostname", "name or service not known",
+        "network unreachable",
+        "500 internal server error", "502 bad gateway", "503 service unavailable",
+    )):
+        return EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT
+
+    return EXTERNAL_API_SUBTYPE_OTHER
+
+
+def classify_external_api_subtype(task: "Task", logs: str | None = None) -> str:
+    """Return a sub-type label for an EXTERNAL_API failure."""
+    status_msg = task.latest_status_message or ""
+    combined = status_msg + " " + (logs or "")
+    return _external_api_subtype_from_message(combined)
 
 
 # Bounded in-memory store for CODE_ERROR fallthrough fingerprints.

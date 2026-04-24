@@ -372,6 +372,9 @@ async def _handle_main_branch_ci_failure_inner(
         structured_signals=structured_signals,
     )
 
+    from app.failure_classification import _external_api_subtype_from_message  # noqa: PLC0415
+    _ext_api_subtype = _external_api_subtype_from_message(error_summary) if error_summary else None
+
     task_context: dict[str, Any] = {
         "auto_remediation": True,
         "ci_failure_sha": head_sha,
@@ -380,6 +383,8 @@ async def _handle_main_branch_ci_failure_inner(
         "ci_failure_type": failure_type,
         "trigger_failure_class": "MIGRATION_ERROR" if failure_type == "migration" else "CODE_ERROR",
     }
+    if _ext_api_subtype and _ext_api_subtype != "other":
+        task_context["external_api_subtype"] = _ext_api_subtype
     if regression_of is not None:
         task_context["regression_of_task_id"] = str(regression_of.id)
         prev_pr = (regression_of.context or {}).get("merged_pr_number") \
