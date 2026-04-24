@@ -1511,6 +1511,31 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
         sample_messages = fp_entry.get("sample_messages") or (
             [fp_entry["sample_message"]] if fp_entry.get("sample_message") else []
         )
+
+        # Re-classify the primary sample against the current classifier.
+        # Fingerprints can linger in the in-memory store for up to 24 h after
+        # the underlying classify_failure fix is deployed (the store is
+        # process-local; it doesn't clear on code push). If the sample now
+        # routes to AGENT_TIMEOUT (or any non-CODE_ERROR class), the issue
+        # has already been addressed and spawning another remediation task
+        # would waste capacity and trigger an identical cycle 24 h later.
+        if sample_messages:
+            from app.failure_classification import classify_failure as _rfc, CODE_ERROR as _CE  # noqa: PLC0415
+            import types as _types  # noqa: PLC0415
+            _probe = _types.SimpleNamespace(
+                context={},
+                latest_status_message=sample_messages[0],
+                id=None,
+            )
+            if _rfc(_probe) != _CE:
+                logger.info(
+                    "[AUTO REMEDIATION] Skipping fingerprint %s: primary sample "
+                    "no longer classifies as CODE_ERROR (underlying fix already deployed). "
+                    "Sample: %.80s",
+                    fp[:32], sample_messages[0],
+                )
+                continue
+
         sample_statuses = fp_entry.get("sample_statuses") or (
             [fp_entry["sample_status"]] if fp_entry.get("sample_status") else []
         )

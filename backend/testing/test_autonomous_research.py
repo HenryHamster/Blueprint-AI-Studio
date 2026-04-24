@@ -6911,6 +6911,53 @@ async def test_residual_fingerprint_remediation_cooldown_expired_allows_respawn(
 
 
 @pytest.mark.asyncio
+async def test_residual_fingerprint_remediation_skips_agent_timeout_sample(db_session, _clear_residual_state):
+    """Fingerprints whose primary sample now classifies as non-CODE_ERROR are skipped.
+
+    Tasks that die (OOM/SIGKILL) while the agent is creating a PR leave the
+    PR-creation heartbeat as latest_status_message. Before the classify_failure
+    fix was deployed, these could slip into the residual store as CODE_ERROR.
+    After the fix, the re-classification guard detects the heartbeat via
+    classify_failure and skips spawning a redundant remediation task.
+    """
+    import time
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+
+    project = Project(
+        name="Residual Skip Agent Timeout",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-remskip01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Simulate a fingerprint that was recorded before the classify_failure fix
+    # was deployed — an agent PR-creation heartbeat that should have been
+    # AGENT_TIMEOUT but fell through to CODE_ERROR in the old code.
+    fp = "creating pull request for blueprint/task-<hash>..."
+    pr_heartbeat = "[15.5MB] Creating pull request for blueprint/task-2a30fc5a..."
+    _residual_store[fp] = {
+        "count": 8,
+        "first_seen": time.time() - 7200,
+        "last_seen": time.time(),
+        "sample_message": pr_heartbeat,
+        "sample_messages": [pr_heartbeat],
+        "sample_statuses": [pr_heartbeat],
+        "task_ids": ["fake-task-id-1", "fake-task-id-2"],
+    }
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 0, "PR-creation heartbeat fingerprint should be skipped by re-classification guard"
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    create_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "create"]
+    assert len(create_tasks) == 0, "No remediation task should have been spawned for a non-CODE_ERROR fingerprint"
+
+
+@pytest.mark.asyncio
 async def test_residual_fingerprint_remediation_skipped_when_no_fingerprints(db_session, _clear_residual_state):
     """Empty residual store → no task spawned."""
     from app.autonomous_research import _spawn_residual_fingerprint_remediation
