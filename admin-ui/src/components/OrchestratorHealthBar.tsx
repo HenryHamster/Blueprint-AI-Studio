@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import type { Task } from './TaskCard';
 import type { OrchestratorHealth, ProviderApisHealth } from '../types/settings';
@@ -68,11 +68,16 @@ function monitoringDuration(since: string): string {
   return formatDurationSec(Math.floor((Date.now() - parseTimestamp(since).getTime()) / 1000));
 }
 
+const COST_WARN_THRESHOLD = 0.8;
+
 export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsConnected, lastFetchTime, tasks, pipelineThrottle }: OrchestratorHealthBarProps) {
   const [now, setNow] = useState(() => Date.now());
   const [circuitExpanded, setCircuitExpanded] = useState(false);
   const [refreshingQuota, setRefreshingQuota] = useState(false);
   const [localQuota, setLocalQuota] = useState<GithubQuota | null>(null);
+  const [dailyCostUsd, setDailyCostUsd] = useState<number | null>(null);
+  const [dailyCostCeilingUsd, setDailyCostCeilingUsd] = useState<number>(0);
+  const costFetchRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
@@ -88,6 +93,24 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
     const localTs = localQuota.last_updated;
     if (serverTs && localTs && serverTs >= localTs) setLocalQuota(null);
   }, [detailedHealth?.github_quota, localQuota]);
+
+  const fetchCostData = useCallback(async () => {
+    try {
+      const res = await apiFetch('/api/admin/digest?hours=1');
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.daily_cost_usd != null) setDailyCostUsd(data.daily_cost_usd);
+        if (data?.daily_cost_ceiling_usd != null) setDailyCostCeilingUsd(data.daily_cost_ceiling_usd);
+      }
+    } catch { /* silent */ }
+  }, []);
+
+  useEffect(() => {
+    fetchCostData();
+    const schedule = () => { costFetchRef.current = setTimeout(() => { fetchCostData().then(schedule); }, 60_000); };
+    schedule();
+    return () => { if (costFetchRef.current) clearTimeout(costFetchRef.current); };
+  }, [fetchCostData]);
 
   const refreshQuota = async () => {
     if (refreshingQuota) return;
@@ -407,6 +430,28 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
             </span>
           </>
         )}
+
+        {(() => {
+          if (!dailyCostCeilingUsd || dailyCostCeilingUsd <= 0 || dailyCostUsd == null) return null;
+          const ratio = dailyCostUsd / dailyCostCeilingUsd;
+          if (ratio < COST_WARN_THRESHOLD) return null;
+          const pct = Math.round(ratio * 100);
+          const over = ratio >= 1;
+          return (
+            <>
+              <div className="w-px h-3 bg-neutral-800 shrink-0" />
+              <button
+                type="button"
+                className={`inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded cursor-pointer ${over ? 'bg-red-900/40 text-red-400' : 'bg-amber-900/40 text-amber-400'}`}
+                title={`Daily cost: $${dailyCostUsd.toFixed(2)} / $${dailyCostCeilingUsd.toFixed(2)} ceiling (${pct}%). Click to view cost section.`}
+                onClick={() => { document.getElementById('cost-section')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${over ? 'bg-red-500 animate-pulse' : 'bg-amber-400 animate-pulse'}`} />
+                Cost: {pct}%{over ? ' ⚠' : ''}
+              </button>
+            </>
+          );
+        })()}
       </div>
 
       {/* Right: stale heartbeats + last update */}

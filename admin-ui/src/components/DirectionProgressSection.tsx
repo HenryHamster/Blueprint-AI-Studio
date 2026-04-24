@@ -76,6 +76,9 @@ export interface DirectionProgress {
     avg_subtask_count?: number;
     avg_cross_module_count?: number;
   } | null;
+  cost_budget_usd?: number | null;
+  budget_utilization_pct?: number | null;
+  budget_exceeded?: boolean;
 }
 
 type DirectionSortKey = 'default' | 'acceptance_asc' | 'cost_desc' | 'first_attempt_asc';
@@ -233,6 +236,43 @@ export function DirectionProgressSection({ directions }: { directions: Direction
                       : `${dp.avg_time_to_merge_hours.toFixed(1)}h/merge`}
                   </span>
                 )}
+                {(() => {
+                  const spend = dp.estimated_cost_usd;
+                  const budget = dp.cost_budget_usd;
+                  const utilPct = dp.budget_utilization_pct;
+                  const exceeded = dp.budget_exceeded;
+                  if (typeof budget === 'number' && budget > 0 && typeof utilPct === 'number') {
+                    const spendStr = typeof spend === 'number' ? `$${spend.toFixed(2)}` : '?';
+                    const tooltip = `${spendStr} / $${budget.toFixed(2)} budget (${Math.round(utilPct)}% utilized)`;
+                    if (exceeded) {
+                      return (
+                        <span className="text-[9px] bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded font-mono" title={tooltip}>
+                          over budget
+                        </span>
+                      );
+                    }
+                    if (utilPct >= 80) {
+                      return (
+                        <span className="text-[9px] bg-amber-500/10 text-amber-500 border border-amber-500/20 px-1.5 py-0.5 rounded font-mono" title={tooltip}>
+                          {Math.round(utilPct)}% budget
+                        </span>
+                      );
+                    }
+                    return (
+                      <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded font-mono" title={tooltip}>
+                        {Math.round(utilPct)}% budget
+                      </span>
+                    );
+                  }
+                  if (typeof spend === 'number' && spend > 0) {
+                    return (
+                      <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded font-mono" title="Estimated cost this window (no budget set)">
+                        ${spend.toFixed(2)}
+                      </span>
+                    );
+                  }
+                  return null;
+                })()}
               </div>
             </button>
             {isExpanded && (

@@ -41,8 +41,10 @@ from app.task_completion import (
     _record_regression_signal_if_matching,
     _maybe_escalate_exhausted_followups,
     build_blueprint_pr_footer,
+    build_blueprint_pr_merge_summary_comment,
     patch_pr_body_with_blueprint_meta,
     BLUEPRINT_PR_META_MARKER,
+    BLUEPRINT_PR_MERGE_SUMMARY_MARKER,
 )
 from app.strategic_constants import STRATEGIC_RATIONALE_MAX
 from app.models import Alert, AlertSeverity, TaskStatus
@@ -4491,6 +4493,52 @@ class TestBuildBlueprintPrFooter:
         assert "d-xyz" in footer
         assert BLUEPRINT_PR_META_MARKER in footer
 
+    def test_falls_back_to_context_review_metadata(self):
+        task = make_task(
+            context={
+                "review_loop": {"iteration": 3},
+                "direction_id": "d-ctx",
+                "direction_title": "From context",
+            }
+        )
+        footer = build_blueprint_pr_footer(task)
+        assert "3 iterations" in footer
+        assert "From context" in footer
+        assert "d-ctx" in footer
+
+
+class TestBuildBlueprintPrMergeSummaryComment:
+    def test_formats_merge_summary_from_context_and_payload(self):
+        task = make_task(
+            payloads=[{"type": "review", "scope": "backend"}],
+            context={
+                "review_loop": {"iteration": 2},
+                "direction_title": "Reduce flaky tests",
+                "agent_handler": "review-fix",
+                "llm_model": "gpt-5",
+            },
+        )
+        with patch("app.max_plan_pool.get_task_llm_provider", return_value="openai"):
+            comment = build_blueprint_pr_merge_summary_comment(task)
+
+        assert comment.startswith(BLUEPRINT_PR_MERGE_SUMMARY_MARKER)
+        assert "### Blueprint Merge Summary" in comment
+        assert "Review-fix iterations: **2**" in comment
+        assert "- Task: `review` (`backend`)" in comment
+        assert "- Agent: `review-fix`" in comment
+        assert "- Provider/Model: `openai / gpt-5`" in comment
+        assert "- Direction: Reduce flaky tests" in comment
+
+    def test_defaults_when_metadata_missing(self):
+        task = make_task(payloads=[{}], context={})
+        with patch("app.max_plan_pool.get_task_llm_provider", return_value=""):
+            comment = build_blueprint_pr_merge_summary_comment(task)
+
+        assert "Review-fix iterations: **n/a**" in comment
+        assert "- Task: `create` (`unknown`)" in comment
+        assert "- Provider/Model: `unknown`" in comment
+        assert "- Direction: n/a" in comment
+
 
 # ── patch_pr_body_with_blueprint_meta ────────────────────────────────────────
 
@@ -4578,4 +4626,3 @@ class TestPatchPrBodyWithBlueprintMeta:
             await patch_pr_body_with_blueprint_meta("tok", "owner", "repo", 1, "<!-- blueprint:meta -->\n*x*")
 
         assert not patch_called
-

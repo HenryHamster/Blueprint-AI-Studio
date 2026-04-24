@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { apiFetch } from '../api';
 
 interface RecentInvestigation {
@@ -144,6 +144,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
   const [investigationsOpen, setInvestigationsOpen] = useState(false);
   const [residuals, setResiduals] = useState<ResidualFingerprintsData | null>(null);
   const [residualsOpen, setResidualsOpen] = useState(false);
+  const firstOverdueRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const qs = projectId ? `?hours=24&top_n=10&project_id=${encodeURIComponent(projectId)}` : '?hours=24&top_n=10';
@@ -175,6 +176,8 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
   const fixesHeld = funnel.fixes_held ?? 0;
   const active = funnel.active_investigations ?? 0;
   const avgHours = funnel.avg_time_to_remediation_hours ?? null;
+  const OVERDUE_HOURS = 2;
+  const overdueCount = (funnel.active_investigations_detail ?? []).filter(a => (a.elapsed_hours ?? 0) > OVERDUE_HOURS).length;
 
   const stages: { key: string; label: string; count: number; prev: number | null }[] = [
     { key: 'spawned', label: 'Spawned', count: spawned, prev: null },
@@ -255,6 +258,19 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
           >
             {fixesHeld} held
           </span>
+        )}
+        {overdueCount > 0 && (
+          <button
+            type="button"
+            onClick={() => {
+              setInvestigationsOpen(true);
+              setTimeout(() => firstOverdueRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+            }}
+            className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-400 border-amber-500/30 hover:bg-amber-500/30 transition-colors"
+            title={`${overdueCount} investigation${overdueCount > 1 ? 's' : ''} running longer than ${OVERDUE_HOURS}h`}
+          >
+            {overdueCount} overdue
+          </button>
         )}
       </div>
 
@@ -506,10 +522,11 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                   <div>
                     <div className="text-[9px] uppercase tracking-wide text-neutral-600 mb-1">Active</div>
                     <div className="space-y-0.5">
-                      {activeDetails.map(a => {
-                        const overdue = (a.elapsed_hours ?? 0) > 2;
+                      {activeDetails.map((a, idx) => {
+                        const overdue = (a.elapsed_hours ?? 0) > OVERDUE_HOURS;
+                        const isFirstOverdue = overdue && activeDetails.slice(0, idx).every(b => (b.elapsed_hours ?? 0) <= OVERDUE_HOURS);
                         return (
-                          <div key={a.task_id} className="flex justify-between text-[11px]">
+                          <div key={a.task_id} ref={isFirstOverdue ? firstOverdueRef : undefined} className="flex justify-between text-[11px]">
                             <span className="font-mono text-neutral-400 truncate">
                               {a.direction_id ?? '(no direction)'}
                             </span>

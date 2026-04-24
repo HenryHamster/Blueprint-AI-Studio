@@ -3143,6 +3143,39 @@ async def test_digest_direction_progress_cost_budget_fields(client: AsyncClient,
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_no_budget_fields(client: AsyncClient, db_session):
+    """When no cost_budget_usd is set, estimated_cost_usd is populated but utilization fields are null."""
+    now = _utcnow()
+    project = make_project(
+        directions=[{"id": "dir-nb", "text": "No budget dir", "status": "active"}]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="t",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"direction_id": "dir-nb", "scope": "small"},
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),
+        vm_spot=True,
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    assert dp["cost_budget_usd"] is None
+    assert dp["budget_utilization_pct"] is None
+    assert dp["budget_exceeded"] is False
+    assert dp["estimated_cost_usd"] is not None
+    assert dp["estimated_cost_usd"] > 0
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_cost_by_type(client: AsyncClient, db_session):
     """direction_progress entries include cost_by_type breakdown keyed by task type."""
     now = _utcnow()

@@ -668,6 +668,44 @@ function DirectionCardImpl({
                 Mark Complete
               </button>
             )}
+            {/* Budget utilization indicator */}
+            {(() => {
+              const spend = d.estimated_cost_usd;
+              const budget = d.cost_budget_usd;
+              if (spend == null && (budget == null || budget === 0)) return null;
+              const utilPct = d.budget_utilization_pct != null
+                ? d.budget_utilization_pct
+                : (budget != null && budget > 0 && spend != null ? (spend / budget) * 100 : null);
+              const exceeded = d.budget_exceeded ?? (utilPct != null && utilPct > 100);
+              if (budget == null || budget === 0) {
+                return (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
+                    ${(spend ?? 0).toFixed(2)} spent
+                  </span>
+                );
+              }
+              if (spend == null) {
+                return (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
+                    Budget ${budget.toFixed(2)}
+                  </span>
+                );
+              }
+              const color = exceeded ? 'red' : utilPct != null && utilPct > 80 ? 'amber' : 'emerald';
+              const label = exceeded
+                ? `$${spend.toFixed(2)} · over budget`
+                : utilPct != null
+                  ? `$${spend.toFixed(2)} / $${budget.toFixed(2)} · ${Math.round(utilPct)}%`
+                  : `$${spend.toFixed(2)} / $${budget.toFixed(2)}`;
+              return (
+                <span
+                  title={`$${spend.toFixed(2)} spent of $${budget.toFixed(2)} budget`}
+                  className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
+                >
+                  {label}
+                </span>
+              );
+            })()}
             {/* Cooldown badge */}
             {key === 'active' && (() => {
               const cooldownStatus = getCooldownStatus(d, cooldownMinutes);

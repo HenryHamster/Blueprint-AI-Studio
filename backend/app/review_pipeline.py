@@ -14,6 +14,7 @@ from datetime import timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.github import post_pipeline_merge_summary_comment as post_merge_summary_comment  # noqa: F401
 from app.models import Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
@@ -524,13 +525,42 @@ async def _handle_cap_exhaustion(
             project_id=str(orig.project_id) if orig.project_id else "",
         )
 
+    # Cap exhaustion bypasses the normal status-update handler; call
+    # _record_remediation_if_terminal directly to keep direction state consistent.
+    try:
+        from app.task_completion import _record_remediation_if_terminal  # noqa: PLC0415
+        await _record_remediation_if_terminal(orig, TaskStatus.FAILED, session)
+        await session.commit()
+    except Exception as e:
+        logger.warning(f"[PIPELINE] Cap-exhaustion: failed to record remediation outcome for PR #{pr_number}: {e}")
+    investigation_id: str | None = None
+    try:
+        from app.autonomous_research import _spawn_review_convergence_investigation  # noqa: PLC0415
+        _inv = await _spawn_review_convergence_investigation(
+            orig, session, pr_number=pr_number, iterations=iterations,
+            detail=cap_label, trigger="review_cap_exhausted",
+        )
+        if _inv is not None:
+            investigation_id = str(_inv)
+            await session.commit()
+    except Exception as e:
+        logger.warning(f"[PIPELINE] Cap-exhaustion: convergence investigation spawn failed for PR #{pr_number}: {e}", exc_info=True)
+
     try:
         gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
         try:
+            fingerprint = ((orig.context or {}).get("failure_fingerprints") or [None])[0]
+            investigation_note = (
+                f"A convergence investigation has been queued (task `{investigation_id[:8]}`) "
+                f"to diagnose why this PR could not converge. Reopen after the investigation completes."
+                if investigation_id else
+                "No investigation was spawned (no direction attached or a recent one already covers this). Manual review required."
+            )
+            fingerprint_note = f"\n\nFailure fingerprint: `{fingerprint}`" if fingerprint else ""
             await create_pr_comment(
                 gh_token, owner, repo, pr_number,
                 f"Auto-closed: review-fix cap reached ({iterations} iterations, {cap_label}). "
-                f"Manual review required. Reopen this PR to resume work."
+                f"{investigation_note}{fingerprint_note}"
             )
         except Exception as e:
             logger.warning(f"[PIPELINE] Cap-exhaustion: failed to comment on PR #{pr_number}: {e}")
@@ -552,29 +582,6 @@ async def _handle_cap_exhaustion(
         )
     except Exception as e:
         logger.warning(f"[PIPELINE] Cap-exhaustion: failed to create alert for PR #{pr_number}: {e}")
-
-    # Record remediation failure on the linked direction. Cap exhaustion sets
-    # orig.status = FAILED directly on the ORM, bypassing the status update
-    # handler that normally fires _record_remediation_if_terminal — without this
-    # call, a remediation create task that hit the cap would leave the direction
-    # stuck on its last 'merged' stamp (recorded prematurely on PR creation).
-    try:
-        from app.task_completion import _record_remediation_if_terminal  # noqa: PLC0415
-        await _record_remediation_if_terminal(orig, TaskStatus.FAILED, session)
-        await session.commit()
-    except Exception as e:
-        logger.warning(f"[PIPELINE] Cap-exhaustion: failed to record remediation outcome for PR #{pr_number}: {e}")
-
-    try:
-        from app.autonomous_research import _spawn_review_convergence_investigation  # noqa: PLC0415
-        if await _spawn_review_convergence_investigation(
-            orig, session,
-            pr_number=pr_number, iterations=iterations,
-            detail=cap_label, trigger="review_cap_exhausted",
-        ):
-            await session.commit()
-    except Exception as e:
-        logger.warning(f"[PIPELINE] Cap-exhaustion: convergence investigation spawn failed for PR #{pr_number}: {e}", exc_info=True)
 
 
 SPAWN_REASON_KEY = "_last_pipeline_spawn_reason"

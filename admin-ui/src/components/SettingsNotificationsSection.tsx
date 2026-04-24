@@ -27,6 +27,8 @@ interface SettingsNotificationsSectionProps {
   onUpdateEnabledEvents: (events: string[]) => void;
   throttleSeconds: number;
   onUpdateThrottleSeconds: (seconds: number) => void;
+  dailyCostCeilingUsd: number;
+  onUpdateDailyCostCeiling: (value: number) => void;
   isAdmin: boolean;
 }
 
@@ -48,6 +50,8 @@ export function SettingsNotificationsSection({
   onUpdateEnabledEvents,
   throttleSeconds,
   onUpdateThrottleSeconds,
+  dailyCostCeilingUsd,
+  onUpdateDailyCostCeiling,
   isAdmin,
 }: SettingsNotificationsSectionProps) {
   const [urlDraft, setUrlDraft] = useState(webhookUrl);
@@ -101,6 +105,34 @@ export function SettingsNotificationsSection({
       <div className="flex items-center gap-2">
         <Bell className="w-4 h-4 text-neutral-400" />
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider">External Notifications</h3>
+      </div>
+
+      {/* Daily Cost Ceiling */}
+      <div>
+        <label className="block text-xs font-medium text-neutral-400 mb-1.5">Daily Cost Ceiling ($)</label>
+        {isAdmin ? (
+          <>
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={dailyCostCeilingUsd === 0 ? '' : dailyCostCeilingUsd}
+              placeholder="Disabled"
+              onChange={e => {
+                const v = parseFloat(e.target.value);
+                onUpdateDailyCostCeiling(isNaN(v) || v <= 0 ? 0 : v);
+              }}
+              className="w-32 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <p className="text-[11px] text-neutral-600 mt-1">
+              {dailyCostCeilingUsd === 0 ? 'No ceiling — pipeline runs without a daily cost limit.' : `Pipeline will alert and pause autonomous tasks if daily cost exceeds $${dailyCostCeilingUsd}.`}
+            </p>
+          </>
+        ) : (
+          <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-400 w-32 font-mono">
+            {dailyCostCeilingUsd === 0 ? 'Disabled' : `$${dailyCostCeilingUsd}`}
+          </div>
+        )}
       </div>
 
       {/* Webhook URL */}

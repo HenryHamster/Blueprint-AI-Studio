@@ -116,7 +116,7 @@ export function useAppState() {
     requireApprovalGates,
     autoArchiveEnabled, autoArchiveTerminalAfterDays,
     autoArchiveMaxTerminalTasksPerProject, autoArchiveIntervalMinutes,
-    notificationConfig,
+    notificationConfig, dailyCostCeilingUsd,
     providerTierModelMap, taskTypeModelPreferences,
     taskTypeCategories, categoryRouting, taskTypeRouting,
     providerSettingsByEffort,
@@ -141,7 +141,7 @@ export function useAppState() {
     updateAutoArchiveMaxTerminalTasksPerProject, updateAutoArchiveIntervalMinutes,
     handleUpdateMaxAutonomousRate, handleUpdateAutonomousResearchInterval,
     handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
-    updateHealthCheckUrls, updateNotificationConfig, updateBuildConfig,
+    updateHealthCheckUrls, updateNotificationConfig, updateDailyCostCeiling, updateBuildConfig,
   } = useSettings(addToast);
 
   const {
@@ -1050,7 +1050,7 @@ export function useAppState() {
     agentPromptSuffixes, updateAgentPromptSuffixes,
     handleUpdateAutonomousResearchInterval, handleUpdateDirectionCooldownMinutes, handleUpdateStrategicResearchFrequency,
     healthCheckUrls, updateHealthCheckUrls,
-    notificationConfig, updateNotificationConfig,
+    notificationConfig, updateNotificationConfig, dailyCostCeilingUsd, updateDailyCostCeiling,
     buildConfig, handleUpdateBuildConfig, handleDetectBuildConfig,
     autoRemediationConfig, autoRemediationStats, handleUpdateAutoRemediationConfig,
     issueImplementationConfig, handleUpdateIssueImplementationConfig,

@@ -1323,7 +1323,7 @@ async def _spawn_review_convergence_investigation(
     detail: str,
     trigger: str,
     review_history: list | None = None,
-) -> bool:
+) -> uuid.UUID | None:
     """Spawn an investigate task for review convergence failures.
 
     Fired from ``review_pipeline._handle_cap_exhaustion`` (trigger=
@@ -1337,14 +1337,14 @@ async def _spawn_review_convergence_investigation(
     """
     ttype = (orig_task.first_payload or {}).get("type") or ""
     if ttype in ("investigate", "smoketest"):
-        return False
+        return None
 
     direction_id = (orig_task.context or {}).get("direction_id")
     if not direction_id:
-        return False
+        return None
 
     if await _recent_investigation_exists(orig_task.project_id, direction_id, session):
-        return False
+        return None
 
     from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
     from app.failure_classification import CODE_ERROR, TAXONOMY_REVIEW_QUALITY  # noqa: PLC0415
@@ -1380,7 +1380,7 @@ async def _spawn_review_convergence_investigation(
                 f"(direction {direction_id}): shares fingerprint "
                 f"{diagnosis_fingerprint[:40]} with existing investigate task {shared_id}"
             )
-            return False
+            return None
 
     history = review_history or (orig_task.context or {}).get("review_loop", {}).get("review_history") or []
     issues_lines: list[str] = []
@@ -1450,7 +1450,7 @@ async def _spawn_review_convergence_investigation(
         f"[REVIEW CONVERGENCE] Spawned investigation {new_task.id} for "
         f"PR #{pr_number} ({trigger}, direction {direction_id})"
     )
-    return True
+    return new_task.id
 
 
 async def _spawn_residual_fingerprint_remediation(project: Project, session: AsyncSession) -> int:

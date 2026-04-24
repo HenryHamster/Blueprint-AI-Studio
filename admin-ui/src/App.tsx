@@ -429,6 +429,8 @@ export default function App() {
         userRole={s.userRole}
         notificationConfig={s.notificationConfig}
         onUpdateNotificationConfig={s.updateNotificationConfig}
+        dailyCostCeilingUsd={s.dailyCostCeilingUsd}
+        onUpdateDailyCostCeiling={s.updateDailyCostCeiling}
         selectedProjectId={s.selectedProjectId}
         selectedProjectOwner={selectedProject?.github_owner ?? null}
         selectedProjectRepo={selectedProject?.github_repo ?? null}

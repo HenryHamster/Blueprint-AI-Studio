@@ -143,6 +143,8 @@ export interface HeaderBarProps {
   userRole: 'admin' | 'user' | null;
   notificationConfig: import('./SettingsNotificationsSection').NotificationConfig;
   onUpdateNotificationConfig: (config: Partial<import('./SettingsNotificationsSection').NotificationConfig>) => void;
+  dailyCostCeilingUsd: number;
+  onUpdateDailyCostCeiling: (value: number) => void;
   // Build config (project-scoped)
   selectedProjectId: string | null;
   selectedProjectOwner: string | null;
@@ -495,6 +497,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onToggleUserManagement={props.onToggleUserManagement}
           notificationConfig={props.notificationConfig}
           onUpdateNotificationConfig={props.onUpdateNotificationConfig}
+          dailyCostCeilingUsd={props.dailyCostCeilingUsd}
+          onUpdateDailyCostCeiling={props.onUpdateDailyCostCeiling}
           selectedProjectId={props.selectedProjectId}
           selectedProjectOwner={props.selectedProjectOwner}
           selectedProjectRepo={props.selectedProjectRepo}

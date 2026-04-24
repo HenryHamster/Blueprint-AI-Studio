@@ -2097,3 +2097,106 @@ async def test_update_branch_with_sha_retry_retry_also_fails(mocker):
 
     assert result == {"updated": False, "message": "retry failure"}
     assert update_branch_mock.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# build_merge_summary_body + post_merge_summary_comment
+# ---------------------------------------------------------------------------
+
+@pytest.mark.smoketest
+def test_build_merge_summary_body_all_fields():
+    """All fields produce a collapsible block with headline and detail lines."""
+    from app.github import build_merge_summary_body
+
+    body = build_merge_summary_body(
+        task_type="create",
+        scope="small",
+        iteration_count=3,
+        provider="anthropic",
+        model="claude-opus-4-7",
+        cost_usd=0.42,
+        direction_title="Fix auth timeout",
+        direction_id="abc12345",
+    )
+
+    assert "<details>" in body
+    assert "create" in body
+    assert "small" in body
+    assert "3 review cycles" in body
+    assert "~$0.42" in body
+    assert "anthropic / claude-opus-4-7" in body
+    assert "Fix auth timeout" in body
+    assert "abc12345" in body
+
+
+@pytest.mark.smoketest
+def test_build_merge_summary_body_no_detail_lines_is_one_liner():
+    """Without provider/model and without direction, body is a simple inline string."""
+    from app.github import build_merge_summary_body
+
+    body = build_merge_summary_body(task_type="fix", scope="medium", iteration_count=2, cost_usd=0.10)
+
+    assert "<details>" not in body
+    assert "🤖 Blueprint:" in body
+    assert "fix" in body
+    assert "medium" in body
+    assert "2 review cycles" in body
+    assert "~$0.10" in body
+
+
+@pytest.mark.smoketest
+def test_build_merge_summary_body_single_iteration_hidden():
+    """iteration_count=1 is not shown (only meaningful for >1 cycles)."""
+    from app.github import build_merge_summary_body
+
+    body = build_merge_summary_body(task_type="create", iteration_count=1)
+    assert "review cycle" not in body
+
+
+@pytest.mark.smoketest
+def test_build_merge_summary_body_empty_inputs():
+    """Empty inputs fall back to 'merge complete' headline, no crash."""
+    from app.github import build_merge_summary_body
+
+    body = build_merge_summary_body()
+    assert "merge complete" in body
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_post_merge_summary_comment_returns_true_on_success(mocker):
+    """Happy path: posts comment and returns True."""
+    from app.github import post_merge_summary_comment
+
+    mock_comment = mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock, return_value={})
+
+    result = await post_merge_summary_comment(
+        "token", "owner", "repo", 42,
+        task_type="create", scope="small", iteration_count=2,
+        provider="anthropic", model="claude-opus-4-7", cost_usd=0.35,
+        direction_title="Improve reliability",
+    )
+
+    assert result is True
+    mock_comment.assert_awaited_once()
+    body_arg = mock_comment.call_args[0][4]
+    assert "create" in body_arg
+    assert "Improve reliability" in body_arg
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_post_merge_summary_comment_returns_false_on_error(mocker):
+    """If create_pr_comment raises, returns False instead of propagating."""
+    from fastapi import HTTPException
+    from app.github import post_merge_summary_comment
+
+    mocker.patch(
+        "app.github.create_pr_comment",
+        new_callable=AsyncMock,
+        side_effect=HTTPException(status_code=500, detail="GitHub down"),
+    )
+
+    result = await post_merge_summary_comment("token", "owner", "repo", 42)
+
+    assert result is False

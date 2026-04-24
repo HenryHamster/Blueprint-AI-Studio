@@ -6291,7 +6291,7 @@ async def test_review_convergence_investigation_spawns_on_cap_exhausted(db_sessi
         pr_number=4321, iterations=10,
         detail="global", trigger="review_cap_exhausted",
     )
-    assert spawned is True
+    assert spawned is not None
     await db_session.commit()
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
@@ -6314,7 +6314,7 @@ async def test_review_convergence_investigation_spawns_on_cap_exhausted(db_sessi
         orig, db_session,
         pr_number=4321, iterations=10,
         detail="global", trigger="review_cap_exhausted",
-    ) is False
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -6344,7 +6344,7 @@ async def test_review_convergence_investigation_skips_without_direction(db_sessi
     assert await _spawn_review_convergence_investigation(
         orig, db_session,
         pr_number=1, iterations=5, detail="x", trigger="review_stuck_cycle",
-    ) is False
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -6375,7 +6375,7 @@ async def test_review_convergence_investigation_skips_investigate_type(db_sessio
     assert await _spawn_review_convergence_investigation(
         orig, db_session,
         pr_number=1, iterations=5, detail="x", trigger="review_cap_exhausted",
-    ) is False
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -6413,7 +6413,7 @@ async def test_review_convergence_investigation_sets_fingerprint_and_failure_cla
         pr_number=9001, iterations=10,
         detail="global", trigger="review_cap_exhausted",
     )
-    assert spawned is True
+    assert spawned is not None
     await db_session.commit()
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
@@ -6479,7 +6479,7 @@ async def test_review_convergence_investigation_skipped_by_cross_direction_finge
         pr_number=9100, iterations=10,
         detail="global", trigger="review_cap_exhausted",
     )
-    assert spawned is False
+    assert spawned is None
     await db_session.commit()
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))

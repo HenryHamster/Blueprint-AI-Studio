@@ -1297,6 +1297,12 @@ Return nothing — just write the files.`;
         : bpDirTitle || `\`${bpDirId}\``;
       bpBadgeParts.push(`direction: ${dirLabel}`);
     }
+    const bpProvider = process.env.PROVIDER;
+    const bpModel = process.env.LLM_MODEL;
+    if (bpProvider || bpModel) {
+      const modelStr = bpModel ? ` (${bpModel})` : '';
+      bpBadgeParts.push(`provider: ${bpProvider || 'unknown'}${modelStr}`);
+    }
     const bpBadge = bpBadgeParts.length > 0 ? `\n\n${bpBadgeParts.join(' · ')}` : '';
     prBody += `---\n*Automated by Blueprint Agent*${bpBadge}`;
 

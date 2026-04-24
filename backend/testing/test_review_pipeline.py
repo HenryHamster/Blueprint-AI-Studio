@@ -40,6 +40,7 @@ from app.review_pipeline import (
     _is_test_file,
     _max_review_iterations,
     _spawn_pipeline_task,
+    post_merge_summary_comment,
     should_auto_approve_diff,
 )
 from testing.factories import make_project, make_task
@@ -4034,3 +4035,102 @@ async def test_direction_title_not_set_when_no_direction_text(db_session, mocker
     assert "direction_title" not in (result.context or {}), (
         "direction_title must not be set when direction has no text"
     )
+
+
+# ── post_merge_summary_comment ────────────────────────────────────────────────
+
+
+class TestPostMergeSummaryComment:
+    """Unit tests for post_merge_summary_comment — no DB required."""
+
+    def _make_orig(self, *, created_by="ORCHESTRATOR", task_type="create",
+                   scope="small", provider=None, model=None,
+                   direction_id=None, direction_title=None) -> Task:
+        ctx: dict = {}
+        if scope:
+            ctx["scope"] = scope
+        if provider:
+            ctx["llm_provider"] = provider
+        if model:
+            ctx["llm_model"] = model
+        if direction_id:
+            ctx["direction_id"] = direction_id
+        if direction_title:
+            ctx["direction_title"] = direction_title
+        return make_task(
+            created_by=created_by,
+            payloads=[{"type": task_type}],
+            context=ctx,
+        )
+
+    def _make_ci(self, *, iteration=0) -> Task:
+        return make_task(
+            context={"review_loop": {"iteration": iteration, "pr_number": 42}},
+        )
+
+    @pytest.mark.asyncio
+    async def test_skips_user_created_task(self, mocker):
+        mock_comment = mocker.patch(
+            "app.github.create_pr_comment", new_callable=AsyncMock
+        )
+        orig = self._make_orig(created_by="USER")
+        ci = self._make_ci(iteration=1)
+        await post_merge_summary_comment(orig, ci, "tok", "owner", "repo", 42)
+        mock_comment.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_basic_summary_posted(self, mocker):
+        posted: list[str] = []
+
+        async def _fake_comment(tok, owner, repo, pr, body):
+            posted.append(body)
+
+        mocker.patch("app.github.create_pr_comment", side_effect=_fake_comment)
+        mocker.patch(
+            "app.task_completion._estimated_task_cost_usd", return_value=0.05
+        )
+
+        orig = self._make_orig(
+            scope="small", provider="anthropic", model="claude-sonnet-4-5",
+            direction_id="dir-abc", direction_title="Add webhook enrichment",
+        )
+        ci = self._make_ci(iteration=2)
+        await post_merge_summary_comment(orig, ci, "tok", "owner", "repo", 42)
+
+        assert len(posted) == 1
+        body = posted[0]
+        assert "Blueprint" in body
+        assert "`create`" in body
+        assert "`small` scope" in body
+        assert "2 review cycles" in body
+        assert "~$0.05" in body
+        assert "anthropic/claude-sonnet-4-5" in body
+        assert "Add webhook enrichment" in body
+
+    @pytest.mark.asyncio
+    async def test_zero_iterations_omitted(self, mocker):
+        posted: list[str] = []
+
+        async def _fake_comment(tok, owner, repo, pr, body):
+            posted.append(body)
+
+        mocker.patch("app.github.create_pr_comment", side_effect=_fake_comment)
+        mocker.patch("app.task_completion._estimated_task_cost_usd", return_value=None)
+
+        orig = self._make_orig()
+        ci = self._make_ci(iteration=0)
+        await post_merge_summary_comment(orig, ci, "tok", "owner", "repo", 42)
+
+        assert len(posted) == 1
+        assert "cycle" not in posted[0]
+
+    @pytest.mark.asyncio
+    async def test_comment_error_is_swallowed(self, mocker):
+        mocker.patch(
+            "app.github.create_pr_comment", side_effect=RuntimeError("network")
+        )
+        mocker.patch("app.task_completion._estimated_task_cost_usd", return_value=None)
+        orig = self._make_orig()
+        ci = self._make_ci(iteration=1)
+        # Should not raise
+        await post_merge_summary_comment(orig, ci, "tok", "owner", "repo", 42)

@@ -95,6 +95,52 @@ def _review_approved(review_loop: dict) -> bool:
     return review_loop.get("verdict") == "APPROVE"
 
 
+async def _post_merge_summary(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    task: Task,
+    review_loop: dict,
+) -> None:
+    """Post a one-time structured merge summary on a Blueprint-generated PR. Best-effort."""
+    from app.github import create_pr_comment  # noqa: PLC0415
+
+    ctx = task.context or {}
+    payload = task.first_payload or {}
+
+    task_type = payload.get("type") or "create"
+    scope = ctx.get("scope") or payload.get("scope")
+    iteration = review_loop.get("iteration", 0)
+    direction_title = ctx.get("direction_title")
+    direction_id = ctx.get("direction_id")
+    provider = ctx.get("llm_provider")
+    model = ctx.get("llm_model")
+
+    cost_usd = None
+    _prov_at = getattr(task, "vm_provisioned_at", None)
+    _stop_at = getattr(task, "vm_stopped_at", None)
+    if _prov_at and _stop_at:
+        _rate = (0.020 if getattr(task, "vm_spot", False) else 0.067) / 3600
+        cost_usd = (_stop_at - _prov_at).total_seconds() * _rate
+
+    type_scope = f"{task_type} / {scope}" if scope else task_type
+    lines = [f"**Blueprint merge summary** — {type_scope}", ""]
+    lines.append(f"- **Review-fix iterations**: {iteration}")
+    agent_parts = [p for p in [provider, model] if p]
+    if agent_parts:
+        lines.append(f"- **Agent**: {' / '.join(agent_parts)}")
+    if cost_usd is not None:
+        lines.append(f"- **Estimated cost**: ~${cost_usd:.2f}")
+    if direction_title or direction_id:
+        lines.append(f"- **Direction**: {(direction_title or str(direction_id))[:80]}")
+
+    try:
+        await create_pr_comment(gh_token, owner, repo, pr_number, "\n".join(lines))
+    except Exception as exc:
+        logger.warning(f"[CI] Failed to post merge summary on PR #{pr_number}: {exc}")
+
+
 async def _attempt_merge_with_retry_and_escalation(
     task: Task,
     gh_token: str,
@@ -132,6 +178,7 @@ async def _attempt_merge_with_retry_and_escalation(
     if merge_result.get("merged"):
         await create_pr_comment(gh_token, owner, repo, ci_pr_number,
             "**Blueprint CI + Review**: All checks passed, PR auto-merged.")
+        await _post_merge_summary(gh_token, owner, repo, ci_pr_number, task, ci_loop)
         task.status = TaskStatus.COMPLETED
         task.latest_status_message = f"CI passed + review approved, PR #{ci_pr_number} merged ({source})"
         if ci_orig_id:

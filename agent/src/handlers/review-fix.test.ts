@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', () => ({
@@ -1115,9 +1115,40 @@ describe('buildBlueprintPrFooter', () => {
     expect(result).toMatch(/2 iterations · direction: PR clarity \(d-abc\)/);
     expect(result).toContain('<!-- blueprint:meta -->');
   });
+
+  it('includes provider when set', () => {
+    const result = buildBlueprintPrFooter({ provider: 'anthropic' });
+    expect(result).toContain('provider: anthropic');
+    expect(result).toContain('<!-- blueprint:meta -->');
+  });
+
+  it('includes provider and model when both set', () => {
+    const result = buildBlueprintPrFooter({ provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' });
+    expect(result).toContain('provider: anthropic (claude-3-5-sonnet-20241022)');
+  });
+
+  it('shows unknown provider when only model is set', () => {
+    const result = buildBlueprintPrFooter({ model: 'claude-3-5-sonnet-20241022' });
+    expect(result).toContain('provider: unknown (claude-3-5-sonnet-20241022)');
+  });
 });
 
 describe('handleFix — PR body annotation after push', () => {
+  let _savedProvider: string | undefined;
+  let _savedLLMModel: string | undefined;
+  beforeEach(() => {
+    _savedProvider = process.env.PROVIDER;
+    _savedLLMModel = process.env.LLM_MODEL;
+    delete process.env.PROVIDER;
+    delete process.env.LLM_MODEL;
+  });
+  afterEach(() => {
+    if (_savedProvider === undefined) delete process.env.PROVIDER;
+    else process.env.PROVIDER = _savedProvider;
+    if (_savedLLMModel === undefined) delete process.env.LLM_MODEL;
+    else process.env.LLM_MODEL = _savedLLMModel;
+  });
+
   it('calls GitHub PATCH to annotate PR body when push succeeds and direction_id is set', async () => {
     // Make git rev-parse return different local/remote heads so push path runs.
     vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {

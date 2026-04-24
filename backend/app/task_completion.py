@@ -22,6 +22,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.github import create_branch, create_pr_comment, get_branch_sha, get_open_pull_requests
+from app.github import BLUEPRINT_PR_MERGE_SUMMARY_MARKER, build_blueprint_pr_merge_summary_comment  # noqa: F401
 from app.models import (
     DIAGNOSIS_IN_PROGRESS_KEY,
     DIAGNOSIS_STARTED_AT_KEY,
@@ -86,6 +87,11 @@ def build_blueprint_pr_footer(
     """
     ctx = task.context or {}
     parts: list[str] = []
+    review_loop = ctx.get("review_loop") or {}
+    if iteration_count is None and isinstance(review_loop.get("iteration"), int):
+        iteration_count = int(review_loop["iteration"])
+    if not direction_title and isinstance(ctx.get("direction_title"), str):
+        direction_title = ctx.get("direction_title")
 
     cost = _estimated_task_cost_usd(task)
     if cost is not None:

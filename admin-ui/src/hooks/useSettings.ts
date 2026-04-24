@@ -53,6 +53,7 @@ export function useSettings(addToast: AddToast) {
   const [providerSettingsDefaults, setProviderSettingsDefaults] = useState<ProviderSettingsDefaults>({});
   const [taskTypeProviderOverrides, setTaskTypeProviderOverrides] = useState<TaskTypeProviderOverrides>({});
   const [buildConfig, setBuildConfig] = useState<BuildConfig | null>(null);
+  const [dailyCostCeilingUsd, setDailyCostCeilingUsd] = useState<number>(0);
 
   // ── Handlers ────────────────────────────────────────────────────────────
 
@@ -93,6 +94,7 @@ export function useSettings(addToast: AddToast) {
         setAutoArchiveTerminalAfterDays(data.auto_archive_terminal_after_days ?? 7);
         setAutoArchiveMaxTerminalTasksPerProject(data.auto_archive_max_terminal_tasks_per_project ?? 200);
         setAutoArchiveIntervalMinutes(data.auto_archive_interval_minutes ?? 60);
+        setDailyCostCeilingUsd(data.daily_cost_ceiling_usd ?? 0);
         if (data.notification_config) {
           setNotificationConfig({
             webhook_url: data.notification_config.webhook_url ?? '',
@@ -603,6 +605,21 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
+  const updateDailyCostCeiling = async (value: number) => {
+    const prev = dailyCostCeilingUsd;
+    setDailyCostCeilingUsd(value);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH', headers: await authHeaders(),
+        body: JSON.stringify({ daily_cost_ceiling_usd: value }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setDailyCostCeilingUsd(prev);
+      addToast('Failed to update daily cost ceiling', 'error');
+    }
+  };
+
   const updateNotificationConfig = async (config: Partial<NotificationConfig>) => {
     const prev = notificationConfig;
     const next = { ...notificationConfig, ...config };
@@ -634,7 +651,7 @@ export function useSettings(addToast: AddToast) {
     requireApprovalGates,
     autoArchiveEnabled, autoArchiveTerminalAfterDays,
     autoArchiveMaxTerminalTasksPerProject, autoArchiveIntervalMinutes,
-    notificationConfig,
+    notificationConfig, dailyCostCeilingUsd,
     providerTierModelMap, taskTypeModelPreferences,
     taskTypeCategories, categoryRouting, taskTypeRouting,
     providerSettingsByEffort,
@@ -662,7 +679,7 @@ export function useSettings(addToast: AddToast) {
     updateHealthCheckUrls, updateRequireApprovalGates,
     updateAutoArchiveEnabled, updateAutoArchiveTerminalAfterDays,
     updateAutoArchiveMaxTerminalTasksPerProject, updateAutoArchiveIntervalMinutes,
-    updateNotificationConfig,
+    updateNotificationConfig, updateDailyCostCeiling,
     updateBuildConfig,
   };
 }

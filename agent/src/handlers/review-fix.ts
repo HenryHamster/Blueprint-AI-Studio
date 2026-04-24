@@ -262,6 +262,8 @@ export function buildBlueprintPrFooter(opts: {
   iterations?: number;
   directionId?: string;
   directionTitle?: string;
+  provider?: string;
+  model?: string;
 }): string {
   const parts: string[] = [];
   if (opts.iterations && opts.iterations > 1) parts.push(`${opts.iterations} iterations`);
@@ -270,6 +272,10 @@ export function buildBlueprintPrFooter(opts: {
       ? `${opts.directionTitle.slice(0, 60)} (${opts.directionId})`
       : opts.directionId;
     parts.push(`direction: ${title}`);
+  }
+  if (opts.provider || opts.model) {
+    const modelStr = opts.model ? ` (${opts.model})` : '';
+    parts.push(`provider: ${opts.provider || 'unknown'}${modelStr}`);
   }
   if (parts.length === 0) return '';
   return `<!-- blueprint:meta -->\n*${parts.join(' · ')}*`;
@@ -1195,6 +1201,8 @@ export async function handleFix(
         iterations: iteration,
         directionId: fixCtxForMeta.direction_id as string | undefined,
         directionTitle: fixCtxForMeta.direction_title as string | undefined,
+        provider: process.env.PROVIDER,
+        model: process.env.LLM_MODEL,
       });
       if (prFooter) patchPrBodyMeta(ghToken, owner, repo, prNumber, prFooter).catch(() => { /* best-effort */ });
 

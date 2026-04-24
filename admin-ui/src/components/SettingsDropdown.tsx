@@ -126,6 +126,8 @@ interface SettingsDropdownProps {
   // Notification config
   notificationConfig: NotificationConfig;
   onUpdateNotificationConfig: (config: Partial<NotificationConfig>) => void;
+  dailyCostCeilingUsd: number;
+  onUpdateDailyCostCeiling: (value: number) => void;
   // Optional class name for the trigger button (e.g. to hide it on mobile)
   triggerClassName?: string;
   userRole?: 'admin' | 'user' | null;
@@ -357,6 +359,8 @@ export function SettingsDropdown({
   zoneHealth,
   notificationConfig,
   onUpdateNotificationConfig,
+  dailyCostCeilingUsd,
+  onUpdateDailyCostCeiling,
   triggerClassName,
   userRole,
   userEmail,
@@ -1351,6 +1355,8 @@ export function SettingsDropdown({
         onUpdateEnabledEvents={events => onUpdateNotificationConfig({ enabled_events: events })}
         throttleSeconds={notificationConfig.throttle_seconds}
         onUpdateThrottleSeconds={secs => onUpdateNotificationConfig({ throttle_seconds: secs })}
+        dailyCostCeilingUsd={dailyCostCeilingUsd}
+        onUpdateDailyCostCeiling={onUpdateDailyCostCeiling}
         isAdmin={isAdmin}
       />
     );
