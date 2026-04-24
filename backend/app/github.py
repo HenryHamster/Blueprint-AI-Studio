@@ -1280,6 +1280,18 @@ async def create_pull_request(
                 # so the caller can mark the task as completed instead of failed.
                 logger.info(f"[PR] No commits between {head} and {base} — empty diff")
                 return {"empty_diff": True, "merged": True, "html_url": "", "number": 0}
+        # Unmatched 422 (e.g. "head ref missing", validation errors). Surface the
+        # real GitHub message with 422 so the caller can distinguish upstream
+        # validation failures from internal server errors. Detail starts with
+        # "Failed to create pull request" so the EXTERNAL_API classifier still
+        # routes it correctly.
+        gh_msg = data.get("message", "Validation failed")
+        err_msgs = "; ".join(str(e.get("message", "")) for e in errors if e.get("message"))
+        detail = f"Failed to create pull request (GitHub 422): {gh_msg}"
+        if err_msgs:
+            detail += f" — {err_msgs}"
+        logger.warning(f"Failed to create pull request (422 unmatched): {response.text[:500]}")
+        raise HTTPException(status_code=422, detail=detail[:500])
 
     if response.status_code == 401:
         logger.error(f"Failed to create pull request (401 Unauthorized): {response.text}")
@@ -1289,8 +1301,8 @@ async def create_pull_request(
         )
     logger.error(f"Failed to create pull request ({response.status_code}): {response.text}")
     raise HTTPException(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail=f"Failed to create pull request: {response.text[:500]}"
+        status_code=status.HTTP_502_BAD_GATEWAY if response.status_code >= 500 else status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=f"Failed to create pull request (GitHub {response.status_code}): {response.text[:500]}"
     )
 
 
