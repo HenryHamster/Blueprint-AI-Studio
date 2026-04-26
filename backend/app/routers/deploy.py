@@ -42,9 +42,10 @@ async def pause_pipeline(
 
     state = await session.get(DeploymentState, 1)
     if state:
+        from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle at module load
         state.status = DeploymentStatus.PAUSED
         state.pause_reason = "Manual pause via admin"
-        state.paused_at = _utcnow()
+        pause_clock.mark_paused(state, pause_clock.PAUSED_KIND_MANUAL)
         state.pre_pause_max_vms = runtime_config["max_concurrent_vms"]
         state.runtime_max_concurrent_vms = runtime_config["max_concurrent_vms"]
         session.add(state)
@@ -76,10 +77,11 @@ async def resume_pipeline(
     if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.ROLLED_BACK):
         raise HTTPException(status_code=400, detail=f"Pipeline is {state.status}, not paused — nothing to resume")
 
+    from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle at module load
     restore_vms = state.pre_pause_max_vms or state.runtime_max_concurrent_vms or 5
     state.status = DeploymentStatus.STABLE
     state.pause_reason = None
-    state.paused_at = None
+    pause_clock.accumulate_pause_window(state)
     state.pre_pause_max_vms = None
     session.add(state)
     await session.commit()
@@ -138,11 +140,12 @@ async def reset_deploy_health(
     deploy_monitoring["task_results"] = deque(maxlen=100)
 
     # Restore VM count and clear pause fields
+    from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle at module load
     runtime_config["max_concurrent_vms"] = restore_vms
     state.runtime_max_concurrent_vms = restore_vms
     state.status = DeploymentStatus.STABLE
     state.pause_reason = None
-    state.paused_at = None
+    pause_clock.accumulate_pause_window(state)
     state.pre_pause_max_vms = None
     session.add(state)
     await session.commit()

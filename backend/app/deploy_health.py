@@ -752,9 +752,10 @@ async def _check_pause_mode():
                         state.runtime_max_concurrent_vms or 0,
                         anomaly_pre,
                     )
+                    from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle at module load
                     state.status = DeploymentStatus.PAUSED
                     state.pause_reason = f"External dependency down: {', '.join(critical_failures)}"
-                    state.paused_at = _utcnow()
+                    pause_clock.mark_paused(state, pause_clock.PAUSED_KIND_AUTO)
                     state.pre_pause_max_vms = original_capacity
                     state.runtime_max_concurrent_vms = original_capacity
                     session.add(state)
@@ -852,9 +853,10 @@ async def _check_pause_mode():
         else:
             initial_vms = min(2, restore)
 
+        from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle at module load
         state.status = DeploymentStatus.MONITORING if _shared_state.deploy_monitoring["window_start"] else DeploymentStatus.STABLE
         state.pause_reason = None
-        state.paused_at = None
+        pause_clock.accumulate_pause_window(state)
         state.pre_pause_max_vms = None
         # Always persist the ORIGINAL target as the ramp-up target, even on forced
         # resume. Previously forced resume stored initial_vms (=1), which caused
