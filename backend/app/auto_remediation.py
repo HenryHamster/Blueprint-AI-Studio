@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import func as _func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -186,17 +187,17 @@ async def _handle_main_branch_ci_failure_inner(
             return
 
     # ── Guard: rate limit ──
+    # Audit W1 (B4/B14): auto_remediation is now an indexed column, so this
+    # query can push the filter into SQL instead of scanning all recent tasks
+    # and filtering in Python.
     one_hour_ago = now - timedelta(hours=1)
-    recent_tasks = (await session.execute(
-        select(Task).where(
+    recent_auto_count = (await session.execute(
+        select(_func.count()).select_from(Task).where(
             Task.project_id == project_id,
             Task.created_at >= one_hour_ago,
+            Task.auto_remediation.is_(True),
         )
-    )).scalars().all()
-    recent_auto_count = sum(
-        1 for t in recent_tasks
-        if (t.context or {}).get("auto_remediation") is True
-    )
+    )).scalar() or 0
     if recent_auto_count >= max_per_hour:
         logger.info(
             "[AUTO-REMEDIATION] Rate limit hit (%d/%d in last hour) for project %s",
@@ -215,11 +216,12 @@ async def _handle_main_branch_ci_failure_inner(
         select(Task).where(
             Task.project_id == project_id,
             Task.status.in_(active_statuses),
+            Task.auto_remediation.is_(True),
         )
     )).scalars().all()
     for t in active_tasks:
         ctx = t.context or {}
-        if ctx.get("auto_remediation") is True and ctx.get("ci_failure_branch") == head_branch:
+        if ctx.get("ci_failure_branch") == head_branch:
             logger.info(
                 "[AUTO-REMEDIATION] Duplicate: active task %s already covers branch %s",
                 t.id, head_branch,
@@ -227,10 +229,9 @@ async def _handle_main_branch_ci_failure_inner(
             return
 
     # ── Guard: concurrent limit ──
-    active_auto_count = sum(
-        1 for t in active_tasks
-        if (t.context or {}).get("auto_remediation") is True
-    )
+    # Audit W1 (B4/B14): active_tasks is now already filtered to
+    # auto_remediation=True, so the count is a direct len().
+    active_auto_count = len(active_tasks)
     if active_auto_count >= max_concurrent:
         logger.info(
             "[AUTO-REMEDIATION] Concurrent limit hit (%d/%d) for project %s",
@@ -307,18 +308,24 @@ async def _handle_main_branch_ci_failure_inner(
     if fingerprint:
         max_per_fingerprint = config.get("max_per_fingerprint", 3)
         fp_window_start = now - timedelta(hours=24)
-        fp_recent = (await session.execute(
-            select(Task).where(
+        # Audit W1 (B6/B14): previous_error_fingerprint is now an indexed
+        # column. Include QUEUED/IN_PROGRESS active spawns alongside terminal
+        # FAILED/CANCELLED so concurrent in-flight remediations count toward
+        # the cap (fixes the parallel-spawn-overshoot race).
+        cap_states = [
+            TaskStatus.FAILED, TaskStatus.CANCELLED,
+            TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+        ]
+        fp_failed_count = (await session.execute(
+            select(_func.count()).select_from(Task).where(
                 Task.project_id == project_id,
                 Task.created_at >= fp_window_start,
-                Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+                Task.status.in_(cap_states),
+                Task.auto_remediation.is_(True),
+                Task.previous_error_fingerprint == fingerprint,
             )
-        )).scalars().all()
-        fp_failed_count = sum(
-            1 for t in fp_recent
-            if (t.context or {}).get("auto_remediation") is True
-            and (t.context or {}).get("_previous_error_fingerprint") == fingerprint
-        )
+        )).scalar() or 0
         if fp_failed_count >= max_per_fingerprint:
             logger.warning(
                 "[AUTO-REMEDIATION] Per-fingerprint cap hit (%d/%d) for branch %s "
@@ -425,6 +432,11 @@ async def _handle_main_branch_ci_failure_inner(
             task_context["direction_id"] = matched_direction_id
             task_context["diagnosis_fingerprint"] = fingerprint
 
+    # Audit W1 (B4/B14): set the auto_remediation column + previous_error_fingerprint
+    # column directly so the cap queries above see this spawn immediately.
+    # Strip the now-redundant context keys (no dual-source).
+    task_context.pop("auto_remediation", None)
+    task_context.pop("_previous_error_fingerprint", None)
     task = Task(
         project_id=project_id,
         title=f"Auto-fix: CI failure on {head_branch}",
@@ -438,6 +450,8 @@ async def _handle_main_branch_ci_failure_inner(
         context=task_context,
         status=TaskStatus.QUEUED,
         created_by="SYSTEM_AUTO_REMEDIATION",
+        auto_remediation=True,
+        previous_error_fingerprint=fingerprint,
     )
     session.add(task)
     await session.flush()  # assign task.id
@@ -633,20 +647,19 @@ async def _find_recent_merged_remediation(
     if not fingerprint:
         return None
     cutoff = _utcnow() - timedelta(hours=window_hours)
+    # Audit W1: filter on the indexed columns instead of scanning JSONB.
     rows = (await session.execute(
         select(Task).where(
             Task.project_id == project_id,
             Task.status == TaskStatus.COMPLETED,
             Task.created_at >= cutoff,
+            Task.auto_remediation.is_(True),
+            Task.previous_error_fingerprint == fingerprint,
         ).order_by(Task.created_at.desc())
     )).scalars().all()
     for t in rows:
         ctx = t.context or {}
-        if ctx.get("auto_remediation") is not True:
-            continue
-        if ctx.get("ci_failure_branch") != branch:
-            continue
-        if ctx.get("_previous_error_fingerprint") == fingerprint:
+        if ctx.get("ci_failure_branch") == branch:
             return t
     return None
 

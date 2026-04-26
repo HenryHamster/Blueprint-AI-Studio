@@ -101,16 +101,24 @@ async def _make_task(
     latest_status_message: str | None = None,
     vm_instance_id: str | None = None,
 ) -> Task:
+    # Audit W1: extract promoted columns from context for legacy fixtures.
+    ctx = dict(context or {})
+    extra: dict = {}
+    if "_previous_error_fingerprint" in ctx:
+        extra["previous_error_fingerprint"] = ctx.pop("_previous_error_fingerprint")
+    if "auto_remediation" in ctx:
+        extra["auto_remediation"] = bool(ctx.pop("auto_remediation"))
     task = Task(
         project_id=project_id,
         payloads=[{"type": task_type, "prompt": f"do {task_type}"}],
         status=status,
         created_by="ORCHESTRATOR",
         parent_task_id=parent_task_id,
-        context=context or {},
+        context=ctx,
         depends_on=depends_on or [],
         latest_status_message=latest_status_message,
         vm_instance_id=vm_instance_id,
+        **extra,
     )
     session.add(task)
     await session.commit()

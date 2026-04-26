@@ -418,6 +418,10 @@ class TestGeminiFallbackModel:
         # nothing to fall back from.
         assert provider.fallback_model("gemini-2.5-pro") is None
 
+    def test_legacy_preview_alias_falls_back_through_live_preview(self):
+        provider = get_provider(LLMProviderName.GEMINI)
+        assert provider.fallback_model("gemini-3-pro-preview") == "gemini-2.5-pro"
+
 
 # ---------------------------------------------------------------------------
 # Gemini thinking-config bifurcation — 2.5 uses thinkingBudget (int),

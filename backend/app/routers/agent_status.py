@@ -67,17 +67,23 @@ def record_task_result(
     task_id: str = "",
     task_type: str = "",
     task_context: dict | None = None,
+    auto_remediation: bool = False,
 ):
     """Record a task result for deployment monitoring. Deduplicates by task_id.
 
-    When `task_context` carries `auto_remediation: True`, the recorded
-    task_type is overridden to `auto_remediation` so these tasks don't
-    pollute the per-type failure-rate gate on their underlying type
+    When ``auto_remediation`` is True (or task_context legacy fallback says so),
+    the recorded task_type is overridden to ``auto_remediation`` so these tasks
+    don't pollute the per-type failure-rate gate on their underlying type
     (typically `create`). Auto-remediation tasks have a fundamentally
     different risk profile — they're spawned to fix known-broken code on
     main, so their failure rate is expected to run higher than fresh
     feature work. Bundling them into the generic `create` bucket
     cascades those failures into a gate that blocks normal create tasks.
+
+    Audit W1: ``auto_remediation`` is now a Task column; callers should
+    pass ``auto_remediation=task.auto_remediation`` directly. The
+    ``task_context`` fallback is retained for callsites that haven't yet
+    been threaded through with a Task object in scope.
     """
     from app.shared_state import deploy_monitoring
     # Deduplicate: only record one result per task
@@ -90,7 +96,7 @@ def record_task_result(
             _recorded_task_ids.clear()
 
     # Override the bucket when the task was auto-spawned remediation.
-    if task_context and task_context.get("auto_remediation"):
+    if auto_remediation or (task_context and task_context.get("auto_remediation")):
         task_type = "auto_remediation"
 
     entry = (_utcnow().isoformat(), "success" if success else "failure", failure_class, task_type)
@@ -392,13 +398,20 @@ def _get_applicable_types(tasks: list) -> list[str]:
 
 
 async def _persist_post_commit_pending(factory, task_id, reason: str, payload_dump):
-    """Write context['_post_commit_pending'] on a fresh session with retry.
+    """Set the post_commit_pending column + retry metadata on a fresh session.
 
     The request's original session is often unusable here — either the
     transaction was poisoned by a LockNotAvailableError or the row is still
     held by the peer that triggered this failure. A new session with
     skip_locked lets the marker land as soon as the peer releases, without
     blocking on Postgres' lock_timeout.
+
+    Audit W1 (A2/A5): the pending flag is now a real column
+    (``Task.post_commit_pending``) so the idempotency guard at
+    ``update_agent_status`` reads a DB-fresh value instead of a stale
+    in-memory copy. The retry metadata (reason / payload / attempts) lives
+    in context['_post_commit_pending_meta'] for diagnostics; nothing reads
+    it for control flow.
     """
     last_exc = None
     for attempt in range(5):
@@ -416,12 +429,13 @@ async def _persist_post_commit_pending(factory, task_id, reason: str, payload_du
                         return
                     await asyncio.sleep(1 + attempt)
                     continue
-                prior = (locked.context or {}).get("_post_commit_pending") or {}
-                locked.context = {**(locked.context or {}), "_post_commit_pending": {
+                locked.post_commit_pending = True
+                prior_meta = (locked.context or {}).get("_post_commit_pending_meta") or {}
+                locked.context = {**(locked.context or {}), "_post_commit_pending_meta": {
                     "at": _utcnow().isoformat(),
                     "reason": reason,
                     "payload": payload_dump,
-                    "attempts": int(prior.get("attempts", 0)) + 1,
+                    "attempts": int(prior_meta.get("attempts", 0)) + 1,
                 }}
                 flag_modified(locked, "context")
                 s.add(locked)
@@ -458,9 +472,9 @@ async def _propagate_pipeline_failure_to_original(task: Task, session: AsyncSess
             await _check_and_trigger_rollup(orig, session)
         logger.error(f"[PIPELINE] Cancelled original task {original_task_id} — {task_type} failed, skipping in rollup")
         # Auto-remediation: review/fix cycle exhaustion means the remediation
-        # attempt failed. The review task itself doesn't carry auto_remediation
-        # in its context, so propagate via the original create task's context.
-        if (orig.context or {}).get("auto_remediation") is True:
+        # attempt failed. The review task itself doesn't carry auto_remediation,
+        # so propagate via the original create task. (Audit W1: column now.)
+        if orig.auto_remediation:
             try:
                 from app.notification_dispatch import post_auto_fix_result_message  # noqa: PLC0415
                 _ar_branch = (orig.context or {}).get("ci_failure_branch", "main")
@@ -539,13 +553,21 @@ async def update_agent_status(
 
     # Idempotency guard: if the task is already in a terminal state, ignore duplicate
     # callbacks (e.g. agent HTTP retries).  Still return 200 so the agent doesn't retry.
-    # Exception: if _post_commit_pending is set, the early-commit succeeded but
+    # Exception: if post_commit_pending is set, the early-commit succeeded but
     # _process_post_commit raised before spawning review/fix tasks. Let the retry
     # re-run post-commit processing so the PR doesn't get orphaned.
+    # Audit W1 (A2/A5): post_commit_pending is now a column. We re-fetch it
+    # via a sub-row SELECT inside this branch so a marker that was just
+    # written by `_persist_post_commit_pending` on a fresh session is visible
+    # even though the in-memory `task` object was loaded earlier in the
+    # request and has stale context.
     if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
-        pending_info = (task.context or {}).get("_post_commit_pending")
-        if pending_info and isinstance(pending_info, dict):
-            logger.info(f"[PIPELINE] Retrying post-commit for terminal task {task.id} (_post_commit_pending set)")
+        pending_row = (await session.execute(
+            select(Task.post_commit_pending).where(Task.id == task.id)
+        )).first()
+        is_pending = bool(pending_row and pending_row[0])
+        if is_pending:
+            logger.info(f"[PIPELINE] Retrying post-commit for terminal task {task.id} (post_commit_pending set)")
             # Release the outer FOR UPDATE SKIP LOCKED row lock before calling
             # _process_post_commit: it opens a separate session and takes its
             # own FOR UPDATE (task_lifecycle.py:559) on the same row. Holding
@@ -557,9 +579,7 @@ async def update_agent_status(
             try:
                 result = await _process_post_commit(task.id, payload, _session_factory=_factory)
                 await session.refresh(task)
-                ctx = dict(task.context or {})
-                ctx.pop("_post_commit_pending", None)
-                task.context = ctx
+                task.post_commit_pending = False
                 session.add(task)
                 await session.commit()
                 return result
@@ -606,8 +626,9 @@ async def update_agent_status(
         task.latest_status_message = payload.logs[-8000:]
     if payload.failure_category:
         from app.failure_classification import normalize_agent_failure_category  # noqa: PLC0415
+        normalized_failure_category = normalize_agent_failure_category(payload.failure_category, task)
         ctx = dict(task.context or {})
-        ctx['failure_category'] = normalize_agent_failure_category(payload.failure_category, task)
+        ctx['failure_category'] = normalized_failure_category
         task.context = ctx
     if payload.scope_gate_triggered:
         ctx = dict(task.context or {})
@@ -830,7 +851,37 @@ async def update_agent_status(
                         )
                         logger.error(f"[SMOKETEST] Spawned plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests")
         except Exception as e:
-            logger.warning(f"[SMOKETEST] Failed to spawn plan task after smoketest failure: {e}", exc_info=True)
+            # Audit W5/A6: smoketest plan-task spawn used to silently log-and-continue.
+            # That hid genuine breakage of the smoketest → fix-spawn → CI loop. Now
+            # we surface the failure: set spawn_failed=True so operators can query,
+            # AND create a persistent alert so the situation can't be missed.
+            logger.error(
+                f"[SMOKETEST] Failed to spawn plan task after smoketest failure for task {task.id}: {e}",
+                exc_info=True,
+            )
+            task.spawn_failed = True
+            try:
+                spawn_alert = Alert(
+                    project_id=task.project_id,
+                    severity=AlertSeverity.ERROR,
+                    title=f"Smoketest fix-plan spawn failed for task {task.id}",
+                    message=(
+                        f"A smoketest reported failures on task {task.id} but the "
+                        f"follow-up plan task could not be spawned: {type(e).__name__}: {e!r}. "
+                        f"Operator must manually create a plan task to address the smoketest failures."
+                    )[:1000],
+                    task_id=task.id,
+                )
+                session.add(spawn_alert)
+                await broadcast_to_project(
+                    str(task.project_id), "alert_created",
+                    {"alert_id": str(spawn_alert.id), "severity": spawn_alert.severity, "title": spawn_alert.title},
+                )
+            except Exception as alert_err:
+                logger.error(
+                    f"[SMOKETEST] Failed to create spawn-failed alert for task {task.id}: {alert_err}",
+                    exc_info=True,
+                )
 
     # 3c. Parse debug result, store in plan_output, and optionally spawn a fix task
     if payload.artifact_type == ArtifactType.DEBUG_RESULT and payload.logs:
@@ -888,7 +939,7 @@ async def update_agent_status(
             _direction_id = str((task.context or {}).get("direction_id") or "")
             _project_id = str(task.project_id) if task.project_id else ""
             if payload.status == TaskStatus.COMPLETED:
-                record_task_result(success=True, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}))
+                record_task_result(success=True, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}), auto_remediation=task.auto_remediation)
                 _shared_state.tasks_completed_total += 1
                 if _direction_id:
                     _shared_state.record_direction_result(
@@ -911,9 +962,12 @@ async def update_agent_status(
                         logger.warning(f"[STATUS] record_completion_event failed for {acct_id_clear}: {e}", exc_info=True)
             else:
                 failure_class = classify_failure(task, payload.logs)
-                from app.failure_classification import persist_failure_category  # noqa: PLC0415
+                from app.failure_classification import (  # noqa: PLC0415
+                    EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
+                    persist_failure_category,
+                )
                 persist_failure_category(task, failure_class)
-                record_task_result(success=False, failure_class=failure_class, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}))
+                record_task_result(success=False, failure_class=failure_class, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}), auto_remediation=task.auto_remediation)
                 _shared_state.tasks_failed_total += 1
                 if _direction_id:
                     _shared_state.record_direction_result(
@@ -955,15 +1009,78 @@ async def update_agent_status(
                         ctx["blacklisted_accounts"] = blacklisted
                     should_requeue = True
                     if failure_class == "EXTERNAL_API":
+                        external_api_subtype = ctx.get("external_api_subtype")
+                        if external_api_subtype == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG:
+                            provider_name = get_task_llm_provider(task)
+                            current_model = model or _extract_task_model(task)
+                            fallback_model = None
+                            if provider_name and current_model:
+                                try:
+                                    from app.providers.registry import get_provider  # noqa: PLC0415
+                                    fallback_model = get_provider(provider_name).fallback_model(current_model)
+                                except Exception as e:
+                                    logger.warning(
+                                        "[AGENT STATUS] Could not resolve provider model fallback "
+                                        "for task %s provider=%s model=%s: %s",
+                                        task.id,
+                                        provider_name,
+                                        current_model,
+                                        e,
+                                        exc_info=True,
+                                    )
+                            if fallback_model and fallback_model != current_model:
+                                ctx = apply_task_llm_runtime_context(
+                                    ctx,
+                                    account_id=None,
+                                    provider=provider_name,
+                                    auth_mode=get_task_llm_auth_mode(task),
+                                    model=fallback_model,
+                                    execution_mode=get_task_llm_execution_mode(task),
+                                )
+                                ctx["model_fallback"] = {
+                                    "requested": current_model,
+                                    "effective": fallback_model,
+                                    "provider": provider_name,
+                                    "reason": "provider_model_config_rejection",
+                                    "at": _utcnow().isoformat(),
+                                }
+                                ctx.pop("_api_failure_retries", None)
+                                task.retry_after_until = None  # audit W1: column is source of truth
+                                ctx.pop("blacklisted_accounts", None)
+                                payloads = list(task.payloads or [])
+                                if payloads and isinstance(payloads[0], dict):
+                                    payloads[0] = dict(payloads[0])
+                                    payloads[0]["model"] = fallback_model
+                                    task.payloads = payloads
+                                    flag_modified(task, "payloads")
+                                logger.warning(
+                                    "[AGENT STATUS] Task %s provider model/config rejection for "
+                                    "%s/%s - requeuing with fallback model %s",
+                                    task.id,
+                                    provider_name,
+                                    current_model,
+                                    fallback_model,
+                                )
+                            else:
+                                logger.warning(
+                                    "[AGENT STATUS] Task %s provider model/config rejection for "
+                                    "%s/%s - no fallback available; not requeuing same runtime",
+                                    task.id,
+                                    provider_name,
+                                    current_model,
+                                )
+                                task.latest_status_message = (
+                                    "External API model/config failure - update provider model/settings and retry."
+                                )
+                                task.attempt_count = _runtime_config["max_retries"]
+                                should_requeue = False
                         # Permanent auth failures (bad/expired credentials) should never be
                         # retried — they will keep failing until the operator re-authenticates.
                         # Detect these by inspecting the failure message before burning retries.
-                        _logs_lower = (payload.logs or "").lower()
-                        _PERMANENT_AUTH_INDICATORS = (
+                        elif any(ind in (payload.logs or "").lower() for ind in (
                             "token expired", "token revoked", "bad credentials",
                             "unauthorized", "401",
-                        )
-                        if any(ind in _logs_lower for ind in _PERMANENT_AUTH_INDICATORS):
+                        )):
                             logger.warning(
                                 f"[AGENT STATUS] Task {task.id} EXTERNAL_API permanent auth failure "
                                 f"— not requeuing (operator must re-authenticate)"
@@ -1038,16 +1155,16 @@ async def update_agent_status(
                                             if earliest_recovery is None or recovery_dt < earliest_recovery:
                                                 earliest_recovery = recovery_dt
                             if any_available:
-                                ctx.pop("retry_after", None)
+                                task.retry_after_until = None  # audit W1: column source of truth
                             elif earliest_recovery:
                                 minutes_until = (earliest_recovery - _utcnow()).total_seconds() / 60
-                                set_retry_after(ctx, minutes_until)
+                                set_retry_after(task, minutes_until)
                                 task.latest_status_message = f"Rate Limited — all accounts exhausted, waiting for recovery"
                             else:
-                                set_retry_after(ctx, 5)
+                                set_retry_after(task, 5)
                                 task.latest_status_message = f"Rate Limited — all accounts exhausted, retrying in 5min"
                         elif failure_class != "EXTERNAL_API":
-                            ctx.pop("retry_after", None)
+                            task.retry_after_until = None  # audit W1: column source of truth
                         # Preserve llm_* runtime identity keys (provider/model/auth_mode/
                         # execution_mode) for observability — debugging which provider failed
                         # and per-provider metrics need this. The blacklisted_accounts list
@@ -1115,7 +1232,11 @@ async def update_agent_status(
                 # Exponential backoff: 30min * 2^(n-1), capped at 4 hours, ±20% jitter
                 base_delay_minutes = min(30 * (2 ** (rl_hit_count - 1)), 240)
                 delay_minutes = base_delay_minutes * random.uniform(0.8, 1.2)
-                retry_after = set_retry_after(ctx, delay_minutes)
+                # Audit W1: pass task — set_retry_after now writes the column
+                # in addition to the context counter.
+                task.context = ctx
+                retry_after = set_retry_after(task, delay_minutes)
+                ctx = dict(task.context or {})
                 logger.info(f"[ORCHESTRATOR] Task {task.id} rate-limited (hit #{rl_hit_count}) — holding back {delay_minutes:.0f}min (retry_after={retry_after})")
                 # Blacklist rate-limited account so the retry picks a different one
                 if acct_id:
@@ -1125,10 +1246,12 @@ async def update_agent_status(
                     ctx["blacklisted_accounts"] = blacklisted
             elif failure_class == "PROVISION_FAILURE":
                 delay_minutes = 5 * random.uniform(0.75, 1.25)  # 3.75-6.25 minutes
-                retry_after = set_retry_after(ctx, delay_minutes)
+                task.context = ctx
+                retry_after = set_retry_after(task, delay_minutes)
+                ctx = dict(task.context or {})
                 logger.info(f"[ORCHESTRATOR] Task {task.id} provision failure — holding back {delay_minutes:.1f}min (retry_after={retry_after})")
             else:
-                ctx.pop("retry_after", None)  # Clear any stale retry_after on non-delayed retries
+                task.retry_after_until = None  # audit W1: column source of truth
                 # Agent reached the point of POSTing a result, so provisioning worked —
                 # don't carry a stale provision budget into the retry.
                 ctx.pop("provision_failures", None)

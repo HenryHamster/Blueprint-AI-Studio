@@ -28,7 +28,14 @@ def make_membership(project_id, user_id="test-user-123", role="owner") -> Projec
 
 
 def make_task(project_id=None, **kwargs) -> Task:
-    """Create a Task instance with test defaults. Pass kwargs to override."""
+    """Create a Task instance with test defaults. Pass kwargs to override.
+
+    Audit W1: several lifecycle flags moved from JSONB context to columns
+    (auto_remediation, post_commit_pending, retry_after_until, etc.). Tests
+    that historically pass these inside the ``context`` dict get them
+    silently extracted here and applied to the column instead — keeps
+    existing test fixtures working with the column-based source of truth.
+    """
     if project_id is None:
         project_id = uuid.uuid4()
     defaults = dict(
@@ -49,6 +56,29 @@ def make_task(project_id=None, **kwargs) -> Task:
     # updated_at as "last touched" (e.g. admin_analytics._rolling_window_stats).
     if "created_at" in kwargs and "updated_at" not in kwargs:
         defaults["updated_at"] = kwargs["created_at"]
+    # Auto-extract promoted columns from context for legacy test fixtures.
+    ctx = defaults.get("context") or {}
+    if isinstance(ctx, dict) and ctx:
+        promoted_bool = {
+            "auto_remediation": "auto_remediation",
+            "_post_commit_pending": "post_commit_pending",
+            "_post_commit_failed": "post_commit_failed",
+            "requeue_in_flight": "requeue_in_flight",
+            "_spawn_failed": "spawn_failed",
+        }
+        new_ctx = dict(ctx)
+        for ctx_key, col_name in promoted_bool.items():
+            if ctx_key in new_ctx and col_name not in defaults:
+                val = new_ctx.pop(ctx_key)
+                defaults[col_name] = bool(val)
+        promoted_text = {
+            "_previous_error_fingerprint": "previous_error_fingerprint",
+            "strategic_cycle_id": "strategic_cycle_id",
+        }
+        for ctx_key, col_name in promoted_text.items():
+            if ctx_key in new_ctx and col_name not in defaults:
+                defaults[col_name] = new_ctx.pop(ctx_key)
+        defaults["context"] = new_ctx
     return Task(**defaults)
 
 

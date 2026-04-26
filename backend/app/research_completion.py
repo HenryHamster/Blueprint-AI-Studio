@@ -1336,12 +1336,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             **(({'effort': finding_effort} if finding_effort else {})),
             **({"prompt_suffix": _combined_suffix} if _combined_suffix else {}),
         }, f"research_completion:finding:{task_type}")
+        # Audit W1: previous_error_fingerprint is a column. Pull it out of
+        # prior_retry_ctx so it lands on the column, not in JSONB context.
+        _prev_fp_col = prior_retry_ctx.pop("_previous_error_fingerprint", None)
         new_task = Task(
             project_id=task.project_id,
             title=title,
             description=finding.get("description", prompt[:200]),
             parent_task_id=task.id,
             payloads=[finding_payload],
+            previous_error_fingerprint=_prev_fp_col,
             context={
                 "research_task_id": str(task.id),
                 "parent_research_task_id": str(task.id),

@@ -15,23 +15,68 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def set_retry_after(context: dict, minutes: float) -> str:
-    """Clamp `minutes` to [0, 30] and write `retry_after` on the context dict.
+def set_retry_after(task_or_ctx, minutes: float) -> str:
+    """Clamp `minutes` to [0, 30], write retry_after on the task or context.
 
-    Returns the ISO-formatted timestamp that was written. A single helper
-    prevents far-future or malformed values from permanently blocking
-    dispatch, since the orchestrator skips tasks where retry_after > now.
+    Audit 2026-04-25 W1: ``Task.retry_after_until`` is now a real column
+    (was JSONB ``context['retry_after']``) so concurrent dispatch / status
+    POST writes can't race on a stale in-memory copy. This helper accepts
+    either a Task object (preferred) or the legacy context dict (still
+    supported for code paths that don't have a Task in scope, e.g. spawn
+    paths that operate on ``new_task_context`` before the row exists).
+
+    The escalation counter ``_retry_after_resets`` stays in context (it's
+    an escalation hint, not idempotency-critical, so writer races are
+    tolerable).
+
+    Returns the ISO-formatted timestamp that was written.
     """
     clamped = max(0.0, min(float(minutes), RETRY_AFTER_MAX_MINUTES))
-    iso = (_utcnow() + timedelta(minutes=clamped)).isoformat()
+    deadline = _utcnow() + timedelta(minutes=clamped)
+    iso = deadline.isoformat()
     # Round-trip to validate ISO format before persisting.
     datetime.fromisoformat(iso)
-    context["retry_after"] = iso
-    try:
-        context["_retry_after_resets"] = int(context.get("_retry_after_resets") or 0) + 1
-    except (TypeError, ValueError):
-        context["_retry_after_resets"] = 1
+
+    # Branch on shape: a Task object exposes retry_after_until as an
+    # attribute and (usually) ``context`` as a dict; a plain dict only has
+    # the legacy context shape.
+    if hasattr(task_or_ctx, "retry_after_until"):
+        task = task_or_ctx
+        task.retry_after_until = deadline
+        ctx = dict(task.context or {})
+        try:
+            ctx["_retry_after_resets"] = int(ctx.get("_retry_after_resets") or 0) + 1
+        except (TypeError, ValueError):
+            ctx["_retry_after_resets"] = 1
+        task.context = ctx
+    else:
+        context = task_or_ctx
+        context["retry_after"] = iso
+        try:
+            context["_retry_after_resets"] = int(context.get("_retry_after_resets") or 0) + 1
+        except (TypeError, ValueError):
+            context["_retry_after_resets"] = 1
     return iso
+
+
+def clear_retry_after(task_or_ctx) -> None:
+    """Clear retry_after deadline + reset counter on task or context dict.
+
+    Pairs with ``set_retry_after`` for symmetric API. Replaces the
+    scattered ``ctx.pop("retry_after", None); ctx.pop("_retry_after_resets", None)``
+    pattern that existed in 5+ sites.
+    """
+    if hasattr(task_or_ctx, "retry_after_until"):
+        task = task_or_ctx
+        task.retry_after_until = None
+        if task.context:
+            ctx = dict(task.context)
+            ctx.pop("_retry_after_resets", None)
+            task.context = ctx
+    else:
+        context = task_or_ctx
+        context.pop("retry_after", None)
+        context.pop("_retry_after_resets", None)
 
 
 def rate_limit_retry_minutes(

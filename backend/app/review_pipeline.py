@@ -151,9 +151,15 @@ def _format_repeating_issues_section(history: list) -> str:
 _CHURN_NARROW_FOCUS_PREFIX = (
     "⚠️ ISSUE CHURN DETECTED: the prior {window} fix iterations resolved some "
     "issues but introduced new ones (CRITICAL+MAJOR counts: {counts}). "
-    "Address ONLY the explicitly listed issues below. Do NOT modify files "
-    "that are not directly referenced by those issues. Do NOT refactor, "
-    "reformat, or clean up unrelated code in this iteration.\n\n"
+    "Prefer addressing only the listed issues; avoid incidental refactoring "
+    "or cleanup. If the same issue keeps recurring, the fix you've been "
+    "applying is probably wrong — don't apply it harder, investigate. Two "
+    "common patterns: (1) the planned file set was wrong and the fix "
+    "genuinely needs files outside scope (a sibling cluster's dep) — expand "
+    "scope, explain why in the PR description, stop rewriting the same file "
+    "differently each iteration; (2) review asks for a literal revert — run "
+    "`git checkout origin/<base_branch> -- <file>` rather than rewriting "
+    "from memory, which drifts each iteration and never converges.\n\n"
 )
 
 # Softer proactive directive injected when a fix iteration has consumed at

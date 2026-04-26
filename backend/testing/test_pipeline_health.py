@@ -2278,6 +2278,149 @@ def test_all_accounts_blocked_action_noop_when_no_signal():
     assert act(blocked_count=0, dispatched_count=0, already_alerted=True) == "noop"
 
 
+# ── stall alert title/body formatting ────────────────────────────────────────
+
+def test_format_stall_alert_falls_back_when_no_reasons():
+    """No reasons captured → keep the original rate-limit copy. Preserves
+    dedup keys and existing operator expectations for legacy callers."""
+    from app.orchestrator import _format_stall_alert
+
+    title, body = _format_stall_alert(None, None)
+    assert "rate-limited" in title.lower()
+    assert "rate-limit cooldown" in body.lower()
+    assert "Waiting for cooldown." in body
+
+
+def test_format_stall_alert_rate_limit_only_includes_recovery():
+    """A pure rate-limit cooldown stall should mention earliest recovery
+    in the body rather than the generic "Waiting for cooldown" string.
+    Title says "eligible" not "all" because describe_pool_blockage
+    summarizes per-task-model state — accounts that don't serve this task's
+    model can still be healthy. (2026-04-24 misleading-alert fix.)"""
+    from app.orchestrator import _format_stall_alert
+
+    earliest = datetime(2026, 4, 25, 12, 30, tzinfo=timezone.utc)
+    reasons = {"all accounts in rate-limit cooldown (earliest recovery: 2026-04-25T12:30:00+00:00)"}
+    title, body = _format_stall_alert(reasons, earliest)
+    assert title == "Pipeline stalled — eligible Max plan accounts rate-limited"
+    assert "Earliest recovery: 2026-04-25T12:30:00+00:00." in body
+
+
+def test_format_stall_alert_capacity_only_no_cooldown_copy():
+    """Slot/cap contention is NOT a rate-limit problem — the title and body
+    must not claim cooldown or earliest recovery (none exists)."""
+    from app.orchestrator import _format_stall_alert
+
+    title, body = _format_stall_alert({"no eligible accounts or slot contention"}, None)
+    assert title == "Pipeline stalled — eligible Max plan accounts at capacity"
+    assert "rate-limited" not in title.lower()
+    assert "cooldown" not in body.lower()
+    assert "Waiting for cooldown" not in body
+
+
+def test_format_stall_alert_mixed_rate_limit_and_capacity():
+    """When both rate-limit and capacity pressure are present (e.g., one
+    account cooling down and another at daily-cap), the title must reflect
+    the mix instead of pretending it's pure rate-limit."""
+    from app.orchestrator import _format_stall_alert
+
+    earliest = datetime(2026, 4, 25, 14, 0, tzinfo=timezone.utc)
+    reasons = {
+        "all accounts in rate-limit cooldown (earliest recovery: 2026-04-25T14:00:00+00:00)",
+        "no eligible accounts or slot contention",
+    }
+    title, body = _format_stall_alert(reasons, earliest)
+    assert title == "Pipeline stalled — eligible Max plan accounts unavailable (rate limits + capacity)"
+    # Both reasons must be reflected in the body so operators see what's
+    # actually wrong rather than only one half of the truth.
+    assert "rate-limit cooldown" in body
+    assert "slot contention" in body
+    assert "Earliest recovery:" in body
+
+
+def test_format_stall_alert_no_accounts_configured():
+    """No-accounts case is its own diagnostic — different fix (add an
+    account, not wait for cooldown), so the title must not say cooldown."""
+    from app.orchestrator import _format_stall_alert
+
+    title, body = _format_stall_alert({"no accounts configured"}, None)
+    assert title == "Pipeline stalled — no Max plan accounts configured"
+    assert "rate-limited" not in title.lower()
+    assert "cooldown" not in body.lower()
+
+
+def test_format_stall_alert_no_ready_accounts():
+    """Disabled accounts or accounts missing credentials are not a cooldown
+    problem; operators need to make an account ready."""
+    from app.orchestrator import _format_stall_alert
+
+    title, body = _format_stall_alert({"no ready accounts for provider gemini"}, None)
+    assert title == "Pipeline stalled — no Max plan accounts ready"
+    assert "rate-limited" not in title.lower()
+    assert "cooldown" not in body.lower()
+
+    title, body = _format_stall_alert({"no accounts configured for provider gemini"}, None)
+    assert title == "Pipeline stalled — no Max plan accounts ready"
+    assert "cooldown" not in body.lower()
+
+
+def test_missing_runtime_credentials_stall_reason_distinguishes_no_pool_and_no_ready():
+    from app.orchestrator import _missing_runtime_credentials_stall_reason as reason
+
+    assert reason(
+        user_pool_count=0,
+        provider_account_count=0,
+        ready_provider_account_count=0,
+        runtime_provider="gemini",
+    ) == "no accounts configured"
+    assert reason(
+        user_pool_count=2,
+        provider_account_count=2,
+        ready_provider_account_count=0,
+        runtime_provider="gemini",
+    ) == "no ready accounts for provider gemini"
+    assert reason(
+        user_pool_count=2,
+        provider_account_count=0,
+        ready_provider_account_count=0,
+        runtime_provider="gemini",
+    ) == "no accounts configured for provider gemini"
+
+
+def test_format_stall_alert_partial_rate_limit_string_still_classifies():
+    """The partial-mix string from describe_pool_blockage ("N of M
+    accounts rate-limited, remaining accounts at capacity") triggers BOTH
+    rate-limited AND capacity classification because it actually is both."""
+    from app.orchestrator import _format_stall_alert
+
+    reasons = {"3 of 5 accounts rate-limited, remaining accounts at capacity"}
+    title, _body = _format_stall_alert(reasons, None)
+    assert title == "Pipeline stalled — eligible Max plan accounts unavailable (rate limits + capacity)"
+
+
+def test_format_stall_alert_title_never_claims_pool_wide_when_per_task():
+    """Regression guard for the 2026-04-24 misleading-alert bug: the alert
+    fires per-cycle when at least one task can't dispatch and zero tasks
+    dispatched. The reasons describe per-task-model constraints, not the
+    full pool state. Title must not assert "all" pool accounts are bad."""
+    from app.orchestrator import _format_stall_alert
+
+    for reasons in (
+        None,
+        {"all accounts in rate-limit cooldown (earliest recovery: 2026-04-25T12:30:00+00:00)"},
+        {"no eligible accounts or slot contention"},
+        {"no accounts configured"},
+        {"no ready accounts for provider gemini"},
+        {"3 of 5 accounts rate-limited, remaining accounts at capacity"},
+    ):
+        title, _ = _format_stall_alert(reasons, None)
+        # "all Max plan accounts" implies pool-wide state; we only know
+        # per-task-model state, so this phrasing is forbidden.
+        assert "all Max plan accounts" not in title, (
+            f"Title falsely claims pool-wide state for per-task constraint: {title!r}"
+        )
+
+
 # ── retry_after escalation thresholds ────────────────────────────────────────
 
 def test_retry_after_escalation_below_alert_returns_none():

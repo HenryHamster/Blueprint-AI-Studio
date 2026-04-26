@@ -5107,7 +5107,8 @@ async def test_respawn_after_cooldown_injects_prior_failure_context(db_session, 
     # Enriched failure diagnosis fields (mirror task_lifecycle._requeue_parent_task)
     assert ctx.get("_previous_error_summary") == "Tests failed: AssertionError in test_webhooks.py line 42"
     assert ctx.get("_previous_failure_stage") == "test"
-    assert isinstance(ctx.get("_previous_error_fingerprint"), str) and ctx["_previous_error_fingerprint"]
+    # Audit W1: previous_error_fingerprint is a column.
+    assert isinstance(children[0].previous_error_fingerprint, str) and children[0].previous_error_fingerprint
 
 
 @pytest.mark.asyncio
@@ -5777,14 +5778,15 @@ async def test_task_failure_investigation_spawns_for_code_defect(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
+    # Audit W1: previous_error_fingerprint is a column.
     failed = Task(
         project_id=project.id,
         title="Broken feature",
         payloads=[{"type": "create", "prompt": "do thing"}],
+        previous_error_fingerprint="abc123",
         context={
             "direction_id": direction_id,
             "_tool_trace": "Edit file.py\nRun tests → failed",
-            "_previous_error_fingerprint": "abc123",
             "failing_tests": ["test_foo", "test_bar"],
         },
         status=TaskStatus.FAILED,
@@ -6138,14 +6140,15 @@ async def test_task_failure_investigation_skipped_by_cross_direction_fingerprint
     await db_session.commit()
     await db_session.refresh(sibling_inv)
 
+    # Audit W1: previous_error_fingerprint is a column.
     failed = Task(
         project_id=project.id,
         title="Broken feature",
         payloads=[{"type": "create", "prompt": "do thing"}],
+        previous_error_fingerprint="fp-shared-xdir",
         context={
             "direction_id": "d-xdir0001",
             "_tool_trace": "Edit file.py\nRun tests → failed",
-            "_previous_error_fingerprint": "fp-shared-xdir",
             "failing_tests": ["test_foo"],
         },
         status=TaskStatus.FAILED,

@@ -197,9 +197,11 @@ async def _attempt_merge_with_retry_and_escalation(
 
     merge_msg = merge_result.get("message", "")
     if "in progress" in merge_msg.lower() or "status check" in merge_msg.lower():
+        from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle
         ci_loop["ci_poll_interval"] = 10
         ci_loop["ci_last_polled"] = _utcnow().isoformat()
         ci_loop["ci_wait_started"] = _utcnow().isoformat()
+        ci_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(session)
         task.context = {**(task.context or {}), "review_loop": ci_loop}
         task.latest_status_message = f"Merge blocked (checks re-running on PR #{ci_pr_number}) — back to CI polling"
         logger.warning(f"[CI] PR #{ci_pr_number} merge blocked by in-progress checks — returning to CI wait ({source})")
@@ -231,10 +233,12 @@ async def _attempt_merge_with_retry_and_escalation(
         # This is not a merge infrastructure failure — defer back to CI polling
         # without burning the merge retry budget.
         if _ms == "unstable":
+            from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle
             ci_loop["ci_passed"] = False
             ci_loop["ci_poll_interval"] = 30
             ci_loop["ci_last_polled"] = _utcnow().isoformat()
             ci_loop["ci_wait_started"] = _utcnow().isoformat()
+            ci_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(session)
             task.context = {**(task.context or {}), "review_loop": ci_loop}
             flag_modified(task, "context")
             task.latest_status_message = (
@@ -256,10 +260,12 @@ async def _attempt_merge_with_retry_and_escalation(
             except Exception as e:
                 _upd = {"updated": False, "message": str(e)[:200]}
                 logger.warning(f"[CI] PR #{ci_pr_number} update_branch raised: {e}")
+            from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle
             ci_loop["ci_passed"] = False
             ci_loop["ci_poll_interval"] = 30
             ci_loop["ci_last_polled"] = _utcnow().isoformat()
             ci_loop["ci_wait_started"] = _utcnow().isoformat()
+            ci_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(session)
             if _upd.get("updated"):
                 ci_loop["update_branch_failures"] = 0
                 task.context = {**(task.context or {}), "review_loop": ci_loop}
@@ -628,7 +634,7 @@ async def _attempt_merge_with_retry_and_escalation(
                 from app.shared_state import record_direction_result  # noqa: PLC0415
                 _fc = classify_failure(task)
                 persist_failure_category(task, _fc)
-                record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}))
+                record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}), auto_remediation=task.auto_remediation)
                 _direction_id = str((task.context or {}).get("direction_id") or "")
                 if _direction_id:
                     record_direction_result(

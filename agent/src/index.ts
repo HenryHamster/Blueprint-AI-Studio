@@ -70,11 +70,21 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
       'please wait and try again later',
       'you have reached your daily',
       'automatically switching from gemini-',
+      'quota exceeded for quota metric',
+      'quota exceeded for metric',
+      "you've exceeded the rate limit",
+      'you exceeded your current quota, please check your plan and billing details',
+      'please retry in',
+      'to increase your limits, request a quota increase',
+      'switching to the gemini-2.5-flash model',
     ],
     service_account: [
       'resource has been exhausted',
       'resource_exhausted',
       'ratelimitexceeded',
+      'quota exceeded for metric',
+      'resource exhausted. please try again later',
+      'please refer to https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429',
     ],
   },
 } as const;
@@ -477,7 +487,13 @@ function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: n
 function startHeartbeat(taskId: string, getMessage: () => string) {
   // Fire first heartbeat immediately — don't wait 30s.
   // If the agent crashes in the first 30s, at least one heartbeat is recorded.
-  void (async () => {
+  // Audit 2026-04-25 (W4/C1+C2): replace `void async` IIFE with explicit
+  // .catch() handler so a synchronous throw inside the async block (e.g.
+  // collectMetrics() bug, JSON.stringify failure) doesn't silently disappear.
+  // The previous `void` form would drop those errors entirely — no log, no
+  // unhandledRejection event, the agent just goes silent until the orchestrator
+  // reaper kills it minutes later with no forensic record.
+  (async () => {
     try {
       const metrics = collectMetrics();
       await apiPost('/api/agent/heartbeat', {
@@ -489,9 +505,9 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
     } catch (e) {
       log(`Initial heartbeat failed: ${String(e)}`);
     }
-  })();
+  })().catch(e => log(`Initial heartbeat outer error: ${String(e)}`));
 
-  heartbeatTimer = setInterval(() => { void (async () => {
+  heartbeatTimer = setInterval(() => { (async () => {
     try {
       const metrics = collectMetrics();
       // Proactive OOM warning — SIGKILL from cgroup can't be caught, so warn while we still can
@@ -544,7 +560,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         return;
       }
     }
-  })(); }, HEARTBEAT_INTERVAL);
+  })().catch(e => log(`Heartbeat outer error (W4/C1): ${String(e)}`)); }, HEARTBEAT_INTERVAL);
 }
 
 function stopHeartbeat() {
@@ -2098,25 +2114,51 @@ echo ""
       if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
       if (runCommand.outputMode === 'claude-stream-json') {
         for (const line of text.split('\n').filter(Boolean)) {
+          let obj: ClaudeOutput | null = null;
           try {
-            const obj = JSON.parse(line) as ClaudeOutput;
-            if (obj.type === 'assistant' && obj.message?.content) {
-              for (const block of obj.message.content) {
-                if (block.type === 'text') {
-                  sendLog(ws, (block.text ?? '') + '\n');
-                  statusRef.value = (block.text ?? '').slice(0, 100);
-                } else if (block.type === 'tool_use') {
-                  sendLog(ws, `[tool: ${strVal(block.name)}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
-                  statusRef.value = `Using tool: ${strVal(block.name)}`;
-                  recordToolUse(strVal(block.name), block.input);
-                }
-              }
-            } else if (obj.type === 'result') {
-              lastResultText = obj.result ?? '';
-              sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
-            }
+            obj = JSON.parse(line) as ClaudeOutput;
           } catch {
             sendLog(ws, text);
+            continue;
+          }
+          // Audit 2026-04-25 (W4/C3): explicit type dispatch instead of
+          // silent fall-through. Previously a `type: 'error'` message was
+          // logged as raw text and then dropped — `lastResultText` stayed
+          // stale from earlier output and the handler would return success
+          // with the WRONG result text. Now an error-type message captures
+          // the error into stderr buffer so downstream classification sees it.
+          const objType = (obj as { type?: string } | null)?.type;
+          if (objType === 'assistant' && obj?.message?.content) {
+            for (const block of obj.message.content) {
+              if (block.type === 'text') {
+                sendLog(ws, (block.text ?? '') + '\n');
+                statusRef.value = (block.text ?? '').slice(0, 100);
+              } else if (block.type === 'tool_use') {
+                sendLog(ws, `[tool: ${strVal(block.name)}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
+                statusRef.value = `Using tool: ${strVal(block.name)}`;
+                recordToolUse(strVal(block.name), block.input);
+              }
+            }
+          } else if (objType === 'result') {
+            lastResultText = (obj as { result?: string }).result ?? '';
+            sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
+          } else if (objType === 'error') {
+            // Surface explicit error messages from the runner so failure
+            // classification & status reporting see them.
+            const errMsg = (obj as { message?: string; error?: string }).message
+              || (obj as { error?: string }).error
+              || JSON.stringify(obj);
+            const errLine = `[claude-stream error] ${errMsg}\n`;
+            sendLog(ws, errLine);
+            // Push into stderr buffers (analogous to the stderr handler below)
+            // so combined-output classification picks it up.
+            if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += errLine;
+            if (stderrBuffer.length < 50_000) stderrBuffer += errLine;
+          } else if (objType === 'system' || objType === 'user') {
+            // Benign metadata — ignore silently.
+          } else if (objType) {
+            // Unknown type: log so we don't silently drop information.
+            sendLog(ws, `[claude-stream unknown type: ${objType}]\n`);
           }
         }
       } else {
@@ -2281,11 +2323,22 @@ async function main() {
     const { token: ghToken, owner, repo } = ghRes.data;
     log(`GitHub: ${owner}/${repo}`);
 
-    // Dispatch to handler (fall back to create for unknown types)
+    // Dispatch to handler.
+    // Audit 2026-04-25 (W4/C4): unknown task types used to silently fall back
+    // to the `create` handler, which then operated on payloads of the wrong
+    // shape and produced wrong output. Now we throw — the failure surfaces
+    // immediately as a real failure, not silent wrong work. This satisfies
+    // the "fail fast on actual failure" rule from the audit.
     const handlersMap: Partial<Record<string, Handler>> = handlers;
     const knownHandler = handlersMap[taskType];
-    if (!knownHandler) sendLog(ws, `Warning: unknown task type "${taskType}", using create handler\n`);
-    const handler = knownHandler ?? handlers.create;
+    if (!knownHandler) {
+      const supported = Object.keys(handlers).sort().join(', ');
+      throw new Error(
+        `Unknown task type "${taskType}". Backend emitted a task type the agent does not handle. ` +
+        `Supported handlers: ${supported}`
+      );
+    }
+    const handler = knownHandler;
     await handler(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
     sendLog(ws, '\nTask completed.\n');
 

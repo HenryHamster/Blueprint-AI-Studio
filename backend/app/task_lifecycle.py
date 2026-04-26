@@ -528,7 +528,8 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # project-wide, which is too late for individual task abort.
         try:
             from app.anomaly_detection import _error_fingerprint as _fp_fn
-            prior_fp = (child.context or {}).get("_previous_error_fingerprint")
+            # Audit W1: previous_error_fingerprint is now a column.
+            prior_fp = child.previous_error_fingerprint
             current_fp = _fp_fn(original_status_message or "")
             if prior_fp and current_fp and prior_fp == current_fp:
                 logger.info(
@@ -1090,7 +1091,7 @@ async def _process_post_commit(
                     logger.error(f"[RESEARCH] Failed to record research failure for {task.id}: {_res_exc!r}", exc_info=True)
 
             # Post result message for permanently failed auto-remediation tasks
-            if (task.context or {}).get("auto_remediation") is True:
+            if task.auto_remediation:
                 try:
                     _ar_branch = (task.context or {}).get("ci_failure_branch", "main")
                     await post_auto_fix_result_message(
@@ -1199,7 +1200,7 @@ async def _process_post_commit(
                                 task.requires_approval = True
                                 task.latest_status_message = f"Security scan blocked: {scan_result['summary']}"
                                 session.add(task)
-                                if (task.context or {}).get("auto_remediation") is True:
+                                if task.auto_remediation:
                                     try:
                                         await post_auto_fix_result_message(
                                             session, task.project_id,
@@ -1227,7 +1228,7 @@ async def _process_post_commit(
                                         task.requires_approval = True
                                         task.latest_status_message = f"Security scan blocked: {scan_result['summary']}"
                                         session.add(task)
-                                        if (task.context or {}).get("auto_remediation") is True:
+                                        if task.auto_remediation:
                                             try:
                                                 await post_auto_fix_result_message(
                                                     session, task.project_id,
@@ -1250,7 +1251,7 @@ async def _process_post_commit(
                                     task.context = {**(task.context or {}), "scan_transient_failure": True}
                                     task.latest_status_message = f"Security scan unavailable (infrastructure error) — requires manual approval: {type(retry_exc).__name__}: {retry_exc!r}"[:500]
                                     session.add(task)
-                                    if (task.context or {}).get("auto_remediation") is True:
+                                    if task.auto_remediation:
                                         try:
                                             await post_auto_fix_result_message(
                                                 session, task.project_id,
@@ -1268,7 +1269,7 @@ async def _process_post_commit(
                                 task.requires_approval = True
                                 task.latest_status_message = f"Security scan failed — requires manual approval: {type(e).__name__}: {e!r}"[:500]
                                 session.add(task)
-                                if (task.context or {}).get("auto_remediation") is True:
+                                if task.auto_remediation:
                                     try:
                                         await post_auto_fix_result_message(
                                             session, task.project_id,
@@ -1287,8 +1288,9 @@ async def _process_post_commit(
                             task.context = {**(task.context or {}), "pr_merged": True}
                             session.add(task)
                             _t_ctx = task.context or {}
+                            # Audit W1: auto_remediation is now a column.
                             if _t_ctx.get("diagnosis_task_id") or (
-                                _t_ctx.get("auto_remediation") is True and _t_ctx.get("direction_id")
+                                task.auto_remediation and _t_ctx.get("direction_id")
                             ):
                                 try:
                                     from app.task_completion import _record_remediation_outcome
@@ -1868,8 +1870,9 @@ async def _process_post_commit(
                                             orig.latest_status_message = "Rollup PR merged"
                                         session.add(orig)
                                         _o_ctx = orig.context or {}
+                                        # Audit W1: auto_remediation is now a column.
                                         if _o_ctx.get("diagnosis_task_id") or (
-                                            _o_ctx.get("auto_remediation") is True and _o_ctx.get("direction_id")
+                                            orig.auto_remediation and _o_ctx.get("direction_id")
                                         ):
                                             try:
                                                 from app.task_completion import _record_remediation_outcome
@@ -1877,7 +1880,7 @@ async def _process_post_commit(
                                             except Exception as _rr_exc:
                                                 logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome on merge for task {orig.id}: {_rr_exc!r}")
                                         # Post result message for auto-remediation tasks
-                                        if (orig.context or {}).get("auto_remediation") is True:
+                                        if orig.auto_remediation:
                                             try:
                                                 _ar_branch = (orig.context or {}).get("ci_failure_branch", base_branch)
                                                 await post_auto_fix_result_message(
@@ -2037,11 +2040,13 @@ async def _process_post_commit(
                             merge_msg = merge_result.get("message", "unknown")
                             await create_pr_comment(gh_token, owner, repo, pr_number,
                                 f"**Blueprint Review Pipeline**: Merge blocked — {merge_msg}. Retrying with backoff.")
+                            from app import pause_clock  # noqa: PLC0415
                             merge_wait_loop = dict(review_loop)
                             merge_wait_loop["ci_waiting"] = True
                             merge_wait_loop["review_approved"] = True
                             merge_wait_loop["ci_passed"] = True  # CI was already verified green above
                             merge_wait_loop["ci_wait_started"] = _utcnow().isoformat()
+                            merge_wait_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(session)
                             merge_wait_loop["ci_poll_interval"] = 30
                             merge_wait_loop["pr_number"] = pr_number
                             merge_wait_loop["branch"] = branch
@@ -2200,7 +2205,9 @@ async def _process_post_commit(
                                 if _orig:
                                     _orig_loop = dict((_orig.context or {}).get("review_loop", {}) or {})
                                     if _orig_loop.get("ci_waiting"):
+                                        from app import pause_clock  # noqa: PLC0415
                                         _orig_loop["ci_wait_started"] = _utcnow().isoformat()
+                                        _orig_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(session)
                                         _orig.context = {**(_orig.context or {}), "review_loop": _orig_loop}
                                         flag_modified(_orig, "context")
                                         session.add(_orig)
@@ -2332,10 +2339,12 @@ async def _process_post_commit(
                     # review-side gate is open. Set review_approved explicitly even
                     # though the inherited review_loop should already carry it from
                     # the prior approval write.
+                    from app import pause_clock  # noqa: PLC0415
                     ci_loop = review_loop.copy()
                     ci_loop["ci_waiting"] = True
                     ci_loop["review_approved"] = True
                     ci_loop["ci_wait_started"] = _utcnow().isoformat()
+                    ci_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(session)
                     ci_loop["ci_poll_interval"] = 10
                     task.status = TaskStatus.EVALUATING
                     task.context = {**(task.context or {}), "review_loop": ci_loop}

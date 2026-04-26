@@ -431,7 +431,12 @@ async def _record_project_remediation_outcome(
     if not project:
         return False
     ctx = task.context or {}
-    fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint") or ctx.get("_previous_error_fingerprint")
+    # Audit W1: previous_error_fingerprint is now a column.
+    fingerprint = (
+        ctx.get("diagnosis_fingerprint")
+        or ctx.get("error_fingerprint")
+        or task.previous_error_fingerprint
+    )
     state = dict(project.remediation_tracking or {})
     now_iso = _utcnow().isoformat()
     entry: Dict[str, Any] = {
@@ -510,7 +515,8 @@ async def _record_remediation_if_terminal(
         return
     ctx = task.context or {}
     has_direction_linkage = bool(ctx.get("diagnosis_task_id") and ctx.get("direction_id"))
-    is_auto_remediation = ctx.get("auto_remediation") is True
+    # Audit W1: auto_remediation is now a column.
+    is_auto_remediation = bool(getattr(task, "auto_remediation", False))
     if not has_direction_linkage and not is_auto_remediation:
         return
     # Tasks that produce a PR enter the review pipeline — their true outcome
@@ -1562,7 +1568,7 @@ async def _ensure_branch(
     from app.routers.agent_status import record_task_result  # noqa: PLC0415
     _fc = classify_failure(task)
     persist_failure_category(task, _fc)
-    record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}))
+    record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}), auto_remediation=task.auto_remediation)
     session.add(task)
     await _maybe_create_failure_alert(task, session, f"Failed to create branch: {type(e).__name__}: {e!r}"[:200])
     await session.commit()

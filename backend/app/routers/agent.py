@@ -107,27 +107,40 @@ async def verify_agent_token(
 ):
     """
     Validates the short-lived JWT passed by the agent VM.
-    Rejects tokens for tasks that are no longer active (completed/failed/cancelled).
-    The status endpoint is exempt because agents may retry their own completion POST
-    (the endpoint has its own idempotency guard).
+
+    Audit 2026-04-25 (W3/E2): the path-based exemption for /status and
+    /credentials/rotate has been replaced by a stricter VM-instance check.
+    Same-VM idempotent retries on terminal tasks are still allowed (so a
+    legitimate post-commit retry from the original agent succeeds), but a
+    DIFFERENT VM trying to override the status of a requeued task is now
+    rejected with 403 vm_instance_mismatch — failing fast on a real
+    failure mode, not on legitimate work.
+
+    Rejects tokens for tasks that are no longer active (completed/failed/cancelled),
+    EXCEPT when the same VM that the task is currently assigned to is retrying
+    /status or /credentials/rotate (idempotency).
     """
     payload = verify_agent_jwt(x_agent_token)
     task_id = payload.get("sub")
     if not task_id:
         return payload
+    token_vm = payload.get("vm_instance_id")
+    is_idempotent_path = request.url.path in (
+        "/api/agent/status", "/api/agent/credentials/rotate",
+    )
 
     # Fast path: known terminated (in-memory, O(1))
-    # Allow status + credentials/rotate endpoints through — agents may post
-    # final status retries and OAuth rotation after the task reaches terminal
-    # state in the DB. Both endpoints are idempotent.
+    # Same-VM retry on idempotent paths is allowed; a different-VM call is rejected.
     if task_id in _terminated_task_ids:
-        if request.url.path not in ("/api/agent/status", "/api/agent/credentials/rotate"):
+        if not is_idempotent_path:
             raise HTTPException(status_code=401, detail="Task is no longer active")
-        return payload
+        # Even on idempotent paths we'll fall through to the DB check so
+        # we can compare token_vm against task.vm_instance_id (the cache
+        # alone doesn't carry that field).
 
     # Fast path: recently verified as active (TTL cache)
     cached_expiry = _agent_active_cache.get(task_id)
-    if cached_expiry and time.time() < cached_expiry:
+    if cached_expiry and time.time() < cached_expiry and task_id not in _terminated_task_ids:
         return payload
 
     # Slow path: DB check (runs at most once per AGENT_CACHE_TTL per task)
@@ -137,15 +150,29 @@ async def verify_agent_token(
         session_factory = app.dependency_overrides.get(get_session, get_session)
         async for session in session_factory():
             task = await session.get(Task, uuid.UUID(task_id))
-            if task and task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            if task is None:
+                # Task not found in DB — fail open (may not be committed yet, or test scenario)
+                break
+            # Audit W3/E10: project_id authz when the token carries it.
+            token_project = payload.get("project_id")
+            if token_project and str(task.project_id) != token_project:
+                raise HTTPException(status_code=403, detail="project_mismatch")
+            # Audit W3/E2: stale-VM guard. If the task has been reassigned
+            # to a different VM (reaper requeue), the original agent's
+            # token must NOT be allowed to mutate state for the new VM's
+            # task. Same-VM retries are still allowed (idempotent path).
+            if (
+                token_vm
+                and task.vm_instance_id
+                and task.vm_instance_id != token_vm
+            ):
+                raise HTTPException(status_code=403, detail="vm_instance_mismatch")
+            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
                 _terminated_task_ids[task_id] = time.time()
-                # Allow status + credentials/rotate endpoints through —
-                # agents may retry final status POSTs and rotate refreshed
-                # OAuth tokens after the task reaches terminal state in the
-                # DB. Both are idempotent and bounded in scope.
-                if request.url.path not in ("/api/agent/status", "/api/agent/credentials/rotate"):
+                # Same-VM idempotent retry on terminal task is OK; different
+                # VM (or any non-idempotent path) fails fast.
+                if not is_idempotent_path:
                     raise HTTPException(status_code=401, detail="Task is no longer active")
-            # Task not found in DB — fail open (may not be committed yet, or test scenario)
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001 — fail open on DB errors so agents aren't blocked by transient DB issues
@@ -527,11 +554,37 @@ def _build_direction_narrative(direction: dict) -> "dict | None":
 
 @router.post("/refresh-token")
 @limiter.limit("120/minute")
-async def agent_refresh_token(request: Request, token: dict = Depends(verify_agent_token)):
+async def agent_refresh_token(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
     """
     Accepts a valid (non-expired) agent JWT and returns a new one with a fresh 8-hour TTL.
+
+    Audit 2026-04-25 (W3/E1/E2): refresh now also validates that the task
+    is still assigned to this VM — a stale agent whose task has been
+    requeued to a different VM gets 409 instead of a renewed token. The
+    project_id is included in the new token so the W3 cross-project
+    authz check (E10) can apply uniformly.
     """
-    new_token = create_agent_token(token["sub"], token["vm_instance_id"], task_type=token.get("task_type", ""))
+    task_id = token["sub"]
+    vm_id = token["vm_instance_id"]
+    task = await session.get(Task, uuid.UUID(task_id))
+    if task is None:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    if task.vm_instance_id != vm_id:
+        raise HTTPException(status_code=409, detail="vm_instance_mismatch")
+    if task.status not in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.QUEUED):
+        raise HTTPException(status_code=409, detail=f"task_not_active:{task.status}")
+    task.last_token_refresh_at = _utcnow()
+    await session.commit()
+    new_token = create_agent_token(
+        task_id,
+        vm_id,
+        task_type=token.get("task_type", ""),
+        project_id=token.get("project_id", "") or str(task.project_id),
+    )
     return {"token": new_token}
 
 
@@ -1402,7 +1455,8 @@ async def claim_task(
                                 compact_diff.append(item)
                         if compact_diff:
                             entry["pr_diff_summary"] = compact_diff
-                    fingerprint = pctx.get("_previous_error_fingerprint")
+                    # Audit W1: previous_error_fingerprint is now a column on the Task.
+                    fingerprint = pt.previous_error_fingerprint
                     if fingerprint:
                         entry["previous_error_fingerprint"] = str(fingerprint)
                     review_loop = pctx.get("review_loop")

@@ -2103,7 +2103,6 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
                 {"file": "foo.py", "additions": 10, "deletions": 5, "change_type": "modified"},
                 {"file": "bar.ts", "additions": 3, "deletions": 2, "change_type": "added"},
             ],
-            "_previous_error_fingerprint": "abc123def456",
             "_self_review_outcome": {
                 "verdict": "FAIL",
                 "notes": "lint errors remain",
@@ -2115,6 +2114,8 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
             },
             "review_loop": {"iteration": 3},
         },
+        # Audit W1: previous_error_fingerprint is a column.
+        previous_error_fingerprint="abc123def456",
         status=TaskStatus.FAILED,
         title="Prior failed task",
         latest_status_message="TypeError: cannot read property x of undefined",
@@ -3271,6 +3272,131 @@ async def test_external_api_permanent_auth_failure_does_not_requeue(client: Asyn
         assert "auth" in task.latest_status_message.lower() or "re-authenticate" in task.latest_status_message.lower(), (
             f"case {i}: status message should mention auth/re-authenticate, got: {task.latest_status_message!r}"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested_model", ["gemini-3.1-pro-preview", "gemini-3-pro-preview"])
+async def test_external_api_provider_model_config_falls_back_without_backoff(
+    requested_model, client: AsyncClient, db_session, mocker
+):
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.routers.agent_status.release_max_plan_account", new_callable=mocker.AsyncMock)
+    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=mocker.AsyncMock)
+
+    project = Project(name="Gemini Model Fallback Test", user_id="test-user-gemini-fallback")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Audit W1: retry_after_until is a column. Set it on the task directly.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "test", "model": requested_model}],
+        vm_instance_id="agent-vm-gemini-model-config",
+        status=TaskStatus.IN_PROGRESS,
+        retry_after_until=datetime(2026, 4, 25),
+        context={
+            "llm_account_id": "gemini-acct-1",
+            "max_plan_account_id": "gemini-acct-1",
+            "llm_provider": "gemini",
+            "llm_auth_mode": "api_key",
+            "llm_model": requested_model,
+            "llm_execution_mode": "default",
+            "_api_failure_retries": 2,
+            "blacklisted_accounts": ["gemini-acct-1"],
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-gemini-model-config")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "fatal",
+            "logs": "ModelNotFoundError: models/gemini-3.1-pro-preview is not found for API version v1beta",
+        },
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.payloads[0]["model"] == "gemini-2.5-pro"
+    ctx = task.context or {}
+    assert ctx["failure_category"] == "EXTERNAL_API"
+    assert ctx["external_api_subtype"] == "provider_model_config"
+    assert ctx["llm_provider"] == "gemini"
+    assert ctx["llm_auth_mode"] == "api_key"
+    assert ctx["llm_model"] == "gemini-2.5-pro"
+    assert "llm_account_id" not in ctx
+    assert "max_plan_account_id" not in ctx
+    assert "_api_failure_retries" not in ctx
+    assert task.retry_after_until is None  # column source of truth
+    assert "blacklisted_accounts" not in ctx
+    assert ctx["model_fallback"]["requested"] == requested_model
+    assert ctx["model_fallback"]["effective"] == "gemini-2.5-pro"
+    assert ctx["model_fallback"]["reason"] == "provider_model_config_rejection"
+
+
+@pytest.mark.asyncio
+async def test_external_api_provider_model_config_without_fallback_does_not_requeue(client: AsyncClient, db_session, mocker):
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=mocker.AsyncMock,
+        return_value={"status": "accepted"},
+    )
+
+    project = Project(name="Provider Model No Fallback Test", user_id="test-user-model-no-fallback")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work", "model": "gpt-no-such"}],
+        vm_instance_id="agent-vm-model-no-fallback",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "llm_provider": "openai",
+            "llm_auth_mode": "api_key",
+            "llm_model": "gpt-no-such",
+            "llm_execution_mode": "default",
+            "_api_failure_retries": 2,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-model-no-fallback")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "fatal",
+            "logs": "model not found: gpt-no-such",
+        },
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.attempt_count >= 3
+    ctx = task.context or {}
+    assert ctx["failure_category"] == "EXTERNAL_API"
+    assert ctx["external_api_subtype"] == "provider_model_config"
+    assert task.latest_status_message is not None
+    assert "model/config" in task.latest_status_message
 
 
 @pytest.mark.asyncio

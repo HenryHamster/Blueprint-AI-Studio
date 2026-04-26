@@ -915,7 +915,12 @@ async def _check_evaluating_timeouts():
 
     try:
         async with AsyncSessionLocal() as session:
+            from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle
+            from app.models import DeploymentState  # noqa: PLC0415
             now = _utcnow()
+            # Fetch DeployState once per cycle so CI backstop can subtract
+            # pause windows from elapsed (admin pause + auto-pause both count).
+            _deploy_state = await session.get(DeploymentState, 1)
             evaluating_tasks = (await session.execute(
                 select(Task).where(
                     Task.status == TaskStatus.EVALUATING,
@@ -1013,7 +1018,13 @@ async def _check_evaluating_timeouts():
                     if evaluating_since is None:
                         evaluating_since = task.started_at or task.created_at
 
-                    elapsed = (now - evaluating_since).total_seconds()
+                    # Pause-aware elapsed: subtract any pause windows that
+                    # occurred since the timer started. Legacy timers without
+                    # a stashed baseline fall back to raw elapsed.
+                    _ci_baseline = rl.get("ci_wait_pause_baseline")
+                    elapsed = pause_clock.active_elapsed(
+                        _deploy_state, evaluating_since, _ci_baseline,
+                    ) if _deploy_state else (now - evaluating_since).total_seconds()
                     # Early trigger: if CI has passed but review_approved is
                     # missing AND the review child task is already terminal
                     # (FAILED/CANCELLED), the review VM died silently — we
@@ -1091,6 +1102,10 @@ async def _check_evaluating_timeouts():
                             new_rl["review_recovery_attempted"] = True
                             new_rl["review_recovery_at"] = _utcnow().isoformat()
                             new_rl["ci_wait_started"] = _utcnow().isoformat()
+                            new_rl["ci_wait_pause_baseline"] = (
+                                pause_clock.total_paused_seconds(_deploy_state)
+                                if _deploy_state else 0.0
+                            )
                             task.context = {**(task.context or {}), "review_loop": new_rl}
                             flag_modified(task, "context")
                             task.latest_status_message = (
@@ -1320,16 +1335,20 @@ async def _sweep_post_commit_pending():
     When _process_post_commit (review-pipeline spawn, rollup gate handoff,
     completion handlers) times out — usually because GitHub quota hit 0 and
     a defensive call took > 240s to give up — agent_status.py sets
-    context._post_commit_pending = {at, reason, payload, attempts}.  The
-    idempotency guard in agent_status re-runs post-commit when the agent
+    Task.post_commit_pending = True and stores retry metadata under
+    context['_post_commit_pending_meta'] = {at, reason, payload, attempts}.
+    The idempotency guard in agent_status re-runs post-commit when the agent
     retries its status POST, but the agent VM has almost always terminated
     by then, so without this sweeper the task sits with its verdict/rollup
     state silently lost.
 
+    Audit W1 (A2/A5): post_commit_pending is a real column now; the scan
+    filter and clear go through the column instead of JSONB.
+
     This runs every 60s.  For each pending task:
       - Reconstruct AgentStatusPayload from the saved dict.
       - Call _process_post_commit on a fresh session.
-      - On success: clear the _post_commit_pending flag.
+      - On success: clear the post_commit_pending column.
       - On failure/timeout: bump attempts counter (max 5 — avoid infinite
         loop if the underlying cause is non-transient).
     """
@@ -1341,26 +1360,26 @@ async def _sweep_post_commit_pending():
         async with AsyncSessionLocal() as session:
             tasks = (await session.execute(
                 select(Task).where(
+                    Task.post_commit_pending.is_(True),
                     Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
                     Task.archived.is_(False),
-                    Task.context["_post_commit_pending"].is_not(None),
                 ).limit(50)
             )).scalars().all()
 
             if not tasks:
                 return
 
-            logger.info(f"[POST_COMMIT SWEEP] Found {len(tasks)} task(s) with _post_commit_pending")
+            logger.info(f"[POST_COMMIT SWEEP] Found {len(tasks)} task(s) with post_commit_pending")
 
             for task in tasks:
                 ctx = task.context or {}
-                pending = ctx.get("_post_commit_pending") or {}
-                attempts = int(pending.get("attempts", 0) or 0)
-                payload_dump = pending.get("payload")
+                pending_meta = ctx.get("_post_commit_pending_meta") or {}
+                attempts = int(pending_meta.get("attempts", 0) or 0)
+                payload_dump = pending_meta.get("payload")
 
                 if attempts >= MAX_ATTEMPTS:
-                    # Give up.  Convert the pending flag into a terminal marker
-                    # so the task doesn't keep getting picked up every sweep.
+                    # Give up.  Mark abandoned + clear pending so the task
+                    # doesn't keep getting picked up every sweep.
                     logger.warning(
                         f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} exceeded "
                         f"{MAX_ATTEMPTS} attempts — marking post_commit_abandoned"
@@ -1369,10 +1388,12 @@ async def _sweep_post_commit_pending():
                     new_ctx["_post_commit_abandoned"] = {
                         "at": _utcnow().isoformat(),
                         "after_attempts": attempts,
-                        "last_reason": pending.get("reason"),
+                        "last_reason": pending_meta.get("reason"),
                     }
-                    new_ctx.pop("_post_commit_pending", None)
+                    new_ctx.pop("_post_commit_pending_meta", None)
                     task.context = new_ctx
+                    task.post_commit_pending = False
+                    task.post_commit_failed = True
                     from sqlalchemy.orm.attributes import flag_modified
                     flag_modified(task, "context")
                     session.add(task)
@@ -1390,8 +1411,10 @@ async def _sweep_post_commit_pending():
                         "at": _utcnow().isoformat(),
                         "reason": "no_saved_payload",
                     }
-                    new_ctx.pop("_post_commit_pending", None)
+                    new_ctx.pop("_post_commit_pending_meta", None)
                     task.context = new_ctx
+                    task.post_commit_pending = False
+                    task.post_commit_failed = True
                     from sqlalchemy.orm.attributes import flag_modified
                     flag_modified(task, "context")
                     session.add(task)
@@ -1408,7 +1431,7 @@ async def _sweep_post_commit_pending():
 
                 logger.info(
                     f"[POST_COMMIT SWEEP] Retrying post-commit for task {str(task.id)[:8]} "
-                    f"(attempt {attempts + 1}/{MAX_ATTEMPTS}, reason={pending.get('reason')})"
+                    f"(attempt {attempts + 1}/{MAX_ATTEMPTS}, reason={pending_meta.get('reason')})"
                 )
                 try:
                     await _process_post_commit(task.id, _payload)
@@ -1417,8 +1440,9 @@ async def _sweep_post_commit_pending():
                     async with AsyncSessionLocal() as clear_session:
                         refreshed = await clear_session.get(Task, task.id)
                         if refreshed:
+                            refreshed.post_commit_pending = False
                             new_ctx = dict(refreshed.context or {})
-                            new_ctx.pop("_post_commit_pending", None)
+                            new_ctx.pop("_post_commit_pending_meta", None)
                             refreshed.context = new_ctx
                             from sqlalchemy.orm.attributes import flag_modified
                             flag_modified(refreshed, "context")
@@ -1437,10 +1461,10 @@ async def _sweep_post_commit_pending():
                         refreshed = await bump_session.get(Task, task.id)
                         if refreshed:
                             new_ctx = dict(refreshed.context or {})
-                            new_pending = dict(new_ctx.get("_post_commit_pending") or pending)
+                            new_pending = dict(new_ctx.get("_post_commit_pending_meta") or pending_meta)
                             new_pending["attempts"] = int(new_pending.get("attempts", attempts)) + 1
                             new_pending["last_retry_at"] = _utcnow().isoformat()
-                            new_ctx["_post_commit_pending"] = new_pending
+                            new_ctx["_post_commit_pending_meta"] = new_pending
                             refreshed.context = new_ctx
                             from sqlalchemy.orm.attributes import flag_modified
                             flag_modified(refreshed, "context")

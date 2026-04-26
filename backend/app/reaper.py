@@ -475,7 +475,8 @@ async def reaper_service():
                         _copy_analysis_artifacts_to_previous(rl_ctx)
                         rl_ctx = clear_task_llm_runtime_context(rl_ctx)
                         rl_ctx.pop("_slot_released", None)
-                        rl_ctx.pop("retry_after", None)  # clear any stale delay
+                        # Audit W1: retry_after_until is a column now.
+                        task.retry_after_until = None
                         # Rate-limit is an account-level issue, not a provision failure —
                         # don't carry provision budget into the next dispatch.
                         rl_ctx.pop("provision_failures", None)
@@ -723,7 +724,8 @@ async def reaper_service():
                                 import app.shared_state as _anomaly_state  # noqa: PLC0415
                                 _reap_failure_class = "PROVISION_FAILURE" if is_provision_failure else classify_failure(task, logs=combined_logs)
                                 _fingerprint = _error_fingerprint(reap_reason)
-                                reaper_ctx["_previous_error_fingerprint"] = _fingerprint
+                                # Audit W1: previous_error_fingerprint is a column.
+                                task.previous_error_fingerprint = _fingerprint
                                 _stage = _derive_failure_stage(_reap_failure_class, reap_reason)
                                 if _stage:
                                     reaper_ctx["_previous_failure_stage"] = _stage
@@ -820,8 +822,8 @@ async def reaper_service():
                             else:
                                 # Exponential backoff for agent failures: 1, 2, 4, 8 min capped at 15
                                 delay_minutes = min(2 ** (task.attempt_count - 1), 15) * random.uniform(0.75, 1.25)
-                            set_retry_after(reaper_ctx, delay_minutes)
                             task.context = reaper_ctx
+                            set_retry_after(task, delay_minutes)
                             session.add(task)
 
                         await broadcast_to_project(
@@ -1147,7 +1149,7 @@ async def reaper_service():
                         _new_ctx.pop("provision_failed_accounts", None)
                         _new_ctx = clear_task_llm_runtime_context(_new_ctx)
                         _new_ctx.pop("_slot_released", None)
-                        _new_ctx.pop("retry_after", None)
+                        _t.retry_after_until = None  # audit W1: column source of truth
                         _new_ctx.pop("failure_category", None)
                         # Clear EXTERNAL_API retry counter: a resurrected task that hits another
                         # API error would otherwise see stale _api_failure_retries > 5 and
@@ -1275,19 +1277,15 @@ async def reaper_service():
                     )).scalars().all()
                     _cleared = 0
                     for _qt in _queued_with_retry:
-                        _qctx = _qt.context or {}
-                        _ra = _qctx.get("retry_after")
-                        if _ra is None:
+                        # Audit W1: retry_after_until is a column now.
+                        if _qt.retry_after_until is None:
                             continue
-                        _parsed = parse_retry_after(_ra)
-                        if _parsed is None:
-                            logger.warning(f"[REAPER] Task {_qt.id}: clearing unparseable retry_after={_ra!r}")
-                        elif _parsed > _retry_cutoff:
-                            logger.warning(f"[REAPER] Task {_qt.id}: clearing far-future retry_after={_ra} (>{RETRY_AFTER_MAX_MINUTES}min)")
+                        if _qt.retry_after_until > _retry_cutoff:
+                            logger.warning(f"[REAPER] Task {_qt.id}: clearing far-future retry_after={_qt.retry_after_until.isoformat()} (>{RETRY_AFTER_MAX_MINUTES}min)")
                         else:
                             continue
-                        _new_ctx = dict(_qctx)
-                        _new_ctx.pop("retry_after", None)
+                        _qt.retry_after_until = None
+                        _new_ctx = dict(_qt.context or {})
                         _new_ctx.pop("_retry_after_resets", None)
                         _qt.context = _new_ctx
                         session.add(_qt)
@@ -1332,8 +1330,9 @@ async def reaper_service():
                             continue
 
                         _qt_type = (_qt.first_payload or {}).get("type", "unknown")
-                        _ra_raw = _qctx.get("retry_after")
-                        _ra_dt = parse_retry_after(_ra_raw) if _ra_raw else None
+                        # Audit W1: retry_after_until is a column.
+                        _ra_dt = _qt.retry_after_until
+                        _ra_raw = _ra_dt.isoformat() if _ra_dt else None
                         _ra_recent_cutoff = now - timedelta(minutes=5)
                         if _qt.requires_approval:
                             _likely_cause = "awaiting operator approval"

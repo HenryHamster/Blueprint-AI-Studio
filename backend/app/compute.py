@@ -249,6 +249,7 @@ async def prepare_and_store_agent_secret(
     execution_mode: str | None = None,
     provider_metadata: dict | None = None,
     provider_settings: dict | None = None,
+    project_id: str = "",  # audit W3/E10: needed for cross-project authz claim
 ) -> str | None:
     """Build agent credentials and store them in Secret Manager.
 
@@ -267,6 +268,7 @@ async def prepare_and_store_agent_secret(
         provider=provider,
         auth_mode=auth_mode,
         model=model,
+        project_id=project_id,
         execution_mode=execution_mode,
         provider_metadata=provider_metadata,
         provider_settings=provider_settings,
@@ -291,9 +293,12 @@ def build_agent_secret_manifest(
     execution_mode: str | None = None,
     provider_metadata: dict | None = None,
     provider_settings: dict | None = None,
+    project_id: str = "",
 ) -> dict:
     """Build the provider-aware secret manifest consumed by agent startup."""
-    agent_jwt = create_agent_token(str(task_id), vm_instance_id, task_type=task_type)
+    agent_jwt = create_agent_token(
+        str(task_id), vm_instance_id, task_type=task_type, project_id=project_id,
+    )
     provider_name = provider or LLMProviderName.ANTHROPIC.value
     provider_enum = LLMProviderName(provider_name)
     resolved_auth_mode = auth_mode or (
@@ -929,12 +934,24 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     _send_beacon() {{
       local msg="$1"
       local tok="$2"
-      [ -z "$tok" ] && return 0
-      curl -sf -X POST "{ORCHESTRATOR_URL}/api/agent/heartbeat" \
+      if [ -z "$tok" ]; then
+        echo "[BEACON_SKIPPED] no token yet for: $msg" >&2
+        return 0
+      fi
+      # Capture curl's stderr so a failed beacon is at least visible in the
+      # systemd journal (and therefore in any AGENT_DIED_EARLY capture later).
+      # Without this every beacon failure was silent — the symptom that drove
+      # the 2026-04-24 silent-pre-claim investigation.
+      local err curl_exit
+      err="$(curl -sf -X POST "{ORCHESTRATOR_URL}/api/agent/heartbeat" \
         -H "Content-Type: application/json" \
         -H "X-Agent-Token: $tok" \
         -d "$(printf '{{"task_id": "{task_id}", "status_message": "%s"}}' "$msg")" \
-        --connect-timeout 5 --max-time 10 >/dev/null 2>&1 || true
+        --connect-timeout 5 --max-time 10 2>&1 >/dev/null)"
+      curl_exit=$?
+      if [ "$curl_exit" -ne 0 ]; then
+        echo "[BEACON_FAILED] $msg :: ${{err:-curl failed with exit $curl_exit}}" >&2
+      fi
     }}
     EARLY_TOKEN="$(printf '%s' "$CREDS" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("env",{{}}).get("AGENT_SECRET_TOKEN",""))' 2>/dev/null || true)"
     _send_beacon "PROVISION_PROGRESS: creds fetched, entering env setup" "$EARLY_TOKEN"
@@ -1022,18 +1039,35 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     AGENT_TOKEN="${{AGENT_SECRET_TOKEN:-}}"
     ORCH_URL="${{ORCHESTRATOR_URL:-}}"
     if systemctl is-active --quiet blueprint-agent; then
-      curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \
+      # Capture curl's stderr so a failed startup-completed heartbeat is at
+      # least visible in the systemd journal. Previously this curl used `-sf`
+      # with no redirect — when the orchestrator was briefly unreachable the
+      # heartbeat silently dropped and the only signal was a missing
+      # status_log entry on the orchestrator side. Logged failures land in
+      # the journal and therefore in any AGENT_DIED_EARLY capture if the
+      # agent later dies before claiming.
+      _STARTUP_HB_ERR=""
+      _STARTUP_HB_EXIT=0
+      _STARTUP_HB_ERR="$(curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \
         -H "Content-Type: application/json" \
         -H "X-Agent-Token: $AGENT_TOKEN" \
         -d '{{"task_id": "{task_id}", "status_message": "Startup script completed, agent service started"}}' \
-        --connect-timeout 10 --max-time 15 && echo "PROVISION_HEALTH_OK" || echo "PROVISION_HEALTH_FAILED (agent will self-report via heartbeat)"
+        --connect-timeout 10 --max-time 15 2>&1 >/dev/null)"
+      _STARTUP_HB_EXIT=$?
+      if [ "$_STARTUP_HB_EXIT" -ne 0 ]; then
+        echo "PROVISION_HEALTH_FAILED: startup heartbeat curl failed :: ${{_STARTUP_HB_ERR:-curl exit $_STARTUP_HB_EXIT}}" >&2
+      else
+        echo "PROVISION_HEALTH_OK"
+      fi
     else
       # Agent service died within 30s — capture journal and report so the reaper's
       # "Silent pre-claim death" classification gets forensic evidence.  Without this
       # POST, the VM powers off and the orchestrator only knows that no heartbeat
-      # ever arrived.  Truncate to 3KB to fit in a reasonable status message.
+      # ever arrived.  Keep the LAST 3KB (tail) — the error and stack are at the
+      # end of the journal, while head would be just systemd boilerplate +
+      # the agent's banner line that tells us nothing about why it died.
       echo "Agent service died within 30s of start — capturing journal for diagnostics"
-      SERVICE_LOG="$(journalctl -u blueprint-agent --no-pager -n 50 2>/dev/null | tr '"' "'" | tr '\\n' ' ' | head -c 3000 || echo 'no journal')"
+      SERVICE_LOG="$(journalctl -u blueprint-agent --no-pager -n 50 2>/dev/null | tr '"' "'" | tr '\\n' ' ' | tail -c 3000 || echo 'no journal')"
       EXIT_STATUS="$(systemctl show blueprint-agent --property=ExecMainStatus --value 2>/dev/null || echo '?')"
       EXIT_CODE="$(systemctl show blueprint-agent --property=ExecMainCode --value 2>/dev/null || echo '?')"
       curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \

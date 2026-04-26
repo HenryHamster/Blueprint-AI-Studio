@@ -657,28 +657,34 @@ class TestDirectionLifecycleInvariants:
 
 MODULE_SIZE_LIMITS = {
     # (relative_path_from_app_dir, max_lines)
+    # Audit 2026-04-25 W1/W3: bumped a handful of ceilings after the
+    # pipeline-audit fix lap added prescribed fixes (column promotion,
+    # idempotency rewrite, JWT shape, auth path-exemption replacement,
+    # smoketest spawn alert, beacon error capture, gemini model fallback).
+    # Per `feedback_guardrails_not_straitjackets.md`: these are loose
+    # upper bounds, not ratchets — only bumped when work justifies it.
     "main.py": 3500,
     "task_completion.py": 2400,
     "task_lifecycle.py": 2550,
-    "orchestrator.py": 3000,
+    "orchestrator.py": 3100,
     "admin.py": 3000,
     "compute.py": 2500,
-    "github.py": 2000,
+    "github.py": 2050,
     "routers/admin_settings.py": 3000,
     "routers/admin_analytics.py": 800,
     "routers/admin_digest.py": 4200,
     "routers/admin_pool_accounts.py": 900,
     "max_plan_pool.py": 2100,
     "anomaly_detection.py": 2000,
-    "routers/agent.py": 2300,
+    "routers/agent.py": 2400,
     "services.py": 1700,
-    "routers/agent_status.py": 1550,
+    "routers/agent_status.py": 1700,
     "autonomous_research.py": 1800,
     "research_completion.py": 2050,
     "strategic_completion.py": 1500,
     "rollup_management.py": 1600,
     "reaper.py": 1450,
-    "review_pipeline.py": 1250,
+    "review_pipeline.py": 1300,
     "deploy_health.py": 1000,
 }
 

@@ -42,19 +42,22 @@ from app.orchestrator_filters import (
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config, sync_runtime_config_from_state as _sync_runtime_config_from_state
-from app.time_utils import _utcnow, rate_limit_retry_minutes, set_retry_after
+from app.time_utils import _utcnow, clear_retry_after, parse_retry_after, rate_limit_retry_minutes, set_retry_after
 
 logger = logging.getLogger("blueprint")
 
 
-def _clear_retry_after_state(ctx: dict) -> None:
-    """Clear retry_after hold and its reset counter.
+def _clear_retry_after_state(task_or_ctx) -> None:
+    """Clear retry_after hold and its reset counter on a Task or context dict.
 
     Why: the counter feeds an escalation alert; leaving it across recovery
     episodes causes false escalations on the next rate-limit episode.
+
+    Audit 2026-04-25 W1: ``task.retry_after_until`` is now a real column
+    so callers should pass the Task; the dict-only form is kept for legacy
+    callsites that operate on bare context dicts (e.g. spawn paths).
     """
-    ctx.pop("retry_after", None)
-    ctx.pop("_retry_after_resets", None)
+    clear_retry_after(task_or_ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -113,40 +116,114 @@ def _compute_retry_after_escalation_action(
     return None
 
 
+_STALL_TITLE_PREFIX = "Pipeline stalled —"
+
+
+def _missing_runtime_credentials_stall_reason(
+    *,
+    user_pool_count: int,
+    provider_account_count: int,
+    ready_provider_account_count: int,
+    runtime_provider: str | None,
+) -> str:
+    """Describe why dispatch cannot find any usable runtime credentials."""
+    if user_pool_count == 0:
+        return "no accounts configured"
+    if runtime_provider and provider_account_count == 0:
+        return f"no accounts configured for provider {runtime_provider}"
+    if ready_provider_account_count == 0:
+        provider_suffix = f" for provider {runtime_provider}" if runtime_provider else ""
+        return f"no ready accounts{provider_suffix}"
+    return "no eligible accounts or slot contention"
+
+
+def _format_stall_alert(
+    blockage_reasons: set[str] | None, earliest_recovery: datetime | None
+) -> tuple[str, str]:
+    """Build a truthful (title, body) for the all-accounts-blocked stall alert
+    from the per-cycle blockage reasons emitted by describe_pool_blockage().
+
+    A stall can come from rate-limit cooldown, slot/daily-cap contention,
+    missing accounts, or a mix. Each shape gets a distinct title so the
+    operator alert is not lying about why work isn't dispatching.
+
+    The title says "eligible" rather than "all" because describe_pool_blockage
+    summarizes per-task-model constraints — when only the model-eligible
+    candidates are exhausted, other accounts in the pool can still serve
+    different models. Calling that "all" was the 2026-04-24 misleading-alert
+    bug where the user saw "all rate-limited" while 50 other tasks completed.
+
+    With no reasons supplied (legacy callers / tests), fall back to the
+    rate-limit wording so dedup keys and copy stay stable.
+    """
+    recovery_iso = earliest_recovery.isoformat() if earliest_recovery else None
+    reasons = sorted(blockage_reasons) if blockage_reasons else []
+    if not reasons:
+        title = f"{_STALL_TITLE_PREFIX} eligible Max plan accounts rate-limited"
+        body = (
+            "Every dispatchable task was skipped because the model-eligible "
+            "Max plan accounts are in rate-limit cooldown. "
+            + (f"Earliest recovery: {recovery_iso}." if recovery_iso else "Waiting for cooldown.")
+        )
+        return title, body
+    rate_limited = any("rate-limit cooldown" in r or "rate-limited" in r for r in reasons)
+    capacity = any("slot contention" in r or "at capacity" in r for r in reasons)
+    no_pool_accounts = any(r == "no accounts configured" for r in reasons)
+    no_provider_accounts = any("no accounts configured for provider" in r for r in reasons)
+    no_ready_accounts = any("no ready accounts" in r for r in reasons)
+    if no_pool_accounts and not no_provider_accounts and not no_ready_accounts and not rate_limited and not capacity:
+        title = f"{_STALL_TITLE_PREFIX} no Max plan accounts configured"
+    elif (no_pool_accounts or no_provider_accounts or no_ready_accounts) and not rate_limited and not capacity:
+        title = f"{_STALL_TITLE_PREFIX} no Max plan accounts ready"
+    elif rate_limited and capacity:
+        title = f"{_STALL_TITLE_PREFIX} eligible Max plan accounts unavailable (rate limits + capacity)"
+    elif rate_limited:
+        title = f"{_STALL_TITLE_PREFIX} eligible Max plan accounts rate-limited"
+    elif capacity:
+        title = f"{_STALL_TITLE_PREFIX} eligible Max plan accounts at capacity"
+    else:
+        title = f"{_STALL_TITLE_PREFIX} eligible Max plan accounts unavailable"
+    body = "Every dispatchable task was skipped because: " + "; ".join(reasons) + "."
+    if rate_limited:
+        body += f" Earliest recovery: {recovery_iso}." if recovery_iso else " Waiting for cooldown."
+    return title, body
+
+
 async def _emit_all_accounts_blocked_stall(
-    session: AsyncSession, earliest_recovery: datetime | None
+    session: AsyncSession,
+    earliest_recovery: datetime | None,
+    blockage_reasons: set[str] | None = None,
 ) -> None:
     """Broadcast, alert, and notify operators that the pipeline is stalled on
     Max-plan account exhaustion. Intended to be called once per stall episode."""
-    from app.broadcast import broadcast_to_project, manager as ws_manager  # noqa: PLC0415
-    from app.models import Alert, AlertSeverity  # noqa: PLC0415
-    from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+    from app.broadcast import broadcast_to_project, manager as ws_manager
+    from app.models import Alert, AlertSeverity
+    from app.notification_dispatch import dispatch_external_notification
 
     recovery_iso = earliest_recovery.isoformat() if earliest_recovery else None
-    title = "Pipeline stalled — all Max plan accounts rate-limited"
-    msg = (
-        "Every dispatchable task was skipped because all Max plan accounts are "
-        "in rate-limit cooldown. "
-        + (f"Earliest recovery: {recovery_iso}." if recovery_iso else "Waiting for cooldown.")
-    )
+    title, msg = _format_stall_alert(blockage_reasons, earliest_recovery)
     try:
         await ws_manager.broadcast_to_all("pipeline_throttle", {
             "reason": "all_accounts_blocked",
             "detail": msg,
             "earliest_recovery": recovery_iso,
+            "blockage_reasons": sorted(blockage_reasons) if blockage_reasons else [],
         })
     except Exception:
         logger.exception("[ORCHESTRATOR] Failed to broadcast all_accounts_blocked throttle")
     try:
         projects = (await session.execute(select(Project))).scalars().all()
         project_ids = [p.id for p in projects]
+        # Dedup across the "Pipeline stalled — ..." family, not the exact
+        # title: with dynamic copy a new stall episode could otherwise stack
+        # a second alert if its blockage shape (rate-limit vs capacity) flips.
         existing_rows = (await session.execute(
             select(Alert.project_id).where(
                 Alert.project_id.in_(project_ids),
                 Alert.task_id.is_(None),
                 Alert.severity == AlertSeverity.ERROR,
                 Alert.dismissed_at.is_(None),
-                Alert.title == title,
+                Alert.title.like(f"{_STALL_TITLE_PREFIX}%"),
             )
         )).all() if project_ids else []
         projects_with_alert = {row[0] for row in existing_rows}
@@ -1003,33 +1080,26 @@ async def orchestrator_worker():
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
                 eligible_ids = []
                 for task in candidate_tasks:
-                    # Skip tasks held back due to retry_after delay
-                    retry_after_str = (task.context or {}).get("retry_after")
-                    if retry_after_str:
-                        try:
-                            retry_after_dt = datetime.fromisoformat(retry_after_str)
-                            if retry_after_dt > _utcnow():
-                                # Release rate-limit holds early when the dispatching user's
-                                # pool has recovered. _infra_wait holds wait for zone recovery.
-                                if not (task.context or {}).get("_infra_wait") and await _user_has_available_account(task):
-                                    ctx = dict(task.context or {})
-                                    _clear_retry_after_state(ctx)
-                                    task.context = ctx
-                                    session.add(task)
-                                    logger.info(f"[ORCHESTRATOR] Task {task.id} retry_after cleared early — account pool recovered")
-                                else:
-                                    logger.info(f"[ORCHESTRATOR] Task {task.id} held back — retry_after={retry_after_str}")
-                                    continue
-                        except (ValueError, TypeError):
-                            logger.warning(
-                                f"[ORCHESTRATOR] Task {task.id} has malformed retry_after={retry_after_str!r} — letting through"
-                            )
+                    # Skip tasks held back due to retry_after hold (audit W1:
+                    # ``retry_after_until`` is a column now, so a stale
+                    # in-memory copy can't shadow a fresh DB value).
+                    if task.retry_after_until and task.retry_after_until > _utcnow():
+                        # Release rate-limit holds early when the dispatching
+                        # user's pool has recovered. _infra_wait holds wait
+                        # for zone recovery.
+                        if not (task.context or {}).get("_infra_wait") and await _user_has_available_account(task):
+                            _clear_retry_after_state(task)
+                            session.add(task)
+                            logger.info(f"[ORCHESTRATOR] Task {task.id} retry_after cleared early — account pool recovered")
+                        else:
+                            logger.info(f"[ORCHESTRATOR] Task {task.id} held back — retry_after={task.retry_after_until.isoformat()}")
+                            continue
                     # Clear infra-wait flag when task becomes eligible again
                     if (task.context or {}).get("_infra_wait"):
                         ctx = dict(task.context or {})
                         ctx.pop("_infra_wait", None)
-                        _clear_retry_after_state(ctx)
                         task.context = ctx
+                        _clear_retry_after_state(task)
                         session.add(task)
 
                     deps = task.depends_on or []
@@ -1519,7 +1589,10 @@ async def orchestrator_worker():
                 # Zone pre-check: skip dispatch entirely if all GCP zones are in cooldown
                 if queued_tasks and not any_zone_available():
                     global _last_zone_exhaustion_log
-                    now_check = datetime.now(timezone.utc)
+                    # Audit W1/F8: use _utcnow() (naive UTC) so subtraction
+                    # against soonest_zone_recovery() (also naive) doesn't
+                    # raise on aware/naive mismatch.
+                    now_check = _utcnow()
                     if _last_zone_exhaustion_log is None or (now_check - _last_zone_exhaustion_log).total_seconds() >= 60:
                         _last_zone_exhaustion_log = now_check
                         recovery = soonest_zone_recovery()
@@ -1591,6 +1664,7 @@ async def orchestrator_worker():
                 _cycle_accounts_blocked = 0
                 _cycle_dispatched = 0
                 _cycle_earliest_recovery: datetime | None = None
+                _cycle_blockage_reasons: set[str] = set()
 
                 for task in queued_tasks:
                     # Per-type failure gate: skip tasks whose type is currently failing
@@ -1689,6 +1763,7 @@ async def orchestrator_worker():
                             _pool_summary = summarize_pool_state(task_model, user_id=dispatch_user_id)
                             earliest_recovery = _pool_summary["earliest_recovery"]
                             stall_msg = describe_pool_blockage(task_model, user_id=dispatch_user_id)
+                            _cycle_blockage_reasons.add(stall_msg)
                             if earliest_recovery:
                                 stall_delay_minutes = rate_limit_retry_minutes(earliest_recovery)
                             else:
@@ -1829,6 +1904,14 @@ async def orchestrator_worker():
                             )
                         else:
                             logger.warning(f"[ORCHESTRATOR] No credentials available — skipping task {task.id}")
+                            stall_msg = _missing_runtime_credentials_stall_reason(
+                                user_pool_count=len(user_pool),
+                                provider_account_count=len(provider_accounts),
+                                ready_provider_account_count=len(ready_provider_accounts),
+                                runtime_provider=runtime_provider,
+                            )
+                            _cycle_blockage_reasons.add(stall_msg)
+                            _cycle_accounts_blocked += 1
                             # Update directly on the locked task object (separate session would deadlock)
                             task.latest_status_message = (
                                 "Waiting for credentials — add an LLM account or set "
@@ -1915,6 +1998,7 @@ async def orchestrator_worker():
                                     provider=llm_provider, auth_mode=llm_auth_mode, model=llm_model,
                                     execution_mode=llm_execution_mode, provider_metadata=llm_provider_metadata,
                                     provider_settings=llm_provider_settings,
+                                    project_id=str(task.project_id),  # audit W3/E10
                                 ),
                             )
 
@@ -2024,11 +2108,12 @@ async def orchestrator_worker():
                                                 # Align retry with zone recovery; cap at 30 min
                                                 recovery = soonest_zone_recovery()
                                                 if recovery:
-                                                    wait_sec = max(60, (recovery - datetime.now(timezone.utc)).total_seconds() + 60)
+                                                    # Audit W1/F8: _utcnow() for naive subtraction
+                                                    wait_sec = max(60, (recovery - _utcnow()).total_seconds() + 60)
                                                     delay_min = min(wait_sec / 60, 30)
                                                 else:
                                                     delay_min = 10
-                                                set_retry_after(ctx, delay_min)
+                                                set_retry_after(failed_task, delay_min)
                                                 failed_task.latest_status_message = f"Infra-wide provision failure (#{infra_count}), requeued — waiting for zone recovery: {provision_err or 'unknown'}"[:500]
                                                 logger.warning(f"[ORCHESTRATOR] Task {t_id} infra provision failure — requeuing without burning retry budget (delay {delay_min:.0f}min)")
                                             else:
@@ -2072,7 +2157,9 @@ async def orchestrator_worker():
                                                     failed_task.last_heartbeat = None
                                                     failed_task.started_at = None
                                                     # Back off 2 min per failure to let zones recover
-                                                    set_retry_after(ctx, 2 * prov_failures)
+                                                    failed_task.context = ctx
+                                                    set_retry_after(failed_task, 2 * prov_failures)
+                                                    ctx = dict(failed_task.context or {})
                                                     failed_task.latest_status_message = f"Provision failed (attempt {prov_failures}/{max_prov_retries}), requeued: {provision_err or 'unknown'}"
                                                     logger.warning(f"[ORCHESTRATOR] Task {t_id} provision failed (attempt {prov_failures}) — requeuing")
 
@@ -2137,7 +2224,9 @@ async def orchestrator_worker():
                             logger.exception("[ORCHESTRATOR] Failed to broadcast rate_limit_stall_resolved")
                 elif _stall_action == "fire":
                     _all_accounts_blocked_alerted = True
-                    await _emit_all_accounts_blocked_stall(session, _cycle_earliest_recovery)
+                    await _emit_all_accounts_blocked_stall(
+                        session, _cycle_earliest_recovery, _cycle_blockage_reasons or None
+                    )
 
                 # Per-cycle broadcast so operators can see held-task counts in
                 # the admin UI without tailing logs. Distinct from the debounced
@@ -2182,8 +2271,17 @@ async def orchestrator_worker():
                     # without setting ci_wait_started, which silently disables the timeout.
                     # Commit immediately so the update is persisted even if we continue below.
                     if not ci_loop.get("ci_wait_started"):
+                        from app import pause_clock  # noqa: PLC0415
                         ci_loop["ci_wait_started"] = _utcnow().isoformat()
+                        ci_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(session)
                         ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                        # Without flag_modified, JSONB nested-dict mutations
+                        # may not be detected by SQLAlchemy when the new outer
+                        # dict shares the same review_loop reference as the
+                        # old. Drives the 2026-04-24 "CI wait exceeded 20min"
+                        # flap where escalated/ci_last_polled never persisted.
+                        from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                        flag_modified(ci_task, "context")
                         session.add(ci_task)
                         await session.commit()
 
@@ -2215,6 +2313,14 @@ async def orchestrator_worker():
                             if not ci_loop.get("escalated"):
                                 ci_loop["escalated"] = True
                                 ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                # See note at the ci_wait_started persist above
+                                # — without flag_modified the escalated flag
+                                # silently fails to persist, the next cycle
+                                # reads escalated=False, and this whole block
+                                # re-fires every 2-4s, which is exactly the
+                                # "CI wait exceeded 20min" flap pattern.
+                                from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                flag_modified(ci_task, "context")
                                 ci_task.latest_status_message = f"CI wait exceeded {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — retrying, alert sent"
                                 session.add(ci_task)
                                 await _maybe_create_failure_alert(
@@ -2266,6 +2372,8 @@ async def orchestrator_worker():
                                 ci_loop["ci_last_polled"] = _utcnow().isoformat()
                                 ci_loop["ci_poll_interval"] = min((ci_loop.get("ci_poll_interval", 30)) * 2, 300)
                                 ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                flag_modified(ci_task, "context")
                                 logger.warning(f"[CI] Transient error fetching PR #{ci_pr_number} for task {ci_task.id} "
                                                f"(attempt {_fetch_failures}): {exc.detail}")
                                 session.add(ci_task)
@@ -2273,6 +2381,7 @@ async def orchestrator_worker():
                                 if _fetch_failures >= 10 and not ci_loop.get("fetch_escalated"):
                                     ci_loop["fetch_escalated"] = True
                                     ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                                    flag_modified(ci_task, "context")
                                     await _maybe_create_failure_alert(ci_task, session,
                                         f"PR #{ci_pr_number} GitHub API failures ({_fetch_failures}x) — still retrying")
                                     session.add(ci_task)
@@ -2757,6 +2866,12 @@ async def orchestrator_worker():
                             ci_loop["ci_last_polled"] = _utcnow().isoformat()
                             ci_loop["head_sha"] = ci_head_sha
                             ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
+                            # JSONB nested-dict mutation needs flag_modified —
+                            # otherwise ci_last_polled/poll_interval don't
+                            # persist and the per-task 30s skip never engages,
+                            # so the orchestrator hammers GitHub every 2s.
+                            from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                            flag_modified(ci_task, "context")
                             session.add(ci_task)
                             await session.commit()
                             await broadcast_to_project(str(ci_task.project_id), "task_updated",
@@ -2796,28 +2911,25 @@ async def orchestrator_worker():
                 # The agent retry handles most cases via the idempotency guard
                 # modification, but if all retries failed the flag persists here.
                 # Scan for these and directly spawn the missing review.
+                # Audit W1 (A2/A5): post_commit_pending is now a column, so the
+                # scan filter and clears go through the column instead of JSONB.
                 try:
                     pending_tasks = (await session.execute(
                         select(Task).where(
+                            Task.post_commit_pending.is_(True),
                             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
                         ).limit(50)
                     )).scalars().all()
                     for pt in pending_tasks:
-                        if not (pt.context or {}).get("_post_commit_pending"):
-                            continue
                         if pt.status != TaskStatus.COMPLETED:
-                            ctx = dict(pt.context or {})
-                            ctx.pop("_post_commit_pending", None)
-                            pt.context = ctx
+                            pt.post_commit_pending = False
                             session.add(pt)
                             await session.commit()
                             continue
                         pt_payload = pt.first_payload
                         pt_type = pt_payload.get("type", "create")
                         if pt_type not in ("create", "refactor", "docs", "qa", "deps", "migrate", ""):
-                            ctx = dict(pt.context or {})
-                            ctx.pop("_post_commit_pending", None)
-                            pt.context = ctx
+                            pt.post_commit_pending = False
                             session.add(pt)
                             await session.commit()
                             continue
@@ -2828,18 +2940,14 @@ async def orchestrator_worker():
                             ).limit(1)
                         )).scalars().first()
                         if not pr_artifact or not pr_artifact.url:
-                            ctx = dict(pt.context or {})
-                            ctx.pop("_post_commit_pending", None)
-                            pt.context = ctx
+                            pt.post_commit_pending = False
                             session.add(pt)
                             await session.commit()
                             continue
                         try:
                             pc_pr_number = int(pr_artifact.url.rstrip("/").split("/")[-1])
                         except (ValueError, IndexError):
-                            ctx = dict(pt.context or {})
-                            ctx.pop("_post_commit_pending", None)
-                            pt.context = ctx
+                            pt.post_commit_pending = False
                             session.add(pt)
                             await session.commit()
                             continue
@@ -2853,9 +2961,7 @@ async def orchestrator_worker():
                             pt, "review", session, pc_pr_number, pc_branch, pc_base,
                             original_prompt=pc_prompt, original_task_id=str(pt.id)
                         )
-                        ctx = dict(pt.context or {})
-                        ctx.pop("_post_commit_pending", None)
-                        pt.context = ctx
+                        pt.post_commit_pending = False
                         if review_task and was_created:
                             logger.info(f"[RECOVERY] Spawned review {review_task.id} for orphaned PR #{pc_pr_number} (task {pt.id})")
                         elif review_task:

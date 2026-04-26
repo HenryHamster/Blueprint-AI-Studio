@@ -1543,8 +1543,8 @@ async def test_reaper_infra_provision_failure_with_zone_recovery(reaper_db, mock
     assert ctx.get("provision_failures", 0) == 0
     assert ctx.get("provision_failures_infra", 0) == 1
     assert ctx.get("_infra_wait") is True
-    # retry_after must be set (aligned with zone recovery)
-    assert ctx.get("retry_after") is not None
+    # Audit W1: retry_after_until is a column. Must be set (aligned with zone recovery).
+    assert task.retry_after_until is not None
 
 
 # ── Rate-limit detection ────────────────────────────────────────────────────
@@ -2939,16 +2939,18 @@ async def test_infra_recovery_resurrects_rate_limit_when_account_available(reape
     await reaper_db.commit()
     await reaper_db.refresh(project)
 
+    # Audit W1: retry_after_until is a column. The resurrection path in
+    # reaper.py clears the column directly.
     task = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "do work"}],
         status=TaskStatus.FAILED,
         attempt_count=3,
+        retry_after_until=datetime(2026, 1, 1),
         context={
             "failure_category": "RATE_LIMIT",
             "blacklisted_accounts": ["acct-blacklisted"],
             "max_plan_account_id": "acct-blacklisted",
-            "retry_after": "2026-01-01T00:00:00Z",
         },
         updated_at=datetime.utcnow() - timedelta(minutes=30),
     )
@@ -2969,7 +2971,7 @@ async def test_infra_recovery_resurrects_rate_limit_when_account_available(reape
     # Rate limit retry state cleared
     assert "blacklisted_accounts" not in ctx
     assert "max_plan_account_id" not in ctx
-    assert "retry_after" not in ctx
+    assert task.retry_after_until is None  # column cleared
     assert "failure_category" not in ctx
     assert task.attempt_count == 0
 
@@ -3196,14 +3198,17 @@ async def test_reaper_queued_age_alert_retry_after_cause(reaper_db, mocker):
     await reaper_db.commit()
     await reaper_db.refresh(project)
 
-    future = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=10)).isoformat()
+    # Audit W1: retry_after_until is a column. The escalation counter
+    # _retry_after_resets stays in JSONB.
+    future_dt = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=10)
     stale_task = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "rate-limited"}],
         status=TaskStatus.QUEUED,
         requires_approval=False,
         created_at=datetime.now(timezone.utc) - timedelta(hours=3),
-        context={"retry_after": future, "_retry_after_resets": 4},
+        retry_after_until=future_dt,
+        context={"_retry_after_resets": 4},
     )
     reaper_db.add(stale_task)
     await reaper_db.commit()
@@ -3355,28 +3360,29 @@ async def test_reaper_clears_far_future_retry_after(reaper_db, mocker):
     await reaper_db.commit()
     await reaper_db.refresh(project)
 
-    far_future = (datetime.utcnow() + timedelta(hours=5)).isoformat()
+    # Audit W1: retry_after is now a column (Task.retry_after_until); the
+    # context counter (_retry_after_resets) stays in JSONB for escalation logic.
+    far_future_dt = datetime.utcnow() + timedelta(hours=5)
+    valid_dt = datetime.utcnow() + timedelta(minutes=5)
     stale_task = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "do work"}],
         status=TaskStatus.QUEUED,
-        context={"retry_after": far_future, "_retry_after_resets": 2},
+        retry_after_until=far_future_dt,
+        context={"_retry_after_resets": 2},
     )
-    malformed_task = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "prompt": "more work"}],
-        status=TaskStatus.QUEUED,
-        context={"retry_after": "not-a-timestamp"},
-    )
+    # Note: a "malformed" timestamp can no longer be set on a typed column,
+    # so the malformed-input case is now structurally impossible. The sweep
+    # only needs to handle far-future values.
     valid_task = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "ok work"}],
         status=TaskStatus.QUEUED,
-        context={"retry_after": (datetime.utcnow() + timedelta(minutes=5)).isoformat()},
+        retry_after_until=valid_dt,
     )
-    reaper_db.add_all([stale_task, malformed_task, valid_task])
+    reaper_db.add_all([stale_task, valid_task])
     await reaper_db.commit()
-    for t in (stale_task, malformed_task, valid_task):
+    for t in (stale_task, valid_task):
         await reaper_db.refresh(t)
 
     try:
@@ -3385,20 +3391,16 @@ async def test_reaper_clears_far_future_retry_after(reaper_db, mocker):
         pass
 
     await reaper_db.refresh(stale_task)
-    await reaper_db.refresh(malformed_task)
     await reaper_db.refresh(valid_task)
 
-    assert "retry_after" not in (stale_task.context or {}), (
+    assert stale_task.retry_after_until is None, (
         "far-future retry_after should have been cleared"
     )
     assert "_retry_after_resets" not in (stale_task.context or {}), (
         "_retry_after_resets must be cleared alongside retry_after to avoid "
         "false escalations on the next rate-limit episode"
     )
-    assert "retry_after" not in (malformed_task.context or {}), (
-        "unparseable retry_after should have been cleared"
-    )
-    assert (valid_task.context or {}).get("retry_after"), (
+    assert valid_task.retry_after_until is not None, (
         "valid (<=30min) retry_after should be preserved"
     )
 

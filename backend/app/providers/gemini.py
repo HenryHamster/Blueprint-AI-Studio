@@ -572,4 +572,5 @@ class GeminiProvider(LLMProvider):
         """
         if not isinstance(model, str):
             return None
-        return _PREVIEW_TO_GA_FALLBACK.get(model.strip())
+        normalized = _LEGACY_MODEL_ALIASES.get(model.strip(), model.strip())
+        return _PREVIEW_TO_GA_FALLBACK.get(normalized)

@@ -67,17 +67,32 @@ def verify_ws_ticket(ticket: str) -> dict:
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid ticket")
 
-def create_agent_token(task_id: str, vm_instance_id: str, task_type: str = "") -> str:
+AGENT_TOKEN_TTL_HOURS = 8  # was 2; raised so long-running tasks don't 401 mid-execution.
+
+
+def create_agent_token(
+    task_id: str,
+    vm_instance_id: str,
+    task_type: str = "",
+    project_id: str = "",
+    ttl_hours: int = AGENT_TOKEN_TTL_HOURS,
+) -> str:
+    """Generate a short-lived JWT for a specific agent VM.
+
+    Audit 2026-04-25 (W3): claims now include project_id (E10) and a
+    longer 8h TTL with refresh endpoint, so long-running tasks don't
+    self-terminate when the token expires mid-execution. task_type and
+    vm_instance_id remain so per-endpoint authz (E2/E3) can validate
+    without an extra DB lookup.
     """
-    Generate a short-lived JWT for a specific agent VM.
-    Includes task_type so endpoints can authorize by agent role.
-    """
-    expire = datetime.now(timezone.utc) + timedelta(hours=2)  # VM TTL is 1h, 2h gives margin
+    expire = datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
     to_encode = {
         "sub": str(task_id),
         "vm_instance_id": vm_instance_id,
         "task_type": task_type,
-        "exp": expire
+        "project_id": project_id,
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
     }
     encoded_jwt = jwt.encode(to_encode, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM)
     return encoded_jwt

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -53,13 +54,16 @@ async def _create_auto_remediation_task(
     sha: str = "abc123",
     created_at_offset: timedelta | None = None,
 ) -> Task:
-    """Create an auto-remediation task for guard-rail testing."""
+    """Create an auto-remediation task for guard-rail testing.
+
+    Audit W1: auto_remediation is a column now.
+    """
     task = Task(
         project_id=project_id,
         title="Auto-fix: CI failure on main",
         payloads=[{"type": "create", "prompt": "fix it"}],
+        auto_remediation=True,
         context={
-            "auto_remediation": True,
             "ci_failure_sha": sha,
             "ci_failure_branch": "main",
         },
@@ -118,11 +122,16 @@ def _sign_webhook_payload(payload_bytes: bytes) -> str:
 
 
 async def _count_auto_tasks(session: AsyncSession, project_id: uuid.UUID) -> int:
-    """Count tasks with auto_remediation=True in the project."""
-    all_tasks = (await session.execute(
-        select(Task).where(Task.project_id == project_id)
-    )).scalars().all()
-    return sum(1 for t in all_tasks if (t.context or {}).get("auto_remediation") is True)
+    """Count tasks with auto_remediation=True in the project.
+
+    Audit W1: auto_remediation is now a column (was JSONB context key).
+    """
+    return (await session.execute(
+        select(func.count()).select_from(Task).where(
+            Task.project_id == project_id,
+            Task.auto_remediation.is_(True),
+        )
+    )).scalar() or 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,7 +166,7 @@ async def test_happy_path_spawns_task(db_session: AsyncSession):
     task = tasks[0]
     assert task.status == TaskStatus.QUEUED
     assert task.created_by == "SYSTEM_AUTO_REMEDIATION"
-    assert task.context["auto_remediation"] is True
+    assert task.auto_remediation is True  # audit W1: column source of truth
     assert task.context["ci_failure_sha"] == "deadbeef"
     assert task.context["ci_failure_branch"] == "main"
     assert task.context["ci_failure_type"] == "test"
@@ -196,17 +205,20 @@ async def test_task_context_includes_error_fingerprint(db_session: AsyncSession)
 
     tasks = await session_tasks(db_session, project.id)
     assert len(tasks) == 1
+    # Audit W1: previous_error_fingerprint is now a column (was JSONB key).
     # Fingerprint is stage-aware: "AssertionError ... test_foo" → stage="test".
-    assert tasks[0].context["_previous_error_fingerprint"] == _error_fingerprint(error_summary, "test")
+    assert tasks[0].previous_error_fingerprint == _error_fingerprint(error_summary, "test")
 
 
 async def session_tasks(session: AsyncSession, project_id: uuid.UUID) -> list[Task]:
+    # Audit W1: filter on the column directly.
     result = await session.execute(
         select(Task).where(
             Task.project_id == project_id,
+            Task.auto_remediation.is_(True),
         )
     )
-    return [t for t in result.scalars().all() if (t.context or {}).get("auto_remediation")]
+    return list(result.scalars().all())
 
 
 @pytest.mark.asyncio
@@ -860,13 +872,14 @@ async def test_per_fingerprint_cap_blocks_repeat_spawn(db_session: AsyncSession)
     stage = _derive_failure_stage("CODE_ERROR", err)
     fp = _error_fingerprint(err, stage)
     for _ in range(3):
+        # Audit W1: auto_remediation + previous_error_fingerprint are columns.
         t = Task(
             project_id=project.id,
             payloads=[{"type": "create", "prompt": "x"}],
+            auto_remediation=True,
+            previous_error_fingerprint=fp,
             context={
-                "auto_remediation": True,
                 "ci_failure_branch": "main",
-                "_previous_error_fingerprint": fp,
             },
             status=TaskStatus.FAILED,
             created_by="SYSTEM_AUTO_REMEDIATION",
@@ -916,7 +929,7 @@ async def test_full_ci_remediation_cycle_spawn_to_trackable_outcome(db_session: 
     task = spawned[0]
 
     # (2) Verify context fields required for downstream tracking
-    assert task.context["auto_remediation"] is True
+    assert task.auto_remediation is True  # audit W1: column source of truth
     assert task.context["trigger_failure_class"] == "CODE_ERROR"
     assert task.context["ci_failure_type"] == "test"
     assert task.context["ci_failure_sha"] == "cafed00d"
@@ -928,13 +941,15 @@ async def test_full_ci_remediation_cycle_spawn_to_trackable_outcome(db_session: 
 
     # (4) Verify the task is queryable as a completed CI auto-remediation and
     # aggregatable by trigger_failure_class — the shape the digest funnel relies on.
+    # Audit W1: filter on the column directly.
     result = await db_session.execute(
         select(Task).where(
             Task.project_id == project.id,
             Task.status == TaskStatus.COMPLETED,
+            Task.auto_remediation.is_(True),
         )
     )
-    completed = [t for t in result.scalars().all() if (t.context or {}).get("auto_remediation") is True]
+    completed = list(result.scalars().all())
     assert len(completed) == 1
 
     by_trigger: dict[str, int] = {}
@@ -1060,11 +1075,12 @@ async def test_pipeline_exhaustion_propagates_to_auto_remediation_branch(db_sess
     project = await _create_project(db_session)
     await db_session.flush()
 
+    # Audit W1: auto_remediation is a column.
     original = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "auto-fix CI", "base_branch": "main"}],
+        auto_remediation=True,
         context={
-            "auto_remediation": True,
             "ci_failure_sha": "abc123",
             "ci_failure_branch": "main",
         },
@@ -1244,13 +1260,14 @@ async def test_remediation_outcome_recorded_when_auto_remediation_merges(db_sess
         db_session,
         directions=[{"id": direction_id, "title": "fix auth", "status": "active"}],
     )
+    # Audit W1: auto_remediation is a column.
     task = Task(
         project_id=project.id,
         title="Auto-fix",
         payloads=[{"type": "create", "prompt": "fix"}],
         status=TaskStatus.COMPLETED,
+        auto_remediation=True,
         context={
-            "auto_remediation": True,
             "diagnosis_task_id": str(uuid.uuid4()),
             "direction_id": direction_id,
             "diagnosis_fingerprint": "fp-abc",
@@ -1278,13 +1295,14 @@ async def test_remediation_outcome_recorded_for_fingerprint_matched_merge(db_ses
         db_session,
         directions=[{"id": direction_id, "title": "fix auth", "status": "active"}],
     )
+    # Audit W1: auto_remediation is now a column.
     task = Task(
         project_id=project.id,
         title="Auto-fix",
         payloads=[{"type": "create", "prompt": "fix"}],
         status=TaskStatus.COMPLETED,
+        auto_remediation=True,
         context={
-            "auto_remediation": True,
             "direction_id": direction_id,
             "diagnosis_fingerprint": "fp-fm",
         },
@@ -1298,7 +1316,7 @@ async def test_remediation_outcome_recorded_for_fingerprint_matched_merge(db_ses
     ctx = task.context or {}
     guard_fires = bool(
         ctx.get("diagnosis_task_id")
-        or (ctx.get("auto_remediation") is True and ctx.get("direction_id"))
+        or (task.auto_remediation and ctx.get("direction_id"))
     )
     assert guard_fires
 
@@ -1314,15 +1332,16 @@ async def test_remediation_outcome_recorded_for_fingerprint_matched_merge(db_ses
 async def test_find_recent_merged_remediation_matches_branch_and_fingerprint(db_session: AsyncSession):
     """A recent completed auto-remediation task with matching branch+fingerprint is found."""
     project = await _create_project(db_session)
+    # Audit W1: auto_remediation + previous_error_fingerprint are columns.
     prior = Task(
         project_id=project.id,
         title="Auto-fix: CI failure on main",
         payloads=[{"type": "create"}],
         status=TaskStatus.COMPLETED,
+        auto_remediation=True,
+        previous_error_fingerprint="fp-xyz",
         context={
-            "auto_remediation": True,
             "ci_failure_branch": "main",
-            "_previous_error_fingerprint": "fp-xyz",
         },
     )
     db_session.add(prior)
@@ -1353,15 +1372,16 @@ async def test_regression_detection_injects_context_and_prompt(db_session: Async
     # Mirror production: prior remediation tasks persist the stage-aware
     # fingerprint, so the regression probe must match that exact form.
     fp = _error_fingerprint(err, _derive_failure_stage("CODE_ERROR", err))
+    # Audit W1: auto_remediation + previous_error_fingerprint are columns.
     prior = Task(
         project_id=project.id,
         title="Auto-fix: CI failure on main",
         payloads=[{"type": "create"}],
         status=TaskStatus.COMPLETED,
+        auto_remediation=True,
+        previous_error_fingerprint=fp,
         context={
-            "auto_remediation": True,
             "ci_failure_branch": "main",
-            "_previous_error_fingerprint": fp,
             "merged_pr_number": 4242,
         },
     )
@@ -1393,12 +1413,14 @@ async def test_regression_task_failure_suspends_at_threshold_one(db_session: Asy
     from app.notification_dispatch import post_auto_fix_result_message
 
     project = await _create_project(db_session)
+    # Audit W1: auto_remediation is a column.
     task = Task(
         project_id=project.id,
         title="Auto-fix regression",
         payloads=[{"type": "create"}],
         status=TaskStatus.FAILED,
-        context={"auto_remediation": True, "regression_of_task_id": str(uuid.uuid4())},
+        auto_remediation=True,
+        context={"regression_of_task_id": str(uuid.uuid4())},
     )
     db_session.add(task)
     await db_session.flush()

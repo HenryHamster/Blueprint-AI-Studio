@@ -552,6 +552,7 @@ async def test_rate_limit_requeue_blacklists_account_and_skips_budget(
     mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
 
     project = await _make_project(reaper_db)
+    # Audit W1: retry_after_until is a column.
     t = Task(
         project_id=project.id,
         # _extract_task_model reads payloads[0]["model"]
@@ -560,10 +561,10 @@ async def test_rate_limit_requeue_blacklists_account_and_skips_budget(
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
         last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        retry_after_until=datetime(2099, 1, 1),  # should be cleared
         context={
             "max_plan_account_id": "acct-123",
             "last_error": "API Error: rate limit reached",
-            "retry_after": "2099-01-01T00:00:00",  # should be cleared
             "provision_failures": 2,  # should be dropped (account-level issue)
         },
     )
@@ -578,7 +579,7 @@ async def test_rate_limit_requeue_blacklists_account_and_skips_budget(
     assert t.attempt_count == 1, "rate-limit path must not burn attempt budget"
     assert "acct-123" in (ctx.get("blacklisted_accounts") or [])
     assert "max_plan_account_id" not in ctx
-    assert "retry_after" not in ctx, "stale retry_after must be cleared on rate-limit requeue"
+    assert t.retry_after_until is None, "stale retry_after must be cleared on rate-limit requeue"
     assert "provision_failures" not in ctx
     # reaper plumbs structured rate-limit signal (retry_after_seconds, kind) through;
     # on a generic Anthropic rate-limit message, the signal resolves to the baseline
@@ -673,9 +674,9 @@ async def test_external_api_retry_delay_escalates_with_attempt_count(
 
     assert t.status == TaskStatus.QUEUED
     assert t.attempt_count == 3
-    ra = (t.context or {}).get("retry_after")
-    assert ra, "retry_after must be set after a reaped retry"
-    delay_min = (datetime.fromisoformat(ra) - before).total_seconds() / 60
+    # Audit W1: retry_after_until is a column.
+    assert t.retry_after_until is not None, "retry_after must be set after a reaped retry"
+    delay_min = (t.retry_after_until - before).total_seconds() / 60
     # 30 min * 0.9 = 27 min. Without escalation (e.g. general backoff at attempt 3)
     # we'd see min(2^2, 15) * 0.9 = 3.6 min, so the 20-min floor confirms escalation.
     assert 20 <= delay_min <= 29, f"expected ~27min (30min * 0.9 jitter), got {delay_min:.1f}min"
@@ -713,9 +714,9 @@ async def test_external_api_transient_5xx_uses_short_first_delay(
 
     assert t.status == TaskStatus.QUEUED
     assert t.attempt_count == 1
-    ra = (t.context or {}).get("retry_after")
-    assert ra
-    delay_min = (datetime.fromisoformat(ra) - before).total_seconds() / 60
+    # Audit W1: retry_after_until is a column.
+    assert t.retry_after_until is not None
+    delay_min = (t.retry_after_until - before).total_seconds() / 60
     # 1.5 min * 1.0 jitter, allowing margin for test latency.
     assert 0.5 <= delay_min <= 3.0, f"expected ~1.5min, got {delay_min:.1f}min"
 
@@ -752,9 +753,9 @@ async def test_external_api_transient_5xx_skips_delay_when_healthy(
     # Fast-path: transient 5xx + recovered dependency + no committed work
     # must not burn the retry budget.
     assert t.attempt_count == 0
-    ra = (t.context or {}).get("retry_after")
-    assert ra
-    delay_min = (datetime.fromisoformat(ra) - before).total_seconds() / 60
+    # Audit W1: retry_after_until is a column.
+    assert t.retry_after_until is not None
+    delay_min = (t.retry_after_until - before).total_seconds() / 60
     assert delay_min < 1.0, f"expected near-zero delay, got {delay_min:.1f}min"
 
 
@@ -827,9 +828,9 @@ async def test_general_exponential_backoff_capped_at_15_minutes(
 
     assert t.status == TaskStatus.QUEUED
     assert t.attempt_count == 6
-    ra = (t.context or {}).get("retry_after")
-    assert ra, "retry_after must be set after a reaped retry"
-    delay_min = (datetime.fromisoformat(ra) - before).total_seconds() / 60
+    # Audit W1: retry_after_until is a column.
+    assert t.retry_after_until is not None, "retry_after must be set after a reaped retry"
+    delay_min = (t.retry_after_until - before).total_seconds() / 60
     # Cap: min(2^5, 15) = 15. Without the cap it would be 32 → clamped at 30 by set_retry_after.
     assert 14 <= delay_min <= 16, f"expected 15-min cap, got {delay_min:.1f}min"
 
@@ -921,12 +922,16 @@ async def test_scope_aware_budget_large_code_error_fails_immediately(
 async def test_retry_after_sweep_clears_unparseable(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
+    """Audit W1: with retry_after_until as a typed column, "unparseable"
+    is no longer structurally possible. The remaining failure mode is a
+    far-future value (covered separately). This test now verifies that
+    a NULL column doesn't get mistaken for needing-clear (no spurious sweep)."""
     project = await _make_project(reaper_db)
     t = Task(
         project_id=project.id,
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
-        context={"retry_after": "not-a-timestamp"},
+        # No retry_after_until set — sweep should leave it alone.
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -934,21 +939,24 @@ async def test_retry_after_sweep_clears_unparseable(
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
-    assert "retry_after" not in (t.context or {})
+    assert t.retry_after_until is None  # remained unset
 
 
 @pytest.mark.asyncio
 async def test_retry_after_sweep_clears_far_future(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
-    """Anything beyond RETRY_AFTER_MAX_MINUTES (30) must be cleared."""
+    """Anything beyond RETRY_AFTER_MAX_MINUTES (30) must be cleared.
+
+    Audit W1: retry_after_until is a column.
+    """
     project = await _make_project(reaper_db)
-    far = (datetime.utcnow() + timedelta(hours=6)).isoformat()
+    far_dt = datetime.utcnow() + timedelta(hours=6)
     t = Task(
         project_id=project.id,
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
-        context={"retry_after": far},
+        retry_after_until=far_dt,
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -956,7 +964,7 @@ async def test_retry_after_sweep_clears_far_future(
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
-    assert "retry_after" not in (t.context or {})
+    assert t.retry_after_until is None
 
 
 # ── Step 3: EVALUATING parent sweep (re-trigger rollup on stale parents) ──
@@ -1171,14 +1179,17 @@ async def test_step4_diagnostic_summarizes_failure_categories(
 async def test_retry_after_sweep_preserves_valid(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
-    """A retry_after within the 30-min ceiling must be left intact."""
+    """A retry_after within the 30-min ceiling must be left intact.
+
+    Audit W1: retry_after_until is a column.
+    """
     project = await _make_project(reaper_db)
-    valid = (datetime.utcnow() + timedelta(minutes=5)).isoformat()
+    valid_dt = datetime.utcnow() + timedelta(minutes=5)
     t = Task(
         project_id=project.id,
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
-        context={"retry_after": valid},
+        retry_after_until=valid_dt,
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -1186,7 +1197,7 @@ async def test_retry_after_sweep_preserves_valid(
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
-    assert (t.context or {}).get("retry_after") == valid
+    assert t.retry_after_until == valid_dt
 
 
 # ── skip_locked / force-lock mechanism (Step 2) ──────────────────────────
@@ -1695,11 +1706,13 @@ async def test_step5_provision_failure_resurrected_when_zone_available(
     _resurrection_count is incremented."""
     # reaper_side_effects already patches any_zone_available → True.
     project = await _make_project(reaper_db)
+    # Audit W1: retry_after_until is a column.
     t = Task(
         project_id=project.id,
         payloads=[{"type": "create"}],
         status=TaskStatus.FAILED,
         attempt_count=4,
+        retry_after_until=datetime(2030, 1, 1),
         context={
             "failure_category": "PROVISION_FAILURE",
             "provision_failures": 3,
@@ -1707,7 +1720,6 @@ async def test_step5_provision_failure_resurrected_when_zone_available(
             "_infra_wait": True,
             "blacklisted_accounts": ["acct-1"],
             "max_plan_account_id": "acct-1",
-            "retry_after": "2030-01-01T00:00:00",
             "_slot_released": True,
             "_api_failure_retries": 4,
         },
@@ -1723,13 +1735,13 @@ async def test_step5_provision_failure_resurrected_when_zone_available(
     assert t.attempt_count == 0
     assert ctx.get("_resurrection_count") == 1
     assert ctx.get("_resurrected_from") == "PROVISION_FAILURE"
+    assert t.retry_after_until is None  # column source of truth
     for cleared in (
         "provision_failures",
         "provision_failures_infra",
         "_infra_wait",
         "blacklisted_accounts",
         "max_plan_account_id",
-        "retry_after",
         "_slot_released",
         "failure_category",
         "_api_failure_retries",

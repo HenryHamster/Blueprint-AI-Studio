@@ -767,6 +767,31 @@ describe('matchesRateLimit', () => {
     expect(matchesRateLimit('RESOURCE_EXHAUSTED while calling model', 'gemini', 'service_account')).toBe(true);
   });
 
+  it('detects Gemini API-key quota metric bodies', () => {
+    const msg = "Quota exceeded for quota metric 'GenerateRequests'. Please retry in 39.8s.";
+    expect(matchesRateLimit(msg, 'gemini', 'api_key')).toBe(true);
+  });
+
+  it('detects Gemini API-key billing quota bodies', () => {
+    const msg = 'You exceeded your current quota, please check your plan and billing details.';
+    expect(matchesRateLimit(msg, 'gemini', 'api_key')).toBe(true);
+  });
+
+  it('detects Gemini Code Assist fallback quota messages', () => {
+    const msg = 'Automatically switching from gemini-2.5-pro. Switching to the gemini-2.5-flash model.';
+    expect(matchesRateLimit(msg, 'gemini', 'api_key')).toBe(true);
+  });
+
+  it('detects Gemini service-account Vertex quota bodies', () => {
+    const msg = 'Resource exhausted. Please try again later. Please refer to https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429';
+    expect(matchesRateLimit(msg, 'gemini', 'service_account')).toBe(true);
+  });
+
+  it('detects Gemini service-account quota metric bodies', () => {
+    const msg = 'Quota exceeded for metric: aiplatform.googleapis.com/generate_content_requests';
+    expect(matchesRateLimit(msg, 'gemini', 'service_account')).toBe(true);
+  });
+
   it('does not cross-match provider-specific rate limits', () => {
     expect(matchesRateLimit('Rate limit reached for gpt-5 in organization test', 'anthropic', 'oauth')).toBe(false);
   });

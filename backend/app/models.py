@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
-from sqlalchemy import Column, String, Integer, Index, Text, text, event, Enum as SAEnum
+from sqlalchemy import Boolean, Column, String, Integer, Index, Text, text, event, Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB
 import logging
 import uuid
@@ -242,6 +242,21 @@ class Task(SQLModel, table=True):
     vm_stopped_at: Optional[datetime] = Field(default=None)
     vm_spot: bool = Field(default=False)
 
+    # Lifecycle flags promoted from JSONB context (audit 2026-04-25 W1).
+    # Reading these via SELECT FOR UPDATE returns DB-fresh values without
+    # the stale-in-memory races that JSONB-based idempotency guards had.
+    post_commit_pending: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
+    post_commit_failed: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
+    requeue_in_flight: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
+    infra_wait_until: Optional[datetime] = Field(default=None)
+    retry_after_until: Optional[datetime] = Field(default=None)
+    previous_error_fingerprint: Optional[str] = Field(default=None)
+    auto_remediation: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
+    strategic_cycle_id: Optional[str] = Field(default=None, max_length=36)
+    spawn_failed: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
+    last_remediation_at: Optional[datetime] = Field(default=None)
+    last_token_refresh_at: Optional[datetime] = Field(default=None)
+
     @property
     def first_payload(self) -> Dict[str, Any]:
         """First payload dict, defaulting to empty dict if none exist.
@@ -394,6 +409,15 @@ class DeploymentState(SQLModel, table=True):
     rollback_count: int = Field(default=0)           # consecutive rollbacks (reset on STABLE)
     pause_reason: Optional[str] = Field(default=None)
     paused_at: Optional[datetime] = Field(default=None)
+    # Cumulative pause-time, split by origin. Timers consult the sum via
+    # app.pause_clock to subtract pause windows from their elapsed
+    # calculations. Split for observability (self-inflicted vs external-dep
+    # downtime); timer math always uses the sum.
+    total_manual_paused_seconds: float = Field(default=0.0)
+    total_auto_paused_seconds: float = Field(default=0.0)
+    # "manual" or "auto" while paused; None while running. Routes the
+    # in-flight window to the correct counter at resume.
+    paused_kind: Optional[str] = Field(default=None)
     # Pre-deploy saved max_concurrent_vms for PAUSE mode restore
     pre_pause_max_vms: Optional[int] = Field(default=None)
     # Persisted runtime config — restored on startup so settings survive restarts
@@ -419,6 +443,11 @@ class DeploymentState(SQLModel, table=True):
     pipeline_events_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     # Timestamp when HALTED state was entered — used for auto-recovery timer
     halted_at: Optional[datetime] = Field(default=None)
+    # Optimistic-concurrency version (audit 2026-04-25 W1 / F4): bumped on
+    # every write so concurrent mutations from different code paths can
+    # detect lost-write hazards without holding the row lock for the whole
+    # post-commit cycle.
+    version: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default=text("0")))
 
 
 class MaxPlanAccount(SQLModel, table=True):

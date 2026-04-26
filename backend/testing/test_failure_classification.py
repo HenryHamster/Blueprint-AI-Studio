@@ -12,6 +12,7 @@ from app.failure_classification import (
     EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT,
     EXTERNAL_API_SUBTYPE_OTHER,
     EXTERNAL_API_SUBTYPE_PROVIDER_AUTH,
+    EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
     EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA,
     MIGRATION_ERROR,
     PROVISION_FAILURE,
@@ -25,6 +26,7 @@ from app.failure_classification import (
     classify_failure_taxonomy,
     classify_timeout_subtype,
     get_top_residual_fingerprints,
+    normalize_agent_failure_category,
     persist_failure_category,
     record_residual_fingerprint,
     should_trigger_code_defect_investigation,
@@ -122,6 +124,34 @@ class TestPersistFailureCategoryTimeoutSubtype:
         persist_failure_category(task, CODE_ERROR)
         assert task.context["failure_category"] == CODE_ERROR
         assert "timeout_subtype" not in task.context
+
+
+class TestNormalizeAgentFailureCategory:
+    def test_generic_fatal_model_config_rejection_overrides_code_error(self):
+        msg = "Fatal error: ModelNotFoundError: models/gemini-3.1-pro-preview is not found for API version v1beta"
+        task = _task(msg, {"llm_provider": "gemini", "llm_auth_mode": "api_key"})
+
+        assert normalize_agent_failure_category("fatal", task) == EXTERNAL_API
+
+    def test_generic_fatal_gemini_quota_overrides_code_error(self):
+        msg = "Fatal error: Quota exceeded for quota metric 'GenerateRequests'. Please retry in 39.8s."
+        task = _task(msg, {"llm_provider": "gemini", "llm_auth_mode": "api_key"})
+
+        assert normalize_agent_failure_category("fatal", task) == RATE_LIMIT
+        assert task.context["rate_limit_kind"] == "rate_limit"
+        assert task.context["rate_limit_matched_pattern"] == "quota exceeded for quota metric"
+
+    def test_specific_code_label_stays_authoritative(self):
+        msg = "pytest failed while docs mention quota exceeded for quota metric"
+        task = _task(msg, {"llm_provider": "gemini", "llm_auth_mode": "api_key"})
+
+        assert normalize_agent_failure_category("test_failed", task) == CODE_ERROR
+        assert "rate_limit_kind" not in task.context
+
+    def test_generic_fatal_without_provider_signal_stays_code_error(self):
+        task = _task("Fatal error: TypeError: cannot read property of undefined")
+
+        assert normalize_agent_failure_category("fatal", task) == CODE_ERROR
 
 
 class TestClassifyFailureCodeError:
@@ -753,6 +783,10 @@ class TestExternalApiSubtypeFromMessage:
     def test_db_connectivity_could_not_connect(self):
         assert _external_api_subtype_from_message("could not connect to server: Connection refused") == EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
 
+    def test_provider_model_config(self):
+        msg = "ModelNotFoundError: models/gemini-3.1-flash-preview is not found for API version v1beta"
+        assert _external_api_subtype_from_message(msg) == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
+
     def test_provider_auth_unauthorized(self):
         assert _external_api_subtype_from_message("401 Unauthorized from api.anthropic.com") == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
 
@@ -821,6 +855,11 @@ class TestPersistFailureCategoryExternalApiSubtype:
         task = _task("401 Unauthorized")
         persist_failure_category(task, EXTERNAL_API)
         assert task.context["external_api_subtype"] == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+
+    def test_external_api_persists_model_config_subtype(self):
+        task = _task("400: Unsupported value: 'service_tier' does not support 'flex' with this model")
+        persist_failure_category(task, EXTERNAL_API)
+        assert task.context["external_api_subtype"] == EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
 
     def test_non_external_api_does_not_write_subtype(self):
         task = _task("No heartbeat received")

@@ -1118,6 +1118,9 @@ async def _compute_digest(
                 Task.requires_approval,
                 Task.vm_provisioned_at, Task.vm_started_at,
                 Task.vm_stopped_at, Task.vm_spot,
+                # Audit W1: promoted columns read in the digest funnel.
+                Task.previous_error_fingerprint,
+                Task.auto_remediation,
             ))
             .limit(_DIGEST_TASK_ROW_CAP)
         )
@@ -1143,6 +1146,9 @@ async def _compute_digest(
                 Task.requires_approval,
                 Task.vm_provisioned_at, Task.vm_started_at,
                 Task.vm_stopped_at, Task.vm_spot,
+                # Audit W1: promoted columns read in the digest funnel.
+                Task.previous_error_fingerprint,
+                Task.auto_remediation,
             ))
             .limit(_DIGEST_TASK_ROW_CAP)
         )
@@ -1191,6 +1197,8 @@ async def _compute_digest(
                 Task.id, Task.status, Task.title,
                 Task.started_at, Task.project_id, Task.context,
                 Task.vm_provisioned_at, Task.vm_spot,
+                Task.previous_error_fingerprint,
+                Task.auto_remediation,
             ))
         )
         active_tasks_all: List[Task] = []
@@ -1206,6 +1214,8 @@ async def _compute_digest(
                 Task.id, Task.status, Task.title, Task.payloads,
                 Task.started_at, Task.project_id, Task.context,
                 Task.vm_provisioned_at, Task.vm_spot,
+                Task.previous_error_fingerprint,
+                Task.auto_remediation,
             ))
         )
         active_tasks_all = list(active_result.scalars().all())
@@ -2784,7 +2794,7 @@ async def _compute_digest(
     _ci_rem_result = await session.execute(
         select(Task).where(
             *_funnel_filters,
-            Task.context["auto_remediation"].as_boolean() == True,  # noqa: E712
+            Task.auto_remediation.is_(True),  # promoted column (audit W1)
         )
     )
     _ci_rem_tasks = list(_ci_rem_result.scalars().all())
@@ -2824,7 +2834,7 @@ async def _compute_digest(
         Task.status == TaskStatus.COMPLETED,
         or_(
             Task.context["diagnosis_task_id"].as_string().is_not(None),
-            Task.context["auto_remediation"].as_boolean() == True,  # noqa: E712
+            Task.auto_remediation.is_(True),  # promoted column (audit W1)
         ),
         Task.context["pr_merged"].as_boolean() == True,  # noqa: E712
     ]
@@ -2981,10 +2991,11 @@ async def _compute_digest(
     _inflight_statuses = {TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING}
     for _t in list(all_tasks) + list(active_tasks_all):
         _ctx = _t.context or {}
+        # Audit W1: previous_error_fingerprint is a column.
         _fp_ = (
             _ctx.get("diagnosis_fingerprint")
             or _ctx.get("error_fingerprint")
-            or _ctx.get("_previous_error_fingerprint")
+            or _t.previous_error_fingerprint
         )
         if not _fp_:
             continue

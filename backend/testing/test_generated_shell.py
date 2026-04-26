@@ -449,6 +449,18 @@ class TestComputeStartupScriptBeacons:
             "regression from task 0bcfd031)"
         )
 
+    def test_curl_failure_logs_preserve_real_exit_status(self):
+        """A negated assignment (`if ! err="$(curl ...)"`) reports `$?` as
+        the negation's status, not curl's. Beacon diagnostics must capture the
+        curl exit before branching so empty-stderr failures don't log exit 0."""
+        script = _render_compute_startup_script()
+        assert "curl_exit=$?" in script
+        assert "curl failed with exit $curl_exit" in script
+        assert "_STARTUP_HB_EXIT=$?" in script
+        assert "curl exit $_STARTUP_HB_EXIT" in script
+        assert "curl failed with exit $?" not in script
+        assert "curl exit $?" not in script
+
 
 # ---------------------------------------------------------------------------
 # shellcheck — runs if the binary is available. Complements the narrow

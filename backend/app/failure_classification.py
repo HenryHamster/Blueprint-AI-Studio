@@ -109,6 +109,23 @@ _MIGRATION_PATTERNS: tuple[str, ...] = (
 )
 
 
+# Provider model/config rejections are upstream runtime incompatibilities, not
+# repository code defects. Keep this list narrow so ordinary test failures that
+# mention "model" still fall through normally.
+_PROVIDER_MODEL_CONFIG_PATTERNS: tuple[str, ...] = (
+    "modelnotfounderror",
+    "model not found",
+    "is not found for api version",
+    "is not supported for generatecontent",
+    "unsupported service_tier",
+    "unsupported value: 'service_tier'",
+)
+
+
+def _provider_model_config_rejection(combined: str) -> bool:
+    return any(kw in combined for kw in _PROVIDER_MODEL_CONFIG_PATTERNS)
+
+
 # Failure classes that don't penalize direction health / research productivity —
 # the task never really ran because the infra (VMs, rate limits, upstream APIs,
 # agent lifecycle) got in the way, or the scope was structurally mismatched
@@ -289,6 +306,66 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
 }
 
 
+_GENERIC_AGENT_CODE_LABELS: frozenset[str] = frozenset({
+    "claude_code_failed",
+    "fatal",
+})
+
+
+def _persist_rate_limit_signal_context(task: "Task", signal) -> None:
+    """Persist rate-limit signal metadata onto task.context.
+
+    Audit 2026-04-25 (W5/B1): defensive ``getattr`` instead of direct
+    attribute access. If the provider returns a partial signal (missing
+    .kind etc.) the previous version silently swallowed the AttributeError
+    and downstream retry logic had no rate_limit_kind to read — RATE_LIMIT
+    was returned but the cooldown key was missing, so requeue ran
+    immediately instead of waiting. Now we always write *something* (kind=
+    "unknown" when the source is malformed) plus an explicit
+    ``rate_limit_persistence_failed`` flag so the requeue path can apply a
+    conservative cooldown.
+    """
+    kind = getattr(signal, "kind", None)
+    retry_after = getattr(signal, "retry_after_seconds", None)
+    matched = getattr(signal, "matched_pattern", None)
+    try:
+        ctx = dict(task.context or {})
+        ctx["rate_limit_kind"] = kind or "unknown"
+        if retry_after is not None:
+            ctx["rate_limit_retry_after_seconds"] = retry_after
+        if matched is not None:
+            ctx["rate_limit_matched_pattern"] = matched
+        if kind is None:
+            ctx["rate_limit_persistence_failed"] = True
+            logger.warning(
+                "[FAILURE_CLASS] Task %s rate-limit signal missing .kind; persisted with kind=unknown",
+                task.id,
+            )
+        task.context = ctx
+    except Exception:
+        logger.exception("[FAILURE_CLASS] Failed to persist rate_limit_* keys")
+
+
+def _text_provider_failure_override(task: "Task", combined: str) -> str | None:
+    """Return a strong provider/API class from text, or None.
+
+    Used only to override generic agent labels like "fatal"; precise agent
+    categories such as test_failed/lint_failed remain authoritative.
+    """
+    if _provider_model_config_rejection(combined):
+        return EXTERNAL_API
+
+    signal = _task_rate_limit_signal(task, combined)
+    if signal is not None:
+        _persist_rate_limit_signal_context(task, signal)
+        return RATE_LIMIT
+
+    if any(kw in combined for kw in _task_rate_limit_patterns(task)):
+        return RATE_LIMIT
+
+    return None
+
+
 # Explicit phrase match so status messages like
 # "No heartbeat received after 300s since provisioning" (which aren't
 # provision failures — they're heartbeat/startup timeouts) don't get
@@ -370,8 +447,14 @@ def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
     if not raw:
         return classify_failure(task)
     label = raw.strip()
-    mapped = _AGENT_CATEGORY_TO_CLASS.get(label.lower())
+    label_lower = label.lower()
+    mapped = _AGENT_CATEGORY_TO_CLASS.get(label_lower)
     if mapped:
+        if mapped == CODE_ERROR and label_lower in _GENERIC_AGENT_CODE_LABELS:
+            combined = (task.latest_status_message or "").lower()
+            override = _text_provider_failure_override(task, combined)
+            if override:
+                return override
         return mapped
     if label in INFRA_CLASSES or label == CODE_ERROR:
         return label
@@ -435,6 +518,7 @@ def classify_timeout_subtype(task: "Task", logs: str | None = None) -> str:
 # tailored recovery patterns per failure mode.
 EXTERNAL_API_SUBTYPE_PROVIDER_AUTH = "provider_auth"
 EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA = "provider_quota"
+EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG = "provider_model_config"
 EXTERNAL_API_SUBTYPE_GITHUB_PR_CREATE = "github_pr_create"
 EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY = "db_connectivity"
 EXTERNAL_API_SUBTYPE_NETWORK_TRANSIENT = "network_transient"
@@ -456,6 +540,9 @@ def _external_api_subtype_from_message(combined: str) -> str:
         "operator does not exist",
     )):
         return EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY
+
+    if _provider_model_config_rejection(combined):
+        return EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
 
     # Provider auth — token/credential failures from any upstream API.
     if any(kw in combined for kw in (
@@ -683,8 +770,16 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
     # canonical uppercase names written by normalize_agent_failure_category().
     agent_category = (task.context or {}).get('failure_category')
     if agent_category:
-        if agent_category in _AGENT_CATEGORY_TO_CLASS:
-            return _AGENT_CATEGORY_TO_CLASS[agent_category]
+        agent_label = str(agent_category).strip()
+        agent_lower = agent_label.lower()
+        if agent_lower in _AGENT_CATEGORY_TO_CLASS:
+            mapped = _AGENT_CATEGORY_TO_CLASS[agent_lower]
+            if mapped == CODE_ERROR and agent_lower in _GENERIC_AGENT_CODE_LABELS:
+                combined = (task.latest_status_message or "").lower() + " " + (logs or "").lower()
+                override = _text_provider_failure_override(task, combined)
+                if override:
+                    return override
+            return mapped
         if agent_category in INFRA_CLASSES or agent_category == CODE_ERROR:
             return agent_category
 
@@ -765,15 +860,7 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
     # fall back to legacy pattern-list scan for tasks without provider context.
     signal = _task_rate_limit_signal(task, combined)
     if signal is not None:
-        try:
-            ctx = dict(task.context or {})
-            ctx["rate_limit_kind"] = signal.kind
-            if signal.retry_after_seconds is not None:
-                ctx["rate_limit_retry_after_seconds"] = signal.retry_after_seconds
-            ctx["rate_limit_matched_pattern"] = signal.matched_pattern
-            task.context = ctx
-        except Exception:
-            logger.exception("[FAILURE_CLASS] Failed to persist rate_limit_* keys")
+        _persist_rate_limit_signal_context(task, signal)
         return "RATE_LIMIT"
     rate_limit_patterns = _task_rate_limit_patterns(task)
     if any(kw in combined for kw in rate_limit_patterns):
@@ -808,6 +895,8 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
     # The OpenAI/Gemini adapters gate known-bad combinations at settings_to_cli
     # time, but the classifier is the last line of defense if a new
     # incompatibility lands before the gate list is updated.
+    if _provider_model_config_rejection(combined):
+        return "EXTERNAL_API"
     if ("failed to create" in combined and "branch" in combined) or \
        any(kw in combined for kw in ["api.github.com", "api.anthropic.com",
                                       "500 internal server error",
@@ -822,14 +911,7 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
                                       "rollup pr creation failed",
                                       "staging branch",
                                       "401", "unauthorized", "bad credentials",
-                                      "token expired", "token invalid", "token revoked",
-                                      # Provider model/config rejections — upstream 400s, not code defects.
-                                      "modelnotfounderror",
-                                      "model not found",
-                                      "is not found for api version",
-                                      "is not supported for generatecontent",
-                                      "unsupported service_tier",
-                                      "unsupported value: 'service_tier'"]):
+                                      "token expired", "token invalid", "token revoked"]):
         return "EXTERNAL_API"
 
     # Agent timeout — reaped by heartbeat, execution timeout, process killed by OS/orchestrator, OOM.

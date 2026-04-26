@@ -691,11 +691,13 @@ async def create_check_run(
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    # Audit W1/F8: use _utcnow() for consistency with the rest of the app.
+    from app.time_utils import _utcnow as _ut  # noqa: PLC0415
     payload: dict = {
         "name": name,
         "head_sha": head_sha,
         "status": "in_progress",
-        "started_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "started_at": _ut().strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     if details_url:
         payload["details_url"] = details_url
@@ -746,10 +748,12 @@ async def update_check_run(
     if annotations:
         output["annotations"] = annotations[:50]
 
+    # Audit W1/F8: use _utcnow() for consistency with the rest of the app.
+    from app.time_utils import _utcnow as _ut  # noqa: PLC0415
     payload: dict = {
         "status": "completed",
         "conclusion": conclusion,
-        "completed_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "completed_at": _ut().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "output": output,
     }
 

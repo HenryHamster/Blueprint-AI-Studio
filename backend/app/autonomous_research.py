@@ -1174,7 +1174,8 @@ async def _spawn_task_failure_investigation(
         failure_taxonomy = TAXONOMY_REVIEW_QUALITY
     else:
         failure_taxonomy = TAXONOMY_INFRA_RELATED
-    prev_fp = ctx.get("_previous_error_fingerprint") or ""
+    # Audit W1: previous_error_fingerprint is now a column.
+    prev_fp = task.previous_error_fingerprint or ""
     if await _recent_investigation_exists(
         task.project_id, direction_id, session,
         error_fingerprint=prev_fp or None,
