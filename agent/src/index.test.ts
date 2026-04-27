@@ -841,6 +841,8 @@ describe('provider runner prompt transport', () => {
     // sandbox are separate knobs (YOLO auto-enables docker sandbox
     // unless GEMINI_SANDBOX=false pins it off).
     expect(command.env?.GEMINI_SANDBOX).toBe('false');
+    // Trust gate opt-out — ephemeral VM is the isolation boundary.
+    expect(command.env?.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
   });
 });
 

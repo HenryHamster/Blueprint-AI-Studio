@@ -2072,7 +2072,9 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         } else if (model) {
           args.push('-m', model);
         }
-        const geminiEnv = { ...baseEnv, GEMINI_SANDBOX: 'false' };
+        // Ephemeral VM is the isolation boundary — trust gate is redundant,
+        // mirrors the GEMINI_SANDBOX/yolo rationale already in place.
+        const geminiEnv = { ...baseEnv, GEMINI_SANDBOX: 'false', GEMINI_CLI_TRUST_WORKSPACE: 'true' };
         return {
           command: 'gemini',
           args,
@@ -2086,7 +2088,9 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
       buildValidationCommand: (model) => {
         const args = ['-o', 'text', '-p', 'Respond with OK.'];
         if (model) args.push('-m', model);
-        const geminiEnv = { ...baseEnv, GEMINI_SANDBOX: 'false' };
+        // Ephemeral VM is the isolation boundary — trust gate is redundant,
+        // mirrors the GEMINI_SANDBOX/yolo rationale already in place.
+        const geminiEnv = { ...baseEnv, GEMINI_SANDBOX: 'false', GEMINI_CLI_TRUST_WORKSPACE: 'true' };
         return { command: 'gemini', args, env: geminiEnv, timeoutMs: 30_000 };
       },
     };

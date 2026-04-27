@@ -247,10 +247,18 @@ class GeminiProvider(LLMProvider):
                     "GOOGLE_APPLICATION_CREDENTIALS": secret_path,
                     "GOOGLE_CLOUD_PROJECT": str(metadata.get("project") or ""),
                     "GOOGLE_CLOUD_LOCATION": str(metadata.get("location") or ""),
+                    # Ephemeral VM is the isolation boundary — trust gate is
+                    # redundant, mirrors the GEMINI_SANDBOX/yolo rationale.
+                    "GEMINI_CLI_TRUST_WORKSPACE": "true",
                 },
                 files=(FileMaterial(path=secret_path, content=secret or "", mode="0600"),),
             )
-        return SecretMaterial(env={"GEMINI_API_KEY": secret or ""})
+        return SecretMaterial(env={
+            "GEMINI_API_KEY": secret or "",
+            # Ephemeral VM is the isolation boundary — trust gate is redundant,
+            # mirrors the GEMINI_SANDBOX/yolo rationale already in place.
+            "GEMINI_CLI_TRUST_WORKSPACE": "true",
+        })
 
     def settings_schema(self) -> dict[str, Any]:
         # Approval mode / sandbox / safety filters / sampling knobs are

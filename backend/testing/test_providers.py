@@ -78,6 +78,16 @@ def test_gemini_service_account_materializes_credentials_file():
     # vars. Regression guard: never set it, even if historical code did.
     assert "GOOGLE_GENAI_USE_VERTEXAI" not in material.env
     assert material.files[0].path == "/opt/agent/gemini/sa.json"
+    # Trust gate opt-out — ephemeral VM is the isolation boundary.
+    assert material.env["GEMINI_CLI_TRUST_WORKSPACE"] == "true"
+
+
+def test_gemini_api_key_secret_material_includes_trust_workspace():
+    provider = get_provider(LLMProviderName.GEMINI)
+    material = provider.secret_material("my-api-key", LLMAuthMode.API_KEY)
+    assert material.env["GEMINI_API_KEY"] == "my-api-key"
+    # Trust gate opt-out — ephemeral VM is the isolation boundary.
+    assert material.env["GEMINI_CLI_TRUST_WORKSPACE"] == "true"
 
 
 def test_gemini_thinking_budget_clamped_to_per_model_cap():

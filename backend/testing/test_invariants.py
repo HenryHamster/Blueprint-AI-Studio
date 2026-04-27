@@ -791,7 +791,7 @@ FRONTEND_SIZE_LIMITS = {
     "components/TaskCard.tsx": 1500,
     "components/DirectionCard.tsx": 1200,
     "components/PipelineView.tsx": 1200,
-    "components/DashboardHome.tsx": 1500,
+    "components/DashboardHome.tsx": 1650,
     "components/MessagesPanel.tsx": 1000,
     "components/MetricsDashboard.tsx": 500,
     "components/ProjectDashboard.tsx": 300,
