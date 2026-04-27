@@ -425,9 +425,16 @@ async def sync_runtime_config_from_state(state) -> list[str]:
             runtime_config[key] = new_val
             changed.append(key)
 
+    paused = state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED)
+
     async with runtime_config_lock:
         try:
-            if state.runtime_max_concurrent_vms is not None:
+            # When paused, the override below clamps max_concurrent_vms to 0.
+            # Skip the persisted-value restore so the in-memory cap doesn't
+            # bounce 15→0 every cycle (which both spammed "Runtime config
+            # drift corrected: ['max_concurrent_vms', 'max_concurrent_vms']"
+            # and briefly exposed the pre-pause cap to lock-free readers).
+            if state.runtime_max_concurrent_vms is not None and not paused:
                 _set("max_concurrent_vms", int(state.runtime_max_concurrent_vms))
             if state.runtime_max_retries is not None:
                 _set("max_retries", int(state.runtime_max_retries))
@@ -489,11 +496,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
         except Exception as e:
             logger.warning(f"[CONFIG-SYNC] Could not sync runtime_config_json: {e}")
 
-        # PAUSED/HALTED always forces the dispatch cap to 0 — overrides any
-        # restored runtime_max_concurrent_vms (which holds the pre-pause value
-        # for later resume).
+        # PAUSED/HALTED always forces the dispatch cap to 0. (We already
+        # skipped the restore from runtime_max_concurrent_vms above when
+        # paused, so this just zeros the in-memory value.)
         try:
-            if state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+            if paused:
                 _set("max_concurrent_vms", 0)
         except Exception as e:
             logger.warning(f"[CONFIG-SYNC] Could not apply PAUSED override: {e}")

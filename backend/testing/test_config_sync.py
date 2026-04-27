@@ -73,6 +73,33 @@ async def test_sync_forces_zero_when_paused_even_if_column_nonzero():
 
 
 @pytest.mark.asyncio
+async def test_sync_paused_does_not_bounce_max_concurrent_vms():
+    """Regression: when status=PAUSED and the persisted column holds the
+    pre-pause value (e.g. 15), repeated sync cycles must not flip the
+    in-memory value 0→15→0. Previously the restore-then-override pattern
+    left ``changed`` with ``["max_concurrent_vms", "max_concurrent_vms"]``
+    and briefly exposed the pre-pause cap to lock-free readers."""
+    state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.PAUSED,
+        current_revision="rev-1",
+        current_sha="sha-1",
+        last_known_good_revision="rev-1",
+        last_known_good_sha="sha-1",
+        runtime_max_concurrent_vms=15,
+    )
+    # Steady state during pause: in-memory already 0 from prior sync.
+    _shared_state.runtime_config["max_concurrent_vms"] = 0
+
+    changed = await sync_runtime_config_from_state(state)
+
+    # In-memory must stay 0 — the persisted 15 is for resume, not now.
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 0
+    # Must not double-list the key (was the source of the log spam).
+    assert changed.count("max_concurrent_vms") <= 1
+
+
+@pytest.mark.asyncio
 async def test_sync_forces_zero_when_halted():
     state = DeploymentState(
         id=1,

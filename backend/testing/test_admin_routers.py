@@ -1758,3 +1758,40 @@ class TestAcknowledgeRunningUpdate:
             f"/api/admin/projects/{other.id}/running-update/acknowledge"
         )
         assert resp.status_code == 404
+
+
+class TestBuildDeployStatePayload:
+    """Regression: WS broadcasts use websocket.send_json which lacks FastAPI's
+    JSON encoder, so any datetime in the payload raised
+    'Object of type datetime is not JSON serializable' on every connect."""
+
+    @pytest.mark.asyncio
+    async def test_payload_external_health_last_check_is_json_safe(self, db_session):
+        """external_health.last_check is a live datetime; the payload must
+        coerce it to an isoformat string (or None) so json.dumps succeeds."""
+        import json
+        from datetime import datetime as _dt
+        import app.shared_state as _shared_state
+        from app.admin import build_deploy_state_payload
+        from app.models import DeploymentState, DeploymentStatus
+
+        snap = _shared_state.external_health.get("last_check")
+        try:
+            _shared_state.external_health["last_check"] = _dt(2026, 4, 27, 8, 0, 0)
+            db_session.add(DeploymentState(
+                id=1,
+                status=DeploymentStatus.STABLE,
+                current_revision="rev-1",
+                current_sha="sha-1",
+                last_known_good_revision="rev-1",
+                last_known_good_sha="sha-1",
+                runtime_max_concurrent_vms=5,
+            ))
+            await db_session.commit()
+
+            payload = await build_deploy_state_payload(db_session)
+
+            json.dumps(payload)
+            assert payload["external_health"]["last_check"] == "2026-04-27T08:00:00"
+        finally:
+            _shared_state.external_health["last_check"] = snap

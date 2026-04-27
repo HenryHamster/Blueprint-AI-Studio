@@ -1653,6 +1653,15 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
     )
     ramp_step_size = min(2, target_vms - current_vms) if ramp_in_progress else 0
 
+    # external_health holds a live datetime in last_check; copy and coerce so
+    # WebSocket consumers using send_json (which lacks FastAPI's encoder)
+    # don't choke on "Object of type datetime is not JSON serializable".
+    _last_check = external_health.get("last_check")
+    external_health_serializable = {
+        **external_health,
+        "last_check": _last_check.isoformat() if isinstance(_last_check, datetime) else _last_check,
+    }
+
     return {
         "current_revision": state.current_revision,
         "current_sha": state.current_sha,
@@ -1670,7 +1679,7 @@ async def build_deploy_state_payload(session: AsyncSession) -> dict:
         "monitoring_window": window_progress,
         "failure_rate": round(failure_rate, 3),
         "task_results_count": len(results),
-        "external_health": external_health,
+        "external_health": external_health_serializable,
         "max_concurrent_vms": runtime_config["max_concurrent_vms"],
         "current_vms": current_vms,
         "target_vms": target_vms,
