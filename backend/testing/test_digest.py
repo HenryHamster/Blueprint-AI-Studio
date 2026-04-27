@@ -4935,3 +4935,69 @@ async def test_residual_fingerprints_requires_auth(unauthenticated_client: Async
     """Endpoint requires admin auth."""
     response = await unauthenticated_client.get("/api/admin/residual-fingerprints")
     assert response.status_code in (401, 403)
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_cpm_threshold(client: AsyncClient, db_session):
+    """median_cost_per_merged_pr is calculated correctly and directions exceeding 3x median are flagged."""
+    from app.routers.admin_analytics import SPOT_RATE
+    
+    dir_configs = [
+        ("dir-a", 10.0),
+        ("dir-b", 20.0),
+        ("dir-c", 100.0),
+    ]
+    
+    recent_ts = (_utcnow() - timedelta(minutes=1)).isoformat()
+    project = make_project(
+        directions=[
+            {
+                "id": did,
+                "text": did,
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "prs_merged": 1}
+                ]
+            }
+            for did, cost in dir_configs
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for did, cost in dir_configs:
+        # t_cost = SPOT_RATE * duration_sec => duration_sec = t_cost / SPOT_RATE
+        duration_sec = cost / SPOT_RATE
+        now = _utcnow()
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_spot=True,
+            vm_provisioned_at=now - timedelta(seconds=duration_sec),
+            vm_started_at=now - timedelta(seconds=duration_sec),
+            vm_stopped_at=now,
+            context={
+                "direction_id": did,
+                "pr_merged": True,
+            },
+            payloads=[{"type": "research"}]
+        )
+        db_session.add(t)
+
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["median_cost_per_merged_pr"] == 20.0
+    
+    dp_by_id = {dp["direction_id"]: dp for dp in data["direction_progress"]}
+    assert dp_by_id["dir-a"]["cost_per_merged_pr"] == 10.0
+    assert dp_by_id["dir-a"]["cost_per_merge_exceeds_threshold"] is False
+    
+    assert dp_by_id["dir-b"]["cost_per_merged_pr"] == 20.0
+    assert dp_by_id["dir-b"]["cost_per_merge_exceeds_threshold"] is False
+    
+    assert dp_by_id["dir-c"]["cost_per_merged_pr"] == 100.0
+    assert dp_by_id["dir-c"]["cost_per_merge_exceeds_threshold"] is True

@@ -2,6 +2,7 @@
 import asyncio
 import uuid
 import logging
+import statistics
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
@@ -27,6 +28,8 @@ from app.direction_outcomes import synthesize_prompt_quality_patterns
 from app.retry_budget import failure_class_history_classes
 
 logger = logging.getLogger(__name__)
+
+_CPM_RETIREMENT_MULTIPLIER = 3.0
 
 
 router = APIRouter(
@@ -2278,6 +2281,15 @@ async def _compute_digest(
     all_product_ratios = [d["product_ratio"] for d in direction_progress_list if d.get("product_ratio") is not None]
     overall_product_ratio = round(sum(all_product_ratios) / len(all_product_ratios), 3) if all_product_ratios else None
 
+    all_cpms = [d["cost_per_merged_pr"] for d in direction_progress_list if d.get("cost_per_merged_pr") is not None]
+    median_cost_per_merged_pr = round(statistics.median(all_cpms), 4) if all_cpms else None
+    for d in direction_progress_list:
+        cpm = d.get("cost_per_merged_pr")
+        if cpm is not None and median_cost_per_merged_pr is not None:
+            d["cost_per_merge_exceeds_threshold"] = cpm > (median_cost_per_merged_pr * _CPM_RETIREMENT_MULTIPLIER)
+        else:
+            d["cost_per_merge_exceeds_threshold"] = False
+
     # Pipeline-level acceptance rate: total merged / (total merged + total rejected) across directions in window
     _pipeline_total_merged_d = sum(d.get("prs_merged") or 0 for d in direction_progress_list)
     _pipeline_total_rejected_d = sum(d.get("prs_rejected") or 0 for d in direction_progress_list)
@@ -3144,6 +3156,7 @@ async def _compute_digest(
         "recent_completions": recent_completions,
         "direction_progress": direction_progress_list,
         "overall_product_ratio": overall_product_ratio,
+        "median_cost_per_merged_pr": median_cost_per_merged_pr,
         "overall_type_distribution": overall_type_distribution or None,
         "total_estimated_cost_usd": total_estimated_cost_usd,
         "spot_cost_usd": total_spot_cost_usd,
