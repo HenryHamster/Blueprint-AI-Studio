@@ -535,7 +535,7 @@ async def reaper_service():
                                     if serial_log:
                                         logger.warning(
                                             f"[REAPER] Serial log for dying agent {vm_id} "
-                                            f"(task {task.id}):\n{serial_log[-500:]}"
+                                            f"(task {task.id}):\n{serial_log}"
                                         )
                                 except Exception:
                                     logger.exception(f"[REAPER] Failed to capture serial log for VM {vm_id}")
@@ -572,7 +572,7 @@ async def reaper_service():
                                 "provision_failed_accounts": sticky or None,
                             }
                             if serial_log:
-                                new_ctx["last_serial_log"] = serial_log[-500:]
+                                new_ctx["last_serial_log"] = serial_log
                             record_zone_failure(prov_zone, reason="AGENT_STARTUP_FAILURE")
                         else:
                             # No provision_zone — VM may never have been created, or the

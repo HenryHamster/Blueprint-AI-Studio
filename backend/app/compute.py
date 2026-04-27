@@ -889,7 +889,13 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
       local TOKEN=""
       local ORCH="{ORCHESTRATOR_URL}"
       if [ -f /etc/agent.env ]; then
-        TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env 2>/dev/null | cut -d= -f2- || true)"
+        # tr -d '"' strips the surrounding double quotes that
+        # materialize_manifest.py writes per systemd env file format
+        # (KEY="value"). Without this strip, the token reaches the
+        # orchestrator as `"eyJ..."` (literal quotes) and JWT verify
+        # returns 401 — which curl -f surfaces as exit 22 and silently
+        # kills the script (task 923f51e8 investigation).
+        TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
       fi
       if [ -z "$TOKEN" ] && [ -n "$EARLY_TOKEN" ]; then
         TOKEN="$EARLY_TOKEN"
@@ -968,13 +974,22 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
       # systemd journal (and therefore in any AGENT_DIED_EARLY capture later).
       # Without this every beacon failure was silent — the symptom that drove
       # the 2026-04-24 silent-pre-claim investigation.
-      local err curl_exit
+      #
+      # The `|| curl_exit=$?` guard absorbs the substitution's non-zero
+      # exit so it can never propagate to errexit. Plain
+      # `err="$(curl ... )"` makes bash treat the whole simple-command as
+      # exiting with curl's status (per the manual: "When used alone,
+      # the assignment statements set the exit status of the command to
+      # the exit status of the last command substitution") — combined
+      # with set -e and curl -f returning 22 on any 4xx, that silently
+      # killed the script with no ERR trap before the 2026-04-27 fix
+      # (task 923f51e8 investigation).
+      local err="" curl_exit=0
       err="$(curl -sf -X POST "{ORCHESTRATOR_URL}/api/agent/heartbeat" \
         -H "Content-Type: application/json" \
         -H "X-Agent-Token: $tok" \
         -d "$(printf '{{"task_id": "{task_id}", "status_message": "%s"}}' "$msg")" \
-        --connect-timeout 5 --max-time 10 2>&1 >/dev/null)"
-      curl_exit=$?
+        --connect-timeout 5 --max-time 10 2>&1 >/dev/null)" || curl_exit=$?
       if [ "$curl_exit" -ne 0 ]; then
         echo "[BEACON_FAILED] $msg :: ${{err:-curl failed with exit $curl_exit}}" >&2
       fi
@@ -1005,7 +1020,10 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     # Beacon B — env file materialized. Distinguishes "python manifest
     # block hung" from later-step hangs. Uses the token from the just-written
     # /etc/agent.env so subsequent beacons have a canonical source.
-    AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2- || true)"
+    # tr -d '"' strips the surrounding quotes (systemd env file format)
+    # — without it the JWT reaches the orchestrator wrapped in literal
+    # quotes and verify_agent_token returns 401 (task 923f51e8).
+    AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2- | tr -d '"' || true)"
     _send_beacon "PROVISION_PROGRESS: env file materialized, preparing payload" "$AGENT_TOKEN"
 
     # Add PAYLOAD_URI if present (validated safe GCS URI — no secrets)
@@ -1037,8 +1055,8 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     systemctl daemon-reload
     timeout 60 systemctl restart blueprint-agent || {{
         echo "Service start failed"
-        AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env 2>/dev/null | cut -d= -f2- || true)"
-        ORCH_URL="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env 2>/dev/null | cut -d= -f2- || true)"
+        AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
+        ORCH_URL="$(grep '^ORCHESTRATOR_URL=' /etc/agent.env 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
         SERVICE_LOG="$(journalctl -u blueprint-agent --no-pager -n 30 2>/dev/null | tr '"' "'" | tr '\\n' ' ' || echo 'no journal')"
         curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \
           -H "Content-Type: application/json" \
@@ -1462,7 +1480,17 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
 # ─── Shared VM Helpers (used by both delete and cleanup paths) ────────────
 
 def _capture_serial_for_vm(vm_name: str, zone: str) -> str | None:
-    """Best-effort serial capture. Returns tail or None."""
+    """Best-effort serial capture. Returns tail or None.
+
+    8000-byte tail (was 2000): the script's death window is often
+    minutes before the reaper acts. The last 500-2000 bytes are
+    routine systemd housekeeping (cert refresh, session activity)
+    that came AFTER the script died — the actually-useful lines
+    (BEACON_*, FATAL, materialize stderr, kernel OOM) sit further
+    back. 8KB is large enough to hold the full startup-script
+    journal output for the longest paths we've seen, while still
+    fitting in JSONB without bloating the row.
+    """
     from google.cloud import compute_v1
     if not zone or zone == "unknown":
         logger.warning(f"[COMPUTE] Serial capture skipped for {vm_name}: zone='{zone}'")
@@ -1472,7 +1500,7 @@ def _capture_serial_for_vm(vm_name: str, zone: str) -> str | None:
         serial = client.get_serial_port_output(
             project=GCP_PROJECT_ID, zone=zone, instance=vm_name, timeout=10
         )
-        return (serial.contents or "")[-2000:]
+        return (serial.contents or "")[-8000:]
     except Exception as e:
         # Serial capture is the only forensic source for agent startup failures;
         # when it fails we must know why (VM already gone vs permission vs quota).

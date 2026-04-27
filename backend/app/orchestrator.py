@@ -911,7 +911,7 @@ async def orchestrator_worker():
                                         logger.warning(
                                             f"[ORCHESTRATOR] Serial log for stale "
                                             f"provisioning VM {old_vm_for_serial} "
-                                            f"(task {t.id}):\n{serial_log[-500:]}"
+                                            f"(task {t.id}):\n{serial_log}"
                                         )
                                 except Exception:
                                     logger.exception(
@@ -931,7 +931,7 @@ async def orchestrator_worker():
                             fresh_t.latest_status_message = f"Failed after {provision_failures} provision attempts"
                             failed_ctx = {**(fresh_t.context or {}), "failure_category": "PROVISION_FAILURE", "provision_failures": provision_failures}
                             if serial_log:
-                                failed_ctx["last_serial_log"] = serial_log[-500:]
+                                failed_ctx["last_serial_log"] = serial_log
                             fresh_t.context = failed_ctx
                             logger.error(f"[ORCHESTRATOR] Task {t.id} exceeded provision retry limit ({provision_failures}) — marking FAILED")
                             acct_id = get_task_llm_account_id(fresh_t)
@@ -956,7 +956,7 @@ async def orchestrator_worker():
                         fresh_t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         requeue_ctx = {**(fresh_t.context or {}), "provision_failures": provision_failures}
                         if serial_log:
-                            requeue_ctx["last_serial_log"] = serial_log[-500:]
+                            requeue_ctx["last_serial_log"] = serial_log
                         fresh_t.context = clear_task_llm_runtime_context(requeue_ctx)
                         session.add(fresh_t)
                         tasks_recovered += 1
@@ -2227,7 +2227,7 @@ async def orchestrator_worker():
                                         from app.compute import _capture_serial_for_vm
                                         serial_log = await asyncio.to_thread(_capture_serial_for_vm, vm_id, prov_zone)
                                         if serial_log:
-                                            logger.error(f"[ORCHESTRATOR] Serial log for failed VM {vm_id}:\n{serial_log[-500:]}")
+                                            logger.error(f"[ORCHESTRATOR] Serial log for failed VM {vm_id}:\n{serial_log}")
                                 except Exception:
                                     logger.exception(f"[ORCHESTRATOR] Failed to capture serial log for VM {vm_id}")
                                 # Requeue with retry tracking — zone exhaustion is transient
@@ -2239,7 +2239,7 @@ async def orchestrator_worker():
                                             if prov_zone:
                                                 ctx["provision_zone"] = prov_zone
                                             if serial_log:
-                                                ctx["last_serial_log"] = serial_log[-500:]
+                                                ctx["last_serial_log"] = serial_log
 
                                             # Classify: infra-wide (zone/quota exhaustion) vs task-specific
                                             err_lower = (provision_err or "").lower()

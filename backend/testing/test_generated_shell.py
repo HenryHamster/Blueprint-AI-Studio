@@ -258,6 +258,59 @@ class TestGeneratedShellContract:
             )
         )
 
+    def test_env_file_extracts_strip_quotes(self, gen: ShellGenerator):
+        """systemd EnvironmentFile values are written as ``KEY="value"``
+        with surrounding double quotes (see materialize_manifest.py).
+        A pipeline of ``grep '^KEY=' /etc/agent.env | cut -d= -f2-``
+        keeps those quotes — the extracted value is ``"actual"`` not
+        ``actual``.
+
+        For HTTP headers like ``X-Agent-Token: "eyJ..."`` the orchestrator's
+        JWT verifier rejects the malformed token with 401, ``curl -f``
+        exits 22, and (combined with ``set -e`` on the assignment) the
+        script silently dies with no ERR trap fire — the exact failure
+        mode of task 923f51e8 where every VM hit ~10 min of silent idle
+        before the reaper bounced it.
+
+        Fix: pipe through ``tr -d '"'`` (safe for quote-free values like
+        JWTs and URLs) before assigning. This test enforces that any
+        ``grep`` of /etc/agent.env piped to ``cut`` includes a quote-
+        stripping step in the same substitution.
+        """
+        script = gen.render()
+        # Match `VAR="$(... grep ... /etc/agent.env ... | ... cut ... )"`
+        # on a single logical line. We only care about the agent.env case
+        # because that's the systemd-env-format file with the quoting
+        # convention; other files don't follow the convention.
+        pattern = re.compile(
+            r"^\s*[A-Z_][A-Z0-9_]*=\"\$\("
+            r"[^)]*\bgrep\b[^)]*/etc/agent\.env[^)]*"
+            r"\|[^)]*\bcut\b[^)]*"
+            r"\)\"",
+            re.MULTILINE,
+        )
+        offenders = []
+        for m in pattern.finditer(script):
+            snippet = m.group(0)
+            # Acceptable quote-strip steps inside the substitution.
+            if "tr -d '\"'" in snippet or "tr -d \"\\\"\"" in snippet:
+                continue
+            if re.search(r"sed[^|]*['\"]\^?\\?[\"]", snippet):
+                continue
+            line_no = script.count("\n", 0, m.start()) + 1
+            offenders.append((line_no, snippet[:140]))
+        assert not offenders, (
+            f"{gen.name}: extracting values from /etc/agent.env via "
+            f"`grep | cut` MUST strip the surrounding quotes "
+            f"(`| tr -d '\"'`). systemd env file values are written as "
+            f"KEY=\"value\"; without stripping the cut output is "
+            f"`\"value\"` (literal quotes) and consumers like the JWT "
+            f"verifier reject it. Bash's `var=$(curl -f ...)` simple-"
+            f"command rule then exits the script with curl's status "
+            f"under set -e, with NO ERR trap fire. Offenders:\n"
+            + "\n".join(f"  line {i}: {s}" for i, s in offenders)
+        )
+
     def test_err_trap_captures_diagnostics(self, gen: ShellGenerator):
         """When a VM dies pre-claim with no forensics, BASH_COMMAND is the
         single most useful data point. If an ERR trap exists at all, it
