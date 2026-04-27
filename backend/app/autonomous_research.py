@@ -13,7 +13,6 @@ import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -23,7 +22,7 @@ from app.models import (
     Task, Project, TaskHistory, TaskStatus, Alert, AlertSeverity,
 )
 from app.database import AsyncSessionLocal
-from app.payload_schemas import validate_internal_payload, ALL_TASK_TYPES
+from app.payload_schemas import validate_internal_payload, ALL_TASK_TYPES, PayloadTooLargeError
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
@@ -59,12 +58,12 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
 
 async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     """Inner implementation — always called under the per-project spawn lock."""
-    from app.main import _maybe_create_circuit_breaker_alert  # noqa: PLC0415
-    from app.task_lifecycle import _increment_research_spawn_count  # noqa: PLC0415
-    from app.research_completion import _compute_momentum_factor, _compute_productivity_score, _compute_acceptance_rate  # noqa: PLC0415
-    from app.direction_metrics import _compute_direction_quality_score, _compute_difficulty_index  # noqa: PLC0415
-    from app.anomaly_detection import _compute_research_anomalies, check_anomaly_actions  # noqa: PLC0415
-    from app.direction_lifecycle import _process_direction_lifecycle  # noqa: PLC0415
+    from app.main import _maybe_create_circuit_breaker_alert
+    from app.task_lifecycle import _increment_research_spawn_count
+    from app.research_completion import _compute_momentum_factor, _compute_productivity_score, _compute_acceptance_rate
+    from app.direction_metrics import _compute_direction_quality_score, _compute_difficulty_index
+    from app.anomaly_detection import _compute_research_anomalies, check_anomaly_actions
+    from app.direction_lifecycle import _process_direction_lifecycle
     # Guard: autonomous must be enabled
     if not project.autonomous_enabled:
         return
@@ -193,10 +192,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # Build vision priority lookup: directions tagged with a system_id that appears
     # earlier in vision.priorities get a lower (better) rank.
     vision_priorities = (vision_data.get("priorities") or []) if vision_data else []
-    vision_priority_index: dict = {}
-    for idx, sys_id in enumerate(vision_priorities):
-        if isinstance(sys_id, str):
-            vision_priority_index[sys_id] = idx
+    vision_priority_index: dict = {
+        sys_id: idx
+        for idx, sys_id in enumerate(vision_priorities)
+        if isinstance(sys_id, str)
+    }
 
     def _vision_rank(d: dict) -> int:
         """0 = top vision priority, len = unlisted. Directions without system_id get neutral rank."""
@@ -208,7 +208,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # Sort all eligible directions by priority for greedy selection
     chosen_directions: list[dict] = []
     if active_directions:
-        import random
         priority_rank = {"high": 0, "medium": 1, "low": 2}
 
         def _direction_score(d: dict) -> tuple:
@@ -278,14 +277,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # Tests use SQLite which has no advisory locks; the try/except keeps
         # the fallback equivalent to "assume we hold the lock" (safe because
         # there's only one process in tests).
-        from sqlalchemy import text as _sql_text  # noqa: PLC0415
+        from sqlalchemy import text as _sql_text
         _lock_key = abs(hash(f"research_spawn:{project.id}")) % (2**31)
         try:
             _got_lock = (await session.execute(
                 _sql_text("SELECT pg_try_advisory_xact_lock(:k)"),
                 {"k": _lock_key},
             )).scalar()
-        except Exception:
+        except Exception:  # noqa: BLE001 — SQLite/test dialects raise NotSupportedError; treat as "no contention"
             _got_lock = True  # non-Postgres dialect (tests) — skip serialization
         if not _got_lock:
             logger.info(
@@ -331,7 +330,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     pending_sr = (project.vision or {}).get('_pending_strategic_review')
     if pending_sr:
         try:
-            from app.strategic_spawning import _spawn_strategic_review  # noqa: PLC0415
+            from app.strategic_spawning import _spawn_strategic_review
             if await _spawn_strategic_review(project, session, cycle_id=pending_sr.get('cycle_id')):
                 project.vision = {**project.vision}
                 project.vision.pop('_pending_strategic_review', None)
@@ -375,20 +374,52 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         is_architecture_cycle = arch_frequency > 0 and strategic_cycle_count % arch_frequency == 0
 
         spawned = False
-        if is_architecture_cycle:
-            # Full pipeline: Phase 1 (architecture) → Phase 2 (strategic) via completion handler
-            from app.strategic_spawning import _spawn_design_doc_update
-            spawned = await _spawn_design_doc_update(project, session)
-            if spawned:
-                logger.info(f"[AUTONOMOUS] Spawned design doc update (strategic cycle #{strategic_cycle_count}, "
-                            f"vision rev {(project.vision or {}).get('revision', 0)})")
-        else:
-            # Strategy-only: skip architecture, go straight to strategic review
-            from app.strategic_spawning import _spawn_strategic_review
-            spawned = await _spawn_strategic_review(project, session)
-            if spawned:
-                logger.info(f"[AUTONOMOUS] Spawned strategic review without architecture "
-                            f"(cycle #{strategic_cycle_count}, arch runs every {arch_frequency})")
+        try:
+            if is_architecture_cycle:
+                # Full pipeline: Phase 1 (architecture) → Phase 2 (strategic) via completion handler
+                from app.strategic_spawning import _spawn_design_doc_update
+                spawned = await _spawn_design_doc_update(project, session)
+                if spawned:
+                    logger.info(f"[AUTONOMOUS] Spawned design doc update (strategic cycle #{strategic_cycle_count}, "
+                                f"vision rev {(project.vision or {}).get('revision', 0)})")
+            else:
+                # Strategy-only: skip architecture, go straight to strategic review
+                from app.strategic_spawning import _spawn_strategic_review
+                spawned = await _spawn_strategic_review(project, session)
+                if spawned:
+                    logger.info(f"[AUTONOMOUS] Spawned strategic review without architecture "
+                                f"(cycle #{strategic_cycle_count}, arch runs every {arch_frequency})")
+        except PayloadTooLargeError as e:
+            # The strategic payload outgrew the 256 KB cap (problem_model + design_doc
+            # carry most of the weight). Without this catch, the exception bubbles up
+            # to _check_idle_research's outer except and silently kills *all* autonomy
+            # (including tactical research) for as long as the strategic context stays
+            # bloated. Fall through so tactical research continues, and surface a
+            # dedup'd alert so the operator knows strategic refresh is paused.
+            logger.warning(
+                f"[STRATEGIC] Skipping strategic spawn for project {project.id}: {e}. "
+                f"Tactical research will continue."
+            )
+            existing_alert = (await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == "Strategic review skipped: payload too large",
+                    Alert.dismissed_at.is_(None),
+                )
+            )).scalars().first()
+            if not existing_alert:
+                session.add(Alert(
+                    project_id=project.id,
+                    severity=AlertSeverity.WARNING,
+                    title="Strategic review skipped: payload too large",
+                    message=(
+                        f"Strategic spawn payload exceeds the 256 KB limit "
+                        f"({e.size} bytes, top contributors: "
+                        f"{', '.join(f'{k}={n}B' for k, n in e.top_keys[:3])}). "
+                        "Tactical research continues, but strategic refresh is paused "
+                        "until the design_doc/problem_model/conversation_thread shrink."
+                    ),
+                ))
 
         if spawned:
             research_spawn_count += 1
@@ -480,8 +511,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # Check anomaly-driven pipeline adjustments (apply or restore) after anomaly tracking
     anomaly_action = await check_anomaly_actions()
     if anomaly_action["action"] != "none":
-        from app.broadcast import broadcast_to_project  # noqa: PLC0415
-        from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
+        from app.broadcast import broadcast_to_project
+        from app.notification_dispatch import dispatch_external_notification
         await broadcast_to_project(
             str(project.id),
             "anomaly_adjustment",
@@ -503,7 +534,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 ),
             )
             session.add(alert)
-            asyncio.ensure_future(dispatch_external_notification(
+            asyncio.ensure_future(dispatch_external_notification(  # noqa: RUF006 — fire-and-forget notification
                 str(project.id),
                 "ANOMALY_ADJUSTMENT",
                 {
@@ -526,7 +557,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 ),
             )
             session.add(alert)
-            asyncio.ensure_future(dispatch_external_notification(
+            asyncio.ensure_future(dispatch_external_notification(  # noqa: RUF006 — fire-and-forget notification
                 str(project.id),
                 "ANOMALY_RESTORED",
                 {
@@ -684,7 +715,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             ).order_by(Task.created_at.desc()).limit(20)
         )).scalars().all()
         prev_research_rows = [r for r in prev_research_rows if (r.context or {}).get("deferred_findings")]
-        from app.finding_deduplication import finding_hash as _finding_hash  # noqa: PLC0415
+        from app.finding_deduplication import finding_hash as _finding_hash
         _deferred_ttl_days = int(_runtime_config.get("deferred_finding_ttl_days", 7))
         _ttl_cutoff = _utcnow() - timedelta(days=_deferred_ttl_days)
         dir_deferred: list[dict] = []
@@ -768,7 +799,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
 async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncSession):
     """Spawn a periodic non-research task (qa, security_audit, deps) if its schedule is due."""
-    from app.main import _maybe_create_circuit_breaker_alert  # noqa: PLC0415
+    from app.main import _maybe_create_circuit_breaker_alert
     from sqlalchemy import func
 
     # Guard: task_type must be a known type
@@ -958,7 +989,7 @@ async def _recent_investigation_exists(
     ``_MAX_ACTIVE_INVESTIGATIONS_PER_DIRECTION`` always applies to prevent
     resource exhaustion.
     """
-    from sqlalchemy import or_  # noqa: PLC0415
+    from sqlalchemy import or_
     active_statuses = (
         TaskStatus.QUEUED, TaskStatus.PROVISIONING,
         TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
@@ -999,7 +1030,7 @@ async def _spawn_direction_hold_investigation(project: Project, session: AsyncSe
     retrying. Investigation reports are consumed by _handle_investigation_completion,
     which can then drive targeted remediation.
     """
-    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+    from app.anomaly_detection import _error_fingerprint
     held = _shared_state.get_held_directions()
     if not held:
         return 0
@@ -1099,7 +1130,7 @@ async def _spawn_task_failure_investigation(
     Gating is delegated to ``should_trigger_code_defect_investigation``; this
     function adds 24h dedup per direction and builds the investigation prompt.
     """
-    from app.failure_classification import (  # noqa: PLC0415
+    from app.failure_classification import (
         AGENT_TIMEOUT, CODE_ERROR, REVIEW_QUALITY_STREAK_THRESHOLD,
         TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED, TAXONOMY_REVIEW_QUALITY,
         classify_failure_taxonomy,
@@ -1183,7 +1214,7 @@ async def _spawn_task_failure_investigation(
         return False
 
     if prev_fp:
-        from app.task_completion import _find_sibling_fingerprint_investigation  # noqa: PLC0415
+        from app.task_completion import _find_sibling_fingerprint_investigation
         sibling_cutoff = _utcnow() - timedelta(hours=24)
         shared_id = await _find_sibling_fingerprint_investigation(
             task.project_id, prev_fp, sibling_cutoff, session,
@@ -1347,9 +1378,9 @@ async def _spawn_review_convergence_investigation(
     if await _recent_investigation_exists(orig_task.project_id, direction_id, session):
         return None
 
-    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
-    from app.failure_classification import CODE_ERROR, TAXONOMY_REVIEW_QUALITY  # noqa: PLC0415
-    from app.task_completion import _find_sibling_fingerprint_investigation  # noqa: PLC0415
+    from app.anomaly_detection import _error_fingerprint
+    from app.failure_classification import CODE_ERROR, TAXONOMY_REVIEW_QUALITY
+    from app.task_completion import _find_sibling_fingerprint_investigation
 
     fp_source = (orig_task.latest_status_message or "").strip()
     if not fp_source:
@@ -1470,8 +1501,8 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
 
     Returns the number of tasks spawned (0 or 1).
     """
-    from app.failure_classification import get_top_residual_fingerprints  # noqa: PLC0415
-    from sqlalchemy import cast, func, select, String  # noqa: PLC0415
+    from app.failure_classification import get_top_residual_fingerprints
+    from sqlalchemy import cast, func, select, String
 
     fingerprints = get_top_residual_fingerprints(window_seconds=86400, top_n=10)
     if not fingerprints:
@@ -1521,8 +1552,8 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
         # has already been addressed and spawning another remediation task
         # would waste capacity and trigger an identical cycle 24 h later.
         if sample_messages:
-            from app.failure_classification import classify_failure as _rfc, CODE_ERROR as _CE  # noqa: PLC0415
-            import types as _types  # noqa: PLC0415
+            from app.failure_classification import classify_failure as _rfc, CODE_ERROR as _CE
+            import types as _types
             _probe = _types.SimpleNamespace(
                 context={},
                 latest_status_message=sample_messages[0],
@@ -1633,7 +1664,7 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
 
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
-    from app.anomaly_detection import _expire_stale_proposals, _check_anomaly_proposals  # noqa: PLC0415
+    from app.anomaly_detection import _expire_stale_proposals, _check_anomaly_proposals
     now = _utcnow()
     interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
     if _shared_state.last_idle_check and (now - _shared_state.last_idle_check) < timedelta(minutes=interval_minutes):

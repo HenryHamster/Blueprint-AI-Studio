@@ -7,10 +7,9 @@ function slots in that module.
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app import strategic_cycle
@@ -45,6 +44,60 @@ def _agent_view_design_doc(doc: dict | None) -> dict:
     }
 
 
+# Maximum history/past_moves entries to keep per active gap when shipping the
+# problem model to the strategic agent. Active gaps accumulate move records and
+# evidence over time; shipping the full lineage every cycle pushes the strategic
+# payload past the 256 KB hard cap (see _MAX_PAYLOAD_BYTES rationale). Keep
+# enough to reason about recent direction trajectory without dragging months
+# of stale context.
+_GAP_HISTORY_KEEP = 5
+_GAP_PAST_MOVES_KEEP = 5
+_GAP_EVIDENCE_KEEP = 8
+
+
+def _agent_view_problem_model(pm: dict | None) -> dict:
+    """Trim Project.problem_model for inclusion in strategic-agent payloads.
+
+    Two sources of unbounded growth get capped here:
+
+    1. ``archived_gaps`` — closed gaps retained for operator/UI reference.
+       The strategic agent does not act on them; if it needs historical
+       context it can pull a specific gap by id from the full record.
+       This was 24 KB / 31 entries on the Blueprint project at the time
+       this was added.
+    2. Per-active-gap ``history`` / ``past_moves`` / ``evidence`` arrays
+       grow with every cycle. Trim to the most recent N entries each so
+       the per-gap footprint stays bounded.
+
+    Together these two trims drop the problem_model from ~78 KB to ~50 KB
+    on a mature project — enough headroom under the 256 KB payload cap
+    for the rest of the strategic context to keep working.
+    """
+    if not pm:
+        return {}
+    trimmed = dict(pm)
+    trimmed.pop("archived_gaps", None)
+    gaps = trimmed.get("gaps") or []
+    if gaps:
+        new_gaps = []
+        for g in gaps:
+            if not isinstance(g, dict):
+                new_gaps.append(g)
+                continue
+            g2 = dict(g)
+            for key, keep in (
+                ("history", _GAP_HISTORY_KEEP),
+                ("past_moves", _GAP_PAST_MOVES_KEEP),
+                ("evidence", _GAP_EVIDENCE_KEEP),
+            ):
+                arr = g2.get(key)
+                if isinstance(arr, list) and len(arr) > keep:
+                    g2[key] = arr[-keep:]
+            new_gaps.append(g2)
+        trimmed["gaps"] = new_gaps
+    return trimmed
+
+
 async def _build_shipped_changes_manifest(
     project: Project, session: AsyncSession
 ) -> list[dict]:
@@ -58,7 +111,7 @@ async def _build_shipped_changes_manifest(
     # Task.updated_at is TIMESTAMP WITHOUT TIME ZONE — the cutoff must be naive
     # UTC or asyncpg raises "can't subtract offset-naive and offset-aware
     # datetimes" when binding the parameter.
-    def _parse_naive_utc(ts: str) -> Optional[datetime]:
+    def _parse_naive_utc(ts: str) -> datetime | None:
         try:
             parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             if parsed.tzinfo is not None:
@@ -67,7 +120,7 @@ async def _build_shipped_changes_manifest(
         except (ValueError, TypeError):
             return None
 
-    cutoff: Optional[datetime] = None
+    cutoff: datetime | None = None
     last_updated = (project.design_doc or {}).get("_meta", {}).get("last_updated")
     if last_updated:
         cutoff = _parse_naive_utc(last_updated)
@@ -147,7 +200,7 @@ def _rollup_body_is_trivial(body: str | None) -> bool:
     can substitute per-subtask detail instead."""
     if not body:
         return True
-    import re  # noqa: PLC0415
+    import re
     return bool(re.match(r"^\s*Rollup of \d+ subtasks?\b", body))
 
 
@@ -257,7 +310,7 @@ async def _build_recent_interventions(
         if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
     ]
     merged_tasks.sort(
-        key=lambda t: t.updated_at or t.created_at or datetime.min,
+        key=lambda t: t.updated_at or t.created_at or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
 
@@ -338,7 +391,7 @@ async def _build_recent_interventions(
             (t.title or "")[:160] for t in d_tasks
             if t.status == TaskStatus.COMPLETED
             and (t.context or {}).get("pr_merged")
-            and (t.updated_at or t.created_at or datetime.min) >= recent_cutoff
+            and (t.updated_at or t.created_at or datetime.min.replace(tzinfo=timezone.utc)) >= recent_cutoff
         ]
         if recent_merges:
             entry["recent_merged_titles"] = recent_merges[:10]
@@ -418,7 +471,7 @@ def _build_previous_decision_outcomes(project: Project, cycle_history: list) -> 
     created_predictions = prev_entry.get("created_predictions") or {}
     retired_final_metrics = prev_entry.get("retired_final_metrics") or {}
 
-    def _summarize(direction_id: str, role: str, rationale: Optional[str]) -> dict[str, Any]:
+    def _summarize(direction_id: str, role: str, rationale: str | None) -> dict[str, Any]:
         d = directions_by_id.get(direction_id)
         if d is None:
             entry: dict[str, Any] = {"direction_id": direction_id, "role": role, "status": "missing"}
@@ -600,7 +653,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     On completion, it chains to _spawn_strategic_review (Phase 2).
     Returns True if a task was created, False if skipped.
     """
-    from app.task_lifecycle import _has_active_strategic_task  # noqa: PLC0415
+    from app.task_lifecycle import _has_active_strategic_task
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
         logger.warning(f"[STRATEGIC] Skipping design doc update — strategic task already active for {project.id}")
@@ -634,7 +687,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
         "project_name": project.name,
         "vision": project.vision or {},
-        "problem_model": project.problem_model or {},
+        "problem_model": _agent_view_problem_model(project.problem_model),
         "open_messages": open_msgs,
         "shipped_changes_manifest": shipped_changes_manifest,
         "base_branch": "main",
@@ -676,14 +729,14 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     return True
 
 
-async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle_id: Optional[str] = None) -> bool:
+async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle_id: str | None = None) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
     Called by _handle_design_doc_completion after the design doc is updated.
     Uses type 'strategic_review' so it doesn't block tactical research.
     Returns True if a task was created, False if skipped.
     """
-    from app.task_lifecycle import _has_active_strategic_task  # noqa: PLC0415
+    from app.task_lifecycle import _has_active_strategic_task
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
         logger.warning(f"[STRATEGIC] Skipping strategic review — strategic task already active for {project.id}")
@@ -718,9 +771,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
             for desc in (h.get("key_finding_descriptions") or []):
                 if desc and desc not in recent_findings:
                     recent_findings.append(desc)
-            for fd in (h.get("failed_task_details") or []):
-                if fd:
-                    recent_failures.append(fd)
+            recent_failures.extend(fd for fd in (h.get("failed_task_details") or []) if fd)
         total_prs = total_merged + total_rejected
         operator_rejection_rate = round(total_rejected / total_prs, 2) if total_prs > 0 else None
         stat_entry: dict = {
@@ -738,7 +789,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
             stat_entry["prs_rejected"] = total_rejected
         if operator_rejection_rate is not None and total_rejected > 0:
             stat_entry["operator_rejection_rate"] = operator_rejection_rate
-        from app.routers.admin_analytics import ON_DEMAND_RATE  # noqa: PLC0415
+        from app.routers.admin_analytics import ON_DEMAND_RATE
         cost_seconds = 0.0
         for h in history:
             tcount = h.get("tasks_created", 0) or 0
@@ -788,13 +839,16 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     rejected_proposals.sort(key=lambda r: r.get("rejected_at") or "", reverse=True)
     rejected_proposals = rejected_proposals[:10]
 
-    # Fetch unified conversation thread — last 30 messages chronologically,
+    # Fetch unified conversation thread — recent messages chronologically,
     # regardless of status.  Gives the strategic agent a coherent back-and-forth
-    # instead of flat, separated open/resolved lists.
+    # instead of flat, separated open/resolved lists. Capped at 15 because the
+    # full strategic payload sits dangerously close to the 256 KB hard limit
+    # (design_doc + problem_model alone are ~160 KB), and conversation_thread
+    # is the most aggressively trimmable component without losing critical state.
     thread_result = await session.execute(
         select(ProjectMessage).where(
             ProjectMessage.project_id == project.id,
-        ).order_by(ProjectMessage.created_at.desc()).limit(30)
+        ).order_by(ProjectMessage.created_at.desc()).limit(15)
     )
     all_thread_msgs = list(reversed(thread_result.scalars().all()))  # chronological
     conversation_thread = [
@@ -826,7 +880,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     review_effort = _runtime_config.get("task_type_efforts", {}).get("strategic_review") or \
                     _runtime_config.get("task_type_efforts", {}).get("research") or None
 
-    from app.strategic_analysis import _build_outcome_evaluation, _compute_prediction_calibration_factor  # noqa: PLC0415
+    from app.strategic_analysis import _build_outcome_evaluation, _compute_prediction_calibration_factor
     # Audit W2: cycle history is in the StrategicCycle table; pre-fetch once
     # and pass into all the sync analysis helpers so they don't need the session.
     cycle_history = await strategic_cycle.recent_for_agent_context(
@@ -850,7 +904,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "research_mode": "strategic",
         "design_doc": _agent_view_design_doc(project.design_doc),
         "vision": project.vision or {},
-        "problem_model": project.problem_model or {},
+        "problem_model": _agent_view_problem_model(project.problem_model),
         "running_update": project.running_update or "",
         "running_update_acknowledged_at": (
             project.running_update_acknowledged_at.isoformat()
