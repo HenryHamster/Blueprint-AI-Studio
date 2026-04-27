@@ -1130,6 +1130,20 @@ async def _process_post_commit(
                     exc_info=True,
                 )
 
+        # Audit 2026-04-25 A7/A12: release the FOR UPDATE row lock before the
+        # review pipeline runs its slow GitHub calls (PR fetch, check-runs,
+        # PR review submission, merge attempts — each can hit GitHub rate
+        # limits and stretch into the tens of seconds, occasionally minutes).
+        # Heartbeats arriving in that window would otherwise hit the locked
+        # row, get None from skip_locked, and return 409. Multiple skipped
+        # heartbeats over 5+ minutes would let the reaper false-orphan the
+        # task. Commit here flushes all pending state mutations from sections
+        # 1–4 above (dependent unblocking, failure recording, investigation
+        # spawns) and releases the lock; the rest of post-commit processing
+        # operates on the already-loaded task object without re-locking.
+        if session.dirty or session.new:
+            await session.commit()
+
         # 5. Review Pipeline — auto-spawn review/fix tasks based on completed task type
         if payload.status == TaskStatus.COMPLETED:
             task_payload = task.first_payload

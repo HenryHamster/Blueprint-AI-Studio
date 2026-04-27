@@ -341,6 +341,13 @@ async def reaper_service():
 
                 # Collect old VM IDs for deletion after commit (can't set attrs on SQLModel)
                 _reaper_old_vms: Dict[str, str] = {}
+                # Audit 2026-04-25 A8: defer parent re-queue to AFTER session.commit()
+                # so the orphan-row FOR UPDATE lock is released first. The previous
+                # version called _requeue_parent_task (which clones children + remaps
+                # deps + does its own queries) WHILE holding force-locked rows, which
+                # starved agent heartbeats with 429s and triggered cascading false
+                # orphan detection on the next reaper cycle.
+                _deferred_parent_requeues: list[Task] = []
 
                 for task in orphaned_tasks:
                     # Re-validate status before acting — task may have completed/been cancelled
@@ -695,8 +702,14 @@ async def reaper_service():
                                 select(Task).where(Task.parent_task_id == task.id)
                             )).scalars().all()
                         if children:
-                            logger.info(f"[REAPER] Re-evaluating parent task {task.id}")
-                            await _requeue_parent_task(task, session)
+                            # Audit A8: queue for post-commit processing; don't
+                            # block heartbeats on this task while we clone children.
+                            # Mark requeue_in_flight so the next reaper cycle (and
+                            # the orchestrator dispatch) skips this task while we work.
+                            logger.info(f"[REAPER] Deferring re-evaluation of parent task {task.id} until after lock release")
+                            task.requeue_in_flight = True
+                            session.add(task)
+                            _deferred_parent_requeues.append(task)
                         else:
                             if not is_provision_failure and not ext_api_fast_path:
                                 task.attempt_count += 1
@@ -883,6 +896,26 @@ async def reaper_service():
 
                 if orphaned_tasks:
                     await session.commit()
+
+                    # Audit A8: now that the orphan-row lock is released, do the
+                    # slow parent-requeue work (child clone + dep remap). Heartbeats
+                    # on the parent task will go through fine since we only set
+                    # requeue_in_flight (a marker), not a row lock.
+                    for parent in _deferred_parent_requeues:
+                        try:
+                            await _requeue_parent_task(parent, session)
+                        except Exception as e:
+                            logger.error(
+                                f"[REAPER] Deferred parent requeue failed for {parent.id}: {e}",
+                                exc_info=True,
+                            )
+                        finally:
+                            # Always clear the in-flight marker so subsequent reaper
+                            # cycles can re-evaluate if requeue itself failed.
+                            parent.requeue_in_flight = False
+                            session.add(parent)
+                    if _deferred_parent_requeues:
+                        await session.commit()
 
                     # Delete old VMs after commit (IDs captured before overwrite)
                     for old_vm in _reaper_old_vms.values():

@@ -582,6 +582,20 @@ class Artifact(SQLModel, table=True):
 
     artifact_type: ArtifactType = Field(sa_column=Column(String, nullable=False))
 
+    # Audit 2026-04-25 A14: partial UNIQUE on (task_id) WHERE artifact_type='PULL_REQUEST'
+    # closes the SELECT-then-INSERT race in agent_status.update_agent_status that
+    # could create two PR artifacts pointing at the same PR. Other artifact types
+    # (GIT_COMMIT, ERROR_LOG, SCREENSHOT, ...) legitimately have multiple rows per
+    # task, so the constraint is partial. Migration 0050.
+    __table_args__ = (
+        Index(
+            "ux_artifact_task_pull_request",
+            "task_id",
+            unique=True,
+            postgresql_where=text("artifact_type = 'PULL_REQUEST'"),
+        ),
+    )
+
     # Git-based outputs
     commit_hash: Optional[str] = None
     repo_url: Optional[str] = None

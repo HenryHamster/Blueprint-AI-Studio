@@ -14,6 +14,7 @@ import random
 import uuid
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -511,11 +512,22 @@ async def update_agent_status(
     # overwriting status after a task was requeued with a new VM.
     # FOR UPDATE prevents race with reaper: without it, a stale agent's
     # COMPLETED can overwrite the reaper's QUEUED (requeue) between read and write.
-    # SKIP LOCKED: _process_post_commit re-acquires FOR UPDATE on a separate
-    # session and holds it while making GitHub API calls (15–120s).  A duplicate
-    # status POST arriving in that window would block on FOR UPDATE, hit the 30s
-    # lock_timeout, and return 500.  skip_locked returns None instead so we can
-    # signal the agent to retry via a 503.
+    #
+    # SKIP LOCKED design (audit E9): _process_post_commit re-acquires FOR UPDATE
+    # on a separate session and holds it while making GitHub API calls (15–120s).
+    # A duplicate status POST arriving in that window would block on a plain
+    # FOR UPDATE, hit the 30s Postgres lock_timeout, and return 500 — Cloud Run
+    # then classifies the 5xx as ContainerError and quarantines the instance.
+    # skip_locked + 429 retry is the correct trade-off here: the agent's apiPost
+    # already treats 429 as retry-able with backoff. The verification report
+    # (2026-04-26) flagged this as PARTIAL because there's no blocking-lock
+    # alternative — but that alternative is structurally worse on Cloud Run.
+    # Mitigations in this design:
+    #   - terminal-state short-circuit (no pointless retries on COMPLETED tasks)
+    #   - structured 429 with Retry-After (5s) for contention
+    #   - the lock holder (post-commit) commits before its long GitHub calls
+    #     (early-commit pattern at line ~1635), so the contention window is
+    #     bounded to the few-ms early-commit phase, not the full post-commit
     stmt = select(Task).where(
         Task.id == payload.task_id,
         Task.vm_instance_id == token.get("vm_instance_id")
@@ -545,6 +557,12 @@ async def update_agent_status(
         # responses as ContainerError (Cloud Run flags any 5xx as a container
         # fault, quarantining the instance). The agent's apiPost treats 429
         # as retry-able the same way it handles 5xx.
+        # Audit E9: log at INFO so observability can see contention spikes
+        # without polluting WARN/ERROR with normal retry traffic.
+        logger.info(
+            f"[AGENT_STATUS] Row locked for task {check_task.id} (status={check_task.status}); "
+            f"returning 429 to agent for retry"
+        )
         raise HTTPException(
             status_code=429,
             detail="Task row locked, retry",
@@ -649,7 +667,11 @@ async def update_agent_status(
         flag_modified(task, 'context')
     session.add(task)
 
-    # 3. Create Artifact if provided (with duplicate prevention for PR artifacts)
+    # 3. Create Artifact if provided (with duplicate prevention for PR artifacts).
+    # Audit 2026-04-25 A14: pre-check is non-locking — two concurrent status POSTs
+    # can both pass and INSERT. Migration 0050 added a partial unique index
+    # (ux_artifact_task_pull_request) that makes the second INSERT raise
+    # IntegrityError; we catch it and treat as the dedup-skip path.
     if payload.artifact_type:
         if payload.artifact_type == ArtifactType.PULL_REQUEST:
             existing = (await session.execute(
@@ -671,6 +693,16 @@ async def update_agent_status(
                     logs=payload.logs
                 )
                 session.add(artifact)
+                try:
+                    await session.flush()  # surface IntegrityError now, not at commit
+                except IntegrityError as ie:
+                    # Concurrent peer beat us to it — partial UNIQUE caught the race.
+                    await session.rollback()
+                    logger.info(
+                        f"[STATUS] Task {task.id} PR artifact race lost (peer inserted first); "
+                        f"continuing with peer's row: {ie}"
+                    )
+                    return {"status": "accepted_dedup_race"}
                 # Store changed files and enriched retry info in task context
                 if payload.changed_files or payload.diff_summary or payload.self_review_outcome:
                     ctx = dict(task.context or {})
@@ -1293,7 +1325,52 @@ async def update_agent_status(
                         task.latest_status_message or f"[{failure_class}] Retries exhausted ({task.attempt_count}/{max_r})",
                     )
                 except Exception as _alert_err:
-                    logger.warning(f"[AGENT_STATUS] Failed to create failure alert for task {task.id}: {_alert_err}")
+                    # Audit 2026-04-25 A15: alert-creation failure was logged-and-continued.
+                    # Operator never saw the alert AND never saw that it failed to create.
+                    # Now we (a) mark the task so admin queries can find these silent failures,
+                    # (b) raise a project-level WARNING alert about the alert-system failure
+                    # itself so observability isn't blind to alert-system breakage.
+                    logger.error(
+                        f"[AGENT_STATUS] Failed to create failure alert for task {task.id}: {_alert_err}",
+                        exc_info=True,
+                    )
+                    _alert_err_ctx = dict(task.context or {})
+                    _alert_err_ctx["alert_creation_failed"] = True
+                    _alert_err_ctx["alert_creation_failure"] = (
+                        f"{type(_alert_err).__name__}: {str(_alert_err)[:300]}"
+                    )
+                    task.context = _alert_err_ctx
+                    flag_modified(task, "context")
+                    session.add(task)
+                    try:
+                        meta_alert = Alert(
+                            project_id=task.project_id,
+                            severity=AlertSeverity.WARNING,
+                            title=f"Alert system failure on task {str(task.id)[:8]}",
+                            message=(
+                                f"Failed to create the failure alert for task {task.id} "
+                                f"(type={task.first_payload.get('type', '')}, "
+                                f"failure_class={failure_class}). "
+                                f"Operator must inspect logs — task failure may be invisible "
+                                f"in the alerts panel. Error: "
+                                f"{type(_alert_err).__name__}: {str(_alert_err)[:200]}"
+                            ),
+                            task_id=None,  # project-level, not bound to the failed task
+                        )
+                        session.add(meta_alert)
+                        await broadcast_to_project(
+                            str(task.project_id),
+                            "alert_created",
+                            {"alert_id": str(meta_alert.id), "severity": "WARNING", "title": meta_alert.title},
+                        )
+                    except Exception as _meta_err:
+                        # Last-resort: if even the meta-alert fails, give up gracefully
+                        # rather than tearing down the status POST. Logged at ERROR so
+                        # CloudLogging picks it up.
+                        logger.error(
+                            f"[AGENT_STATUS] Meta-alert creation also failed for task {task.id}: {_meta_err}",
+                            exc_info=True,
+                        )
 
         # Record first-attempt success metrics for playbook effectiveness tracking
         if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
@@ -1662,12 +1739,21 @@ async def update_agent_status(
                 _payload_dump = payload.model_dump(mode="json")
             except Exception:
                 _payload_dump = None
+            _persist_err: Exception | None = None
             try:
                 await _persist_post_commit_pending(
                     _factory, task.id, reason, _payload_dump
                 )
             except Exception as ctx_err:
+                _persist_err = ctx_err
                 logger.exception(
                     f"[PIPELINE] Failed to set _post_commit_pending for task {task.id}: {ctx_err}"
                 )
+            # Audit 2026-04-25 A9: explicitly chain the persist failure so
+            # operators see both the original post-commit error AND the
+            # secondary persist failure in one traceback. The bare `raise`
+            # already used implicit __context__ chaining, but `raise … from`
+            # makes the intent unambiguous and survives future refactors.
+            if _persist_err is not None:
+                raise e from _persist_err
             raise
