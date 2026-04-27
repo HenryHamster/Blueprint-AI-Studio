@@ -421,6 +421,48 @@ class TestClassifyFailureFastPath:
         t = _task("failed to provision VM", {"failure_category": "some_unknown"})
         assert classify_failure(t) == PROVISION_FAILURE
 
+    def test_retry_after_exhausted_maps_to_rate_limit(self):
+        """Orchestrator auto-fail after too many retry_after cycles must not be CODE_ERROR."""
+        t = _task(
+            "Auto-failed after 16 retry_after cycles (threshold 16); held 240m. "
+            "Pool state: all accounts in rate-limit cooldown (earliest recovery: 2026-04-24T12:30:00+00:00).",
+            {"failure_category": "retry_after_exhausted"},
+        )
+        assert classify_failure(t) == RATE_LIMIT
+
+
+class TestClassifyFailurePipelineRateLimitMessages:
+    """Pipeline-internal rate-limit status strings must not fall through to CODE_ERROR."""
+
+    def test_requeued_waiting_for_account_cooldown(self):
+        """The exact fingerprint phrase that was creating spurious auto-remediation tasks."""
+        t = _task("Rate limited — requeued, waiting for account cooldown")
+        assert classify_failure(t) == RATE_LIMIT
+
+    def test_requeued_with_exhausted_account_blacklisted(self):
+        t = _task("Rate limited — requeued with exhausted account blacklisted")
+        assert classify_failure(t) == RATE_LIMIT
+
+    def test_all_accounts_rate_limited_waiting_for_cooldown(self):
+        t = _task("All accounts rate-limited — waiting for cooldown")
+        assert classify_failure(t) == RATE_LIMIT
+
+    def test_all_accounts_in_rate_limit_cooldown(self):
+        t = _task("all accounts in rate-limit cooldown (earliest recovery: 2026-04-24T12:30:00+00:00)")
+        assert classify_failure(t) == RATE_LIMIT
+
+    def test_auto_failed_with_rate_limit_pool_state(self):
+        t = _task(
+            "Auto-failed after 16 retry_after cycles (threshold 16); held 240m. "
+            "Pool state: all accounts in rate-limit cooldown (earliest recovery: 2026-04-24T12:30:00+00:00).",
+        )
+        assert classify_failure(t) == RATE_LIMIT
+
+    def test_github_rate_limit_with_cooldown_is_still_external_api(self):
+        """GitHub rate limits must still route to EXTERNAL_API, not RATE_LIMIT."""
+        t = _task("GitHub API rate limit exceeded — cooldown active")
+        assert classify_failure(t) == EXTERNAL_API
+
 
 class TestClassifyFailureEdgeCases:
     def test_empty_status_is_agent_timeout(self):

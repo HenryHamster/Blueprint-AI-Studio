@@ -801,6 +801,10 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
             return mapped
         if agent_category in INFRA_CLASSES or agent_category == CODE_ERROR:
             return agent_category
+        # Orchestrator-internal: task auto-failed after too many retry_after cycles
+        # because all accounts were rate-limited. Root cause is RATE_LIMIT.
+        if agent_category == "retry_after_exhausted":
+            return RATE_LIMIT
 
     status_msg = (task.latest_status_message or "").lower()
     logs_lower = (logs or "").lower()
@@ -884,6 +888,20 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
     rate_limit_patterns = _task_rate_limit_patterns(task)
     if any(kw in combined for kw in rate_limit_patterns):
         return "RATE_LIMIT"
+
+    # Pipeline-internal rate-limit status messages — backend-generated strings written by
+    # the orchestrator and reaper on tasks held or requeued due to provider account
+    # exhaustion. These contain "rate limit" or "rate-limit" but are not from GitHub
+    # (already caught above) and don't match provider-specific API error patterns because
+    # they're internal status strings, not API responses. Classify as RATE_LIMIT so they
+    # don't fall through to CODE_ERROR and create spurious auto-remediation fingerprints.
+    # Examples:
+    #   "Rate limited — requeued, waiting for account cooldown"
+    #   "All accounts rate-limited — waiting for cooldown"
+    #   "Auto-failed after N retry_after cycles; Pool state: all accounts in rate-limit cooldown"
+    if any(rl in combined for rl in ("rate limited", "rate-limit")) and \
+            any(pl in combined for pl in ("requeued", "cooldown")):
+        return RATE_LIMIT
 
     # Workflow limits — iteration caps, spawn failures due to pipeline state (not code errors).
     # Checked before merge-blocking EXTERNAL_API so a message like "merge blocked, fix not spawned

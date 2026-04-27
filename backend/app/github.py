@@ -44,12 +44,9 @@ import re as _re
 
 
 def _normalize_endpoint_template(method: str, url: str) -> str:
-    """Collapse a concrete GitHub URL into an endpoint template for counting.
+    """Collapse GitHub URLs to endpoint templates for counting (e.g. /pulls/1852 → /pulls/{n}).
 
-    ``GET https://api.github.com/repos/foo/bar/pulls/1852`` becomes
-    ``GET /repos/{owner}/{repo}/pulls/{n}`` so per-call counters don't
-    explode on PR numbers, SHAs, or branch refs.  The mapping is a
-    handful of regexes — cheap, doesn't require parsing the URL.
+    Prevents counter explosion on PR numbers, SHAs, or branch refs.
     """
     path = url.split("api.github.com", 1)[-1]
     # Strip query string; it's not useful for grouping hotspots.
@@ -76,22 +73,11 @@ def _record_call(method: str, url: str) -> None:
 
 
 async def probe_rate_limit() -> bool:
-    """Ping GitHub's /rate_limit endpoint to keep github_quota fresh.
+    """Ping /rate_limit (free call) to keep github_quota fresh for the dashboard.
 
-    /rate_limit is a free call — doesn't count against the 5000/hr REST
-    budget (per GitHub docs).  We use it as a heartbeat so the dashboard
-    quota pill shows real numbers even when the pipeline is idle and no
-    task-driven GitHub calls have happened recently.
-
-    Uses a cached installation token (not App JWT) — GitHub reports
-    SEPARATE rate-limit buckets per token type, and the pill is only
-    meaningful for the installation-token bucket (which is what every
-    task-driven call uses).  Probing with App JWT populates the pill
-    with the App's narrower ~60/hr bucket, making it look like quota
-    is exhausted when in fact the 5000/hr install bucket is fine.
-
-    Returns True on success, False if no cached install token is
-    available (in which case the pill waits for organic task traffic).
+    Uses cached install token (not JWT) — install bucket is 5000/hr vs JWT's ~60/hr,
+    so probing with JWT would make quota look exhausted when the install bucket is fine.
+    Returns True on success, False if no cached token (pill waits for organic traffic).
     """
     # Pull any currently-cached installation token — doesn't spend quota
     # on a refresh.  If nothing's cached, skip the probe; real activity
