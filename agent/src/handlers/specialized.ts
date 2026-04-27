@@ -7,7 +7,7 @@ import {
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
-import { describeJsonExtractionResult, extractJsonArrayDetailed } from '../json-extract.js';
+import { describeJsonExtractionResult, extractJsonArrayDetailed, extractJsonObjectDetailed } from '../json-extract.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
@@ -691,18 +691,40 @@ IMPORTANT:
 - Base every claim on code you have actually read.`;
 
   statusRef.value = 'Running investigation...';
-  const { exitCode } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
-  const investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
+  let investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
   if (investigationResult === null) {
-    await persistAndPostStatus(taskId, {
-      task_id: taskId,
-      status: 'FAILED',
-      artifact_type: 'ERROR_LOG',
-      logs: `Failed to read investigation report from /tmp/investigation_report_${taskId}.json`,
-      failure_category: 'parse_failed',
-    });
-    return;
+    const requiredFields = ['summary', 'root_cause', 'affected_files', 'recommended_fix', 'severity', 'confidence'];
+
+    // Try lastResultText first (cheaper — usually the final message)
+    if (lastResultText && lastResultText.includes('"root_cause"')) {
+      const res = extractJsonObjectDetailed(lastResultText, 'root_cause', 'recommended_fix');
+      if (res.ok && requiredFields.every(k => k in (res.value as Record<string, unknown>))) {
+        investigationResult = res.value as Record<string, unknown>;
+        sendLog(ws, `[WARNING] Investigation JSON recovered from lastResultText transcript rather than file.\n`);
+      }
+    }
+
+    // Fall back to full transcript
+    if (investigationResult === null) {
+      const res = extractJsonObjectDetailed(allOutput, 'root_cause', 'recommended_fix');
+      if (res.ok && requiredFields.every(k => k in (res.value as Record<string, unknown>))) {
+        investigationResult = res.value as Record<string, unknown>;
+        sendLog(ws, `[WARNING] Investigation JSON recovered from allOutput transcript rather than file.\n`);
+      }
+    }
+
+    if (investigationResult === null) {
+      await persistAndPostStatus(taskId, {
+        task_id: taskId,
+        status: 'FAILED',
+        artifact_type: 'ERROR_LOG',
+        logs: `Failed to read investigation report from /tmp/investigation_report_${taskId}.json; no JSON object with root_cause found in transcript`,
+        failure_category: 'parse_failed',
+      });
+      return;
+    }
   }
 
   const logs = sanitize(JSON.stringify(investigationResult));

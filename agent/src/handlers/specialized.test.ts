@@ -412,12 +412,62 @@ describe('handleInvestigate — report reading and status mapping', () => {
 
   it('sets status FAILED with parse_failed category when investigation_report file is missing', async () => {
     vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
 
     await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('parse_failed');
+  });
+
+  it('recovers investigation JSON from lastResultText when file is missing', async () => {
+    const recovered = {
+      summary: 'Auth token not invalidated',
+      root_cause: 'Missing invalidation call in logout handler',
+      affected_files: [{ path: 'backend/app/auth.py', issue: 'no invalidation' }],
+      recommended_fix: 'Call invalidate() in logout()',
+      severity: 'high',
+      confidence: 'medium',
+    };
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify(recovered),
+    });
+
+    await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
+    expect(call.logs).toBe(JSON.stringify(recovered));
+  });
+
+  it('recovers investigation JSON from allOutput when file and lastResultText are both missing', async () => {
+    const recovered = {
+      summary: 'Null pointer in parser',
+      root_cause: 'Parser assumes non-null input',
+      affected_files: [{ path: 'src/parser.ts', issue: 'no null guard' }],
+      recommended_fix: 'Add null check before parsing',
+      severity: 'medium',
+      confidence: 'high',
+    };
+    const prose = `I investigated the issue.\n\nHere is my report:\n${JSON.stringify(recovered)}\n\nHope this helps.`;
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: prose,
+      lastResultText: '',
+    });
+
+    await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
+    expect(call.logs).toBe(JSON.stringify(recovered));
   });
 
   it('sets status FAILED and artifact_type ERROR_LOG on non-zero exitCode with result', async () => {

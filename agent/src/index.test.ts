@@ -1040,6 +1040,10 @@ describe('provider runner reliability', () => {
     vi.mocked(fs.openSync).mockReturnValue(3);
   });
 
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it('uses the stderr tail so late rate-limit text is still classified', async () => {
     mockProviderRun(['x'.repeat(60_000), "\nyou've hit your usage limit\n"], 1);
 
@@ -1048,6 +1052,7 @@ describe('provider runner reliability', () => {
   });
 
   it('writes the stdin prompt file as owner-only', async () => {
+    vi.stubEnv('TASK_ID', '');
     mockProviderRun([], 0);
 
     await runProviderAgent('private prompt', null, { value: '' });
