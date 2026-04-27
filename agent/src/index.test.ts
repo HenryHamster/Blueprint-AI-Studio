@@ -1034,6 +1034,7 @@ describe('provider runner reliability', () => {
   }
 
   beforeEach(() => {
+    vi.stubEnv('TASK_ID', '');
     vi.mocked(spawn).mockReset();
     vi.mocked(fs.writeFileSync).mockClear();
     vi.mocked(fs.chmodSync).mockClear();
