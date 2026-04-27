@@ -627,9 +627,10 @@ async def claim_task(
         # replay, the retry hits the QUEUED/PROVISIONING filter, returns 404,
         # and the agent dies with PRE_CLAIM_FAILED on a task that was actually
         # claimed successfully. Match this VM's just-claimed task (last heartbeat
-        # within 3 min — longer than the agent's worst-case retry window of
-        # API_TIMEOUT * API_MAX_RETRIES with backoff) and replay the same response.
-        replay_cutoff = _utcnow() - timedelta(minutes=3)
+        # within 5 min — covers slow GCP provisioning and the agent's worst-case
+        # retry window of API_TIMEOUT * API_MAX_RETRIES with backoff) and replay
+        # the same response.
+        replay_cutoff = _utcnow() - timedelta(minutes=5)
         replay_stmt = select(Task).where(
             Task.vm_instance_id == vm_id,
             Task.status == TaskStatus.IN_PROGRESS,

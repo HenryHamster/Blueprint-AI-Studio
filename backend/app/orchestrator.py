@@ -42,6 +42,7 @@ from app.orchestrator_filters import (
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config, sync_runtime_config_from_state as _sync_runtime_config_from_state
+from app.task_locking import task_lock
 from app.time_utils import _utcnow, clear_retry_after, parse_retry_after, rate_limit_retry_minutes, set_retry_after
 
 logger = logging.getLogger("blueprint")
@@ -60,6 +61,31 @@ def _clear_retry_after_state(task_or_ctx) -> None:
     clear_retry_after(task_or_ctx)
 
 
+async def _lock_task_for_mutation(
+    session: AsyncSession,
+    task_id: uuid.UUID,
+    *,
+    allowed_statuses: tuple[TaskStatus, ...] | None = None,
+    reason: str = "task mutation",
+) -> Task | None:
+    """Lock a task before a hot-path mutation and rollback on skipped rows."""
+    async with task_lock(session, task_id) as task:
+        if task is None:
+            logger.info("[ORCHESTRATOR] %s for task %s deferred: task row locked", reason, task_id)
+            await session.rollback()
+            return None
+        if allowed_statuses is not None and task.status not in allowed_statuses:
+            logger.info(
+                "[ORCHESTRATOR] %s for task %s skipped: status=%s",
+                reason,
+                task_id,
+                task.status,
+            )
+            await session.rollback()
+            return None
+        return task
+
+
 async def _lock_provisioning_task_for_vm(
     session: AsyncSession,
     task_id: uuid.UUID,
@@ -72,16 +98,13 @@ async def _lock_provisioning_task_for_vm(
     a new ``vm_instance_id``. Mutating without this fresh locked check can
     overwrite the reaper's QUEUED state with stale provision-failure handling.
     """
-    task = (await session.execute(
-        select(Task)
-        .where(Task.id == task_id)
-        .with_for_update(skip_locked=True)
-    )).scalars().first()
+    task = await _lock_task_for_mutation(
+        session,
+        task_id,
+        allowed_statuses=None,
+        reason="provision result",
+    )
     if task is None:
-        logger.info(
-            "[ORCHESTRATOR] Provision result for task %s deferred: task row locked",
-            task_id,
-        )
         return None
     if task.status != TaskStatus.PROVISIONING or task.vm_instance_id != vm_id:
         logger.info(
@@ -92,6 +115,7 @@ async def _lock_provisioning_task_for_vm(
             task.vm_instance_id,
             vm_id,
         )
+        await session.rollback()
         return None
     return task
 
@@ -818,7 +842,8 @@ async def orchestrator_worker():
                 # Fetch all active tasks once — used for both concurrency limit and counter reconciliation
                 # Light query: only load columns needed for the stale-provision scan
                 # and concurrency count. Heavy JSONB (context, status_log) is
-                # deferred — the few stale tasks are re-read with_for_update below.
+                # deferred — the few stale tasks are re-read through task_lock()
+                # before mutation below.
                 # context + title are needed by filter_file_conflicts (Step 2.5).
                 # payloads is needed by filter_migration_serialization (Step 2.72)
                 # via _is_migration_task -> task.first_payload.
@@ -845,11 +870,15 @@ async def orchestrator_worker():
                         continue
                     if ((t.last_heartbeat is None or t.last_heartbeat < ten_min_ago)
                         and t.started_at and t.started_at < ten_min_ago):
-                        # Re-read with lock to prevent race with reaper on provision_failures
-                        fresh_t = (await session.execute(
-                            select(Task).where(Task.id == t.id).with_for_update(skip_locked=True)
-                        )).scalars().first()
-                        if not fresh_t or fresh_t.status != TaskStatus.PROVISIONING:
+                        # Re-read with task_lock to prevent races with the reaper
+                        # and provisioning callback on provision_failures/requeue state.
+                        fresh_t = await _lock_task_for_mutation(
+                            session,
+                            t.id,
+                            allowed_statuses=(TaskStatus.PROVISIONING,),
+                            reason="stale provisioning recovery",
+                        )
+                        if not fresh_t:
                             continue  # Reaper already handled it
                         # Check provision failure limit before requeueing
                         provision_failures = (fresh_t.context or {}).get("provision_failures", 0) + 1
@@ -1124,19 +1153,39 @@ async def orchestrator_worker():
                         # user's pool has recovered. _infra_wait holds wait
                         # for zone recovery.
                         if not (task.context or {}).get("_infra_wait") and await _user_has_available_account(task):
-                            _clear_retry_after_state(task)
-                            session.add(task)
+                            locked_task = await _lock_task_for_mutation(
+                                session,
+                                task.id,
+                                allowed_statuses=(TaskStatus.QUEUED,),
+                                reason="retry_after release",
+                            )
+                            if locked_task is None:
+                                continue
+                            _clear_retry_after_state(locked_task)
+                            session.add(locked_task)
+                            await session.commit()
+                            task = locked_task
                             logger.info(f"[ORCHESTRATOR] Task {task.id} retry_after cleared early — account pool recovered")
                         else:
                             logger.info(f"[ORCHESTRATOR] Task {task.id} held back — retry_after={task.retry_after_until.isoformat()}")
                             continue
                     # Clear infra-wait flag when task becomes eligible again
                     if (task.context or {}).get("_infra_wait"):
-                        ctx = dict(task.context or {})
+                        locked_task = await _lock_task_for_mutation(
+                            session,
+                            task.id,
+                            allowed_statuses=(TaskStatus.QUEUED,),
+                            reason="infra_wait clear",
+                        )
+                        if locked_task is None:
+                            continue
+                        ctx = dict(locked_task.context or {})
                         ctx.pop("_infra_wait", None)
-                        task.context = ctx
-                        _clear_retry_after_state(task)
-                        session.add(task)
+                        locked_task.context = ctx
+                        _clear_retry_after_state(locked_task)
+                        session.add(locked_task)
+                        await session.commit()
+                        task = locked_task
 
                     deps = task.depends_on or []
                     if not deps:
@@ -1607,14 +1656,16 @@ async def orchestrator_worker():
                 # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]
 
-                # Step 3: Lock ONLY the tasks we're about to dispatch (minimal lock duration)
+                # Step 3: Re-read ONLY the tasks we're about to dispatch. This
+                # scan is read-only; the row is locked with task_lock() at the
+                # top of the per-task mutation block below.
                 queued_tasks = []
                 if eligible_ids:
-                    lock_stmt = select(Task).where(
+                    dispatch_stmt = select(Task).where(
                         Task.id.in_(eligible_ids),
-                        Task.status == TaskStatus.QUEUED  # Re-check status under lock
-                    ).with_for_update(skip_locked=True)
-                    queued_tasks = list((await session.execute(lock_stmt)).scalars().all())
+                        Task.status == TaskStatus.QUEUED,
+                    )
+                    queued_tasks = list((await session.execute(dispatch_stmt)).scalars().all())
 
                 logger.info(f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_account_by_id)} accounts")
                 _shared_state.tasks_queued_gauge = (await session.execute(
@@ -1702,15 +1753,27 @@ async def orchestrator_worker():
                 _cycle_earliest_recovery: datetime | None = None
                 _cycle_blockage_reasons: set[str] = set()
 
-                for task in queued_tasks:
+                for queued_task in queued_tasks:
                     # Per-type failure gate: skip tasks whose type is currently failing
                     # (global 80% backstop already handled above; this skips only the bad type)
-                    _task_type_for_gate = task.first_payload.get("type", "")
+                    _task_type_for_gate = queued_task.first_payload.get("type", "")
                     if _task_type_for_gate and _task_type_for_gate in _failing_types:
                         logger.info(
-                            f"[ORCHESTRATOR] Skipping task {task.id} "
+                            f"[ORCHESTRATOR] Skipping task {queued_task.id} "
                             f"(type={_task_type_for_gate}) — per-type failure gate active"
                         )
+                        continue
+
+                    task = await _lock_task_for_mutation(
+                        session,
+                        queued_task.id,
+                        allowed_statuses=(TaskStatus.QUEUED,),
+                        reason="dispatch",
+                    )
+                    if task is None:
+                        continue
+                    if task.requires_approval:
+                        await session.rollback()
                         continue
 
                     # Ensure VM ID exists (cleared during stale PROVISIONING recovery)
@@ -1905,6 +1968,7 @@ async def orchestrator_worker():
                             except Exception:
                                 logger.exception(f"[ORCHESTRATOR] Failed to evaluate retry_after escalation for task {task.id}")
                             if _auto_failed:
+                                await session.commit()
                                 continue
                             if task.latest_status_message != stall_msg:
                                 # Update directly on the locked task object (separate session would deadlock)
@@ -1917,6 +1981,7 @@ async def orchestrator_worker():
                                 _cycle_earliest_recovery is None or earliest_recovery < _cycle_earliest_recovery
                             ):
                                 _cycle_earliest_recovery = earliest_recovery
+                            await session.commit()
                             continue
                         # No accounts at all — fall back to raw provider credentials when present
                         (
@@ -1954,6 +2019,7 @@ async def orchestrator_worker():
                                 f"{_provider_env_credential_hint(runtime_provider)}"
                             )
                             session.add(task)
+                            await session.commit()
                             continue
 
                     if _sync_task_payload_runtime_fields(
@@ -2288,26 +2354,39 @@ async def orchestrator_worker():
 
                 # Check tasks waiting on CI (review approved, CI pending)
                 CI_WAIT_TIMEOUT_MINUTES = 20
-                ci_waiting_tasks = (await session.execute(
-                    select(Task).where(Task.status == TaskStatus.EVALUATING).limit(200)
+                ci_waiting_task_ids = (await session.execute(
+                    select(Task.id).where(Task.status == TaskStatus.EVALUATING).limit(200)
                 )).scalars().all()
-                for ci_task in ci_waiting_tasks:
-                    ci_loop = (ci_task.context or {}).get("review_loop", {})
+                for ci_task_id in ci_waiting_task_ids:
+                    ci_task = await _lock_task_for_mutation(
+                        session,
+                        ci_task_id,
+                        allowed_statuses=(TaskStatus.EVALUATING,),
+                        reason="CI polling",
+                    )
+                    if ci_task is None:
+                        continue
+                    ci_loop = dict((ci_task.context or {}).get("review_loop", {}) or {})
                     if not ci_loop.get("ci_waiting"):
+                        await session.rollback()
                         continue
                     if ci_loop.get("conflict_fix_spawned"):
+                        await session.rollback()
                         continue  # Already handled — fix task spawned for merge conflicts
                     if ci_loop.get("ci_fix_spawned"):
+                        await session.rollback()
                         continue  # Already handled — fix task spawned for CI failure
                     if ci_loop.get("merge_rule_blocked"):
+                        await session.rollback()
                         continue  # Merge blocked by branch protection — requires manual intervention
                     ci_pr_number = ci_loop.get("pr_number")
                     if not ci_pr_number:
+                        await session.rollback()
                         continue
 
                     # Ensure ci_wait_started is always set — some paths set ci_waiting=True
                     # without setting ci_wait_started, which silently disables the timeout.
-                    # Commit immediately so the update is persisted even if we continue below.
+                    # Commit immediately, then reacquire task_lock before more mutations below.
                     if not ci_loop.get("ci_wait_started"):
                         from app import pause_clock  # noqa: PLC0415
                         ci_loop["ci_wait_started"] = _utcnow().isoformat()
@@ -2322,6 +2401,15 @@ async def orchestrator_worker():
                         flag_modified(ci_task, "context")
                         session.add(ci_task)
                         await session.commit()
+                        ci_task = await _lock_task_for_mutation(
+                            session,
+                            ci_task_id,
+                            allowed_statuses=(TaskStatus.EVALUATING,),
+                            reason="CI polling after wait-start persist",
+                        )
+                        if ci_task is None:
+                            continue
+                        ci_loop = dict((ci_task.context or {}).get("review_loop", {}) or {})
 
                     # Exponential backoff: skip if not enough time has elapsed since last poll.
                     # Webhooks handle the fast path — polling is a fallback.
@@ -2331,6 +2419,7 @@ async def orchestrator_worker():
                         try:
                             _last_polled_dt = datetime.fromisoformat(ci_last_polled)
                             if (_utcnow() - _last_polled_dt).total_seconds() < ci_poll_interval:
+                                await session.rollback()
                                 continue
                         except (ValueError, TypeError):
                             pass
@@ -2368,6 +2457,15 @@ async def orchestrator_worker():
                                 await session.commit()
                                 await broadcast_to_project(str(ci_task.project_id), "task_updated",
                                                            {"task_id": str(ci_task.id), "status": ci_task.status})
+                                ci_task = await _lock_task_for_mutation(
+                                    session,
+                                    ci_task_id,
+                                    allowed_statuses=(TaskStatus.EVALUATING,),
+                                    reason="CI polling after escalation persist",
+                                )
+                                if ci_task is None:
+                                    continue
+                                ci_loop = dict((ci_task.context or {}).get("review_loop", {}) or {})
                             # Fall through — continue polling CI even after escalation
 
                         ci_gh_token, ci_owner, ci_repo = await get_github_token_for_task(ci_task.id, session)
@@ -2409,6 +2507,10 @@ async def orchestrator_worker():
                                 ci_loop["pr_fetch_failures"] = _fetch_failures
                                 ci_loop["ci_last_polled"] = _utcnow().isoformat()
                                 ci_loop["ci_poll_interval"] = min((ci_loop.get("ci_poll_interval", 30)) * 2, 300)
+                                if _fetch_failures >= 10 and not ci_loop.get("fetch_escalated"):
+                                    ci_loop["fetch_escalated"] = True
+                                    await _maybe_create_failure_alert(ci_task, session,
+                                        f"PR #{ci_pr_number} GitHub API failures ({_fetch_failures}x) — still retrying")
                                 ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
                                 from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
                                 flag_modified(ci_task, "context")
@@ -2416,17 +2518,10 @@ async def orchestrator_worker():
                                                f"(attempt {_fetch_failures}): {exc.detail}")
                                 session.add(ci_task)
                                 await session.commit()
-                                if _fetch_failures >= 10 and not ci_loop.get("fetch_escalated"):
-                                    ci_loop["fetch_escalated"] = True
-                                    ci_task.context = {**(ci_task.context or {}), "review_loop": ci_loop}
-                                    flag_modified(ci_task, "context")
-                                    await _maybe_create_failure_alert(ci_task, session,
-                                        f"PR #{ci_pr_number} GitHub API failures ({_fetch_failures}x) — still retrying")
-                                    session.add(ci_task)
-                                    await session.commit()
                                 continue
 
                             if not pr_data:
+                                await session.rollback()
                                 continue
 
                             if ci_loop.get("pr_fetch_failures"):
@@ -2802,6 +2897,15 @@ async def orchestrator_worker():
                                 ci_task, "fix", session, ci_pr_number, ci_branch, ci_base,
                                 fix_prompt=fix_prompt, original_task_id=ci_orig_id
                             )
+                            ci_task = await _lock_task_for_mutation(
+                                session,
+                                ci_task_id,
+                                allowed_statuses=(TaskStatus.EVALUATING,),
+                                reason="CI conflict result",
+                            )
+                            if ci_task is None:
+                                continue
+                            ci_loop = dict((ci_task.context or {}).get("review_loop", {}) or {})
                             if fix_task:
                                 from app.rollup_state import _is_rollup_parent_awaiting_merge
                                 ci_loop_ctx = dict(ci_loop)
@@ -2887,6 +2991,15 @@ async def orchestrator_worker():
                                             f"PR #{ci_pr_number}: no CI checks after {int(_no_checks_elapsed / 60)}min"
                                         )
                                         await session.commit()
+                                        ci_task = await _lock_task_for_mutation(
+                                            session,
+                                            ci_task_id,
+                                            allowed_statuses=(TaskStatus.EVALUATING,),
+                                            reason="CI polling after no-checks alert",
+                                        )
+                                        if ci_task is None:
+                                            continue
+                                        ci_loop = dict((ci_task.context or {}).get("review_loop", {}) or {})
                                 except (ValueError, TypeError):
                                     pass
 
