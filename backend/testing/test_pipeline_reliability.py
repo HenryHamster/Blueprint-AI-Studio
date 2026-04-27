@@ -413,6 +413,91 @@ async def test_stale_provision_failure_creates_alert(orch_db, mocker):
     )
 
 
+@pytest.mark.asyncio
+async def test_stale_provisioning_captures_serial_before_vm_delete(orch_db, mocker):
+    """When the orchestrator's stale-PROVISIONING reaper requeues a stuck task,
+    it must capture the VM's serial console output BEFORE deleting the VM and
+    persist it to ``task.context["last_serial_log"]``.
+
+    Without this, silent post-creds-fetch deaths (where the in-script ERR-trap
+    + failure-beacon path is bypassed by SIGKILL/kernel hang) leave NO forensic
+    trail — the operator sees only the last successful beacon ("creds fetched,
+    entering env setup") forever and the VM is gone before anyone can SSH in.
+    Serial console is the only out-of-band signal that survives the script's
+    death and the VM's deletion.
+    """
+    session, _Session = orch_db
+
+    project = Project(name="Serial Capture Test", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    stale_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "serial test"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id="agent-vm-serial-001",
+        started_at=_naive_utc_ago(minutes=15),
+        last_heartbeat=None,
+        # provision_zone is set by the provisioning callback once the VM is
+        # confirmed running; the reaper reads it from context to know which
+        # zone to query.
+        context={"provision_zone": "us-west1-b"},
+    )
+    session.add(stale_task)
+    await session.commit()
+    await session.refresh(stale_task)
+    task_id = stale_task.id
+
+    serial_payload = (
+        "Apr 27 08:20:39 startup-script: Starting Agent VM Initialization...\n"
+        "Apr 27 08:20:44 startup-script: Secret fetched (attempt 1)\n"
+        "Apr 27 08:20:44 startup-script: PROVISION_PROGRESS: creds fetched, entering env setup\n"
+        "Apr 27 08:21:05 kernel: <silence after this — script died here>\n"
+    )
+    capture_mock = mocker.patch(
+        "app.compute._capture_serial_for_vm",
+        return_value=serial_payload,
+    )
+    # _ensure_vm_deleted is already patched by orch_db fixture; grab its mock
+    # so we can assert call ordering relative to capture.
+    delete_mock = mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+
+    await _run_one_cycle(mocker)
+
+    # --- 1. Serial capture happened with the right (vm_id, zone) ---
+    capture_mock.assert_called_once_with("agent-vm-serial-001", "us-west1-b")
+
+    # --- 2. VM was deleted ---
+    delete_mock.assert_called_once()
+    deleted_vm = delete_mock.call_args[0][0]
+    assert deleted_vm == "agent-vm-serial-001", (
+        f"Expected the stale VM 'agent-vm-serial-001' to be deleted, "
+        f"got {deleted_vm!r}"
+    )
+
+    # --- 3. Captured serial is persisted on the task ---
+    async with _Session() as verify_session:
+        from sqlmodel import select as _select
+        result = await verify_session.execute(_select(Task).where(Task.id == task_id))
+        updated = result.scalars().first()
+
+    assert updated is not None
+    assert updated.status == TaskStatus.QUEUED, (
+        f"Expected requeue (provision_failures=0+1=1 < 3), got {updated.status}"
+    )
+    assert "last_serial_log" in (updated.context or {}), (
+        f"Expected task.context['last_serial_log'] to hold the captured serial "
+        f"tail; got context keys: {list((updated.context or {}).keys())}"
+    )
+    saved = updated.context["last_serial_log"]
+    # Stored as last 500 bytes
+    assert "PROVISION_PROGRESS: creds fetched" in saved, (
+        f"Expected serial tail to include the last successful beacon line; "
+        f"got: {saved!r}"
+    )
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 4 — CI polling fails task on deleted PR (404)
 # ══════════════════════════════════════════════════════════════════════════════

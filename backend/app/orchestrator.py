@@ -880,12 +880,59 @@ async def orchestrator_worker():
                         )
                         if not fresh_t:
                             continue  # Reaper already handled it
+
+                        # Capture serial console BEFORE any state mutation. This
+                        # is the only forensic source for silent post-creds-fetch
+                        # deaths — the in-script ERR-trap + failure-beacon path
+                        # can be bypassed (SIGKILL, kernel hang, lost-after-trap
+                        # poweroff). reaper.py:534 already does this for the
+                        # agent-startup-failure reaper; the stale-PROVISIONING
+                        # path was the silent gap.
+                        old_vm_for_serial = fresh_t.vm_instance_id
+                        serial_log: str | None = None
+                        if old_vm_for_serial:
+                            from app.compute import (
+                                _capture_serial_for_vm,
+                                get_vm_zone,
+                            )
+                            prov_zone = (fresh_t.context or {}).get("provision_zone")
+                            if not prov_zone:
+                                cached_zone = get_vm_zone(old_vm_for_serial)
+                                if cached_zone and cached_zone != "unknown":
+                                    prov_zone = cached_zone
+                            if prov_zone:
+                                try:
+                                    serial_log = await asyncio.to_thread(
+                                        _capture_serial_for_vm,
+                                        old_vm_for_serial,
+                                        prov_zone,
+                                    )
+                                    if serial_log:
+                                        logger.warning(
+                                            f"[ORCHESTRATOR] Serial log for stale "
+                                            f"provisioning VM {old_vm_for_serial} "
+                                            f"(task {t.id}):\n{serial_log[-500:]}"
+                                        )
+                                except Exception:
+                                    logger.exception(
+                                        f"[ORCHESTRATOR] Serial capture failed for "
+                                        f"stale provisioning VM {old_vm_for_serial}"
+                                    )
+                            else:
+                                logger.warning(
+                                    f"[ORCHESTRATOR] Serial capture skipped for task "
+                                    f"{t.id}: zone unknown (vm_id={old_vm_for_serial})"
+                                )
+
                         # Check provision failure limit before requeueing
                         provision_failures = (fresh_t.context or {}).get("provision_failures", 0) + 1
                         if provision_failures >= _runtime_config.get("max_provision_retries", 3):
                             fresh_t.status = TaskStatus.FAILED
                             fresh_t.latest_status_message = f"Failed after {provision_failures} provision attempts"
-                            fresh_t.context = {**(fresh_t.context or {}), "failure_category": "PROVISION_FAILURE", "provision_failures": provision_failures}
+                            failed_ctx = {**(fresh_t.context or {}), "failure_category": "PROVISION_FAILURE", "provision_failures": provision_failures}
+                            if serial_log:
+                                failed_ctx["last_serial_log"] = serial_log[-500:]
+                            fresh_t.context = failed_ctx
                             logger.error(f"[ORCHESTRATOR] Task {t.id} exceeded provision retry limit ({provision_failures}) — marking FAILED")
                             acct_id = get_task_llm_account_id(fresh_t)
                             if acct_id:
@@ -907,9 +954,10 @@ async def orchestrator_worker():
                         fresh_t.status = TaskStatus.QUEUED
                         fresh_t.started_at = None
                         fresh_t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                        fresh_t.context = clear_task_llm_runtime_context(
-                            {**(fresh_t.context or {}), "provision_failures": provision_failures}
-                        )
+                        requeue_ctx = {**(fresh_t.context or {}), "provision_failures": provision_failures}
+                        if serial_log:
+                            requeue_ctx["last_serial_log"] = serial_log[-500:]
+                        fresh_t.context = clear_task_llm_runtime_context(requeue_ctx)
                         session.add(fresh_t)
                         tasks_recovered += 1
                         if fresh_t.last_heartbeat is None:

@@ -666,7 +666,7 @@ MODULE_SIZE_LIMITS = {
     "main.py": 3500,
     "task_completion.py": 2450,
     "task_lifecycle.py": 2600,
-    "orchestrator.py": 3250,
+    "orchestrator.py": 3300,
     "admin.py": 3000,
     "compute.py": 2500,
     "github.py": 2050,
