@@ -21,6 +21,7 @@ from app.failure_classification import (
     SCOPE_OVERFLOW,
     _external_api_subtype_from_message,
     _fingerprint_message,
+    _looks_like_error,
     _timeout_subtype_from_message,
     classify_external_api_subtype,
     classify_failure,
@@ -724,7 +725,7 @@ class TestResidualStore:
         assert results[0]['task_ids'] == ['task-1']
 
     def test_dedup_same_task_id(self):
-        t = self._task_with_id("some error", "task-abc")
+        t = self._task_with_id("TypeError: some error", "task-abc")
         record_residual_fingerprint(t)
         record_residual_fingerprint(t)
         results = get_top_residual_fingerprints()
@@ -800,6 +801,90 @@ class TestResidualStore:
         assert result == AGENT_TIMEOUT
         results = get_top_residual_fingerprints()
         assert not any('task-timeout' in r['task_ids'] for r in results)
+
+    def test_heartbeat_records_but_is_marked_not_error_shaped(self):
+        """Regression (#3270, 2026-04-27): a task that failed with no
+        recoverable error logs and a benign status message used to drive
+        auto-remediation off the heartbeat (PROVISION_PROGRESS / Using
+        tool / Creating pull request / ...). The cluster is still kept
+        for diagnostic visibility, but flagged ``is_error_shaped=False``
+        so the spawn site can apply a higher count threshold."""
+        for benign in (
+            "PROVISION_PROGRESS: creds fetched, entering env setup",
+            "[12.1MB] Using tool: Grep",
+            "Creating pull request...",
+            "[10.5MB cg:512MB] Cloning org/repo...",
+            "Rebasing onto main...",
+            "Capturing test baseline...",
+            "Fetching GitHub credentials...",
+            "DIAGNOSTIC_TEST",
+        ):
+            import app.failure_classification as fc
+            fc._residual_store.clear()
+            fc._residual_seen_task_ids.clear()
+            t = self._task_with_id(benign, f"task-benign-{hash(benign)}")
+            record_residual_fingerprint(t)
+            results = get_top_residual_fingerprints()
+            assert len(results) == 1, f"{benign!r} should still record"
+            assert results[0]['is_error_shaped'] is False, (
+                f"{benign!r} should be flagged not-error-shaped, "
+                f"got is_error_shaped={results[0]['is_error_shaped']}"
+            )
+
+    def test_error_shaped_status_marks_cluster_error_shaped(self):
+        """``[ERROR] ...`` is the agent's explicit error-status prefix
+        (agent/src/index.ts:2606). When the agent tags its status as an
+        error, the cluster gets ``is_error_shaped=True`` even without
+        separate log lines, so the spawn site uses the normal threshold."""
+        t = self._task_with_id("[ERROR] connection refused after 30s", "task-err-status")
+        record_residual_fingerprint(t)
+        results = get_top_residual_fingerprints()
+        assert len(results) == 1
+        assert results[0]['is_error_shaped'] is True
+
+    def test_logs_with_real_error_mark_cluster_error_shaped(self):
+        """A heartbeat-shaped status combined with an error-shaped log
+        line still produces an error-shaped cluster (fingerprint comes
+        from the log line, not the status)."""
+        t = self._task_with_id("[10.5MB] Using tool: Bash", "task-real-err")
+        err_logs = "TypeError: 'NoneType' object is not callable\n  at handle"
+        record_residual_fingerprint(t, logs=err_logs)
+        results = get_top_residual_fingerprints()
+        assert len(results) == 1
+        assert results[0]['is_error_shaped'] is True
+        assert "TypeError" in results[0]['sample_message']
+
+    def test_is_error_shaped_is_sticky_true_across_contributions(self):
+        """If any contribution to a cluster is error-shaped, the cluster
+        stays error-shaped. Later heartbeat-only contributions to the
+        same fingerprint don't downgrade the threshold."""
+        # Same fingerprint (status text identical), first contribution
+        # has error logs, second doesn't.
+        t1 = self._task_with_id("AttributeError: NoneType has no attr 'x'", "task-1")
+        t2 = self._task_with_id("AttributeError: NoneType has no attr 'x'", "task-2")
+        record_residual_fingerprint(t1)
+        record_residual_fingerprint(t2)
+        results = get_top_residual_fingerprints()
+        assert len(results) == 1
+        assert results[0]['count'] == 2
+        assert results[0]['is_error_shaped'] is True
+
+    def test_looks_like_error_predicate(self):
+        assert _looks_like_error("AttributeError: NoneType has no attr 'x'")
+        assert _looks_like_error("TypeError: foo is not a function")
+        assert _looks_like_error("[ERROR] connection refused")
+        assert _looks_like_error("Traceback (most recent call last):")
+        assert _looks_like_error("AssertionError: expected true")
+        assert _looks_like_error("FAILED: build step 3")
+        assert _looks_like_error("cannot find module 'x'")
+        assert _looks_like_error("no such file or directory")
+        assert not _looks_like_error("PROVISION_PROGRESS: payload ready")
+        assert not _looks_like_error("[10.5MB] Using tool: Bash")
+        assert not _looks_like_error("Creating pull request...")
+        assert not _looks_like_error("Rebasing onto main...")
+        assert not _looks_like_error("DIAGNOSTIC_TEST")
+        assert not _looks_like_error("")
+        assert not _looks_like_error(None)
 
 
 class TestDeriveFailureStageMigration:

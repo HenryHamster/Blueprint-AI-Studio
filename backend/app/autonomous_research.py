@@ -1528,6 +1528,12 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
 
     cooldown_hours = _runtime_config.get("residual_remediation_cooldown_hours", 24)
     cooldown_seconds = cooldown_hours * 3600
+    # Higher count threshold for fingerprints whose source isn't error-shaped
+    # (latest_status_message was a routine heartbeat — Cloning, Using tool,
+    # PROVISION_PROGRESS, etc. — and no error line surfaced from the logs).
+    # A single one-off task dying with such a status is noise; many tasks
+    # dying with the same heartbeat is a real signal worth investigating.
+    no_error_min_count = int(_runtime_config.get("residual_remediation_no_error_min_count", 20))
     now = time.time()
     project_id_str = str(project.id)
 
@@ -1535,6 +1541,17 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
         fp = fp_entry["fingerprint"]
         cooldown_key = f"{project_id_str}:{fp}"
         if now - _residual_remediation_cooldowns.get(cooldown_key, 0.0) < cooldown_seconds:
+            continue
+
+        # Require a high count before remediating non-error-shaped clusters.
+        if not fp_entry.get("is_error_shaped", True) and fp_entry.get("count", 0) < no_error_min_count:
+            logger.info(
+                "[AUTO REMEDIATION] Skipping fingerprint %s: heartbeat-only cluster "
+                "(no error-shaped contribution) at count=%d, threshold=%d. "
+                "Sample: %.80s",
+                fp[:32], fp_entry.get("count", 0), no_error_min_count,
+                (fp_entry.get("sample_message") or "")[:80],
+            )
             continue
 
         # Prefer the list-of-samples when present (added so fingerprints

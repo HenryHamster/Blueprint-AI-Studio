@@ -659,6 +659,25 @@ _RE_SIZE_TOKEN = re.compile(
 _RE_NUM = re.compile(r'\b\d+\b')
 
 
+# Substrings that mark a line/message as error-shaped. Single source of
+# truth for both _extract_error_signature (pulls a line out of a log
+# blob) and _looks_like_error (predicate on a status message). Keep them
+# discriminating enough that benign agent heartbeats (Cloning/Rebasing/
+# Using tool/PROVISION_PROGRESS) don't accidentally match.
+_ERROR_KEYWORDS: tuple[str, ...] = (
+    'error:', '[error]', 'exception', 'traceback', 'assertionerror',
+    'fail:', 'failed:', ' fail ', 'no such ', 'cannot ',
+)
+
+
+def _looks_like_error(text: str) -> bool:
+    """True when ``text`` contains an _ERROR_KEYWORDS substring."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(kw in low for kw in _ERROR_KEYWORDS)
+
+
 def _extract_error_signature(logs: str | None) -> str:
     """Pull the most fingerprint-able line out of an error log blob.
 
@@ -670,14 +689,11 @@ def _extract_error_signature(logs: str | None) -> str:
     if not logs:
         return ''
     for line in logs.splitlines():
-        low = line.strip().lower()
-        if not low:
+        stripped = line.strip()
+        if not stripped:
             continue
-        if any(kw in low for kw in (
-            'error:', 'exception', 'traceback', 'assertionerror',
-            'fail:', 'failed:', ' fail ', 'no such ', 'cannot ',
-        )):
-            return line.strip()[:500]
+        if _looks_like_error(stripped):
+            return stripped[:500]
     return ''
 
 
@@ -723,6 +739,13 @@ def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
     # for human operators (shown in admin UI / remediation prompt) — we
     # just don't let it drive the group-by.
     fingerprint_source = err_line or status_msg
+    # Track whether this contribution is error-shaped. The spawn-side
+    # threshold uses this to demand a much higher count before
+    # auto-remediating on heartbeat-only clusters (PROVISION_PROGRESS /
+    # Using tool / Creating pull request / ...). One-off failures with
+    # no error output are noise; many failures with the same heartbeat
+    # are a real signal worth looking at.
+    is_error_shaped = bool(err_line) or _looks_like_error(status_msg)
     fp = _fingerprint_message(fingerprint_source) or '<empty>'
     now = time.time()
     trimmed_sample = fingerprint_source[:500]
@@ -731,6 +754,12 @@ def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
         entry = _residual_store[fp]
         entry['count'] += 1
         entry['last_seen'] = now
+        # Sticky-true: a cluster counts as error-shaped if any
+        # contribution had error-shaped logs/status. Once true, keep
+        # true so later heartbeat-only contributions don't downgrade
+        # the cluster's threshold.
+        if is_error_shaped:
+            entry['is_error_shaped'] = True
         if task_id not in entry['task_ids'] and len(entry['task_ids']) < 5:
             entry['task_ids'].append(task_id)
         # Accumulate distinct samples across tasks that share this
@@ -752,6 +781,7 @@ def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
             'count': 1,
             'first_seen': now,
             'last_seen': now,
+            'is_error_shaped': is_error_shaped,
             # First/primary samples — kept for backward-compat with code
             # that reads `sample_message`/`sample_status`.
             'sample_message': trimmed_sample,
@@ -778,6 +808,7 @@ def get_top_residual_fingerprints(window_seconds: int = 86400, top_n: int = 10) 
             'fingerprint': fp,
             'count': entry['count'],
             'last_seen': entry['last_seen'],
+            'is_error_shaped': entry.get('is_error_shaped', True),
             'sample_message': entry['sample_message'],
             'sample_status': entry.get('sample_status', ''),
             'sample_messages': entry.get('sample_messages', [entry['sample_message']]),

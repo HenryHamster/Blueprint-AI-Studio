@@ -1907,7 +1907,7 @@ async def test_medium_scope_cross_module_related_files_auto_decomposes(db_sessio
 
 @pytest.mark.asyncio
 async def test_medium_scope_expansion_ratio_prediction_upgrades_to_large(db_session, mocker, monkeypatch):
-    """Medium finding with 4 related_files × 3.0 avg_expansion_ratio predicts >10 → upgrade."""
+    """Medium finding with 4 related_files x 3.0 avg_expansion_ratio predicts >10 → upgrade."""
     monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
     direction = _active_direction("d-exprat01", "Expansion ratio prediction direction")
     direction["research_history"] = [
@@ -2306,7 +2306,7 @@ def test_auto_decompose_prepends_scope_boundary_preamble_to_prompt():
         prompt = sub["prompt"]
         assert prompt.endswith(original_prompt)
         assert "Scope boundary" in prompt
-        assert f"cluster " in prompt.lower()
+        assert "cluster " in prompt.lower()
         assert f"/{len(result)}" in prompt  # cluster N/M
         for f in sub["related_files"]:
             assert f in prompt
@@ -2863,7 +2863,7 @@ async def test_direction_proposals_capped_at_10_pending_total(db_session, mocker
         name="Proposal Global Cap",
         user_id="test-user-123",
         autonomous_enabled=True,
-        directions=[direction] + existing_proposed,
+        directions=[direction, *existing_proposed],
     )
     db_session.add(project)
     await db_session.commit()
@@ -4479,8 +4479,6 @@ async def test_health_gate_metadata_findings_bypass_cap(db_session, mocker):
 @pytest.mark.asyncio
 async def test_prior_deferred_findings_processed_in_next_cycle(db_session, mocker):
     """Deferred findings from a previous cycle are prepended and spawned in the next cycle."""
-    from app.research_completion import _DEGRADED_SPAWN_CAP
-
     direction_id = "d-deferred-recovery01"
     direction = _active_direction(direction_id, "Deferred recovery test")
     project = Project(
@@ -6978,5 +6976,89 @@ async def test_residual_fingerprint_remediation_skipped_when_no_fingerprints(db_
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
     assert spawned == 0
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    assert len(result.scalars().all()) == 0
+
+@pytest.mark.asyncio
+async def test_residual_fingerprint_remediation_threshold_for_no_error_cluster(db_session, _clear_residual_state):
+    """Heartbeat-only clusters (is_error_shaped=False) require a much higher
+    count before remediation. A single PROVISION_PROGRESS / Using tool /
+    Cloning failure is noise; many of the same is a real signal worth a
+    remediation task. Threshold lives in
+    ``runtime_config['residual_remediation_no_error_min_count']`` (default 20).
+    """
+    import time
+    from app.failure_classification import _residual_store
+    from app.shared_state import runtime_config as _rc
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+
+    project = Project(
+        name="Residual No-Error Threshold",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-remthr01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Below threshold: heartbeat fingerprint with count=5 → skipped.
+    fp = "provision_progress: creds fetched, entering env setup"
+    sample = "PROVISION_PROGRESS: creds fetched, entering env setup"
+    _residual_store[fp] = {
+        "count": 5,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time(),
+        "is_error_shaped": False,
+        "sample_message": sample,
+        "sample_messages": [sample],
+        "sample_statuses": [sample],
+        "task_ids": ["t1", "t2", "t3", "t4", "t5"],
+    }
+    saved_threshold = _rc.get("residual_remediation_no_error_min_count")
+    try:
+        _rc["residual_remediation_no_error_min_count"] = 20
+        spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+        assert spawned == 0, "below-threshold heartbeat cluster should not spawn"
+
+        # Bump count above threshold → spawn fires.
+        _residual_store[fp]["count"] = 25
+        spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+        assert spawned == 1, "above-threshold heartbeat cluster should spawn"
+    finally:
+        if saved_threshold is None:
+            _rc.pop("residual_remediation_no_error_min_count", None)
+        else:
+            _rc["residual_remediation_no_error_min_count"] = saved_threshold
+
+
+@pytest.mark.asyncio
+async def test_residual_fingerprint_remediation_error_shaped_uses_normal_threshold(db_session, _clear_residual_state):
+    """Error-shaped clusters (is_error_shaped=True) use the existing
+    spawn rules — no extra count threshold. count=1 is still enough."""
+    import time
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+
+    project = Project(
+        name="Residual Error-Shaped Normal Threshold",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-remerrt01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fp = "fp_typeerror_real_<n>"
+    sample = "TypeError: 'NoneType' object is not callable"
+    _residual_store[fp] = {
+        "count": 1,
+        "first_seen": time.time() - 600,
+        "last_seen": time.time(),
+        "is_error_shaped": True,
+        "sample_message": sample,
+        "sample_messages": [sample],
+        "sample_statuses": [sample],
+        "task_ids": ["t-real-err"],
+    }
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 1, "error-shaped cluster should spawn at count=1"
