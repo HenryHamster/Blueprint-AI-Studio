@@ -28,6 +28,21 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Prod has pre-existing duplicate PR artifacts from the very race this
+    # index is meant to close (A14). Dedupe before the index, keeping the
+    # most recent row per task_id (ties broken by id for determinism).
+    op.execute("""
+        WITH ranked AS (
+            SELECT id, ROW_NUMBER() OVER (
+                PARTITION BY task_id
+                ORDER BY created_at DESC, id DESC
+            ) AS rn
+            FROM artifact
+            WHERE artifact_type = 'PULL_REQUEST'
+        )
+        DELETE FROM artifact
+        WHERE id IN (SELECT id FROM ranked WHERE rn > 1);
+    """)
     op.create_index(
         'ux_artifact_task_pull_request',
         'artifact',
