@@ -172,6 +172,43 @@ async def _sweep_orphan_direction_holds(session) -> int:
     return cleared
 
 
+async def _sweep_stale_residual_cases(session) -> int:
+    """Close ACTIVE residual cases whose last_seen_at is older than 72 hours.
+
+    When a CODE_ERROR fingerprint stops occurring (infra recovers, an unrelated
+    PR fixes it, etc.) the ResidualRemediationCase row stays ACTIVE forever
+    without this sweep. Returns the number of cases transitioned to
+    CLOSED_ORGANICALLY.
+    """
+    from app.models import ResidualRemediationCase, ResidualCaseStatus  # noqa: PLC0415
+    from app.failure_classification import _mark_residual_case_closed  # noqa: PLC0415
+
+    stale_cutoff = _utcnow() - timedelta(hours=72)
+    stale_cases = (await session.execute(
+        select(ResidualRemediationCase).where(
+            ResidualRemediationCase.status == ResidualCaseStatus.ACTIVE,
+            ResidualRemediationCase.last_seen_at < stale_cutoff,
+        )
+    )).scalars().all()
+
+    closed = 0
+    for case in stale_cases:
+        case.status = ResidualCaseStatus.CLOSED_ORGANICALLY
+        case.updated_at = _utcnow()
+        session.add(case)
+        _mark_residual_case_closed(case.fingerprint)
+        closed += 1
+        logger.info(
+            "[REAPER] Closed stale residual case %s (fingerprint=%r, last_seen_at=%s)",
+            case.id, case.fingerprint, case.last_seen_at.isoformat(),
+        )
+
+    if closed:
+        await session.commit()
+        logger.info("[REAPER] Closed %d stale residual remediation case(s)", closed)
+    return closed
+
+
 async def reaper_service():
     """
     Background worker that scans for orphaned VMs.
@@ -1326,6 +1363,15 @@ async def reaper_service():
                         logger.info(f"[REAPER] Cleared stale retry_after on {_cleared} task(s)")
                 except Exception as e:
                     logger.error(f"[REAPER] Stale retry_after sweep error: {e}", exc_info=True)
+
+                # Step 5e: Close ACTIVE ResidualRemediationCase rows whose fingerprint
+                # has not been seen in the last 72 h. Without this sweep the table
+                # accumulates stale ACTIVE rows for fingerprints that stopped occurring
+                # organically (infra recovered, unrelated PR fixed the root cause, etc.).
+                try:
+                    await _sweep_stale_residual_cases(session)
+                except Exception as e:
+                    logger.error(f"[REAPER] Stale residual case sweep error: {e}", exc_info=True)
 
                 # Step 6: QUEUED task age alerts — escalate through 3 tiers (INFO/WARNING/ERROR
                 # at 1×/3×/6× the threshold) so long-stalled tasks re-alert instead of going silent.

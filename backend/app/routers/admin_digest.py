@@ -19,6 +19,7 @@ from app.database import get_session
 from app.digest_cache import DigestCache, get_digest_cache
 from app.models import (
     Task, TaskStatus, Project, Artifact, ArtifactType, _utcnow,
+    ResidualRemediationCase, ResidualRemediationCaseStatus,
 )
 from app.auth import get_current_user, require_admin
 from app.shared_state import runtime_config as _runtime_config
@@ -1046,6 +1047,43 @@ async def get_residual_fingerprints(
             for e in top
         ],
     }
+
+
+@router.post("/residual-cases/{fingerprint}/ignore")
+async def ignore_residual_case(
+    fingerprint: str,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """Mark a residual fingerprint as IGNORED for a project.
+
+    Creates or updates the ResidualRemediationCase row for this
+    (project_id, fingerprint) pair to status=IGNORED, suppressing future
+    auto-remediation spawn decisions for this fingerprint.
+    """
+    now = _utcnow()
+    result = await session.execute(
+        select(ResidualRemediationCase).where(
+            ResidualRemediationCase.project_id == project_id,
+            ResidualRemediationCase.fingerprint == fingerprint,
+        )
+    )
+    case = result.scalar_one_or_none()
+    if case is None:
+        case = ResidualRemediationCase(
+            project_id=project_id,
+            fingerprint=fingerprint,
+            status=ResidualRemediationCaseStatus.IGNORED,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(case)
+    else:
+        case.status = ResidualRemediationCaseStatus.IGNORED
+        case.updated_at = now
+    await session.commit()
+    return {"id": str(case.id), "fingerprint": fingerprint, "status": ResidualRemediationCaseStatus.IGNORED}
 
 
 @router.post("/residual-fingerprints/clear")

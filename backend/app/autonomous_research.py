@@ -1502,11 +1502,21 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
     Returns the number of tasks spawned (0 or 1).
     """
     from app.failure_classification import get_top_residual_fingerprints
+    from app.models import ResidualRemediationCase, ResidualRemediationCaseStatus
     from sqlalchemy import cast, func, select, String
 
     fingerprints = get_top_residual_fingerprints(window_seconds=86400, top_n=10)
     if not fingerprints:
         return 0
+
+    # Load IGNORED fingerprints for this project so we skip them below.
+    ignored_result = await session.execute(
+        select(ResidualRemediationCase.fingerprint).where(
+            ResidualRemediationCase.project_id == project.id,
+            ResidualRemediationCase.status == ResidualRemediationCaseStatus.IGNORED,
+        )
+    )
+    ignored_fingerprints: set[str] = {row[0] for row in ignored_result.all()}
 
     # Global cap check. Active = QUEUED | PROVISIONING | IN_PROGRESS tasks
     # whose context marks them as auto_remediation. Reading from JSONB with
@@ -1539,6 +1549,9 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
 
     for fp_entry in fingerprints:
         fp = fp_entry["fingerprint"]
+        if fp in ignored_fingerprints:
+            logger.debug("[AUTO REMEDIATION] Skipping IGNORED fingerprint %s (project %s).", fp[:32], project.id)
+            continue
         cooldown_key = f"{project_id_str}:{fp}"
         if now - _residual_remediation_cooldowns.get(cooldown_key, 0.0) < cooldown_seconds:
             continue

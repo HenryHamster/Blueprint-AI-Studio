@@ -632,6 +632,22 @@ _residual_seen_task_ids: set[str] = set()
 _RESIDUAL_MAX_FINGERPRINTS = 300
 _RESIDUAL_SEEN_MAX = 20_000
 
+# Fingerprints whose ResidualRemediationCase has been closed organically.
+# Updated by the reaper sweep; consulted by get_top_residual_fingerprints to
+# prevent re-spawning remediation tasks for fingerprints that stopped occurring.
+_residual_closed_fingerprints: set[str] = set()
+
+
+def _mark_residual_case_closed(fingerprint: str) -> None:
+    """Mark a fingerprint as having a closed ResidualRemediationCase."""
+    _residual_closed_fingerprints.add(fingerprint)
+
+
+def _reactivate_residual_case(fingerprint: str) -> None:
+    """Remove fingerprint from the closed set (case reopened on new occurrence)."""
+    _residual_closed_fingerprints.discard(fingerprint)
+
+
 # Per-account failure class log — rolling 24h window, keyed account_id → {class → [timestamps]}.
 _account_failure_log: dict[str, dict[str, list[float]]] = {}
 
@@ -750,6 +766,9 @@ def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
     now = time.time()
     trimmed_sample = fingerprint_source[:500]
     trimmed_status = status_msg[:500]
+    # If this fingerprint had a closed case, reactivate it — the error is back.
+    _reactivate_residual_case(fp)
+
     if fp in _residual_store:
         entry = _residual_store[fp]
         entry['count'] += 1
@@ -817,6 +836,7 @@ def get_top_residual_fingerprints(window_seconds: int = 86400, top_n: int = 10) 
         }
         for fp, entry in _residual_store.items()
         if entry['last_seen'] >= cutoff
+        and fp not in _residual_closed_fingerprints
     ]
     results.sort(key=lambda x: x['count'], reverse=True)
     return results[:top_n]

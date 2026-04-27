@@ -2302,6 +2302,82 @@ async def test_orphan_sweep_ignores_unheld_streaks(reaper_db):
     assert _ss.direction_failure_streaks[unheld_did]["consecutive_failures"] == 2
 
 
+# ── _sweep_stale_residual_cases ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sweep_stale_residual_cases_closes_active_old(reaper_db):
+    """An ACTIVE case older than 72 h must be closed and its fingerprint marked."""
+    import app.failure_classification as _fc
+    from app.models import ResidualRemediationCase, ResidualCaseStatus
+    from app.reaper import _sweep_stale_residual_cases
+
+    _fc._residual_closed_fingerprints.clear()
+    stale_case = ResidualRemediationCase(
+        fingerprint="old-fp-abc123",
+        status=ResidualCaseStatus.ACTIVE,
+        last_seen_at=datetime.utcnow() - timedelta(hours=73),
+    )
+    reaper_db.add(stale_case)
+    await reaper_db.commit()
+    await reaper_db.refresh(stale_case)
+
+    closed = await _sweep_stale_residual_cases(reaper_db)
+
+    assert closed == 1
+    await reaper_db.refresh(stale_case)
+    assert stale_case.status == ResidualCaseStatus.CLOSED_ORGANICALLY
+    assert "old-fp-abc123" in _fc._residual_closed_fingerprints
+
+
+@pytest.mark.asyncio
+async def test_sweep_stale_residual_cases_ignores_recent(reaper_db):
+    """An ACTIVE case seen within 72 h must not be touched."""
+    import app.failure_classification as _fc
+    from app.models import ResidualRemediationCase, ResidualCaseStatus
+    from app.reaper import _sweep_stale_residual_cases
+
+    _fc._residual_closed_fingerprints.clear()
+    recent_case = ResidualRemediationCase(
+        fingerprint="recent-fp-xyz",
+        status=ResidualCaseStatus.ACTIVE,
+        last_seen_at=datetime.utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(recent_case)
+    await reaper_db.commit()
+    await reaper_db.refresh(recent_case)
+
+    closed = await _sweep_stale_residual_cases(reaper_db)
+
+    assert closed == 0
+    await reaper_db.refresh(recent_case)
+    assert recent_case.status == ResidualCaseStatus.ACTIVE
+    assert "recent-fp-xyz" not in _fc._residual_closed_fingerprints
+
+
+@pytest.mark.asyncio
+async def test_sweep_stale_residual_cases_ignores_already_closed(reaper_db):
+    """A case already in CLOSED_ORGANICALLY must not be counted or re-touched."""
+    import app.failure_classification as _fc
+    from app.models import ResidualRemediationCase, ResidualCaseStatus
+    from app.reaper import _sweep_stale_residual_cases
+
+    _fc._residual_closed_fingerprints.clear()
+    already_closed = ResidualRemediationCase(
+        fingerprint="closed-fp-already",
+        status=ResidualCaseStatus.CLOSED_ORGANICALLY,
+        last_seen_at=datetime.utcnow() - timedelta(hours=100),
+    )
+    reaper_db.add(already_closed)
+    await reaper_db.commit()
+    await reaper_db.refresh(already_closed)
+
+    closed = await _sweep_stale_residual_cases(reaper_db)
+
+    assert closed == 0
+    assert "closed-fp-already" not in _fc._residual_closed_fingerprints
+
+
 # ── _task_has_open_pr + reap-with-PR handoff to EVALUATING ────────────────
 
 

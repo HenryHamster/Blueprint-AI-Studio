@@ -725,6 +725,7 @@ class TestResidualStore:
         import app.failure_classification as fc
         fc._residual_store.clear()
         fc._residual_seen_task_ids.clear()
+        fc._residual_closed_fingerprints.clear()
 
     def _task_with_id(self, msg: str, task_id: str) -> "Task":
         t = MagicMock(spec=Task)
@@ -902,6 +903,43 @@ class TestResidualStore:
         assert not _looks_like_error("DIAGNOSTIC_TEST")
         assert not _looks_like_error("")
         assert not _looks_like_error(None)
+
+    def test_get_top_residual_fingerprints_excludes_closed_cases(self):
+        """Fingerprints whose case has been closed must be absent from results."""
+        import app.failure_classification as fc
+        import time
+        now = time.time()
+        fc._residual_store['open-fp'] = {
+            'count': 5, 'first_seen': now, 'last_seen': now,
+            'sample_message': 'open error', 'task_ids': ['t1'],
+        }
+        fc._residual_store['closed-fp'] = {
+            'count': 8, 'first_seen': now, 'last_seen': now,
+            'sample_message': 'closed error', 'task_ids': ['t2'],
+        }
+        fc._mark_residual_case_closed('closed-fp')
+
+        results = get_top_residual_fingerprints()
+
+        fps = [r['fingerprint'] for r in results]
+        assert 'open-fp' in fps
+        assert 'closed-fp' not in fps
+
+    def test_record_residual_fingerprint_reactivates_closed_case(self):
+        """A new occurrence of a closed fingerprint removes it from the closed set."""
+        import app.failure_classification as fc
+        fc._mark_residual_case_closed('some-fp')
+        assert 'some-fp' in fc._residual_closed_fingerprints
+
+        t = self._task_with_id("AttributeError: some-fp error text", "task-reactivate")
+        # Seed the store with the existing fingerprint so the update path runs
+        import time
+        fp = fc._fingerprint_message("AttributeError: some-fp error text") or '<empty>'
+        fc._mark_residual_case_closed(fp)
+        record_residual_fingerprint(t)
+
+        # After recording a new occurrence the fingerprint must be gone from closed set
+        assert fp not in fc._residual_closed_fingerprints
 
 
 class TestDeriveFailureStageMigration:

@@ -576,6 +576,43 @@ class MaxPlanAccount(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow)
 
 
+class ResidualCaseStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    CLOSED_ORGANICALLY = "CLOSED_ORGANICALLY"
+    IGNORED = "IGNORED"
+    RESOLVED = "RESOLVED"
+
+
+# Backward-compatible alias used by admin_digest.py and autonomous_research.py
+ResidualRemediationCaseStatus = ResidualCaseStatus
+
+
+class ResidualRemediationCase(SQLModel, table=True):
+    """Persistent record for a residual CODE_ERROR fingerprint.
+
+    Created or updated whenever record_residual_fingerprint fires; closed by
+    the reaper after 72 h of silence on the fingerprint.
+    Status IGNORED suppresses auto-remediation spawning for that fingerprint.
+    """
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: Optional[uuid.UUID] = Field(default=None, foreign_key="project.id", index=True)
+    fingerprint: str = Field(index=True)
+    status: str = Field(
+        default=ResidualCaseStatus.ACTIVE,
+        sa_column=Column(String, nullable=False, default=ResidualCaseStatus.ACTIVE),
+    )
+    first_seen_at: datetime = Field(default_factory=_utcnow)
+    last_seen_at: datetime = Field(default_factory=_utcnow)
+    hit_count: int = Field(default=1)
+    sample_message: Optional[str] = Field(default=None)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        Index("ix_residual_case_status_last_seen", "status", "last_seen_at"),
+    )
+
+
 class Artifact(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     task_id: uuid.UUID = Field(foreign_key="task.id", index=True)
@@ -609,3 +646,5 @@ class Artifact(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
 
     task: Task = Relationship(back_populates="artifacts")
+
+
