@@ -650,7 +650,20 @@ async def _create_auto_resume_alerts(session: AsyncSession, flapping: bool = Fal
         )
     if flapping:
         from app.main import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
-        await _send_webhook_notification("FLAPPING_RESUME", resume_title, resume_title)
+        # Surface the actual root cause: which dep is flapping, and how
+        # often. Without this the FLAPPING_RESUME alert was a vague
+        # "something keeps going down" signal — operators had to pull
+        # logs to find the culprit.
+        recent_failed = list(_shared_state.external_health.get("failed_deps", []) or [])
+        flap_payload = {
+            "title": resume_title,
+            "recent_resume_count": len(_recent_auto_resumes),
+            "current_failed_deps": recent_failed,
+        }
+        webhook_msg = resume_title
+        if recent_failed:
+            webhook_msg = f"{resume_title} (current failed deps: {', '.join(recent_failed)})"
+        await _send_webhook_notification("FLAPPING_RESUME", resume_title, webhook_msg)
         try:
             import asyncio as _asyncio  # noqa: PLC0415
             from app.notification_dispatch import dispatch_external_notification  # noqa: PLC0415
@@ -658,7 +671,7 @@ async def _create_auto_resume_alerts(session: AsyncSession, flapping: bool = Fal
                 _asyncio.ensure_future(dispatch_external_notification(
                     project.id,
                     "FLAPPING_RESUME",
-                    {"title": resume_title},
+                    flap_payload,
                 ))
         except Exception as _ne:
             logger.warning(f"[NOTIFY] FLAPPING_RESUME dispatch setup failed: {_ne}")

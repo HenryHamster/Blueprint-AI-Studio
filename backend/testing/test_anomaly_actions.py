@@ -22,6 +22,7 @@ from app.anomaly_detection import (
     _check_max_duration_safeguard,
     _error_fingerprint,
     _expire_stale_anomalies,
+    _expire_stale_project_anomalies,
     _is_recurring_failure_class,
     _normalize_error_message,
     anomaly_maintenance_sweep,
@@ -532,6 +533,27 @@ def test_expire_stale_anomalies_tolerates_datetime_last_seen():
     assert expired == 1
     assert "FRESH" in _shared_state.persistent_anomalies[proj]
     assert "STALE" not in _shared_state.persistent_anomalies[proj]
+
+
+def test_expire_stale_project_anomalies_skips_concurrent_refresh():
+    """A per-project compute must not delete a stale key another compute refreshed."""
+    old_seen = (_utcnow() - timedelta(hours=72)).isoformat()
+    refreshed = _utcnow().isoformat()
+    anomalies = {
+        "REFRESHED": {"last_seen": refreshed},
+        "UNCHANGED_STALE": {"last_seen": old_seen},
+    }
+    _expire_stale_project_anomalies(
+        anomalies,
+        seen_keys=set(),
+        stale_cutoff=(_utcnow() - timedelta(hours=48)).isoformat(),
+        initial_last_seen={
+            "REFRESHED": old_seen,
+            "UNCHANGED_STALE": old_seen,
+        },
+    )
+    assert "REFRESHED" in anomalies
+    assert "UNCHANGED_STALE" not in anomalies
 
 
 @pytest.mark.asyncio

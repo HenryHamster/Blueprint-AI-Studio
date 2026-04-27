@@ -2547,18 +2547,31 @@ async def test_strategic_completion_vision_set_flag_is_success(strategic_db, moc
 
 @pytest.mark.asyncio
 async def test_strategic_completion_api_path_records_directions_created(strategic_db, mocker):
-    """API path should record directions_created/retired in cycle history from task context."""
+    """API path should record directions_created/retired on the cycle row from task context.
+
+    Audit W2: cycle history is the StrategicCycle table now.
+    """
+    from app import strategic_cycle as sc
+    from app.models import StrategicCycle as _SC
+    from app.time_utils import _utcnow as _ut
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     cycle_id = "cycle-test-001"
     project = Project(
         name="P", user_id="u1",
-        vision={"purpose": "test", "revision": 1,
-                "_strategic_cycle_history": [{"cycle_id": cycle_id, "phase1_completed_at": "2026-01-01T00:00:00"}]},
+        vision={"purpose": "test", "revision": 1},
     )
     strategic_db.add(project)
     await strategic_db.commit()
     await strategic_db.refresh(project)
+    strategic_db.add(_SC(
+        id=cycle_id, project_id=project.id,
+        outcome=sc.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_ut(),
+        phase1_completed_at=_ut(),
+        phase2_started_at=_ut(),
+    ))
+    await strategic_db.commit()
 
     task = await _make_strategic_task(
         strategic_db, project,
@@ -2575,15 +2588,14 @@ async def test_strategic_completion_api_path_records_directions_created(strategi
 
     await _handle_strategic_completion(task, "", strategic_db)
 
-    await strategic_db.refresh(project)
-    history = (project.vision or {}).get("_strategic_cycle_history", [])
-    cycle_entry = next((e for e in history if e.get("cycle_id") == cycle_id), None)
-    assert cycle_entry is not None, "Cycle entry not found in history"
-    assert cycle_entry.get("directions_created") == 2
-    assert cycle_entry.get("directions_retired") == 1
-    assert cycle_entry.get("created_direction_ids") == ["dir-a", "dir-b"]
-    assert cycle_entry.get("retired_direction_ids") == ["dir-c"]
-    assert cycle_entry.get("outcome") == "completed"
+    cycle = await sc.get(strategic_db, cycle_id)
+    assert cycle is not None, "Cycle row not found"
+    assert cycle.directions_created == 2
+    assert cycle.directions_retired == 1
+    meta = cycle.cycle_metadata or {}
+    assert meta.get("created_direction_ids") == ["dir-a", "dir-b"]
+    assert meta.get("retired_direction_ids") == ["dir-c"]
+    assert cycle.outcome == sc.OUTCOME_COMPLETED
 
 
 @pytest.mark.asyncio
@@ -2634,18 +2646,29 @@ async def test_strategic_completion_vision_rev_increase_is_success(strategic_db,
 
 @pytest.mark.asyncio
 async def test_strategic_completion_dirs_created_triggers_api_path(strategic_db, mocker):
-    """Strategic task with _strategic_dirs_created>0 but no _strategic_vision_set should use API path."""
+    """Strategic task with _strategic_dirs_created>0 but no _strategic_vision_set should use API path.
+
+    Audit W2: cycle history is the StrategicCycle table.
+    """
+    from app import strategic_cycle as sc
+    from app.models import StrategicCycle as _SC
+    from app.time_utils import _utcnow as _ut
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
-    import uuid
-    cycle_id = str(uuid.uuid4())
-    project = Project(name="P", user_id="u1", vision={
-        "purpose": "test", "revision": 1,
-        "_strategic_cycle_history": [{"cycle_id": cycle_id, "phase1_completed_at": "2026-01-01T00:00:00"}],
-    })
+    # Cycle ids must fit the column (String(36)). Use the same shape spawning uses.
+    cycle_id = sc.new_cycle_id()
+    project = Project(name="P", user_id="u1", vision={"purpose": "test", "revision": 1})
     strategic_db.add(project)
     await strategic_db.commit()
     await strategic_db.refresh(project)
+    strategic_db.add(_SC(
+        id=cycle_id, project_id=project.id,
+        outcome=sc.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_ut(),
+        phase1_completed_at=_ut(),
+        phase2_started_at=_ut(),
+    ))
+    await strategic_db.commit()
 
     # _strategic_dirs_created=2, but _strategic_vision_set is absent and vision_rev unchanged
     task = await _make_strategic_task(
@@ -2663,11 +2686,10 @@ async def test_strategic_completion_dirs_created_triggers_api_path(strategic_db,
     # Should be treated as success (API path), no failure increment
     assert project.vision.get("_strategic_failures", 0) == 0
 
-    # Cycle history should record directions_created=2
-    history = (project.vision or {}).get("_strategic_cycle_history", [])
-    matching = [h for h in history if h.get("cycle_id") == cycle_id]
-    assert matching, "Expected cycle history entry for this cycle_id"
-    assert matching[0].get("directions_created") == 2
+    # Cycle row should record directions_created=2
+    cycle = await sc.get(strategic_db, cycle_id)
+    assert cycle is not None
+    assert cycle.directions_created == 2
 
 
 @pytest.mark.asyncio

@@ -730,6 +730,28 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
             )
             time.sleep(backoff_seconds)
 
+    # E15: verify the version is actually accessible before handing it off
+    # to provisioning. Without this, transient Secret Manager replication
+    # lag or IAM-binding races can yield a version.name that points at a
+    # not-yet-readable version, which only surfaces 60+ seconds later when
+    # the agent VM tries to fetch it and times out into AGENT_DIED_EARLY.
+    try:
+        verification = client.access_secret_version(request={"name": version.name})
+        if verification.payload.data != secret_payload.encode("utf-8"):
+            logger.error(
+                "[COMPUTE] Secret %s post-create payload mismatch (size=%d vs expected=%d)",
+                version.name, len(verification.payload.data), len(secret_payload),
+            )
+            raise RuntimeError(
+                f"Secret {version.name} verification failed: payload mismatch"
+            )
+    except Exception as verify_err:
+        logger.error(
+            "[COMPUTE] Secret %s failed post-create verification: %s",
+            version.name, verify_err,
+        )
+        raise
+
     logger.info(f"Stored agent credentials in Secret Manager: {secret_id}")
     return version.name
 
@@ -874,7 +896,11 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
       fi
       if [ -n "$TOKEN" ] && [ -n "$ORCH" ]; then
         local err_excerpt
-        err_excerpt="$(printf '%s' "$LAST_STAGE_STDERR" | tr '\n' ' ' | tr '"' "'" | head -c 400)"
+        # Scrub credential patterns before sending to the orchestrator. A
+        # previous stage's stderr (e.g. a curl -v or an oauth refresh
+        # rejection) could otherwise embed a Bearer token, an Anthropic
+        # API key, or an unrelated JWT in the heartbeat payload.
+        err_excerpt="$(printf '%s' "$LAST_STAGE_STDERR" | tr '\n' ' ' | tr '"' "'" | sed -E -e 's/[Aa]uthorization:[[:space:]]*[^[:space:]]+/Authorization: [REDACTED]/g' -e 's/[Bb]earer[[:space:]]+[A-Za-z0-9._-]+/Bearer [REDACTED]/g' -e 's/sk-ant-[A-Za-z0-9_-]+/[REDACTED-ANT-KEY]/g' -e 's/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/[REDACTED-JWT]/g' | head -c 400)"
         # Sanitize cmd + stack for JSON: strip quotes/newlines, cap length.
         local cmd_clean stack_clean
         cmd_clean="$(printf '%s' "$cmd" | tr '\n\t' '  ' | tr '"' "'" | head -c 200)"
@@ -1026,10 +1052,12 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     # 6b. Notify orchestrator that startup completed — early health signal
     # Settle window: Type=simple returns as soon as npm is fork()ed, which is
     # not the same as the agent actually running a line of TypeScript. Wait 30s
-    # and re-check is-active before claiming success. If the agent has already
-    # died in this window we skip the success heartbeat and fall through to
-    # the wait loop + poweroff path, so the reaper's no-heartbeat handler sees
-    # the failure with its real classification.
+    # and re-check is-active. To catch agents that boot then die between 30s
+    # and 45s (audit E8: "VM ready != healthy"), wait another 15s and re-check
+    # the ActiveState explicitly — `is-active --quiet` accepts "activating"
+    # which is misleading mid-boot. If either window fails, we skip the success
+    # heartbeat and fall through to the wait loop + poweroff so the reaper's
+    # no-heartbeat handler sees the failure with its real classification.
     sleep 30
     # Source the env file directly — systemd uses the same format, and a
     # grep|cut pipeline crashes with pipefail+set-e when the pattern is
@@ -1038,7 +1066,16 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     [ -f /etc/agent.env ] && . /etc/agent.env || true
     AGENT_TOKEN="${{AGENT_SECRET_TOKEN:-}}"
     ORCH_URL="${{ORCHESTRATOR_URL:-}}"
-    if systemctl is-active --quiet blueprint-agent; then
+    _AGENT_STILL_HEALTHY=0
+    if systemctl is-active --quiet blueprint-agent && \
+       [ "$(systemctl show blueprint-agent --property=ActiveState --value 2>/dev/null)" = "active" ]; then
+      sleep 15
+      if systemctl is-active --quiet blueprint-agent && \
+         [ "$(systemctl show blueprint-agent --property=ActiveState --value 2>/dev/null)" = "active" ]; then
+        _AGENT_STILL_HEALTHY=1
+      fi
+    fi
+    if [ "$_AGENT_STILL_HEALTHY" = "1" ]; then
       # Capture curl's stderr so a failed startup-completed heartbeat is at
       # least visible in the systemd journal. Previously this curl used `-sf`
       # with no redirect — when the orchestrator was briefly unreachable the
@@ -1066,8 +1103,10 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
       # ever arrived.  Keep the LAST 3KB (tail) — the error and stack are at the
       # end of the journal, while head would be just systemd boilerplate +
       # the agent's banner line that tells us nothing about why it died.
-      echo "Agent service died within 30s of start — capturing journal for diagnostics"
-      SERVICE_LOG="$(journalctl -u blueprint-agent --no-pager -n 50 2>/dev/null | tr '"' "'" | tr '\\n' ' ' | tail -c 3000 || echo 'no journal')"
+      echo "Agent service did not stay healthy through the 45s settle window — capturing journal for diagnostics"
+      # Same scrub as _report_failure — agent-side accidental log of a
+      # bearer token / API key would otherwise land in the heartbeat.
+      SERVICE_LOG="$(journalctl -u blueprint-agent --no-pager -n 50 2>/dev/null | tr '"' "'" | tr '\\n' ' ' | sed -E -e 's/[Aa]uthorization:[[:space:]]*[^[:space:]]+/Authorization: [REDACTED]/g' -e 's/[Bb]earer[[:space:]]+[A-Za-z0-9._-]+/Bearer [REDACTED]/g' -e 's/sk-ant-[A-Za-z0-9_-]+/[REDACTED-ANT-KEY]/g' -e 's/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/[REDACTED-JWT]/g' | tail -c 3000 || echo 'no journal')"
       EXIT_STATUS="$(systemctl show blueprint-agent --property=ExecMainStatus --value 2>/dev/null || echo '?')"
       EXIT_CODE="$(systemctl show blueprint-agent --property=ExecMainCode --value 2>/dev/null || echo '?')"
       curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \

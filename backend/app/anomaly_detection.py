@@ -170,6 +170,32 @@ def _is_recurring_failure_class(proj_anomalies: dict, failure_class: str) -> boo
     return bool(entry and entry.get("occurrence_count", 0) >= 3)
 
 
+def _expire_stale_project_anomalies(
+    proj_anomalies: dict,
+    *,
+    seen_keys: set,
+    stale_cutoff: str,
+    initial_last_seen: dict[str, str],
+) -> None:
+    """Delete stale anomalies without clobbering concurrent updates.
+
+    ``_compute_research_anomalies`` mutates the shared anomaly dict in memory.
+    A parallel compute can refresh an entry after this run took its initial
+    snapshot; deleting solely because the key was not seen by this run would
+    reset that concurrent counter. Re-check that ``last_seen`` is unchanged
+    before deleting.
+    """
+    for key in list(proj_anomalies):
+        if key in seen_keys:
+            continue
+        entry = proj_anomalies.get(key) or {}
+        current_last_seen = _as_iso(entry.get("last_seen"))
+        if current_last_seen != initial_last_seen.get(key, current_last_seen):
+            continue
+        if current_last_seen < stale_cutoff:
+            del proj_anomalies[key]
+
+
 async def _compute_research_anomalies(project_id, session: AsyncSession) -> list:
     """Analyze recent task data to identify pipeline anomalies for undirected research focus.
 
@@ -461,6 +487,11 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     # --- Persist anomaly tracking ---
     proj_key = str(project_id)
     proj_anomalies = _shared_state.persistent_anomalies.setdefault(proj_key, {})
+    initial_last_seen = {
+        key: _as_iso((entry or {}).get("last_seen"))
+        for key, entry in proj_anomalies.items()
+        if isinstance(entry, dict)
+    }
     now_iso = now.isoformat()
     seen_keys: set = set()
     for a in anomalies:
@@ -530,9 +561,12 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                 entry["example_message"] = intra_fp_example.get((fp, did), "")[:500]
     # Expire anomalies not seen for 48h
     stale_cutoff = (now - timedelta(hours=48)).isoformat()
-    for key in list(proj_anomalies):
-        if key not in seen_keys and _as_iso(proj_anomalies[key].get("last_seen")) < stale_cutoff:
-            del proj_anomalies[key]
+    _expire_stale_project_anomalies(
+        proj_anomalies,
+        seen_keys=seen_keys,
+        stale_cutoff=stale_cutoff,
+        initial_last_seen=initial_last_seen,
+    )
 
     return anomalies
 

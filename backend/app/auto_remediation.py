@@ -561,11 +561,18 @@ async def _extract_ci_context(
 
         ci_result = await get_check_runs_cached(token, owner, repo, head_sha, project_id=str(project_id))
         details = ci_result.get("details", [])
-        failed_checks = [
-            d["name"] for d in details
-            if d.get("conclusion") == "failure"
-        ]
+        if not isinstance(details, list):
+            details = []
+        failed_checks = []
+        for d in details:
+            if not isinstance(d, dict) or d.get("conclusion") != "failure":
+                continue
+            name = d.get("name")
+            if name:
+                failed_checks.append(str(name))
         raw_logs = ci_result.get("failed_logs", "")
+        if not isinstance(raw_logs, str):
+            raw_logs = str(raw_logs or "")
         structured_signals = _extract_structured_signals(raw_logs)
         error_summary = raw_logs[:3000]
 

@@ -665,7 +665,7 @@ MODULE_SIZE_LIMITS = {
     # upper bounds, not ratchets — only bumped when work justifies it.
     "main.py": 3500,
     "task_completion.py": 2400,
-    "task_lifecycle.py": 2550,
+    "task_lifecycle.py": 2600,
     "orchestrator.py": 3100,
     "admin.py": 3000,
     "compute.py": 2500,
@@ -677,14 +677,14 @@ MODULE_SIZE_LIMITS = {
     "max_plan_pool.py": 2100,
     "anomaly_detection.py": 2000,
     "routers/agent.py": 2400,
-    "services.py": 1700,
+    "services.py": 1800,
     "routers/agent_status.py": 1700,
     "autonomous_research.py": 1800,
     "research_completion.py": 2050,
     "strategic_completion.py": 1500,
     "rollup_management.py": 1600,
-    "reaper.py": 1450,
-    "review_pipeline.py": 1300,
+    "reaper.py": 1500,
+    "review_pipeline.py": 1400,
     "deploy_health.py": 1000,
 }
 

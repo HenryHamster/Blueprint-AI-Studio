@@ -21,6 +21,7 @@ from app.models import (
     UserIntegration,
     _utcnow,
 )
+from app.task_locking import deployment_state_lock
 from app.auth import get_current_user, require_admin
 from app.github import generate_installation_access_token
 from app.max_plan_pool import provider_selection_mode as _provider_selection_mode_from_config
@@ -194,6 +195,7 @@ async def update_settings(
 async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runtime_config: Dict):
     # Snapshot config so we can restore on DB commit failure
     _config_snapshot = dict(_runtime_config)
+    clear_pause_state = False
 
     if "max_concurrent_vms" in payload:
         try:
@@ -206,15 +208,7 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         # Clear PAUSED/HALTED state if user explicitly sets VMs > 0
         # Otherwise the next cold start will override back to 0
         if val > 0:
-            state = await session.get(DeploymentState, 1)
-            if state and state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
-                old_status = state.status
-                state.status = DeploymentStatus.STABLE
-                state.pause_reason = None
-                state.paused_at = None
-                state.pre_pause_max_vms = None
-                session.add(state)
-                logger.warning(f"[SETTINGS] Cleared {old_status} state — user set max_vms={val}")
+            clear_pause_state = True
     if "max_retries" in payload:
         try:
             val = int(payload["max_retries"])
@@ -701,11 +695,30 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
     # Persist to DB so values survive Cloud Run restarts
     # Always persist all runtime config values (not just changed ones) to ensure consistency
     try:
-        # FOR UPDATE prevents concurrent settings writes from racing (multi-instance)
-        state = (await session.execute(
-            select(DeploymentState).where(DeploymentState.id == 1).with_for_update()
-        )).scalars().first()
-        if state:
+        # Non-blocking FOR UPDATE prevents concurrent settings writes from
+        # racing without wedging the admin request behind deploy-health writes.
+        # state can be None either because the row is held by a peer (rare) or
+        # because no DeploymentState row has been created yet (fresh install /
+        # tests). The original sync version silently skipped the persist when
+        # the row was missing; preserve that behavior — only raise 409 when we
+        # can confirm the row exists but is held.
+        async with deployment_state_lock(session, skip_locked=True) as state:
+            if state is None:
+                exists = (await session.execute(
+                    select(DeploymentState.id).where(DeploymentState.id == 1)
+                )).first()
+                if exists is None:
+                    # No DeploymentState row yet — runtime config is in-memory only.
+                    # Skip the persist; the next admin/deploy bootstrap will create the row.
+                    return _runtime_config
+                raise HTTPException(status_code=409, detail="Deployment state locked; retry settings update")
+            if clear_pause_state and state.status in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
+                old_status = state.status
+                state.status = DeploymentStatus.STABLE
+                state.pause_reason = None
+                state.paused_at = None
+                state.pre_pause_max_vms = None
+                logger.warning(f"[SETTINGS] Cleared {old_status} state — user set max_vms={_runtime_config['max_concurrent_vms']}")
             state.runtime_max_concurrent_vms = _runtime_config["max_concurrent_vms"]
             state.runtime_max_retries = _runtime_config["max_retries"]
             state.runtime_max_autonomous_tasks_per_hour = _runtime_config["max_autonomous_tasks_per_hour"]
@@ -751,8 +764,12 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             except AttributeError:
                 pass  # Column not yet added (rolling deploy, old schema)
             session.add(state)
-            await session.commit()
-            logger.info(f"[SETTINGS] Persisted runtime config: max_vms={state.runtime_max_concurrent_vms}")
+        await session.commit()
+        logger.info(f"[SETTINGS] Persisted runtime config: max_vms={state.runtime_max_concurrent_vms if state else 'missing'}")
+    except HTTPException:
+        _runtime_config.update(_config_snapshot)
+        await session.rollback()
+        raise
     except Exception as e:
         # Restore in-memory config to pre-change state on DB failure
         _runtime_config.update(_config_snapshot)

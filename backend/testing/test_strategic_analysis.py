@@ -1,7 +1,10 @@
 """Tests for _build_outcome_evaluation and _compute_prediction_calibration_factor in app.strategic_analysis."""
 import pytest
 from unittest.mock import patch
-from app.strategic_analysis import _build_outcome_evaluation, _compute_prediction_calibration_factor
+from app.strategic_analysis import (
+    _build_outcome_evaluation as _real_build_outcome_evaluation,
+    _compute_prediction_calibration_factor as _real_compute_prediction_calibration_factor,
+)
 from app.direction_metrics import _compute_difficulty_index
 
 
@@ -15,13 +18,28 @@ def _make_project(directions=None, vision=None):
     return p
 
 
+# Audit W2: cycle history is now passed in (was JSONB on vision). These test
+# wrappers preserve the legacy single-arg call pattern by extracting cycle
+# history from project.vision._strategic_cycle_history when not supplied.
+def _build_outcome_evaluation(project, cycle_history=None):
+    if cycle_history is None:
+        cycle_history = (project.vision or {}).get("_strategic_cycle_history") or []
+    return _real_build_outcome_evaluation(project, cycle_history)
+
+
+def _compute_prediction_calibration_factor(project, cycle_history=None, **kwargs):
+    if cycle_history is None:
+        cycle_history = (project.vision or {}).get("_strategic_cycle_history") or []
+    return _real_compute_prediction_calibration_factor(project, cycle_history, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # 1. Empty directions
 # ---------------------------------------------------------------------------
 
 def test_empty_directions_returns_defaults():
     project = _make_project()
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
 
     assert result["overall"]["cycles"] == 0
     assert result["overall"]["merged"] == 0
@@ -52,7 +70,7 @@ def test_history_aggregation():
         }
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
 
     assert result["overall"]["merged"] == 5
     assert result["overall"]["failed"] == 1
@@ -76,7 +94,7 @@ def test_history_acceptance_rate():
         }
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     d = result["directions"][0]
     assert d["acceptance_rate"] == 0.5
 
@@ -88,7 +106,7 @@ def test_no_prs_omits_acceptance_rate():
         ]}
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     assert "acceptance_rate" not in result["directions"][0]
 
 
@@ -108,7 +126,7 @@ def test_failed_approaches_appear_in_output():
         {"id": "dir-1", "status": "active", "research_context": research_ctx, "research_history": []}
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     d = result["directions"][0]
     assert "failed_approaches" in d
     assert "Approach X" in d["failed_approaches"]
@@ -136,7 +154,7 @@ def test_type_distribution_and_product_ratio():
         }
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     d = result["directions"][0]
     assert d["type_distribution"] == {"create": 3, "fix": 1}
     assert d["product_ratio"] == 0.8
@@ -164,7 +182,7 @@ def test_multiple_directions_aggregate():
         },
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
 
     assert result["overall"]["merged"] == 4
     assert result["overall"]["failed"] == 4
@@ -187,7 +205,7 @@ def test_operator_rejection_rate_computed_when_rejections():
         }
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     d = result["directions"][0]
     assert "operator_rejection_rate" in d
     assert d["operator_rejection_rate"] == round(1 / (3 + 1), 2)
@@ -204,7 +222,7 @@ def test_operator_rejection_rate_absent_when_no_rejections():
         }
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     d = result["directions"][0]
     assert "operator_rejection_rate" not in d
 
@@ -228,7 +246,7 @@ def test_trend_improving():
         }
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     assert result["overall"]["trend"] == "improving"
 
 
@@ -246,7 +264,7 @@ def test_trend_declining():
         }
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     assert result["overall"]["trend"] == "declining"
 
 
@@ -262,7 +280,7 @@ def test_trend_stable_fewer_than_4_entries():
         }
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     assert result["overall"]["trend"] == "stable"
 
 
@@ -285,7 +303,7 @@ def test_window_filter_excludes_old_history():
         directions=directions,
         vision={"last_updated": "2026-01-01T00:00:00", "revision": 3},
     )
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     assert result["overall"]["merged"] == 2
     assert result["window"]["from"] == "2026-01-01T00:00:00"
     assert result["window"]["vision_revision"] == 3
@@ -302,7 +320,7 @@ def test_systems_cross_reference():
     ]
     vision = {"systems": [{"id": "sys-A", "name": "Auth", "status": "in_progress"}]}
     project = _make_project(directions=directions, vision=vision)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
 
     assert "systems" in result
     sys_entry = result["systems"][0]
@@ -325,7 +343,7 @@ def test_inactive_directions_skipped():
          "research_history": [{"timestamp": "2026-01-01T00:00:00", "prs_merged": 99}]},
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     assert result["overall"]["merged"] == 1
     assert len(result["directions"]) == 1
 
@@ -353,7 +371,7 @@ def test_taxonomy_summary_aggregated_across_history():
         }
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     d = result["directions"][0]
     assert d["tasks_failed_infra"] == 2
     assert d["taxonomy_summary"] == {
@@ -370,7 +388,7 @@ def test_taxonomy_summary_absent_when_all_zero():
         ]}
     ]
     project = _make_project(directions=directions)
-    d = _build_outcome_evaluation(project)["directions"][0]
+    d = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])["directions"][0]
     assert "tasks_failed_infra" not in d
     assert "taxonomy_summary" not in d
 
@@ -391,7 +409,7 @@ def test_taxonomy_summary_respects_window_filter():
         directions=directions,
         vision={"last_updated": "2026-01-01T00:00:00", "revision": 1},
     )
-    d = _build_outcome_evaluation(project)["directions"][0]
+    d = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])["directions"][0]
     assert d["tasks_failed_infra"] == 1
     assert d["taxonomy_summary"] == {"review_quality": 2}
 
@@ -483,7 +501,7 @@ def test_confirmed_and_proposed_findings():
         {"id": "dir-1", "status": "active", "research_context": research_ctx, "research_history": []}
     ]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     d = result["directions"][0]
     assert "confirmed" in d
     assert "proposed" in d
@@ -653,7 +671,7 @@ def test_difficulty_index_surfaced_in_outcome_evaluation():
                               "tasks_created": 20, "prs_merged": 2}],
     }]
     project = _make_project(directions=directions)
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     assert result["directions"][0]["difficulty_index"] == 10.0
 
 
@@ -664,7 +682,7 @@ def test_difficulty_index_surfaced_in_outcome_evaluation():
 def test_strategic_effectiveness_absent_without_cycle_history():
     project = _make_project(directions=[{"id": "d1", "status": "active",
                                           "research_history": [{"prs_merged": 1}]}])
-    result = _build_outcome_evaluation(project)
+    result = _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
     assert "strategic_effectiveness" not in result
 
 
@@ -733,7 +751,7 @@ def test_strategic_effectiveness_trend_improving():
 def test_decision_accuracy_absent_without_completed_cycle():
     project = _make_project(directions=[{"id": "d1", "status": "active",
                                           "research_history": [{"prs_merged": 1}]}])
-    assert "decision_accuracy" not in _build_outcome_evaluation(project)
+    assert "decision_accuracy" not in _build_outcome_evaluation(project, (project.vision or {}).get("_strategic_cycle_history") or [])
 
 
 def test_decision_accuracy_scores_created_directions():
@@ -818,11 +836,11 @@ def test_strategic_effectiveness_keeps_only_last_5_cycles():
 class TestPredictionCalibrationFactor:
     def test_no_history_returns_one(self):
         project = _make_project(vision={})
-        assert _compute_prediction_calibration_factor(project) == 1.0
+        assert _compute_prediction_calibration_factor(project, (project.vision or {}).get("_strategic_cycle_history") or []) == 1.0
 
     def test_empty_cycle_history_returns_one(self):
         project = _make_project(vision={"_strategic_cycle_history": []})
-        assert _compute_prediction_calibration_factor(project) == 1.0
+        assert _compute_prediction_calibration_factor(project, (project.vision or {}).get("_strategic_cycle_history") or []) == 1.0
 
     def test_completed_cycles_with_zero_predicted_returns_one(self):
         project = _make_project(
@@ -834,7 +852,7 @@ class TestPredictionCalibrationFactor:
                 }]
             },
         )
-        assert _compute_prediction_calibration_factor(project) == 1.0
+        assert _compute_prediction_calibration_factor(project, (project.vision or {}).get("_strategic_cycle_history") or []) == 1.0
 
     def test_insufficient_history_blends_toward_one(self):
         # 1 data point (< min_samples=3) with ratio=0.0 should blend toward 1.0
@@ -847,7 +865,7 @@ class TestPredictionCalibrationFactor:
                 }]
             },
         )
-        factor = _compute_prediction_calibration_factor(project)
+        factor = _compute_prediction_calibration_factor(project, (project.vision or {}).get("_strategic_cycle_history") or [])
         # With 1 sample, raw=0.0, weight=1/3, blended = (1/3)*0 + (2/3)*1 = 0.667
         assert 0.6 < factor < 0.8
 
@@ -865,7 +883,7 @@ class TestPredictionCalibrationFactor:
             for i in range(3)
         ]
         project = _make_project(directions=directions, vision={"_strategic_cycle_history": cycles})
-        factor = _compute_prediction_calibration_factor(project)
+        factor = _compute_prediction_calibration_factor(project, (project.vision or {}).get("_strategic_cycle_history") or [])
         assert factor < 1.0, f"Expected factor < 1.0 for over-prediction, got {factor}"
         assert factor >= 0.5
 
@@ -883,7 +901,7 @@ class TestPredictionCalibrationFactor:
             for i in range(3)
         ]
         project = _make_project(directions=directions, vision={"_strategic_cycle_history": cycles})
-        factor = _compute_prediction_calibration_factor(project)
+        factor = _compute_prediction_calibration_factor(project, (project.vision or {}).get("_strategic_cycle_history") or [])
         assert factor > 1.0, f"Expected factor > 1.0 for under-prediction, got {factor}"
         assert factor <= 1.5
 
@@ -901,7 +919,7 @@ class TestPredictionCalibrationFactor:
             for i in range(5)
         ]
         project = _make_project(directions=directions, vision={"_strategic_cycle_history": cycles})
-        factor = _compute_prediction_calibration_factor(project)
+        factor = _compute_prediction_calibration_factor(project, (project.vision or {}).get("_strategic_cycle_history") or [])
         assert factor == 0.5
 
     def test_extreme_under_prediction_clips_to_maximum(self):
@@ -918,7 +936,7 @@ class TestPredictionCalibrationFactor:
             for i in range(5)
         ]
         project = _make_project(directions=directions, vision={"_strategic_cycle_history": cycles})
-        factor = _compute_prediction_calibration_factor(project)
+        factor = _compute_prediction_calibration_factor(project, (project.vision or {}).get("_strategic_cycle_history") or [])
         assert factor == 1.5
 
     def test_only_completed_cycles_are_used(self):
@@ -941,7 +959,7 @@ class TestPredictionCalibrationFactor:
         )
         # Only the completed cycle matters: actual=1, predicted=1 → ratio=1.0
         # But 1 sample < min_samples=3 → blends toward 1.0 anyway
-        factor = _compute_prediction_calibration_factor(project)
+        factor = _compute_prediction_calibration_factor(project, (project.vision or {}).get("_strategic_cycle_history") or [])
         # ratio=1.0, weight=1/3, blended = 1.0
         assert factor == 1.0
 
@@ -960,7 +978,7 @@ class TestPredictionCalibrationFactor:
         # With lookback_cycles=2, we get 2 data points, both with ratio=0.1
         # 2 < min_samples=3 → weight=2/3, blended = (2/3)*0.1 + (1/3)*1.0 ≈ 0.4
         # Clipped to 0.5
-        factor = _compute_prediction_calibration_factor(project, lookback_cycles=2)
+        factor = _compute_prediction_calibration_factor(project, (project.vision or {}).get("_strategic_cycle_history") or [], lookback_cycles=2)
         assert factor == 0.5  # clipped
 
     def test_missing_direction_skipped(self):
@@ -976,4 +994,4 @@ class TestPredictionCalibrationFactor:
                 ]
             },
         )
-        assert _compute_prediction_calibration_factor(project) == 1.0
+        assert _compute_prediction_calibration_factor(project, (project.vision or {}).get("_strategic_cycle_history") or []) == 1.0

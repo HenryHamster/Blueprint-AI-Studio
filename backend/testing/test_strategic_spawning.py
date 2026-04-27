@@ -55,6 +55,62 @@ def _make_project(**kwargs) -> Project:
     return Project(**defaults)
 
 
+async def _seed_legacy_cycles(session, project: Project) -> None:
+    """Audit W2: seed StrategicCycle rows from legacy ``vision._strategic_cycle_history``.
+
+    Tests historically built cycle history as a JSONB list inline in vision.
+    The W2 migration moved cycles to a real table; this helper backfills the
+    table from the legacy shape so existing test fixtures still produce the
+    same agent-context payload without rewriting every test.
+    """
+    from app.models import StrategicCycle as _SC
+    from app.time_utils import _utcnow as _ut
+    from datetime import datetime as _dt
+    raw = (project.vision or {}).get("_strategic_cycle_history") or []
+    if not raw:
+        return
+    def _parse_ts(v):
+        if not v:
+            return None
+        try:
+            d = _dt.fromisoformat(str(v).replace("Z", "+00:00"))
+            return d.replace(tzinfo=None) if d.tzinfo else d
+        except Exception:
+            return None
+    for entry in raw:
+        if not isinstance(entry, dict) or not entry.get("cycle_id"):
+            continue
+        # Skip if a row already exists for this cycle id.
+        existing = await session.get(_SC, entry["cycle_id"])
+        if existing is not None:
+            continue
+        meta = {k: v for k, v in entry.items() if k not in {
+            "cycle_id", "outcome", "phase1_task_id", "phase1_completed_at",
+            "phase2_task_id", "phase2_completed_at", "phase1_started_at",
+            "directions_created", "directions_retired", "tasks_spawned",
+            "vision_updated", "cycle_reasoning", "summary_text", "started_at",
+        }}
+        session.add(_SC(
+            id=entry["cycle_id"],
+            project_id=project.id,
+            outcome=entry.get("outcome") or "in_progress",
+            phase1_task_id=None,  # legacy entries store str not UUID; skip FK
+            phase1_started_at=_parse_ts(entry.get("started_at"))
+                or _parse_ts(entry.get("phase1_started_at")) or _ut(),
+            phase1_completed_at=_parse_ts(entry.get("phase1_completed_at")),
+            phase2_started_at=_parse_ts(entry.get("phase2_started_at")),
+            phase2_completed_at=_parse_ts(entry.get("phase2_completed_at")),
+            directions_created=int(entry.get("directions_created") or 0),
+            directions_retired=int(entry.get("directions_retired") or 0),
+            tasks_spawned=int(entry.get("tasks_spawned") or 0),
+            vision_updated=bool(entry.get("vision_updated", False)),
+            cycle_reasoning=entry.get("cycle_reasoning"),
+            summary_text=entry.get("summary_text"),
+            cycle_metadata=meta,
+        ))
+    await session.commit()
+
+
 def _patch_spawning_deps(mocker):
     """Patch external dependencies required by the spawning functions."""
     mocker.patch(
@@ -306,6 +362,7 @@ async def test_operator_rejection_rate_computed_correctly(db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
 
@@ -342,6 +399,7 @@ async def test_operator_rejection_rate_absent_when_no_rejections(db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
 
@@ -385,6 +443,7 @@ async def test_operator_rejection_rate_uses_history_aggregate(db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
@@ -419,6 +478,7 @@ async def test_operator_rejection_rate_zero_rejected_in_history_aggregate(db_ses
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
@@ -454,6 +514,7 @@ async def test_cost_fields_present_when_history_has_merge_data(db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
@@ -486,6 +547,7 @@ async def test_cost_fields_absent_without_history_data(db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
@@ -526,6 +588,7 @@ async def test_tasks_failed_infra_includes_history_aggregate(db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
@@ -569,6 +632,7 @@ async def test_spawn_strategic_review_skips_when_strategic_task_active(db_sessio
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is False
@@ -604,6 +668,7 @@ async def test_spawn_strategic_review_proceeds_when_no_active_strategic(db_sessi
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
 
@@ -619,7 +684,13 @@ async def test_spawn_strategic_review_proceeds_when_no_active_strategic(db_sessi
 
 @pytest.mark.asyncio
 async def test_spawn_design_doc_update_adds_cycle_history_entry(db_session, mocker):
-    """_spawn_design_doc_update writes a new entry to _strategic_cycle_history."""
+    """_spawn_design_doc_update writes a new StrategicCycle row.
+
+    Audit W2: cycle history is the StrategicCycle table now (was JSONB).
+    """
+    from app import strategic_cycle
+    from app.models import StrategicCycle as _SC
+    from sqlmodel import select as _select
     _patch_spawning_deps(mocker)
     mocker.patch(
         "app.task_lifecycle._has_active_strategic_task",
@@ -632,66 +703,91 @@ async def test_spawn_design_doc_update_adds_cycle_history_entry(db_session, mock
 
     await _spawn_design_doc_update(project, db_session)
 
-    cycle_history = (project.vision or {}).get("_strategic_cycle_history", [])
-    assert len(cycle_history) == 1
-    entry = cycle_history[0]
-    assert entry.get("outcome") == "in_progress"
-    assert entry.get("phase1_task_id") is not None
-    assert entry.get("cycle_id", "").startswith("sc-")
+    cycles = (await db_session.execute(
+        _select(_SC).where(_SC.project_id == project.id)
+    )).scalars().all()
+    assert len(cycles) == 1
+    cycle = cycles[0]
+    assert cycle.outcome == strategic_cycle.OUTCOME_PHASE1_RUNNING
+    assert cycle.phase1_task_id is not None
+    assert cycle.id.startswith("sc-")
 
 
 @pytest.mark.asyncio
-async def test_spawn_design_doc_update_cycle_history_capped_at_10(db_session, mocker):
-    """_spawn_design_doc_update caps _strategic_cycle_history at 10 entries."""
+async def test_spawn_design_doc_update_cycle_history_unbounded_in_table(db_session, mocker):
+    """Audit W2: the 10-entry cap on cycle history was a JSONB-bloat guard.
+    With cycles in a real table the cap is gone; ``recent_for_agent_context``
+    applies a per-call limit at read time instead."""
+    from app import strategic_cycle
+    from app.models import StrategicCycle as _SC
+    from sqlmodel import select as _select
+    from app.time_utils import _utcnow
     _patch_spawning_deps(mocker)
     mocker.patch(
         "app.task_lifecycle._has_active_strategic_task",
         new=AsyncMock(return_value=False),
     )
-    existing = [{"cycle_id": f"sc-{i:08x}", "outcome": "done"} for i in range(10)]
-    project = _make_project(vision={
-        "purpose": "test purpose",
-        "_strategic_cycle_history": existing,
-    })
+    project = _make_project(vision={"purpose": "test purpose"})
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    # Pre-populate with 10 historical cycles
+    from datetime import timedelta
+    for i in range(10):
+        db_session.add(_SC(
+            id=f"sc-{i:08x}", project_id=project.id,
+            outcome="completed", phase1_started_at=_utcnow() - timedelta(days=i + 1),
+        ))
+    await db_session.commit()
 
     await _spawn_design_doc_update(project, db_session)
 
-    cycle_history = (project.vision or {}).get("_strategic_cycle_history", [])
-    assert len(cycle_history) == 10
-    assert cycle_history[-1].get("outcome") == "in_progress"
+    all_cycles = (await db_session.execute(
+        _select(_SC).where(_SC.project_id == project.id)
+    )).scalars().all()
+    assert len(all_cycles) == 11
+    # The agent-context view caps at the helper's default (10).
+    recent = await strategic_cycle.recent_for_agent_context(db_session, project.id)
+    assert len(recent) == 10
+    # Newest at the front; the just-spawned cycle should be first.
+    assert recent[0]["outcome"] == strategic_cycle.OUTCOME_PHASE1_RUNNING
 
 
 # ── Additional _spawn_strategic_review tests ──────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_spawn_strategic_review_records_phase2_task_id(db_session, mocker):
-    """When called with cycle_id, _spawn_strategic_review records phase2_task_id in history."""
+    """When called with cycle_id, _spawn_strategic_review records phase2_task_id on the cycle row.
+
+    Audit W2: cycle history is the StrategicCycle table now.
+    """
+    from app import strategic_cycle
+    from app.models import StrategicCycle as _SC
+    from app.time_utils import _utcnow
     _patch_spawning_deps(mocker)
     mocker.patch(
         "app.task_lifecycle._has_active_strategic_task",
         new=AsyncMock(return_value=False),
     )
     cycle_id = "sc-abc12345"
-    project = _make_project(vision={
-        "purpose": "test purpose",
-        "_strategic_cycle_history": [
-            {"cycle_id": cycle_id, "phase1_task_id": "old-id", "phase1_completed_at": None}
-        ],
-    })
+    project = _make_project(vision={"purpose": "test purpose"})
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    db_session.add(_SC(
+        id=cycle_id, project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE1_RUNNING,
+        phase1_started_at=_utcnow(),
+    ))
+    await db_session.commit()
 
     await _spawn_strategic_review(project, db_session, cycle_id=cycle_id)
 
-    history = (project.vision or {}).get("_strategic_cycle_history", [])
-    entry = next((e for e in history if e.get("cycle_id") == cycle_id), None)
-    assert entry is not None
-    assert entry.get("phase2_task_id") is not None
-    assert entry.get("phase1_completed_at") is not None
+    cycle = await strategic_cycle.get(db_session, cycle_id)
+    assert cycle is not None
+    assert cycle.phase2_task_id is not None
+    assert cycle.phase1_completed_at is not None
+    assert cycle.outcome == strategic_cycle.OUTCOME_PHASE2_RUNNING
 
 
 @pytest.mark.asyncio
@@ -776,6 +872,7 @@ async def test_previous_decision_outcomes_populated_from_prior_cycle(db_session)
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
@@ -816,6 +913,7 @@ async def test_previous_decision_outcomes_absent_when_no_prior_decisions(db_sess
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
@@ -852,6 +950,7 @@ async def test_previous_decision_outcomes_surfaces_created_rationales(db_session
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
 
@@ -889,6 +988,7 @@ async def test_previous_decision_outcomes_surfaces_retired_rationales(db_session
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
 
@@ -926,6 +1026,7 @@ async def test_previous_decision_outcomes_surfaces_cycle_reasoning(db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
 
@@ -961,6 +1062,7 @@ async def test_previous_decision_outcomes_rationale_absent_when_not_recorded(db_
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
 
@@ -992,6 +1094,7 @@ async def test_previous_decision_outcomes_missing_retired_direction(db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
@@ -1174,6 +1277,7 @@ async def test_build_shipped_manifest_cutoff_from_cycle_history(db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     db_session.add(_make_merged_task(project.id, "Excluded task", direction_id="d-001"))
     await db_session.commit()
@@ -1483,6 +1587,7 @@ async def test_playbook_summary_includes_relevant_entries(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
@@ -1515,6 +1620,7 @@ async def test_playbook_summary_absent_when_no_relevant_entries(db_session, mock
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
@@ -1538,6 +1644,7 @@ async def test_playbook_summary_caps_at_ten_entries(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
@@ -1627,6 +1734,7 @@ async def test_strategic_review_payload_includes_calibration_factor(db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
@@ -1664,6 +1772,7 @@ async def test_strategic_review_calibration_factor_reflects_history(db_session):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True

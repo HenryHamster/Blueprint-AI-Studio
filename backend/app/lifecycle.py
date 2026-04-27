@@ -76,7 +76,14 @@ async def lifespan(app):
         _send_webhook_notification,
     )
     from app.reaper import reaper_service
-    from app.services import gcp_cleanup_service, gcp_image_cleanup_service, secret_reconciliation_service, stale_branch_cleanup_service, auto_archive_service
+    from app.services import (
+        account_availability_refresh_service,
+        auto_archive_service,
+        gcp_cleanup_service,
+        gcp_image_cleanup_service,
+        secret_reconciliation_service,
+        stale_branch_cleanup_service,
+    )
     from app.max_plan_pool import load_max_plan_pool
     from app.orchestrator import orchestrator_worker
     from app.shared_state import runtime_config_sync_service
@@ -122,6 +129,11 @@ async def lifespan(app):
     # Cloud Run instances (each has its own in-memory dict; DB is shared).
     config_sync_task = asyncio.create_task(runtime_config_sync_service())
 
+    # Refresh per-account model-availability caches every 30 min so a
+    # provider-side preview-access change doesn't sit in dispatch rotation
+    # for hours (audit E13).
+    availability_refresh_task = asyncio.create_task(account_availability_refresh_service())
+
     # Store references for admin restart endpoint
     from app.shared_state import background_tasks as _bg_tasks
     _bg_tasks["orchestrator"] = orchestrator_task
@@ -132,6 +144,7 @@ async def lifespan(app):
     _bg_tasks["stale_branch_cleanup"] = stale_branch_task
     _bg_tasks["auto_archive"] = auto_archive_task
     _bg_tasks["config_sync"] = config_sync_task
+    _bg_tasks["availability_refresh"] = availability_refresh_task
 
     # Monitor background tasks for silent crashes (with exponential backoff)
     async def _monitor_background_tasks():
@@ -150,6 +163,7 @@ async def lifespan(app):
             "stale_branch_cleanup": stale_branch_cleanup_service,
             "auto_archive": auto_archive_service,
             "config_sync": runtime_config_sync_service,
+            "availability_refresh": account_availability_refresh_service,
         }
         while True:
             try:

@@ -5,6 +5,7 @@ import contextlib
 import logging
 import re
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Dict
@@ -119,6 +120,73 @@ async def gcp_image_cleanup_service():
             await asyncio.sleep(3600)  # Hourly — images accumulate slowly
         except asyncio.CancelledError:
             logger.info("[IMAGE CLEANUP] Service shutting down.")
+            break
+
+
+async def account_availability_refresh_service():
+    """Periodically refresh stale per-account model-availability caches.
+
+    Audit 2026-04-25 finding E13: ``account_available_models`` was only
+    refreshed by manual admin action. A key that loses preview access
+    (or is added without preview) stays in dispatch rotation for hours,
+    burning slots before the runtime 404 reroutes them. Sweeping every
+    30 min bounds the staleness without spamming the provider.
+    """
+    from app.account_model_availability import (
+        account_availability_is_stale,
+        refresh_account_available_models,
+    )
+    from app.max_plan_pool import _account_by_id, _max_plan_pool_lock
+    from app.models import MaxPlanAccount
+
+    while True:
+        try:
+            async with _max_plan_pool_lock:
+                stale_ids = [
+                    acct["id"] for acct in _account_by_id.values()
+                    if account_availability_is_stale(acct)
+                ]
+            if stale_ids:
+                logger.info(f"[AVAILABILITY] Refreshing {len(stale_ids)} stale account(s)")
+                refreshed = 0
+                for acct_id in stale_ids:
+                    acct = _account_by_id.get(acct_id)
+                    if not acct:
+                        continue
+                    try:
+                        result = await asyncio.wait_for(
+                            refresh_account_available_models(acct),
+                            timeout=30,
+                        )
+                    except Exception as e:
+                        logger.warning(f"[AVAILABILITY] Refresh failed for {acct_id}: {e}")
+                        continue
+                    # refresh_account_available_models mutates acct['provider_metadata']
+                    # in place (success or error). Persist the snapshot so a restart
+                    # doesn't lose the cached list / error string.
+                    metadata = acct.get("provider_metadata") or {}
+                    try:
+                        async with AsyncSessionLocal() as ps:
+                            row = await ps.get(MaxPlanAccount, uuid.UUID(acct_id))
+                            if row is not None:
+                                row.provider_metadata = dict(metadata) or None
+                                ps.add(row)
+                                await ps.commit()
+                    except Exception as e:
+                        logger.warning(f"[AVAILABILITY] Persist failed for {acct_id}: {e}")
+                        continue
+                    if result is not None:
+                        refreshed += 1
+                logger.info(f"[AVAILABILITY] Refreshed {refreshed}/{len(stale_ids)} accounts")
+        except asyncio.CancelledError:
+            logger.info("[AVAILABILITY] Service shutting down.")
+            break
+        except Exception as e:
+            logger.error(f"[AVAILABILITY] Sweeper error: {e}", exc_info=True)
+        try:
+            await asyncio.sleep(1800)  # Run every 30 minutes
+        except asyncio.CancelledError:
+            logger.info("[AVAILABILITY] Service shutting down.")
             break
 
 

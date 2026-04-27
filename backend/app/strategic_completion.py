@@ -15,9 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
 from app.models import Project, ProjectMessage, MessageType, Task
-from app.research_completion import _update_cycle_history
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -39,16 +39,16 @@ async def _record_strategic_task_failure(task: Task, session: AsyncSession) -> N
     vision["_strategic_failures_at"] = _utcnow().isoformat()
     project.vision = vision
     flag_modified(project, "vision")
-    cycle_id = (task.context or {}).get("strategic_cycle_id")
+    # Audit W2: cycle history is in the StrategicCycle table.
+    cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
     if cycle_id:
         task_type = task.first_payload.get("type", "")
         failed_phase = "phase1" if task_type == "design_doc_update" else "phase2"
-        _update_cycle_history(project, cycle_id, {
-            f"{failed_phase}_completed_at": _utcnow().isoformat(),
-            "outcome": "failed",
-            "failed_phase": failed_phase,
-            "error": (task.latest_status_message or "task failed")[:200],
-        })
+        await strategic_cycle.mark_failure(
+            session, cycle_id,
+            phase=failed_phase,
+            reason=(task.latest_status_message or "task failed")[:200],
+        )
     session.add(project)
     logger.warning(
         f"[STRATEGIC] {task.first_payload.get('type')} task {task.id} FAILED "
@@ -399,6 +399,31 @@ async def _check_direction_starvation(
                     fallback_text = "Explore and improve underserved areas of the system"
                     fallback_category = None
 
+                # Audit W2/D8: dedup the fallback against existing directions
+                # AND recently-rejected proposals before creating. The previous
+                # version skipped dedup, so a saturated project would loop
+                # creating near-identical fallbacks every 5 cycles.
+                rejected_proposals = list((vision or {}).get("rejected_proposals") or [])
+                if _is_direction_duplicate(fallback_text, directions, rejected_proposals):
+                    logger.warning(
+                        f"[STRATEGIC] Starvation fallback dedup'd for project {project.id}: "
+                        f"text '{fallback_text}' overlaps with existing/rejected direction. "
+                        f"Resetting starvation counter and alerting operator instead of auto-creating duplicate."
+                    )
+                    vision["_direction_starvation_count"] = 0
+                    project.vision = vision
+                    flag_modified(project, "vision")
+                    session.add(project)
+                    await _create_strategic_alert(
+                        project.id, session,
+                        f"Direction starvation reached {starvation_count} cycles but the fallback "
+                        f"direction '{fallback_text}' would duplicate an existing or recently-rejected "
+                        f"direction (gap: {gap_type}). Manual intervention required — review "
+                        f"existing directions and propose distinct work, or expand "
+                        f"max_active_directions.",
+                    )
+                    return
+
                 fallback_dir: Dict[str, Any] = {
                     "id": f"d-{uuid.uuid4().hex[:8]}",
                     "text": fallback_text,
@@ -534,22 +559,25 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             retired_rationales = _collect_rationales(project, retired_ids, _RETIRED_NOTE_PREFIX)
             created_predictions = _collect_creation_predictions(project, created_ids)
             retired_final_metrics = _collect_retirement_metrics(project, retired_ids)
-            _update_cycle_history(project, cycle_id, {
-                "phase2_completed_at": _utcnow().isoformat(),
-                "vision_updated": _vision_updated,
-                "directions_created": dirs_created,
-                "directions_retired": dirs_retired,
-                "created_direction_ids": created_ids,
-                "retired_direction_ids": retired_ids,
-                "created_rationales": created_rationales,
-                "retired_rationales": retired_rationales,
-                "created_predictions": created_predictions,
-                "retired_final_metrics": retired_final_metrics,
-                "cycle_reasoning": _extract_cycle_reasoning(task),
-                "tasks_spawned": tasks_spawned,
-                "outcome": "completed",
-                "summary_text": _summary,
-            })
+            # Audit W2: cycle outcome lives on the StrategicCycle row;
+            # per-direction maps land in cycle_metadata.
+            await strategic_cycle.mark_phase2_completed(
+                session, cycle_id,
+                summary_text=_summary,
+                cycle_reasoning=_extract_cycle_reasoning(task),
+                directions_created=dirs_created,
+                directions_retired=dirs_retired,
+                tasks_spawned=tasks_spawned,
+                vision_updated=_vision_updated,
+                extra_metadata={
+                    "created_direction_ids": created_ids,
+                    "retired_direction_ids": retired_ids,
+                    "created_rationales": created_rationales,
+                    "retired_rationales": retired_rationales,
+                    "created_predictions": created_predictions,
+                    "retired_final_metrics": retired_final_metrics,
+                },
+            )
         await _check_direction_starvation(project, dirs_created, session)
         session.add(project)
         _spawn_suffix_msg = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
@@ -596,12 +624,14 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             current_vision["_strategic_failures_at"] = _utcnow().isoformat()
             project.vision = current_vision
             flag_modified(project, "vision")
-            cycle_id = (task.context or {}).get("strategic_cycle_id")
+            cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
             if cycle_id:
-                _update_cycle_history(project, cycle_id, {
-                    "phase2_completed_at": _utcnow().isoformat(),
-                    "outcome": "failed",
-                })
+                # Audit W2: failure recorded on the StrategicCycle row.
+                await strategic_cycle.mark_failure(
+                    session, cycle_id,
+                    phase="phase2",
+                    reason="strategic_review unparseable output",
+                )
             session.add(project)
         task.latest_status_message = "Strategic output could not be parsed"
         session.add(task)
@@ -631,39 +661,45 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     task.plan_output = parsed
     session.add(task)
 
-    # Update vision — merge with current DB state to avoid overwriting concurrent user edits
+    # Update vision — merge with current DB state to avoid overwriting concurrent user edits.
+    # Audit W2/D7: full 3-way merge (user-bias, keep-both via _rejected_agent_edits ledger)
+    # extends to systems/priorities/context lists, not just purpose/success_criteria.
     if new_vision and isinstance(new_vision, dict):
+        from app.vision_merge import append_rejected_edits, merge_vision  # noqa: PLC0415
         current_vision = dict(project.vision or {})
-        # Check if user edited vision while the strategic cycle was running
         payload_vision_rev = (task.first_payload.get("vision") or {}).get("revision", 0)
         db_vision_rev = current_vision.get("revision", 0)
-        if db_vision_rev > payload_vision_rev:
-            # User edited vision since this cycle started — merge carefully
-            # Keep user's purpose/criteria if they changed them, take agent's systems/priorities/context
-            logger.info(f"[STRATEGIC] Vision was edited during cycle (payload rev {payload_vision_rev}, DB rev {db_vision_rev}) — merging")
-            merged = dict(current_vision)  # Start from user's current state
-            # Agent's structural analysis takes precedence for these fields
-            for key in ("systems", "priorities", "context"):
-                if key in new_vision:
-                    merged[key] = new_vision[key]
-            # Only update purpose/criteria if the user didn't change them
-            if current_vision.get("purpose") == (task.first_payload.get("vision") or {}).get("purpose"):
-                if "purpose" in new_vision:
-                    merged["purpose"] = new_vision["purpose"]
-            if current_vision.get("success_criteria") == (task.first_payload.get("vision") or {}).get("success_criteria"):
-                if "success_criteria" in new_vision:
-                    merged["success_criteria"] = new_vision["success_criteria"]
-            # Preserve any extra fields the agent added
-            for key in new_vision:
-                if key not in merged:
-                    merged[key] = new_vision[key]
-            new_vision = merged
+        # Baseline: prefer the snapshot the cycle row captured at spawn time
+        # (StrategicCycle.cycle_metadata.baseline_vision). Falls back to the
+        # payload vision if the cycle row is unavailable (legacy task).
+        cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
+        baseline_vision = task.first_payload.get("vision") or {}
+        if cycle_id:
+            cycle_row = await strategic_cycle.get(session, cycle_id)
+            if cycle_row is not None:
+                snap = strategic_cycle.baseline_vision(cycle_row)
+                if snap:
+                    baseline_vision = snap
+        # Always run the 3-way merge — even when no concurrent user edit,
+        # it costs nothing and produces a deterministic empty rejected_edits list.
+        merged, rejected_edits = merge_vision(
+            baseline=baseline_vision,
+            agent=new_vision,
+            current=current_vision,
+        )
+        if rejected_edits:
+            logger.info(
+                f"[STRATEGIC] Vision merge rejected {len(rejected_edits)} agent edit(s) "
+                f"in favor of user changes (payload rev {payload_vision_rev}, DB rev {db_vision_rev})"
+            )
+            append_rejected_edits(merged, rejected_edits)
+        new_vision = merged
         new_vision["revision"] = (db_vision_rev or 0) + 1
         new_vision["last_updated"] = _utcnow().isoformat()
         new_vision.pop("_strategic_failures", None)  # Reset failure counter on success
-        # Preserve internal tracking fields not produced by the agent
-        if "_strategic_cycle_history" in current_vision:
-            new_vision["_strategic_cycle_history"] = current_vision["_strategic_cycle_history"]
+        # Audit W2: cycle history is in the StrategicCycle table; the
+        # ``_strategic_cycle_history`` JSONB key is dropped by migration 0047
+        # and never re-introduced — the agent's vision payload doesn't carry it.
         # Auto-derive system statuses from direction outcomes
         # Agents often leave everything as "planned" — infer from actual merge/direction data
         vision_systems = new_vision.get("systems")
@@ -940,7 +976,8 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
             flag_modified(project, "directions")
 
     # Update cycle history with final outcome
-    cycle_id = (task.context or {}).get("strategic_cycle_id")
+    # Audit W2: cycle outcome lives on the StrategicCycle row.
+    cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
     dirs_created = creates_count if direction_ops and isinstance(direction_ops, list) else 0
     if cycle_id:
         dirs_retired = retires_applied
@@ -948,21 +985,28 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
         _active_dirs_fb = sum(1 for d in (project.directions or []) if d.get("status") == "active")
         _vision_rev_fb = (project.vision or {}).get("revision", 0)
         _summary_fb = f"rev {_vision_rev_fb}, {_active_dirs_fb} active, {dirs_created} created, {dirs_retired} retired"
-        _update_cycle_history(project, cycle_id, {
-            "phase2_completed_at": _utcnow().isoformat(),
-            "vision_updated": vision_produced,
-            "directions_created": dirs_created,
-            "directions_retired": dirs_retired,
-            "created_direction_ids": list(created_ids_fb),
-            "retired_direction_ids": list(retired_ids_fb),
-            "created_rationales": dict(created_rationales_fb),
-            "retired_rationales": dict(retired_rationales_fb),
-            "created_predictions": _collect_creation_predictions(project, created_ids_fb),
-            "retired_final_metrics": _collect_retirement_metrics(project, retired_ids_fb),
-            "cycle_reasoning": _extract_cycle_reasoning(task),
-            "outcome": "completed" if vision_produced else "failed",
-            "summary_text": _summary_fb,
-        })
+        if vision_produced:
+            await strategic_cycle.mark_phase2_completed(
+                session, cycle_id,
+                summary_text=_summary_fb,
+                cycle_reasoning=_extract_cycle_reasoning(task),
+                directions_created=dirs_created,
+                directions_retired=dirs_retired,
+                vision_updated=True,
+                extra_metadata={
+                    "created_direction_ids": list(created_ids_fb),
+                    "retired_direction_ids": list(retired_ids_fb),
+                    "created_rationales": dict(created_rationales_fb),
+                    "retired_rationales": dict(retired_rationales_fb),
+                    "created_predictions": _collect_creation_predictions(project, created_ids_fb),
+                    "retired_final_metrics": _collect_retirement_metrics(project, retired_ids_fb),
+                },
+            )
+        else:
+            await strategic_cycle.mark_failure(
+                session, cycle_id, phase="phase2",
+                reason="strategic_review fallback path produced no vision",
+            )
 
     await _check_direction_starvation(project, dirs_created, session)
     session.add(project)

@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
-from sqlalchemy import Boolean, Column, String, Integer, Index, Text, text, event, Enum as SAEnum
+from sqlalchemy import Boolean, Column, String, Integer, Index, Text, UniqueConstraint, text, event, Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB
 import logging
 import uuid
@@ -93,7 +93,7 @@ class UserIntegration(SQLModel, table=True):
     Stores third-party integrations for a user, such as GitHub App installations.
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    user_id: str = Field(index=True, unique=True)
+    user_id: str = Field(index=True)
 
     # GitHub App Installation ID
     github_installation_id: Optional[str] = None
@@ -104,6 +104,10 @@ class UserIntegration(SQLModel, table=True):
 
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_userintegration_user_id"),
+    )
 
 class Project(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
@@ -199,6 +203,7 @@ class Task(SQLModel, table=True):
 
     created_by: str = Field(default="USER") # "USER", "ORCHESTRATOR", "AGENT_{ID}"
     launched_by_user_id: Optional[str] = Field(default=None)  # Firebase UID of the user who launched this task (for launcher-pays billing)
+    idempotency_key: Optional[str] = Field(default=None, sa_column=Column(String(255), nullable=True))
     requires_approval: bool = Field(default=False)
 
     status: TaskStatus = Field(default=TaskStatus.QUEUED, sa_column=Column(String, default=TaskStatus.QUEUED))
@@ -275,6 +280,19 @@ class Task(SQLModel, table=True):
         Index("ix_task_status_priority", "status", "priority"),
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),
         Index("ix_task_project_status_created", "project_id", "status", "created_at"),
+        Index(
+            "ux_task_active_idempotency_key",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text(
+                "idempotency_key IS NOT NULL AND status IN "
+                "('QUEUED','PROVISIONING','IN_PROGRESS','EVALUATING')"
+            ),
+            sqlite_where=text(
+                "idempotency_key IS NOT NULL AND status IN "
+                "('QUEUED','PROVISIONING','IN_PROGRESS','EVALUATING')"
+            ),
+        ),
         Index("ix_task_context_gin", "context", postgresql_using="gin"),
         Index("ix_task_depends_on_gin", "depends_on", postgresql_using="gin"),
     )
@@ -345,6 +363,64 @@ class Alert(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_alert_task_id_dismissed", "task_id", "dismissed_at"),
+    )
+
+
+class StrategicCycle(SQLModel, table=True):
+    """Strategic-research cycle record.
+
+    Audit 2026-04-25 W2 (project audit_pipeline_2026_04_25): cycles previously
+    lived in a 10-entry sliding JSONB list on ``Project.vision._strategic_cycle_history``.
+    The cap silently dropped old entries — including ones stuck
+    ``outcome="in_progress"`` from phase-1 crashes that never reached the
+    completion handler — so the strategic agent had no diagnostic signal that
+    cycles were failing.
+
+    The cycle has two phases:
+      - ``phase1`` (design_doc_update): the architecture-analysis task
+      - ``phase2`` (strategic_review): the vision/direction-update task
+    Phase 2 spawns synchronously on phase 1 completion (see
+    ``task_completion._spawn_strategic_review``); the lifecycle hook in
+    ``task_lifecycle`` is a backstop that still updates the cycle row when
+    the synchronous chain crashes mid-flight.
+    """
+    id: str = Field(primary_key=True, max_length=36)  # cycle_id (UUID hex)
+    project_id: uuid.UUID = Field(foreign_key="project.id")
+
+    # outcome enum-ish: in_progress | phase1_running | phase1_done |
+    # phase2_running | completed | failed_phase1 | failed_phase2 |
+    # stalled_phase1 | stalled_phase2 | failed_phase2_spawn
+    outcome: str = Field(default="in_progress", sa_column=Column(String(32), nullable=False, server_default="in_progress"))
+
+    # Phase tracking. *_started_at = task creation time;
+    # *_completed_at = terminal status.
+    phase1_task_id: Optional[uuid.UUID] = Field(default=None, foreign_key="task.id")
+    phase1_started_at: datetime = Field(default_factory=_utcnow)
+    phase1_completed_at: Optional[datetime] = Field(default=None)
+    phase2_task_id: Optional[uuid.UUID] = Field(default=None, foreign_key="task.id")
+    phase2_started_at: Optional[datetime] = Field(default=None)
+    phase2_completed_at: Optional[datetime] = Field(default=None)
+
+    # Outcome accounting (filled on phase 2 completion).
+    directions_created: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default=text("0")))
+    directions_retired: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default=text("0")))
+    tasks_spawned: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default=text("0")))
+    vision_updated: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
+
+    # Free-form text fields surfaced to the UI / next cycle's context.
+    cycle_reasoning: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    summary_text: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    failure_reason: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+
+    # Per-direction maps, baseline_vision snapshot for 3-way merge, etc.
+    # No server_default — Python default_factory keeps it consistent across
+    # SQLite (test) and Postgres (prod) without per-dialect cast syntax.
+    cycle_metadata: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, default=dict))
+
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column_kwargs={"onupdate": _utcnow},
     )
 
 
@@ -491,6 +567,11 @@ class MaxPlanAccount(SQLModel, table=True):
     daily_task_count: int = Field(default=0)
     daily_task_count_reset_at: Optional[datetime] = Field(default=None)
     disabled_reason: Optional[str] = Field(default=None)
+    # Set when auto-disable trips (rate-limit threshold). Persisted so
+    # recheck_disabled_accounts can re-enable after cooldown across
+    # orchestrator restarts. Null for never-disabled or admin-disabled
+    # accounts (admin disable doesn't auto-recover).
+    disabled_at: Optional[datetime] = Field(default=None)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 

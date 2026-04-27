@@ -16,7 +16,7 @@ from sqlmodel import select
 
 from app.auth import get_current_user
 from app.database import get_session
-from app.models import LLMAuthMode, LLMProviderName, MaxPlanAccount, Task, TaskStatus, _utcnow
+from app.models import Alert, AlertSeverity, LLMAuthMode, LLMProviderName, MaxPlanAccount, Task, TaskStatus, _utcnow
 from app.providers.registry import get_provider
 from app.shared_state import limiter
 
@@ -355,14 +355,15 @@ async def remove_max_plan_account(
     if not db_account or db_account.user_id != current_user["user_id"]:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    active_using = (
+    active_using_rows = (
         await session.execute(
-            select(Task.id).where(
+            select(Task.id, Task.project_id).where(
                 Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]),
                 Task.context["max_plan_account_id"].as_string() == account_id,
             )
         )
-    ).scalars().all()
+    ).all()
+    active_using = [r[0] for r in active_using_rows]
     if active_using and not force:
         raise HTTPException(
             status_code=409,
@@ -372,7 +373,31 @@ async def remove_max_plan_account(
             ),
         )
     if active_using and force:
-        logger.warning(f"[POOL] Force-deleting account {account_id} with {len(active_using)} active tasks — slots will reconcile next cycle")
+        affected_ids_short = ", ".join(str(t)[:8] for t in active_using[:10])
+        if len(active_using) > 10:
+            affected_ids_short += f" (+{len(active_using) - 10} more)"
+        logger.warning(
+            f"[POOL] Force-deleting account {account_id} with {len(active_using)} active tasks — "
+            f"affected: {affected_ids_short}"
+        )
+        # E5: emit a per-project Alert so operators see which tasks are at risk.
+        # Without this, force-delete was a silent secret-revocation that surfaced
+        # only when individual agents started 401-ing on token refresh.
+        affected_by_project: dict[uuid.UUID, list[uuid.UUID]] = {}
+        for tid, pid in active_using_rows:
+            affected_by_project.setdefault(pid, []).append(tid)
+        for project_id, task_ids in affected_by_project.items():
+            short_list = ", ".join(str(t)[:8] for t in task_ids[:10])
+            suffix = f" (+{len(task_ids) - 10} more)" if len(task_ids) > 10 else ""
+            session.add(Alert(
+                project_id=project_id,
+                severity=AlertSeverity.WARNING,
+                title=f"Pool account force-deleted with {len(task_ids)} active task(s)",
+                message=(
+                    f"Account {db_account.name} ({account_id[:8]}) was force-removed; "
+                    f"these tasks may fail on next token refresh: {short_list}{suffix}"
+                ),
+            ))
 
     secret_ref = _account_secret_ref(db_account)
     if secret_ref and secret_ref.startswith("projects/"):

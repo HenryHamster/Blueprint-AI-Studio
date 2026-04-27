@@ -27,6 +27,7 @@ vi.mock('fs', () => ({
     mkdirSync: vi.fn(),
     openSync: vi.fn().mockReturnValue(3),
     closeSync: vi.fn(),
+    chmodSync: vi.fn(),
   },
 }));
 
@@ -53,8 +54,9 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, type FailureCategory } from './index.js';
 import { execFileSync, spawn } from 'child_process';
+import fs from 'fs';
 import type WebSocket from 'ws';
 
 // ── strVal ───────────────────────────────────────────────────────────────────
@@ -930,6 +932,181 @@ describe('captureTestBaseline timeout selection', () => {
     const npmCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'npm');
     expect(npmCall).toBeDefined();
     expect((npmCall![2] as { timeout: number }).timeout).toBe(60_000);
+  });
+});
+
+// ── Agent reliability medium fixes ───────────────────────────────────────────
+describe('execFileAsync process reliability', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('does not SIGKILL the original process group after the child exits during timeout cleanup', async () => {
+    vi.useFakeTimers();
+    vi.mocked(spawn).mockReset();
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    let closeCb: ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined;
+    const proc = {
+      pid: 4321,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      stdout: { on: vi.fn() },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, cb: (code: number | null, signal: NodeJS.Signals | null) => void) => {
+        if (event === 'close') closeCb = cb;
+      }),
+    };
+    vi.mocked(spawn).mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
+
+    const promise = execFileAsync('npm', ['test'], { timeoutMs: 1000 }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(killSpy).toHaveBeenCalledWith(-4321, 'SIGTERM');
+
+    proc.exitCode = 143;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(killSpy).not.toHaveBeenCalledWith(-4321, 'SIGKILL');
+
+    closeCb?.(143, 'SIGTERM');
+    await promise;
+    killSpy.mockRestore();
+  });
+
+  it('tags external SIGKILL as EOOM instead of ETIMEDOUT', async () => {
+    vi.mocked(spawn).mockReset();
+    vi.mocked(spawn).mockImplementation(() => {
+      const proc = {
+        pid: 4322,
+        exitCode: null as number | null,
+        signalCode: null as NodeJS.Signals | null,
+        stdout: { on: vi.fn() },
+        stderr: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (code: number | null, signal: NodeJS.Signals | null) => void) => {
+          if (event === 'close') {
+            setImmediate(() => {
+              cb(null, 'SIGKILL');
+            });
+          }
+        }),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+
+    await expect(execFileAsync('node', ['worker.js'], { timeoutMs: 60_000 }))
+      .rejects.toMatchObject({ code: 'EOOM', signal: 'SIGKILL', killed: true });
+  });
+});
+
+describe('provider runner reliability', () => {
+  function mockProviderRun(stderrChunks: string[], code: number | null, signal: NodeJS.Signals | null = null) {
+    vi.mocked(spawn).mockImplementation(() => {
+      const stderrCbs: Array<(d: Buffer) => void> = [];
+      const proc = {
+        pid: 9876,
+        exitCode: null as number | null,
+        signalCode: null as NodeJS.Signals | null,
+        stdin: { on: vi.fn(), end: vi.fn() },
+        stdout: { on: vi.fn() },
+        stderr: {
+          on: vi.fn((event: string, cb: (d: Buffer) => void) => {
+            if (event === 'data') stderrCbs.push(cb);
+          }),
+        },
+        on: vi.fn((event: string, cb: (code: number | null, signal: NodeJS.Signals | null) => void) => {
+          if (event === 'close') {
+            setImmediate(() => {
+              for (const chunk of stderrChunks) {
+                for (const stderrCb of stderrCbs) {
+                  stderrCb(Buffer.from(chunk));
+                }
+              }
+              proc.exitCode = code;
+              proc.signalCode = signal;
+              cb(code, signal);
+            });
+          }
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+  }
+
+  beforeEach(() => {
+    vi.mocked(spawn).mockReset();
+    vi.mocked(fs.writeFileSync).mockClear();
+    vi.mocked(fs.chmodSync).mockClear();
+    vi.mocked(fs.unlinkSync).mockClear();
+    vi.mocked(fs.openSync).mockClear();
+    vi.mocked(fs.openSync).mockReturnValue(3);
+  });
+
+  it('uses the stderr tail so late rate-limit text is still classified', async () => {
+    mockProviderRun(['x'.repeat(60_000), "\nyou've hit your usage limit\n"], 1);
+
+    await expect(runProviderAgent('prompt', null, { value: '' }))
+      .rejects.toBeInstanceOf(RateLimitError);
+  });
+
+  it('writes the stdin prompt file as owner-only', async () => {
+    mockProviderRun([], 0);
+
+    await runProviderAgent('private prompt', null, { value: '' });
+
+    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
+      '/tmp/agent_prompt_unknown.txt',
+      'private prompt',
+      { encoding: 'utf-8', mode: 0o600 },
+    );
+    expect(vi.mocked(fs.chmodSync)).toHaveBeenCalledWith('/tmp/agent_prompt_unknown.txt', 0o600);
+  });
+});
+
+describe('stale result retry envelopes', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('persists status payloads in a retry envelope before posting', async () => {
+    vi.mocked(fs.writeFileSync).mockClear();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ status: 'ok' }),
+      text: () => Promise.resolve(''),
+    }));
+
+    await persistAndPostStatus('task-1', { task_id: 'task-1', status: 'COMPLETED' });
+
+    const writeCall = vi.mocked(fs.writeFileSync).mock.calls.find(call => call[0] === '/tmp/task_task-1_result.json');
+    if (!writeCall) throw new Error('expected stale result file write');
+    const rawWritten = writeCall[1];
+    if (typeof rawWritten !== 'string') throw new Error('expected stale result write payload to be a string');
+    const written = JSON.parse(rawWritten) as {
+      payload: { status?: unknown };
+      retry: { attempts?: unknown; nextAttemptAt?: unknown };
+    };
+    expect(written.payload.status).toBe('COMPLETED');
+    expect(written.retry.attempts).toBe(0);
+    expect(written.retry.nextAttemptAt).toBe(0);
+  });
+
+  it('parses legacy payload files and records per-file backoff after failures', () => {
+    const legacy = parseStaleResultFile(JSON.stringify({ task_id: 'legacy-task', status: 'FAILED' }), 1000);
+    expect(legacy.payload.task_id).toBe('legacy-task');
+    expect(legacy.retry.createdAt).toBe(1000);
+
+    const failed = markStaleResultFailure(legacy, new Error('network down'), 2000);
+    expect(failed.retry.attempts).toBe(1);
+    expect(failed.retry.nextAttemptAt).toBe(32_000);
+    expect(failed.retry.lastError).toBe('network down');
+  });
+
+  it('abandons stale result files after the retry ceiling', () => {
+    const stale = parseStaleResultFile(JSON.stringify({
+      payload: { task_id: 'old-task' },
+      retry: { attempts: 10, createdAt: 1000, nextAttemptAt: 0 },
+    }), 1000);
+
+    expect(shouldAbandonStaleResult(stale, 2000)).toBe(true);
   });
 });
 

@@ -43,6 +43,7 @@ from app.failure_classification import (
     TIMEOUT_OOM,
     TIMEOUT_PROCESS_CRASH,
     TIMEOUT_UNKNOWN,
+    _resolve_task_provider_auth,
 )
 from app.models import Task
 
@@ -50,6 +51,17 @@ from app.models import Task
 class _FakeTask:
     def __init__(self, msg: str) -> None:
         self.latest_status_message = msg
+
+
+def test_invalid_provider_auth_marks_context_instead_of_silent_fallback():
+    task = MagicMock()
+    task.id = "task-invalid-provider"
+    task.context = {"llm_provider": "not-a-provider", "llm_auth_mode": "api_key"}
+
+    assert _resolve_task_provider_auth(task) == (None, None)
+    assert task.context["llm_runtime_resolution_failed"] is True
+    assert task.context["llm_runtime_resolution_error"] == "invalid_provider_or_auth_mode"
+    assert task.context["llm_provider_raw"] == "not-a-provider"
 
 
 class TestTimeoutSubtypeFromMessage:
@@ -624,6 +636,14 @@ class TestFingerprintMessage:
         msg1 = "rss 15.4mb heap 12.1mb after retry"
         msg2 = "rss 15.6mb heap 12.3mb after retry"
         assert _fingerprint_message(msg1) == _fingerprint_message(msg2)
+
+    def test_strips_embedded_iec_and_byte_size_tokens(self):
+        msg1 = "rss=15.4MiB heap 123456 bytes after retry"
+        msg2 = "rss=15.6MiB heap 654321 bytes after retry"
+        fp = _fingerprint_message(msg1)
+        assert fp == _fingerprint_message(msg2)
+        assert "mib" not in fp
+        assert "bytes" not in fp
 
     def test_near_duplicates_cluster(self):
         fp1 = _fingerprint_message("AssertionError: expected 3, got 4")

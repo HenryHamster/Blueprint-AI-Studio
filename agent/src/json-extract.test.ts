@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractJsonObject, extractJsonArray } from './json-extract.js';
+import { JsonExtractionError, extractJsonObject, extractJsonArray } from './json-extract.js';
 
 describe('extractJsonObject', () => {
   it('extracts a simple object with required keys', () => {
@@ -24,6 +24,10 @@ describe('extractJsonObject', () => {
   it('tries the next candidate when the first contains required keys but is invalid JSON', () => {
     const text = '{"key": invalid} {"key": "good"}';
     expect(extractJsonObject<{ key: string }>(text, 'key')).toEqual({ key: 'good' });
+  });
+
+  it('throws when required-key candidates are present but none parse', () => {
+    expect(() => extractJsonObject('{"key": invalid}', 'key')).toThrow(JsonExtractionError);
   });
 
   it('handles braces inside string values (code snippets)', () => {
@@ -112,5 +116,9 @@ describe('extractJsonArray', () => {
   it('tries the next array when the first contains the key string but is invalid JSON', () => {
     const text = '["severity": broken] [{"severity": "ok"}]';
     expect(extractJsonArray(text, 'severity')).toEqual([{ severity: 'ok' }]);
+  });
+
+  it('throws when required-key arrays are present but none parse', () => {
+    expect(() => extractJsonArray('["severity": broken]', 'severity')).toThrow(JsonExtractionError);
   });
 });

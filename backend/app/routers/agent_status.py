@@ -551,6 +551,13 @@ async def update_agent_status(
             headers={"Retry-After": "5"},
         )
 
+    # F11: this handler holds a row lock until the early commit below, but it
+    # also performs several SELECTs while preparing artifacts/retry metadata.
+    # Production AsyncSession defaults autoflush=True, so those SELECTs can
+    # push partial task mutations before the explicit commit boundary. Disable
+    # request-session autoflush; commit still flushes all pending work.
+    session.sync_session.autoflush = False
+
     # Idempotency guard: if the task is already in a terminal state, ignore duplicate
     # callbacks (e.g. agent HTTP retries).  Still return 200 so the agent doesn't retry.
     # Exception: if post_commit_pending is set, the early-commit succeeded but

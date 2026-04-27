@@ -31,13 +31,18 @@ class _FakePolicy:
         self.bindings = list(bindings or [])
 
 
-def _make_client(existing_policy_bindings=None, set_iam_side_effects=None):
+def _make_client(existing_policy_bindings=None, set_iam_side_effects=None, payload: bytes | None = None):
     """Build a MagicMock SecretManagerServiceClient with sensible defaults.
 
     - create_secret returns an object whose .name looks like a real secret resource
     - add_secret_version returns an object whose .name looks like a version resource
     - get_iam_policy returns a fresh _FakePolicy with the given bindings on every call
     - set_iam_policy applies set_iam_side_effects in order (e.g. Aborted exceptions)
+    - access_secret_version (audit E15: post-create verification) returns the
+      payload that was supplied via ``payload=`` so the verify branch sees a
+      match. Tests that don't pass payload= will get an empty bytes payload
+      and trip the verification mismatch — which is the correct behavior to
+      cover the failure path.
     """
     client = MagicMock()
     secret_obj = MagicMock()
@@ -55,6 +60,11 @@ def _make_client(existing_policy_bindings=None, set_iam_side_effects=None):
 
     if set_iam_side_effects is not None:
         client.set_iam_policy.side_effect = set_iam_side_effects
+
+    # E15 verification path: read-back must match what was written.
+    verify_obj = MagicMock()
+    verify_obj.payload.data = payload if payload is not None else b""
+    client.access_secret_version.return_value = verify_obj
 
     return client
 
@@ -90,10 +100,11 @@ class TestStoreAgentSecretIamRetry:
             Aborted("etag mismatch 2"),
             None,
         ]
-        client = _make_client(set_iam_side_effects=side_effects)
+        payload = '{"token": "abc"}'
+        client = _make_client(set_iam_side_effects=side_effects, payload=payload.encode("utf-8"))
 
         with patch("google.cloud.secretmanager.SecretManagerServiceClient", return_value=client):
-            result = compute._store_agent_secret("vm123", '{"token": "abc"}')
+            result = compute._store_agent_secret("vm123", payload)
 
         assert result == "projects/test-proj/secrets/agent-creds-vm123/versions/1"
         assert client.set_iam_policy.call_count == 3
@@ -113,10 +124,11 @@ class TestStoreAgentSecretIamRetry:
                 members=[agent_member],
             ),
         ]
-        client = _make_client(existing_policy_bindings=existing)
+        payload = '{"token": "abc"}'
+        client = _make_client(existing_policy_bindings=existing, payload=payload.encode("utf-8"))
 
         with patch("google.cloud.secretmanager.SecretManagerServiceClient", return_value=client):
-            result = compute._store_agent_secret("vm123", '{"token": "abc"}')
+            result = compute._store_agent_secret("vm123", payload)
 
         assert result == "projects/test-proj/secrets/agent-creds-vm123/versions/1"
         # Policy was read once to check the binding, then skipped.

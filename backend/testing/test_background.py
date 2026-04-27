@@ -2290,9 +2290,10 @@ def test_provision_gcp_script_has_settle_window_before_success_heartbeat():
     # The preceding region must contain the settle window + is-active check.
     # Bound the search to a window immediately before the heartbeat curl so
     # we don't accidentally match the earlier `systemctl restart` block.
-    # 1500 chars is enough to cover the settle window + sourcing /etc/agent.env
-    # + the is-active branch without reaching back to the restart block.
-    window_start = max(0, success_idx - 1500)
+    # 2200 chars covers the settle window + the second sleep/is-active recheck
+    # added by audit E8 ("VM ready != healthy") + sourcing /etc/agent.env +
+    # the gated branch — without reaching back to the earlier restart block.
+    window_start = max(0, success_idx - 2200)
     pre_heartbeat = source[window_start:success_idx]
     assert "sleep 30" in pre_heartbeat, (
         "expected 30s settle window before success heartbeat — Type=simple "

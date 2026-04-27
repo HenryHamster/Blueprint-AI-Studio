@@ -24,6 +24,7 @@ from app.shared_state import runtime_config as _runtime_config
 from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SPOT_RATE
 from app.direction_metrics import _compute_direction_quality_score
 from app.direction_outcomes import synthesize_prompt_quality_patterns
+from app.retry_budget import failure_class_history_classes
 
 logger = logging.getLogger(__name__)
 
@@ -2504,10 +2505,7 @@ async def _compute_digest(
     # whether retries changed the failure class or repeated the same one.
     _multi_attempt = []
     for _t in failed_tasks:
-        _hist_raw = (_t.context or {}).get("_failure_class_history") or []
-        if not isinstance(_hist_raw, list):
-            continue
-        _hist = [str(h) for h in _hist_raw if h]
+        _hist = failure_class_history_classes((_t.context or {}).get("_failure_class_history"))
         if len(_hist) >= 2:
             _multi_attempt.append(_hist)
     _repeat_count = sum(

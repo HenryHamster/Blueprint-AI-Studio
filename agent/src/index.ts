@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import WebSocket from 'ws';
 import { handlers, type Handler } from './handlers/index.js';
-import { extractJsonObject, extractJsonArray } from './json-extract.js';
+import { extractJsonObject, extractJsonArray, JsonExtractionError } from './json-extract.js';
 import {
   API_TIMEOUT, API_MAX_RETRIES, LOGS_MAX_LENGTH,
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
@@ -262,6 +262,23 @@ export function strVal(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v : fallback;
 }
 
+const STDERR_TAIL_BYTES = 50_000;
+const STALE_RESULT_RETRY_BASE_MS = 30_000;
+const STALE_RESULT_RETRY_MAX_MS = 30 * 60_000;
+const STALE_RESULT_MAX_ATTEMPTS = 10;
+const STALE_RESULT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function appendBoundedTail(current: string, chunk: string, maxBytes: number): string {
+  const combined = current + chunk;
+  if (Buffer.byteLength(combined, 'utf-8') <= maxBytes) return combined;
+  return Buffer.from(combined, 'utf-8').subarray(-maxBytes).toString('utf-8');
+}
+
+function writePrivateFileSync(path: string, contents: string): void {
+  fs.writeFileSync(path, contents, { encoding: 'utf-8', mode: 0o600 });
+  try { fs.chmodSync(path, 0o600); } catch { /* best effort on non-POSIX filesystems */ }
+}
+
 // ── API Helpers ─────────────────────────────────────────────────────────────
 async function tryRefreshToken(): Promise<boolean> {
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -362,18 +379,96 @@ export async function apiPost(path: string, body: Record<string, unknown> = {}, 
 
 /** Persist result payload to disk before POSTing status, then clean up on success.
  *  If the POST fails (network error, VM kill), the file survives for retry on next startup. */
+export type StaleResultEnvelope = {
+  payload: Record<string, unknown>;
+  retry: {
+    attempts: number;
+    createdAt: number;
+    nextAttemptAt: number;
+    lastAttemptAt?: number;
+    lastError?: string;
+  };
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export function createStaleResultEnvelope(
+  payload: Record<string, unknown>,
+  now = Date.now(),
+): StaleResultEnvelope {
+  return {
+    payload,
+    retry: {
+      attempts: 0,
+      createdAt: now,
+      nextAttemptAt: 0,
+    },
+  };
+}
+
+export function parseStaleResultFile(raw: string, now = Date.now()): StaleResultEnvelope {
+  const parsed = JSON.parse(raw) as unknown;
+  if (!isRecord(parsed)) throw new Error('stale result file is not a JSON object');
+  const payload = parsed.payload;
+  const retry = parsed.retry;
+  if (isRecord(payload) && isRecord(retry)) {
+    return {
+      payload,
+      retry: {
+        attempts: typeof retry.attempts === 'number' ? retry.attempts : 0,
+        createdAt: typeof retry.createdAt === 'number' ? retry.createdAt : now,
+        nextAttemptAt: typeof retry.nextAttemptAt === 'number' ? retry.nextAttemptAt : 0,
+        lastAttemptAt: typeof retry.lastAttemptAt === 'number' ? retry.lastAttemptAt : undefined,
+        lastError: typeof retry.lastError === 'string' ? retry.lastError : undefined,
+      },
+    };
+  }
+  return createStaleResultEnvelope(parsed, now);
+}
+
+export function staleResultBackoffMs(attempts: number): number {
+  const exponent = Math.max(0, Math.min(attempts - 1, 10));
+  return Math.min(STALE_RESULT_RETRY_BASE_MS * Math.pow(2, exponent), STALE_RESULT_RETRY_MAX_MS);
+}
+
+export function shouldAbandonStaleResult(envelope: StaleResultEnvelope, now = Date.now()): boolean {
+  return envelope.retry.attempts >= STALE_RESULT_MAX_ATTEMPTS
+    || now - envelope.retry.createdAt > STALE_RESULT_MAX_AGE_MS;
+}
+
+export function markStaleResultFailure(
+  envelope: StaleResultEnvelope,
+  error: unknown,
+  now = Date.now(),
+): StaleResultEnvelope {
+  const attempts = envelope.retry.attempts + 1;
+  const nextAttemptAt = now + staleResultBackoffMs(attempts);
+  const lastError = error instanceof Error ? error.message : String(error);
+  return {
+    payload: envelope.payload,
+    retry: {
+      ...envelope.retry,
+      attempts,
+      lastAttemptAt: now,
+      nextAttemptAt,
+      lastError: sanitize(lastError).slice(0, 500),
+    },
+  };
+}
+
+function writeStaleResultFile(path: string, envelope: StaleResultEnvelope): void {
+  writePrivateFileSync(path, JSON.stringify(envelope));
+}
+
 export async function persistAndPostStatus(taskId: string, payload: Record<string, unknown>) {
   const resultPath = `/tmp/task_${taskId}_result.json`;
   const enrichedPayload = enrichStatusPayload(taskId, payload);
-  fs.writeFileSync(resultPath, JSON.stringify(enrichedPayload), 'utf-8');
-  try {
-    const result = await apiPost('/api/agent/status', enrichedPayload);
-    try { fs.unlinkSync(resultPath); } catch { /* ignore — file already gone */ }
-    return result;
-  } catch (e) {
-    // File intentionally left on disk — retried on next agent startup
-    throw e;
-  }
+  writeStaleResultFile(resultPath, createStaleResultEnvelope(enrichedPayload));
+  const result = await apiPost('/api/agent/status', enrichedPayload);
+  try { fs.unlinkSync(resultPath); } catch { /* ignore — file already gone */ }
+  return result;
 }
 
 function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): Record<string, unknown> {
@@ -677,8 +772,15 @@ export function readHandlerOutput<T = unknown>(
     const arrayResult = extractJsonArray<T>(raw);
     if (arrayResult && Array.isArray(arrayResult) && (arrayResult as unknown[]).length > 0) return arrayResult;
     // Try extracting a JSON object (strategic output)
-    const objResult = extractJsonObject<T>(raw, 'vision', 'direction_operations');
-    if (objResult) return objResult;
+    try {
+      const objResult = extractJsonObject<T>(raw, 'vision', 'direction_operations');
+      if (objResult) return objResult;
+    } catch (extractErr: unknown) {
+      if (extractErr instanceof JsonExtractionError) {
+        sendLog(ws, `[ERROR] ${extractErr.message}\n`);
+      }
+      throw extractErr;
+    }
     return null;
   }
 }
@@ -732,36 +834,50 @@ export function execFileAsync(
     proc.stderr!.on('data', (d: Buffer) => stderrChunks.push(d));
     let timedOut = false;
     let killTimer: NodeJS.Timeout | null = null;
+    const originalPid = proc.pid;
+    const processGroupStillOwned = () =>
+      originalPid !== undefined
+      && proc.pid === originalPid
+      && proc.exitCode === null
+      && proc.signalCode === null;
     const termTimer = setTimeout(() => {
       timedOut = true;
-      const pid = proc.pid;
-      if (pid) {
+      const pid = originalPid;
+      if (pid !== undefined && processGroupStillOwned()) {
         try { process.kill(-pid, 'SIGTERM'); } catch { /* already exited */ }
         killTimer = setTimeout(() => {
+          if (!processGroupStillOwned()) return;
           try { process.kill(-pid, 'SIGKILL'); } catch { /* already dead */ }
         }, 5000);
       }
     }, timeoutMs);
-    proc.on('close', (code) => {
+    proc.on('close', (code, signal) => {
+      const closeSignal = signal ?? null;
       clearTimeout(termTimer);
       if (killTimer) clearTimeout(killTimer);
       const stdout = Buffer.concat(stdoutChunks).toString('utf-8');
       const stderr = Buffer.concat(stderrChunks).toString('utf-8');
-      if (code === 0 && !timedOut) {
+      if (code === 0 && closeSignal === null && !timedOut) {
         resolve(stdout);
         return;
       }
       const parts = [`Command failed: ${cmd} ${args.join(' ')}`];
+      if (closeSignal) parts.push(`Signal: ${closeSignal}`);
       if (stdout.trim()) parts.push(stdout);
       if (stderr.trim()) parts.push(stderr);
       const err: Error & {
-        stdout?: string; stderr?: string; status?: number | null; killed?: boolean; code?: string;
+        stdout?: string; stderr?: string; status?: number | null; signal?: NodeJS.Signals | null; killed?: boolean; code?: string;
       } = new Error(parts.join('\n'));
       err.stdout = stdout;
       err.stderr = stderr;
       err.status = code;
-      err.killed = timedOut;
-      if (timedOut) err.code = 'ETIMEDOUT';
+      err.signal = closeSignal;
+      err.killed = timedOut || closeSignal !== null;
+      if (closeSignal === 'SIGKILL' && !timedOut) {
+        err.code = 'EOOM';
+      } else if (timedOut) {
+        err.code = 'ETIMEDOUT';
+      }
       reject(err);
     });
     proc.on('error', (e) => { clearTimeout(termTimer); if (killTimer) clearTimeout(killTimer); reject(e); });
@@ -2007,6 +2123,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   let lastResultText = '';
   let stderrBuffer = '';
   let timedOut = false;
+  let providerKilledByOOM = false;
 
   sendLog(ws, `\n--- ${runner.displayName} starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\nMode: ${LLM_EXECUTION_MODE}\n\n`);
   log(`Spawning ${runner.displayName} CLI...`);
@@ -2079,7 +2196,7 @@ echo ""
       // Write prompt to a temp file and pipe via stdin to avoid E2BIG when
       // the prompt (design doc + project context + directions) exceeds ARG_MAX (~128KB).
       promptFile = `/tmp/agent_prompt_${process.env.TASK_ID || 'unknown'}.txt`;
-      fs.writeFileSync(promptFile, withExecutionModePrompt(prompt));
+      writePrivateFileSync(promptFile, withExecutionModePrompt(prompt));
       promptFd = fs.openSync(promptFile, 'r');
     }
 
@@ -2100,13 +2217,25 @@ echo ""
 
     const timeoutMs = runCommand.timeoutMs;
     const timeoutMinutes = timeoutMs / 60000;
+    let forceKillTimer: NodeJS.Timeout | null = null;
+    const originalPid = child.pid;
+    const processGroupStillOwned = () =>
+      originalPid !== undefined
+      && child?.pid === originalPid
+      && child.exitCode === null
+      && child.signalCode === null;
     const killTimer = setTimeout(() => {
       log(`${runCommand.displayName} process timed out after ${timeoutMinutes} minutes — killing process group`);
       sendLog(ws, `\n[TIMEOUT] ${runCommand.displayName} exceeded ${timeoutMinutes}-minute time limit\n`);
       timedOut = true;
-      const pid = child?.pid;
-      if (pid) { try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ } }
-      setTimeout(() => { if (pid) { try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ } } }, 5000);
+      const pid = originalPid;
+      if (pid !== undefined && processGroupStillOwned()) {
+        try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
+        forceKillTimer = setTimeout(() => {
+          if (!processGroupStillOwned()) return;
+          try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
+        }, 5000);
+      }
     }, timeoutMs);
 
     child.stdout!.on('data', (data: Buffer) => {
@@ -2153,7 +2282,7 @@ echo ""
             // Push into stderr buffers (analogous to the stderr handler below)
             // so combined-output classification picks it up.
             if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += errLine;
-            if (stderrBuffer.length < 50_000) stderrBuffer += errLine;
+            stderrBuffer = appendBoundedTail(stderrBuffer, errLine, STDERR_TAIL_BYTES);
           } else if (objType === 'system' || objType === 'user') {
             // Benign metadata — ignore silently.
           } else if (objType) {
@@ -2174,17 +2303,31 @@ echo ""
     child.stderr!.on('data', (data: Buffer) => {
       const text = sanitize(data.toString());
       if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
-      if (stderrBuffer.length < 50_000) stderrBuffer += text;
+      stderrBuffer = appendBoundedTail(stderrBuffer, text, STDERR_TAIL_BYTES);
       sendLog(ws, `[stderr] ${text}`);
     });
 
-    child.on('error', (err) => { clearTimeout(killTimer); sendLog(ws, `[error] ${err.message}\n`); resolve(1); });
-    child.on('close', (code) => {
+    child.on('error', (err) => {
       clearTimeout(killTimer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      sendLog(ws, `[error] ${err.message}\n`);
+      resolve(1);
+    });
+    child.on('close', (code, signal) => {
+      const closeSignal = signal ?? null;
+      clearTimeout(killTimer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (closeSignal === 'SIGKILL' && !timedOut) {
+        providerKilledByOOM = true;
+        const oomLine = `EOOM: ${runCommand.displayName} process received external SIGKILL before agent timeout; likely cgroup OOM\n`;
+        stderrBuffer = appendBoundedTail(stderrBuffer, oomLine, STDERR_TAIL_BYTES);
+        if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += oomLine;
+        sendLog(ws, `[stderr] ${oomLine}`);
+      }
       if (promptFile) {
         try { fs.unlinkSync(promptFile); } catch { /* ignore */ }
       }
-      log(`${runCommand.displayName} exited with code ${code ?? 'null'}`);
+      log(`${runCommand.displayName} exited with code ${code ?? 'null'}${closeSignal ? ` signal ${closeSignal}` : ''}`);
       resolve(code ?? 1);
     });
   });
@@ -2193,6 +2336,11 @@ echo ""
 
   if (timedOut) {
     throw new ClaudeTimeoutError(`${runner.displayName} exceeded ${runCommand.timeoutMs / 60000}-minute time limit`);
+  }
+  if (providerKilledByOOM) {
+    const err = new ClaudeTimeoutError(`EOOM: ${runner.displayName} received external SIGKILL before agent timeout; likely cgroup OOM`);
+    (err as Error & { code?: string }).code = 'EOOM';
+    throw err;
   }
 
   if (exitCode !== 0) {
@@ -2264,16 +2412,43 @@ async function main() {
     const staleFiles = fs.readdirSync('/tmp').filter(f => /^task_.+_result\.json$/.test(f));
     for (const file of staleFiles) {
       const filePath = `/tmp/${file}`;
+      let staleEnvelope: StaleResultEnvelope | null = null;
       try {
         const raw = fs.readFileSync(filePath, 'utf-8');
-        const stalePayload = JSON.parse(raw) as Record<string, unknown>;
+        staleEnvelope = parseStaleResultFile(raw);
+        const stalePayload = staleEnvelope.payload;
         const staleTaskId = strVal(stalePayload.task_id) || file.replace(/^task_/, '').replace(/_result\.json$/, '');
+        const now = Date.now();
+        if (shouldAbandonStaleResult(staleEnvelope, now)) {
+          log(`Abandoning stale result for task ${staleTaskId} after ${staleEnvelope.retry.attempts} failed retries / ${(now - staleEnvelope.retry.createdAt) / 1000}s age`);
+          try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+          continue;
+        }
+        if (staleEnvelope.retry.nextAttemptAt > now) {
+          const waitSec = Math.ceil((staleEnvelope.retry.nextAttemptAt - now) / 1000);
+          log(`Skipping stale result for task ${staleTaskId}; retry backoff has ${waitSec}s remaining`);
+          continue;
+        }
         log(`Found stale result file for task ${staleTaskId} — retrying POST`);
         await apiPost('/api/agent/status', stalePayload);
         try { fs.unlinkSync(filePath); } catch { /* ignore */ }
         log(`Stale result for task ${staleTaskId} posted successfully`);
       } catch (e) {
-        log(`WARNING: Failed to retry stale result from ${file}: ${String(e)} — reaper will handle it`);
+        if (staleEnvelope) {
+          const updated = markStaleResultFailure(staleEnvelope, e);
+          const staleTaskId = strVal(updated.payload.task_id) || file.replace(/^task_/, '').replace(/_result\.json$/, '');
+          if (shouldAbandonStaleResult(updated)) {
+            log(`WARNING: Stale result for task ${staleTaskId} exhausted retries after ${updated.retry.attempts} attempts; deleting file so /tmp cannot grow unbounded`);
+            try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+          } else {
+            writeStaleResultFile(filePath, updated);
+            const waitSec = Math.ceil((updated.retry.nextAttemptAt - Date.now()) / 1000);
+            log(`WARNING: Failed to retry stale result from ${file}: ${String(e)} — next retry in ${waitSec}s`);
+          }
+        } else {
+          log(`WARNING: Malformed stale result file ${file}: ${String(e)} — deleting`);
+          try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+        }
       }
     }
   } catch (e) {

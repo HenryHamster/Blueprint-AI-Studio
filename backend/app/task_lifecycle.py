@@ -45,6 +45,7 @@ from app.failure_classification import (
 )
 from app.retry_budget import (
     CODE_ERROR_STAGE_GUIDANCE,
+    append_failure_class_history,
     classify_override_reason,
     compute_effective_max_requeues,
 )
@@ -613,12 +614,10 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             logger.exception("[REQUEUE] Failed to accumulate prior attempt cost for task %s", child.id)
         clone_ctx["_previous_error"] = (original_status_message or "")[:5000]
         clone_ctx["_previous_failure_class"] = failure_class
-        _prior_history = clone_ctx.get("_failure_class_history") or []
-        if not isinstance(_prior_history, list):
-            _prior_history = []
-        _prior_history = [str(h) for h in _prior_history if h]
-        _prior_history.append(failure_class)
-        clone_ctx["_failure_class_history"] = _prior_history[-5:]
+        clone_ctx["_failure_class_history"] = append_failure_class_history(
+            clone_ctx.get("_failure_class_history"),
+            failure_class,
+        )
 
         # Enriched failure diagnosis: fingerprint, stage, error summary, and recurring flag
         try:
@@ -2528,6 +2527,38 @@ async def _process_post_commit(
                     session.add(pt)
                 await session.commit()
                 await broadcast_to_project(str(project.id), "project_updated", {"status": new_project_status})
+
+        # Audit W2 (D2/D4): backstop for the synchronous strategic chain.
+        # If a strategic task (design_doc_update or strategic_review) reached
+        # a terminal status but the completion handlers above failed to update
+        # the StrategicCycle row, the cycle would stay "phase*_running"
+        # forever and the stalled-cycle reaper would have to clean it up
+        # later. Catch it here while the task lifecycle still has context.
+        try:
+            cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
+            if cycle_id and payload.status in (
+                TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED,
+            ):
+                from app import strategic_cycle  # noqa: PLC0415
+                cycle_row = await strategic_cycle.get(session, cycle_id)
+                if cycle_row is not None and cycle_row.outcome in strategic_cycle.ACTIVE_OUTCOMES:
+                    task_type = task.first_payload.get("type", "")
+                    failed_phase = "phase1" if task_type == "design_doc_update" else "phase2"
+                    logger.warning(
+                        f"[STRATEGIC] Task {task.id} ({task_type}) reached {payload.status} "
+                        f"but cycle {cycle_id} still in {cycle_row.outcome} — backstop marking failed_{failed_phase}"
+                    )
+                    await strategic_cycle.mark_failure(
+                        session, cycle_id,
+                        phase=failed_phase,
+                        reason=f"lifecycle_backstop: task {task.id} terminal in {payload.status} without completion-handler cycle update",
+                    )
+                    await session.commit()
+        except Exception as _bk_exc:
+            logger.error(
+                f"[STRATEGIC] Lifecycle backstop failed for task {task.id}: {_bk_exc!r}",
+                exc_info=True,
+            )
 
         # Final commit for any deferred changes (status, artifacts, spawned tasks)
         if session.dirty or session.new:

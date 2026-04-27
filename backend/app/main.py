@@ -120,7 +120,7 @@ from app.strategic_constants import (  # noqa: E402
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0046"
+EXPECTED_SCHEMA_REVISION = "0049"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -551,12 +551,40 @@ async def _init_deployment_state():
         if state.status not in (DeploymentStatus.PAUSED, DeploymentStatus.HALTED):
             from app.shared_state import deploy_monitoring
             results = deploy_monitoring["task_results"]
-            if results:
-                failures = sum(1 for r in results if r[1] == "failure")
-                deploy_monitoring["pre_deploy_failure_rate"] = failures / len(results)
+            results_list = list(results)
+            # E11: split the deque into 3 chunks and use the median rate as
+            # the pre-deploy baseline. A single snapshot lets a transient
+            # spike right before deploy poison the whole monitoring window
+            # — rollback logic then either over-reads the baseline (skips
+            # rollback when the deploy IS bad) or under-reads it (rolls
+            # back code that's actually fine). 3-chunk median dampens
+            # both directions while still picking up a real degradation.
+            if len(results_list) >= 9:
+                chunks = 3
+                chunk_size = len(results_list) // chunks
+                rates: list[float] = []
+                for i in range(chunks):
+                    start = i * chunk_size
+                    end = start + chunk_size if i < chunks - 1 else len(results_list)
+                    chunk = results_list[start:end]
+                    if not chunk:
+                        continue
+                    chunk_failures = sum(1 for r in chunk if r[1] == "failure")
+                    rates.append(chunk_failures / len(chunk))
+                rates.sort()
+                # Median of an odd-count list is rates[len // 2].
+                deploy_monitoring["pre_deploy_failure_rate"] = rates[len(rates) // 2]
+                deploy_monitoring["pre_deploy_failure_rate_samples"] = rates
+            elif results_list:
+                failures = sum(1 for r in results_list if r[1] == "failure")
+                deploy_monitoring["pre_deploy_failure_rate"] = failures / len(results_list)
+                deploy_monitoring["pre_deploy_failure_rate_samples"] = [
+                    deploy_monitoring["pre_deploy_failure_rate"]
+                ]
             else:
                 # No previous data (idle→active). Use generous baseline to avoid false rollbacks.
                 deploy_monitoring["pre_deploy_failure_rate"] = 0.15
+                deploy_monitoring["pre_deploy_failure_rate_samples"] = [0.15]
             deploy_monitoring["previous_window_results"] = list(results)
             deploy_monitoring["previous_window_start"] = deploy_monitoring.get("window_start")
             deploy_monitoring["task_results"] = deque(maxlen=100)

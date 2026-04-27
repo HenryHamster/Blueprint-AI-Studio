@@ -60,6 +60,42 @@ def _clear_retry_after_state(task_or_ctx) -> None:
     clear_retry_after(task_or_ctx)
 
 
+async def _lock_provisioning_task_for_vm(
+    session: AsyncSession,
+    task_id: uuid.UUID,
+    vm_id: str,
+) -> Task | None:
+    """Lock a PROVISIONING task only if it still owns the provisioning VM.
+
+    Provisioning completes on a background coroutine. By the time that coroutine
+    reports success/failure, the reaper may already have requeued the task with
+    a new ``vm_instance_id``. Mutating without this fresh locked check can
+    overwrite the reaper's QUEUED state with stale provision-failure handling.
+    """
+    task = (await session.execute(
+        select(Task)
+        .where(Task.id == task_id)
+        .with_for_update(skip_locked=True)
+    )).scalars().first()
+    if task is None:
+        logger.info(
+            "[ORCHESTRATOR] Provision result for task %s deferred: task row locked",
+            task_id,
+        )
+        return None
+    if task.status != TaskStatus.PROVISIONING or task.vm_instance_id != vm_id:
+        logger.info(
+            "[ORCHESTRATOR] Ignoring stale provision result for task %s "
+            "(status=%s, vm=%s, result_vm=%s)",
+            task_id,
+            task.status,
+            task.vm_instance_id,
+            vm_id,
+        )
+        return None
+    return task
+
+
 # ---------------------------------------------------------------------------
 # Module-level globals managed by orchestrator_worker
 # ---------------------------------------------------------------------------
@@ -2015,14 +2051,16 @@ async def orchestrator_worker():
                                 # If so, this VM is an orphan: delete it immediately.
                                 try:
                                     async with AsyncSessionLocal() as hb_session:
-                                        hb_task = await hb_session.get(Task, t_id)
-                                        if not hb_task or hb_task.vm_instance_id != vm_id:
-                                            current_vm = hb_task.vm_instance_id if hb_task else "gone"
-                                            logger.warning(f"[ORCHESTRATOR] VM {vm_id} created but task {t_id} now has vm_id={current_vm} — deleting orphan")
-                                            await _ensure_vm_deleted(vm_id, reason="vm_id_mismatch")
-                                            success = False
-                                            return
-                                        if hb_task.status == TaskStatus.PROVISIONING:
+                                        hb_task = await _lock_provisioning_task_for_vm(hb_session, t_id, vm_id)
+                                        if hb_task is None:
+                                            current_task = await hb_session.get(Task, t_id)
+                                            if not current_task or current_task.vm_instance_id != vm_id:
+                                                current_vm = current_task.vm_instance_id if current_task else "gone"
+                                                logger.warning(f"[ORCHESTRATOR] VM {vm_id} created but task {t_id} now has vm_id={current_vm} — deleting orphan")
+                                                await _ensure_vm_deleted(vm_id, reason="vm_id_mismatch")
+                                                success = False
+                                                return
+                                        else:
                                             # Refresh vm_provisioned_at to the point the GCE API
                                             # confirmed the VM is running. This gives the agent a
                                             # fresh window to claim before the reaper considers it
@@ -2081,7 +2119,7 @@ async def orchestrator_worker():
                                 # Requeue with retry tracking — zone exhaustion is transient
                                 try:
                                     async with AsyncSessionLocal() as inner_session:
-                                        failed_task = await inner_session.get(Task, t_id)
+                                        failed_task = await _lock_provisioning_task_for_vm(inner_session, t_id, vm_id)
                                         if failed_task:
                                             ctx = dict(failed_task.context or {})
                                             if prov_zone:

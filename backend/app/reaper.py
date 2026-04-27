@@ -15,8 +15,8 @@ from app.compute import get_provision_error, record_zone_failure, _capture_seria
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import record_pipeline_event, external_health as _external_health, resolve_retry_budget
 from app.failure_classification import classify_failure, persist_failure_category, INFRA_CLASSES
+from app.retry_budget import append_failure_class_history
 from app.time_utils import _utcnow, set_retry_after, parse_retry_after, RETRY_AFTER_MAX_MINUTES
-from app.failure_classification import classify_failure, persist_failure_category
 
 logger = logging.getLogger(__name__)
 
@@ -739,12 +739,10 @@ async def reaper_service():
                                     reaper_ctx["_max_attempts"] = class_budget
                                     reaper_ctx["_previous_error"] = (task.latest_status_message or "")[:1500]
                                     reaper_ctx["_previous_failure_class"] = _reap_failure_class
-                                    _prior_history = reaper_ctx.get("_failure_class_history") or []
-                                    if not isinstance(_prior_history, list):
-                                        _prior_history = []
-                                    _prior_history = [str(h) for h in _prior_history if h]
-                                    _prior_history.append(_reap_failure_class)
-                                    reaper_ctx["_failure_class_history"] = _prior_history[-5:]
+                                    reaper_ctx["_failure_class_history"] = append_failure_class_history(
+                                        reaper_ctx.get("_failure_class_history"),
+                                        _reap_failure_class,
+                                    )
                                     if _reap_failure_class == "CODE_ERROR":
                                         reaper_ctx["_previous_error_summary"] = (task.latest_status_message or "")[:500]
                                     _copy_analysis_artifacts_to_previous(reaper_ctx)
@@ -1400,6 +1398,56 @@ async def reaper_service():
 
                 except Exception as e:
                     logger.error(f"[REAPER] Queued age alert sweep error: {e}", exc_info=True)
+
+                # Step 7: Stalled strategic-cycle reaper.
+                # Audit W2/D2/D12: cycles stuck in phase*_running state for >3h
+                # mean the synchronous phase1→phase2 chain crashed and the
+                # lifecycle backstop missed it (e.g. orchestrator restart between
+                # task termination and post-commit). Mark them stalled so the
+                # strategic agent can see the failure on the next run.
+                try:
+                    from app import strategic_cycle  # noqa: PLC0415
+                    from app.models import Alert, AlertSeverity  # noqa: PLC0415
+                    from app.broadcast import broadcast_to_project as _bcast  # noqa: PLC0415
+                    stalled = await strategic_cycle.find_stalled(session)
+                    for c in stalled:
+                        if c.outcome in (
+                            strategic_cycle.OUTCOME_IN_PROGRESS,
+                            strategic_cycle.OUTCOME_PHASE1_RUNNING,
+                            strategic_cycle.OUTCOME_PHASE1_DONE,
+                        ):
+                            c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE1
+                            stalled_phase = "phase1"
+                        else:
+                            c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE2
+                            stalled_phase = "phase2"
+                        if c.failure_reason is None:
+                            c.failure_reason = f"reaper_stall: cycle in {stalled_phase} >3h with no completion"
+                        session.add(c)
+                        try:
+                            alert = Alert(
+                                project_id=c.project_id,
+                                severity=AlertSeverity.WARNING,
+                                title=f"Strategic cycle {c.id} stalled in {stalled_phase}",
+                                message=(
+                                    f"Cycle {c.id} has been in {stalled_phase} for >3h with no "
+                                    f"completion handler update. Marking stalled — next strategic "
+                                    f"cycle will spawn a fresh attempt. Phase1 task: {c.phase1_task_id}, "
+                                    f"phase2 task: {c.phase2_task_id}."
+                                ),
+                            )
+                            session.add(alert)
+                            await _bcast(
+                                str(c.project_id), "alert_created",
+                                {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+                            )
+                        except Exception:
+                            logger.exception(f"[REAPER] Failed to create stalled-cycle alert for {c.id}")
+                    if stalled:
+                        await session.commit()
+                        logger.info(f"[REAPER] Marked {len(stalled)} strategic cycle(s) stalled")
+                except Exception as e:
+                    logger.error(f"[REAPER] Stalled-cycle sweep error: {e}", exc_info=True)
             consecutive_errors = 0
         except asyncio.CancelledError:
             logger.info("[REAPER] Service shutting down.")

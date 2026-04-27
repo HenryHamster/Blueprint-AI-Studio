@@ -26,7 +26,26 @@ def _resolve_task_provider_auth(task: "Task"):
         return None, None
     try:
         return LLMProviderName(provider_raw), LLMAuthMode(auth_mode_raw)
-    except ValueError:
+    except ValueError as exc:
+        try:
+            ctx = dict(getattr(task, "context", {}) or {})
+            ctx["llm_runtime_resolution_failed"] = True
+            ctx["llm_runtime_resolution_error"] = "invalid_provider_or_auth_mode"
+            ctx["llm_provider_raw"] = provider_raw
+            ctx["llm_auth_mode_raw"] = auth_mode_raw
+            task.context = ctx
+        except Exception:
+            logger.exception(
+                "[FAILURE_CLASS] Failed to mark invalid provider/auth context for task %s",
+                getattr(task, "id", None),
+            )
+        logger.warning(
+            "[FAILURE_CLASS] Invalid task provider/auth mode for task %s: provider=%r auth_mode=%r (%s)",
+            getattr(task, "id", None),
+            provider_raw,
+            auth_mode_raw,
+            exc,
+        )
         return None, None
 
 
@@ -623,7 +642,7 @@ _RE_MEM_PREFIX = re.compile(
 # before numbering so "10.5mb" and "10.4mb" collapse together rather than
 # leaving stray "5mb"/"4mb" differentiators.
 _RE_SIZE_TOKEN = re.compile(
-    r'\b\d+(?:\.\d+)?\s*(?:mb|gb|kb|ms|s)\b',
+    r'\b\d+(?:\.\d+)?\s*(?:gib|mib|kib|gb|mb|kb|bytes?|b|ms|s)\b',
     re.IGNORECASE,
 )
 _RE_NUM = re.compile(r'\b\d+\b')

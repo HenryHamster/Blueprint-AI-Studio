@@ -1083,6 +1083,138 @@ Keep `task.context` JSONB only for:
 
 ---
 
+# Medium Failure-Classification Addendum — 2026-04-26
+
+**Status:** implemented in the current working tree.
+**Scope:** B2, B3, B7, B8, B10, B11, B15.
+**Intent:** close the medium-severity failure-classification and retry/dedup correctness gaps that were outside the original critical/high workstreams.
+
+## Completed Items
+
+| Finding | Status | Implementation |
+|---|---|---|
+| B2 | Done | `failure_classification._fingerprint_message()` now strips embedded IEC/binary byte size tokens (`MiB`, `KiB`, `bytes`, `b`) in addition to existing memory-prefix handling, so residual CODE_ERROR fingerprints do not split by memory-reading noise. |
+| B3 | Done | `finding_deduplication.build_dedup_state()` no longer uses a `context.get("finding_hash")` guard followed by `context["finding_hash"]`; finding hashes are read once via `_task_finding_hash()`, avoiding volatile-context KeyError races. |
+| B7 | Done | `anomaly_detection._compute_research_anomalies()` snapshots initial `last_seen` values and expires stale per-project anomalies through `_expire_stale_project_anomalies()`, which skips deletion if another compute refreshed the entry concurrently. |
+| B8 | Done | CODE_ERROR dedup cooldown is now explicit `created_at + CODE_ERROR_COOLDOWN > now` via `_within_code_error_cooldown()`, with naive/aware datetime coercion. |
+| B10 | Done | Added timestamped retry history helpers in `retry_budget.py`: `normalize_failure_class_history()`, `append_failure_class_history()`, and `failure_class_history_classes()`. Retry, reaper, and admin digest paths now use 48h-bounded failure-class history instead of unbounded bare strings. |
+| B11 | Done | `_extract_ci_context()` now tolerates malformed GitHub check-run detail rows: non-list `details`, non-dict entries, missing `name`, and non-string `failed_logs` no longer collapse extraction. |
+| B15 | Done | `_resolve_task_provider_auth()` now logs invalid provider/auth enum values and marks `task.context` with `llm_runtime_resolution_failed`, `llm_runtime_resolution_error`, and raw values instead of silently falling back to generic provider handling. |
+
+## Files Touched
+
+- `backend/app/failure_classification.py`
+- `backend/app/finding_deduplication.py`
+- `backend/app/anomaly_detection.py`
+- `backend/app/retry_budget.py`
+- `backend/app/task_lifecycle.py`
+- `backend/app/reaper.py`
+- `backend/app/routers/admin_digest.py`
+- `backend/app/auto_remediation.py`
+- `backend/testing/test_failure_classification.py`
+- `backend/testing/test_finding_deduplication.py`
+- `backend/testing/test_anomaly_actions.py`
+- `backend/testing/test_auto_remediation.py`
+- `backend/testing/test_retry_budget.py`
+
+## Verification
+
+Passed:
+
+```bash
+scripts/test-backend.sh \
+  testing/test_failure_classification.py \
+  testing/test_finding_deduplication.py \
+  testing/test_retry_budget.py \
+  testing/test_anomaly_actions.py \
+  testing/test_auto_remediation.py::test_extract_ci_context_skips_failed_check_without_name
+```
+
+Result: **308 passed**.
+
+Also passed:
+
+```bash
+git diff --check
+```
+
+Blocked verification:
+
+```bash
+scripts/test-backend.sh --postgres \
+  testing/test_failure_classification.py \
+  testing/test_finding_deduplication.py \
+  testing/test_retry_budget.py \
+  testing/test_anomaly_actions.py \
+  testing/test_auto_remediation.py
+```
+
+This currently fails before pytest during `alembic upgrade head` because the in-flight migration `backend/alembic/versions/0047_add_strategic_cycle_table.py` creates `ix_strategiccycle_project_started` on `strategiccycle.started_at`, but the created table does not define `started_at`. That blocker belongs to the W2 strategic-cycle migration work, not this medium failure-classification slice.
+
+## Residual Risk
+
+- Full DB-backed validation should be rerun after the strategic-cycle migration is corrected.
+- Legacy bare-string `_failure_class_history` entries are converted on the next append/read; no data migration was added because this field remains JSONB retry metadata and the helper is backward compatible.
+
+---
+
+# Medium DB Consistency Addendum — 2026-04-26
+
+**Status:** implemented in the current working tree; verification not run yet.
+**Scope:** F10, F11, F12, F13, F14.
+**Intent:** close the medium-severity database consistency and lock-semantics gaps that were outside the original critical/high workstreams.
+
+## Completed Items
+
+| Finding | Status | Implementation |
+|---|---|---|
+| F10 | Done | `UserIntegration.user_id` now has an explicit named table-level unique constraint (`uq_userintegration_user_id`) in the SQLModel metadata, with migration coverage, instead of relying only on field-level unique index metadata. |
+| F11 | Done | `agent_status` disables request-session autoflush after acquiring the task row lock for status completion handling, preventing incidental SELECTs from flushing partial task mutations before the explicit commit boundary. |
+| F12 | Done | Review/fix pipeline task creation now writes a deterministic active-task `idempotency_key`; the `task` table has a partial unique index for active statuses, and `_spawn_pipeline_task()` reuses existing active tasks on duplicate or concurrent spawn attempts. |
+| F13 | Done | Orchestrator provisioning success/failure handling now re-locks the task row and verifies the task is still `PROVISIONING` for the same `vm_instance_id` before mutating it, preventing stale provisioning callbacks from overwriting reaper recovery. |
+| F14 | Done | Admin settings persistence now uses the shared non-blocking `deployment_state_lock(..., skip_locked=True)` helper and performs pause-state clearing inside the same locked DeploymentState mutation. |
+
+## Files Touched
+
+- `backend/alembic/versions/0049_db_consistency_mediums.py`
+- `backend/app/main.py`
+- `backend/app/models.py`
+- `backend/app/review_pipeline.py`
+- `backend/app/orchestrator.py`
+- `backend/app/routers/agent_status.py`
+- `backend/app/routers/admin_settings.py`
+- `backend/testing/test_db_consistency_mediums.py`
+
+## Verification
+
+Not run yet.
+
+Recommended targeted command:
+
+```bash
+bash scripts/test-backend.sh --postgres testing/test_db_consistency_mediums.py
+```
+
+Recommended follow-up checks:
+
+```bash
+ruff check \
+  backend/app/models.py \
+  backend/app/review_pipeline.py \
+  backend/app/orchestrator.py \
+  backend/app/routers/agent_status.py \
+  backend/app/routers/admin_settings.py \
+  backend/testing/test_db_consistency_mediums.py
+```
+
+## Residual Risk
+
+- The new migration should be validated against the current in-flight migration stack before merge, especially because other concurrent agents are adding migrations in the same range.
+- The partial unique index only deduplicates active pipeline tasks; terminal tasks intentionally do not block a later retry with the same key.
+- Full DB-backed validation remains pending until another test sweep runs the targeted Postgres command above.
+
+---
+
 # Validation strategy
 
 After each workstream PR:
@@ -1103,7 +1235,7 @@ After all 6 workstreams:
 
 # What this plan does NOT cover
 
-- Medium-severity findings (~35) — opportunistic cleanup, separate planning
+- Remaining medium-severity findings outside the completed failure-classification addendum above — opportunistic cleanup, separate planning
 - Test coverage gaps (D11, C15) beyond what's needed to validate the fixes
 - Performance optimization unrelated to correctness
 - Admin UI changes (only backend exposure of new state; UI follow-up)

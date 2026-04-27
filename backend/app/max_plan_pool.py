@@ -622,6 +622,7 @@ async def load_max_plan_pool():
                 "daily_task_count": acct.daily_task_count,
                 "daily_task_count_reset_at": acct.daily_task_count_reset_at,
                 "disabled_reason": acct.disabled_reason,
+                "disabled_at": acct.disabled_at,
             }
             # Restore rate-limit state from DB (skip expired cooldowns)
             rl_state = acct.rate_limit_state or {}
@@ -1512,6 +1513,9 @@ async def recheck_disabled_accounts():
                         if acct.get("enabled", True):
                             db_acct.disabled_reason = None
                             acct["disabled_reason"] = None
+                            db_acct.disabled_at = None
+                        else:
+                            db_acct.disabled_at = acct.get("disabled_at")
                         rl_session.add(db_acct)
                 await rl_session.commit()
             # Clear any retried accounts on success
@@ -1539,6 +1543,7 @@ async def recheck_disabled_accounts():
                     db_acct.daily_task_count_reset_at = acct.get("daily_task_count_reset_at")
                     db_acct.disabled_reason = acct.get("disabled_reason")
                     db_acct.enabled = acct.get("enabled", True)
+                    db_acct.disabled_at = acct.get("disabled_at")
                     cap_session.add(db_acct)
                 await cap_session.commit()
             for acct_id in flush_ids:

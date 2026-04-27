@@ -11,6 +11,7 @@ import re
 import uuid
 from datetime import timedelta
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -585,6 +586,38 @@ SPAWN_REASON_DEFERRED = "deferred_cross_type"
 SPAWN_REASON_CAP = "cap_exhausted"
 SPAWN_REASON_STUCK = "stuck_cycle"
 
+_PIPELINE_ACTIVE_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+)
+
+
+def _pipeline_task_idempotency_key(
+    *,
+    project_id,
+    task_type: str,
+    pr_number: int,
+    original_task_id: str,
+    iteration: int,
+    is_rollup: bool,
+) -> str:
+    chain_id = f"rollup-pr-{pr_number}" if is_rollup else original_task_id
+    return f"review_pipeline:{project_id}:{chain_id}:{pr_number}:{task_type}:{iteration}"
+
+
+async def _get_active_pipeline_task_by_key(
+    session: AsyncSession,
+    idempotency_key: str,
+) -> Task | None:
+    return (await session.execute(
+        select(Task).where(
+            Task.idempotency_key == idempotency_key,
+            Task.status.in_(_PIPELINE_ACTIVE_STATUSES),
+        )
+    )).scalars().first()
+
 
 def _set_spawn_reason(task: Task, reason: str) -> None:
     ctx = dict(task.context or {})
@@ -624,6 +657,7 @@ async def _spawn_pipeline_task(
                                 whose snapshot is now stale because the caller
                                 requested a fix.
     """
+    source_task_id = source_task.id
     # Resolve the chain identifier once, so the "already merged" guard, the
     # dedup guard, and the spawn path all agree on which chain this is.
     # A chain is identified by the *create* task that opened the PR; review/fix
@@ -675,6 +709,7 @@ async def _spawn_pipeline_task(
     # SAME rollup PR. Gate dedup on PR-number only in that case so we don't
     # double-spawn review/fix for the shared PR.
     is_rollup_source = bool((source_task.context or {}).get("_is_rollup_review"))
+    superseded_stale_task = False
     active_pipeline = (await session.execute(
         select(Task).where(
             Task.project_id == source_task.project_id,
@@ -702,6 +737,7 @@ async def _spawn_pipeline_task(
             )
             persist_failure_category(t, AGENT_TIMEOUT)
             session.add(t)
+            superseded_stale_task = True
             logger.warning(
                 f"[PIPELINE] Superseding stale {t_type} task {t.id} "
                 f"(last_heartbeat={t.last_heartbeat}, started_at={t.started_at}) "
@@ -731,6 +767,7 @@ async def _spawn_pipeline_task(
             )
             persist_failure_category(t, AGENT_TIMEOUT)
             session.add(t)
+            superseded_stale_task = True
             logger.warning(
                 f"[PIPELINE] Cancelling in-flight review {t.id} on PR #{pr_number} "
                 f"so fix can proceed (review snapshot is stale)"
@@ -748,6 +785,11 @@ async def _spawn_pipeline_task(
         _set_spawn_reason(source_task, SPAWN_REASON_DEFERRED)
         session.add(source_task)
         return (None, False)
+
+    if superseded_stale_task:
+        # Release the active-idempotency partial index before inserting the
+        # replacement task in the same transaction.
+        await session.flush()
 
     # Per-PR iteration cap: count completed review/fix tasks for this PR across all chains
     # Filter to tasks matching this PR number (check payloads JSONB).
@@ -823,6 +865,28 @@ async def _spawn_pipeline_task(
         _set_spawn_reason(source_task, SPAWN_REASON_CAP)
         session.add(source_task)
         return (None, False)
+
+    idempotency_key = _pipeline_task_idempotency_key(
+        project_id=source_task.project_id,
+        task_type=task_type,
+        pr_number=pr_number,
+        original_task_id=resolved_original_id,
+        iteration=iteration,
+        is_rollup=is_rollup,
+    )
+    existing_by_key = await _get_active_pipeline_task_by_key(session, idempotency_key)
+    if existing_by_key is not None:
+        logger.warning(
+            f"[PIPELINE] Reusing idempotent {task_type} spawn for PR #{pr_number}: "
+            f"{existing_by_key.id}"
+        )
+        source_task.latest_status_message = (
+            f"{task_type.title()} skipped for PR #{pr_number} — "
+            f"idempotent spawn already active → {str(existing_by_key.id)[:8]}"
+        )
+        _set_spawn_reason(source_task, SPAWN_REASON_DEDUP)
+        session.add(source_task)
+        return (existing_by_key, False)
 
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
 
@@ -1231,12 +1295,33 @@ async def _spawn_pipeline_task(
         priority=inherited_priority,
         payloads=[payload_data],
         context=propagated_ctx,
+        idempotency_key=idempotency_key,
         vm_instance_id=vm_name,
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
     )
     session.add(new_task)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        existing = await _get_active_pipeline_task_by_key(session, idempotency_key)
+        if existing is None:
+            raise
+        logger.warning(
+            f"[PIPELINE] Concurrent {task_type} spawn for PR #{pr_number} "
+            f"hit idempotency key; using existing task {existing.id}"
+        )
+        reloaded_source = await session.get(Task, source_task_id)
+        if reloaded_source is not None:
+            reloaded_source.latest_status_message = (
+                f"{task_type.title()} skipped for PR #{pr_number} — "
+                f"idempotent spawn already active → {str(existing.id)[:8]}"
+            )
+            _set_spawn_reason(reloaded_source, SPAWN_REASON_DEDUP)
+            session.add(reloaded_source)
+            await session.commit()
+        return (existing, False)
     await session.refresh(new_task)
 
     history = TaskHistory(task_id=new_task.id, action="SPAWNED",

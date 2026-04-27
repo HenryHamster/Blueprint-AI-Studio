@@ -15,6 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 
+from app.time_utils import _utcnow
 from app.strategic_completion import (
     _check_direction_health,
     _check_direction_completion,
@@ -563,19 +564,24 @@ class TestRecordStrategicTaskFailure:
 
     @pytest.mark.asyncio
     async def test_updates_cycle_history_for_strategic_review(self, strat_fail_db):
+        # Audit W2: cycle history is a real table now. Insert a StrategicCycle
+        # row and verify _record_strategic_task_failure flips its outcome.
+        from app import strategic_cycle as sc
+        from app.models import StrategicCycle
         cycle_id = "cycle-fail-001"
-        project = Project(
-            name="P", user_id="u1",
-            vision={
-                "purpose": "test",
-                "_strategic_cycle_history": [
-                    {"cycle_id": cycle_id, "phase1_completed_at": "2026-01-01T00:00:00"}
-                ],
-            },
-        )
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
         strat_fail_db.add(project)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(project)
+        cycle = StrategicCycle(
+            id=cycle_id, project_id=project.id,
+            outcome=sc.OUTCOME_PHASE2_RUNNING,
+            phase1_started_at=_utcnow(),
+            phase1_completed_at=_utcnow(),
+            phase2_started_at=_utcnow(),
+        )
+        strat_fail_db.add(cycle)
+        await strat_fail_db.commit()
 
         task = await _make_failure_task(
             strat_fail_db, project,
@@ -584,29 +590,28 @@ class TestRecordStrategicTaskFailure:
             status_message="Claude API timeout",
         )
         await _record_strategic_task_failure(task, strat_fail_db)
-
-        history = project.vision.get("_strategic_cycle_history", [])
-        entry = next((e for e in history if e.get("cycle_id") == cycle_id), None)
-        assert entry is not None
-        assert entry.get("outcome") == "failed"
-        assert entry.get("failed_phase") == "phase2"  # strategic_review → phase2
-        assert entry.get("phase2_completed_at") is not None
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(cycle)
+        assert cycle.outcome == sc.OUTCOME_FAILED_PHASE2
+        assert cycle.phase2_completed_at is not None
+        assert cycle.failure_reason and "Claude API timeout" in cycle.failure_reason
 
     @pytest.mark.asyncio
     async def test_updates_cycle_history_for_design_doc_update(self, strat_fail_db):
+        from app import strategic_cycle as sc
+        from app.models import StrategicCycle
         cycle_id = "cycle-fail-002"
-        project = Project(
-            name="P", user_id="u1",
-            vision={
-                "purpose": "test",
-                "_strategic_cycle_history": [
-                    {"cycle_id": cycle_id},
-                ],
-            },
-        )
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
         strat_fail_db.add(project)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(project)
+        cycle = StrategicCycle(
+            id=cycle_id, project_id=project.id,
+            outcome=sc.OUTCOME_PHASE1_RUNNING,
+            phase1_started_at=_utcnow(),
+        )
+        strat_fail_db.add(cycle)
+        await strat_fail_db.commit()
 
         task = await _make_failure_task(
             strat_fail_db, project,
@@ -615,12 +620,11 @@ class TestRecordStrategicTaskFailure:
             status_message="VM crash",
         )
         await _record_strategic_task_failure(task, strat_fail_db)
-
-        history = project.vision.get("_strategic_cycle_history", [])
-        entry = next((e for e in history if e.get("cycle_id") == cycle_id), None)
-        assert entry is not None
-        assert entry.get("failed_phase") == "phase1"  # design_doc_update → phase1
-        assert entry.get("phase1_completed_at") is not None
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(cycle)
+        assert cycle.outcome == sc.OUTCOME_FAILED_PHASE1
+        assert cycle.phase1_completed_at is not None
+        assert cycle.failure_reason and "VM crash" in cycle.failure_reason
 
     @pytest.mark.asyncio
     async def test_no_cycle_id_skips_cycle_history_update(self, strat_fail_db):
@@ -919,6 +923,7 @@ class TestRationalePersistence:
         assert len(_extract_cycle_reasoning(t)) == 500
 
     def test_build_previous_decision_outcomes_surfaces_rationales(self):
+        # Audit W2: cycle history is now passed in (was JSONB on vision).
         project = Project(
             name="P", user_id="u1",
             directions=[
@@ -927,21 +932,20 @@ class TestRationalePersistence:
                     "research_history": [{"prs_merged": 1}],
                 },
             ],
-            vision={
-                "_strategic_cycle_history": [
-                    {
-                        "cycle_id": "sc-1",
-                        "outcome": "completed",
-                        "created_direction_ids": ["d-n"],
-                        "retired_direction_ids": ["d-gone"],
-                        "created_rationales": {"d-n": "because new capability"},
-                        "retired_rationales": {"d-gone": "stalled for 5 cycles"},
-                        "cycle_reasoning": "focus on velocity",
-                    },
-                ],
-            },
+            vision={},
         )
-        out = _build_previous_decision_outcomes(project)
+        cycle_history = [
+            {
+                "cycle_id": "sc-1",
+                "outcome": "completed",
+                "created_direction_ids": ["d-n"],
+                "retired_direction_ids": ["d-gone"],
+                "created_rationales": {"d-n": "because new capability"},
+                "retired_rationales": {"d-gone": "stalled for 5 cycles"},
+                "cycle_reasoning": "focus on velocity",
+            },
+        ]
+        out = _build_previous_decision_outcomes(project, cycle_history)
         assert out is not None
         assert out["cycle_reasoning"] == "focus on velocity"
         assert out["created"][0]["rationale"] == "because new capability"
@@ -954,17 +958,16 @@ class TestRationalePersistence:
         project = Project(
             name="P", user_id="u1",
             directions=[{"id": "d-n", "status": "active", "text": "t", "research_history": []}],
-            vision={
-                "_strategic_cycle_history": [
-                    {
-                        "cycle_id": "sc-1",
-                        "outcome": "completed",
-                        "created_direction_ids": ["d-n"],
-                    },
-                ],
-            },
+            vision={},
         )
-        out = _build_previous_decision_outcomes(project)
+        cycle_history = [
+            {
+                "cycle_id": "sc-1",
+                "outcome": "completed",
+                "created_direction_ids": ["d-n"],
+            },
+        ]
+        out = _build_previous_decision_outcomes(project, cycle_history)
         assert out is not None
         assert "cycle_reasoning" not in out
         assert "rationale" not in out["created"][0]
@@ -1018,25 +1021,25 @@ class TestDirectionPredictionCalibration:
                 "id": "d-n", "status": "active", "text": "new",
                 "research_history": [{"prs_merged": 4}],
             }],
-            vision={
-                "_strategic_cycle_history": [{
-                    "cycle_id": "sc-1",
-                    "outcome": "completed",
-                    "created_direction_ids": ["d-n"],
-                    "retired_direction_ids": ["d-gone"],
-                    "created_predictions": {"d-n": {
-                        "estimated_difficulty": "high", "text_length": 3,
-                        "mature_system_count": 0, "similar_direction_count": 1,
-                        "similar_past_merges": 1,
-                    }},
-                    "retired_final_metrics": {"d-gone": {
-                        "final_quality_score": 0.2, "final_prs_merged": 0,
-                        "final_cycles_active": 5,
-                    }},
-                }],
-            },
+            vision={},
         )
-        out = _build_previous_decision_outcomes(project)
+        # Audit W2: cycle history is now passed in (was JSONB on vision).
+        cycle_history = [{
+            "cycle_id": "sc-1",
+            "outcome": "completed",
+            "created_direction_ids": ["d-n"],
+            "retired_direction_ids": ["d-gone"],
+            "created_predictions": {"d-n": {
+                "estimated_difficulty": "high", "text_length": 3,
+                "mature_system_count": 0, "similar_direction_count": 1,
+                "similar_past_merges": 1,
+            }},
+            "retired_final_metrics": {"d-gone": {
+                "final_quality_score": 0.2, "final_prs_merged": 0,
+                "final_cycles_active": 5,
+            }},
+        }]
+        out = _build_previous_decision_outcomes(project, cycle_history)
         assert out["created"][0]["prediction"]["estimated_difficulty"] == "high"
         assert out["created"][0]["calibration_delta"] == 3
         assert out["retired"][0]["final_metrics"]["final_cycles_active"] == 5

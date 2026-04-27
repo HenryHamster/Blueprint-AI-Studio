@@ -6,11 +6,16 @@ from datetime import datetime, timezone
 from app.time_utils import _utcnow
 
 
-def _build_outcome_evaluation(project) -> dict:
+def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dict:
     """Build a planned-vs-actual assessment for the strategic agent.
 
     Compares what the vision predicted against what directions actually produced.
     All data lives on project.directions and project.vision — no DB queries needed.
+
+    Audit W2: ``cycle_history`` is now passed in (was JSONB on vision); the
+    async caller pre-fetches via ``strategic_cycle.recent_for_agent_context``.
+    Falls back to an empty list if the caller didn't provide one — the
+    sub-helpers handle that gracefully.
     """
     from app.research_context import _parse_research_context  # noqa: PLC0415
     from app.direction_metrics import _compute_difficulty_index  # noqa: PLC0415
@@ -291,24 +296,28 @@ def _build_outcome_evaluation(project) -> dict:
         result["systems"] = systems
     if direction_outcomes:
         result["directions"] = direction_outcomes
-    strategic_effectiveness = _build_strategic_effectiveness(directions, vision)
+    strategic_effectiveness = _build_strategic_effectiveness(directions, cycle_history or [], vision)
     if strategic_effectiveness:
         result["strategic_effectiveness"] = strategic_effectiveness
-    decision_accuracy = _build_decision_accuracy(directions, vision)
+    decision_accuracy = _build_decision_accuracy(directions, cycle_history or [])
     if decision_accuracy:
         result["decision_accuracy"] = decision_accuracy
     return result
 
 
-def _build_decision_accuracy(directions: list, vision: dict) -> dict:
+def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
     """Score the most recent completed strategic cycle's create/retire decisions.
 
     Looks up each created direction's actual merge outcome and quality score,
     and each retired direction's current status, then summarizes how accurate
     the strategic agent's last set of decisions turned out to be.
+
+    Audit W2: ``cycle_history`` is now passed in (was read from
+    ``vision._strategic_cycle_history``); the async caller pre-fetches via
+    ``strategic_cycle.recent_for_agent_context``.
     """
     from app.direction_metrics import _compute_direction_quality_score  # noqa: PLC0415
-    cycle_history = list((vision or {}).get("_strategic_cycle_history") or [])
+    cycle_history = list(cycle_history or [])
     target = None
     for entry in reversed(cycle_history):
         if entry.get("outcome") != "completed":
@@ -405,14 +414,21 @@ def _build_decision_accuracy(directions: list, vision: dict) -> dict:
     return result
 
 
-def _build_strategic_effectiveness(directions: list, vision: dict) -> dict:
-    """Aggregate per-cycle strategic decision quality from _strategic_cycle_history.
+def _build_strategic_effectiveness(directions: list, cycle_history: list, vision: dict | None = None) -> dict:
+    """Aggregate per-cycle strategic decision quality from cycle history.
 
     Measures whether the strategic agent's own choices (which directions to
     create/retire) are producing better outcomes across recent cycles. Distinct
     from per-direction trends, which measure direction performance.
+
+    Audit W2: ``cycle_history`` is passed in (was read from
+    ``vision._strategic_cycle_history``); the async caller pre-fetches via
+    ``strategic_cycle.recent_for_agent_context``. ``vision`` is still needed
+    for the ``_strategic_failures`` counter (a circuit-breaker state that
+    intentionally stays in JSONB, not promoted to the cycle table).
     """
-    cycle_history = list(vision.get("_strategic_cycle_history") or [])
+    vision = vision or {}
+    cycle_history = list(cycle_history or [])
     completed = [
         c for c in cycle_history
         if c.get("outcome") not in (None, "in_progress")
@@ -483,7 +499,7 @@ def _build_strategic_effectiveness(directions: list, vision: dict) -> dict:
 
 
 def _compute_prediction_calibration_factor(
-    project, lookback_cycles: int = 5, min_samples: int = 3
+    project, cycle_history: list | None = None, lookback_cycles: int = 5, min_samples: int = 3,
 ) -> float:
     """Compute a scaling factor to correct systematic bias in merge predictions.
 
@@ -502,7 +518,8 @@ def _compute_prediction_calibration_factor(
         float == 1.0 — no history or predictions are well-calibrated
         float > 1.0  — predictions have been pessimistic (under-predicting merges)
     """
-    cycle_history = (project.vision or {}).get("_strategic_cycle_history") or []
+    # Audit W2: cycle_history is now passed in (was read from JSONB).
+    cycle_history = list(cycle_history or [])
     directions_by_id = {
         d.get("id"): d for d in (project.directions or []) if d.get("id")
     }

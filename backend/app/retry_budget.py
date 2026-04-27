@@ -15,6 +15,8 @@ guardrail. Three pieces live here:
 - :data:`CODE_ERROR_STAGE_GUIDANCE` provides per-pipeline-stage retry hints
   for CODE_ERROR failures, used by ``_build_retry_prompt_suffix``.
 """
+from datetime import datetime, timedelta, timezone
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -26,6 +28,7 @@ from app.failure_classification import (
     classify_failure,
 )
 from app.models import Task, TaskStatus
+from app.time_utils import _utcnow
 
 
 CODE_ERROR_STAGE_GUIDANCE: dict[str, str] = {
@@ -60,6 +63,81 @@ CODE_ERROR_STAGE_GUIDANCE: dict[str, str] = {
         "verify the branch has commits ahead of the base, and ensure the base branch is correct."
     ),
 }
+
+FAILURE_CLASS_HISTORY_TTL = timedelta(hours=48)
+FAILURE_CLASS_HISTORY_MAX = 5
+
+
+def _coerce_history_datetime(value: datetime, reference: datetime) -> datetime:
+    if value.tzinfo is None and reference.tzinfo is not None:
+        return value.replace(tzinfo=timezone.utc)
+    if value.tzinfo is not None and reference.tzinfo is None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _parse_history_seen_at(raw: object) -> datetime | None:
+    if isinstance(raw, datetime):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def normalize_failure_class_history(
+    raw_history: object,
+    *,
+    now: datetime | None = None,
+    ttl: timedelta = FAILURE_CLASS_HISTORY_TTL,
+) -> list[dict[str, str]]:
+    """Return timestamped, unexpired failure-class history entries.
+
+    Legacy entries were bare strings and never expired. Keep them readable, but
+    convert them to timestamped entries on the next write so future retry-budget
+    decisions are bounded by ``ttl`` instead of all historical attempts.
+    """
+    if not isinstance(raw_history, list):
+        return []
+    now = now or _utcnow()
+    cutoff = now - ttl
+    normalized: list[dict[str, str]] = []
+    for entry in raw_history:
+        if isinstance(entry, dict):
+            cls = str(entry.get("class") or entry.get("failure_class") or "").strip()
+            seen_at = _parse_history_seen_at(entry.get("at") or entry.get("seen_at"))
+        elif isinstance(entry, str):
+            cls = entry.strip()
+            seen_at = now
+        else:
+            continue
+        if not cls:
+            continue
+        seen_at = seen_at or now
+        comparable_seen_at = _coerce_history_datetime(seen_at, now)
+        if comparable_seen_at < cutoff:
+            continue
+        normalized.append({"class": cls, "at": comparable_seen_at.isoformat()})
+    return normalized[-FAILURE_CLASS_HISTORY_MAX:]
+
+
+def append_failure_class_history(
+    raw_history: object,
+    failure_class: str,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, str]]:
+    now = now or _utcnow()
+    history = normalize_failure_class_history(raw_history, now=now)
+    if failure_class:
+        history.append({"class": str(failure_class), "at": now.isoformat()})
+    return history[-FAILURE_CLASS_HISTORY_MAX:]
+
+
+def failure_class_history_classes(raw_history: object, *, now: datetime | None = None) -> list[str]:
+    return [entry["class"] for entry in normalize_failure_class_history(raw_history, now=now)]
 
 
 async def compute_effective_max_requeues(
@@ -98,12 +176,11 @@ async def compute_effective_max_requeues(
         prev_class = ctx.get("_previous_failure_class")
         if prev_class and current_class == prev_class and current_class not in INFRA_CLASSES:
             reduction = max(reduction, 1)
-        history = ctx.get("_failure_class_history") or []
-        if isinstance(history, list):
+        history = failure_class_history_classes(ctx.get("_failure_class_history"), now=_utcnow())
+        if history:
             counts: dict[str, int] = {}
             for cls in history:
-                if isinstance(cls, str) and cls:
-                    counts[cls] = counts.get(cls, 0) + 1
+                counts[cls] = counts.get(cls, 0) + 1
             for cls, count in counts.items():
                 if cls == SCOPE_OVERFLOW and count >= 2:
                     reduction = max(reduction, 1)

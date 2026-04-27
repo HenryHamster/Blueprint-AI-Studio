@@ -33,9 +33,21 @@ function findMatchingClose(text: string, start: number, open: string, close: str
   return -1;
 }
 
+export class JsonExtractionError extends Error {
+  constructor(
+    public readonly kind: 'object' | 'array',
+    public readonly requiredKeys: readonly string[],
+    message: string,
+  ) {
+    super(message);
+    this.name = 'JsonExtractionError';
+  }
+}
+
 /**
  * Extract the first JSON object from `text` that contains all `requiredKeys`.
  * Returns the parsed object, or null if none found.
+ * Throws JsonExtractionError if matching candidates were present but malformed.
  */
 export function extractJsonObject<T = Record<string, unknown>>(text: string, ...requiredKeys: string[]): T | null {
   // Quick bail: all keys must appear somewhere in the text
@@ -43,6 +55,7 @@ export function extractJsonObject<T = Record<string, unknown>>(text: string, ...
     if (!text.includes(`"${key}"`)) return null;
   }
   let pos = 0;
+  const parseErrors: string[] = [];
   while (pos < text.length) {
     const start = text.indexOf('{', pos);
     if (start === -1) break;
@@ -52,9 +65,18 @@ export function extractJsonObject<T = Record<string, unknown>>(text: string, ...
     if (requiredKeys.every(k => candidate.includes(`"${k}"`))) {
       try {
         return JSON.parse(candidate) as T;
-      } catch { /* try next */ }
+      } catch (err: unknown) {
+        parseErrors.push(err instanceof Error ? err.message : String(err));
+      }
     }
     pos = start + 1;
+  }
+  if (requiredKeys.length > 0 && parseErrors.length > 0) {
+    throw new JsonExtractionError(
+      'object',
+      requiredKeys,
+      `Failed to parse JSON object containing required keys (${requiredKeys.join(', ')}): ${parseErrors[0]}`,
+    );
   }
   return null;
 }
@@ -62,12 +84,14 @@ export function extractJsonObject<T = Record<string, unknown>>(text: string, ...
 /**
  * Extract the first JSON array from `text` that contains objects with all `requiredKeys`.
  * Returns the parsed array, or null if none found.
+ * Throws JsonExtractionError if matching candidates were present but malformed.
  */
 export function extractJsonArray<T = unknown[]>(text: string, ...requiredKeys: string[]): T | null {
   for (const key of requiredKeys) {
     if (!text.includes(`"${key}"`)) return null;
   }
   let pos = 0;
+  const parseErrors: string[] = [];
   while (pos < text.length) {
     const start = text.indexOf('[', pos);
     if (start === -1) break;
@@ -77,9 +101,18 @@ export function extractJsonArray<T = unknown[]>(text: string, ...requiredKeys: s
     if (requiredKeys.every(k => candidate.includes(`"${k}"`))) {
       try {
         return JSON.parse(candidate) as T;
-      } catch { /* try next */ }
+      } catch (err: unknown) {
+        parseErrors.push(err instanceof Error ? err.message : String(err));
+      }
     }
     pos = start + 1;
+  }
+  if (requiredKeys.length > 0 && parseErrors.length > 0) {
+    throw new JsonExtractionError(
+      'array',
+      requiredKeys,
+      `Failed to parse JSON array containing required keys (${requiredKeys.join(', ')}): ${parseErrors[0]}`,
+    );
   }
   return null;
 }

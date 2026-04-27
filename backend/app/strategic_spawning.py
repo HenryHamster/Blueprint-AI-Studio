@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
 from app.models import Task, Project, TaskHistory, TaskStatus, ProjectMessage
 from app.payload_schemas import validate_internal_payload
@@ -72,13 +73,13 @@ async def _build_shipped_changes_manifest(
         cutoff = _parse_naive_utc(last_updated)
 
     if cutoff is None:
-        cycle_history = (project.vision or {}).get("_strategic_cycle_history") or []
-        for entry in reversed(cycle_history):
-            phase1_ts = entry.get("phase1_completed_at")
-            if phase1_ts:
-                cutoff = _parse_naive_utc(phase1_ts)
-                if cutoff is not None:
-                    break
+        # Audit W2: cycle history is the StrategicCycle table now. Walk
+        # newest-first; the helper returns rows in that order.
+        recent_cycles = await strategic_cycle.all_for_project(session, project.id, limit=20)
+        for c in recent_cycles:
+            if c.phase1_completed_at:
+                cutoff = c.phase1_completed_at
+                break
 
     # Query completed tasks updated after cutoff (filter pr_merged in Python)
     stmt = (
@@ -381,18 +382,21 @@ async def _build_recent_interventions(
     return result
 
 
-def _build_previous_decision_outcomes(project: Project) -> dict[str, Any] | None:
+def _build_previous_decision_outcomes(project: Project, cycle_history: list) -> dict[str, Any] | None:
     """Summarize outcomes of the most recent completed strategic cycle's
     direction create/retire decisions so the agent can learn from them.
 
-    Walks _strategic_cycle_history newest-first for an entry with outcome
+    Walks ``cycle_history`` newest-first for an entry with outcome
     "completed" that also recorded created_direction_ids or
     retired_direction_ids. For each direction id it looks up the current
     direction in project.directions and reports cycles_active, prs_merged,
     quality_score, and paused flags. Retired directions missing from the
     current list are reported with status="missing".
+
+    Audit W2: ``cycle_history`` is now passed in (was JSONB); the async
+    caller pre-fetches via ``strategic_cycle.recent_for_agent_context``.
     """
-    cycle_history = (project.vision or {}).get("_strategic_cycle_history") or []
+    cycle_history = list(cycle_history or [])
     if not cycle_history:
         return None
     prev_entry = None
@@ -637,7 +641,11 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         **({"model": doc_model} if doc_model else {}),
         **({"effort": doc_effort} if doc_effort else {}),
     }, "autonomous_research:design_doc_update")
-    cycle_id = "sc-" + uuid.uuid4().hex[:8]
+    # Audit W2: cycle history is a real table now (StrategicCycle); the
+    # 10-entry sliding-window cap in vision JSONB is gone. Snapshot the
+    # vision at cycle start so the 3-way merge in strategic_completion can
+    # compare user edits against the same baseline the agent was given.
+    cycle_id = strategic_cycle.new_cycle_id()
     new_task = Task(
         project_id=project.id,
         title=f"Architecture review: {project.name}",
@@ -647,32 +655,22 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
         context={"strategic_cycle_id": cycle_id},
+        strategic_cycle_id=cycle_id,
     )
     session.add(new_task)
+    await session.flush()  # assign new_task.id for the FK below
     history = TaskHistory(
         task_id=new_task.id, action="SPAWNED",
         details={"spawned_by": "STRATEGIC_CYCLE", "phase": "design_doc_update"},
     )
     session.add(history)
-    # Record cycle start in vision history (keep last 10 entries)
-    vision = dict(project.vision or {})
-    cycle_history = list(vision.get("_strategic_cycle_history") or [])
-    cycle_history.append({
-        "cycle_id": cycle_id,
-        "started_at": _utcnow().isoformat(),
-        "phase1_task_id": str(new_task.id),
-        "phase1_completed_at": None,
-        "phase2_task_id": None,
-        "phase2_completed_at": None,
-        "directions_created": 0,
-        "directions_retired": 0,
-        "vision_updated": False,
-        "outcome": "in_progress",
-    })
-    vision["_strategic_cycle_history"] = cycle_history[-10:]
-    project.vision = vision
-    flag_modified(project, "vision")
-    session.add(project)
+    await strategic_cycle.create(
+        session,
+        project_id=project.id,
+        cycle_id=cycle_id,
+        phase1_task_id=new_task.id,
+        baseline_vision=project.vision or {},
+    )
     await session.commit()
     logger.info(f"[STRATEGIC] Spawned design_doc_update task {new_task.id} for project {project.id} (cycle {cycle_id})")
     return True
@@ -829,8 +827,13 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
                     _runtime_config.get("task_type_efforts", {}).get("research") or None
 
     from app.strategic_analysis import _build_outcome_evaluation, _compute_prediction_calibration_factor  # noqa: PLC0415
+    # Audit W2: cycle history is in the StrategicCycle table; pre-fetch once
+    # and pass into all the sync analysis helpers so they don't need the session.
+    cycle_history = await strategic_cycle.recent_for_agent_context(
+        session, project.id, limit=20,
+    )
     last_strategic_at = await _find_last_strategic_cycle_time(project, session)
-    calibration_factor = _compute_prediction_calibration_factor(project)
+    calibration_factor = _compute_prediction_calibration_factor(project, cycle_history)
     if abs(calibration_factor - 1.0) < 0.05:
         calibration_note = f"Predictions are well-calibrated (factor {calibration_factor})."
     elif calibration_factor < 1.0:
@@ -857,12 +860,12 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "self_reflection_log": (project.self_reflection_log or [])[-5:],
         "is_self_repo": bool(project.is_self_repo),
         "directions_summary": direction_stats,
-        "outcome_evaluation": _build_outcome_evaluation(project),
+        "outcome_evaluation": _build_outcome_evaluation(project, cycle_history),
         "recent_interventions": recent_interventions,
         "prediction_calibration_factor": calibration_factor,
         "prediction_calibration_note": calibration_note,
         **({"previous_decision_outcomes": _prev_outcomes}
-           if (_prev_outcomes := _build_previous_decision_outcomes(project)) else {}),
+           if (_prev_outcomes := _build_previous_decision_outcomes(project, cycle_history)) else {}),
         **({"anomaly_summary": _anomaly_summary}
            if (_anomaly_summary := _build_anomaly_summary(project)) else {}),
         **({"playbook_summary": _playbook_summary}
@@ -884,26 +887,21 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
         context={"strategic_cycle_id": cycle_id} if cycle_id else {},
+        strategic_cycle_id=cycle_id,
     )
     session.add(new_task)
+    await session.flush()  # assign new_task.id for the cycle update below
     history = TaskHistory(
         task_id=new_task.id, action="SPAWNED",
         details={"spawned_by": "STRATEGIC_CYCLE", "phase": "strategic_review"},
     )
     session.add(history)
     if cycle_id:
-        # Record phase1 completion and phase2 task id in cycle history
-        vision = dict(project.vision or {})
-        cycle_history = list(vision.get("_strategic_cycle_history") or [])
-        for entry in cycle_history:
-            if entry.get("cycle_id") == cycle_id:
-                entry["phase1_completed_at"] = _utcnow().isoformat()
-                entry["phase2_task_id"] = str(new_task.id)
-                break
-        vision["_strategic_cycle_history"] = cycle_history
-        project.vision = vision
-        flag_modified(project, "vision")
-        session.add(project)
+        # Audit W2: record phase1 completion + phase2 task_id on the cycle
+        # row instead of patching vision._strategic_cycle_history JSONB.
+        await strategic_cycle.mark_phase1_completed(
+            session, cycle_id, phase2_task_id=new_task.id,
+        )
     await session.commit()
     logger.info(f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project.id}")
     return True

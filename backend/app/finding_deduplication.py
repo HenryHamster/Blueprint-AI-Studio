@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 from app.failure_classification import INFRA_CLASSES, classify_failure
@@ -36,6 +36,32 @@ _STOPWORDS = frozenset({
 })
 
 _PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def _task_context(task: Task) -> dict:
+    ctx = task.context or {}
+    return ctx if isinstance(ctx, dict) else {}
+
+
+def _task_finding_hash(task: Task) -> str | None:
+    value = _task_context(task).get("finding_hash")
+    return str(value) if value else None
+
+
+def _coerce_datetime_for_compare(value: datetime, reference: datetime) -> datetime:
+    if value.tzinfo is None and reference.tzinfo is not None:
+        return value.replace(tzinfo=timezone.utc)
+    if value.tzinfo is not None and reference.tzinfo is None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _within_code_error_cooldown(task: Task, now: datetime) -> bool:
+    """Return true while a CODE_ERROR task should still block respawn."""
+    if task.created_at is None:
+        return True
+    created_at = _coerce_datetime_for_compare(task.created_at, now)
+    return created_at + CODE_ERROR_COOLDOWN > now
 
 
 def finding_hash(title: str, description: str) -> str:
@@ -89,50 +115,43 @@ def build_dedup_state(
     now = now or _utcnow()
     recent_tasks = list(recent_tasks)
 
-    recent_finding_hashes: set[str] = {
-        t.context["finding_hash"]
-        for t in recent_tasks
-        if t.context and t.context.get("finding_hash")
-        # Exclude COMPLETED without pr_merged (code was never shipped)
-        and not (
-            t.status == TaskStatus.COMPLETED
-            and not (t.context or {}).get("pr_merged")
-        )
+    recent_finding_hashes: set[str] = set()
+    failed_hashes: dict[str, object] = {}
+    for t in recent_tasks:
+        ctx = _task_context(t)
+        fhash = _task_finding_hash(t)
+        if not fhash:
+            continue
+        if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+            failed_hashes[fhash] = t.status
+        # Exclude COMPLETED without pr_merged (code was never shipped).
+        if t.status == TaskStatus.COMPLETED and not ctx.get("pr_merged"):
+            continue
         # Exclude ghost merges: pr_merged=True but rollup parent failed (code
         # never reached main).
-        and not (
+        if (
             t.status == TaskStatus.COMPLETED
-            and (t.context or {}).get("pr_merged")
+            and ctx.get("pr_merged")
             and t.parent_task_id in failed_parent_ids
-        )
-        # Exclude transient infra failures (task never ran, should be retried).
-        and not (
-            t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
-            and classify_failure(t) in INFRA_CLASSES
-        )
-        # Exclude CODE_ERROR failures older than cooldown — codebase may have
-        # changed, or improved context may allow a different implementation
-        # approach. Tasks within the cooldown window still block to prevent
-        # rapid re-spin loops.
-        and not (
-            t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
-            and classify_failure(t) == "CODE_ERROR"
-            and t.created_at < now - CODE_ERROR_COOLDOWN
-        )
-    }
-
-    failed_hashes: dict[str, object] = {
-        t.context["finding_hash"]: t.status
-        for t in recent_tasks
-        if t.context and t.context.get("finding_hash")
-        and t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
-    }
+        ):
+            continue
+        if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+            failure_class = classify_failure(t)
+            # Exclude transient infra failures (task never ran, should be retried).
+            if failure_class in INFRA_CLASSES:
+                continue
+            # Exclude CODE_ERROR failures after their task-specific cooldown has
+            # elapsed. This is equivalent in intent to "created_at+48h", but is
+            # explicit and handles aware/naive timestamps consistently.
+            if failure_class == "CODE_ERROR" and not _within_code_error_cooldown(t, now):
+                continue
+        recent_finding_hashes.add(fhash)
 
     prior_failure_by_hash: dict[str, Task] = {}
     for pt in recent_tasks:
         if not pt.context:
             continue
-        pfh = pt.context.get("finding_hash")
+        pfh = _task_finding_hash(pt)
         if not pfh:
             continue
         if pt.status not in (TaskStatus.FAILED, TaskStatus.CANCELLED):
@@ -145,8 +164,10 @@ def build_dedup_state(
     # user-cancelled low-priority tasks).
     now_iso = now.isoformat()
     for t in recent_tasks:
-        if t.context and t.context.get("suppress_until") and t.context["suppress_until"] > now_iso:
-            fhash = t.context.get("finding_hash")
+        ctx = _task_context(t)
+        suppress_until = ctx.get("suppress_until")
+        if suppress_until and str(suppress_until) > now_iso:
+            fhash = _task_finding_hash(t)
             if fhash:
                 recent_finding_hashes.add(fhash)
                 failed_hashes.setdefault(fhash, "suppressed")

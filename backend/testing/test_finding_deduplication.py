@@ -97,6 +97,28 @@ def test_build_dedup_state_includes_completed_pr_merged():
     assert "merged1" in hashes
 
 
+def test_build_dedup_state_reads_finding_hash_once():
+    """Regression: get()+[] access could KeyError if context changed between reads."""
+
+    class VolatileContext(dict):
+        def get(self, key, default=None):
+            if key == "finding_hash":
+                return "volatile1"
+            return super().get(key, default)
+
+        def __getitem__(self, key):
+            if key == "finding_hash":
+                raise KeyError(key)
+            return super().__getitem__(key)
+
+    t = _make_task(status=TaskStatus.COMPLETED, context={"finding_hash": "placeholder"})
+    t.context = VolatileContext({"pr_merged": True})
+    hashes, failed, prior = build_dedup_state([t], failed_parent_ids=set())
+    assert "volatile1" in hashes
+    assert failed == {}
+    assert prior == {}
+
+
 def test_build_dedup_state_excludes_ghost_merges():
     parent_id = uuid.uuid4()
     t = _make_task(
@@ -140,6 +162,18 @@ def test_build_dedup_state_code_error_cooldown_boundary():
     # within-cooldown blocks; beyond-cooldown allows respawn
     assert "cool1" in hashes
     assert "cool2" not in hashes
+
+
+def test_build_dedup_state_code_error_cooldown_boundary_uses_created_at_plus_window():
+    now = datetime.utcnow()
+    at_boundary = _make_task(
+        status=TaskStatus.FAILED,
+        context={"finding_hash": "boundary"},
+        created_at=now - CODE_ERROR_COOLDOWN,
+        latest_status_message="CODE_ERROR: unit test failed at assertion",
+    )
+    hashes, _, _ = build_dedup_state([at_boundary], failed_parent_ids=set(), now=now)
+    assert "boundary" not in hashes
 
 
 def test_build_dedup_state_suppress_until_active():

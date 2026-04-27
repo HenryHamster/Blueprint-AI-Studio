@@ -585,6 +585,34 @@ async def test_extract_ci_context_no_token():
     assert signals == {"failing_tests": [], "error_locations": [], "error_messages": []}
 
 
+@pytest.mark.asyncio
+async def test_extract_ci_context_skips_failed_check_without_name():
+    """Malformed CI details should not collapse the whole extraction result."""
+    mock_ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "details": [
+            {"status": "completed", "conclusion": "failure"},
+            {"name": "CI / lint", "status": "completed", "conclusion": "failure"},
+        ],
+        "failed_logs": "src/App.tsx:12:5 error: lint failed",
+    }
+
+    with patch("app.auto_remediation.get_check_runs_cached", new_callable=AsyncMock) as mock_runs, \
+         patch("app.auto_remediation.get_repo_installation_token", new_callable=AsyncMock) as mock_token:
+        mock_token.return_value = "ghp_test_token"
+        mock_runs.return_value = mock_ci_result
+
+        failed_checks, error_summary, failure_type, signals = await _extract_ci_context(
+            "acme", "webapp", "deadbeef", uuid.uuid4(), AsyncMock(),
+        )
+
+    assert failed_checks == ["CI / lint"]
+    assert error_summary == "src/App.tsx:12:5 error: lint failed"
+    assert failure_type == "lint"
+    assert "src/App.tsx:12" in signals["error_locations"]
+
+
 def test_extract_structured_signals_pytest():
     """Pytest FAILED lines and Python tracebacks are extracted even past truncation."""
     logs = (
