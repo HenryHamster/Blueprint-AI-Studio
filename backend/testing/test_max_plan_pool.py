@@ -21,6 +21,7 @@ from app.max_plan_pool import (
     cascade_disabled_models,
     describe_pool_blockage,
     get_account_health_stats,
+    get_all_account_health_summaries,
     summarize_pool_state,
     _account_by_id,
     _max_plan_pools,
@@ -423,3 +424,105 @@ class TestSerializeDisabledModelInfo:
         at = datetime(2026, 4, 22, 3, 0, tzinfo=timezone.utc)
         out = _serialize_disabled_model_info({"hits": 1, "at": at, "kind": "rate_limit"})
         assert "kind" not in out
+
+
+# ── get_all_account_health_summaries ─────────────────────────────────────────
+
+class TestGetAllAccountHealthSummaries:
+    def _reset_pools(self):
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+
+    def test_returns_empty_for_unknown_user(self):
+        self._reset_pools()
+        try:
+            assert get_all_account_health_summaries(user_id="nobody") == []
+        finally:
+            self._reset_pools()
+
+    def test_healthy_account_has_expected_keys(self):
+        self._reset_pools()
+        try:
+            now = datetime.utcnow()
+            acct = _acct(id="h1", user_id="u", name="TestAcct")
+            _account_by_id["h1"] = acct
+            _max_plan_pools["u"] = [acct]
+            summaries = get_all_account_health_summaries(user_id="u", now=now)
+            assert len(summaries) == 1
+            s = summaries[0]
+            assert s["state"] == "healthy"
+            assert s["health_score"] == 0.0
+            assert s["rate_limited_models"] == []
+            assert s["disqualify_threshold"] == _HEALTH_SCORE_DISQUALIFY_THRESHOLD
+            assert s["name"] == "TestAcct"
+            assert s["id"] == "h1"
+        finally:
+            self._reset_pools()
+
+    def test_rate_limited_account_shows_cooldown(self):
+        self._reset_pools()
+        try:
+            now = datetime.utcnow()
+            acct = _acct(id="r1", user_id="u",
+                         disabled_models={OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}})
+            _account_by_id["r1"] = acct
+            _max_plan_pools["u"] = [acct]
+            summaries = get_all_account_health_summaries(user_id="u", now=now)
+            s = summaries[0]
+            assert s["state"] == "unavailable"
+            assert len(s["rate_limited_models"]) == 1
+            rl = s["rate_limited_models"][0]
+            assert rl["model"] == OPUS
+            assert rl["kind"] == "rate_limit"
+            assert rl["cooldown_remaining_seconds"] > 0
+        finally:
+            self._reset_pools()
+
+    def test_disabled_account_shows_fully_disabled(self):
+        self._reset_pools()
+        try:
+            now = datetime.utcnow()
+            acct = _acct(id="d1", user_id="u", enabled=False,
+                         disabled_reason="auto-disabled after 5 rate-limit hits")
+            _account_by_id["d1"] = acct
+            _max_plan_pools["u"] = [acct]
+            summaries = get_all_account_health_summaries(user_id="u", now=now)
+            s = summaries[0]
+            assert s["state"] == "fully_disabled"
+            assert s["disabled_reason"] is not None
+        finally:
+            self._reset_pools()
+
+    def test_low_health_score_shows_disqualified(self):
+        self._reset_pools()
+        try:
+            now = datetime.utcnow()
+            # 3 rl_events → score = -6, below threshold of -4
+            acct = _acct(id="q1", user_id="u",
+                         rl_events=[now - timedelta(hours=i) for i in range(1, 4)])
+            _account_by_id["q1"] = acct
+            _max_plan_pools["u"] = [acct]
+            summaries = get_all_account_health_summaries(user_id="u", now=now)
+            s = summaries[0]
+            assert s["state"] == "disqualified"
+            assert s["health_score"] < _HEALTH_SCORE_DISQUALIFY_THRESHOLD
+        finally:
+            self._reset_pools()
+
+    def test_quota_exhausted_distinct_from_rate_limit(self):
+        """quota_exhausted kind is preserved in rate_limited_models and has 24h cooldown."""
+        self._reset_pools()
+        try:
+            now = datetime.utcnow()
+            acct = _acct(id="qe1", user_id="u",
+                         disabled_models={OPUS: {"hits": 1, "at": now - timedelta(minutes=5),
+                                                  "kind": "quota_exhausted"}})
+            _account_by_id["qe1"] = acct
+            _max_plan_pools["u"] = [acct]
+            summaries = get_all_account_health_summaries(user_id="u", now=now)
+            s = summaries[0]
+            rl = s["rate_limited_models"][0]
+            assert rl["kind"] == "quota_exhausted"
+            assert rl["cooldown_remaining_seconds"] > 23 * 3600
+        finally:
+            self._reset_pools()

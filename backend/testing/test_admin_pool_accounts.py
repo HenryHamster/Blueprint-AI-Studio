@@ -1,8 +1,12 @@
+import uuid
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
+import pytest
 from sqlmodel import select
 
-from app.models import LLMAuthMode, LLMProviderName, MaxPlanAccount
+from app.max_plan_pool import _account_by_id, _max_plan_pools
+from app.models import LLMAuthMode, LLMProviderName, MaxPlanAccount, Project, Task, TaskStatus
 
 
 async def test_add_max_plan_account_legacy_anthropic_payload(client, db_session, mocker):
@@ -215,3 +219,174 @@ async def test_update_max_plan_account_allows_auth_mode_change_with_existing_cla
     await db_session.refresh(acct)
     assert acct.auth_mode == LLMAuthMode.API_KEY
     assert acct.claude_config_json is None
+
+
+# ── /max-plan-accounts/health ──────────────────────────────────────────────
+
+@pytest.fixture
+def inject_pool():
+    """Inject test accounts into the in-memory pool with auto-cleanup."""
+    injected: dict[str, list[str]] = {}  # user_id -> [account_ids]
+
+    def _inject(user_id: str, accounts: list):
+        _max_plan_pools[user_id] = accounts
+        for a in accounts:
+            _account_by_id[a["id"]] = a
+        injected.setdefault(user_id, []).extend(a["id"] for a in accounts)
+
+    yield _inject
+
+    for uid, acct_ids in injected.items():
+        _max_plan_pools.pop(uid, None)
+        for acct_id in acct_ids:
+            _account_by_id.pop(acct_id, None)
+
+
+async def test_account_health_summary_returns_per_account_data(client, inject_pool):
+    """Health endpoint returns one entry per in-pool account with correct fields."""
+    now = datetime.utcnow()
+    acct_id = str(uuid.uuid4())
+    acct = {
+        "id": acct_id,
+        "name": "Test Account",
+        "provider": "anthropic",
+        "auth_mode": "oauth",
+        "oauth_token": "sk-ant-test",
+        "enabled": True,
+        "active_tasks": 0,
+        "completion_events": [{"at": now - timedelta(hours=1), "duration_seconds": 30}],
+        "rl_events": [now - timedelta(hours=2)],
+    }
+    inject_pool("test-user-123", [acct])
+
+    res = await client.get("/api/admin/max-plan-accounts/health")
+    assert res.status_code == 200
+    body = res.json()
+    assert len(body["accounts"]) == 1
+    a = body["accounts"][0]
+    assert a["account_id"] == acct_id
+    assert a["label"] == "Test Account"
+    assert a["state"] == "healthy"
+    assert a["completions_24h"] == 1
+    assert a["rl_events_24h"] == 1
+    assert a["health_score"] == -1.0  # 1 completion - 2 * 1 rl_event
+    assert set(a["failure_class_counts"].keys()) == set(
+        ["CODE_ERROR", "RATE_LIMIT", "EXTERNAL_API",
+         "PROVISION_FAILURE", "MIGRATION_ERROR", "AGENT_TIMEOUT", "SCOPE_OVERFLOW"]
+    )
+    assert all(v == 0 for v in a["failure_class_counts"].values())
+    assert a["rate_limited_models"] == []
+
+
+async def test_account_health_summary_failure_class_window_filter(client, db_session, inject_pool):
+    """Only tasks updated within the 24h window contribute to failure_class_counts."""
+    now = datetime.utcnow()
+    acct_id = str(uuid.uuid4())
+    acct = {
+        "id": acct_id, "name": "Window Test", "provider": "anthropic",
+        "auth_mode": "oauth", "oauth_token": "sk-ant-test",
+        "enabled": True, "active_tasks": 0,
+    }
+    inject_pool("test-user-123", [acct])
+
+    project = Project(name="p", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    task_in = Task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        latest_status_message="tests failed: assertion error",
+        context={"llm_account_id": acct_id},
+        updated_at=now - timedelta(hours=12),
+    )
+    task_out = Task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        latest_status_message="tests failed: assertion error",
+        context={"llm_account_id": acct_id},
+        updated_at=now - timedelta(hours=36),
+    )
+    db_session.add_all([task_in, task_out])
+    await db_session.commit()
+
+    res = await client.get("/api/admin/max-plan-accounts/health")
+    assert res.status_code == 200
+    a = res.json()["accounts"][0]
+    assert a["failure_class_counts"]["CODE_ERROR"] == 1  # only task_in counted
+    assert sum(a["failure_class_counts"].values()) == 1
+
+
+async def test_account_health_summary_user_isolation(client, inject_pool):
+    """Health endpoint only returns accounts belonging to the authenticated user."""
+    acct_other = {
+        "id": str(uuid.uuid4()), "name": "Other User Account",
+        "provider": "anthropic", "auth_mode": "oauth",
+        "oauth_token": "sk-ant-other", "enabled": True, "active_tasks": 0,
+    }
+    inject_pool("other-user-456", [acct_other])
+    inject_pool("test-user-123", [])
+
+    res = await client.get("/api/admin/max-plan-accounts/health")
+    assert res.status_code == 200
+    assert res.json()["accounts"] == []
+
+
+async def test_account_health_summary_fully_disabled_state(client, inject_pool):
+    """Accounts with enabled=False show state='disabled' regardless of health score."""
+    acct_id = str(uuid.uuid4())
+    acct = {
+        "id": acct_id, "name": "Disabled Account", "provider": "anthropic",
+        "auth_mode": "oauth", "oauth_token": "sk-ant-test",
+        "enabled": False, "active_tasks": 0,
+        "disabled_reason": "auto-disabled after 5 rate-limit hit(s)",
+    }
+    inject_pool("test-user-123", [acct])
+
+    res = await client.get("/api/admin/max-plan-accounts/health")
+    assert res.status_code == 200
+    a = res.json()["accounts"][0]
+    assert a["state"] == "disabled"
+    assert a["disabled_reason"] == "auto-disabled after 5 rate-limit hit(s)"
+
+
+async def test_account_health_summary_disqualified_state(client, inject_pool):
+    """Healthy accounts with health score below the disqualify threshold show state='disqualified'."""
+    now = datetime.utcnow()
+    acct_id = str(uuid.uuid4())
+    # 0 completions, 3 RL events → score = 0 - 2*3 = -6, below threshold of -4
+    acct = {
+        "id": acct_id, "name": "Disqualified Account", "provider": "anthropic",
+        "auth_mode": "oauth", "oauth_token": "sk-ant-test",
+        "enabled": True, "active_tasks": 0,
+        "rl_events": [now - timedelta(hours=1), now - timedelta(hours=2), now - timedelta(hours=3)],
+    }
+    inject_pool("test-user-123", [acct])
+
+    res = await client.get("/api/admin/max-plan-accounts/health")
+    assert res.status_code == 200
+    a = res.json()["accounts"][0]
+    assert a["state"] == "disqualified"
+    assert a["health_score"] < -4
+
+
+async def test_account_health_summary_disabled_models_with_kind(client, inject_pool):
+    """Disabled models list distinguishes quota_exhausted from exponential cooldown."""
+    now = datetime.utcnow()
+    acct_id = str(uuid.uuid4())
+    acct = {
+        "id": acct_id, "name": "RL Account", "provider": "anthropic",
+        "auth_mode": "oauth", "oauth_token": "sk-ant-test",
+        "enabled": True, "active_tasks": 0,
+        "disabled_models": {
+            "claude-opus-4-7": {"hits": 1, "at": now - timedelta(minutes=5)},
+            "claude-sonnet-4-6": {"hits": 2, "at": now - timedelta(hours=1), "kind": "quota_exhausted"},
+        },
+    }
+    inject_pool("test-user-123", [acct])
+
+    res = await client.get("/api/admin/max-plan-accounts/health")
+    assert res.status_code == 200
+    a = res.json()["accounts"][0]
+    mods = {m["model"]: m for m in a["rate_limited_models"]}
+    assert mods["claude-opus-4-7"]["cooldown_type"] == "rate_limit"
+    assert mods["claude-sonnet-4-6"]["cooldown_type"] == "quota_exhausted"
+    assert mods["claude-sonnet-4-6"]["cooldown_seconds_remaining"] > 3600  # flat 24h

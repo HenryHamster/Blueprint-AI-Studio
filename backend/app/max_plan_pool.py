@@ -839,6 +839,75 @@ def summarize_pool_state(model: str | None, user_id: str | None = None) -> Dict[
     }
 
 
+def get_all_account_health_summaries(
+    user_id: str | None = None, now: datetime | None = None
+) -> list[dict]:
+    """Return per-account health summaries for the admin dashboard.
+
+    Reads exclusively from the in-memory pool so the operator sees the same
+    state that routing decisions are based on.
+
+    Each entry includes: id, name, provider, auth_mode, state
+    (healthy/probing/disqualified/unavailable/fully_disabled), health_score,
+    completions_24h, rl_events_24h, avg_duration_seconds, active_tasks,
+    daily_task_count, daily_task_cap, max_concurrent_tasks,
+    disqualify_threshold, disabled_reason, and rate_limited_models (with
+    model name, kind, hits, cooldown_remaining_seconds per entry).
+    """
+    now = now or _utcnow()
+    accts = _max_plan_pools.get(user_id, []) if user_id else _all_accounts()
+    results = []
+    for acct in accts:
+        health_stats = get_account_health_stats(acct, now=now)
+
+        if not acct.get("enabled", True):
+            state = "fully_disabled"
+        else:
+            # Use Opus as the reference model (primary dispatch model).
+            circuit_state = _account_state_for_model(acct, _OPUS_MODEL, now=now)
+            if (
+                circuit_state == "healthy"
+                and health_stats["health_score"] < _HEALTH_SCORE_DISQUALIFY_THRESHOLD
+            ):
+                state = "disqualified"
+            else:
+                state = circuit_state
+
+        rate_limited_models = []
+        for model_name, info in (acct.get("disabled_models") or {}).items():
+            at_dt = info.get("at")
+            if at_dt is None:
+                continue
+            total_cooldown = _cooldown_seconds_for_info(info)
+            remaining = max(0.0, total_cooldown - (now - at_dt).total_seconds())
+            rate_limited_models.append({
+                "model": model_name,
+                "kind": info.get("kind", "rate_limit"),
+                "hits": info.get("hits", 1),
+                "cooldown_remaining_seconds": int(remaining),
+            })
+
+        results.append({
+            "id": acct["id"],
+            "name": acct.get("name", ""),
+            "provider": acct.get("provider", "anthropic"),
+            "auth_mode": acct.get("auth_mode", "oauth"),
+            "state": state,
+            "disabled_reason": acct.get("disabled_reason"),
+            "health_score": health_stats["health_score"],
+            "completions_24h": health_stats["completions_24h"],
+            "rl_events_24h": health_stats["rl_events_24h"],
+            "avg_duration_seconds": health_stats["avg_duration_seconds"],
+            "active_tasks": acct.get("active_tasks", 0),
+            "daily_task_count": acct.get("daily_task_count", 0),
+            "daily_task_cap": acct.get("daily_task_cap"),
+            "max_concurrent_tasks": acct.get("max_concurrent_tasks"),
+            "disqualify_threshold": _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
+            "rate_limited_models": rate_limited_models,
+        })
+    return results
+
+
 def describe_pool_blockage(model: str | None, user_id: str | None = None) -> str:
     """Human-readable description of why no account can pick up a task.
     Used by reaper queued-age alerts to distinguish rate-limit cooldown from

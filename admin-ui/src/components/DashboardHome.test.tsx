@@ -89,12 +89,14 @@ function setupApiMocks({
   openPRs,
   mediumScope,
   scopeBaselines,
+  accountHealth,
 }: {
   digest?: unknown;
   diagnostics?: unknown;
   openPRs?: unknown;
   mediumScope?: unknown;
   scopeBaselines?: unknown;
+  accountHealth?: unknown;
 }) {
   apiFetchMock.mockImplementation((url: string) => {
     if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse(digest ?? {}));
@@ -102,6 +104,7 @@ function setupApiMocks({
     if (url.includes('/api/admin/open-prs')) return Promise.resolve(jsonResponse(openPRs ?? { open_prs: [] }));
     if (url.includes('/api/admin/medium-scope-measurement')) return Promise.resolve(jsonResponse(mediumScope ?? {}));
     if (url.includes('/api/admin/scope-baselines')) return Promise.resolve(jsonResponse(scopeBaselines ?? {}));
+    if (url.includes('/api/admin/max-plan-accounts/health')) return Promise.resolve(jsonResponse(accountHealth ?? { accounts: [] }));
     return Promise.resolve(jsonResponse({}));
   });
 }
@@ -304,6 +307,85 @@ describe('DashboardHome', () => {
 
     await user.click(await screen.findByText('Stabilize post-merge checks'));
     expect(onDirectionClick).toHaveBeenCalledWith('dir-123');
+  });
+
+  it('renders pool account health panel with a healthy account', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+      accountHealth: {
+        accounts: [
+          {
+            account_id: 'acct-1',
+            label: 'Main Anthropic',
+            provider: 'anthropic',
+            state: 'healthy',
+            health_score: 0.92,
+            completions_24h: 120,
+            rl_events_24h: 2,
+            rate_limited_models: [],
+            failure_class_counts: { CODE_ERROR: 3, RATE_LIMIT: 1 },
+          },
+        ],
+      },
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    expect(await screen.findByText('Provider Account Health')).toBeInTheDocument();
+    expect(screen.getByText('Main Anthropic')).toBeInTheDocument();
+    expect(screen.getByText('healthy')).toBeInTheDocument();
+    expect(screen.getByText('92%')).toBeInTheDocument();
+    expect(screen.getByText('120c 2rl')).toBeInTheDocument();
+  });
+
+  it('shows disabled state with reason and expands to reveal quota-vs-cooldown badges', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+      accountHealth: {
+        accounts: [
+          {
+            account_id: 'acct-2',
+            label: 'Backup Account',
+            provider: 'anthropic',
+            state: 'disqualified',
+            disabled_reason: null,
+            health_score: 0.2,
+            completions_24h: 5,
+            rl_events_24h: 20,
+            rate_limited_models: [
+              { model: 'claude-3-5-sonnet', cooldown_seconds_remaining: 1800, cooldown_type: 'rate_limit' },
+              { model: 'claude-3-opus', cooldown_seconds_remaining: 86400, cooldown_type: 'quota_exhausted' },
+            ],
+            failure_class_counts: { RATE_LIMIT: 20 },
+          },
+        ],
+      },
+    });
+
+    const user = userEvent.setup();
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    expect(await screen.findByText('Provider Account Health')).toBeInTheDocument();
+    expect(screen.getByText('disqualified')).toBeInTheDocument();
+
+    // Expand the account row to reveal disabled-model badges
+    await user.click(screen.getByRole('button', { name: /Backup Account/i }));
+
+    expect(screen.getByText(/24h quota/)).toBeInTheDocument();
+    expect(screen.getByText(/30m/)).toBeInTheDocument();
+  });
+
+  it('does not render pool health panel when no project is selected', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId={null} onViewTask={vi.fn()} />);
+
+    await screen.findByText('No active directions');
+    expect(screen.queryByText('Provider Account Health')).not.toBeInTheDocument();
   });
 
   it('calls onViewTask when clicking a stuck-task actionable issue', async () => {

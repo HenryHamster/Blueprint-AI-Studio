@@ -5,6 +5,7 @@ import pytest
 
 from app.failure_classification import (
     AGENT_TIMEOUT,
+    ALL_FAILURE_CLASSES,
     CODE_ERROR,
     EXTERNAL_API,
     EXTERNAL_API_SUBTYPE_DB_CONNECTIVITY,
@@ -25,9 +26,11 @@ from app.failure_classification import (
     classify_failure,
     classify_failure_taxonomy,
     classify_timeout_subtype,
+    get_account_failure_class_counts,
     get_top_residual_fingerprints,
     normalize_agent_failure_category,
     persist_failure_category,
+    record_account_failure_class,
     record_residual_fingerprint,
     should_trigger_code_defect_investigation,
     should_trigger_review_quality_investigation,
@@ -927,3 +930,46 @@ class TestPersistFailureCategoryExternalApiSubtype:
         task = _task("No heartbeat received")
         persist_failure_category(task, AGENT_TIMEOUT)
         assert "external_api_subtype" not in task.context
+
+
+class TestAccountFailureClassTracking:
+    def setup_method(self):
+        import app.failure_classification as fc
+        fc._account_failure_log.clear()
+
+    def test_record_and_retrieve_counts(self):
+        record_account_failure_class("acct-1", CODE_ERROR)
+        record_account_failure_class("acct-1", CODE_ERROR)
+        record_account_failure_class("acct-1", RATE_LIMIT)
+        counts = get_account_failure_class_counts("acct-1")
+        assert counts[CODE_ERROR] == 2
+        assert counts[RATE_LIMIT] == 1
+        assert counts[EXTERNAL_API] == 0
+
+    def test_unknown_account_returns_zero_counts(self):
+        counts = get_account_failure_class_counts("nonexistent-acct")
+        assert all(v == 0 for v in counts.values())
+        assert set(counts.keys()) == set(ALL_FAILURE_CLASSES)
+
+    def test_window_filter_excludes_old_events(self):
+        import app.failure_classification as fc
+        import time
+        fc._account_failure_log["acct-2"] = {CODE_ERROR: [time.time() - 90000]}
+        counts = get_account_failure_class_counts("acct-2", window_seconds=86400)
+        assert counts[CODE_ERROR] == 0
+
+    def test_persist_failure_category_records_for_account(self):
+        task = _task("some error", ctx={"llm_account_id": "acct-3"})
+        persist_failure_category(task, CODE_ERROR)
+        counts = get_account_failure_class_counts("acct-3")
+        assert counts[CODE_ERROR] == 1
+
+    def test_persist_without_account_id_does_not_raise(self):
+        task = _task("some error")
+        persist_failure_category(task, CODE_ERROR)
+
+    def test_all_failure_classes_coverage(self):
+        for cls in ALL_FAILURE_CLASSES:
+            record_account_failure_class("acct-all", cls)
+        counts = get_account_failure_class_counts("acct-all")
+        assert all(counts[cls] == 1 for cls in ALL_FAILURE_CLASSES)

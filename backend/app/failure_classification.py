@@ -158,6 +158,11 @@ INFRA_CLASSES: frozenset[str] = frozenset({
     SCOPE_OVERFLOW,
 })
 
+# Ordered tuple of all canonical failure classes for per-account health panel display.
+ALL_FAILURE_CLASSES: tuple[str, ...] = (
+    CODE_ERROR, RATE_LIMIT, EXTERNAL_API, PROVISION_FAILURE, MIGRATION_ERROR, AGENT_TIMEOUT, SCOPE_OVERFLOW,
+)
+
 
 # Taxonomy sub-categories — finer-grained grouping for failure-mode analysis.
 # INFRA_RELATED covers everything in INFRA_CLASSES; the other three partition
@@ -453,6 +458,9 @@ def persist_failure_category(task: "Task", failure_class: str, logs: str | None 
         status_msg = task.latest_status_message or ""
         ctx["external_api_subtype"] = _external_api_subtype_from_message(status_msg + " " + (logs or ""))
     task.context = ctx
+    account_id = ctx.get("llm_account_id") or ctx.get("max_plan_account_id")
+    if account_id:
+        record_account_failure_class(str(account_id), failure_class)
 
 
 def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
@@ -624,6 +632,9 @@ _residual_seen_task_ids: set[str] = set()
 _RESIDUAL_MAX_FINGERPRINTS = 300
 _RESIDUAL_SEEN_MAX = 20_000
 
+# Per-account failure class log — rolling 24h window, keyed account_id → {class → [timestamps]}.
+_account_failure_log: dict[str, dict[str, list[float]]] = {}
+
 _RE_UUID = re.compile(
     r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b',
     re.IGNORECASE,
@@ -778,6 +789,25 @@ def get_top_residual_fingerprints(window_seconds: int = 86400, top_n: int = 10) 
     ]
     results.sort(key=lambda x: x['count'], reverse=True)
     return results[:top_n]
+
+
+def record_account_failure_class(account_id: str, failure_class: str) -> None:
+    """Record a failure-class event for an account in the rolling 24h window."""
+    if not account_id:
+        return
+    now = time.time()
+    by_class = _account_failure_log.setdefault(account_id, {})
+    timestamps = by_class.setdefault(failure_class, [])
+    timestamps.append(now)
+    cutoff = now - 86400
+    by_class[failure_class] = [t for t in timestamps if t >= cutoff]
+
+
+def get_account_failure_class_counts(account_id: str, window_seconds: int = 86400) -> dict[str, int]:
+    """Return per-failure-class counts for an account within the time window."""
+    cutoff = time.time() - window_seconds
+    by_class = _account_failure_log.get(account_id, {})
+    return {cls: sum(1 for t in by_class.get(cls, []) if t >= cutoff) for cls in ALL_FAILURE_CLASSES}
 
 
 def classify_failure(task: "Task", logs: str | None = None) -> str:

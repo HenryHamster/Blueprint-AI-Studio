@@ -167,3 +167,5 @@ export interface ZoneHealthEntry {
   consecutive_failures: number;
   cooldown_active: boolean;
 }
+
+

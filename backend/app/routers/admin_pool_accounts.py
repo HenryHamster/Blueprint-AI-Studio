@@ -176,6 +176,79 @@ def _parse_cap(payload: Dict[str, Any], field: str) -> int | None | object:
 
 _UNSET = object()
 
+_HEALTH_FAILURE_CLASSES = (
+    "CODE_ERROR", "RATE_LIMIT", "EXTERNAL_API",
+    "PROVISION_FAILURE", "MIGRATION_ERROR", "AGENT_TIMEOUT", "SCOPE_OVERFLOW",
+)
+
+
+@router.get("/max-plan-accounts/health")
+async def get_account_health_summary(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Per-account health summary: state, 24h completions/RL events, health score,
+    rate-limited models with cooldown, and per-failure-class task counts."""
+    from datetime import timedelta
+
+    from app.failure_classification import classify_failure
+    from app.max_plan_pool import get_all_account_health_summaries
+
+    user_id = current_user["user_id"]
+    now = _utcnow()
+    cutoff = now - timedelta(hours=24)
+
+    summaries = get_all_account_health_summaries(user_id=user_id, now=now)
+
+    account_ids = {s["id"] for s in summaries}
+    failure_counts: dict[str, dict[str, int]] = {}
+    if account_ids:
+        failed_tasks = (
+            await session.execute(
+                select(Task).where(
+                    Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+                    Task.updated_at >= cutoff,
+                    Task.latest_status_message.isnot(None),
+                )
+            )
+        ).scalars().all()
+        for t in failed_tasks:
+            ctx = t.context or {}
+            acct_id = ctx.get("llm_account_id") or ctx.get("max_plan_account_id")
+            if acct_id not in account_ids:
+                continue
+            fc = classify_failure(t)
+            bucket = failure_counts.setdefault(acct_id, {c: 0 for c in _HEALTH_FAILURE_CLASSES})
+            if fc in bucket:
+                bucket[fc] += 1
+
+    accounts = []
+    for s in summaries:
+        acct_id = s["id"]
+        state = "disabled" if s["state"] == "fully_disabled" else s["state"]
+        rate_limited_models = [
+            {
+                "model": m["model"],
+                "cooldown_type": m["kind"],
+                "cooldown_seconds_remaining": m["cooldown_remaining_seconds"],
+            }
+            for m in s["rate_limited_models"]
+        ]
+        accounts.append({
+            "account_id": acct_id,
+            "label": s.get("name", acct_id),
+            "provider": s.get("provider"),
+            "state": state,
+            "disabled_reason": s.get("disabled_reason"),
+            "health_score": s["health_score"],
+            "completions_24h": s["completions_24h"],
+            "rl_events_24h": s["rl_events_24h"],
+            "rate_limited_models": rate_limited_models,
+            "failure_class_counts": failure_counts.get(acct_id, {c: 0 for c in _HEALTH_FAILURE_CLASSES}),
+        })
+
+    return {"accounts": accounts}
+
 
 @router.post("/max-plan-accounts")
 @limiter.limit("10/minute")
