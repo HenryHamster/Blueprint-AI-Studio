@@ -1019,6 +1019,9 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
     # "creating pull request for blueprint/" is the agent's heartbeat during PR push — never an error
     # message. Tasks that die in this state (OOM, SIGKILL) leave this stale heartbeat as
     # latest_status_message; they must not create CODE_ERROR fingerprints in the residual store.
+    # "using tool: " is the agent's heartbeat during a Claude Code tool call (Grep, Read, Edit, etc.).
+    # Tasks reaped mid-tool-call (VM kill, network drop, OOM of the Claude subprocess) leave this
+    # as latest_status_message; they are infrastructure deaths, not code defects.
     if any(kw in combined for kw in ["no heartbeat", "reaped", "never started",
                                       "execution timed out", "sigterm",
                                       "out of memory", "oom-kill", "memory limit exceeded",
@@ -1028,7 +1031,8 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
                                       "node process killed",
                                       "oom killer", "killed by", "cgroup",
                                       "[fatal:", "fatal error", "process crashed",
-                                      "creating pull request for blueprint/"]):
+                                      "creating pull request for blueprint/",
+                                      "using tool: "]):
         return "AGENT_TIMEOUT"
 
     # Orchestration constraints — dependency waits are not code defects

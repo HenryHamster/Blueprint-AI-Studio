@@ -252,6 +252,22 @@ class TestClassifyFailureAgentTimeout:
         msg = "[13.6MB] Creating pull request for blueprint/task-df8cfed3..."
         assert classify_failure(_task(msg)) == AGENT_TIMEOUT
 
+    @pytest.mark.parametrize("msg", [
+        "[12.1MB] Using tool: Grep",
+        "[13.7MB] Using tool: Grep",
+        "[8.4MB] Using tool: Read",
+        "[10.2MB] Using tool: Edit",
+        "[9.5MB cg:512.0MB] Using tool: Bash",
+    ])
+    def test_tool_call_heartbeat_is_agent_timeout(self, msg):
+        """Regression: tasks reaped mid-tool-call (OOM of Claude subprocess, VM kill,
+        network drop) leave 'Using tool: <Name>' as their latest_status_message. Without
+        this pattern, classify_failure falls through to CODE_ERROR and
+        record_residual_fingerprint creates spurious fingerprints that trigger
+        auto-remediation for non-existent code defects. Mirrors the
+        'creating pull request for blueprint/' guard."""
+        assert classify_failure(_task(msg)) == AGENT_TIMEOUT
+
     def test_cascade_beats_code_error_default(self):
         """A 'Cancelled:' prefix routes to AGENT_TIMEOUT even if tail looks like code."""
         msg = "Cancelled: AssertionError in downstream"

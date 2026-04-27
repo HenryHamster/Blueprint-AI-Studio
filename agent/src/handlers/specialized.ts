@@ -7,7 +7,7 @@ import {
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
-import { describeJsonExtractionResult, extractJsonArrayDetailed, extractJsonObjectDetailed } from '../json-extract.js';
+import { describeJsonExtractionResult, extractJsonArrayDetailed, extractJsonObjectDetailed, JsonExtractionError } from '../json-extract.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
@@ -699,19 +699,30 @@ IMPORTANT:
 
     // Try lastResultText first (cheaper — usually the final message)
     if (lastResultText && lastResultText.includes('"root_cause"')) {
-      const res = extractJsonObjectDetailed(lastResultText, 'root_cause', 'recommended_fix');
-      if (res.ok && requiredFields.every(k => k in (res.value as Record<string, unknown>))) {
-        investigationResult = res.value as Record<string, unknown>;
-        sendLog(ws, `[WARNING] Investigation JSON recovered from lastResultText transcript rather than file.\n`);
+      try {
+        const res = extractJsonObjectDetailed(lastResultText, 'root_cause', 'recommended_fix');
+        if (res.ok && requiredFields.every(k => k in (res.value as Record<string, unknown>))) {
+          investigationResult = res.value as Record<string, unknown>;
+          sendLog(ws, `[WARNING] Investigation JSON recovered from lastResultText transcript rather than file.\n`);
+        }
+      } catch (e) {
+        // JsonExtractionError: candidate found but JSON.parse failed (e.g. malformed output).
+        // Fall through to allOutput scan below.
+        sendLog(ws, `[WARNING] lastResultText JSON extraction failed: ${e instanceof JsonExtractionError ? e.message : String(e)}\n`);
       }
     }
 
     // Fall back to full transcript
     if (investigationResult === null) {
-      const res = extractJsonObjectDetailed(allOutput, 'root_cause', 'recommended_fix');
-      if (res.ok && requiredFields.every(k => k in (res.value as Record<string, unknown>))) {
-        investigationResult = res.value as Record<string, unknown>;
-        sendLog(ws, `[WARNING] Investigation JSON recovered from allOutput transcript rather than file.\n`);
+      try {
+        const res = extractJsonObjectDetailed(allOutput, 'root_cause', 'recommended_fix');
+        if (res.ok && requiredFields.every(k => k in (res.value as Record<string, unknown>))) {
+          investigationResult = res.value as Record<string, unknown>;
+          sendLog(ws, `[WARNING] Investigation JSON recovered from allOutput transcript rather than file.\n`);
+        }
+      } catch (e) {
+        // JsonExtractionError: malformed JSON candidate found in transcript — treat as not found.
+        sendLog(ws, `[WARNING] allOutput JSON extraction failed: ${e instanceof JsonExtractionError ? e.message : String(e)}\n`);
       }
     }
 

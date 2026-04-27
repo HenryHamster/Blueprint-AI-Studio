@@ -470,6 +470,42 @@ describe('handleInvestigate — report reading and status mapping', () => {
     expect(call.logs).toBe(JSON.stringify(recovered));
   });
 
+  it('falls through to parse_failed when lastResultText has malformed JSON with required keys', async () => {
+    // JsonExtractionError is thrown when the transcript contains a balanced JSON
+    // object with the required keys but the content fails JSON.parse (e.g. JS object
+    // literal with unquoted values). The try/catch in handleInvestigate must catch
+    // this and treat it as "not found" rather than letting it propagate as a fatal error.
+    const malformedJson = '{"root_cause": undefined, "recommended_fix": "fix it"}';
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: malformedJson,
+    });
+
+    await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('parse_failed');
+  });
+
+  it('falls through to parse_failed when allOutput has malformed JSON with required keys', async () => {
+    const malformedJson = 'Investigation complete.\n{"root_cause": undefined, "recommended_fix": "fix it"}\nDone.';
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: malformedJson,
+      lastResultText: '',
+    });
+
+    await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('parse_failed');
+  });
+
   it('sets status FAILED and artifact_type ERROR_LOG on non-zero exitCode with result', async () => {
     vi.mocked(readHandlerOutput).mockReturnValue({ summary: 'partial', root_cause: '', affected_files: [], recommended_fix: '', severity: 'low', confidence: 'low' });
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: '', lastResultText: '' });
