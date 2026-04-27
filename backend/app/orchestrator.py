@@ -1716,9 +1716,27 @@ async def orchestrator_worker():
                     queued_tasks = list((await session.execute(dispatch_stmt)).scalars().all())
 
                 logger.info(f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_account_by_id)} accounts")
-                _shared_state.tasks_queued_gauge = (await session.execute(
-                    select(_func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False))
-                )).scalar() or 0
+                # Snapshot per-task gate fields BEFORE entering the dispatch loop.
+                # Inside the loop, _lock_task_for_mutation calls session.rollback()
+                # on contention/status mismatch, which expires every attribute on
+                # every object loaded in this session — including queued_task.payloads.
+                # The next iteration's queued_task.first_payload would then trigger a
+                # sync lazy-load from async context (bug pattern documented at
+                # ACTIVE_TASKS_LIGHT_COLUMNS comment above) and crash the cycle.
+                _queued_task_gate_info: list[tuple] = [
+                    (qt.id, qt.first_payload.get("type", ""))
+                    for qt in queued_tasks
+                ]
+                # Gauge query: skip autoflush so pending UPDATEs from earlier in the
+                # cycle don't get pushed and contend on a row another transaction holds
+                # (LockNotAvailableError). The count is a snapshot for metrics, not a
+                # transactional read — pending state being absent is the right answer.
+                # session.no_autoflush is a sync context manager (toggles a flag,
+                # no I/O), so use plain ``with`` even on an AsyncSession.
+                with session.no_autoflush:
+                    _shared_state.tasks_queued_gauge = (await session.execute(
+                        select(_func.count()).select_from(Task).where(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False))
+                    )).scalar() or 0
                 # tasks_active_gauge already set above after active_count is computed
 
                 # Zone pre-check: skip dispatch entirely if all GCP zones are in cooldown
@@ -1801,20 +1819,22 @@ async def orchestrator_worker():
                 _cycle_earliest_recovery: datetime | None = None
                 _cycle_blockage_reasons: set[str] = set()
 
-                for queued_task in queued_tasks:
+                for _qt_id, _task_type_for_gate in _queued_task_gate_info:
                     # Per-type failure gate: skip tasks whose type is currently failing
-                    # (global 80% backstop already handled above; this skips only the bad type)
-                    _task_type_for_gate = queued_task.first_payload.get("type", "")
+                    # (global 80% backstop already handled above; this skips only the bad type).
+                    # Use the snapshot tuple — never read .first_payload off a session-bound
+                    # object inside this loop, since _lock_task_for_mutation's rollback would
+                    # expire it and trigger a sync lazy-load that crashes the cycle.
                     if _task_type_for_gate and _task_type_for_gate in _failing_types:
                         logger.info(
-                            f"[ORCHESTRATOR] Skipping task {queued_task.id} "
+                            f"[ORCHESTRATOR] Skipping task {_qt_id} "
                             f"(type={_task_type_for_gate}) — per-type failure gate active"
                         )
                         continue
 
                     task = await _lock_task_for_mutation(
                         session,
-                        queued_task.id,
+                        _qt_id,
                         allowed_statuses=(TaskStatus.QUEUED,),
                         reason="dispatch",
                     )
@@ -1840,7 +1860,6 @@ async def orchestrator_worker():
                     task_project = await session.get(Project, task.project_id)
                     # Launcher pays; fall back to project owner for autonomous tasks
                     dispatch_user_id = task.launched_by_user_id or (task_project.user_id if task_project else "")
-                    task_type = task.payloads[0].get("type", "create") if task.payloads else "create"
                     task_model = _extract_task_model(task)
                     # Prune stale blacklist entries — accounts whose model cooldown has expired
                     # should be eligible again, otherwise rate-limited tasks get stuck forever
