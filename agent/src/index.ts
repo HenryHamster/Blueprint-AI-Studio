@@ -2072,8 +2072,10 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         } else if (model) {
           args.push('-m', model);
         }
-        // Ephemeral VM is the isolation boundary — trust gate is redundant,
-        // mirrors the GEMINI_SANDBOX/yolo rationale already in place.
+        // GEMINI_CLI_TRUST_WORKSPACE=true bypasses the trusted-directory check
+        // that otherwise downgrades --approval-mode=yolo to "default" (which
+        // then prompts and stalls). The VM is the isolation boundary so the
+        // workspace trust check is redundant here.
         const geminiEnv = { ...baseEnv, GEMINI_SANDBOX: 'false', GEMINI_CLI_TRUST_WORKSPACE: 'true' };
         return {
           command: 'gemini',
@@ -2088,8 +2090,10 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
       buildValidationCommand: (model) => {
         const args = ['-o', 'text', '-p', 'Respond with OK.'];
         if (model) args.push('-m', model);
-        // Ephemeral VM is the isolation boundary — trust gate is redundant,
-        // mirrors the GEMINI_SANDBOX/yolo rationale already in place.
+        // GEMINI_CLI_TRUST_WORKSPACE=true bypasses the trusted-directory check
+        // that otherwise downgrades --approval-mode=yolo to "default" (which
+        // then prompts and stalls). The VM is the isolation boundary so the
+        // workspace trust check is redundant here.
         const geminiEnv = { ...baseEnv, GEMINI_SANDBOX: 'false', GEMINI_CLI_TRUST_WORKSPACE: 'true' };
         return { command: 'gemini', args, env: geminiEnv, timeoutMs: 30_000 };
       },

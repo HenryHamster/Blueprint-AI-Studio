@@ -927,6 +927,71 @@ async def _summarize_latest_review_for_chain(parent: Task, session) -> dict | No
         return None
 
 
+# Threshold for considering a never-claimed QUEUED pipeline task "abandoned"
+# during CI backstop recovery. Matches the queued_max_age_seconds default in
+# _chain_has_active_pipeline_work so the two paths agree on what "stuck" means.
+_QUEUED_PIPELINE_SUPERSEDE_AFTER_SECONDS = 30 * 60
+
+
+async def _supersede_long_queued_pipeline_tasks(
+    parent: Task,
+    session,
+    pr_number: int,
+    original_task_id: str,
+) -> int:
+    """Cancel review/fix tasks on this chain that have been QUEUED past the
+    abandon threshold without ever being claimed.
+
+    Called from CI backstop recovery to unblock the dedup guard in
+    _spawn_pipeline_task — a fix task that's sat in the queue for an hour
+    waiting for an account is the same blocker as a dead VM, just slower
+    to detect. Without this, the recovery review spawn defers and the
+    parent gets hard-killed when it could have been recovered.
+
+    Returns the count of tasks superseded so the caller can log it.
+    """
+    from app.failure_classification import AGENT_TIMEOUT, persist_failure_category
+    cutoff = _utcnow() - timedelta(seconds=_QUEUED_PIPELINE_SUPERSEDE_AFTER_SECONDS)
+    candidates = (await session.execute(
+        select(Task).where(
+            Task.project_id == parent.project_id,
+            Task.status == TaskStatus.QUEUED,
+        )
+    )).scalars().all()
+    superseded = 0
+    for t in candidates:
+        if t.id == parent.id:
+            continue
+        fp = t.first_payload
+        if fp.get("type") not in ("review", "fix"):
+            continue
+        if fp.get("pr_number") != pr_number:
+            continue
+        if (fp.get("original_task_id") or "") != original_task_id:
+            continue
+        # Skip tasks that have actually been claimed and are working.
+        if t.last_heartbeat is not None or t.started_at is not None:
+            continue
+        if t.created_at and t.created_at >= cutoff:
+            continue  # too fresh — could legitimately be waiting on capacity
+        t.status = TaskStatus.CANCELLED
+        t.latest_status_message = (
+            f"Superseded by CI backstop recovery on PR #{pr_number}: "
+            f"queued >{_QUEUED_PIPELINE_SUPERSEDE_AFTER_SECONDS // 60}min "
+            f"without claim, blocking parent recovery"
+        )
+        persist_failure_category(t, AGENT_TIMEOUT)
+        session.add(t)
+        superseded += 1
+        logger.warning(
+            f"[BACKSTOP RECOVERY] Cancelling long-queued {fp.get('type')} "
+            f"{str(t.id)[:8]} on PR #{pr_number} so recovery review can proceed"
+        )
+    if superseded:
+        await session.flush()
+    return superseded
+
+
 async def _attempt_ci_backstop_recovery(parent: Task, session, review_loop: dict) -> bool:
     """One-shot attempt to unstick a parent whose review gate never closed.
 
@@ -934,6 +999,11 @@ async def _attempt_ci_backstop_recovery(parent: Task, session, review_loop: dict
     the original review VM died (rate-limit, crash) before posting status.
     Spawns a fresh review via the normal pipeline path; the new dedup guard
     will supersede any stale corpse on the same chain.
+
+    Before spawning, supersedes any review/fix on this chain that has sat in
+    QUEUED past the abandon threshold (account exhaustion, slot starvation).
+    Without this step, _spawn_pipeline_task's dedup guard defers the recovery
+    review and the parent gets hard-killed instead of recovered.
 
     Returns True iff a fresh review was spawned (parent should reset its CI
     wait window and skip the hard kill for this tick).
@@ -946,6 +1016,9 @@ async def _attempt_ci_backstop_recovery(parent: Task, session, review_loop: dict
     if not (pr_number and branch):
         return False
     try:
+        await _supersede_long_queued_pipeline_tasks(
+            parent, session, pr_number, original_task_id,
+        )
         review_task, _ = await _spawn_pipeline_task(
             parent, "review", session, pr_number, branch, base_branch,
             original_prompt=(parent.description or parent.title or ""),
@@ -983,8 +1056,8 @@ async def _check_evaluating_timeouts():
 
     try:
         async with AsyncSessionLocal() as session:
-            from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle
-            from app.models import DeploymentState  # noqa: PLC0415
+            from app import pause_clock
+            from app.models import DeploymentState
             now = _utcnow()
             # Fetch DeployState once per cycle so CI backstop can subtract
             # pause windows from elapsed (admin pause + auto-pause both count).

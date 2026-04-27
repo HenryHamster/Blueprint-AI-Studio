@@ -21,7 +21,11 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy import select
 from sqlmodel import SQLModel
 
-from app.services import _check_evaluating_timeouts, _chain_has_active_pipeline_work
+from app.services import (
+    _check_evaluating_timeouts,
+    _chain_has_active_pipeline_work,
+    _supersede_long_queued_pipeline_tasks,
+)
 from app.rollup_management import _check_and_trigger_rollup
 from app.models import Project, Task, TaskStatus, Alert, AlertSeverity
 
@@ -1156,3 +1160,202 @@ async def test_evaluating_approval_gate_within_window_not_failed(eval_db, mocker
 
     await eval_db.refresh(parent)
     assert parent.status == TaskStatus.EVALUATING
+
+
+# ── Backstop recovery: supersede long-queued blocking pipeline tasks ──────────
+
+@pytest.mark.asyncio
+async def test_supersede_cancels_long_queued_fix_blocking_recovery(eval_db):
+    """A fix task QUEUED past the abandon threshold (30 min) without ever
+    being claimed must be cancelled when CI backstop recovery runs — without
+    this the recovery review's dedup guard defers and the parent gets
+    hard-killed instead of recovered.
+
+    Regression for task b215fe9e: review b2f19dce died without verdict;
+    fix 36406295 queued for 1h waiting for an account; recovery review
+    deferred behind it; parent backstopped after 1.7h.
+    """
+    project = Project(name="Backstop Supersede", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    stuck_fix = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "fix",
+            "pr_number": 90001,
+            "original_task_id": str(parent.id),
+        }],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=None,
+        started_at=None,
+    )
+    stuck_fix.created_at = _naive_utc_ago(minutes=60)  # well past 30-min threshold
+    eval_db.add(stuck_fix)
+    await eval_db.commit()
+    await eval_db.refresh(stuck_fix)
+
+    superseded_count = await _supersede_long_queued_pipeline_tasks(
+        parent, eval_db, pr_number=90001, original_task_id=str(parent.id),
+    )
+    await eval_db.commit()
+
+    assert superseded_count == 1
+    await eval_db.refresh(stuck_fix)
+    assert stuck_fix.status == TaskStatus.CANCELLED
+    assert "Superseded by CI backstop recovery" in (stuck_fix.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_supersede_skips_recently_queued_fix(eval_db):
+    """A fix task queued within the 30-min freshness window is not yet
+    'abandoned' — could legitimately be waiting on capacity. Leave alone."""
+    project = Project(name="Backstop Fresh Queue", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    fresh_fix = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "fix",
+            "pr_number": 90002,
+            "original_task_id": str(parent.id),
+        }],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=None,
+        started_at=None,
+    )
+    fresh_fix.created_at = _naive_utc_ago(minutes=10)  # fresh
+    eval_db.add(fresh_fix)
+    await eval_db.commit()
+    await eval_db.refresh(fresh_fix)
+
+    superseded_count = await _supersede_long_queued_pipeline_tasks(
+        parent, eval_db, pr_number=90002, original_task_id=str(parent.id),
+    )
+
+    assert superseded_count == 0
+    await eval_db.refresh(fresh_fix)
+    assert fresh_fix.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_supersede_skips_already_claimed_fix(eval_db):
+    """A fix task that has actually started (heartbeated or set started_at)
+    is real work — the abandon threshold only applies to never-claimed
+    QUEUED tasks. Don't cancel work in progress."""
+    project = Project(name="Backstop Claimed Fix", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # QUEUED but with last_heartbeat set (e.g., requeued mid-flight)
+    requeued_fix = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "fix",
+            "pr_number": 90003,
+            "original_task_id": str(parent.id),
+        }],
+        status=TaskStatus.QUEUED,
+        last_heartbeat=_naive_utc_ago(minutes=5),
+        started_at=_naive_utc_ago(minutes=10),
+    )
+    requeued_fix.created_at = _naive_utc_ago(minutes=60)
+    eval_db.add(requeued_fix)
+    await eval_db.commit()
+    await eval_db.refresh(requeued_fix)
+
+    superseded_count = await _supersede_long_queued_pipeline_tasks(
+        parent, eval_db, pr_number=90003, original_task_id=str(parent.id),
+    )
+
+    assert superseded_count == 0
+    await eval_db.refresh(requeued_fix)
+    assert requeued_fix.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_supersede_only_matches_chain(eval_db):
+    """Only review/fix tasks matching the parent's PR number AND
+    original_task_id get cancelled. Tasks on a different chain are
+    untouched even when long-queued."""
+    project = Project(name="Backstop Chain Match", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # Different PR
+    other_pr_fix = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "fix",
+            "pr_number": 99999,
+            "original_task_id": str(parent.id),
+        }],
+        status=TaskStatus.QUEUED,
+    )
+    other_pr_fix.created_at = _naive_utc_ago(minutes=60)
+    eval_db.add(other_pr_fix)
+
+    # Different chain (different original_task_id) on same PR
+    other_chain_fix = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "fix",
+            "pr_number": 90004,
+            "original_task_id": "some-other-chain-id",
+        }],
+        status=TaskStatus.QUEUED,
+    )
+    other_chain_fix.created_at = _naive_utc_ago(minutes=60)
+    eval_db.add(other_chain_fix)
+    await eval_db.commit()
+
+    superseded_count = await _supersede_long_queued_pipeline_tasks(
+        parent, eval_db, pr_number=90004, original_task_id=str(parent.id),
+    )
+
+    assert superseded_count == 0
+    await eval_db.refresh(other_pr_fix)
+    await eval_db.refresh(other_chain_fix)
+    assert other_pr_fix.status == TaskStatus.QUEUED
+    assert other_chain_fix.status == TaskStatus.QUEUED
