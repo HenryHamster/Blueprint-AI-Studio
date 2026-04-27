@@ -298,6 +298,167 @@ def _enforce_payload_size(payload: dict) -> None:
     raise PayloadTooLargeError(size, _MAX_PAYLOAD_BYTES, top_keys)
 
 
+# pack_under_budget priority tiers. Higher tier packs first.
+# Use string literals (not raw ints) so call sites read declaratively
+# and _packer_meta drop entries describe priority in human terms.
+_TIER_RANK: dict[str, int] = {"critical": 1000, "high": 100, "medium": 10, "low": 1}
+
+
+def _serialized_size(v: Any) -> int:
+    """Serialized JSON byte length of *v* using the project-standard `default=str`."""
+    return len(json.dumps(v, default=str).encode())
+
+
+def pack_under_budget(
+    payload: dict,
+    schema: dict[str, dict],
+    budget: int = 120 * 1024,
+) -> dict:
+    """Pack *payload* keys under *budget* bytes by priority tier.
+
+    Each key is looked up in *schema*: entries should have ``priority`` (one
+    of ``"critical"``, ``"high"``, ``"medium"``, ``"low"``) and an optional
+    ``summarize: (value) -> trimmed_value`` callback. Missing schema entries
+    default to ``priority="low"`` with a logged warning.
+
+    Algorithm: sort by (tier desc, size asc) so within a tier smaller items
+    pack first — a 50KB high won't evict a 5KB high purely by insertion
+    order. Then greedy-fill: try full size; if over remaining budget call
+    ``summarize`` once; if still over, drop. Critical-tier items that can't
+    fit (even after summarize) raise :class:`PayloadTooLargeError` —
+    silently dropping critical context is worse than failing loudly.
+
+    Returns a new dict containing the packed keys plus a ``_packer_meta``
+    entry describing what was trimmed/dropped and the budget accounting.
+    The agent prompt is responsible for surfacing this metadata so the
+    LLM knows what's available-but-not-shipped (and which fetch endpoint
+    to call for it).
+    """
+    if budget <= 0:
+        raise ValueError(f"pack_under_budget: budget must be positive, got {budget}")
+
+    parts: list[dict] = []
+    for key, value in payload.items():
+        entry = schema.get(key)
+        if entry is None:
+            logger.warning(
+                "pack_under_budget: no schema entry for key %r — defaulting to priority='low'",
+                key,
+            )
+            entry = {}
+        priority = entry.get("priority", "low")
+        if priority not in _TIER_RANK:
+            logger.warning(
+                "pack_under_budget: unknown priority %r for key %r — treating as 'low'",
+                priority, key,
+            )
+            priority = "low"
+        try:
+            full_size = _serialized_size(value)
+            unserializable = False
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "pack_under_budget: key %r not JSON-serializable (%s) — will be dropped",
+                key, exc,
+            )
+            full_size = None
+            unserializable = True
+        parts.append({
+            "key": key,
+            "value": value,
+            "priority": priority,
+            "size": full_size,
+            "unserializable": unserializable,
+            "summarize": entry.get("summarize"),
+        })
+
+    parts.sort(key=lambda p: (
+        -_TIER_RANK[p["priority"]],
+        p["size"] if p["size"] is not None else float("inf"),
+    ))
+
+    packed: dict = {}
+    used = 0
+    trimmed: list[dict] = []
+    dropped: list[dict] = []
+
+    for p in parts:
+        key = p["key"]
+        if p["unserializable"]:
+            dropped.append({"key": key, "reason": "value not JSON-serializable"})
+            continue
+        remaining = budget - used
+        if p["size"] <= remaining:
+            packed[key] = p["value"]
+            used += p["size"]
+            continue
+        included = False
+        if p["summarize"] is not None:
+            try:
+                trimmed_value = p["summarize"](p["value"])
+            except Exception as exc:  # noqa: BLE001 — summarize fns must not crash the packer
+                logger.warning(
+                    "pack_under_budget: summarize for key %r raised %s — dropping",
+                    key, exc,
+                )
+            else:
+                try:
+                    trimmed_size = _serialized_size(trimmed_value)
+                except (TypeError, ValueError) as exc:
+                    logger.warning(
+                        "pack_under_budget: trimmed value for key %r not serializable (%s) — dropping",
+                        key, exc,
+                    )
+                    trimmed_size = None
+                if trimmed_size is not None:
+                    # Defensive: never grow the payload by trimming. If a caller's
+                    # summarize_fn returns a larger value (caller bug), revert to
+                    # original and proceed with the normal fits/drops decision.
+                    if trimmed_size > p["size"]:
+                        logger.warning(
+                            "pack_under_budget: summarize for key %r grew value (%d > %d) — using original",
+                            key, trimmed_size, p["size"],
+                        )
+                        trimmed_value = p["value"]
+                        trimmed_size = p["size"]
+                    if trimmed_size <= remaining:
+                        packed[key] = trimmed_value
+                        used += trimmed_size
+                        if isinstance(p["value"], list) and isinstance(trimmed_value, list):
+                            trimmed.append({
+                                "key": key,
+                                "kind": "list_trimmed",
+                                "shown": len(trimmed_value),
+                                "total": len(p["value"]),
+                            })
+                        else:
+                            trimmed.append({"key": key, "kind": "summarized"})
+                        included = True
+        if not included:
+            if p["priority"] == "critical":
+                top_keys = sorted(
+                    ((pp["key"], pp["size"] or 0) for pp in parts),
+                    key=lambda pair: pair[1],
+                    reverse=True,
+                )
+                raise PayloadTooLargeError(used + (p["size"] or 0), budget, top_keys)
+            dropped.append({
+                "key": key,
+                "reason": (
+                    "exceeds remaining budget even after summarize"
+                    if p["summarize"] else "exceeds remaining budget (no summarize_fn)"
+                ),
+            })
+
+    packed["_packer_meta"] = {
+        "budget_total": budget,
+        "budget_used": used,
+        "trimmed": trimmed,
+        "dropped": dropped,
+    }
+    return packed
+
+
 def validate_task_payload(raw: dict) -> dict:
     """Validate *raw* against the per-type schema.
 

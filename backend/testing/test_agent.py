@@ -5545,3 +5545,165 @@ async def test_rotate_credentials_allowed_after_task_terminated(client: AsyncCli
     )
     assert res.status_code == 200, res.text
     assert res.json() == {"rotated": True}
+
+
+# ── Strategic-context fetch endpoints ─────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_agent_fetch_direction_returns_full_record_with_history_cap(
+    client: AsyncClient, db_session
+):
+    """Agent gets the full direction including capped research_history."""
+    project = Project(
+        name="Fetch Test", user_id="test-user-123",
+        directions=[
+            {"id": "dir-1", "status": "active", "text": "First", "priority": "high",
+             "research_history": [{"prs_merged": i} for i in range(30)]}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-fetch")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-fetch")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/directions/dir-1",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["data"]["id"] == "dir-1"
+    assert body["data"]["text"] == "First"
+    # 30 entries → capped at 20 most recent
+    assert len(body["data"]["research_history"]) == 20
+    assert body["data"]["_history_truncated"] == {"shown": 20, "total": 30}
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_direction_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent with token for project A can't fetch direction in project B (404,
+    not 403, so probing can't be used to enumerate project ids)."""
+    project_a = Project(name="A", user_id="test-user-a")
+    project_b = Project(
+        name="B", user_id="test-user-b",
+        directions=[{"id": "dir-b1", "status": "active", "text": "B"}],
+    )
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-a")
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-a")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/directions/dir-b1",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_playbook_entry_with_and_without_prefix(
+    client: AsyncClient, db_session
+):
+    """Agent can fetch a playbook entry by either bare key or playbook/<key>."""
+    project = Project(
+        name="Playbook Test", user_id="test-user-pb",
+        design_doc={
+            "playbook/frontend-build": {
+                "title": "Frontend build",
+                "content": "Run npm run build before pushing.",
+                "confirmed_count": 5,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-pb")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pb")
+    headers = {"x-agent-token": token}
+
+    # Bare key
+    r1 = await client.get(
+        f"/api/agent/projects/{project.id}/playbook/frontend-build",
+        headers=headers,
+    )
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["data"]["entry"]["confirmed_count"] == 5
+
+    # 404 on missing key
+    r2 = await client.get(
+        f"/api/agent/projects/{project.id}/playbook/does-not-exist",
+        headers=headers,
+    )
+    assert r2.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_gap_handles_active_and_archived(
+    client: AsyncClient, db_session
+):
+    """Agent can fetch gaps regardless of active/archived status; the response
+    flags ``from_archive`` so the agent knows the context."""
+    project = Project(
+        name="Gap Test", user_id="test-user-gap",
+        problem_model={
+            "gaps": [
+                {"id": "g-active", "name": "Active gap",
+                 "history": [f"h{i}" for i in range(10)]},
+            ],
+            "archived_gaps": [
+                {"id": "g-old", "name": "Closed gap",
+                 "history": [f"h{i}" for i in range(5)]},
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-gap")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-gap")
+    headers = {"x-agent-token": token}
+
+    r1 = await client.get(
+        f"/api/agent/projects/{project.id}/gaps/g-active", headers=headers
+    )
+    assert r1.status_code == 200, r1.text
+    body = r1.json()
+    assert body["data"]["id"] == "g-active"
+    assert body["from_archive"] is False
+    assert len(body["data"]["history"]) == 10  # full history, not trimmed
+
+    r2 = await client.get(
+        f"/api/agent/projects/{project.id}/gaps/g-old", headers=headers
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["from_archive"] is True
+
+    r3 = await client.get(
+        f"/api/agent/projects/{project.id}/gaps/g-missing", headers=headers
+    )
+    assert r3.status_code == 404

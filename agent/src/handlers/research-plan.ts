@@ -1385,6 +1385,39 @@ echo ""
     fs.writeFileSync(`${WORKSPACE}/strategic`, strategicHelper, { mode: 0o755 });
     excludeAgentHelpers();
 
+    // ./fetch helper — pulls full state for items the strategic packer trimmed.
+    // The strategic-spawn payload is packed under a tight byte budget (see
+    // pack_under_budget in backend/app/payload_schemas.py); when it trims a
+    // list or drops a section it records that in payload._packer_meta. The
+    // agent inspects _packer_meta and uses ./fetch to retrieve detail it
+    // actually needs (avoids a 256 KB context that the LLM has to scan).
+    const projectMetadataForFetch = task.project_metadata as Record<string, unknown> | undefined;
+    const fetchProjectId = (projectMetadataForFetch?.project_id as string | undefined) ?? '';
+    const fetchHelper = `#!/bin/bash
+# Strategic-context fetch tool — pull detail for items the packer trimmed.
+# Reads ORCHESTRATOR_URL, AGENT_API_TOKEN from env. project_id is baked in.
+KIND="\${1:?Usage: fetch direction|playbook|gap <id>}"
+ID="\${2:?Usage: fetch direction|playbook|gap <id>}"
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+PROJECT="${fetchProjectId}"
+[ -n "\$PROJECT" ] || { echo "[ERROR] no project_id available; fetch is only usable in strategic-mode tasks" >&2; exit 1; }
+
+case "\$KIND" in
+  direction)  PATH_SUFFIX="directions/\$ID" ;;
+  playbook)   PATH_SUFFIX="playbook/\$ID" ;;
+  gap)        PATH_SUFFIX="gaps/\$ID" ;;
+  *) echo "Unknown kind: \$KIND (use direction|playbook|gap)" >&2; exit 1 ;;
+esac
+
+curl -sS --max-time 20 --connect-timeout 10 \\
+  -X GET "\$API/api/agent/projects/\$PROJECT/\$PATH_SUFFIX" \\
+  -H "X-Agent-Token: \$TOKEN"
+echo ""
+`;
+    fs.writeFileSync(`${WORKSPACE}/fetch`, fetchHelper, { mode: 0o755 });
+    excludeAgentHelpers();
+
     // Also write design-doc helper so strategic agent can read/write sections
     const designDocHelper = `#!/bin/bash
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
@@ -1510,6 +1543,52 @@ echo ""
       ? `User last active: ${userActiveRel || 'unknown'}${ackRel ? ` | last acknowledged running_update: ${ackRel}` : ''}`
       : 'User activity: no record yet';
 
+    // ── Packer metadata: tell the agent what was trimmed and how to recover it ──
+    // The strategic-spawn payload is filled under a hard byte budget (see
+    // pack_under_budget in backend/app/payload_schemas.py). When the packer
+    // can't fit a section it either summarizes (list_trimmed) or drops it
+    // wholesale; both forms land in payload._packer_meta. Render them so the
+    // agent knows what's available-but-not-shipped and can call ./fetch.
+    const packerMeta = payload._packer_meta as Record<string, unknown> | undefined;
+    const renderPackerMeta = (meta: Record<string, unknown> | undefined): string => {
+      if (!meta) return '';
+      const trimmed = Array.isArray(meta.trimmed) ? meta.trimmed as Array<Record<string, unknown>> : [];
+      const dropped = Array.isArray(meta.dropped) ? meta.dropped as Array<Record<string, unknown>> : [];
+      if (trimmed.length === 0 && dropped.length === 0) return '';
+      const lines: string[] = ['## Context not shipped this cycle (use ./fetch if you need it)'];
+      if (trimmed.length > 0) {
+        lines.push('', 'Trimmed (partial data shipped):');
+        for (const t of trimmed) {
+          const k = strVal(t.key, '?');
+          const kind = strVal(t.kind, 'summarized');
+          if (kind === 'list_trimmed') {
+            const shown = (t.shown as number | undefined) ?? '?';
+            const total = (t.total as number | undefined) ?? '?';
+            lines.push(`  - ${k}: showing ${shown} of ${total} entries`);
+          } else {
+            lines.push(`  - ${k}: shipped in summarized form`);
+          }
+        }
+      }
+      if (dropped.length > 0) {
+        lines.push('', 'Dropped entirely (not in this payload):');
+        for (const d of dropped) {
+          const k = strVal(d.key, '?');
+          const reason = strVal(d.reason, 'budget exhausted');
+          lines.push(`  - ${k}: ${reason}`);
+        }
+      }
+      lines.push(
+        '',
+        'To pull full detail when you need it:',
+        '  - `./fetch direction <id>` — full direction record (research_history capped at 20 cycles)',
+        '  - `./fetch playbook <key>` — single playbook entry (e.g. `./fetch playbook frontend-build`)',
+        '  - `./fetch gap <id>` — single gap with full history/past_moves/evidence',
+      );
+      return lines.join('\n');
+    };
+    const packerMetaSection = renderPackerMeta(packerMeta);
+
     const problemModelSection = problemModelJson
       ? `## Your current understanding (problem_model)\n\`\`\`json\n${problemModelJson}\n\`\`\``
       : `## Your current understanding (problem_model)\n_(empty — this is the first cycle. Bootstrap from the other sections below.)_`;
@@ -1545,6 +1624,7 @@ Each cycle you look at what's happening and decide whether it's still on the rig
 ${clockHeader}
 Self-repo: ${isSelfRepo ? 'true' : 'false'}
 ${userStateLine}
+${packerMetaSection ? `\n${packerMetaSection}\n` : ''}
 ${strategicContext ? `\n## Running Context (from prior cycles)\n${strategicContext}\n` : ''}
 ${problemModelSection}
 
@@ -1728,6 +1808,13 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # from the Recent Work section needs investigation NOW instead of waiting for
 # the next autonomous cycle.
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "Full investigation prompt...", "direction_id": "d-xxx"}'
+
+# Pull full detail for items the strategic packer trimmed (see "Context not
+# shipped this cycle" section in your prompt). Use only when you actually
+# need the detail — extra context hurts reasoning quality.
+./fetch direction <direction_id>   # full direction record
+./fetch playbook <key>             # single playbook entry
+./fetch gap <gap_id>               # single problem_model gap
 
 # Respond to or resolve user messages
 ./messages resolve <message-id> 'How it was addressed'

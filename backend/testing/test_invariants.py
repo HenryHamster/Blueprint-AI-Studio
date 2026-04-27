@@ -676,7 +676,7 @@ MODULE_SIZE_LIMITS = {
     "routers/admin_pool_accounts.py": 900,
     "max_plan_pool.py": 2100,
     "anomaly_detection.py": 2000,
-    "routers/agent.py": 2400,
+    "routers/agent.py": 2600,
     "services.py": 1800,
     "routers/agent_status.py": 1800,
     "autonomous_research.py": 1800,

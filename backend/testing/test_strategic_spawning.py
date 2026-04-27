@@ -44,13 +44,13 @@ def _ensure_test_account_pool():
 
 def _make_project(**kwargs) -> Project:
     """Build a Project with sensible test defaults."""
-    defaults = dict(
-        name="Test Project",
-        user_id="test-user-123",
-        autonomous_enabled=True,
-        directions=[],
-        vision={},
-    )
+    defaults = {
+        "name": "Test Project",
+        "user_id": "test-user-123",
+        "autonomous_enabled": True,
+        "directions": [],
+        "vision": {},
+    }
     defaults.update(kwargs)
     return Project(**defaults)
 
@@ -1783,3 +1783,114 @@ async def test_strategic_review_calibration_factor_reflects_history(db_session):
     factor = payload["prediction_calibration_factor"]
     assert factor < 1.0, f"Expected factor < 1.0 for over-prediction history, got {factor}"
     assert "optimistic" in payload["prediction_calibration_note"]
+
+
+# ── pack_under_budget integration ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_strategic_review_packer_meta_present_on_small_project(db_session):
+    """Small project: packer ships everything cleanly, meta lists no trims."""
+    project = _make_project(
+        directions=[
+            {"id": "d-small1", "status": "active", "text": "Small direction",
+             "priority": "medium", "research_history": [{"prs_merged": 1}]}
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "_packer_meta" in payload, "Packer must always attach _packer_meta"
+    meta = payload["_packer_meta"]
+    assert meta["trimmed"] == [], f"Small project should have no trims: {meta['trimmed']}"
+    assert meta["dropped"] == [], f"Small project should have no drops: {meta['dropped']}"
+    assert meta["budget_used"] > 0
+    assert meta["budget_used"] < meta["budget_total"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_packer_keeps_payload_under_cap_on_bloated_project(db_session):
+    """Bloated project (50 directions, heavy history): packer must keep payload
+    under the 256 KB validate_internal_payload hard cap and surface trims/drops
+    so the agent can fetch full state via the ./fetch tool."""
+    import json as _json
+    from app.payload_schemas import _MAX_PAYLOAD_BYTES
+
+    # Synthesize 50 directions, each with bulky research_history
+    directions = [
+        {
+            "id": f"d-bloat{i:02d}",
+            "status": "active",
+            "text": f"Direction {i} " + ("filler text " * 30),
+            "priority": "medium",
+            "research_history": [
+                {
+                    "prs_merged": 1,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                    "tasks_created": 1,
+                    "key_finding_descriptions": [f"finding {j} " * 20 for j in range(5)],
+                    "failed_task_details": [],
+                    "timestamp": "2026-04-01T00:00:00Z",
+                }
+                for _ in range(8)
+            ],
+            "research_context": "context narrative " * 200,
+        }
+        for i in range(50)
+    ]
+    project = _make_project(
+        directions=directions,
+        vision={"purpose": "bloated project test"},
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": "x"},
+            "gaps": [
+                {"id": f"g{i}", "name": f"gap {i}", "description": "x" * 500,
+                 "history": [f"h{j}" * 10 for j in range(20)],
+                 "past_moves": [f"m{j}" * 10 for j in range(20)],
+                 "evidence": [f"e{j}" * 10 for j in range(20)]}
+                for i in range(20)
+            ],
+            "archived_gaps": [
+                {"id": f"ag{i}", "name": "archived"} for i in range(40)
+            ],
+            "friction": [],
+            "capabilities": [],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    # Hard requirement: must fit under the 256KB cap that crashed autonomy before
+    serialized_size = len(_json.dumps(payload, default=str).encode())
+    assert serialized_size < _MAX_PAYLOAD_BYTES, (
+        f"Packer failed to keep payload under cap: {serialized_size}B >= {_MAX_PAYLOAD_BYTES}B"
+    )
+
+    meta = payload["_packer_meta"]
+    # On a 50-direction bloated project, directions_summary should have been
+    # trimmed (cap is 12). archived_gaps drops via _agent_view_problem_model
+    # before pack, so they don't appear in meta — the trim happened upstream.
+    assert meta["budget_used"] <= meta["budget_total"]
+    assert len(payload["directions_summary"]) <= 12, (
+        f"Expected ≤12 directions after trim, got {len(payload['directions_summary'])}"
+    )
+    # The trim must be visible to the agent so it knows to fetch the rest.
+    trimmed_keys = {entry["key"] for entry in meta["trimmed"]}
+    assert "directions_summary" in trimmed_keys, (
+        f"Trimmed list must include directions_summary; meta={meta}"
+    )

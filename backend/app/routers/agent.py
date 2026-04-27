@@ -131,12 +131,11 @@ async def verify_agent_token(
 
     # Fast path: known terminated (in-memory, O(1))
     # Same-VM retry on idempotent paths is allowed; a different-VM call is rejected.
-    if task_id in _terminated_task_ids:
-        if not is_idempotent_path:
-            raise HTTPException(status_code=401, detail="Task is no longer active")
-        # Even on idempotent paths we'll fall through to the DB check so
-        # we can compare token_vm against task.vm_instance_id (the cache
-        # alone doesn't carry that field).
+    if task_id in _terminated_task_ids and not is_idempotent_path:
+        raise HTTPException(status_code=401, detail="Task is no longer active")
+    # On idempotent paths with terminated task we fall through to the DB
+    # check so we can compare token_vm against task.vm_instance_id (the
+    # cache alone doesn't carry that field).
 
     # Fast path: recently verified as active (TTL cache)
     cached_expiry = _agent_active_cache.get(task_id)
@@ -2352,3 +2351,127 @@ async def agent_github_create_pr(
         logger.info(f"[PR] Saved PR artifact for task {req.task_id}: {pr_url}")
 
     return {"status": "success", "data": result}
+
+
+# ---------------------------------------------------------------------------
+# Strategic-context fetch endpoints
+# ---------------------------------------------------------------------------
+# The strategic-spawn payload is now packed under a tight budget (see
+# pack_under_budget in payload_schemas.py). When the packer trims a list or
+# drops a section entirely, the agent sees that in payload._packer_meta and
+# can call these endpoints to pull the full detail it needs. Deliberately
+# scoped to read-only project state — mutations stay on the existing
+# /api/agent/strategic POST surface.
+
+_RESEARCH_HISTORY_KEEP_ON_FETCH = 20
+
+
+async def _resolve_agent_project(
+    project_id: uuid.UUID,
+    token: dict,
+    session: AsyncSession,
+) -> Project:
+    """Confirm the agent's task belongs to *project_id* and return the project.
+
+    The agent JWT carries the task id (``sub`` claim) but not the project id,
+    so we look up the task and verify the path matches. Cross-project access
+    returns 404 (not 403) so probing for other projects' state can't be used
+    to enumerate ids.
+    """
+    task_id = token.get("sub")
+    if not task_id:
+        raise HTTPException(status_code=401, detail="Missing task id in token")
+    task = await session.get(Task, uuid.UUID(task_id))
+    if task is None or task.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Project not found")
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@router.get("/projects/{project_id}/directions/{direction_id}")
+@limiter.limit("60/minute")
+async def agent_fetch_direction(
+    request: Request,
+    project_id: uuid.UUID,
+    direction_id: str,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return one direction by id, with research_history capped at the most
+    recent 20 cycles. Used by the agent when ``directions_summary`` was
+    list_trimmed and it needs deeper detail on a specific direction."""
+    project = await _resolve_agent_project(project_id, token, session)
+    direction = next(
+        (d for d in (project.directions or []) if d.get("id") == direction_id),
+        None,
+    )
+    if direction is None:
+        raise HTTPException(status_code=404, detail="Direction not found")
+    out = dict(direction)
+    history = out.get("research_history")
+    if isinstance(history, list) and len(history) > _RESEARCH_HISTORY_KEEP_ON_FETCH:
+        out["research_history"] = history[-_RESEARCH_HISTORY_KEEP_ON_FETCH:]
+        out["_history_truncated"] = {
+            "shown": _RESEARCH_HISTORY_KEEP_ON_FETCH,
+            "total": len(history),
+        }
+    return {"status": "success", "data": out}
+
+
+@router.get("/projects/{project_id}/playbook/{key:path}")
+@limiter.limit("60/minute")
+async def agent_fetch_playbook_entry(
+    request: Request,
+    project_id: uuid.UUID,
+    key: str,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return a single ``playbook/<key>`` entry from design_doc with full
+    content. Used when ``playbook_summary`` was dropped from the strategic
+    payload but the agent needs to consult a specific entry."""
+    project = await _resolve_agent_project(project_id, token, session)
+    design_doc = project.design_doc or {}
+    full_key = f"playbook/{key}" if not key.startswith("playbook/") else key
+    entry = design_doc.get(full_key)
+    if entry is None:
+        # Also try the operator-only archive — agent can still read closed
+        # entries when investigating historical patterns.
+        archive = design_doc.get("playbook_archive") or []
+        if isinstance(archive, list):
+            archived = next(
+                (e for e in archive if isinstance(e, dict) and e.get("key") == full_key),
+                None,
+            )
+            if archived is not None:
+                return {"status": "success", "data": archived, "from_archive": True}
+        raise HTTPException(status_code=404, detail="Playbook entry not found")
+    return {"status": "success", "data": {"key": full_key, "entry": entry}}
+
+
+@router.get("/projects/{project_id}/gaps/{gap_id}")
+@limiter.limit("60/minute")
+async def agent_fetch_gap(
+    request: Request,
+    project_id: uuid.UUID,
+    gap_id: str,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return a single problem_model gap (active or archived) with full
+    history/past_moves/evidence. Used when problem_model was summarized
+    (per-gap arrays trimmed) and the agent needs the full lineage of a
+    specific gap to reason about it."""
+    project = await _resolve_agent_project(project_id, token, session)
+    pm = project.problem_model or {}
+    for source_key, archived_flag in (("gaps", False), ("archived_gaps", True)):
+        for g in pm.get(source_key) or []:
+            if isinstance(g, dict) and g.get("id") == gap_id:
+                return {
+                    "status": "success",
+                    "data": g,
+                    "from_archive": archived_flag,
+                }
+    raise HTTPException(status_code=404, detail="Gap not found")

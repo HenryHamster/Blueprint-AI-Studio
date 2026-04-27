@@ -15,7 +15,7 @@ from sqlmodel import select
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
 from app.models import Task, Project, TaskHistory, TaskStatus, ProjectMessage
-from app.payload_schemas import validate_internal_payload
+from app.payload_schemas import pack_under_budget, validate_internal_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -96,6 +96,135 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
             new_gaps.append(g2)
         trimmed["gaps"] = new_gaps
     return trimmed
+
+
+# Per-payload caps used by the strategic-spawn schema's summarize_fns. These are
+# what the agent sees by default; for full content the agent uses ./fetch.
+_DIRECTIONS_SUMMARY_KEEP = 12
+_OUTCOME_DIRECTION_OUTCOMES_KEEP = 10
+_CONVERSATION_THREAD_KEEP_WHEN_TRIMMED = 8
+
+
+def _direction_activity_score(stat: dict) -> int:
+    """Sort key for choosing which direction stats stay in the strategic payload.
+
+    Higher = more activity. Combines work shipped (merged), work pending (failed),
+    and recency (cycles). High-priority directions get a small boost so a quiet
+    high-priority direction doesn't get evicted by a chatty low-priority one.
+    """
+    if not isinstance(stat, dict):
+        return 0
+    merged = int(stat.get("prs_merged") or 0)
+    failed = int(stat.get("tasks_failed") or 0)
+    cycles = int(stat.get("total_cycles") or 0)
+    priority = stat.get("priority")
+    priority_bonus = {"high": 5, "medium": 0, "low": -2}.get(priority, 0)
+    proposed_bonus = 3 if stat.get("status") == "proposed" else 0
+    return merged * 3 + failed + cycles + priority_bonus + proposed_bonus
+
+
+def _summarize_directions(stats: list) -> list:
+    """Keep the top-N direction_summary entries by activity score.
+
+    Dropped directions are still discoverable by id via the agent's
+    ``./fetch direction <id>`` helper, so the agent can pull the full
+    record when it needs to reason about a quiet direction.
+    """
+    if not isinstance(stats, list) or len(stats) <= _DIRECTIONS_SUMMARY_KEEP:
+        return stats
+    sorted_stats = sorted(stats, key=_direction_activity_score, reverse=True)
+    return sorted_stats[:_DIRECTIONS_SUMMARY_KEEP]
+
+
+def _summarize_outcome_evaluation(oe: dict) -> dict:
+    """Trim an outcome_evaluation payload to the strategic agent's working set.
+
+    The biggest growth driver is ``direction_outcomes`` (one entry per active
+    direction, each carrying scope_performance, type_distribution, lifetime
+    aggregates, etc). Cap to top-N by activity. Top-level summaries
+    (``overall_summary``, ``systems``, trend) are kept in full — they're
+    aggregates that don't grow with project size.
+    """
+    if not isinstance(oe, dict):
+        return oe
+    trimmed = dict(oe)
+    direction_outcomes = trimmed.get("direction_outcomes")
+    if isinstance(direction_outcomes, list) and len(direction_outcomes) > _OUTCOME_DIRECTION_OUTCOMES_KEEP:
+        sorted_outcomes = sorted(
+            direction_outcomes,
+            key=lambda d: (
+                int((d or {}).get("merged") or 0) * 3
+                + int((d or {}).get("failed") or 0)
+                + int((d or {}).get("cycles") or 0)
+            ),
+            reverse=True,
+        )
+        trimmed["direction_outcomes"] = sorted_outcomes[:_OUTCOME_DIRECTION_OUTCOMES_KEEP]
+    return trimmed
+
+
+def _summarize_conversation_thread(thread: list) -> list:
+    """Keep the most recent N conversation messages."""
+    if not isinstance(thread, list) or len(thread) <= _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED:
+        return thread
+    return thread[-_CONVERSATION_THREAD_KEEP_WHEN_TRIMMED:]
+
+
+# Schemas for pack_under_budget. Each key declares its priority tier and an
+# optional summarize_fn. Critical = always shipped (raises if can't fit).
+# High = shipped unless budget exhausted by summarized criticals + earlier
+# high items. Medium and low get progressively more aggressive trimming.
+#
+# When new fields are added to the strategic payload, register them here or
+# the packer will warn (and treat them as low). A registered key with no
+# summarize_fn is dropped wholesale rather than trimmed when over budget.
+_STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
+    # Identity / routing — must always reach the agent
+    "type":                            {"priority": "critical"},
+    "research_mode":                   {"priority": "critical"},
+    "project_name":                    {"priority": "critical"},
+    "base_branch":                     {"priority": "critical"},
+    "is_self_repo":                    {"priority": "critical"},
+    "model":                           {"priority": "critical"},
+    "effort":                          {"priority": "critical"},
+    # Vision + intent — small but load-bearing for every decision
+    "vision":                          {"priority": "critical"},
+    # User-facing state the agent must respond to
+    "open_messages":                   {"priority": "high"},
+    "running_update":                  {"priority": "high"},
+    "running_update_acknowledged_at":  {"priority": "high"},
+    "user_last_active_at":             {"priority": "high"},
+    # Core working set (the big stuff) — summarize when over budget
+    "directions_summary":              {"priority": "high",   "summarize": _summarize_directions},
+    "problem_model":                   {"priority": "high",   "summarize": _agent_view_problem_model},
+    "design_doc":                      {"priority": "medium", "summarize": _agent_view_design_doc},
+    "outcome_evaluation":              {"priority": "medium", "summarize": _summarize_outcome_evaluation},
+    "recent_interventions":            {"priority": "medium"},
+    "conversation_thread":             {"priority": "medium", "summarize": _summarize_conversation_thread},
+    # Long-tail context — first to be dropped when budget is tight
+    "self_reflection_log":             {"priority": "low"},
+    "previous_decision_outcomes":      {"priority": "low"},
+    "anomaly_summary":                 {"priority": "low"},
+    "playbook_summary":                {"priority": "low"},
+    "rejected_proposals":              {"priority": "low"},
+    "prediction_calibration_factor":   {"priority": "low"},
+    "prediction_calibration_note":     {"priority": "low"},
+}
+
+
+_DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
+    "type":                            {"priority": "critical"},
+    "project_name":                    {"priority": "critical"},
+    "base_branch":                     {"priority": "critical"},
+    "model":                           {"priority": "critical"},
+    "effort":                          {"priority": "critical"},
+    "vision":                          {"priority": "critical"},
+    "open_messages":                   {"priority": "high"},
+    "design_doc":                      {"priority": "high",   "summarize": _agent_view_design_doc},
+    "problem_model":                   {"priority": "high",   "summarize": _agent_view_problem_model},
+    "proposed_changes":                {"priority": "high"},
+    "shipped_changes_manifest":        {"priority": "medium"},
+}
 
 
 async def _build_shipped_changes_manifest(
@@ -681,7 +810,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # Build shipped_changes_manifest: tasks merged since the last arch review
     shipped_changes_manifest = await _build_shipped_changes_manifest(project, session)
 
-    payload: dict = validate_internal_payload({
+    payload: dict = pack_under_budget({
         "type": "design_doc_update",
         "design_doc": _agent_view_design_doc(project.design_doc),
         "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
@@ -693,7 +822,8 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         "base_branch": "main",
         **({"model": doc_model} if doc_model else {}),
         **({"effort": doc_effort} if doc_effort else {}),
-    }, "autonomous_research:design_doc_update")
+    }, _DESIGN_DOC_UPDATE_SCHEMA)
+    payload = validate_internal_payload(payload, "autonomous_research:design_doc_update")
     # Audit W2: cycle history is a real table now (StrategicCycle); the
     # 10-entry sliding-window cap in vision JSONB is gone. Snapshot the
     # vision at cycle start so the 3-way merge in strategic_completion can
@@ -899,7 +1029,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     recent_interventions = await _build_recent_interventions(
         project, session, last_strategic_at=last_strategic_at
     )
-    payload: dict = validate_internal_payload({
+    payload: dict = pack_under_budget({
         "type": "strategic_review",
         "research_mode": "strategic",
         "design_doc": _agent_view_design_doc(project.design_doc),
@@ -931,7 +1061,8 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "base_branch": "main",
         **({"model": review_model} if review_model else {}),
         **({"effort": review_effort} if review_effort else {}),
-    }, "autonomous_research:strategic_review")
+    }, _STRATEGIC_REVIEW_SCHEMA)
+    payload = validate_internal_payload(payload, "autonomous_research:strategic_review")
     new_task = Task(
         project_id=project.id,
         title=f"Strategic review: {project.name}",
