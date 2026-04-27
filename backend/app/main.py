@@ -1777,16 +1777,35 @@ async def update_playbook(
 
 class AgentAnnotation(BaseModel):
     task_id: uuid.UUID
-    annotation_type: Literal["comment", "issue", "vision"]
-    content: str
+    annotation_type: Literal["comment", "issue", "vision", "size_breach"]
+    content: str = ""  # free-form prose (comment/issue/vision); ignored for size_breach
     target_page: Optional[str] = None  # design doc page key (for comments)
     severity: Optional[str] = None     # low/medium/high (for issues)
+    # size_breach fields — programmatic signal from a test-invariant failure.
+    # Server bumps the limit (policy-driven, not agent-judgment) and returns
+    # new_limit; the agent applies it to module_size_limits.json and commits.
+    file_path: Optional[str] = None
+    current_size: Optional[int] = None
+    change_summary: Optional[str] = None
 
 _ANNOTATION_TYPE_MAP = {
     "comment": MessageType.NOTE,
     "issue": MessageType.BUG_REPORT,
     "vision": MessageType.FEEDBACK,
+    "size_breach": MessageType.FEEDBACK,
 }
+
+
+def _bump_size_limit(current_size: int) -> int:
+    """Server-side policy for how much to bump a size limit on breach.
+
+    Picks the larger of "current_size + 200" and "current + 15%" so a
+    small overrun gets a reasonable floor and a big overrun doesn't
+    leave tiny headroom. Rounded to the nearest 50 lines for stability."""
+    floor = current_size + 200
+    proportional = int(current_size * 1.15)
+    raw = max(floor, proportional)
+    return ((raw + 49) // 50) * 50
 
 @app.post("/api/agent/annotate")
 @limiter.limit("30/minute")
@@ -1800,10 +1819,23 @@ async def agent_annotate(
     if str(payload.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
 
-    if len(payload.content) > 2000:
-        raise HTTPException(status_code=400, detail="Content exceeds 2000 character limit")
-    if not payload.content.strip():
-        raise HTTPException(status_code=400, detail="Content cannot be empty")
+    is_size_breach = payload.annotation_type == "size_breach"
+    if is_size_breach:
+        if not payload.file_path or not payload.file_path.strip():
+            raise HTTPException(status_code=400, detail="size_breach requires file_path")
+        if not payload.current_size or payload.current_size <= 0:
+            raise HTTPException(status_code=400, detail="size_breach requires positive current_size")
+        if not payload.change_summary or not payload.change_summary.strip():
+            raise HTTPException(status_code=400, detail="size_breach requires change_summary")
+        if len(payload.file_path) > 200:
+            raise HTTPException(status_code=400, detail="file_path too long")
+        if len(payload.change_summary) > 500:
+            raise HTTPException(status_code=400, detail="change_summary exceeds 500 character limit")
+    else:
+        if len(payload.content) > 2000:
+            raise HTTPException(status_code=400, detail="Content exceeds 2000 character limit")
+        if not payload.content.strip():
+            raise HTTPException(status_code=400, detail="Content cannot be empty")
     if payload.severity and payload.severity not in ("low", "medium", "high"):
         raise HTTPException(status_code=400, detail="Severity must be low, medium, or high")
     if payload.target_page and len(payload.target_page) > 100:
@@ -1822,24 +1854,45 @@ async def agent_annotate(
     if count >= 10:
         raise HTTPException(status_code=429, detail="Max 10 annotations per task")
 
+    if is_size_breach:
+        new_limit = _bump_size_limit(payload.current_size)
+        content = (
+            f"Size breach: {payload.file_path} grew to {payload.current_size} lines. "
+            f"Suggested new limit: {new_limit}. Change: {payload.change_summary.strip()}"
+        )
+        ctx = {
+            "annotation_type": "size_breach",
+            "task_type": token.get("task_type", ""),
+            "file_path": payload.file_path.strip(),
+            "current_size": payload.current_size,
+            "new_limit": new_limit,
+            "change_summary": payload.change_summary.strip(),
+        }
+    else:
+        content = payload.content.strip()
+        ctx = {
+            "annotation_type": payload.annotation_type,
+            "task_type": token.get("task_type", ""),
+            **({"target_page": payload.target_page} if payload.target_page else {}),
+            **({"severity": payload.severity} if payload.severity else {}),
+        }
+
     msg = ProjectMessage(
         project_id=task.project_id,
         message_type=_ANNOTATION_TYPE_MAP[payload.annotation_type],
         from_type="agent",
         from_task_id=task.id,
-        content=payload.content.strip(),
-        context={
-            "annotation_type": payload.annotation_type,
-            "task_type": token.get("task_type", ""),
-            **({"target_page": payload.target_page} if payload.target_page else {}),
-            **({"severity": payload.severity} if payload.severity else {}),
-        },
+        content=content,
+        context=ctx,
     )
     session.add(msg)
     await session.commit()
 
     logger.info(f"[ANNOTATE] {payload.annotation_type} from task {task.id} ({token.get('task_type', '?')})")
-    return {"status": "ok", "annotation_id": str(msg.id)}
+    response: dict[str, Any] = {"status": "ok", "annotation_id": str(msg.id)}
+    if is_size_breach:
+        response["new_limit"] = ctx["new_limit"]
+    return response
 
 class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""

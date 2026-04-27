@@ -655,38 +655,40 @@ class TestDirectionLifecycleInvariants:
 # If a file hits the limit, consider a refactor — but do NOT "ratchet down"
 # the limit after every cleanup. These limits should stay stable.
 
-MODULE_SIZE_LIMITS = {
-    # (relative_path_from_app_dir, max_lines)
-    # Audit 2026-04-25 W1/W3: bumped a handful of ceilings after the
-    # pipeline-audit fix lap added prescribed fixes (column promotion,
-    # idempotency rewrite, JWT shape, auth path-exemption replacement,
-    # smoketest spawn alert, beacon error capture, gemini model fallback).
-    # Per `feedback_guardrails_not_straitjackets.md`: these are loose
-    # upper bounds, not ratchets — only bumped when work justifies it.
-    "main.py": 3500,
-    "task_completion.py": 2450,
-    "task_lifecycle.py": 2600,
-    "orchestrator.py": 3300,
-    "admin.py": 3000,
-    "compute.py": 2500,
-    "github.py": 2050,
-    "routers/admin_settings.py": 3000,
-    "routers/admin_analytics.py": 800,
-    "routers/admin_digest.py": 4200,
-    "routers/admin_pool_accounts.py": 900,
-    "max_plan_pool.py": 2100,
-    "anomaly_detection.py": 2000,
-    "routers/agent.py": 2600,
-    "services.py": 1900,
-    "routers/agent_status.py": 1800,
-    "autonomous_research.py": 1800,
-    "research_completion.py": 2050,
-    "strategic_completion.py": 1500,
-    "rollup_management.py": 1600,
-    "reaper.py": 1550,
-    "review_pipeline.py": 1400,
-    "deploy_health.py": 1000,
-}
+_SIZE_LIMITS_JSON = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+
+
+def _load_size_limits() -> dict:
+    """Load the size-limits JSON.  Single source of truth for both backend
+    and frontend ceilings; updated by agents via the size_breach annotation
+    flow when a justified change pushes a file over its limit."""
+    import json
+    with open(_SIZE_LIMITS_JSON) as f:
+        return json.load(f)
+
+
+_SIZE_LIMITS = _load_size_limits()
+MODULE_SIZE_LIMITS = _SIZE_LIMITS["backend"]
+
+
+def _size_breach_message(rel_path: str, count: int, limit: int, module_kind: str) -> str:
+    """Structured assertion error directing the failing agent to the
+    size_breach annotation flow.  The agent should NOT refactor in this PR
+    (that's a strategic decision); they may bump the limit + emit the
+    annotation if their growth is justified, or shrink their diff if not."""
+    return (
+        f"{rel_path} has {count} lines (limit: {limit}).\n\n"
+        f"If your change legitimately needed to grow this file:\n"
+        f"  1. POST /api/agent/annotate with annotation_type='size_breach',\n"
+        f"     file_path='{rel_path}', current_size={count}, and a one-sentence\n"
+        f"     change_summary describing what your diff added to this file.\n"
+        f"  2. Apply the new_limit returned in the response to\n"
+        f"     backend/testing/module_size_limits.json under '{module_kind}'.\n"
+        f"  3. Commit both the source change and the JSON edit.\n\n"
+        f"If your diff is bundling unrelated code, shrink it to only what the\n"
+        f"task asked for. Do NOT refactor or extract code in this PR — that's\n"
+        f"a strategic decision, not a create/fix one."
+    )
 
 
 class TestBackendModuleSizeGuardrails:
@@ -702,10 +704,7 @@ class TestBackendModuleSizeGuardrails:
         path = os.path.join(os.path.dirname(__file__), "..", "app", relative_path)
         with open(path) as f:
             count = len(f.readlines())
-        assert count <= max_lines, (
-            f"{relative_path} has {count} lines (limit: {max_lines}). "
-            "This file has grown large — consider refactoring into smaller modules."
-        )
+        assert count <= max_lines, _size_breach_message(relative_path, count, max_lines, "backend")
 
     def test_main_py(self):
         self._check_module("main.py")
@@ -779,24 +778,7 @@ class TestBackendModuleSizeGuardrails:
 
 # ── Frontend File Size Guardrails ─────────────────────────────────────────────
 
-FRONTEND_SIZE_LIMITS = {
-    "useAppState.ts": 3000,
-    "components/DirectionsPanel.tsx": 3000,
-    "components/CatchUpPanel.tsx": 2600,
-    "components/TaskDetailDrawer.tsx": 2500,
-    "components/SettingsDropdown.tsx": 2500,
-    "components/KanbanBoard.tsx": 1500,
-    "components/KanbanColumn.tsx": 1500,
-    "App.tsx": 2000,
-    "components/TaskCard.tsx": 1500,
-    "components/DirectionCard.tsx": 1200,
-    "components/PipelineView.tsx": 1200,
-    "components/DashboardHome.tsx": 1650,
-    "components/MessagesPanel.tsx": 1000,
-    "components/MetricsDashboard.tsx": 500,
-    "components/ProjectDashboard.tsx": 300,
-    "components/HealthOverviewCard.tsx": 250,
-}
+FRONTEND_SIZE_LIMITS = _SIZE_LIMITS["frontend"]
 
 
 def _get_frontend_path(relative: str) -> str:
@@ -818,10 +800,7 @@ class TestFrontendSizeGuardrails:
         path = _get_frontend_path(relative_path)
         with open(path) as f:
             count = len(f.readlines())
-        assert count <= max_lines, (
-            f"{relative_path} has {count} lines (limit: {max_lines}). "
-            "This file has grown large — consider extracting sub-components or hooks."
-        )
+        assert count <= max_lines, _size_breach_message(relative_path, count, max_lines, "frontend")
 
     def test_useappstate(self):
         self._check_frontend("useAppState.ts")
