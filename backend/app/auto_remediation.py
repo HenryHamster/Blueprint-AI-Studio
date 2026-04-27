@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy import func as _func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
@@ -19,6 +20,7 @@ from app.direction_lifecycle import _REMEDIATION_MONITOR_EXPIRY_DAYS
 from app.github import get_check_runs_cached, get_repo_installation_token
 from app.models import Project, Task, TaskStatus
 from app.notification_dispatch import post_auto_fix_spawned_message
+from app.task_completion import _stamp_remediation_spawn_on_direction
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -455,6 +457,17 @@ async def _handle_main_branch_ci_failure_inner(
     )
     session.add(task)
     await session.flush()  # assign task.id
+    direction_id = task_context.get("direction_id")
+    if direction_id:
+        project = await session.get(Project, project_id)
+        if project:
+            directions = list(project.directions or [])
+            target = next((d for d in directions if d.get("id") == direction_id), None)
+            if target is not None:
+                _stamp_remediation_spawn_on_direction(target, task)
+                project.directions = directions
+                flag_modified(project, "directions")
+                session.add(project)
 
     # ── Notifications ──
     try:

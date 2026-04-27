@@ -44,6 +44,7 @@ from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/call
     SCOPE_FILE_BUDGETS,
     _DEGRADED_SPAWN_CAP,
     _assess_spawn_health,
+    _assess_project_spawn_health,
     _maybe_cold_start_upgrade_medium,
     _calibrate_scope,
     _poor_decomp_history,
@@ -762,7 +763,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Assess pipeline health once before spawning implementation tasks.
     # Metadata findings (design_doc_observation, direction_update) are processed
     # regardless; only VM-consuming implementation tasks are capped.
-    _pipeline_degraded, _health_reason = _assess_spawn_health()
+    _pipeline_degraded, _health_reason = await _assess_project_spawn_health(
+        session, task.project_id, _effective_cap,
+    )
     _impl_spawned = 0
     _deferred_findings: list[dict] = []
     _low_conf_skipped_findings: list[dict] = []

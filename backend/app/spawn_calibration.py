@@ -14,12 +14,17 @@ import os
 from datetime import timedelta
 from typing import Any
 
+from sqlalchemy import func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
+
 from app.direction_metrics import (
     _compute_acceptance_rate,
     _compute_direction_quality_score,
     _compute_momentum_factor,
     _compute_rolling_median_review_iterations,
 )
+from app.models import Task, TaskStatus
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -42,8 +47,48 @@ SCOPE_FILE_BUDGETS: dict[str, dict[str, int]] = {
 # the next research cycle.
 _DEGRADED_SPAWN_CAP = 2
 
+_ACTIVE_SPAWN_HEALTH_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+)
 
-def _assess_spawn_health() -> tuple[bool, str | None]:
+
+def _active_task_budget_for_design_cap(design_cap: int) -> int:
+    return max(1, int(design_cap) * 2)
+
+
+async def _count_project_active_tasks(session: AsyncSession, project_id: Any) -> int:
+    row = (await session.execute(
+        select(func.count())
+        .select_from(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status.in_(_ACTIVE_SPAWN_HEALTH_STATUSES),
+        )
+    )).one()
+    return int(row[0] or 0)
+
+
+async def _assess_project_spawn_health(
+    session: AsyncSession,
+    project_id: Any,
+    design_cap: int,
+) -> tuple[bool, str | None]:
+    active_task_count = await _count_project_active_tasks(session, project_id)
+    active_task_budget = _active_task_budget_for_design_cap(design_cap)
+    return _assess_spawn_health(
+        active_task_count=active_task_count,
+        active_task_budget=active_task_budget,
+    )
+
+
+def _assess_spawn_health(
+    *,
+    active_task_count: int | None = None,
+    active_task_budget: int | None = None,
+) -> tuple[bool, str | None]:
     """Check pipeline health signals for spawn-time gating.
 
     Returns (is_degraded, reason). When degraded, _handle_research_completion
@@ -52,7 +97,8 @@ def _assess_spawn_health() -> tuple[bool, str | None]:
     Checks (in order):
     1. Zone availability: all zones in cooldown → degraded
     2. Account availability: no accounts available for create model → degraded
-    3. Rolling failure rate: >50% of recent task_results are failures → degraded
+    3. Active backlog: project already has > budget active tasks → degraded
+    4. Rolling failure rate: >50% of recent task_results are failures → degraded
     """
     from app.compute import any_zone_available  # noqa: PLC0415
     from app.max_plan_pool import _account_by_id, _account_available_for_model  # noqa: PLC0415
@@ -66,6 +112,13 @@ def _assess_spawn_health() -> tuple[bool, str | None]:
         all_accounts = list(_account_by_id.values())
         if all_accounts and not any(_account_available_for_model(a, create_model) for a in all_accounts):
             return True, "no accounts available"
+
+    if active_task_count is not None and active_task_budget is not None:
+        if active_task_count > active_task_budget:
+            return True, (
+                f"active task backlog over budget "
+                f"({active_task_count}/{active_task_budget} queued/in-flight)"
+            )
 
     task_results = list(deploy_monitoring.get("task_results", []))
     # Apply a 60-minute window to avoid false positives from historical failures that

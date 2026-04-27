@@ -7,7 +7,11 @@ import {
   getProviderRunner,
 } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
-import { extractJsonObject, extractJsonArray } from '../json-extract.js';
+import {
+  describeJsonExtractionResult,
+  extractJsonArrayDetailed,
+  extractJsonObjectDetailed,
+} from '../json-extract.js';
 import {
   PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, excludeAgentHelpers, buildRetryContext, type PlaybookEntry,
@@ -706,8 +710,11 @@ ${DEFAULT_TOOL_GUIDANCE}`;
     if (lastResultText && lastResultText.includes('"subtasks"')) {
       logs = sanitize(lastResultText);
     } else {
-      const planObj = extractJsonObject(allOutput, 'subtasks');
-      logs = sanitize(planObj ? JSON.stringify(planObj) : (lastResultText || allOutput.slice(-50_000)));
+      const planObj = extractJsonObjectDetailed(allOutput, 'subtasks');
+      if (!planObj.ok) {
+        sendLog(ws, `[WARNING] Could not extract plan JSON: ${describeJsonExtractionResult(planObj)}\n`);
+      }
+      logs = sanitize(planObj.ok ? JSON.stringify(planObj.value) : (lastResultText || allOutput.slice(-50_000)));
     }
   }
 
@@ -1848,8 +1855,11 @@ ${analysisText.slice(0, 50_000)}
     const strategicOutput = readHandlerOutput(taskId, 'strategic_output', ws);
     let logs = strategicOutput !== null ? sanitize(JSON.stringify(strategicOutput)) : '';
     if (!logs) {
-      const stratObj = extractJsonObject(allOutput, 'vision', 'direction_operations');
-      logs = sanitize(stratObj ? JSON.stringify(stratObj) : (lastResultText || allOutput.slice(-50_000)));
+      const stratObj = extractJsonObjectDetailed(allOutput, 'vision', 'direction_operations');
+      if (!stratObj.ok) {
+        sendLog(ws, `[WARNING] Could not extract strategic JSON: ${describeJsonExtractionResult(stratObj)}\n`);
+      }
+      logs = sanitize(stratObj.ok ? JSON.stringify(stratObj.value) : (lastResultText || allOutput.slice(-50_000)));
     }
 
     const strategicProgress = readProgressArtifact(taskId, 'research');
@@ -2091,8 +2101,11 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
     if (lastResultText && lastResultText.includes('"prompt"')) {
       logs = sanitize(lastResultText);
     } else {
-      const findingsArr = extractJsonArray(allOutput, 'prompt');
-      logs = sanitize(findingsArr ? JSON.stringify(findingsArr) : (lastResultText || allOutput.slice(-50_000)));
+      const findingsArr = extractJsonArrayDetailed(allOutput, 'prompt');
+      if (!findingsArr.ok) {
+        sendLog(ws, `[WARNING] Could not extract research findings JSON: ${describeJsonExtractionResult(findingsArr)}\n`);
+      }
+      logs = sanitize(findingsArr.ok ? JSON.stringify(findingsArr.value) : (lastResultText || allOutput.slice(-50_000)));
     }
   }
 

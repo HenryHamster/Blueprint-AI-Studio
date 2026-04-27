@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { JsonExtractionError, extractJsonObject, extractJsonArray } from './json-extract.js';
+import {
+  describeJsonExtractionResult,
+  JsonExtractionError,
+  extractJsonObject,
+  extractJsonArray,
+  extractJsonObjectDetailed,
+  extractJsonArrayDetailed,
+} from './json-extract.js';
 
 describe('extractJsonObject', () => {
   it('extracts a simple object with required keys', () => {
@@ -51,6 +58,16 @@ describe('extractJsonObject', () => {
     expect(extractJsonObject('just some text', 'key')).toBeNull();
   });
 
+  it('surfaces a typed no-match result for callers that need diagnostics', () => {
+    const result = extractJsonObjectDetailed('just some text', 'key');
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('missing_required_key');
+      expect(describeJsonExtractionResult(result)).toContain('missing_required_key');
+    }
+  });
+
   it('returns null when a { has no matching close', () => {
     expect(extractJsonObject('{ "key": "value"', 'key')).toBeNull();
   });
@@ -95,6 +112,16 @@ describe('extractJsonArray', () => {
 
   it('returns null when there is no array', () => {
     expect(extractJsonArray('just text', 'k')).toBeNull();
+  });
+
+  it('surfaces a typed array no-match result for callers that need diagnostics', () => {
+    const result = extractJsonArrayDetailed('just text with "k"', 'k');
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('no_json_start');
+      expect(describeJsonExtractionResult(result)).toContain('no_json_start');
+    }
   });
 
   it('handles nested arrays containing objects with required keys', () => {

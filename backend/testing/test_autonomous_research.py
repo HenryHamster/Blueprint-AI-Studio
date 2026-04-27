@@ -4233,7 +4233,7 @@ async def test_health_gate_normal_no_cap(db_session, mocker):
     findings = [_make_finding(f"Improvement {i}", direction_id) for i in range(5)]
     mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
     # Healthy pipeline: zone available, no degradation
-    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+    mocker.patch("app.research_completion._assess_project_spawn_health", return_value=(False, None))
 
     await _handle_research_completion(task, "", db_session)
 
@@ -4269,7 +4269,7 @@ async def test_health_gate_zone_exhaustion_caps_spawn(db_session, mocker):
     findings = [_make_finding(f"Zone cap finding {i}", direction_id) for i in range(6)]
     mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
     mocker.patch(
-        "app.research_completion._assess_spawn_health",
+        "app.research_completion._assess_project_spawn_health",
         return_value=(True, "all zones in cooldown"),
     )
 
@@ -4311,7 +4311,7 @@ async def test_health_gate_account_unavailable_caps_spawn(db_session, mocker):
     findings = [_make_finding(f"Account cap finding {i}", direction_id) for i in range(5)]
     mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
     mocker.patch(
-        "app.research_completion._assess_spawn_health",
+        "app.research_completion._assess_project_spawn_health",
         return_value=(True, "no accounts available"),
     )
 
@@ -4351,7 +4351,7 @@ async def test_health_gate_deferred_findings_stored_in_context(db_session, mocke
     ]
     mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
     mocker.patch(
-        "app.research_completion._assess_spawn_health",
+        "app.research_completion._assess_project_spawn_health",
         return_value=(True, "high failure rate (8/10 recent tasks failed)"),
     )
 
@@ -4387,7 +4387,7 @@ async def test_deferred_stats_persisted_on_research_history_entry(db_session, mo
     findings = [_make_finding(f"Finding {i}", direction_id) for i in range(5)]
     mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
     mocker.patch(
-        "app.research_completion._assess_spawn_health",
+        "app.research_completion._assess_project_spawn_health",
         return_value=(True, "high failure rate"),
     )
 
@@ -4451,7 +4451,7 @@ async def test_health_gate_metadata_findings_bypass_cap(db_session, mocker):
     mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
     # Pipeline is degraded — but metadata findings must still be processed
     mocker.patch(
-        "app.research_completion._assess_spawn_health",
+        "app.research_completion._assess_project_spawn_health",
         return_value=(True, "all zones in cooldown"),
     )
 
@@ -4514,7 +4514,7 @@ async def test_prior_deferred_findings_processed_in_next_cycle(db_session, mocke
     new_findings = [_make_finding("Fresh finding C", direction_id)]
     mocker.patch("app.research_completion._parse_research_findings", return_value=new_findings)
     # Healthy pipeline: no cap
-    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+    mocker.patch("app.research_completion._assess_project_spawn_health", return_value=(False, None))
 
     await _handle_research_completion(task, "", db_session)
 
@@ -4568,7 +4568,7 @@ async def test_prior_deferred_findings_still_capped_if_pipeline_degraded(db_sess
     new_findings = [_make_finding(f"New finding {i}", direction_id) for i in range(2)]
     mocker.patch("app.research_completion._parse_research_findings", return_value=new_findings)
     mocker.patch(
-        "app.research_completion._assess_spawn_health",
+        "app.research_completion._assess_project_spawn_health",
         return_value=(True, "all zones in cooldown"),
     )
 
@@ -4631,7 +4631,7 @@ async def test_repeatedly_deferred_low_confidence_findings_are_decayed(db_sessio
         "app.research_completion._parse_research_findings",
         return_value=[_make_finding("Fresh sentinel", direction_id)],
     )
-    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+    mocker.patch("app.research_completion._assess_project_spawn_health", return_value=(False, None))
 
     await _handle_research_completion(task, "", db_session)
 
@@ -4728,7 +4728,7 @@ async def test_batch_cap_excess_findings_are_deferred_not_discarded(db_session, 
     _patch_research_externals(mocker)
     # Force batch cap to 3 by saturating queue (cap_by_queue = max(3, 15-12) = 3)
     mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
-    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+    mocker.patch("app.research_completion._assess_project_spawn_health", return_value=(False, None))
 
     findings = [_make_finding(f"Finding {i}", direction_id) for i in range(5)]
     mocker.patch("app.research_completion._parse_research_findings", return_value=findings)
@@ -4766,7 +4766,7 @@ async def test_priority_sort_before_batch_cap_keeps_high_priority(db_session, mo
     _patch_research_externals(mocker)
     # Force batch cap to 3
     mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
-    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+    mocker.patch("app.research_completion._assess_project_spawn_health", return_value=(False, None))
 
     # Agent returns 5 findings in low-first order — without priority sort,
     # the batch cap would discard the trailing high-priority findings.
@@ -4819,7 +4819,7 @@ async def test_batch_cap_preserves_depends_on_indices_across_priority_selection(
     _patch_research_externals(mocker)
     # Force batch cap to 3
     mocker.patch.object(_shared_state, "tasks_queued_gauge", 12)
-    mocker.patch("app.research_completion._assess_spawn_health", return_value=(False, None))
+    mocker.patch("app.research_completion._assess_project_spawn_health", return_value=(False, None))
 
     # Agent output: a low-priority prerequisite at index 0, a pure-low filler
     # at index 1, a high-priority dependent at index 2 (points to 0), and a
@@ -4872,7 +4872,7 @@ async def test_batch_cap_and_health_gate_deferrals_combine(db_session, mocker):
     mocker.patch.object(_shared_state, "tasks_queued_gauge", 11)
     # And pipeline degraded so health gate further limits to _DEGRADED_SPAWN_CAP
     mocker.patch(
-        "app.research_completion._assess_spawn_health",
+        "app.research_completion._assess_project_spawn_health",
         return_value=(True, "all zones in cooldown"),
     )
 

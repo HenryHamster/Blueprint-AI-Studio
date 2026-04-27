@@ -44,27 +44,64 @@ export class JsonExtractionError extends Error {
   }
 }
 
+export type JsonExtractionMissReason =
+  | 'missing_required_key'
+  | 'no_json_start'
+  | 'unbalanced_json'
+  | 'no_matching_candidate';
+
+export type JsonExtractionResult<T> =
+  | { ok: true; value: T }
+  | {
+      ok: false;
+      kind: 'object' | 'array';
+      reason: JsonExtractionMissReason;
+      requiredKeys: readonly string[];
+      detail: string;
+    };
+
+export function describeJsonExtractionResult(result: JsonExtractionResult<unknown>): string {
+  if (result.ok) return 'matched';
+  return `${result.kind} ${result.reason}: ${result.detail}`;
+}
+
 /**
  * Extract the first JSON object from `text` that contains all `requiredKeys`.
  * Returns the parsed object, or null if none found.
  * Throws JsonExtractionError if matching candidates were present but malformed.
  */
-export function extractJsonObject<T = Record<string, unknown>>(text: string, ...requiredKeys: string[]): T | null {
-  // Quick bail: all keys must appear somewhere in the text
+export function extractJsonObjectDetailed<T = Record<string, unknown>>(
+  text: string,
+  ...requiredKeys: string[]
+): JsonExtractionResult<T> {
   for (const key of requiredKeys) {
-    if (!text.includes(`"${key}"`)) return null;
+    if (!text.includes(`"${key}"`)) {
+      return {
+        ok: false,
+        kind: 'object',
+        reason: 'missing_required_key',
+        requiredKeys,
+        detail: `required key "${key}" is absent from output`,
+      };
+    }
   }
   let pos = 0;
   const parseErrors: string[] = [];
+  let sawStart = false;
+  let sawUnbalanced = false;
   while (pos < text.length) {
     const start = text.indexOf('{', pos);
     if (start === -1) break;
+    sawStart = true;
     const end = findMatchingClose(text, start, '{', '}');
-    if (end === -1) break;
+    if (end === -1) {
+      sawUnbalanced = true;
+      break;
+    }
     const candidate = text.slice(start, end + 1);
     if (requiredKeys.every(k => candidate.includes(`"${k}"`))) {
       try {
-        return JSON.parse(candidate) as T;
+        return { ok: true, value: JSON.parse(candidate) as T };
       } catch (err: unknown) {
         parseErrors.push(err instanceof Error ? err.message : String(err));
       }
@@ -78,7 +115,36 @@ export function extractJsonObject<T = Record<string, unknown>>(text: string, ...
       `Failed to parse JSON object containing required keys (${requiredKeys.join(', ')}): ${parseErrors[0]}`,
     );
   }
-  return null;
+  if (!sawStart) {
+    return {
+      ok: false,
+      kind: 'object',
+      reason: 'no_json_start',
+      requiredKeys,
+      detail: 'no object opening brace found',
+    };
+  }
+  if (sawUnbalanced) {
+    return {
+      ok: false,
+      kind: 'object',
+      reason: 'unbalanced_json',
+      requiredKeys,
+      detail: 'object opening brace had no matching close',
+    };
+  }
+  return {
+    ok: false,
+    kind: 'object',
+    reason: 'no_matching_candidate',
+    requiredKeys,
+    detail: `no object contained all required keys (${requiredKeys.join(', ')})`,
+  };
+}
+
+export function extractJsonObject<T = Record<string, unknown>>(text: string, ...requiredKeys: string[]): T | null {
+  const result = extractJsonObjectDetailed<T>(text, ...requiredKeys);
+  return result.ok ? result.value : null;
 }
 
 /**
@@ -86,21 +152,38 @@ export function extractJsonObject<T = Record<string, unknown>>(text: string, ...
  * Returns the parsed array, or null if none found.
  * Throws JsonExtractionError if matching candidates were present but malformed.
  */
-export function extractJsonArray<T = unknown[]>(text: string, ...requiredKeys: string[]): T | null {
+export function extractJsonArrayDetailed<T = unknown[]>(
+  text: string,
+  ...requiredKeys: string[]
+): JsonExtractionResult<T> {
   for (const key of requiredKeys) {
-    if (!text.includes(`"${key}"`)) return null;
+    if (!text.includes(`"${key}"`)) {
+      return {
+        ok: false,
+        kind: 'array',
+        reason: 'missing_required_key',
+        requiredKeys,
+        detail: `required key "${key}" is absent from output`,
+      };
+    }
   }
   let pos = 0;
   const parseErrors: string[] = [];
+  let sawStart = false;
+  let sawUnbalanced = false;
   while (pos < text.length) {
     const start = text.indexOf('[', pos);
     if (start === -1) break;
+    sawStart = true;
     const end = findMatchingClose(text, start, '[', ']');
-    if (end === -1) break;
+    if (end === -1) {
+      sawUnbalanced = true;
+      break;
+    }
     const candidate = text.slice(start, end + 1);
     if (requiredKeys.every(k => candidate.includes(`"${k}"`))) {
       try {
-        return JSON.parse(candidate) as T;
+        return { ok: true, value: JSON.parse(candidate) as T };
       } catch (err: unknown) {
         parseErrors.push(err instanceof Error ? err.message : String(err));
       }
@@ -114,5 +197,34 @@ export function extractJsonArray<T = unknown[]>(text: string, ...requiredKeys: s
       `Failed to parse JSON array containing required keys (${requiredKeys.join(', ')}): ${parseErrors[0]}`,
     );
   }
-  return null;
+  if (!sawStart) {
+    return {
+      ok: false,
+      kind: 'array',
+      reason: 'no_json_start',
+      requiredKeys,
+      detail: 'no array opening bracket found',
+    };
+  }
+  if (sawUnbalanced) {
+    return {
+      ok: false,
+      kind: 'array',
+      reason: 'unbalanced_json',
+      requiredKeys,
+      detail: 'array opening bracket had no matching close',
+    };
+  }
+  return {
+    ok: false,
+    kind: 'array',
+    reason: 'no_matching_candidate',
+    requiredKeys,
+    detail: `no array contained all required keys (${requiredKeys.join(', ')})`,
+  };
+}
+
+export function extractJsonArray<T = unknown[]>(text: string, ...requiredKeys: string[]): T | null {
+  const result = extractJsonArrayDetailed<T>(text, ...requiredKeys);
+  return result.ok ? result.value : null;
 }

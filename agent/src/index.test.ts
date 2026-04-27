@@ -1108,6 +1108,61 @@ describe('stale result retry envelopes', () => {
 
     expect(shouldAbandonStaleResult(stale, 2000)).toBe(true);
   });
+
+  it('fails final status with oauth_rotation_failed when OAuth rotation cannot persist', async () => {
+    const oldProvider = process.env.PROVIDER;
+    const oldAuthMode = process.env.AUTH_MODE;
+    process.env.PROVIDER = 'openai';
+    process.env.AUTH_MODE = 'oauth';
+    vi.resetModules();
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    mockReadFileSync.mockImplementation((path, encoding) => {
+      if (String(path).includes('/opt/agent/openai/auth.json')) {
+        return encoding ? '{"refresh_token":"rotated"}' : Buffer.from('{"refresh_token":"rotated"}');
+      }
+      return '';
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/api/agent/credentials/rotate')) {
+        return {
+          ok: false,
+          status: 400,
+          text: () => Promise.resolve('revoked token'),
+          json: () => Promise.resolve({}),
+          headers: { get: () => null },
+        } as unknown as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: () => Promise.resolve(''),
+        json: () => Promise.resolve({ status: 'ok' }),
+        headers: { get: () => null },
+      } as unknown as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      const mod = await import('./index.js');
+      await mod.persistAndPostStatus('task-oauth', {
+        task_id: 'task-oauth',
+        status: 'COMPLETED',
+        logs: 'original completion',
+      });
+    } finally {
+      process.env.PROVIDER = oldProvider;
+      process.env.AUTH_MODE = oldAuthMode;
+    }
+
+    const statusCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/api/agent/status'));
+    expect(statusCall).toBeTruthy();
+    const body = JSON.parse(String(statusCall?.[1]?.body)) as Record<string, unknown>;
+    expect(body.status).toBe('FAILED');
+    expect(body.oauth_rotation_failed).toBe(true);
+    expect(body.failure_category).toBe('oauth_rotation_failed');
+    expect(body.logs).toContain('OAuth credential rotation failed');
+  });
 });
 
 // ── Failure category classification ──────────────────────────────────────────

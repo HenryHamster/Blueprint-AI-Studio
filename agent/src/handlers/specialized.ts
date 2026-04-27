@@ -7,7 +7,7 @@ import {
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
-import { extractJsonArray } from '../json-extract.js';
+import { describeJsonExtractionResult, extractJsonArrayDetailed } from '../json-extract.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
@@ -97,8 +97,11 @@ Rules:
     if (lastResultText && lastResultText.includes('"severity"')) {
       logs = sanitize(lastResultText);
     } else {
-      const findingsArr = extractJsonArray(allOutput, 'severity');
-      logs = sanitize(findingsArr ? JSON.stringify(findingsArr) : (lastResultText || allOutput.slice(-50_000)));
+      const findingsArr = extractJsonArrayDetailed(allOutput, 'severity');
+      if (!findingsArr.ok) {
+        sendLog(ws, `[WARNING] Could not extract security findings JSON: ${describeJsonExtractionResult(findingsArr)}\n`);
+      }
+      logs = sanitize(findingsArr.ok ? JSON.stringify(findingsArr.value) : (lastResultText || allOutput.slice(-50_000)));
     }
   }
 
@@ -612,8 +615,11 @@ Rules:
     if (lastResultText && lastResultText.includes('"severity"')) {
       logs = sanitize(lastResultText);
     } else {
-      const findingsArr = extractJsonArray(allOutput, 'severity');
-      logs = sanitize(findingsArr ? JSON.stringify(findingsArr) : (lastResultText || allOutput.slice(-50_000)));
+      const findingsArr = extractJsonArrayDetailed(allOutput, 'severity');
+      if (!findingsArr.ok) {
+        sendLog(ws, `[WARNING] Could not extract performance findings JSON: ${describeJsonExtractionResult(findingsArr)}\n`);
+      }
+      logs = sanitize(findingsArr.ok ? JSON.stringify(findingsArr.value) : (lastResultText || allOutput.slice(-50_000)));
     }
   }
 

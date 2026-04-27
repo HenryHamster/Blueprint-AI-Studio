@@ -19,7 +19,7 @@ import {
 } from './constants.js';
 
 // ── Failure categories ───────────────────────────────────────────────────────
-export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'timeout';
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'timeout' | 'oauth_rotation_failed';
 type ProviderName = 'anthropic' | 'openai' | 'gemini';
 type AuthMode = 'oauth' | 'api_key' | 'service_account';
 type OutputMode = 'claude-stream-json' | 'text';
@@ -462,12 +462,59 @@ function writeStaleResultFile(path: string, envelope: StaleResultEnvelope): void
   writePrivateFileSync(path, JSON.stringify(envelope));
 }
 
+const pendingStatusFlagsByTask = new Map<string, Record<string, unknown>>();
+
+function setPendingStatusFlag(taskId: string, key: string, value: unknown): void {
+  const current = pendingStatusFlagsByTask.get(taskId) ?? {};
+  pendingStatusFlagsByTask.set(taskId, { ...current, [key]: value });
+}
+
+function clearPendingStatusFlags(taskId: string): void {
+  pendingStatusFlagsByTask.delete(taskId);
+}
+
+function statusFlagsForTask(taskId: string): Record<string, unknown> {
+  return pendingStatusFlagsByTask.get(taskId) ?? {};
+}
+
+function isTerminalStatus(status: unknown): boolean {
+  return status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED';
+}
+
+async function applyFinalStatusPrerequisites(
+  taskId: string,
+  payload: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (!isTerminalStatus(payload.status)) return payload;
+  try {
+    await rotateOAuthCredentialsIfChanged(taskId);
+    return payload;
+  } catch (e) {
+    const message = sanitize(e instanceof Error ? e.message : String(e)).slice(0, 500);
+    log(`[ERROR] OAuth rotation failed; failing task with oauth_rotation_failed so the backend does not reuse a revoked token: ${message}`);
+    const existingLogs = typeof payload.logs === 'string' && payload.logs.trim()
+      ? `${payload.logs}\n\n`
+      : '';
+    return {
+      ...payload,
+      status: 'FAILED',
+      artifact_type: 'ERROR_LOG',
+      logs: `${existingLogs}OAuth credential rotation failed after task execution: ${message}`,
+      failure_category: 'oauth_rotation_failed',
+      oauth_rotation_failed: true,
+      oauth_rotation_error: message,
+    };
+  }
+}
+
 export async function persistAndPostStatus(taskId: string, payload: Record<string, unknown>) {
   const resultPath = `/tmp/task_${taskId}_result.json`;
-  const enrichedPayload = enrichStatusPayload(taskId, payload);
+  const statusPayload = await applyFinalStatusPrerequisites(taskId, payload);
+  const enrichedPayload = enrichStatusPayload(taskId, statusPayload);
   writeStaleResultFile(resultPath, createStaleResultEnvelope(enrichedPayload));
   const result = await apiPost('/api/agent/status', enrichedPayload);
   try { fs.unlinkSync(resultPath); } catch { /* ignore — file already gone */ }
+  clearPendingStatusFlags(taskId);
   return result;
 }
 
@@ -479,6 +526,7 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
     execution_mode: LLM_EXECUTION_MODE,
     task_id: taskId,
     ...payload,
+    ...statusFlagsForTask(taskId),
   };
 }
 
@@ -710,28 +758,47 @@ async function connectLogStream(taskId: string): Promise<WebSocket | null> {
   const wsUrl = ORCHESTRATOR_URL.replace(/^http/, 'ws');
   const maxRetries = 3;
   const baseDelay = 2000;
+  let lastFailure = 'unknown';
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       const ws = await new Promise<WebSocket | null>((resolve) => {
         const conn = new WebSocket(`${wsUrl}/api/agent/ws/${taskId}`);
-        const timeout = setTimeout(() => { resolve(null); }, 5000);
+        let settled = false;
+        const finish = (socket: WebSocket | null, failure?: string) => {
+          if (settled) return;
+          settled = true;
+          if (failure) lastFailure = failure;
+          resolve(socket);
+        };
+        const timeout = setTimeout(() => {
+          try { conn.terminate(); } catch { /* ignore */ }
+          finish(null, 'connect timeout');
+        }, 5000);
         conn.on('open', () => {
           clearTimeout(timeout);
           conn.send(JSON.stringify({ token: AGENT_TOKEN }));
-          resolve(conn);
+          finish(conn);
         });
-        conn.on('error', () => { clearTimeout(timeout); resolve(null); });
+        conn.on('error', (err: Error) => {
+          clearTimeout(timeout);
+          finish(null, err.message || 'websocket error');
+        });
       });
       if (ws) {
         flushLogBuffer(ws);
         return ws;
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      lastFailure = err instanceof Error ? err.message : String(err);
+    }
     if (attempt < maxRetries - 1) {
       await new Promise(r => setTimeout(r, baseDelay * Math.pow(2, attempt)));
     }
   }
+  setPendingStatusFlag(taskId, 'websocket_connect_failed', true);
+  setPendingStatusFlag(taskId, 'websocket_connect_error', sanitize(lastFailure).slice(0, 500));
+  setPendingStatusFlag(taskId, 'websocket_connect_attempts', maxRetries);
   return null;
 }
 
@@ -2558,14 +2625,6 @@ async function main() {
   } finally {
     stopHeartbeat();
     if (ws) ws.close();
-    // Rotate OAuth creds back to backend if the CLI refreshed them in-place
-    // during the run. Best-effort — failures don't block shutdown. Only
-    // openai/oauth rotates today; other providers no-op server-side.
-    try {
-      await rotateOAuthCredentialsIfChanged(taskId);
-    } catch (e) {
-      log(`OAuth rotation failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
-    }
     // Clean up workspace to avoid leaking tokens in git config
     try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch { /* ignore */ }
     // Clean up /tmp files written by Claude Code handlers (task-specific paths)

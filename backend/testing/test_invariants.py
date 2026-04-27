@@ -664,7 +664,7 @@ MODULE_SIZE_LIMITS = {
     # Per `feedback_guardrails_not_straitjackets.md`: these are loose
     # upper bounds, not ratchets — only bumped when work justifies it.
     "main.py": 3500,
-    "task_completion.py": 2400,
+    "task_completion.py": 2450,
     "task_lifecycle.py": 2600,
     "orchestrator.py": 3250,
     "admin.py": 3000,

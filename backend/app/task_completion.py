@@ -166,6 +166,20 @@ def _stamp_orphan_remediation_outcome(
     flag_modified(task, "context")
 
 
+def _stamp_remediation_spawn_on_direction(direction: Dict[str, Any], task: Task) -> None:
+    """Record that a remediation task is in flight without declaring its outcome."""
+    ctx = task.context or {}
+    direction["last_remediation_at"] = _utcnow().isoformat()
+    direction["last_remediation_task_id"] = str(task.id)
+    direction["remediation_task_id"] = str(task.id)
+    diagnosis_task_id = ctx.get("diagnosis_task_id")
+    if diagnosis_task_id:
+        direction["last_remediation_diagnosis_task_id"] = str(diagnosis_task_id)
+    fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint")
+    if fingerprint:
+        direction["last_remediation_fingerprint"] = str(fingerprint)
+
+
 async def _record_remediation_outcome(
     task: Task, *, merged: bool, session: AsyncSession,
 ) -> bool:
@@ -1437,7 +1451,7 @@ async def _handle_investigation_terminal_failure(
                 partial_spawn.context = spawn_ctx
                 flag_modified(partial_spawn, "context")
                 session.add(partial_spawn)
-                target["remediation_task_id"] = str(partial_spawn.id)
+                _stamp_remediation_spawn_on_direction(target, partial_spawn)
                 target["last_diagnosis_outcome"] = "partial_remediation_spawned"
                 clear_direction_hold(str(direction_id))
                 flag_modified(project, "directions")
@@ -2028,7 +2042,7 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
         direction.pop(DIAGNOSIS_STARTED_AT_KEY, None)
         direction.pop(DIAGNOSIS_TASK_ID_KEY, None)
         if spawned_child is not None:
-            direction["remediation_task_id"] = str(spawned_child.id)
+            _stamp_remediation_spawn_on_direction(direction, spawned_child)
         if structural:
             note_text = (
                 f"Diagnosis ({now_iso[:10]}) flagged this direction as structurally "
