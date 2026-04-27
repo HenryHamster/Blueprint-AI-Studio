@@ -235,6 +235,7 @@ class TestClassifyFailureAgentTimeout:
         "stuck in ci-wait",
         "backstop timeout fired",
         "waiting on dependency PR",
+        "Waiting: serializing migration — task 7af4d393 is already producing a migration in this project",
         "Cancelled: parent evaluation timeout",
         "Cancelled: some new orchestrator reason",
         "Superseded by fix on PR #1234",

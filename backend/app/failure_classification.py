@@ -1032,7 +1032,8 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
         return "AGENT_TIMEOUT"
 
     # Orchestration constraints — dependency waits are not code defects
-    if any(kw in combined for kw in ["waiting on", "dependencies cleared"]):
+    if any(kw in combined for kw in ["waiting on", "dependencies cleared",
+                                      "serializing migration"]):
         return "AGENT_TIMEOUT"
 
     # Cascade cancellations — any task cancelled by the orchestrator/services is an infrastructure
