@@ -40,19 +40,21 @@ async def test_concurrent_dispatch_mutations_keep_both_context_updates(db_sessio
     first_has_lock = asyncio.Event()
 
     async def dispatch_mutation(label: str, hold_first_lock: bool = False) -> None:
-        async with Session() as session:
-            async with task_lock(session, task.id, skip_locked=False, timeout=5) as locked_task:
-                assert locked_task is not None
-                if hold_first_lock:
-                    first_has_lock.set()
-                    await asyncio.sleep(0.2)
-                ctx = dict(locked_task.context or {})
-                mutations = list(ctx.get("dispatch_mutations") or [])
-                mutations.append(label)
-                ctx["dispatch_mutations"] = mutations
-                locked_task.context = ctx
-                session.add(locked_task)
-                await session.commit()
+        async with (
+            Session() as session,
+            task_lock(session, task.id, skip_locked=False, timeout=5) as locked_task,
+        ):
+            assert locked_task is not None
+            if hold_first_lock:
+                first_has_lock.set()
+                await asyncio.sleep(0.2)
+            ctx = dict(locked_task.context or {})
+            mutations = list(ctx.get("dispatch_mutations") or [])
+            mutations.append(label)
+            ctx["dispatch_mutations"] = mutations
+            locked_task.context = ctx
+            session.add(locked_task)
+            await session.commit()
 
     async def second_dispatch() -> None:
         await first_has_lock.wait()
@@ -63,6 +65,10 @@ async def test_concurrent_dispatch_mutations_keep_both_context_updates(db_sessio
         second_dispatch(),
     )
 
-    result = await db_session.execute(select(Task).where(Task.id == task.id))
-    refreshed = result.scalar_one()
-    assert refreshed.context["dispatch_mutations"] == ["first", "second"]
+    # The sub-sessions committed via fresh sessions; db_session's identity-map
+    # copy still holds the pre-mutation snapshot (expire_on_commit=False).
+    # Read through a fresh session to see the actual post-commit row state.
+    async with Session() as verify_session:
+        result = await verify_session.execute(select(Task).where(Task.id == task.id))
+        refreshed = result.scalar_one()
+        assert refreshed.context["dispatch_mutations"] == ["first", "second"]

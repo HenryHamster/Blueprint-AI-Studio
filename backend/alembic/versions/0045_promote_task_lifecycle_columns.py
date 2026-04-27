@@ -95,15 +95,42 @@ def upgrade() -> None:
     )
 
     # --- backfill from existing context JSONB ---
-    # Booleans first.
+    # Booleans first. Some prod rows store these keys as objects (e.g.
+    # auto_remediation = {"at": "..."}) instead of bools — guard the cast
+    # with jsonb_typeof so non-boolean shapes degrade to FALSE rather than
+    # crashing the whole migration on InvalidTextRepresentationError.
     op.execute("""
         UPDATE task SET
-          post_commit_pending = COALESCE((context->>'_post_commit_pending')::boolean, FALSE),
-          requeue_in_flight   = COALESCE((context->>'requeue_in_flight')::boolean, FALSE),
-          auto_remediation    = COALESCE((context->>'auto_remediation')::boolean, FALSE),
-          spawn_failed        = COALESCE((context->>'_spawn_failed')::boolean, FALSE),
-          previous_error_fingerprint = context->>'_previous_error_fingerprint',
-          strategic_cycle_id  = context->>'strategic_cycle_id'
+          post_commit_pending = CASE
+            WHEN jsonb_typeof(context->'_post_commit_pending') = 'boolean'
+              THEN (context->>'_post_commit_pending')::boolean
+            ELSE FALSE
+          END,
+          requeue_in_flight = CASE
+            WHEN jsonb_typeof(context->'requeue_in_flight') = 'boolean'
+              THEN (context->>'requeue_in_flight')::boolean
+            ELSE FALSE
+          END,
+          auto_remediation = CASE
+            WHEN jsonb_typeof(context->'auto_remediation') = 'boolean'
+              THEN (context->>'auto_remediation')::boolean
+            ELSE FALSE
+          END,
+          spawn_failed = CASE
+            WHEN jsonb_typeof(context->'_spawn_failed') = 'boolean'
+              THEN (context->>'_spawn_failed')::boolean
+            ELSE FALSE
+          END,
+          previous_error_fingerprint = CASE
+            WHEN jsonb_typeof(context->'_previous_error_fingerprint') = 'string'
+              THEN context->>'_previous_error_fingerprint'
+            ELSE NULL
+          END,
+          strategic_cycle_id = CASE
+            WHEN jsonb_typeof(context->'strategic_cycle_id') = 'string'
+              THEN context->>'strategic_cycle_id'
+            ELSE NULL
+          END
         WHERE context IS NOT NULL;
     """)
     # Timestamp fields parsed best-effort; leave NULL on parse fail. Match
