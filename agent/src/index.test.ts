@@ -926,24 +926,24 @@ describe('captureTestBaseline timeout selection', () => {
     configureSpawnMock();
   });
 
-  it('uses TEST_BASELINE_DOCKER_TIMEOUT (180s) for runners containing scripts/test-backend.sh', async () => {
+  it('uses TEST_BASELINE_DOCKER_TIMEOUT (10min) for runners containing scripts/test-backend.sh', async () => {
     const buildConfig = {
       directories: [{ path: '', type: 'python', test_cmd: 'bash scripts/test-backend.sh' }],
     };
     await captureTestBaseline(null, { value: '' }, buildConfig);
     const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
     expect(bashCall).toBeDefined();
-    expect((bashCall![2] as { timeout: number }).timeout).toBe(180_000);
+    expect((bashCall![2] as { timeout: number }).timeout).toBe(600_000);
   });
 
-  it('uses TEST_BASELINE_DOCKER_TIMEOUT (180s) for runners with docker in args', async () => {
+  it('uses TEST_BASELINE_DOCKER_TIMEOUT (10min) for runners with docker in args', async () => {
     const buildConfig = {
       directories: [{ path: '', type: 'python', test_cmd: 'docker run --rm myimage pytest' }],
     };
     await captureTestBaseline(null, { value: '' }, buildConfig);
     const dockerCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'docker');
     expect(dockerCall).toBeDefined();
-    expect((dockerCall![2] as { timeout: number }).timeout).toBe(180_000);
+    expect((dockerCall![2] as { timeout: number }).timeout).toBe(600_000);
   });
 
   it('uses the passed timeoutMs (60s default) for non-Docker runners', async () => {
@@ -954,6 +954,52 @@ describe('captureTestBaseline timeout selection', () => {
     const npmCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'npm');
     expect(npmCall).toBeDefined();
     expect((npmCall![2] as { timeout: number }).timeout).toBe(60_000);
+  });
+});
+
+// ── Auto-detect: scripts/test-backend.sh runs with --postgres ────────────────
+// Without --postgres, test-backend.sh defaults to in-memory SQLite. CI runs
+// Postgres. SQLite-passing-Postgres-failing fixes get pushed and only fail on
+// CI, costing a full review-fix iteration. Force --postgres on the auto-detect
+// path so the local gate matches CI.
+describe('detectTestRunners auto-detect appends --postgres', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(spawn).mockReset();
+    configureSpawnMock();
+    vi.mocked(fs.existsSync).mockReset();
+  });
+
+  function fakeSelfRepoFs() {
+    // Simulate Blueprint's own repo layout: backend/pytest.ini exists AND
+    // scripts/test-backend.sh exists. No top-level package.json, no agent/
+    // package.json — so the only auto-detected runner is the backend script.
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) => {
+      const s = String(p);
+      return s.endsWith('/backend/pytest.ini') || s.endsWith('/scripts/test-backend.sh');
+    });
+  }
+
+  it('appends --postgres when auto-detecting backend/pytest.ini + scripts/test-backend.sh', async () => {
+    fakeSelfRepoFs();
+    // No buildConfig = auto-detect path
+    await captureTestBaseline(null, { value: '' });
+    const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
+    expect(bashCall).toBeDefined();
+    const args = bashCall![1] as string[];
+    expect(args).toContain('scripts/test-backend.sh');
+    expect(args).toContain('--postgres');
+  });
+
+  it('appends --postgres when auto-detecting in testFixLoop', async () => {
+    fakeSelfRepoFs();
+    await testFixLoop(null, { value: '' });
+    const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
+    expect(bashCall).toBeDefined();
+    const args = bashCall![1] as string[];
+    expect(args).toContain('scripts/test-backend.sh');
+    expect(args).toContain('--postgres');
   });
 });
 

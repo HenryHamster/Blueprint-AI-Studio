@@ -14,7 +14,7 @@ import {
   FRONTEND_NPM_TIMEOUT, FRONTEND_ESLINT_TIMEOUT, FRONTEND_BUILD_TIMEOUT,
   AGENT_NPM_TIMEOUT, AGENT_TSC_TIMEOUT,
   RUFF_TIMEOUT,
-  TEST_RUNNER_TIMEOUT, TEST_BASELINE_TIMEOUT, TEST_BASELINE_DOCKER_TIMEOUT,
+  TEST_RUNNER_TIMEOUT, TEST_RUNNER_DOCKER_TIMEOUT, TEST_BASELINE_TIMEOUT, TEST_BASELINE_DOCKER_TIMEOUT,
   claudeTimeoutForEffort, MAX_OUTPUT_BYTES,
 } from './constants.js';
 
@@ -1361,9 +1361,13 @@ function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
       const backendTestScript = `${WORKSPACE}/scripts/test-backend.sh`;
       const agentPkg = `${WORKSPACE}/agent/package.json`;
 
+      // --postgres makes test-backend.sh stand up a Postgres sidecar so the
+      // local run matches CI. Without it, the script defaults to in-memory
+      // SQLite and Postgres-only failures (enum/JSONB/migration drift) only
+      // surface on CI, after a push, burning a full review-fix iteration.
       if (existsSync(backendPytestIni)) {
         if (existsSync(backendTestScript)) {
-          runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh'], cwd: WORKSPACE, label: 'pytest (backend)' });
+          runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh', '--postgres'], cwd: WORKSPACE, label: 'pytest (backend)' });
         } else {
           runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend)' });
         }
@@ -1371,7 +1375,7 @@ function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
         try {
           if (readFileSync(backendPyproject, 'utf-8').includes('pytest')) {
             if (existsSync(backendTestScript)) {
-              runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh'], cwd: WORKSPACE, label: 'pytest (backend pyproject)' });
+              runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh', '--postgres'], cwd: WORKSPACE, label: 'pytest (backend pyproject)' });
             } else {
               runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend pyproject)' });
             }
@@ -1733,7 +1737,8 @@ export async function testFixLoop(
 
       try {
         sendHeartbeatSync(taskId, `Running tests [${runner.label}]...`);
-        await execFileAsync(runner.cmd, runArgs, { cwd: runner.cwd, timeoutMs: TEST_RUNNER_TIMEOUT });
+        const runnerTimeout = isDockerRunner(runner) ? TEST_RUNNER_DOCKER_TIMEOUT : TEST_RUNNER_TIMEOUT;
+        await execFileAsync(runner.cmd, runArgs, { cwd: runner.cwd, timeoutMs: runnerTimeout });
         ranAnyRunner = true;
         sendLog(ws, `Tests passed [${runner.label}].\n`);
       } catch (testErr: unknown) {

@@ -46,8 +46,14 @@ export const RUFF_TIMEOUT = 60_000;
 // Test fix loop
 export const MAX_TEST_FIX_ATTEMPTS = 2;
 export const TEST_RUNNER_TIMEOUT = 180_000;
+// Docker test runners (e.g. scripts/test-backend.sh --postgres) build the
+// image, start a Postgres sidecar, run alembic upgrade, then execute the
+// full pytest suite — typically 5–8 minutes end to end. The non-Docker
+// budget is too tight to be useful here, so we branch in testFixLoop /
+// captureTestBaseline at every isDockerRunner site.
+export const TEST_RUNNER_DOCKER_TIMEOUT = 600_000;
 export const TEST_BASELINE_TIMEOUT = 60_000;
-export const TEST_BASELINE_DOCKER_TIMEOUT = 180_000;
+export const TEST_BASELINE_DOCKER_TIMEOUT = 600_000;
 
 // Self-review loop
 export const MAX_SELF_REVIEW_ATTEMPTS = 2;
