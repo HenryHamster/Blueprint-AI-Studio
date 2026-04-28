@@ -1446,9 +1446,10 @@ async def update_agent_status(
                                         if len(_recent) > 10:
                                             _recent = _recent[-10:]
                                     _entry["recent_outcomes"] = _recent
-                                    # Compute and persist effectiveness_score
-                                    _score = sum(_recent) / len(_recent) if _recent else 0.5
-                                    _entry["effectiveness_score"] = round(_score, 4)
+                                    _ref = _entry.get("reference_count", 0)
+                                    _conf = _entry.get("confirmed_count", 0)
+                                    if _conf > 0 or _ref > 0:
+                                        _entry["effectiveness_score"] = round(_conf / max(_ref, 1), 4)
                                 _doc[_pk] = _entry
                                 _confirmed_changed = True
                         if _confirmed_changed:

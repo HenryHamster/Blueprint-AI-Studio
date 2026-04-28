@@ -2418,6 +2418,38 @@ async def _compute_digest(
         else:
             d["cost_per_merge_exceeds_threshold"] = False
 
+    # Per-task-type cost-per-merge: for each task type, total VM cost / merged PR count
+    _type_cost: Dict[str, float] = {}
+    _type_merges: Dict[str, int] = {}
+    for t in all_tasks:
+        if not (t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start):
+            continue
+        rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+        t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+        task_type = (t.first_payload or {}).get("type", "unknown")
+        _type_cost[task_type] = _type_cost.get(task_type, 0.0) + t_cost
+        if (t.context or {}).get("pr_merged") is True:
+            _type_merges[task_type] = _type_merges.get(task_type, 0) + 1
+    _type_cpms = {
+        ttype: _type_cost[ttype] / _type_merges[ttype]
+        for ttype in _type_cost
+        if _type_merges.get(ttype, 0) > 0
+    }
+    _median_cpm_by_type = round(statistics.median(list(_type_cpms.values())), 4) if _type_cpms else None
+    cost_per_merge_by_type = {
+        ttype: {
+            "total_cost_usd": round(_type_cost[ttype], 4),
+            "merged_count": _type_merges.get(ttype, 0),
+            "cost_per_merge": round(_type_cpms[ttype], 4) if ttype in _type_cpms else None,
+            "exceeds_threshold": (
+                _type_cpms[ttype] > (_median_cpm_by_type * _CPM_RETIREMENT_MULTIPLIER)
+                if ttype in _type_cpms and _median_cpm_by_type is not None
+                else False
+            ),
+        }
+        for ttype in _type_cost
+    }
+
     # Pipeline-level acceptance rate: total merged / (total merged + total rejected) across directions in window
     _pipeline_total_merged_d = sum(d.get("prs_merged") or 0 for d in direction_progress_list)
     _pipeline_total_rejected_d = sum(d.get("prs_rejected") or 0 for d in direction_progress_list)
@@ -3311,6 +3343,8 @@ async def _compute_digest(
         "direction_progress": direction_progress_list,
         "overall_product_ratio": overall_product_ratio,
         "median_cost_per_merged_pr": median_cost_per_merged_pr,
+        "cost_per_merge_by_type": cost_per_merge_by_type,
+        "median_cost_per_merge_by_type": _median_cpm_by_type,
         "overall_type_distribution": overall_type_distribution or None,
         "total_estimated_cost_usd": total_estimated_cost_usd,
         "spot_cost_usd": total_spot_cost_usd,

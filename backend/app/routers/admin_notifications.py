@@ -358,29 +358,54 @@ async def admin_playbook_list(
             _STALE_DAYS = 30
             stale = bool(v.get("stale"))  # Stored flag (auto-archived) takes precedence
             if not stale:
-                reference_ts = last_referenced_at or updated_at
-                if reference_ts:
+                if last_referenced_at:
                     try:
                         from datetime import datetime
-                        ts = datetime.fromisoformat(reference_ts)
+                        ts = datetime.fromisoformat(last_referenced_at)
                         if ts.tzinfo is not None:
                             ts = ts.replace(tzinfo=None)
                         stale = (now_utc - ts).days >= _STALE_DAYS
                     except Exception:
-                        logger.exception(f"[PLAYBOOK] Failed to parse reference_ts={reference_ts}")
-                else:
-                    stale = True
+                        logger.exception(f"[PLAYBOOK] Failed to parse last_referenced_at={last_referenced_at}")
+                elif not v.get("reference_count", 0):
+                    # Never referenced: use updated_at as staleness proxy
+                    if updated_at:
+                        try:
+                            from datetime import datetime
+                            ts = datetime.fromisoformat(updated_at)
+                            if ts.tzinfo is not None:
+                                ts = ts.replace(tzinfo=None)
+                            stale = (now_utc - ts).days >= _STALE_DAYS
+                        except Exception:
+                            logger.exception(f"[PLAYBOOK] Failed to parse updated_at={updated_at}")
+                    else:
+                        stale = True
+                # reference_count > 0 but no last_referenced_at → unknown recency, not stale
+            age_days = 0
+            if updated_at:
+                try:
+                    from datetime import datetime as _dt
+                    _ts = _dt.fromisoformat(updated_at.replace("Z", "+00:00"))
+                    if _ts.tzinfo is not None:
+                        _ts = _ts.replace(tzinfo=None)
+                    age_days = (now_utc - _ts).days
+                except Exception:
+                    pass
+            confirmed = v.get("confirmed_count", 0)
+            referenced = v.get("reference_count", 0)
             entries[short_key] = {
                 "content": v.get("content", ""),
                 "source_task_id": v.get("source_task_id"),
                 "updated_at": updated_at,
-                "confirmed_count": v.get("confirmed_count", 0),
-                "applicable_types": v.get("applicable_types"),
-                "reference_count": v.get("reference_count", 0),
+                "confirmed_count": confirmed,
+                "applicable_types": v.get("applicable_types") or [],
+                "reference_count": referenced,
                 "last_referenced_at": last_referenced_at,
                 "last_confirmed_at": v.get("last_confirmed_at"),
-                "effectiveness_score": v.get("effectiveness_score"),
+                "effectiveness_score": round(confirmed / max(referenced, 1), 3) if (confirmed > 0 or referenced > 0) else v.get("effectiveness_score"),
                 "stale": stale,
+                "source": v.get("source", ""),
+                "age_days": age_days,
             }
     return {"entries": entries, "count": len(entries)}
 

@@ -342,3 +342,67 @@ async def update_auto_review_config(
 
     config = {**_AUTO_REVIEW_DEFAULTS, **stored}
     return {"project_id": str(project_id), "config": config}
+
+
+# ---------------------------------------------------------------------------
+# Playbook Inspector endpoints
+# ---------------------------------------------------------------------------
+
+@router.patch("/projects/{project_id}/playbook/{key:path}")
+async def update_playbook_entry(
+    project_id: uuid.UUID,
+    key: str,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Apply an operation to a playbook entry: promote, demote, or archive."""
+    action = body.get("action")
+    if action not in ("promote", "demote", "archive"):
+        raise HTTPException(status_code=422, detail="'action' must be one of: promote, demote, archive")
+
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+    doc = dict(project.design_doc or {})
+    full_key = f"playbook/{key}"
+    if full_key not in doc or not isinstance(doc[full_key], dict):
+        raise HTTPException(status_code=404, detail=f"Playbook entry '{key}' not found")
+
+    entry = dict(doc[full_key])
+    now_iso = _utcnow().isoformat()
+
+    if action == "promote":
+        entry["confirmed_count"] = entry.get("confirmed_count", 0) + 1
+        outcomes = list(entry.get("recent_outcomes", []))
+        outcomes.append(True)
+        entry["recent_outcomes"] = outcomes[-10:]
+        entry["stale"] = False
+        entry["updated_at"] = now_iso
+        doc[full_key] = entry
+    elif action == "demote":
+        entry["stale"] = True
+        entry["effectiveness_score"] = 0.0
+        entry["updated_at"] = now_iso
+        doc[full_key] = entry
+    elif action == "archive":
+        victim = dict(doc.pop(full_key))
+        victim["_archived_key"] = full_key
+        victim["_archived_at"] = now_iso
+        archive = list(doc.get("playbook_archive") or [])
+        archive.append(victim)
+        doc["playbook_archive"] = archive[-50:]
+
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+    await session.commit()
+
+    if action == "archive":
+        return {"project_id": str(project_id), "key": key, "action": action, "archived": True}
+    confirmed = entry.get("confirmed_count", 0)
+    referenced = entry.get("reference_count", 0)
+    return {"project_id": str(project_id), "key": key, "action": action, "entry": {
+        "confirmed_count": confirmed,
+        "reference_count": referenced,
+        "stale": bool(entry.get("stale")),
+        "effectiveness_score": min(round(confirmed / max(referenced, 1), 3), 1.0),
+    }}

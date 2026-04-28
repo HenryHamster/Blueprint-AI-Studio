@@ -36,6 +36,7 @@ import { QuickFilterPresets } from './components/QuickFilterPresets';
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { DiagnosticsPanel } from './components/DiagnosticsPanel';
+import { PlaybookPanel } from './components/PlaybookPanel';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -669,7 +670,10 @@ export default function App() {
           />
 
           {s.viewMode === 'home' ? (
-            <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} /></ErrorBoundary>
+            <>
+              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} /></ErrorBoundary>
+              <PlaybookPanel selectedProjectId={s.selectedProjectId} />
+            </>
           ) : s.viewMode === 'kanban' ? (
             <ErrorBoundary level="panel">
             <KanbanBoard

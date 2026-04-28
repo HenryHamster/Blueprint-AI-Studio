@@ -5341,6 +5341,76 @@ async def test_drift_snapshot_over_claim_direction_flagged(client: AsyncClient, 
     assert flagged["actually_merged_prs"] == 0
     assert "claim_shipped_consistency" in flagged
     assert "window_days" in data
+    assert "generated_at" in data
+
+
+@pytest.mark.asyncio
+async def test_cost_per_merge_by_type_aggregation(client: AsyncClient, db_session):
+    """cost_per_merge_by_type groups cost and merge counts by task type."""
+    from app.routers.admin_analytics import SPOT_RATE
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # create task: 10s, pr_merged=True
+    t1 = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(seconds=10),
+        vm_started_at=now - timedelta(seconds=10),
+        vm_stopped_at=now,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+    )
+    # fix task: 20s, pr_merged=True
+    t2 = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(seconds=20),
+        vm_started_at=now - timedelta(seconds=20),
+        vm_stopped_at=now,
+        context={"pr_merged": True},
+        payloads=[{"type": "fix"}],
+    )
+    # research task: 5s, no merge
+    t3 = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(seconds=5),
+        vm_started_at=now - timedelta(seconds=5),
+        vm_stopped_at=now,
+        context={},
+        payloads=[{"type": "research"}],
+    )
+    for t in (t1, t2, t3):
+        db_session.add(t)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    cpm_by_type = data["cost_per_merge_by_type"]
+    assert "create" in cpm_by_type
+    assert "fix" in cpm_by_type
+    assert "research" in cpm_by_type
+
+    assert cpm_by_type["create"]["merged_count"] == 1
+    assert abs(cpm_by_type["create"]["total_cost_usd"] - round(SPOT_RATE * 10, 4)) < 1e-6
+    assert cpm_by_type["create"]["cost_per_merge"] is not None
+
+    assert cpm_by_type["fix"]["merged_count"] == 1
+    assert abs(cpm_by_type["fix"]["total_cost_usd"] - round(SPOT_RATE * 20, 4)) < 1e-6
+    assert cpm_by_type["fix"]["cost_per_merge"] is not None
+
+    assert cpm_by_type["research"]["merged_count"] == 0
+    assert cpm_by_type["research"]["cost_per_merge"] is None
 
 
 @pytest.mark.asyncio
@@ -5384,3 +5454,99 @@ async def test_digest_residual_remediation_funnel(client: AsyncClient, db_sessio
     assert rr["merged"] == 1
     assert rr["failed"] == 2          # FAILED + SUSPENDED
     assert rr["remediating"] == 2     # live count: both REMEDIATING cases regardless of window
+
+
+@pytest.mark.asyncio
+async def test_cost_per_merge_by_type_no_vm_tasks(client: AsyncClient, db_session):
+    """When no tasks have VM billing data, cost_per_merge_by_type is empty."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(t)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["cost_per_merge_by_type"] == {}
+    assert data["median_cost_per_merge_by_type"] is None
+
+
+@pytest.mark.asyncio
+async def test_cost_per_merge_by_type_threshold(client: AsyncClient, db_session):
+    """exceeds_threshold is True when a type's CPM exceeds median * 3.0.
+
+    Median requires >=3 types to produce a stable low reference point so the
+    expensive outlier can exceed 3× median.  With create=10s, fix=20s, debug=1000s
+    the median is 20 and 3× threshold is 60; debug (1000s) clearly exceeds it.
+    """
+    from app.routers.admin_analytics import SPOT_RATE
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # create: 10s per merge (cheap)
+    t_create = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(seconds=10),
+        vm_started_at=now - timedelta(seconds=10),
+        vm_stopped_at=now,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+    )
+    # fix: 20s per merge (medium)
+    t_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(seconds=20),
+        vm_started_at=now - timedelta(seconds=20),
+        vm_stopped_at=now,
+        context={"pr_merged": True},
+        payloads=[{"type": "fix"}],
+    )
+    # debug: 1000s per merge (far above 3x median=20 → threshold=60)
+    t_debug = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(seconds=1000),
+        vm_started_at=now - timedelta(seconds=1000),
+        vm_stopped_at=now,
+        context={"pr_merged": True},
+        payloads=[{"type": "debug"}],
+    )
+    for t in (t_create, t_fix, t_debug):
+        db_session.add(t)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    cpm_by_type = data["cost_per_merge_by_type"]
+    median_cpm = data["median_cost_per_merge_by_type"]
+    assert median_cpm is not None
+
+    assert cpm_by_type["create"]["cost_per_merge"] is not None
+    assert cpm_by_type["fix"]["cost_per_merge"] is not None
+    assert cpm_by_type["debug"]["cost_per_merge"] is not None
+
+    # debug CPM (1000s) >> 3 × median (20s); create and fix are below threshold
+    assert cpm_by_type["debug"]["exceeds_threshold"] is True
+    assert cpm_by_type["create"]["exceeds_threshold"] is False
+    assert cpm_by_type["fix"]["exceeds_threshold"] is False

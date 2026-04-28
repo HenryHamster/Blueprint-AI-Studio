@@ -247,3 +247,174 @@ async def test_admin_playbook_size_limits(client: AsyncClient, db_session, proje
         json={"key": "a" * 51, "value": "value"},
     )
     assert resp.status_code == 400
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_list_computed_fields(client: AsyncClient, db_session, project_with_member):
+    """GET /playbook returns computed effectiveness_score, stale, and age_days."""
+    project = project_with_member
+    project.design_doc = {
+        "playbook/tip-a": {
+            "content": "do tip a",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 3,
+            "reference_count": 6,
+            "source": "auto-generated",
+            "applicable_types": ["create", "fix"],
+        },
+        "playbook/tip-b": {
+            "content": "stale tip",
+            "updated_at": "2025-01-01T00:00:00",  # >30 days old, no last_referenced_at
+            "confirmed_count": 0,
+            "reference_count": 0,
+        },
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/playbook")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    entries = data["entries"]
+
+    # tip-a: effectiveness = 3/6 = 0.5
+    a = entries["tip-a"]
+    assert a["effectiveness_score"] == 0.5
+    assert a["source"] == "auto-generated"
+    assert a["applicable_types"] == ["create", "fix"]
+    assert a["age_days"] >= 0
+    assert a["stale"] is False
+
+    # tip-b: no reference in >30 days → stale; confirmed=0, ref=0 → effectiveness unknown (None)
+    b = entries["tip-b"]
+    assert b["stale"] is True
+    assert b["effectiveness_score"] is None
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_patch_promote(client: AsyncClient, db_session, project_with_member):
+    """PATCH /playbook/{key} with action=promote increments confirmed_count."""
+    project = project_with_member
+    project.design_doc = {
+        "playbook/my-tip": {
+            "content": "run tests",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 2,
+            "reference_count": 4,
+            "stale": False,
+        }
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/playbook/my-tip",
+        json={"action": "promote"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["action"] == "promote"
+    assert data["entry"]["confirmed_count"] == 3
+    assert data["entry"]["stale"] is False
+
+    await db_session.refresh(project)
+    assert project.design_doc["playbook/my-tip"]["confirmed_count"] == 3
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_patch_demote(client: AsyncClient, db_session, project_with_member):
+    """PATCH /playbook/{key} with action=demote marks entry stale."""
+    project = project_with_member
+    project.design_doc = {
+        "playbook/bad-tip": {
+            "content": "bad advice",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 1,
+            "reference_count": 5,
+            "stale": False,
+        }
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/playbook/bad-tip",
+        json={"action": "demote"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["entry"]["stale"] is True
+
+    await db_session.refresh(project)
+    assert project.design_doc["playbook/bad-tip"]["stale"] is True
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_patch_archive(client: AsyncClient, db_session, project_with_member):
+    """PATCH /playbook/{key} with action=archive removes entry and appends to archive."""
+    project = project_with_member
+    project.design_doc = {
+        "playbook/old-tip": {
+            "content": "obsolete",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 0,
+        }
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/playbook/old-tip",
+        json={"action": "archive"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["archived"] is True
+
+    await db_session.refresh(project)
+    assert "playbook/old-tip" not in (project.design_doc or {})
+    archive = project.design_doc.get("playbook_archive", [])
+    assert any(a.get("_archived_key") == "playbook/old-tip" for a in archive)
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_patch_404(client: AsyncClient, db_session, project_with_member):
+    """PATCH /playbook/{key} returns 404 for unknown key."""
+    resp = await client.patch(
+        f"/api/admin/projects/{project_with_member.id}/playbook/no-such-key",
+        json={"action": "promote"},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_patch_invalid_action(client: AsyncClient, db_session, project_with_member):
+    """PATCH /playbook/{key} returns 422 for invalid action."""
+    project = project_with_member
+    project.design_doc = {
+        "playbook/tip": {
+            "content": "something",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+        }
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/playbook/tip",
+        json={"action": "invalid"},
+    )
+    assert resp.status_code == 422
