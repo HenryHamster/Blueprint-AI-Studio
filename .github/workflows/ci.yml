@@ -120,6 +120,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: detect
     if: needs.detect.outputs.backend == 'true'
+    # Top-level permissions are contents:read; backend needs write so the
+    # testmon cache push step (main + success only) can force-push the
+    # orphan testmon-cache branch. Other steps don't write to the repo.
+    permissions:
+      contents: write
+      pull-requests: read
     services:
       postgres:
         image: postgres:15
