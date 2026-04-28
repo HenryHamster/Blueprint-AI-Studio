@@ -13,6 +13,7 @@ from app.notification_dispatch import (
     _retry_queue,
     dispatch_external_notification,
     get_notification_stats,
+    is_residual_remediation_task,
     post_auto_fix_result_message,
     post_auto_fix_spawned_message,
     post_cycle_summary_message,
@@ -1083,3 +1084,67 @@ async def test_remediation_discriminator_routes_ci_to_auto_fix_helper(db_session
     await db_session.commit()
     assert msg.context["event_type"] == "auto_fix_result"
     assert msg.context["branch"] == "feat/x"
+
+
+# ─── is_residual_remediation_task — pure predicate ──────────────────────────
+
+def test_is_residual_remediation_task_true():
+    """spawned_by=residual_fingerprint_remediation returns True."""
+    task = MagicMock()
+    task.context = {"spawned_by": "residual_fingerprint_remediation"}
+    assert is_residual_remediation_task(task) is True
+
+
+def test_is_residual_remediation_task_false_for_ci_task():
+    """CI auto-remediation tasks with different spawned_by return False."""
+    task = MagicMock()
+    task.context = {"spawned_by": "ci_auto_remediation_failure", "auto_remediation": True}
+    assert is_residual_remediation_task(task) is False
+
+
+def test_is_residual_remediation_task_false_for_no_context():
+    """Tasks with no context (None) return False without raising."""
+    task = MagicMock()
+    task.context = None
+    assert is_residual_remediation_task(task) is False
+
+
+# ─── post_residual_fix_spawned_message — context fields ─────────────────────
+
+@pytest.mark.asyncio
+async def test_post_residual_fix_spawned_records_task_id_in_context(db_session):
+    """task_id kwarg is reflected into msg.context so downstream
+    subscribers can correlate the notification to the spawned task."""
+    from app.models import Task, TaskStatus  # noqa: PLC0415
+    project = Project(name="Spawned TaskID", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    fix_task = Task(
+        project_id=project.id, status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix"}],
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    msg = await post_residual_fix_spawned_message(
+        db_session, project.id, fingerprint="fp-taskid",
+        sample_message="TypeError in test", task_id=fix_task.id,
+    )
+    await db_session.commit()
+    assert msg.context["task_id"] == str(fix_task.id)
+    assert msg.context["fingerprint"] == "fp-taskid"
+
+
+@pytest.mark.asyncio
+async def test_post_residual_fix_spawned_null_task_id_in_context(db_session):
+    """When no task_id is provided, context stores None — callers that
+    omit the kwarg don't blow up and the field is still present."""
+    project = Project(name="Spawned NoTask", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    msg = await post_residual_fix_spawned_message(
+        db_session, project.id, fingerprint="fp-notask",
+        sample_message="NameError: x",
+    )
+    await db_session.commit()
+    assert msg.context["task_id"] is None
+    assert msg.context["event_type"] == "residual_fix_spawned"
