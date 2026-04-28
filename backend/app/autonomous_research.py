@@ -1,12 +1,4 @@
-"""Autonomous research spawning functions.
-
-This module handles all aspects of autonomous research task spawning:
-- Research task selection and rate limiting
-- Strategic cycle management (design doc update → strategic review)
-- Periodic task scheduling (security_audit, qa, deps)
-- Post-merge and idle research triggers
-- Direction health, auto-pause, and auto-recovery
-"""
+"""Autonomous research spawning functions."""
 import asyncio
 import logging
 import os
@@ -27,11 +19,9 @@ from app.shared_state import runtime_config as _runtime_config
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
 from app.time_utils import _utcnow
 from app.autonomous_research_diagnosis import _spawn_direction_diagnosis  # noqa: F401 — re-export for backwards compat
+from app.direction_mode import append_prompt_suffix, is_pause_mode, mode_prompt_hint, normalized_recommended_mode
 
 logger = logging.getLogger(__name__)
-
-# Per-project lock to prevent concurrent _spawn_research_task calls
-# (post-merge hook and idle check can race on the same project)
 _spawn_locks: dict[str, asyncio.Lock] = {}
 
 def _get_spawn_lock(project_id: str) -> asyncio.Lock:
@@ -264,21 +254,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             if any(rid in (d.get("conflicts_with") or []) for rid in busy_direction_ids):
                 blocked_ids.add(d.get("id"))
 
-        # Cross-instance serialization: Cloud Run runs up to N orchestrator
-        # instances (maxScale=3 currently), each firing its own idle-research
-        # cycle.  Without this lock, instances race — each reads "0 active
-        # research" before any of them commits, then each spawns a task.  The
-        # user sets max_parallel=1 expecting 1 task; without serialization
-        # they get up to N (one per instance, each picking a different
-        # direction because the first instance's just-QUEUED task shows up
-        # as "busy" to the next instance's read).
-        #
-        # pg_try_advisory_xact_lock is non-blocking; losers return for this
-        # cycle and pick up on the next interval tick.  The lock is scoped
-        # to the transaction — releases on commit/rollback automatically.
-        # Tests use SQLite which has no advisory locks; the try/except keeps
-        # the fallback equivalent to "assume we hold the lock" (safe because
-        # there's only one process in tests).
+        # Cross-instance serialization for concurrent orchestrator instances.
         from sqlalchemy import text as _sql_text
         _lock_key = abs(hash(f"research_spawn:{project.id}")) % (2**31)
         try:
@@ -298,6 +274,12 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         max_parallel = _runtime_config.get("max_parallel_research_per_project", 3)
         for d in sorted_eligible:
             did = d.get("id")
+            if is_pause_mode(d):
+                logger.info(
+                    "[AUTONOMOUS] skipped direction due to recommended_mode",
+                    extra={"direction_id": did, "recommended_mode": "pause", "reason": "mode_pause"},
+                )
+                continue
             if did in blocked_ids:
                 continue
             chosen_directions.append(d)
@@ -319,6 +301,12 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 logger.debug(f"[RESEARCH] Selected direction {did} category={category} productivity_score={productivity_score:.2f} momentum={momentum:.1f} vision_rank={_vision_rank(d)}")
     elif not force_strategic:
         return  # No directions and not a strategic cycle — nothing to do
+
+    if not chosen_directions and active_directions and all(is_pause_mode(d) for d in active_directions):
+        logger.info(
+            "[AUTONOMOUS] skipping tactical research: all active directions recommended_mode=pause"
+        )
+        return
 
     # When all active directions are saturated, skip tactical research — a strategic
     # cycle will create fresh directions; spawning more saturated research is wasteful.
@@ -517,12 +505,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     research_model = _runtime_config.get("task_type_models", {}).get("research") or None
     research_effort = _runtime_config.get("task_type_efforts", {}).get("research") or None
     research_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("research")
-    # Every Nth cycle is "undirected" — the agent explores the whole codebase
-    # without a specific direction lens, finding cross-cutting improvements.
-    # Default raised from 4 → 12 on 2026-04-17: cross-cutting research was
-    # producing diminishing returns relative to directed cycles, and it burns
-    # just as much GitHub/account budget per run.  Still configurable via
-    # runtime_config for repos that need more exploratory cycles.
+    # Every Nth cycle is "undirected" for cross-cutting analysis.
     undirected_frequency = _runtime_config.get("undirected_research_frequency", 12)
     is_undirected = undirected_frequency > 0 and research_spawn_count > 0 and research_spawn_count % undirected_frequency == 0
     # Don't run undirected on strategic cycles
@@ -599,6 +582,15 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
     spawned_tasks = []
     for chosen_direction in directions_to_spawn:
+        _mode = normalized_recommended_mode(chosen_direction)
+        if chosen_direction and _mode == "audit" and chosen_direction.get("system_id"):
+            if await _spawn_self_audit_task(
+                project,
+                session,
+                {"focus_systems": [chosen_direction.get("system_id")], "max_systems": 1},
+            ):
+                continue
+
         # Build lightweight direction summaries — include compact history for
         # agent-side stats (aggregateDirectionStats, buildScopeCalibrationSignal).
         # Full histories are available via the API. This keeps the payload under
@@ -683,21 +675,22 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             **({"prompt_suffix": research_suffix} if research_suffix else {}),
         }
         if chosen_direction and chosen_direction.get("category") == "product":
-            product_guidance = (
+            append_prompt_suffix(
+                research_payload,
                 "This direction targets a product feature. Prioritize user-visible changes, "
                 "end-user experience improvements, and direct product value. Structural work "
-                "is acceptable only when it directly enables the product feature."
+                "is acceptable only when it directly enables the product feature.",
             )
-            existing = research_payload.get("prompt_suffix", "")
-            research_payload["prompt_suffix"] = f"{existing}\n{product_guidance}".strip() if existing else product_guidance
+        _mode_hint = mode_prompt_hint(_mode)
+        if chosen_direction and _mode_hint:
+            append_prompt_suffix(research_payload, _mode_hint)
         # Inject failure-mode coaching derived from direction's first-attempt rejection history
         if chosen_direction:
             from app.spawn_calibration import _get_failure_coaching_suffix  # noqa: PLC0415
             _dir_id = chosen_direction.get("id")
             _coaching = _get_failure_coaching_suffix(str(_dir_id), project.design_doc or {}) if _dir_id else None
             if _coaching:
-                _sfx = research_payload.get("prompt_suffix", "")
-                research_payload["prompt_suffix"] = f"{_sfx}\n{_coaching}".strip() if _sfx else _coaching
+                append_prompt_suffix(research_payload, _coaching)
         # Pre-extract design doc context for the current direction's system_id
         if chosen_direction:
             dir_system_id = chosen_direction.get("system_id")
@@ -734,13 +727,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         research_payload = validate_internal_payload(research_payload, "autonomous_research:research")
 
         # Recover deferred findings from recent completed research tasks.
-        # When the pipeline was degraded, _handle_research_completion caps spawns at
-        # _DEGRADED_SPAWN_CAP and stores the remaining findings in the completed task's
-        # context['deferred_findings']. Inject them here so the new cycle processes them
-        # alongside its own discoveries (they go through full dedup + health gate again).
-        # Directed cycles claim findings tagged with their direction_id plus unscoped
-        # findings; undirected cycles claim only unscoped (direction_id-less) findings
-        # so directed leftovers stay reserved for their direction's next cycle.
         task_context: dict = {}
         prev_research_rows = (await session.execute(
             select(Task).where(

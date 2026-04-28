@@ -229,6 +229,92 @@ class TestSelfAuditCompletion:
         )).scalars().all()
         assert rows == []
 
+    @pytest.mark.asyncio
+    async def test_propagates_fundamentals_to_matching_active_directions(self, db_session, mock_broadcast):
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{"id": "d1", "status": "active", "system_id": "sys-auth"}]
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(task, json.dumps({"findings": [{"system_id": "sys-auth", "score": 50, "recommended_mode": "fundamentals"}]}), db_session)
+        await db_session.refresh(project)
+        assert project.directions[0]["recommended_mode"] == "fundamentals"
+        assert project.directions[0]["recommended_mode_meta"]["source"] == "self_audit"
+
+    @pytest.mark.asyncio
+    async def test_ship_does_not_downgrade_existing_audit_mode(self, db_session, mock_broadcast):
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{"id": "d1", "status": "active", "system_id": "sys-auth", "recommended_mode": "audit"}]
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(task, json.dumps({"findings": [{"system_id": "sys-auth", "score": 50, "recommended_mode": "ship"}]}), db_session)
+        await db_session.refresh(project)
+        assert project.directions[0]["recommended_mode"] == "audit"
+
+    @pytest.mark.asyncio
+    async def test_null_mode_does_not_touch_directions(self, db_session, mock_broadcast):
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{"id": "d1", "status": "active", "system_id": "sys-auth", "recommended_mode": "audit"}]
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(task, json.dumps({"findings": [{"system_id": "sys-auth", "score": 50, "recommended_mode": None}]}), db_session)
+        await db_session.refresh(project)
+        assert project.directions[0]["recommended_mode"] == "audit"
+
+    @pytest.mark.asyncio
+    async def test_directions_without_system_id_are_unaffected(self, db_session, mock_broadcast):
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{"id": "d1", "status": "active", "recommended_mode": "ship"}]
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(task, json.dumps({"findings": [{"system_id": "sys-auth", "score": 50, "recommended_mode": "fundamentals"}]}), db_session)
+        await db_session.refresh(project)
+        assert project.directions[0]["recommended_mode"] == "ship"
+
+    @pytest.mark.asyncio
+    async def test_inactive_directions_are_skipped(self, db_session, mock_broadcast):
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{"id": "d1", "status": "expired", "system_id": "sys-auth", "recommended_mode": "ship"}]
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(task, json.dumps({"findings": [{"system_id": "sys-auth", "score": 50, "recommended_mode": "fundamentals"}]}), db_session)
+        await db_session.refresh(project)
+        assert project.directions[0]["recommended_mode"] == "ship"
+
+    @pytest.mark.asyncio
+    async def test_naive_strategic_set_at_does_not_crash_ingest(self, db_session, mock_broadcast):
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{
+            "id": "d1",
+            "status": "active",
+            "system_id": "sys-auth",
+            "recommended_mode": "audit",
+            "recommended_mode_meta": {
+                "source": "strategic",
+                "set_at": "2026-04-28T00:00:00",
+            },
+        }]
+        db_session.add(project)
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(
+            task,
+            json.dumps({"findings": [{"system_id": "sys-auth", "score": 50, "recommended_mode": "fundamentals"}]}),
+            db_session,
+        )
+        await db_session.refresh(project)
+        assert project.directions[0]["recommended_mode"] == "audit"
+
 
 # ── Admin endpoint ──────────────────────────────────────────────────────────
 

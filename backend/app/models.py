@@ -73,6 +73,11 @@ DIAGNOSIS_IN_PROGRESS_KEY = "diagnosis_in_progress"
 DIAGNOSIS_TASK_ID_KEY = "diagnosis_task_id"
 DIAGNOSIS_STARTED_AT_KEY = "diagnosis_started_at"
 
+# Direction recommended_mode provenance metadata (stored in Project.directions JSONB).
+RECOMMENDED_MODE_META_KEY = "recommended_mode_meta"
+RECOMMENDED_MODE_SOURCE_STRATEGIC = "strategic"
+RECOMMENDED_MODE_SOURCE_SELF_AUDIT = "self_audit"
+
 
 # --- Models ---
 

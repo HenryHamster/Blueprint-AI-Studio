@@ -30,6 +30,9 @@ from app.models import (
     MessageType,
     Project,
     ProjectMessage,
+    RECOMMENDED_MODE_META_KEY,
+    RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
+    RECOMMENDED_MODE_SOURCE_STRATEGIC,
     SystemMaturity,
     Task,
     TaskHistory,
@@ -1888,6 +1891,8 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 # Allowed values for SystemMaturity.recommended_mode. Rows with a value outside
 # this set are dropped at ingest with a logged warning rather than persisted.
 _VALID_SELF_AUDIT_MODES = {"audit", "fundamentals", "ship", "pause"}
+_SELF_AUDIT_PROPAGATED_MODES = {"audit", "fundamentals", "pause"}
+_MODE_STRICTNESS = {"ship": 0, "fundamentals": 1, "audit": 2, "pause": 3}
 
 # Per-component scores must be 0-100 integers; we don't enforce a DB check
 # constraint, so we clamp here to keep downstream consumers safe.
@@ -1985,6 +1990,30 @@ def _normalize_self_audit_finding(raw: Dict[str, Any]) -> Optional[Dict[str, Any
     }
 
 
+def _is_recent_strategic_mode_lock(direction: Dict[str, Any], incoming_mode: str, now: datetime) -> bool:
+    meta = direction.get(RECOMMENDED_MODE_META_KEY) or {}
+    if not isinstance(meta, dict) or meta.get("source") != RECOMMENDED_MODE_SOURCE_STRATEGIC:
+        return False
+    existing = str(direction.get("recommended_mode") or "").strip().lower()
+    incoming_rank = _MODE_STRICTNESS.get(incoming_mode, -1)
+    existing_rank = _MODE_STRICTNESS.get(existing, -1)
+    if existing_rank <= incoming_rank:
+        return False
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    try:
+        set_at = datetime.fromisoformat(str(meta.get("set_at", "")).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if set_at.tzinfo is None:
+        # Backward-compatible guard for older strategic metadata that stored
+        # naive timestamps: keep the stricter strategic recommendation.
+        return True
+    if now - set_at > timedelta(hours=6):
+        return False
+    return True
+
+
 async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSession):
     """Ingest a SELF_AUDIT_REPORT into SystemMaturity rows.
 
@@ -2020,8 +2049,12 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
     session.add(task)
 
     upserted = 0
+    project = await session.get(Project, task.project_id)
+    directions = list(project.directions or []) if project else []
+    directions_changed = False
     for finding in normalized:
         system_id = finding["system_id"]
+        mode = finding["recommended_mode"]
         existing = (await session.execute(
             select(SystemMaturity).where(
                 SystemMaturity.project_id == task.project_id,
@@ -2054,6 +2087,26 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
                 source_task_id=task.id,
             ))
         upserted += 1
+        if mode not in _SELF_AUDIT_PROPAGATED_MODES:
+            continue
+        now = _utcnow()
+        for d in directions:
+            if d.get("status") != "active" or d.get("system_id") != system_id:
+                continue
+            if _is_recent_strategic_mode_lock(d, mode, now):
+                continue
+            d["recommended_mode"] = mode
+            d[RECOMMENDED_MODE_META_KEY] = {
+                "mode": mode,
+                "source": RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
+                "source_task_id": str(task.id),
+                "set_at": now.isoformat(),
+            }
+            directions_changed = True
+    if project and directions_changed:
+        project.directions = directions
+        flag_modified(project, "directions")
+        session.add(project)
 
     summary = f"Self audit ingested {upserted} system(s)"
     if dropped:

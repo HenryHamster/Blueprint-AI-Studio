@@ -7100,6 +7100,102 @@ async def test_residual_ignored_case_not_selected(db_session, _clear_residual_st
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 11. Direction recommended_mode dispatch
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_spawn_skips_pause_mode_direction(db_session):
+    project = Project(
+        name="Pause Mode Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[{**_active_direction("d-pause-mode", "Pause me"), "recommended_mode": "pause"}],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    tasks = (await db_session.execute(select(Task).where(Task.project_id == project.id))).scalars().all()
+    assert len(tasks) == 0, "pause mode directions must be skipped this tick"
+
+
+@pytest.mark.asyncio
+async def test_audit_mode_direction_dispatches_self_audit(db_session, mocker):
+    mocker.patch("app.autonomous_research._should_dispatch_self_audit", new=AsyncMock(return_value=None))
+    project = Project(
+        name="Audit Mode Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[{
+            **_active_direction("d-audit-mode", "Audit me"),
+            "recommended_mode": "audit",
+            "system_id": "sys-audit-mode",
+        }],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    tasks = (await db_session.execute(select(Task).where(Task.project_id == project.id))).scalars().all()
+    task_types = [(t.first_payload or {}).get("type") for t in tasks]
+    assert "self_audit" in task_types
+    assert "research" not in task_types
+
+
+@pytest.mark.asyncio
+async def test_fundamentals_mode_direction_injects_mode_hint(db_session, mocker):
+    mocker.patch("app.autonomous_research._should_dispatch_self_audit", new=AsyncMock(return_value=None))
+    project = Project(
+        name="Fundamentals Mode Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[{**_active_direction("d-fund-mode", "Harden internals"), "recommended_mode": "fundamentals"}],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    tasks = (await db_session.execute(select(Task).where(Task.project_id == project.id))).scalars().all()
+    research = [t for t in tasks if (t.first_payload or {}).get("type") == "research"]
+    assert len(research) == 1
+    suffix = (research[0].first_payload or {}).get("prompt_suffix", "")
+    assert "fundamentals mode" in suffix
+
+
+@pytest.mark.asyncio
+async def test_ship_mode_direction_keeps_default_prompt_behavior(db_session, mocker):
+    mocker.patch("app.autonomous_research._should_dispatch_self_audit", new=AsyncMock(return_value=None))
+    project = Project(
+        name="Ship Mode Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[{**_active_direction("d-ship-mode", "Ship feature"), "recommended_mode": "ship"}],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    tasks = (await db_session.execute(select(Task).where(Task.project_id == project.id))).scalars().all()
+    research = [t for t in tasks if (t.first_payload or {}).get("type") == "research"]
+    assert len(research) == 1
+    suffix = (research[0].first_payload or {}).get("prompt_suffix", "").lower()
+    assert "fundamentals mode" not in suffix
+    assert "audit mode" not in suffix
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 12. Mode-aware self_audit dispatch
 # ─────────────────────────────────────────────────────────────────────────────
 

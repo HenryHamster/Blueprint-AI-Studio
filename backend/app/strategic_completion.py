@@ -17,7 +17,14 @@ from sqlmodel import select
 
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
-from app.models import Project, ProjectMessage, MessageType, Task
+from app.models import (
+    MessageType,
+    Project,
+    ProjectMessage,
+    RECOMMENDED_MODE_META_KEY,
+    RECOMMENDED_MODE_SOURCE_STRATEGIC,
+    Task,
+)
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -916,6 +923,13 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 rec_mode = _normalize_recommended_mode(op_entry.get("recommended_mode"))
                 if rec_mode:
                     new_dir["recommended_mode"] = rec_mode
+                    new_dir[RECOMMENDED_MODE_META_KEY] = {
+                        "mode": rec_mode,
+                        "source": RECOMMENDED_MODE_SOURCE_STRATEGIC,
+                        "source_task_id": str(task.id),
+                        "set_at": _utcnow().isoformat(),
+                        "strategic_cycle_id": str(task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id") or ""),
+                    }
                 current_active = sum(1 for d in directions if d.get('status') == 'active')
                 if current_active >= _runtime_config.get('max_active_directions', 5):
                     logger.warning(f'[STRATEGIC] Skipping direction create: active count {current_active} >= cap')
@@ -967,14 +981,29 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                             new_mode = _normalize_recommended_mode(changes["recommended_mode"])
                             if new_mode:
                                 d["recommended_mode"] = new_mode
+                                d[RECOMMENDED_MODE_META_KEY] = {
+                                    "mode": new_mode,
+                                    "source": RECOMMENDED_MODE_SOURCE_STRATEGIC,
+                                    "source_task_id": str(task.id),
+                                    "set_at": _utcnow().isoformat(),
+                                    "strategic_cycle_id": str(task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id") or ""),
+                                }
                             elif changes["recommended_mode"] is None:
                                 d.pop("recommended_mode", None)
+                                d.pop(RECOMMENDED_MODE_META_KEY, None)
                         # Also accept top-level recommended_mode on the
                         # operation so the agent can emit it without
                         # nesting it inside a changes block.
                         top_level_mode = _normalize_recommended_mode(op_entry.get("recommended_mode"))
                         if top_level_mode:
                             d["recommended_mode"] = top_level_mode
+                            d[RECOMMENDED_MODE_META_KEY] = {
+                                "mode": top_level_mode,
+                                "source": RECOMMENDED_MODE_SOURCE_STRATEGIC,
+                                "source_task_id": str(task.id),
+                                "set_at": _utcnow().isoformat(),
+                                "strategic_cycle_id": str(task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id") or ""),
+                            }
                         # Record rationale as a note
                         if rationale:
                             notes = d.get("notes", [])
