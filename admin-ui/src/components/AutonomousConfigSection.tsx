@@ -8,6 +8,8 @@ export interface AutonomousConfigSectionProps {
   setConfigIntervalMinutes: (v: number) => void;
   configMaxParallel: number;
   setConfigMaxParallel: (v: number) => void;
+  configMaxTotalResearch: number;
+  setConfigMaxTotalResearch: (v: number) => void;
   configMaxTasksPerHour: number;
   setConfigMaxTasksPerHour: (v: number) => void;
   configMaxConcurrentAutoRemediations: number;
@@ -25,6 +27,7 @@ export function AutonomousConfigSection({
   configCooldownHours, setConfigCooldownHours,
   configIntervalMinutes, setConfigIntervalMinutes,
   configMaxParallel, setConfigMaxParallel,
+  configMaxTotalResearch, setConfigMaxTotalResearch,
   configMaxTasksPerHour, setConfigMaxTasksPerHour,
   configMaxConcurrentAutoRemediations, setConfigMaxConcurrentAutoRemediations,
   configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours,
@@ -94,7 +97,7 @@ export function AutonomousConfigSection({
 
           {/* Max parallel research tasks per project per cycle */}
           <div className="flex items-center gap-2">
-            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Max concurrent research/plan tasks spawned per project per autonomy cycle">Max parallel</label>
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Max concurrent research/plan tasks spawned per project per autonomy cycle (counts QUEUED/PROVISIONING/IN_PROGRESS only — controls active dispatch concurrency)">Max parallel</label>
             <input
               type="number"
               min={1}
@@ -106,6 +109,27 @@ export function AutonomousConfigSection({
             <button
               onClick={() => saveConfigField('max_parallel_research_per_project', configMaxParallel)}
               disabled={savingConfigField === 'max_parallel_research_per_project'}
+              className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+              title="Save"
+            >
+              <Check className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Max total research per project (includes EVALUATING) */}
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Max total research tasks per project across ALL non-terminal states (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING). Throttles pending-rollup pile-up — each EVALUATING parent has children waiting to merge, and stacking too many makes downstream merges progressively more conflict-prone.">Max total research</label>
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={configMaxTotalResearch}
+              onChange={e => setConfigMaxTotalResearch(Number(e.target.value))}
+              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <button
+              onClick={() => saveConfigField('max_total_research_per_project', configMaxTotalResearch)}
+              disabled={savingConfigField === 'max_total_research_per_project'}
               className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
               title="Save"
             >

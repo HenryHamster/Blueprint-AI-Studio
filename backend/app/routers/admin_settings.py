@@ -257,6 +257,14 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 1440):
             raise HTTPException(status_code=400, detail="ci_backstop_timeout_minutes must be between 1 and 1440")
         _runtime_config["ci_backstop_timeout_minutes"] = val
+    if "max_total_research_per_project" in payload:
+        try:
+            val = int(payload["max_total_research_per_project"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="max_total_research_per_project must be a number")
+        if not (1 <= val <= 50):
+            raise HTTPException(status_code=400, detail="max_total_research_per_project must be between 1 and 50")
+        _runtime_config["max_total_research_per_project"] = val
     if "max_concurrent_auto_remediations" in payload:
         try:
             val = int(payload["max_concurrent_auto_remediations"])
@@ -778,6 +786,7 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "max_pipeline_slots": _runtime_config.get("max_pipeline_slots", 4),
                     "evaluating_pipeline_timeout_minutes": _runtime_config.get("evaluating_pipeline_timeout_minutes", 120),
                     "ci_backstop_timeout_minutes": _runtime_config.get("ci_backstop_timeout_minutes", 60),
+                    "max_total_research_per_project": _runtime_config.get("max_total_research_per_project", 5),
                     "notification_config": _runtime_config.get("notification_config", {
                         "webhook_url": "",
                         "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "RESIDUAL_FIX_ESCALATED"],

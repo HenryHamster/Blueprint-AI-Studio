@@ -614,6 +614,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                 setConfigIntervalMinutes={config.setConfigIntervalMinutes}
                 configMaxParallel={config.configMaxParallel}
                 setConfigMaxParallel={config.setConfigMaxParallel}
+                configMaxTotalResearch={config.configMaxTotalResearch}
+                setConfigMaxTotalResearch={config.setConfigMaxTotalResearch}
                 configMaxTasksPerHour={config.configMaxTasksPerHour}
                 setConfigMaxTasksPerHour={config.setConfigMaxTasksPerHour}
                 configMaxConcurrentAutoRemediations={config.configMaxConcurrentAutoRemediations}

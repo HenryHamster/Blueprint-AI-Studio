@@ -455,8 +455,31 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     active_research_count = sum(1 for t in active_tasks if (t.first_payload).get("type") == "research")
     if active_research_count >= max_parallel:
         return
-    # Reduce chosen_directions to the remaining slots
-    remaining_slots = max_parallel - active_research_count
+    # Second cap: total research in any non-terminal state (including
+    # EVALUATING). Pending rollups in EVALUATING accumulate merge complexity
+    # — each new spawn produces another rollup branch competing for the same
+    # base. This cap prevents the pile-up that makes downstream merges
+    # incrementally more conflict-prone.
+    max_total = _runtime_config.get("max_total_research_per_project", 5)
+    total_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status.in_([
+                TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+            ]),
+        )
+    )).scalars().all()
+    total_research_count = sum(1 for t in total_tasks if (t.first_payload).get("type") == "research")
+    if total_research_count >= max_total:
+        logger.info(
+            f"[AUTONOMOUS] Total research cap reached: {total_research_count}/{max_total} "
+            f"(includes EVALUATING) — skipping spawn for project {project.id}"
+        )
+        return
+    # Reduce chosen_directions to the smaller of the two remaining budgets
+    remaining_slots = min(max_parallel - active_research_count,
+                          max_total - total_research_count)
     chosen_directions = chosen_directions[:remaining_slots]
     # Guard: global rate limit across ALL projects
     from sqlalchemy import func

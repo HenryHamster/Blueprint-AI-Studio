@@ -97,6 +97,14 @@ runtime_config: Dict = {
     # a single review-fix iteration (5-15 min agent + queueing) so multi-pass
     # cycles don't trigger a premature kill of in-flight children.
     "ci_backstop_timeout_minutes": int(os.getenv("CI_BACKSTOP_TIMEOUT_MINUTES", "60")),
+    # Total research tasks (any non-terminal state, *including* EVALUATING)
+    # allowed per project. Distinct from max_parallel_research_per_project,
+    # which counts only QUEUED/PROVISIONING/IN_PROGRESS — that cap controls
+    # active dispatch concurrency. This cap throttles pending-rollup
+    # accumulation: each EVALUATING parent has children waiting to merge
+    # into a research branch and then to main; piling up rollup PRs makes
+    # each subsequent merge incrementally more conflict-prone.
+    "max_total_research_per_project": int(os.getenv("MAX_TOTAL_RESEARCH_PER_PROJECT", "5")),
     # Auto-remediation governors (residual CODE_ERROR fingerprint spawner).
     # Global cap on concurrent/queued auto-remediation tasks prevents queue
     # ballooning when many distinct fingerprints accumulate. Cooldown is
@@ -513,6 +521,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "max_pipeline_slots",
                     "evaluating_pipeline_timeout_minutes",
                     "ci_backstop_timeout_minutes",
+                    "max_total_research_per_project",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))

@@ -74,6 +74,8 @@ vi.mock('../hooks/useAutonomousConfig', () => ({
     setConfigIntervalMinutes: vi.fn(),
     configMaxParallel: 3,
     setConfigMaxParallel: vi.fn(),
+    configMaxTotalResearch: 5,
+    setConfigMaxTotalResearch: vi.fn(),
     configMaxTasksPerHour: 10,
     setConfigMaxTasksPerHour: vi.fn(),
     autonomousConfigOpen: false,

@@ -10,6 +10,7 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
   const [configCooldownHours, setConfigCooldownHours] = useState<number>(24);
   const [configIntervalMinutes, setConfigIntervalMinutes] = useState<number>(60);
   const [configMaxParallel, setConfigMaxParallel] = useState<number>(3);
+  const [configMaxTotalResearch, setConfigMaxTotalResearch] = useState<number>(5);
   const [configMaxTasksPerHour, setConfigMaxTasksPerHour] = useState<number>(10);
   const [configMaxConcurrentAutoRemediations, setConfigMaxConcurrentAutoRemediations] = useState<number>(2);
   const [configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours] = useState<number>(24);
@@ -40,6 +41,7 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
       if (data.autonomous_direction_cooldown_minutes != null) setConfigCooldownHours(data.autonomous_direction_cooldown_minutes / 60);
       if (data.autonomous_research_interval_minutes != null) setConfigIntervalMinutes(data.autonomous_research_interval_minutes);
       if (data.max_parallel_research_per_project != null) setConfigMaxParallel(data.max_parallel_research_per_project);
+      if (data.max_total_research_per_project != null) setConfigMaxTotalResearch(data.max_total_research_per_project);
       if (data.max_autonomous_tasks_per_hour != null) setConfigMaxTasksPerHour(data.max_autonomous_tasks_per_hour);
       if (data.max_concurrent_auto_remediations != null) setConfigMaxConcurrentAutoRemediations(data.max_concurrent_auto_remediations);
       if (data.residual_remediation_cooldown_hours != null) setConfigResidualRemediationCooldownHours(data.residual_remediation_cooldown_hours);
@@ -86,6 +88,7 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
     configCooldownHours, setConfigCooldownHours,
     configIntervalMinutes, setConfigIntervalMinutes,
     configMaxParallel, setConfigMaxParallel,
+    configMaxTotalResearch, setConfigMaxTotalResearch,
     configMaxTasksPerHour, setConfigMaxTasksPerHour,
     configMaxConcurrentAutoRemediations, setConfigMaxConcurrentAutoRemediations,
     configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours,
