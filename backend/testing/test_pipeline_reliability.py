@@ -456,8 +456,10 @@ async def test_stale_provisioning_captures_serial_before_vm_delete(orch_db, mock
         "Apr 27 08:20:44 startup-script: PROVISION_PROGRESS: creds fetched, entering env setup\n"
         "Apr 27 08:21:05 kernel: <silence after this — script died here>\n"
     )
+    # Patch where the name is used: orchestrator imports _capture_serial_for_vm
+    # at module load time, so patching app.compute won't reach the rebound name.
     capture_mock = mocker.patch(
-        "app.compute._capture_serial_for_vm",
+        "app.orchestrator._capture_serial_for_vm",
         return_value=serial_payload,
     )
     # _ensure_vm_deleted is already patched by orch_db fixture; grab its mock
