@@ -7,7 +7,7 @@ from httpx import AsyncClient, ASGITransport
 from sqlmodel import select
 
 from app.main import app
-from app.models import Task, TaskStatus
+from app.models import Task, TaskStatus, ResidualRemediationCase, ResidualCaseStatus
 from app.routers.admin_analytics import _derive_completed_at
 from app.routers.admin_digest import _stash_projected_task_fields
 from testing.factories import make_project, make_task, make_membership, _utcnow
@@ -4938,6 +4938,140 @@ async def test_residual_fingerprints_requires_auth(unauthenticated_client: Async
 
 
 # ---------------------------------------------------------------------------
+# ResidualRemediationCase lifecycle status enrichment
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_residual_fingerprints_case_status_no_case(client: AsyncClient, db_session):
+    """Cluster with no matching case row has no case_status field."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        latest_status_message="syntax error at token unexpected end of file",
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/residual-fingerprints?project_id={project.id}")
+    assert response.status_code == 200
+    top = response.json()["top_residuals"]
+    assert len(top) == 1
+    assert "case_status" not in top[0]
+
+
+@pytest.mark.asyncio
+async def test_residual_fingerprints_case_status_branches(client: AsyncClient, db_session):
+    """Each lifecycle status is surfaced in the corresponding cluster entry."""
+    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # One failed task per status variant so each gets its own fingerprint cluster
+    messages = {
+        ResidualCaseStatus.ACTIVE:      "test failure: active case assertion failed",
+        ResidualCaseStatus.REMEDIATING: "test failure: remediating case import error",
+        ResidualCaseStatus.SUSPENDED:   "test failure: suspended case type mismatch",
+        ResidualCaseStatus.MERGED:      "test failure: merged case unexpected none",
+        ResidualCaseStatus.FAILED:      "test failure: failed case key error raised",
+        ResidualCaseStatus.IGNORED:     "test failure: ignored case attribute missing",
+    }
+    fps = {status: _error_fingerprint(msg) for status, msg in messages.items()}
+
+    for status, msg in messages.items():
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message=msg,
+        ))
+    await db_session.commit()
+
+    # Insert one case row per status
+    for status, fp in fps.items():
+        case = ResidualRemediationCase(
+            project_id=project.id,
+            fingerprint=fp,
+            status=status,
+            last_spawned_pr_number=42 if status == ResidualCaseStatus.REMEDIATING else None,
+            consecutive_failure_count=3 if status == ResidualCaseStatus.SUSPENDED else 0,
+        )
+        db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/residual-fingerprints?project_id={project.id}&top_n=10"
+    )
+    assert response.status_code == 200
+    top = response.json()["top_residuals"]
+
+    by_fp = {r["fingerprint"]: r for r in top}
+
+    for status, fp in fps.items():
+        assert fp in by_fp, f"fingerprint for {status} not in response"
+        entry = by_fp[fp]
+        assert entry["case_status"] == status, f"{status}: case_status mismatch"
+
+    # REMEDIATING entry carries PR number
+    rem_fp = fps[ResidualCaseStatus.REMEDIATING]
+    assert by_fp[rem_fp]["last_spawned_pr_number"] == 42
+
+    # SUSPENDED entry carries consecutive_failure_count
+    sus_fp = fps[ResidualCaseStatus.SUSPENDED]
+    assert by_fp[sus_fp]["consecutive_failure_count"] == 3
+
+    # Entry with no case row should have no case_status — tested in separate test above
+    # MERGED/FAILED/IGNORED entries should not carry PR or failure-count noise
+    for st in (ResidualCaseStatus.MERGED, ResidualCaseStatus.FAILED, ResidualCaseStatus.IGNORED):
+        assert by_fp[fps[st]].get("last_spawned_pr_number") is None
+
+
+@pytest.mark.asyncio
+async def test_residual_fingerprints_case_status_project_scoped(client: AsyncClient, db_session):
+    """Case rows from a different project do not pollute the response."""
+    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+
+    project_a = make_project()
+    project_b = make_project()
+    db_session.add(project_a)
+    db_session.add(project_b)
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    msg = "test failure: type error in cross project test"
+    fp = _error_fingerprint(msg)
+
+    db_session.add(make_task(
+        project_id=project_a.id,
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+    ))
+    # Case row belongs to project_b — should NOT be returned for project_a query
+    case = ResidualRemediationCase(
+        project_id=project_b.id,
+        fingerprint=fp,
+        status=ResidualCaseStatus.SUSPENDED,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/residual-fingerprints?project_id={project_a.id}"
+    )
+    assert response.status_code == 200
+    top = response.json()["top_residuals"]
+    assert len(top) == 1
+    assert "case_status" not in top[0]
+
+
+# ---------------------------------------------------------------------------
 # cost_per_merge_exceeds_threshold / median_cost_per_merged_pr tests
 # ---------------------------------------------------------------------------
 
@@ -5207,4 +5341,46 @@ async def test_drift_snapshot_over_claim_direction_flagged(client: AsyncClient, 
     assert flagged["actually_merged_prs"] == 0
     assert "claim_shipped_consistency" in flagged
     assert "window_days" in data
-    assert "generated_at" in data
+
+
+@pytest.mark.asyncio
+async def test_digest_residual_remediation_funnel(client: AsyncClient, db_session):
+    """Residual remediation funnel sourced from ResidualRemediationCase rows."""
+    from app.models import ResidualRemediationCase, ResidualCaseStatus
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    in_window = now - timedelta(hours=6)
+    out_of_window = now - timedelta(hours=30)
+
+    def make_case(status, spawned_at):
+        import uuid as _uuid
+        return ResidualRemediationCase(
+            project_id=project.id,
+            fingerprint=str(_uuid.uuid4()),
+            status=status,
+            last_spawned_at=spawned_at,
+        )
+
+    # In-window cases: 1 merged, 1 failed, 1 suspended (escalated), 1 remediating
+    db_session.add(make_case(ResidualCaseStatus.MERGED, in_window))
+    db_session.add(make_case(ResidualCaseStatus.FAILED, in_window))
+    db_session.add(make_case(ResidualCaseStatus.SUSPENDED, in_window))
+    db_session.add(make_case(ResidualCaseStatus.REMEDIATING, in_window))
+    # Out-of-window case: excluded from spawned counts; REMEDIATING counts in live total
+    db_session.add(make_case(ResidualCaseStatus.ACTIVE, out_of_window))
+    db_session.add(make_case(ResidualCaseStatus.REMEDIATING, out_of_window))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    rr = response.json()["remediation_funnel"]["residual_remediation_funnel"]
+
+    assert rr["spawned"] == 4         # 4 cases with last_spawned_at in 24h window
+    assert rr["merged"] == 1
+    assert rr["failed"] == 2          # FAILED + SUSPENDED
+    assert rr["remediating"] == 2     # live count: both REMEDIATING cases regardless of window

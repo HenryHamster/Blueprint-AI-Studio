@@ -1032,20 +1032,50 @@ async def get_residual_fingerprints(
             entry["example_task_ids"].append(str(task.id))
 
     top = sorted(clusters.values(), key=lambda x: x["count"], reverse=True)[:top_n]
+
+    # Bulk-lookup ResidualRemediationCase rows for the returned fingerprints.
+    cases: Dict[str, Any] = {}
+    top_fps = [e["fingerprint"] for e in top]
+    if top_fps:
+        case_filters = [ResidualRemediationCase.fingerprint.in_(top_fps)]
+        if project_id:
+            case_filters.append(ResidualRemediationCase.project_id == project_id)
+        case_rows = await session.execute(
+            select(ResidualRemediationCase)
+            .where(*case_filters)
+            .options(load_only(
+                ResidualRemediationCase.fingerprint,
+                ResidualRemediationCase.status,
+                ResidualRemediationCase.last_spawned_pr_number,
+                ResidualRemediationCase.consecutive_failure_count,
+                ResidualRemediationCase.suspended_at,
+            ))
+        )
+        for c in case_rows.scalars().all():
+            cases[c.fingerprint] = c
+
+    enriched = []
+    for e in top:
+        entry: Dict[str, Any] = {
+            "fingerprint": e["fingerprint"],
+            "count": e["count"],
+            "most_recent_at": e["most_recent_at"],
+            "sample_message": e["sample_message"],
+            "example_task_ids": e["example_task_ids"],
+        }
+        c = cases.get(e["fingerprint"])
+        if c is not None:
+            entry["case_status"] = c.status
+            entry["last_spawned_pr_number"] = c.last_spawned_pr_number
+            entry["consecutive_failure_count"] = c.consecutive_failure_count
+            entry["suspended_at"] = c.suspended_at.isoformat() if c.suspended_at else None
+        enriched.append(entry)
+
     return {
         "window_hours": hours,
         "total_code_error_count": sum(e["count"] for e in clusters.values()),
         "residual_count": len(clusters),
-        "top_residuals": [
-            {
-                "fingerprint": e["fingerprint"],
-                "count": e["count"],
-                "most_recent_at": e["most_recent_at"],
-                "sample_message": e["sample_message"],
-                "example_task_ids": e["example_task_ids"],
-            }
-            for e in top
-        ],
+        "top_residuals": enriched,
     }
 
 
@@ -2926,6 +2956,31 @@ async def _compute_digest(
             bucket["failed"] += 1
     ci_auto_remediation["by_ci_failure_type"] = _ci_type_buckets
 
+    # --- Residual remediation funnel (sourced from ResidualRemediationCase rows) ---
+    _rr_spawned_filters = [ResidualRemediationCase.last_spawned_at >= window_start]
+    if project_id:
+        _rr_spawned_filters.append(ResidualRemediationCase.project_id == project_id)
+    _rr_spawned_result = await session.execute(
+        select(ResidualRemediationCase).where(*_rr_spawned_filters)
+    )
+    _rr_cases = list(_rr_spawned_result.scalars().all())
+    _rr_active_filters = [
+        ResidualRemediationCase.status == ResidualRemediationCaseStatus.REMEDIATING,
+    ]
+    if project_id:
+        _rr_active_filters.append(ResidualRemediationCase.project_id == project_id)
+    _rr_active_result = await session.execute(
+        select(ResidualRemediationCase).where(*_rr_active_filters)
+    )
+    residual_remediation_funnel: Dict[str, Any] = {
+        "spawned": len(_rr_cases),
+        "merged": sum(1 for c in _rr_cases if c.status == ResidualRemediationCaseStatus.MERGED),
+        "failed": sum(1 for c in _rr_cases if c.status in (
+            ResidualRemediationCaseStatus.FAILED, ResidualRemediationCaseStatus.SUSPENDED
+        )),
+        "remediating": len(list(_rr_active_result.scalars().all())),
+    }
+
     _prior_tasks = [t for t in _ci_rem_tasks if (t.context or {}).get("prior_diagnosis_task_id")]
     _total_with_prior = len(_prior_tasks)
     _merged_with_prior = sum(1 for t in _prior_tasks if t.status == TaskStatus.COMPLETED)
@@ -3060,6 +3115,7 @@ async def _compute_digest(
         "recent_investigations": recent_investigations,
         "active_investigations_detail": active_investigations_detail,
         "ci_auto_remediation": ci_auto_remediation,
+        "residual_remediation_funnel": residual_remediation_funnel,
         "prior_investigation_reuse": prior_investigation_reuse,
         "diagnosis_drop_off_by_reason": diagnosis_drop_off_by_reason,
     }

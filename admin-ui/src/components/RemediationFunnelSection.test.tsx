@@ -1,8 +1,33 @@
-import { describe, it, expect } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, act } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { RemediationFunnelSection } from './RemediationFunnelSection';
 
+const { apiFetchMock } = vi.hoisted(() => ({
+  apiFetchMock: vi.fn(),
+}));
+
+vi.mock('../api', () => ({
+  apiFetch: (path: string) => apiFetchMock(path),
+}));
+
+function jsonResponse(data: unknown): Response {
+  return { ok: true, json: async () => data } as Response;
+}
+
+function makeResiduals(top: unknown[] = []) {
+  return { window_hours: 24, total_code_error_count: top.length, residual_count: top.length, top_residuals: top };
+}
+
+function baseCluster(overrides: Record<string, unknown> = {}) {
+  return { fingerprint: 'fp-abc123', count: 2, most_recent_at: null, sample_message: 'test: unexpected', example_task_ids: [], ...overrides };
+}
+
 describe('RemediationFunnelSection', () => {
+  beforeEach(() => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals()));
+  });
+
   it('renders nothing when no investigations have been spawned', () => {
     const { container } = render(
       <RemediationFunnelSection
@@ -100,4 +125,92 @@ describe('RemediationFunnelSection', () => {
     expect(screen.getByText('2/3')).toBeInTheDocument();
     expect(screen.getByText('0/2')).toBeInTheDocument();
   });
+
+  it('renders residual remediation funnel card with counts', () => {
+    render(
+      <RemediationFunnelSection
+        funnel={{
+          investigations_spawned: 5,
+          residual_remediation_funnel: {
+            spawned: 4,
+            merged: 1,
+            failed: 2,
+            remediating: 2,
+          },
+        }}
+        conversion={null}
+      />
+    );
+    expect(screen.getByText('Residual remediation')).toBeInTheDocument();
+    // spawned count
+    expect(screen.getByText('4')).toBeInTheDocument();
+    // remediating row
+    expect(screen.getByText('remediating')).toBeInTheDocument();
+    // at least two cells showing '2' (failed=2 and remediating=2)
+    expect(screen.getAllByText('2').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('does not render residual funnel card when spawned is zero', () => {
+    render(
+      <RemediationFunnelSection
+        funnel={{
+          investigations_spawned: 5,
+          residual_remediation_funnel: { spawned: 0, merged: 0, failed: 0, remediating: 0 },
+        }}
+        conversion={null}
+      />
+    );
+    expect(screen.queryByText('Residual remediation')).toBeNull();
+  });
+});
+
+describe('RemediationFunnelSection residuals status pill', () => {
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+  });
+
+  it('renders no status pill when case_status is absent', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([baseCluster()])));
+    const user = userEvent.setup();
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} projectId="p1" />);
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+    expect(screen.queryByText(/REMEDIATING|SUSPENDED|IGNORED|MERGED|FAILED|ACTIVE/)).toBeNull();
+  });
+
+  it('shows REMEDIATING pill with PR number', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+      baseCluster({ case_status: 'REMEDIATING', last_spawned_pr_number: 42 }),
+    ])));
+    const user = userEvent.setup();
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} projectId="p1" />);
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+    expect(screen.getByText('REMEDIATING #42')).toBeInTheDocument();
+  });
+
+  it('shows SUSPENDED pill with failure count', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+      baseCluster({ case_status: 'SUSPENDED', consecutive_failure_count: 3 }),
+    ])));
+    const user = userEvent.setup();
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} projectId="p1" />);
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+    expect(screen.getByText('SUSPENDED ×3')).toBeInTheDocument();
+  });
+
+  it.each(['MERGED', 'FAILED', 'IGNORED', 'ACTIVE'] as const)(
+    'shows %s status pill',
+    async (status) => {
+      apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+        baseCluster({ case_status: status }),
+      ])));
+      const user = userEvent.setup();
+      render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} projectId="p1" />);
+      await act(async () => {});
+      await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+      expect(screen.getByText(status)).toBeInTheDocument();
+    },
+  );
 });

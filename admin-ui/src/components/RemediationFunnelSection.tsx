@@ -41,6 +41,12 @@ interface RemediationFunnelData {
     failed?: number;
     by_ci_failure_type?: Record<string, { spawned?: number; merged?: number; failed?: number }>;
   } | null;
+  residual_remediation_funnel?: {
+    spawned?: number;
+    merged?: number;
+    failed?: number;
+    remediating?: number;
+  } | null;
   prior_investigation_reuse?: {
     total_with_prior?: number;
     merged_with_prior?: number;
@@ -67,6 +73,10 @@ interface ResidualFingerprint {
   most_recent_at: string | null;
   sample_message: string;
   example_task_ids: string[];
+  case_status?: string | null;
+  last_spawned_pr_number?: number | null;
+  consecutive_failure_count?: number | null;
+  suspended_at?: string | null;
 }
 
 interface ResidualFingerprintsData {
@@ -81,6 +91,22 @@ export interface RemediationFunnelSectionProps {
   conversion?: InvestigationConversion | null;
   loading?: boolean;
   projectId?: string | null;
+}
+
+const CASE_STATUS_STYLES: Record<string, string> = {
+  REMEDIATING: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  SUSPENDED: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
+  IGNORED: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
+  MERGED: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+  FAILED: 'bg-red-500/20 text-red-400 border-red-500/30',
+  ACTIVE: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
+};
+
+function caseStatusLabel(r: ResidualFingerprint): string | null {
+  if (!r.case_status) return null;
+  if (r.case_status === 'REMEDIATING' && r.last_spawned_pr_number) return `REMEDIATING #${r.last_spawned_pr_number}`;
+  if (r.case_status === 'SUSPENDED' && r.consecutive_failure_count) return `SUSPENDED ×${r.consecutive_failure_count}`;
+  return r.case_status;
 }
 
 const FAILURE_CLASS_COLORS: Record<string, string> = {
@@ -223,6 +249,13 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
   const ciTypeEntries = Object.entries(ciRem?.by_ci_failure_type ?? {})
     .filter(([, v]) => (v.spawned ?? 0) > 0)
     .sort((a, b) => (b[1].spawned ?? 0) - (a[1].spawned ?? 0));
+
+  const rrFunnel = funnel.residual_remediation_funnel ?? null;
+  const rrSpawned = rrFunnel?.spawned ?? 0;
+  const rrMerged = rrFunnel?.merged ?? 0;
+  const rrFailed = rrFunnel?.failed ?? 0;
+  const rrRemediating = rrFunnel?.remediating ?? 0;
+  const rrResolved = rrMerged + rrFailed;
 
   const reuse = funnel.prior_investigation_reuse ?? null;
   const reuseMergeRate = reuse?.merge_rate != null ? Math.round(reuse.merge_rate * 100) : null;
@@ -454,6 +487,33 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
           </div>
         )}
 
+        {rrSpawned > 0 && (
+          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+            <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">Residual remediation</div>
+            <div className="flex justify-between text-[11px] text-neutral-400 mb-1">
+              <span>spawned</span>
+              <span className="font-mono text-neutral-200">{rrSpawned}</span>
+            </div>
+            <div className="flex justify-between text-[11px] text-neutral-400 mb-1">
+              <span>merged / failed</span>
+              <span>
+                <span className="font-mono text-emerald-400">{rrMerged}</span>
+                <span className="text-neutral-600"> / </span>
+                <span className="font-mono text-red-400">{rrFailed}</span>
+                {rrResolved > 0 && (
+                  <span className="font-mono text-neutral-500"> ({pct(rrMerged, rrResolved)}%)</span>
+                )}
+              </span>
+            </div>
+            {rrRemediating > 0 && (
+              <div className="flex justify-between text-[11px] text-neutral-400">
+                <span>remediating</span>
+                <span className="font-mono text-amber-400">{rrRemediating}</span>
+              </div>
+            )}
+          </div>
+        )}
+
         {successByConf.length > 0 && (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
             <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">Success by confidence</div>
@@ -567,6 +627,16 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                       {r.count}×
                     </span>
                     <span className="text-[10px] text-neutral-500 shrink-0">{relativeTime(r.most_recent_at)}</span>
+                    {(() => {
+                      const label = caseStatusLabel(r);
+                      if (!label) return null;
+                      const style = CASE_STATUS_STYLES[r.case_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+                      return (
+                        <span className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${style}`}>
+                          {label}
+                        </span>
+                      );
+                    })()}
                     <span className="font-mono text-[9px] text-neutral-600 truncate flex-1">{r.fingerprint}</span>
                   </div>
                   <div className="text-[11px] text-neutral-400 leading-snug mb-1.5">{truncate(r.sample_message, 140)}</div>
