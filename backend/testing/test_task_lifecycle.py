@@ -1912,6 +1912,93 @@ async def test_scan_transient_retry_exhausted(tl_db, mocker):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Residual remediation MERGED transition on merge
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
+    """When a residual_fingerprint_remediation task's PR merges (via review pipeline), its REMEDIATING case is set MERGED."""
+    from app.models import ResidualRemediationCase, ResidualCaseStatus
+    from datetime import datetime, timezone
+
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    fp = "fp_lifecycle_resolve_xyz"
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    case = ResidualRemediationCase(
+        project_id=project.id,
+        fingerprint=fp,
+        status=ResidualCaseStatus.REMEDIATING,
+        hit_count=5,
+        sample_message="some recurring error",
+        first_seen_at=now,
+        last_seen_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(case)
+
+    # The original create task spawned by residual fingerprint remediation.
+    orig_task = await _make_task(
+        session, project.id, task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "auto_remediation": True,
+            "spawned_by": "residual_fingerprint_remediation",
+            "error_fingerprint": fp,
+        },
+    )
+
+    # A review task linked to the original via review_loop (this is the task
+    # whose completion triggers the merge path in _process_post_commit).
+    review_task = await _make_task(
+        session, project.id, task_type="review",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "review_loop": {
+                "original_task_id": str(orig_task.id),
+                "pr_number": 99,
+                "branch": "blueprint/task-remfp",
+                "base_branch": "main",
+            },
+        },
+    )
+
+    mocker.patch("app.routers.agent.get_github_token_for_task", new_callable=AsyncMock,
+                 return_value=("gh-token", "owner", "repo"))
+    # get_pull_request: used for PR state check (early-exit guard) and head-branch validation.
+    # Return empty head.sha so CI gate is skipped; ref matches branch so no branch-mismatch abort.
+    mocker.patch("app.github.get_pull_request", new_callable=AsyncMock,
+                 return_value={"head": {"ref": "blueprint/task-remfp", "sha": ""}, "state": "open", "merged": False})
+    mocker.patch("app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1})
+    mocker.patch("app.task_lifecycle._merge_with_retry", new_callable=AsyncMock,
+                 return_value={"merged": True})
+    mocker.patch("app.task_lifecycle._comment_with_retry", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+
+    # Submit APPROVED verdict for the review task; this triggers the merge path in
+    # _process_post_commit → post_remediation_result_message → post_residual_fix_result_message
+    # which transitions the case to MERGED.
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "feedback": "LGTM"}',
+        pr_url="https://github.com/owner/repo/pull/99",
+        branch="blueprint/task-remfp",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+
+    await session.refresh(case)
+    assert case.status == ResidualCaseStatus.MERGED
+    assert case.updated_at >= now
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # _record_parent_failure
 # ══════════════════════════════════════════════════════════════════════════════
 

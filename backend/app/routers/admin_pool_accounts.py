@@ -11,6 +11,7 @@ import uuid
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -210,12 +211,19 @@ async def get_account_health_summary(
                     Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
                     Task.updated_at >= cutoff,
                     Task.latest_status_message.isnot(None),
+                    or_(
+                        Task.account_id.in_(account_ids),
+                        Task.context["llm_account_id"].as_string().in_(account_ids),
+                        Task.context["max_plan_account_id"].as_string().in_(account_ids),
+                    ),
                 )
             )
         ).scalars().all()
         for t in failed_tasks:
-            ctx = t.context or {}
-            acct_id = ctx.get("llm_account_id") or ctx.get("max_plan_account_id")
+            acct_id = t.account_id
+            if not acct_id:
+                ctx = t.context or {}
+                acct_id = ctx.get("llm_account_id") or ctx.get("max_plan_account_id")
             if acct_id not in account_ids:
                 continue
             fc = classify_failure(t)

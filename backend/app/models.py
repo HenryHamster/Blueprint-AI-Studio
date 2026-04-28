@@ -2,7 +2,7 @@ from enum import Enum
 from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
 from sqlmodel.sql.sqltypes import GUID
-from sqlalchemy import Boolean, CheckConstraint, Column, String, Integer, Index, Text, UniqueConstraint, ForeignKey, text, event, Enum as SAEnum
+from sqlalchemy import Boolean, CheckConstraint, Column, String, Integer, Float, Index, Text, UniqueConstraint, ForeignKey, text, event, Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB
 import logging
 import uuid
@@ -263,6 +263,10 @@ class Task(SQLModel, table=True):
     spawn_failed: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
     last_remediation_at: Optional[datetime] = Field(default=None)
     last_token_refresh_at: Optional[datetime] = Field(default=None)
+    provider: Optional[str] = Field(default=None)
+    account_id: Optional[str] = Field(default=None)
+    model: Optional[str] = Field(default=None)
+    estimated_cost_usd: Optional[float] = Field(default=None, sa_column=Column(Float, nullable=True))
 
     @property
     def first_payload(self) -> Dict[str, Any]:
@@ -297,6 +301,8 @@ class Task(SQLModel, table=True):
         ),
         Index("ix_task_context_gin", "context", postgresql_using="gin"),
         Index("ix_task_depends_on_gin", "depends_on", postgresql_using="gin"),
+        Index("ix_task_provider_created_at", "provider", "created_at"),
+        Index("ix_task_account_id_created_at", "account_id", "created_at"),
     )
 
     project: Project = Relationship(back_populates="tasks")

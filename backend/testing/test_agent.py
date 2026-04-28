@@ -102,6 +102,7 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
 @pytest.mark.asyncio
 async def test_agent_status_update_persists_runtime_identity(client: AsyncClient, db_session, mocker):
     mocker.patch("app.main.delete_agent_vm", return_value=True)
+    now = datetime.utcnow()
 
     project = Project(name="Agent Runtime Identity Test", user_id="test-user-123")
     db_session.add(project)
@@ -113,6 +114,7 @@ async def test_agent_status_update_persists_runtime_identity(client: AsyncClient
         payloads=[{"type": "create"}],
         vm_instance_id="agent-vm-runtime",
         status=TaskStatus.IN_PROGRESS,
+        vm_provisioned_at=now - timedelta(minutes=5),
         context={"llm_account_id": "acct-1", "max_plan_account_id": "acct-1"},
     )
     db_session.add(task)
@@ -123,10 +125,9 @@ async def test_agent_status_update_persists_runtime_identity(client: AsyncClient
     headers = {"x-agent-token": token}
     payload = {
         "task_id": str(task.id),
-        "status": "FAILED",
+        "status": "COMPLETED",
         "artifact_type": "ERROR_LOG",
         "logs": "provider-specific failure",
-        "failure_category": "rate_limited",
         "provider": "openai",
         "auth_mode": "api_key",
         "model": "gpt-5.4",
@@ -140,7 +141,15 @@ async def test_agent_status_update_persists_runtime_identity(client: AsyncClient
     assert task.context["llm_auth_mode"] == "api_key"
     assert task.context["llm_model"] == "gpt-5.4"
     assert task.context["llm_execution_mode"] == "default"
-    assert task.context["failure_category"] == "RATE_LIMIT"
+    assert task.provider == "openai"
+    assert task.account_id == "acct-1"
+    assert task.model == "gpt-5.4"
+    assert task.estimated_cost_usd is not None
+
+    provider_tasks = (
+        await db_session.execute(select(Task).where(Task.provider == "openai"))
+    ).scalars().all()
+    assert any(t.id == task.id for t in provider_tasks)
 
 
 @pytest.mark.asyncio

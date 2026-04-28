@@ -6798,6 +6798,24 @@ def _clear_residual_state():
     _residual_store.clear()
 
 
+def _make_residual_case(project_id, fingerprint, hit_count=5, sample_message="some error"):
+    """Helper: create an ACTIVE ResidualRemediationCase for tests."""
+    from app.models import ResidualRemediationCase, ResidualCaseStatus
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return ResidualRemediationCase(
+        project_id=project_id,
+        fingerprint=fingerprint,
+        status=ResidualCaseStatus.ACTIVE,
+        hit_count=hit_count,
+        sample_message=sample_message,
+        first_seen_at=now,
+        last_seen_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+
+
 @pytest.mark.asyncio
 async def test_residual_fingerprint_remediation_spawns_task(db_session, _clear_residual_state):
     """Top residual fingerprint spawns a create task with auto_remediation context."""
@@ -6939,8 +6957,6 @@ async def test_residual_fingerprint_remediation_skips_agent_timeout_sample(db_se
     After the fix, the re-classification guard detects the heartbeat via
     classify_failure and skips spawning a redundant remediation task.
     """
-    import time
-    from app.failure_classification import _residual_store
     from app.autonomous_research import _spawn_residual_fingerprint_remediation
 
     project = Project(
@@ -6956,6 +6972,8 @@ async def test_residual_fingerprint_remediation_skips_agent_timeout_sample(db_se
     # Simulate a fingerprint that was recorded before the classify_failure fix
     # was deployed — an agent PR-creation heartbeat that should have been
     # AGENT_TIMEOUT but fell through to CODE_ERROR in the old code.
+    import time
+    from app.failure_classification import _residual_store
     fp = "creating pull request for blueprint/task-<hash>..."
     pr_heartbeat = "[15.5MB] Creating pull request for blueprint/task-2a30fc5a..."
     _residual_store[fp] = {
@@ -6996,6 +7014,89 @@ async def test_residual_fingerprint_remediation_skipped_when_no_fingerprints(db_
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     assert len(result.scalars().all()) == 0
+
+
+@pytest.mark.asyncio
+async def test_residual_in_memory_selection_ranks_by_hit_count(db_session, _clear_residual_state):
+    """In-memory _residual_store selection picks the highest hit_count fingerprint first."""
+    import time
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+
+    project = Project(
+        name="Residual DB Ranking",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-remrank01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fp_low = "fp_low_count_abc"
+    fp_high = "fp_high_count_xyz"
+    # Seed in-memory store; get_top_residual_fingerprints() sorts by count desc.
+    _residual_store[fp_low] = {
+        "count": 2, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "sample_message": "low error", "task_ids": [],
+    }
+    _residual_store[fp_high] = {
+        "count": 20, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "sample_message": "high error", "task_ids": [],
+    }
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 1
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    create_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "create"]
+    assert len(create_tasks) == 1
+    assert create_tasks[0].context["error_fingerprint"] == fp_high
+
+
+@pytest.mark.asyncio
+async def test_residual_ignored_case_not_selected(db_session, _clear_residual_state):
+    """IGNORED DB case rows block spawn even when the fingerprint is in the store."""
+    import time
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+    from app.models import ResidualRemediationCase, ResidualCaseStatus
+    from datetime import datetime, timezone
+
+    project = Project(
+        name="Residual Ignored Case",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-remign01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fp = "fp_ignored_fingerprint_xyz"
+    # Fingerprint is in the store (would otherwise be eligible).
+    _residual_store[fp] = {
+        "count": 15, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "sample_message": "ignored error", "task_ids": [],
+    }
+    # DB case row carries IGNORED status → lands in blocked_fingerprints.
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    ignored_case = ResidualRemediationCase(
+        project_id=project.id,
+        fingerprint=fp,
+        status=ResidualCaseStatus.IGNORED,
+        hit_count=15,
+        sample_message="ignored error",
+        first_seen_at=now,
+        last_seen_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(ignored_case)
+    await db_session.commit()
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 0, "IGNORED cases must not trigger spawn"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7223,15 +7324,11 @@ async def test_self_audit_skipped_when_force_strategic_with_no_maturity(db_sessi
 
 @pytest.mark.asyncio
 async def test_residual_fingerprint_remediation_threshold_for_no_error_cluster(db_session, _clear_residual_state):
-    """Heartbeat-only clusters (is_error_shaped=False) require a much higher
-    count before remediation. A single PROVISION_PROGRESS / Using tool /
-    Cloning failure is noise; many of the same is a real signal worth a
-    remediation task. Threshold lives in
-    ``runtime_config['residual_remediation_no_error_min_count']`` (default 20).
+    """Non-error-shaped clusters (is_error_shaped=False) require hit_count >= no_error_min_count (default 20).
+    Below the threshold the fingerprint is skipped; at/above the threshold it spawns.
     """
     import time
     from app.failure_classification import _residual_store
-    from app.shared_state import runtime_config as _rc
     from app.autonomous_research import _spawn_residual_fingerprint_remediation
 
     project = Project(
@@ -7244,40 +7341,31 @@ async def test_residual_fingerprint_remediation_threshold_for_no_error_cluster(d
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Below threshold: heartbeat fingerprint with count=5 → skipped.
-    fp = "provision_progress: creds fetched, entering env setup"
-    sample = "PROVISION_PROGRESS: creds fetched, entering env setup"
-    _residual_store[fp] = {
-        "count": 5,
-        "first_seen": time.time() - 3600,
-        "last_seen": time.time(),
-        "is_error_shaped": False,
-        "sample_message": sample,
-        "sample_messages": [sample],
-        "sample_statuses": [sample],
-        "task_ids": ["t1", "t2", "t3", "t4", "t5"],
+    # Below threshold: is_error_shaped=False, count=5 < 20 → must be skipped
+    fp_below = "fp_heartbeat_below_threshold_abc"
+    _residual_store[fp_below] = {
+        "count": 5, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "sample_message": "", "task_ids": [], "is_error_shaped": False,
     }
-    saved_threshold = _rc.get("residual_remediation_no_error_min_count")
-    try:
-        _rc["residual_remediation_no_error_min_count"] = 20
-        spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
-        assert spawned == 0, "below-threshold heartbeat cluster should not spawn"
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 0, "Heartbeat-only cluster below threshold (5 < 20) must NOT spawn"
+    del _residual_store[fp_below]
 
-        # Bump count above threshold → spawn fires.
-        _residual_store[fp]["count"] = 25
-        spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
-        assert spawned == 1, "above-threshold heartbeat cluster should spawn"
-    finally:
-        if saved_threshold is None:
-            _rc.pop("residual_remediation_no_error_min_count", None)
-        else:
-            _rc["residual_remediation_no_error_min_count"] = saved_threshold
+    # Above threshold: is_error_shaped=False, count=25 >= 20 → must spawn.
+    # Explicitly set sample_messages=[] so get_top_residual_fingerprints doesn't
+    # synthesize a [""] list that triggers (and fails) the re-classification guard.
+    fp_above = "fp_heartbeat_above_threshold_xyz"
+    _residual_store[fp_above] = {
+        "count": 25, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "sample_message": "", "sample_messages": [], "task_ids": [], "is_error_shaped": False,
+    }
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 1, "Heartbeat-only cluster above threshold (25 >= 20) SHOULD spawn"
 
 
 @pytest.mark.asyncio
 async def test_residual_fingerprint_remediation_error_shaped_uses_normal_threshold(db_session, _clear_residual_state):
-    """Error-shaped clusters (is_error_shaped=True) use the existing
-    spawn rules — no extra count threshold. count=1 is still enough."""
+    """CODE_ERROR sample spawns at hit_count=1 — no extra threshold."""
     import time
     from app.failure_classification import _residual_store
     from app.autonomous_research import _spawn_residual_fingerprint_remediation
@@ -7295,17 +7383,12 @@ async def test_residual_fingerprint_remediation_error_shaped_uses_normal_thresho
     fp = "fp_typeerror_real_<n>"
     sample = "TypeError: 'NoneType' object is not callable"
     _residual_store[fp] = {
-        "count": 1,
-        "first_seen": time.time() - 600,
-        "last_seen": time.time(),
-        "is_error_shaped": True,
-        "sample_message": sample,
-        "sample_messages": [sample],
-        "sample_statuses": [sample],
-        "task_ids": ["t-real-err"],
+        "count": 1, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "sample_message": sample, "task_ids": [],
     }
+
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
-    assert spawned == 1, "error-shaped cluster should spawn at count=1"
+    assert spawned == 1, "CODE_ERROR sample should spawn at hit_count=1"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

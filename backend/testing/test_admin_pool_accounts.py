@@ -302,13 +302,13 @@ async def test_account_health_summary_failure_class_window_filter(client, db_ses
     task_in = Task(
         project_id=project.id, status=TaskStatus.FAILED,
         latest_status_message="tests failed: assertion error",
-        context={"llm_account_id": acct_id},
+        account_id=acct_id,
         updated_at=now - timedelta(hours=12),
     )
     task_out = Task(
         project_id=project.id, status=TaskStatus.FAILED,
         latest_status_message="tests failed: assertion error",
-        context={"llm_account_id": acct_id},
+        account_id=acct_id,
         updated_at=now - timedelta(hours=36),
     )
     db_session.add_all([task_in, task_out])
@@ -319,6 +319,10 @@ async def test_account_health_summary_failure_class_window_filter(client, db_ses
     a = res.json()["accounts"][0]
     assert a["failure_class_counts"]["CODE_ERROR"] == 1  # only task_in counted
     assert sum(a["failure_class_counts"].values()) == 1
+    db_session.expunge_all()
+    reloaded = await db_session.get(Task, task_in.id)
+    assert reloaded is not None
+    assert reloaded.account_id == acct_id
 
 
 async def test_account_health_summary_user_isolation(client, inject_pool):

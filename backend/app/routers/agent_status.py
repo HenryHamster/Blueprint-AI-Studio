@@ -1231,13 +1231,23 @@ async def update_agent_status(
             session.add(task)
             await session.flush()
 
+        # Persist runtime LLM telemetry on Task for durable analytics.
+        _ctx_terminal = dict(task.context or {})
+        _provider = _ctx_terminal.get("llm_provider") or payload.provider
+        _model = _ctx_terminal.get("llm_model") or payload.model
+        task.provider = str(_provider) if _provider else None
+        task.account_id = str(acct_id) if acct_id else None
+        task.model = str(_model) if _model else None
+
         task.vm_stopped_at = _utcnow()
         if task.vm_provisioned_at:
             _runtime_secs = (task.vm_stopped_at - task.vm_provisioned_at).total_seconds()
             _rate = SPOT_RATE if task.vm_spot else ON_DEMAND_RATE
             ctx = dict(task.context or {})
-            ctx['estimated_cost_usd'] = round(_runtime_secs * _rate, 4)
+            _estimated_cost = round(_runtime_secs * _rate, 4)
+            ctx['estimated_cost_usd'] = _estimated_cost
             task.context = ctx
+            task.estimated_cost_usd = _estimated_cost
             await _check_daily_cost_ceiling(task, session)
         old_vm_id = task.vm_instance_id
         await _ensure_vm_deleted(old_vm_id, reason="agent_completion")
