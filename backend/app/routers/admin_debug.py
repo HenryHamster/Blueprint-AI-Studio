@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Task, TaskStatus, Project, DeploymentState, DeploymentStatus, _utcnow
+from app.models import Task, TaskStatus, Project, DeploymentState, DeploymentStatus, SystemMaturity, _utcnow
 from app.auth import get_current_user, require_admin
 from app.broadcast import broadcast_to_project
 from app.admin import _get_user_project, _get_user_project_with_role
@@ -953,3 +953,33 @@ async def get_global_diagnostics(
         ),
         "truncated": truncated,
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/projects/{project_id}/system-maturity
+# ---------------------------------------------------------------------------
+
+@router.get("/projects/{project_id}/system-maturity")
+async def get_project_system_maturity(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return per-system maturity rows for a project, ordered by score ascending."""
+    await _get_user_project(project_id, current_user["user_id"], session)
+    result = await session.execute(
+        select(SystemMaturity)
+        .where(SystemMaturity.project_id == project_id)
+        .order_by(SystemMaturity.score.asc())
+    )
+    rows = result.scalars().all()
+    return [
+        {
+            "system_id": r.system_id,
+            "score": r.score,
+            "recommended_mode": r.recommended_mode,
+            "top_issues": r.top_issues or [],
+            "last_audited_at": r.last_audited_at.isoformat(),
+        }
+        for r in rows
+    ]

@@ -934,6 +934,13 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                 if current_active >= _runtime_config.get('max_active_directions', 5):
                     logger.warning(f'[STRATEGIC] Skipping direction create: active count {current_active} >= cap')
                     continue
+                # Translate recommended_mode='pause' to paused status so the
+                # existing spawn-skip (status != 'active') mechanism handles it.
+                if rec_mode == "pause":
+                    new_dir["status"] = "paused"
+                    new_dir["auto_paused"] = True
+                    new_dir["paused_reason"] = "Strategic review: recommended_mode=pause"
+                    new_dir["paused_at"] = _utcnow().isoformat()
                 directions.append(new_dir)
                 ops_applied += 1
                 creates_count += 1
@@ -1004,6 +1011,13 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                                 "set_at": _utcnow().isoformat(),
                                 "strategic_cycle_id": str(task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id") or ""),
                             }
+                        # Translate recommended_mode='pause' to paused direction
+                        # status so existing spawn-skip logic handles it.
+                        if d.get("recommended_mode") == "pause" and d.get("status") == "active":
+                            d["status"] = "paused"
+                            d["auto_paused"] = True
+                            d["paused_reason"] = "Strategic review: recommended_mode=pause"
+                            d["paused_at"] = _utcnow().isoformat()
                         # Record rationale as a note
                         if rationale:
                             notes = d.get("notes", [])

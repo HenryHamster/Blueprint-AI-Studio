@@ -1224,3 +1224,149 @@ async def test_strategic_completion_drops_invalid_recommended_mode(db_session, m
     assert len(new_dirs) == 1
     # Field should be absent — invalid mode is silently dropped.
     assert "recommended_mode" not in new_dirs[0]
+
+
+# ── recommended_mode='pause' auto-pause dispatch ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_strategic_completion_pause_mode_auto_pauses_on_create(db_session, mocker):
+    """create op with recommended_mode='pause' starts the direction in paused state.
+
+    This makes the existing spawn-skip (status != 'active') mechanism handle
+    the 'pause' mode without requiring a separate check in spawn-side code."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [{"op": "create", "text": "Paused direction",
+                                   "priority": "medium", "recommended_mode": "pause"}],
+    })
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    new_dirs = [d for d in (project.directions or []) if d.get("text") == "Paused direction"]
+    assert len(new_dirs) == 1
+    d = new_dirs[0]
+    assert d.get("status") == "paused", f"Expected paused, got {d.get('status')!r}"
+    assert d.get("auto_paused") is True
+    assert d.get("recommended_mode") == "pause"
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_pause_mode_auto_pauses_on_update(db_session, mocker):
+    """update op with recommended_mode='pause' transitions an active direction to paused."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {"id": "d-pauseme", "text": "Active direction", "status": "active",
+             "priority": "medium", "notes": [], "research_history": []},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [
+            {"op": "update", "direction_id": "d-pauseme", "changes": {"recommended_mode": "pause"}},
+        ],
+    })
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-pauseme")
+    assert target.get("status") == "paused"
+    assert target.get("auto_paused") is True
+    assert target.get("recommended_mode") == "pause"
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_non_pause_modes_preserve_active_status(db_session, mocker):
+    """update ops with audit/fundamentals/ship modes do not change direction status."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {"id": "d-a", "text": "Audit dir", "status": "active",
+             "priority": "medium", "notes": [], "research_history": []},
+            {"id": "d-f", "text": "Fundamentals dir", "status": "active",
+             "priority": "medium", "notes": [], "research_history": []},
+            {"id": "d-s", "text": "Ship dir", "status": "active",
+             "priority": "medium", "notes": [], "research_history": []},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [
+            {"op": "update", "direction_id": "d-a", "changes": {"recommended_mode": "audit"}},
+            {"op": "update", "direction_id": "d-f", "changes": {"recommended_mode": "fundamentals"}},
+            {"op": "update", "direction_id": "d-s", "changes": {"recommended_mode": "ship"}},
+        ],
+    })
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    by_id = {d["id"]: d for d in (project.directions or [])}
+    for did, expected_mode in [("d-a", "audit"), ("d-f", "fundamentals"), ("d-s", "ship")]:
+        d = by_id[did]
+        assert d.get("status") == "active", f"{did} should stay active for mode={expected_mode}"
+        assert d.get("recommended_mode") == expected_mode
+        assert not d.get("auto_paused")

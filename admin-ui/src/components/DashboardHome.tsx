@@ -119,6 +119,14 @@ interface LatestCycle {
   summary_text?: string | null;
 }
 
+interface SystemMaturityRow {
+  system_id: string;
+  score: number;
+  recommended_mode: string | null;
+  top_issues: Array<Record<string, unknown>>;
+  last_audited_at: string;
+}
+
 interface DigestData {
   failed_count: number;
   success_rate?: number | null;
@@ -282,13 +290,14 @@ interface RateLimitedModel {
   cooldown_type: 'rate_limit' | 'quota_exhausted';
 }
 type AccountHealthState = 'healthy' | 'probing' | 'disqualified' | 'disabled';
-interface AccountHealthEntry {
+export interface AccountHealthEntry {
   account_id: string;
   label: string;
   provider: string;
   state: AccountHealthState;
   disabled_reason?: string | null;
   health_score: number;
+  success_rate_7d?: number | null;
   completions_24h: number;
   rl_events_24h: number;
   rate_limited_models: RateLimitedModel[];
@@ -655,6 +664,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [scopeBaselines, setScopeBaselines] = useState<ScopeBaselinesResponse | null>(null);
   const [scopeTrendsOpen, setScopeTrendsOpen] = useState(false);
   const [accountHealth, setAccountHealth] = useState<AccountHealthEntry[] | null>(null);
+  const [systemMaturity, setSystemMaturity] = useState<SystemMaturityRow[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
   const [lastFetchError, setLastFetchError] = useState(false);
@@ -736,6 +746,15 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             if (res.ok) {
               const data = await res.json();
               setAccountHealth(data.accounts ?? []);
+            }
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/system-maturity`);
+            if (res.ok) {
+              const data = await res.json();
+              setSystemMaturity(Array.isArray(data) ? data : []);
             }
           } catch { /* silent */ }
         })(),
@@ -1060,6 +1079,11 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               loading={loading}
               projectId={selectedProjectId}
             />
+          )}
+
+          {/* Section 1f2: System Maturity */}
+          {selectedProjectId && (
+            <SystemMaturityCard rows={systemMaturity} loading={loading} />
           )}
 
           {/* Section 1g: Recurring Patterns */}
@@ -1702,7 +1726,88 @@ const FAILURE_CLASS_BAR_COLORS: Record<string, string> = {
   SCOPE_OVERFLOW: 'bg-teal-400/70',
 };
 
-function PoolAccountHealthPanel({ accounts, loading }: {
+// ---------- system maturity card ----------
+
+const MATURITY_MODE_STYLES: Record<string, string> = {
+  audit: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  fundamentals: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
+  ship: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+  pause: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
+};
+
+function SystemMaturityCard({ rows, loading }: { rows: SystemMaturityRow[] | null; loading: boolean }) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  return (
+    <section>
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">System Maturity</h2>
+      {loading || rows === null ? (
+        <Skeleton className="h-16 w-full" />
+      ) : rows.length === 0 ? (
+        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">
+          No audits have run yet
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          {rows.map(row => {
+            const scoreColor = row.score >= 70 ? 'bg-emerald-500' : row.score >= 40 ? 'bg-amber-500' : 'bg-red-500';
+            const modeStyle = row.recommended_mode
+              ? (MATURITY_MODE_STYLES[row.recommended_mode] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30')
+              : null;
+            const isExpanded = expandedId === row.system_id;
+            const hasIssues = (row.top_issues ?? []).length > 0;
+            return (
+              <div key={row.system_id} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+                <div className="flex items-center gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <span className="text-xs font-medium text-neutral-200 truncate">{row.system_id}</span>
+                      {modeStyle && (
+                        <span className={`shrink-0 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${modeStyle}`}>
+                          {row.recommended_mode}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="flex-1 h-1.5 rounded-full bg-neutral-800 overflow-hidden">
+                        <div className={`h-full rounded-full ${scoreColor}`} style={{ width: `${row.score}%` }} />
+                      </div>
+                      <span className="shrink-0 text-[10px] font-mono text-neutral-400">{row.score}</span>
+                      <span className="shrink-0 text-[10px] text-neutral-500">{timeAgo(row.last_audited_at)}</span>
+                    </div>
+                  </div>
+                  {hasIssues && (
+                    <button
+                      type="button"
+                      className="shrink-0 text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors ml-1"
+                      onClick={() => setExpandedId(isExpanded ? null : row.system_id)}
+                    >
+                      {isExpanded ? 'hide' : `${row.top_issues.length} issues`}
+                    </button>
+                  )}
+                </div>
+                {isExpanded && hasIssues && (
+                  <div className="mt-2 space-y-0.5 pt-2 border-t border-neutral-800/50">
+                    {row.top_issues.map((issue, i) => {
+                      const desc = (issue.description as string | undefined) ?? JSON.stringify(issue);
+                      return (
+                        <div key={i} className="text-[10px] text-neutral-400 flex items-start gap-1.5">
+                          <span className="shrink-0 text-neutral-600">•</span>
+                          <span>{desc}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function PoolAccountHealthPanel({ accounts, loading }: {
   accounts: AccountHealthEntry[] | null;
   loading: boolean;
 }) {
@@ -1720,8 +1825,12 @@ function PoolAccountHealthPanel({ accounts, loading }: {
           const scoreColor = acct.health_score >= 0.7 ? 'text-emerald-400' : acct.health_score >= 0.4 ? 'text-amber-400' : 'text-red-400';
           const counts = Object.entries(acct.failure_class_counts).filter(([, v]) => (v ?? 0) > 0);
           const totalFailures = counts.reduce((s, [, v]) => s + (v ?? 0), 0);
+          const dominantEntry = counts.length > 0 ? counts.reduce((a, b) => ((b[1] ?? 0) > (a[1] ?? 0) ? b : a)) : null;
+          const sr7d = acct.success_rate_7d;
+          const sr7dColor = sr7d == null ? '' : sr7d >= 0.7 ? 'text-emerald-400' : sr7d >= 0.4 ? 'text-amber-400' : 'text-red-400';
+          const dimmed = acct.state === 'disabled' || acct.state === 'disqualified';
           return (
-            <div key={acct.account_id} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5">
+            <div key={acct.account_id} className={`bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5${dimmed ? ' opacity-50' : ''}`}>
               <button
                 type="button"
                 className="w-full text-left"
@@ -1736,19 +1845,31 @@ function PoolAccountHealthPanel({ accounts, loading }: {
                   <span className={`text-[10px] font-mono font-bold ${scoreColor}`} title="Health score">
                     {Math.round(acct.health_score * 100)}%
                   </span>
+                  {sr7d != null && (
+                    <span className={`text-[10px] font-mono ${sr7dColor}`} title="7-day success rate">
+                      {Math.round(sr7d * 100)}% 7d
+                    </span>
+                  )}
                   <span className="text-[10px] text-neutral-400" title="24h completions · rate-limit events">
                     {acct.completions_24h}c {acct.rl_events_24h}rl
                   </span>
                   {totalFailures > 0 && (
-                    <div className="flex items-center gap-0.5 ml-auto">
-                      {counts.sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0)).map(([cls, count]) => (
-                        <div
-                          key={cls}
-                          title={`${FAILURE_CLASS_SHORT[cls] ?? cls}: ${count}`}
-                          className={`h-2 rounded-sm ${FAILURE_CLASS_BAR_COLORS[cls] ?? 'bg-neutral-500'}`}
-                          style={{ width: `${Math.max(4, Math.round(((count ?? 0) / totalFailures) * 32))}px` }}
-                        />
-                      ))}
+                    <div className="flex items-center gap-1 ml-auto">
+                      {dominantEntry && (
+                        <span className="text-[9px] text-neutral-400" title="Dominant failure class (24h)">
+                          {FAILURE_CLASS_SHORT[dominantEntry[0]] ?? dominantEntry[0].toLowerCase()}:{dominantEntry[1]}
+                        </span>
+                      )}
+                      <div className="flex items-center gap-0.5">
+                        {counts.sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0)).map(([cls, count]) => (
+                          <div
+                            key={cls}
+                            title={`${FAILURE_CLASS_SHORT[cls] ?? cls}: ${count}`}
+                            className={`h-2 rounded-sm ${FAILURE_CLASS_BAR_COLORS[cls] ?? 'bg-neutral-500'}`}
+                            style={{ width: `${Math.max(4, Math.round(((count ?? 0) / totalFailures) * 32))}px` }}
+                          />
+                        ))}
+                      </div>
                     </div>
                   )}
                 </div>

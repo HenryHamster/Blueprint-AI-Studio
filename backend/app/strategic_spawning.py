@@ -1028,6 +1028,13 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
                 stat_entry["proposal_rationale"] = d["proposal_rationale"]
             if d.get("proposed_at"):
                 stat_entry["proposed_at"] = d["proposed_at"]
+        # Surface non-default recommended_mode so the strategic agent can bias
+        # its direction decisions (audit/fundamentals → prefer non-feature work;
+        # pause → tactical spawning should be skipped by autonomous_research).
+        # 'ship' and unset are equivalent (baseline behavior) so they're omitted.
+        _rec_mode = d.get("recommended_mode")
+        if _rec_mode and _rec_mode != "ship":
+            stat_entry["recommended_mode"] = _rec_mode
         direction_stats.append(stat_entry)
 
     # Recently rejected proposals (last 30 days) — surfaced so the strategic

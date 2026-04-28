@@ -1,7 +1,9 @@
 """Tests for failure_classification subtype helpers and classify_failure()."""
+import uuid
 from unittest.mock import MagicMock
 
 import pytest
+import pytest_asyncio
 
 from app.failure_classification import (
     AGENT_TIMEOUT,
@@ -1113,3 +1115,150 @@ class TestAccountFailureClassTracking:
             record_account_failure_class("acct-all", cls)
         counts = get_account_failure_class_counts("acct-all")
         assert all(counts[cls] == 1 for cls in ALL_FAILURE_CLASSES)
+
+
+class TestResidualFingerprintDbWrite:
+    """Tests for _upsert_residual_case_async DB persistence."""
+
+    @pytest_asyncio.fixture
+    async def session_factory(self):
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from sqlmodel import SQLModel
+
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        async with engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+        factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        yield factory
+        async with engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.drop_all)
+        await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_insert_new_fingerprint(self, session_factory, monkeypatch):
+        from datetime import datetime, timezone
+        import app.database as db_mod
+        from app.failure_classification import _upsert_residual_case_async
+        from app.models import ResidualRemediationCase, ResidualCaseStatus
+        from sqlmodel import select
+
+        project_id = uuid.uuid4()
+        now_dt = datetime.now(tz=timezone.utc)
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+
+        await _upsert_residual_case_async(project_id, "fp-new", now_dt, "some error")
+
+        async with session_factory() as session:
+            row = (await session.execute(
+                select(ResidualRemediationCase).where(
+                    ResidualRemediationCase.project_id == project_id,
+                    ResidualRemediationCase.fingerprint == "fp-new",
+                )
+            )).scalars().first()
+        assert row is not None
+        assert row.hit_count == 1
+        assert row.status == ResidualCaseStatus.ACTIVE
+        assert row.sample_message == "some error"
+
+    @pytest.mark.asyncio
+    async def test_second_hit_bumps_count(self, session_factory, monkeypatch):
+        from datetime import datetime, timezone
+        import app.database as db_mod
+        from app.failure_classification import _upsert_residual_case_async
+        from app.models import ResidualRemediationCase
+        from sqlmodel import select
+
+        project_id = uuid.uuid4()
+        now_dt = datetime.now(tz=timezone.utc)
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+
+        await _upsert_residual_case_async(project_id, "fp-bump", now_dt, "err")
+        await _upsert_residual_case_async(project_id, "fp-bump", now_dt, "err2")
+
+        async with session_factory() as session:
+            rows = (await session.execute(
+                select(ResidualRemediationCase).where(
+                    ResidualRemediationCase.project_id == project_id,
+                    ResidualRemediationCase.fingerprint == "fp-bump",
+                )
+            )).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].hit_count == 2
+
+    @pytest.mark.asyncio
+    async def test_closed_organically_reopened(self, session_factory, monkeypatch):
+        from datetime import datetime, timezone
+        import app.database as db_mod
+        from app.failure_classification import _upsert_residual_case_async
+        from app.models import ResidualRemediationCase, ResidualCaseStatus
+        from sqlmodel import select
+
+        project_id = uuid.uuid4()
+        now_dt = datetime.now(tz=timezone.utc)
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+
+        await _upsert_residual_case_async(project_id, "fp-closed", now_dt, "err")
+        async with session_factory() as session:
+            async with session.begin():
+                row = (await session.execute(
+                    select(ResidualRemediationCase).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == "fp-closed",
+                    )
+                )).scalars().first()
+                row.status = ResidualCaseStatus.CLOSED_ORGANICALLY
+                session.add(row)
+
+        await _upsert_residual_case_async(project_id, "fp-closed", now_dt, "err again")
+
+        async with session_factory() as session:
+            row = (await session.execute(
+                select(ResidualRemediationCase).where(
+                    ResidualRemediationCase.project_id == project_id,
+                    ResidualRemediationCase.fingerprint == "fp-closed",
+                )
+            )).scalars().first()
+        assert row.status == ResidualCaseStatus.ACTIVE
+        assert row.hit_count == 2
+
+    @pytest.mark.asyncio
+    async def test_ignored_status_preserved_on_rehit(self, session_factory, monkeypatch):
+        from datetime import datetime, timezone
+        import app.database as db_mod
+        from app.failure_classification import _upsert_residual_case_async
+        from app.models import ResidualRemediationCase, ResidualCaseStatus
+        from sqlmodel import select
+
+        project_id = uuid.uuid4()
+        now_dt = datetime.now(tz=timezone.utc)
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+
+        await _upsert_residual_case_async(project_id, "fp-ignored", now_dt, "err")
+        async with session_factory() as session:
+            async with session.begin():
+                row = (await session.execute(
+                    select(ResidualRemediationCase).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == "fp-ignored",
+                    )
+                )).scalars().first()
+                row.status = ResidualCaseStatus.IGNORED
+                session.add(row)
+
+        await _upsert_residual_case_async(project_id, "fp-ignored", now_dt, "err2")
+
+        async with session_factory() as session:
+            row = (await session.execute(
+                select(ResidualRemediationCase).where(
+                    ResidualRemediationCase.project_id == project_id,
+                    ResidualRemediationCase.fingerprint == "fp-ignored",
+                )
+            )).scalars().first()
+        assert row.status == ResidualCaseStatus.IGNORED
+        assert row.hit_count == 2

@@ -371,3 +371,32 @@ describe('DirectionCard budget utilization indicator', () => {
     expect(badge.className).toMatch(/red/);
   });
 });
+
+describe('DirectionCard cost-per-merge retirement warning', () => {
+  it('renders nothing when cost_per_merge_exceeds_threshold is false', () => {
+    const d = makeDirection({ cost_per_merge_exceeds_threshold: false, cost_per_merged_pr: 1.50 });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.queryByText('High cost/PR')).not.toBeInTheDocument();
+  });
+
+  it('renders nothing when cost_per_merge_exceeds_threshold is absent', () => {
+    const d = makeDirection();
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.queryByText('High cost/PR')).not.toBeInTheDocument();
+  });
+
+  it('renders amber warning badge when cost_per_merge_exceeds_threshold is true', () => {
+    const d = makeDirection({ cost_per_merge_exceeds_threshold: true, cost_per_merged_pr: 45.00 });
+    render(<DirectionCard {...makeProps(d)} />);
+    const badge = screen.getByText('High cost/PR');
+    expect(badge).toBeInTheDocument();
+    expect(badge.className).toMatch(/amber/);
+  });
+
+  it('badge title includes the cost_per_merged_pr value', () => {
+    const d = makeDirection({ cost_per_merge_exceeds_threshold: true, cost_per_merged_pr: 45.00 });
+    render(<DirectionCard {...makeProps(d)} />);
+    const badge = screen.getByText('High cost/PR');
+    expect(badge.getAttribute('title')).toMatch(/\$45\.00/);
+  });
+});

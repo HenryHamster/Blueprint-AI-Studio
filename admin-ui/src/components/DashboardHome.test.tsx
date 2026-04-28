@@ -94,6 +94,7 @@ function setupApiMocks({
   mediumScope,
   scopeBaselines,
   accountHealth,
+  systemMaturity,
 }: {
   digest?: unknown;
   diagnostics?: unknown;
@@ -101,6 +102,7 @@ function setupApiMocks({
   mediumScope?: unknown;
   scopeBaselines?: unknown;
   accountHealth?: unknown;
+  systemMaturity?: unknown;
 }) {
   apiFetchMock.mockImplementation((url: string) => {
     if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse(digest ?? {}));
@@ -109,6 +111,7 @@ function setupApiMocks({
     if (url.includes('/api/admin/medium-scope-measurement')) return Promise.resolve(jsonResponse(mediumScope ?? {}));
     if (url.includes('/api/admin/scope-baselines')) return Promise.resolve(jsonResponse(scopeBaselines ?? {}));
     if (url.includes('/api/admin/max-plan-accounts/health')) return Promise.resolve(jsonResponse(accountHealth ?? { accounts: [] }));
+    if (url.includes('/system-maturity')) return Promise.resolve(jsonResponse(systemMaturity ?? []));
     return Promise.resolve(jsonResponse({}));
   });
 }
@@ -495,5 +498,51 @@ describe('DashboardHome', () => {
       await screen.findByText(/\$2\.10\/PR/);
       expect(screen.queryByTitle(/Cost per merged PR exceeds threshold/)).not.toBeInTheDocument();
     });
+  });
+
+  it('renders SystemMaturityCard with rows including score and mode pill', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+      systemMaturity: [
+        {
+          system_id: 'ci-pipeline',
+          score: 35,
+          recommended_mode: 'audit',
+          top_issues: [{ description: 'High failure rate in test suite' }],
+          last_audited_at: '2026-04-27T12:00:00Z',
+        },
+        {
+          system_id: 'auth-service',
+          score: 82,
+          recommended_mode: 'ship',
+          top_issues: [],
+          last_audited_at: '2026-04-27T11:00:00Z',
+        },
+      ],
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    expect(await screen.findByText('System Maturity')).toBeInTheDocument();
+    expect(screen.getByText('ci-pipeline')).toBeInTheDocument();
+    expect(screen.getByText('auth-service')).toBeInTheDocument();
+    expect(screen.getByText('35')).toBeInTheDocument();
+    expect(screen.getByText('82')).toBeInTheDocument();
+    expect(screen.getByText('audit')).toBeInTheDocument();
+    expect(screen.getByText('ship')).toBeInTheDocument();
+  });
+
+  it('renders System Maturity empty-state when no rows exist', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+      systemMaturity: [],
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    expect(await screen.findByText('System Maturity')).toBeInTheDocument();
+    expect(screen.getByText('No audits have run yet')).toBeInTheDocument();
   });
 });

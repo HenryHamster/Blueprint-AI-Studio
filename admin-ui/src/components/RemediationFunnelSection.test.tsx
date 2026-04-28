@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, act } from '@testing-library/react';
+import { render, screen, act, fireEvent, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { RemediationFunnelSection } from './RemediationFunnelSection';
 
@@ -8,7 +8,7 @@ const { apiFetchMock } = vi.hoisted(() => ({
 }));
 
 vi.mock('../api', () => ({
-  apiFetch: (path: string) => apiFetchMock(path),
+  apiFetch: (path: string, init?: RequestInit) => apiFetchMock(path, init),
 }));
 
 function jsonResponse(data: unknown): Response {
@@ -22,6 +22,30 @@ function makeResiduals(top: unknown[] = []) {
 function baseCluster(overrides: Record<string, unknown> = {}) {
   return { fingerprint: 'fp-abc123', count: 2, most_recent_at: null, sample_message: 'test: unexpected', example_task_ids: [], ...overrides };
 }
+
+const FUNNEL_WITH_SPAWNED = { investigations_spawned: 5 };
+const RESIDUALS_DATA = {
+  window_hours: 24,
+  total_code_error_count: 10,
+  residual_count: 2,
+  top_residuals: [
+    {
+      fingerprint: 'fp-abc123',
+      count: 3,
+      most_recent_at: null,
+      sample_message: 'TypeError: something went wrong',
+      example_task_ids: ['task-uuid-1'],
+    },
+    {
+      fingerprint: 'fp-def456',
+      count: 2,
+      most_recent_at: null,
+      sample_message: 'AssertionError: unexpected value',
+      example_task_ids: ['task-uuid-2'],
+    },
+  ],
+};
+
 
 describe('RemediationFunnelSection', () => {
   beforeEach(() => {
@@ -104,6 +128,78 @@ describe('RemediationFunnelSection', () => {
     expect(screen.getByText('50%')).toBeInTheDocument();
     expect(screen.getByText('structural')).toBeInTheDocument();
     expect(screen.getByText('low conf')).toBeInTheDocument();
+  });
+
+  describe('residual fingerprint ignore button', () => {
+    function renderWithResiduals() {
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('residual-fingerprints')) {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve(RESIDUALS_DATA) });
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+      });
+      render(<RemediationFunnelSection funnel={FUNNEL_WITH_SPAWNED} conversion={null} />);
+    }
+
+    async function openResiduals() {
+      const toggle = await screen.findByRole('button', { name: /Unclassified CODE_ERROR/i });
+      fireEvent.click(toggle);
+    }
+
+    it('shows an Ignore button for each fingerprint row', async () => {
+      renderWithResiduals();
+      await openResiduals();
+      const ignoreButtons = screen.getAllByRole('button', { name: /Ignore fingerprint/i });
+      expect(ignoreButtons).toHaveLength(2);
+    });
+
+    it('POSTs to the correct endpoint and optimistically removes the row on click', async () => {
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('residual-fingerprints')) {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve(RESIDUALS_DATA) });
+        }
+        if (url.includes('residual-cases')) {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+      });
+      render(<RemediationFunnelSection funnel={FUNNEL_WITH_SPAWNED} conversion={null} />);
+      await openResiduals();
+
+      const [firstIgnore] = screen.getAllByRole('button', { name: /Ignore fingerprint/i });
+      fireEvent.click(firstIgnore);
+
+      expect(apiFetchMock).toHaveBeenCalledWith(
+        '/api/admin/residual-cases/fp-abc123/ignore',
+        { method: 'POST' }
+      );
+      // Row replaced by undo affordance
+      expect(screen.getByText('Ignored')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Undo/i })).toBeInTheDocument();
+    });
+
+    it('re-shows the row and displays an error when the POST fails', async () => {
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('residual-fingerprints')) {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve(RESIDUALS_DATA) });
+        }
+        if (url.includes('residual-cases')) {
+          return Promise.resolve({ ok: false, status: 500 });
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+      });
+      render(<RemediationFunnelSection funnel={FUNNEL_WITH_SPAWNED} conversion={null} />);
+      await openResiduals();
+
+      const [firstIgnore] = screen.getAllByRole('button', { name: /Ignore fingerprint/i });
+      fireEvent.click(firstIgnore);
+
+      await waitFor(() => {
+        expect(screen.getByText(/Failed to ignore/i)).toBeInTheDocument();
+      });
+      // Row is re-shown
+      expect(screen.getByText('TypeError: something went wrong')).toBeInTheDocument();
+    });
   });
 
   it('renders success-by-confidence rates', () => {

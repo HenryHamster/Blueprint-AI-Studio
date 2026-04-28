@@ -12,11 +12,13 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
     Project, ProjectMember, SystemMaturity, Task, TaskStatus,
 )
+from app.self_audit_dispatch import _should_dispatch_self_audit
 from app.task_completion import (
     _handle_self_audit_completion,
     _normalize_self_audit_finding,
@@ -359,3 +361,111 @@ class TestSelfAuditAdminEndpoint:
 
         resp = await client.post(f"/api/admin/projects/{other_project.id}/self-audit", json={})
         assert resp.status_code == 404
+
+
+# ── Dispatch decision — direction.recommended_mode ─────────────────────────
+
+class TestShouldDispatchDirectionMode:
+    """_should_dispatch_self_audit honours direction.recommended_mode.
+
+    Each test seeds a project with a single direction that carries a specific
+    recommended_mode, then asserts that the dispatch function produces the
+    expected result (candidate vs. skip).
+    """
+
+    @pytest.mark.asyncio
+    async def test_pause_direction_is_excluded_from_dispatch(self, db_session):
+        """A direction with mode='pause' must not produce audit candidates."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{"system_id": "sys-paused", "recommended_mode": "pause"}]
+        flag_modified(project, "directions")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        result = await _should_dispatch_self_audit(project, db_session)
+        # All directions are paused → direction_system_ids is empty → None
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_audit_direction_forces_fresh_system_into_candidates(self, db_session):
+        """mode='audit' must trigger dispatch even when SystemMaturity row is fresh."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{"system_id": "sys-audit", "recommended_mode": "audit"}]
+        flag_modified(project, "directions")
+        # Fresh row that would normally pass the staleness check — should be overridden.
+        fresh = SystemMaturity(
+            project_id=project.id,
+            system_id="sys-audit",
+            score=85,
+            recommended_mode="ship",
+        )
+        db_session.add(project)
+        db_session.add(fresh)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        result = await _should_dispatch_self_audit(project, db_session)
+        assert result is not None
+        assert "sys-audit" in (result.get("focus_systems") or [])
+
+    @pytest.mark.asyncio
+    async def test_fundamentals_direction_forces_fresh_system_into_candidates(self, db_session):
+        """mode='fundamentals' must trigger dispatch even when SystemMaturity row is fresh."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{"system_id": "sys-fund", "recommended_mode": "fundamentals"}]
+        flag_modified(project, "directions")
+        fresh = SystemMaturity(
+            project_id=project.id,
+            system_id="sys-fund",
+            score=70,
+            recommended_mode="ship",
+        )
+        db_session.add(project)
+        db_session.add(fresh)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        result = await _should_dispatch_self_audit(project, db_session)
+        assert result is not None
+        assert "sys-fund" in (result.get("focus_systems") or [])
+
+    @pytest.mark.asyncio
+    async def test_ship_direction_with_fresh_row_is_not_a_candidate(self, db_session):
+        """mode='ship' must not change existing behaviour: fresh row → no dispatch."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{"system_id": "sys-ship", "recommended_mode": "ship"}]
+        flag_modified(project, "directions")
+        fresh = SystemMaturity(
+            project_id=project.id,
+            system_id="sys-ship",
+            score=90,
+            recommended_mode="ship",
+        )
+        db_session.add(project)
+        db_session.add(fresh)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        result = await _should_dispatch_self_audit(project, db_session)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unset_mode_with_fresh_row_is_not_a_candidate(self, db_session):
+        """No recommended_mode on direction must not change existing behaviour."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{"system_id": "sys-unset"}]
+        flag_modified(project, "directions")
+        fresh = SystemMaturity(
+            project_id=project.id,
+            system_id="sys-unset",
+            score=88,
+            recommended_mode="ship",
+        )
+        db_session.add(project)
+        db_session.add(fresh)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        result = await _should_dispatch_self_audit(project, db_session)
+        assert result is None

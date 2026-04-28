@@ -282,6 +282,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 continue
             if did in blocked_ids:
                 continue
+            if d.get("recommended_mode") == "pause":
+                continue  # strategic agent flagged this system as externally blocked
             chosen_directions.append(d)
             # Block this direction and its conflicts
             blocked_ids.add(did)

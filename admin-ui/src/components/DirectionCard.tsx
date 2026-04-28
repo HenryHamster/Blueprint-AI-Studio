@@ -837,6 +837,15 @@ function DirectionCardImpl({
                 </span>
               );
             })()}
+            {/* Cost-per-merge retirement warning */}
+            {d.cost_per_merge_exceeds_threshold && (
+              <span
+                title={`Cost per merged PR: $${(d.cost_per_merged_pr ?? 0).toFixed(2)} — exceeds project median by 3×`}
+                className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 border-amber-900/50 text-amber-400"
+              >
+                High cost/PR
+              </span>
+            )}
             {/* Cooldown badge */}
             {key === 'active' && (() => {
               const cooldownStatus = getCooldownStatus(d, cooldownMinutes);

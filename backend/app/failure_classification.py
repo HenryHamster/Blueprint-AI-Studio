@@ -2,6 +2,7 @@
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -811,6 +812,98 @@ def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
             'sample_statuses': [trimmed_status] if trimmed_status else [],
             'task_ids': [task_id],
         }
+
+    # Persist to DB for durability across restarts.
+    project_id = getattr(task, 'project_id', None)
+    if project_id is not None:
+        now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+        _schedule_residual_db_upsert(project_id, fp, now_dt, trimmed_sample or trimmed_status)
+
+
+async def _upsert_residual_case_async(
+    project_id,
+    fingerprint: str,
+    now_dt: datetime,
+    sample_message: str,
+) -> None:
+    """Upsert a ResidualRemediationCase row for durability across restarts.
+
+    - New fingerprint → INSERT ACTIVE row, hit_count=1.
+    - Existing ACTIVE / CLOSED_ORGANICALLY → bump hit_count + last_seen_at;
+      reopen CLOSED_ORGANICALLY to ACTIVE.
+    - IGNORED / RESOLVED → bump hit_count + last_seen_at; leave status alone.
+    IntegrityError (concurrent INSERT race) is handled by retrying as an UPDATE.
+    """
+    from app.database import AsyncSessionLocal  # noqa: PLC0415
+    from app.models import ResidualRemediationCase, ResidualCaseStatus  # noqa: PLC0415
+    from sqlalchemy.exc import IntegrityError  # noqa: PLC0415
+    from sqlmodel import select  # noqa: PLC0415
+
+    async def _apply_update(session) -> None:
+        stmt = select(ResidualRemediationCase).where(
+            ResidualRemediationCase.project_id == project_id,
+            ResidualRemediationCase.fingerprint == fingerprint,
+        )
+        existing = (await session.execute(stmt)).scalars().first()
+        if existing is not None:
+            existing.hit_count = (existing.hit_count or 0) + 1
+            existing.last_seen_at = now_dt
+            existing.updated_at = now_dt
+            if existing.status == ResidualCaseStatus.CLOSED_ORGANICALLY:
+                existing.status = ResidualCaseStatus.ACTIVE
+            session.add(existing)
+        else:
+            session.add(ResidualRemediationCase(
+                project_id=project_id,
+                fingerprint=fingerprint,
+                status=ResidualCaseStatus.ACTIVE,
+                first_seen_at=now_dt,
+                last_seen_at=now_dt,
+                hit_count=1,
+                sample_message=sample_message or None,
+            ))
+
+    try:
+        async with AsyncSessionLocal() as session:
+            try:
+                async with session.begin():
+                    await _apply_update(session)
+            except IntegrityError:
+                # Concurrent INSERT won the race; retry as a pure UPDATE.
+                async with session.begin():
+                    stmt = select(ResidualRemediationCase).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == fingerprint,
+                    )
+                    existing = (await session.execute(stmt)).scalars().first()
+                    if existing is not None:
+                        existing.hit_count = (existing.hit_count or 0) + 1
+                        existing.last_seen_at = now_dt
+                        existing.updated_at = now_dt
+                        if existing.status == ResidualCaseStatus.CLOSED_ORGANICALLY:
+                            existing.status = ResidualCaseStatus.ACTIVE
+                        session.add(existing)
+    except Exception:
+        logger.exception(
+            "[FAILURE_CLASS] Residual case DB upsert failed (fingerprint=%r)", fingerprint
+        )
+
+
+def _schedule_residual_db_upsert(
+    project_id,
+    fingerprint: str,
+    now_dt: datetime,
+    sample_message: str,
+) -> None:
+    """Schedule a fire-and-forget DB upsert when an event loop is running."""
+    import asyncio  # noqa: PLC0415
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(
+            _upsert_residual_case_async(project_id, fingerprint, now_dt, sample_message)
+        )
+    except RuntimeError:
+        pass  # No running loop (e.g. tests); in-memory store is the only path
 
 
 def get_top_residual_fingerprints(window_seconds: int = 86400, top_n: int = 10) -> list[dict]:

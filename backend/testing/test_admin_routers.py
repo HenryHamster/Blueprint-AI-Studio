@@ -12,7 +12,7 @@ from sqlmodel import select
 from app.main import app
 from app.models import (
     AllowedUser, Project, ProjectMember, Task, TaskStatus,
-    Alert, ProjectMessage, MessageType,
+    Alert, ProjectMessage, MessageType, SystemMaturity,
 )
 from app.auth import get_current_user, require_admin
 
@@ -1795,3 +1795,63 @@ class TestBuildDeployStatePayload:
             assert payload["external_health"]["last_check"] == "2026-04-27T08:00:00"
         finally:
             _shared_state.external_health["last_check"] = snap
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_debug.py — System Maturity endpoint
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestProjectSystemMaturity:
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_when_no_rows(self, client: AsyncClient, db_session):
+        """Returns empty list when the project has no SystemMaturity rows."""
+        project = await _make_project(db_session)
+        resp = await client.get(f"/api/admin/projects/{project.id}/system-maturity")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    @pytest.mark.asyncio
+    async def test_returns_rows_ordered_by_score_ascending(self, client: AsyncClient, db_session):
+        """Returns rows ordered by score ascending with correct fields."""
+        project = await _make_project(db_session)
+        row_high = SystemMaturity(
+            project_id=project.id,
+            system_id="system-b",
+            score=85,
+            recommended_mode="ship",
+            top_issues=[{"description": "Minor test gaps"}],
+        )
+        row_low = SystemMaturity(
+            project_id=project.id,
+            system_id="system-a",
+            score=30,
+            recommended_mode="audit",
+            top_issues=[{"description": "Critical failures"}],
+        )
+        db_session.add_all([row_high, row_low])
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/system-maturity")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 2
+        # Ordered by score ascending: 30 first, 85 second
+        assert data[0]["system_id"] == "system-a"
+        assert data[0]["score"] == 30
+        assert data[0]["recommended_mode"] == "audit"
+        assert data[0]["top_issues"] == [{"description": "Critical failures"}]
+        assert "last_audited_at" in data[0]
+        assert data[1]["system_id"] == "system-b"
+        assert data[1]["score"] == 85
+        assert data[1]["recommended_mode"] == "ship"
+
+    @pytest.mark.asyncio
+    async def test_returns_404_for_non_member_project(self, client: AsyncClient, db_session):
+        """Non-member project returns 404."""
+        project = Project(name="Other Project", user_id="other-owner")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/system-maturity")
+        assert resp.status_code == 404

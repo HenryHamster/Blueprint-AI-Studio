@@ -95,14 +95,24 @@ async def _should_dispatch_self_audit(
     )
     staleness_cutoff = _utcnow() - timedelta(days=staleness_days)
 
-    # Collect all system_ids currently referenced by directions (any status,
-    # not just active — paused/proposed systems still benefit from audit).
+    # Collect all system_ids currently referenced by directions.
+    # Build a direction-level mode map so the candidate loop can short-circuit
+    # on 'audit'/'fundamentals' and skip 'pause' entirely.
     direction_system_ids: set[str] = set()
+    dir_mode_by_sid: dict[str, str] = {}
     high_drift_directions: list[str] = []
     for d in (project.directions or []):
         sid = d.get("system_id")
-        if sid:
-            direction_system_ids.add(sid)
+        if not sid:
+            continue
+        mode = d.get("recommended_mode") or ""
+        if mode:
+            dir_mode_by_sid[sid] = mode
+        if mode == "pause":
+            # Strategic agent explicitly paused this direction; skip its system
+            # so audit dispatch doesn't compete with the pause intent.
+            continue
+        direction_system_ids.add(sid)
 
     # If no directions reference a system_id, there's nothing to audit
     # per-system. Fall through to the existing dispatch flow rather than
@@ -121,8 +131,14 @@ async def _should_dispatch_self_audit(
     by_sid = {row.system_id: row for row in existing}
 
     candidate_systems: list[str] = []
-    # Stale/missing rows take priority — they have the least context.
+    # Direction-level 'audit'/'fundamentals' mode forces candidacy regardless of
+    # SystemMaturity freshness — the strategic agent has signalled this system
+    # needs attention now. Stale/missing rows also qualify. 'ship'/unset falls
+    # through to the existing SystemMaturity staleness path (no behaviour change).
     for sid in sorted(direction_system_ids):
+        if dir_mode_by_sid.get(sid) in ("audit", "fundamentals"):
+            candidate_systems.append(sid)
+            continue
         row = by_sid.get(sid)
         if row is None:
             candidate_systems.append(sid)

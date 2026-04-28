@@ -790,6 +790,150 @@ async def test_spawn_strategic_review_records_phase2_task_id(db_session, mocker)
     assert cycle.outcome == strategic_cycle.OUTCOME_PHASE2_RUNNING
 
 
+# ── recommended_mode in direction stats ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_recommended_mode_audit_present_in_direction_stats(db_session):
+    """recommended_mode='audit' is surfaced in direction_stats payload."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-mode01",
+                "status": "active",
+                "text": "Direction in audit mode",
+                "priority": "high",
+                "recommended_mode": "audit",
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-mode01")
+
+    assert d_stat.get("recommended_mode") == "audit", (
+        "Expected recommended_mode='audit' in direction stats for audit-mode direction"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recommended_mode_fundamentals_present_in_direction_stats(db_session):
+    """recommended_mode='fundamentals' is surfaced in direction_stats payload."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-mode02",
+                "status": "active",
+                "text": "Direction in fundamentals mode",
+                "priority": "medium",
+                "recommended_mode": "fundamentals",
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-mode02")
+
+    assert d_stat.get("recommended_mode") == "fundamentals", (
+        "Expected recommended_mode='fundamentals' in direction stats for fundamentals-mode direction"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recommended_mode_ship_absent_from_direction_stats(db_session):
+    """recommended_mode='ship' and unset are both omitted — they represent default behavior."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-mode03",
+                "status": "active",
+                "text": "Direction explicitly in ship mode",
+                "priority": "low",
+                "recommended_mode": "ship",
+            },
+            {
+                "id": "d-mode04",
+                "status": "active",
+                "text": "Direction with no mode set",
+                "priority": "low",
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat_ship = next(s for s in payload["directions_summary"] if s["id"] == "d-mode03")
+    d_stat_unset = next(s for s in payload["directions_summary"] if s["id"] == "d-mode04")
+
+    assert "recommended_mode" not in d_stat_ship, (
+        "recommended_mode='ship' should be omitted (default behavior)"
+    )
+    assert "recommended_mode" not in d_stat_unset, (
+        "Unset recommended_mode should be omitted (default behavior)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recommended_mode_pause_present_in_direction_stats(db_session):
+    """recommended_mode='pause' is surfaced so the strategic agent can flag the direction."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-mode05",
+                "status": "active",
+                "text": "Direction recommended for pause",
+                "priority": "low",
+                "recommended_mode": "pause",
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-mode05")
+
+    assert d_stat.get("recommended_mode") == "pause", (
+        "Expected recommended_mode='pause' in direction stats for pause-mode direction"
+    )
+
+
 @pytest.mark.asyncio
 async def test_spawn_strategic_review_no_cycle_id_does_not_modify_history(db_session, mocker):
     """When called without cycle_id, _spawn_strategic_review leaves cycle history unchanged."""

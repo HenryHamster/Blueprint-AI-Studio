@@ -7634,3 +7634,91 @@ def test_success_pattern_retains_scope_against_cold_start_upgrade():
             _runtime_config.pop("pipeline_scope_baseline_rates", None)
         else:
             _runtime_config["pipeline_scope_baseline_rates"] = original_rates
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# recommended_mode — direction-level dispatch behavior
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_spawn_skips_pause_mode_direction(db_session):
+    """A direction with recommended_mode='pause' is excluded from spawn selection.
+    A normal direction in the same project is still spawned."""
+    project = Project(
+        name="Pause Mode Direction",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {**_active_direction("d-pausemode", "Paused system"), "recommended_mode": "pause"},
+            _active_direction("d-normaldir", "Normal direction"),
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    assert len(research) == 1
+    spawned_dir = research[0].first_payload.get("current_direction_id")
+    assert spawned_dir == "d-normaldir", f"pause-mode direction must be skipped; got {spawned_dir!r}"
+
+
+@pytest.mark.asyncio
+async def test_audit_mode_direction_injects_mode_hint(db_session):
+    """A direction with recommended_mode='audit' receives a mode-specific prompt_suffix
+    biasing the research agent toward fix/test/refactor findings."""
+    project = Project(
+        name="Audit Mode Direction",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[{**_active_direction("d-auditdir", "Audit direction"), "recommended_mode": "audit"}],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    assert len(research) == 1
+    suffix = research[0].first_payload.get("prompt_suffix", "")
+    # Accept any audit-mode hint that biases away from "new features".
+    # mode_prompt_hint helper produces validation/audit/drift framing,
+    # earlier wording used "fix/test/refactor".
+    suffix_l = suffix.lower()
+    assert "audit" in suffix_l and ("fix/test/refactor" in suffix or "validation" in suffix_l or "auditing" in suffix_l), (
+        f"audit-mode direction must inject mode hint in prompt_suffix; got: {suffix!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fundamentals_mode_direction_injects_mode_hint(db_session):
+    """A direction with recommended_mode='fundamentals' receives the same mode-specific
+    prompt_suffix as 'audit' mode, biasing research toward stabilization work."""
+    project = Project(
+        name="Fundamentals Mode Direction",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[{**_active_direction("d-funddir0", "Fundamentals direction"), "recommended_mode": "fundamentals"}],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    assert len(research) == 1
+    suffix = research[0].first_payload.get("prompt_suffix", "")
+    suffix_l = suffix.lower()
+    assert "fundamentals" in suffix_l and ("fix/test/refactor" in suffix or "tests" in suffix_l or "maintainability" in suffix_l), (
+        f"fundamentals-mode direction must inject mode hint in prompt_suffix; got: {suffix!r}"
+    )

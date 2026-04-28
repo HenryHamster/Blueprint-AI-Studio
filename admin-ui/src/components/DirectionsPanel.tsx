@@ -107,6 +107,8 @@ export interface Direction {
   budget_utilization_pct?: number | null;
   budget_exceeded?: boolean;
   quality_score?: number | null;
+  cost_per_merged_pr?: number | null;
+  cost_per_merge_exceeds_threshold?: boolean;
 }
 
 

@@ -171,6 +171,36 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
   const [residuals, setResiduals] = useState<ResidualFingerprintsData | null>(null);
   const [residualsOpen, setResidualsOpen] = useState(false);
   const firstOverdueRef = useRef<HTMLDivElement>(null);
+  const [ignoredFingerprints, setIgnoredFingerprints] = useState<Set<string>>(new Set());
+  const [undoFingerprints, setUndoFingerprints] = useState<Map<string, ResidualFingerprint>>(new Map());
+  const [ignoreErrors, setIgnoreErrors] = useState<Map<string, string>>(new Map());
+
+  function handleIgnore(fp: ResidualFingerprint) {
+    const fingerprint = fp.fingerprint;
+    setIgnoredFingerprints(prev => new Set([...prev, fingerprint]));
+    setUndoFingerprints(prev => new Map([...prev, [fingerprint, fp]]));
+    setIgnoreErrors(prev => { const m = new Map(prev); m.delete(fingerprint); return m; });
+
+    const timer = setTimeout(() => {
+      setUndoFingerprints(prev => { const m = new Map(prev); m.delete(fingerprint); return m; });
+    }, 5000);
+
+    apiFetch(`/api/admin/residual-cases/${encodeURIComponent(fingerprint)}/ignore`, { method: 'POST' })
+      .then(r => {
+        if (!r.ok) throw new Error(`${r.status}`);
+      })
+      .catch((err: unknown) => {
+        clearTimeout(timer);
+        setIgnoredFingerprints(prev => { const s = new Set(prev); s.delete(fingerprint); return s; });
+        setUndoFingerprints(prev => { const m = new Map(prev); m.delete(fingerprint); return m; });
+        setIgnoreErrors(prev => new Map([...prev, [fingerprint, err instanceof Error ? err.message : 'error']]));
+      });
+  }
+
+  function handleUndo(fingerprint: string) {
+    setIgnoredFingerprints(prev => { const s = new Set(prev); s.delete(fingerprint); return s; });
+    setUndoFingerprints(prev => { const m = new Map(prev); m.delete(fingerprint); return m; });
+  }
 
   useEffect(() => {
     const qs = projectId ? `?hours=24&top_n=10&project_id=${encodeURIComponent(projectId)}` : '?hours=24&top_n=10';
@@ -620,39 +650,72 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
           </button>
           {residualsOpen && (
             <div className="px-3 pb-3 space-y-2">
-              {residuals.top_residuals.map(r => (
-                <div key={r.fingerprint} className="border border-neutral-800/40 rounded p-2">
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="font-mono text-[10px] bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded shrink-0">
-                      {r.count}×
-                    </span>
-                    <span className="text-[10px] text-neutral-500 shrink-0">{relativeTime(r.most_recent_at)}</span>
-                    {(() => {
-                      const label = caseStatusLabel(r);
-                      if (!label) return null;
-                      const style = CASE_STATUS_STYLES[r.case_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
-                      return (
-                        <span className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${style}`}>
-                          {label}
-                        </span>
-                      );
-                    })()}
-                    <span className="font-mono text-[9px] text-neutral-600 truncate flex-1">{r.fingerprint}</span>
-                  </div>
-                  <div className="text-[11px] text-neutral-400 leading-snug mb-1.5">{truncate(r.sample_message, 140)}</div>
-                  <div className="flex gap-2 flex-wrap">
-                    {r.example_task_ids.map(id => (
-                      <a
-                        key={id}
-                        href={`/tasks/${id}`}
-                        className="font-mono text-[9px] text-neutral-500 hover:text-neutral-300 underline underline-offset-2"
+              {residuals.top_residuals.map(r => {
+                const isIgnored = ignoredFingerprints.has(r.fingerprint);
+                const undoFp = undoFingerprints.get(r.fingerprint);
+                const ignoreError = ignoreErrors.get(r.fingerprint);
+
+                if (isIgnored && undoFp) {
+                  return (
+                    <div key={r.fingerprint} className="border border-neutral-800/40 rounded p-2 flex items-center justify-between gap-2">
+                      <span className="text-[11px] text-neutral-500 italic">Ignored</span>
+                      <button
+                        type="button"
+                        onClick={() => handleUndo(r.fingerprint)}
+                        className="text-[10px] text-amber-400 hover:text-amber-300 underline underline-offset-2"
                       >
-                        {id.slice(0, 8)}
-                      </a>
-                    ))}
+                        Undo
+                      </button>
+                    </div>
+                  );
+                }
+                if (isIgnored) return null;
+
+                return (
+                  <div key={r.fingerprint} className="border border-neutral-800/40 rounded p-2">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="font-mono text-[10px] bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded shrink-0">
+                        {r.count}×
+                      </span>
+                      <span className="text-[10px] text-neutral-500 shrink-0">{relativeTime(r.most_recent_at)}</span>
+                      {(() => {
+                        const label = caseStatusLabel(r);
+                        if (!label) return null;
+                        const style = CASE_STATUS_STYLES[r.case_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+                        return (
+                          <span className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${style}`}>
+                            {label}
+                          </span>
+                        );
+                      })()}
+                      <span className="font-mono text-[9px] text-neutral-600 truncate flex-1">{r.fingerprint}</span>
+                      <button
+                        type="button"
+                        onClick={() => handleIgnore(r)}
+                        className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-neutral-700 text-neutral-500 hover:text-neutral-300 hover:border-neutral-500 transition-colors"
+                        aria-label={`Ignore fingerprint ${r.fingerprint}`}
+                      >
+                        Ignore
+                      </button>
+                    </div>
+                    {ignoreError && (
+                      <div className="text-[10px] text-red-400 mb-1">Failed to ignore: {ignoreError}</div>
+                    )}
+                    <div className="text-[11px] text-neutral-400 leading-snug mb-1.5">{truncate(r.sample_message, 140)}</div>
+                    <div className="flex gap-2 flex-wrap">
+                      {r.example_task_ids.map(id => (
+                        <a
+                          key={id}
+                          href={`/tasks/${id}`}
+                          className="font-mono text-[9px] text-neutral-500 hover:text-neutral-300 underline underline-offset-2"
+                        >
+                          {id.slice(0, 8)}
+                        </a>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
