@@ -41,6 +41,13 @@
     "components/MessagesPanel.tsx": 1000,
     "components/MetricsDashboard.tsx": 500,
     "components/ProjectDashboard.tsx": 300,
-    "components/HealthOverviewCard.tsx": 250
+    "components/HealthOverviewCard.tsx": 250,
+    "components/AutonomousStatus.tsx": 1150,
+    "components/DirectionProgressSection.tsx": 750,
+    "components/RemediationFunnelSection.tsx": 850,
+    "components/OrchestratorHealthBar.tsx": 700,
+    "components/RecentErrorsWidget.tsx": 400,
+    "components/MediumScopeWidget.tsx": 350,
+    "components/SettingsNotificationsSection.tsx": 350
   }
 }
