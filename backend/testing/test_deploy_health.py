@@ -173,6 +173,23 @@ async def test_provider_specific_failure_without_dispatch_outage_does_not_pause(
 
 
 @pytest.mark.asyncio
+async def test_non_anthropic_provider_failure_without_dispatch_outage_does_not_pause(dh_db):
+    """A non-Anthropic provider-specific failure that does not produce a dispatch_api outage
+    must not trigger auto-pause — only dispatch_api (and db/github/gcp) are critical."""
+    await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
+    _shared_state.runtime_config["max_concurrent_vms"] = 4
+    _set_critical_failures("openai_api")
+
+    await _dh._check_pause_mode()
+    await _dh._check_pause_mode()
+    await _dh._check_pause_mode()
+
+    state = await dh_db.get(DeploymentState, 1)
+    assert state.status == DeploymentStatus.STABLE.value
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+
+
+@pytest.mark.asyncio
 async def test_dispatch_api_failure_triggers_pause_after_three_checks(dh_db):
     await _make_deploy_state(dh_db, status=DeploymentStatus.STABLE)
     _shared_state.runtime_config["max_concurrent_vms"] = 4
@@ -1174,6 +1191,49 @@ def test_get_dispatch_health_snapshot_uses_task_type_models_to_infer_required_pr
 
     assert snapshot["required_providers"] == ["openai"]
     assert snapshot["available_providers"] == ["openai"]
+
+
+def test_get_dispatch_health_snapshot_down_when_all_providers_down():
+    """When every relevant provider is down, dispatch status must be 'down' (not 'degraded')."""
+    _shared_state.runtime_config["task_type_provider_preference"] = {"create": ["anthropic", "openai"]}
+    _shared_state.runtime_config["task_type_model_preferences"] = {}
+    _shared_state.runtime_config["task_type_models"] = {}
+    _shared_state.runtime_config["cross_provider_fallback_enabled"] = True
+
+    ext = {
+        "provider_health": {
+            "anthropic": {"status": "down"},
+            "openai": {"status": "down"},
+        }
+    }
+
+    snapshot = _hcp.get_dispatch_health_snapshot(ext)
+
+    assert snapshot["status"] == "down"
+    assert snapshot["available_providers"] == []
+    assert set(snapshot["down_providers"]) == {"anthropic", "openai"}
+
+
+def test_get_dispatch_health_snapshot_uses_task_type_model_preferences():
+    """task_type_model_preferences (category routing) contributes to required providers."""
+    _shared_state.runtime_config["task_type_provider_preference"] = {}
+    _shared_state.runtime_config["task_type_model_preferences"] = {
+        "create": [{"provider": "openai", "model": "gpt-5"}]
+    }
+    _shared_state.runtime_config["task_type_models"] = {}
+    _shared_state.runtime_config["cross_provider_fallback_enabled"] = False
+
+    ext = {
+        "provider_health": {
+            "openai": {"status": "ok"},
+        }
+    }
+
+    snapshot = _hcp.get_dispatch_health_snapshot(ext)
+
+    assert "openai" in snapshot["required_providers"]
+    assert "openai" in snapshot["available_providers"]
+    assert snapshot["status"] == "ok"
 
 
 # ── Tests: check_github_health (passive + active modes) ───────────────────────
