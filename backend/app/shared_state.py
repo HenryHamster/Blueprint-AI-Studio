@@ -93,6 +93,10 @@ runtime_config: Dict = {
     # the typical PR lifecycle (CI + review + fix + re-review + merge) so new
     # research only spawns when a parent is genuinely stuck, not just slow.
     "evaluating_pipeline_timeout_minutes": int(os.getenv("EVALUATING_PIPELINE_TIMEOUT_MINUTES", "120")),
+    # Hard kill for EVALUATING tasks waiting on CI/review verdict. Tuned above
+    # a single review-fix iteration (5-15 min agent + queueing) so multi-pass
+    # cycles don't trigger a premature kill of in-flight children.
+    "ci_backstop_timeout_minutes": int(os.getenv("CI_BACKSTOP_TIMEOUT_MINUTES", "60")),
     # Auto-remediation governors (residual CODE_ERROR fingerprint spawner).
     # Global cap on concurrent/queued auto-remediation tasks prevents queue
     # ballooning when many distinct fingerprints accumulate. Cooldown is
@@ -506,9 +510,14 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "auto_archive_terminal_after_days",
                     "auto_archive_max_terminal_tasks_per_project",
                     "auto_archive_interval_minutes",
+                    "max_pipeline_slots",
+                    "evaluating_pipeline_timeout_minutes",
+                    "ci_backstop_timeout_minutes",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
+                if "reserved_slots_for_types" in config_json:
+                    _set("reserved_slots_for_types", config_json["reserved_slots_for_types"])
         except Exception as e:
             logger.warning(f"[CONFIG-SYNC] Could not sync runtime_config_json: {e}")
 

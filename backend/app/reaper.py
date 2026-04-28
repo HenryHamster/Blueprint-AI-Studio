@@ -1006,6 +1006,20 @@ async def reaper_service():
                         )
                         if not pr_number:
                             continue
+                        # Skip closing rollup PRs (branch=research/*). A rollup PR
+                        # represents many tasks' worth of merged work; closing it
+                        # discards the whole body. Better to leave the rollup
+                        # open for human follow-up than to throw away N children's
+                        # successfully-merged contributions for a single fix task
+                        # that exhausted retries.
+                        branch = payload.get("branch", "")
+                        if branch.startswith("research/"):
+                            logger.warning(
+                                f"[REAPER] Skip closing rollup PR #{pr_number} "
+                                f"(branch={branch}, fix task {task.id}) — "
+                                f"closing would discard the rollup body"
+                            )
+                            continue
                         try:
                             from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
                             from app.github import close_pull_request, create_pr_comment  # noqa: PLC0415

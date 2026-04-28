@@ -249,6 +249,14 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 1440):
             raise HTTPException(status_code=400, detail="evaluating_pipeline_timeout_minutes must be between 1 and 1440")
         _runtime_config["evaluating_pipeline_timeout_minutes"] = val
+    if "ci_backstop_timeout_minutes" in payload:
+        try:
+            val = int(payload["ci_backstop_timeout_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="ci_backstop_timeout_minutes must be a number")
+        if not (1 <= val <= 1440):
+            raise HTTPException(status_code=400, detail="ci_backstop_timeout_minutes must be between 1 and 1440")
+        _runtime_config["ci_backstop_timeout_minutes"] = val
     if "max_concurrent_auto_remediations" in payload:
         try:
             val = int(payload["max_concurrent_auto_remediations"])
@@ -768,6 +776,8 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "auto_archive_interval_minutes": _runtime_config.get("auto_archive_interval_minutes", 60),
                     "reserved_slots_for_types": _runtime_config.get("reserved_slots_for_types", {"create": 1, "research": 1}),
                     "max_pipeline_slots": _runtime_config.get("max_pipeline_slots", 4),
+                    "evaluating_pipeline_timeout_minutes": _runtime_config.get("evaluating_pipeline_timeout_minutes", 120),
+                    "ci_backstop_timeout_minutes": _runtime_config.get("ci_backstop_timeout_minutes", 60),
                     "notification_config": _runtime_config.get("notification_config", {
                         "webhook_url": "",
                         "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "RESIDUAL_FIX_ESCALATED"],

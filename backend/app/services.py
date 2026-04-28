@@ -1044,10 +1044,16 @@ async def _check_evaluating_timeouts():
     """
     from app.main import _maybe_create_failure_alert
     from app.rollup_management import _check_and_trigger_rollup
+    from app.shared_state import runtime_config as _runtime_config
 
     EVALUATING_WARN_SECONDS = 2 * 3600   # 2 hours
     EVALUATING_FAIL_SECONDS = 6 * 3600   # 6 hours
-    CI_BACKSTOP_SECONDS = 30 * 60         # 30 minutes — hard kill for CI-waiting tasks (CI takes 5-10 min)
+    # Hard kill for CI-waiting tasks. Tunable so multi-iteration review/fix
+    # cycles (each ~5-15 min, plus pipeline-cap queueing) don't trigger a
+    # premature kill that cancels in-flight children. 60 min is the default
+    # because realistic cycles routinely run 30-50 min; 30 min was firing
+    # mid-iteration during pipeline-throttled periods.
+    CI_BACKSTOP_SECONDS = int(_runtime_config.get("ci_backstop_timeout_minutes", 60)) * 60
     # Approval-gate companion timeout: parents flagged requires_approval can
     # otherwise stall indefinitely when _chain_has_active_pipeline_work defers
     # the 6h backstop. 2h gives operators a reasonable window to approve/deny.
