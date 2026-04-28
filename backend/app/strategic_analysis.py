@@ -5,6 +5,10 @@ Extracted from app.strategic_completion to keep that module under its line ceili
 from datetime import datetime, timezone
 from app.time_utils import _utcnow
 
+# Directions whose cost_per_merged_pr exceeds median * multiplier are flagged
+# for retirement consideration by the strategic agent.
+_HIGH_COST_PER_MERGE_MULTIPLIER = 2.0
+
 
 def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dict:
     """Build a planned-vs-actual assessment for the strategic agent.
@@ -108,10 +112,15 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
             if tcount and hours:
                 cost_seconds += tcount * hours * 3600
         estimated_cost_usd = round(cost_seconds * ON_DEMAND_RATE, 2)
+        cost_budget_usd = d.get("cost_budget_usd")
         if estimated_cost_usd > 0:
             outcome["estimated_cost_usd"] = estimated_cost_usd
             if merged > 0:
                 outcome["cost_per_merged_pr"] = round(estimated_cost_usd / merged, 2)
+        if isinstance(cost_budget_usd, (int, float)) and cost_budget_usd > 0:
+            outcome["cost_budget_usd"] = cost_budget_usd
+            if estimated_cost_usd > cost_budget_usd:
+                outcome["budget_exceeded"] = True
         if rejected > 0:
             total_prs = merged + rejected
             outcome["operator_rejection_rate"] = round(rejected / total_prs, 2) if total_prs > 0 else None
@@ -203,6 +212,23 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
                 outcome["velocity"] = round(recent_rate / lifetime_rate, 2)
 
         direction_outcomes.append(outcome)
+
+    # Flag directions with cost_per_merged_pr well above project median.
+    # Requires at least 2 data points so the median is meaningful.
+    _cpm_values = sorted(
+        d["cost_per_merged_pr"] for d in direction_outcomes if d.get("cost_per_merged_pr") is not None
+    )
+    if len(_cpm_values) >= 2:
+        n = len(_cpm_values)
+        _cpm_median = (
+            _cpm_values[n // 2] if n % 2 == 1
+            else (_cpm_values[n // 2 - 1] + _cpm_values[n // 2]) / 2
+        )
+        _cpm_threshold = _cpm_median * _HIGH_COST_PER_MERGE_MULTIPLIER
+        for _d_out in direction_outcomes:
+            cpm = _d_out.get("cost_per_merged_pr")
+            if cpm is not None and cpm > _cpm_threshold:
+                _d_out["high_cost_per_merge"] = True
 
     # Overall health
     total_cycles = sum(d["cycles"] for d in direction_outcomes)

@@ -505,7 +505,13 @@ class GeminiProvider(LLMProvider):
         # yolo stalls the agent on an approval that never arrives. Not user-
         # configurable — hardcode it. Sandbox intentionally omitted because
         # the VM itself IS the sandbox.
+        # GEMINI_CLI_TRUST_WORKSPACE bypasses the directory-trust gate added
+        # in recent Gemini CLI builds: without it, the CLI silently overrides
+        # --approval-mode=yolo back to 'default' and then aborts the headless
+        # run because /tmp/workspace is not in the persisted trusted-folders
+        # list.
         args += ["--approval-mode=yolo"]
+        env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
 
         return CLITranslation(
             env=env,

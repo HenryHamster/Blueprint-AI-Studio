@@ -931,7 +931,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _dir_id = finding.get("direction_id") or _parent_direction_id
             _direction = _directions_by_id.get(str(_dir_id)) if _dir_id else None
             if _direction:
-                scope, scope_calibrated_from = _calibrate_scope(scope, _direction, _scope_cal_project)
+                # Determine preliminary task_type from finding_type so success-pattern
+                # evidence in _feedback_scope_override can be used during calibration.
+                # The scope-dependent branch (plan/create) is resolved using the
+                # pre-calibration scope, which is the proposed scope at this point.
+                if finding_type == "research":
+                    _prelim_task_type: str | None = "research"
+                elif finding_type in ("security_audit", "qa", "deps", "docs", "migrate", "perf"):
+                    _prelim_task_type = finding_type
+                elif finding_type == "refactor":
+                    _prelim_task_type = "refactor"
+                elif scope == "large":
+                    _prelim_task_type = "plan"
+                else:
+                    _prelim_task_type = "create"
+                scope, scope_calibrated_from = _calibrate_scope(scope, _direction, _scope_cal_project, _prelim_task_type)
                 _history_calibration_fired = scope_calibrated_from is not None
 
         # Pre-spawn scope-upgrade heuristics (file count, cross-module span,
@@ -968,6 +982,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             task_type = "plan"     # large scope needs decomposition
         else:
             task_type = "create"   # small/medium scope is single-PR work
+
+        # Apply failure-feedback mitigation: downscope when rejection patterns are high
+        # for this direction, and bias toward smaller scopes with proven success patterns.
+        _mit_dir_id = finding.get("direction_id") or _parent_direction_id
+        _mit_direction = _directions_by_id.get(str(_mit_dir_id)) if _mit_dir_id else None
+        if _mit_direction and _scope_cal_project:
+            from app.strategic_spawning import _build_failure_feedback_mitigation  # noqa: PLC0415
+            scope, _, _ = _build_failure_feedback_mitigation(
+                _mit_direction, scope, task_type, _scope_cal_project.design_doc
+            )
+
         # Pre-spawn approval removed: the review pipeline handles quality gates.
         # Only final merge to main requires human approval (critical files gate).
         needs_approval = False

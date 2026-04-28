@@ -577,6 +577,113 @@ def test_cost_estimate_per_direction_and_overall():
     assert [r["id"] for r in ranking] == ["dir-cheap", "dir-pricey"]
 
 
+def test_cost_budget_exceeded_flag():
+    """budget_exceeded appears when estimated spend exceeds cost_budget_usd."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+    directions = [
+        {
+            "id": "dir-1", "status": "active",
+            "cost_budget_usd": 0.01,  # very low budget — will be exceeded
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1,
+                 "tasks_created": 10, "avg_time_to_merge_hours": 2.0},
+            ],
+        }
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["cost_budget_usd"] == 0.01
+    assert d.get("budget_exceeded") is True
+
+
+def test_cost_budget_not_exceeded():
+    """budget_exceeded absent when spend is within cost_budget_usd."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+    directions = [
+        {
+            "id": "dir-1", "status": "active",
+            "cost_budget_usd": 9999.0,  # very high budget — not exceeded
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1,
+                 "tasks_created": 1, "avg_time_to_merge_hours": 1.0},
+            ],
+        }
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["cost_budget_usd"] == 9999.0
+    assert "budget_exceeded" not in d
+
+
+def test_cost_budget_absent_when_no_budget_set():
+    """cost_budget_usd and budget_exceeded absent when direction has no budget."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+    directions = [
+        {
+            "id": "dir-1", "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1,
+                 "tasks_created": 5, "avg_time_to_merge_hours": 2.0},
+            ],
+        }
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert "cost_budget_usd" not in d
+    assert "budget_exceeded" not in d
+
+
+def test_high_cost_per_merge_flag_on_expensive_direction():
+    """high_cost_per_merge set on direction whose cost/PR is >2x project median.
+
+    Three directions are needed so the median is the middle element rather than
+    the average of two values (which would make the expensive direction
+    mathematically unable to exceed the threshold for n=2).
+    """
+    directions = [
+        {
+            "id": "dir-cheap-a", "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 10,
+                 "tasks_created": 2, "avg_time_to_merge_hours": 1.0},
+            ],
+        },
+        {
+            "id": "dir-cheap-b", "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 8,
+                 "tasks_created": 2, "avg_time_to_merge_hours": 1.0},
+            ],
+        },
+        {
+            "id": "dir-pricey", "status": "active",
+            "research_history": [
+                # 100 tasks × 4h each / 1 merge — cost/merge >> median * 2
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1,
+                 "tasks_created": 100, "avg_time_to_merge_hours": 4.0},
+            ],
+        },
+    ]
+    result = _build_outcome_evaluation(_make_project(directions=directions))
+    by_id = {d["id"]: d for d in result["directions"]}
+    assert "high_cost_per_merge" not in by_id["dir-cheap-a"]
+    assert "high_cost_per_merge" not in by_id["dir-cheap-b"]
+    assert by_id["dir-pricey"].get("high_cost_per_merge") is True
+
+
+def test_high_cost_per_merge_absent_with_single_direction():
+    """high_cost_per_merge never set when only one direction has cost data."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+    directions = [
+        {
+            "id": "dir-1", "status": "active",
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1,
+                 "tasks_created": 50, "avg_time_to_merge_hours": 8.0},
+            ],
+        }
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert "high_cost_per_merge" not in d
+
+
 def test_cost_estimate_absent_when_no_runtime_data():
     directions = [
         {"id": "dir-1", "status": "active", "research_history": [

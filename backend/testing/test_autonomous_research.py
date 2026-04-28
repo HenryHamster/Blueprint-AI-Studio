@@ -6976,6 +6976,9 @@ async def test_residual_fingerprint_remediation_skipped_when_no_fingerprints(db_
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
     assert spawned == 0
 
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    assert len(result.scalars().all()) == 0
+
 
 @pytest.mark.asyncio
 async def test_residual_fingerprint_remediation_threshold_for_no_error_cluster(db_session, _clear_residual_state):
@@ -7062,3 +7065,152 @@ async def test_residual_fingerprint_remediation_error_shaped_uses_normal_thresho
     }
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
     assert spawned == 1, "error-shaped cluster should spawn at count=1"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Failure Feedback Consumption — Coaching Suffix & Scope Override
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_coaching_suffix_injected_for_dominant_failure_category(db_session):
+    """_spawn_research_task injects a failure-mode coaching suffix into the research payload
+    when a direction has a dominant first-attempt rejection category (>=3 total, >=40% in one cat)."""
+    dir_id = "d-coachint01"
+    project = Project(
+        name="Coaching Suffix Integration",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(dir_id, "Improve test coverage")],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "direction_first_attempt_feedback": {
+                dir_id: {
+                    "test_coverage": 4,
+                    "correctness": 1,
+                    "total": 5,
+                    "last_updated": "2026-01-01",
+                }
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    research = [t for t in tasks if t.first_payload.get("type") == "research"]
+    assert len(research) == 1, "Should spawn one research task"
+
+    suffix = research[0].first_payload.get("prompt_suffix", "")
+    assert suffix, "prompt_suffix should be set when dominant failure category exists"
+    assert "test_coverage" in suffix, (
+        f"Coaching suffix should name the dominant failure category; got: {suffix!r}"
+    )
+    assert "4/5" in suffix, f"Coaching should cite the count/total; got: {suffix!r}"
+
+
+@pytest.mark.asyncio
+async def test_coaching_suffix_absent_below_rejection_threshold(db_session):
+    """No coaching suffix is injected when the direction has fewer than 3 first-attempt rejections."""
+    dir_id = "d-coachlow01"
+    project = Project(
+        name="Coaching Suffix Below Threshold",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(dir_id, "Improve error handling")],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "direction_first_attempt_feedback": {
+                dir_id: {
+                    "test_coverage": 2,   # Total=2 < 3 → no coaching
+                    "total": 2,
+                    "last_updated": "2026-01-01",
+                }
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    research = [t for t in tasks if t.first_payload.get("type") == "research"]
+    assert len(research) == 1, "Should still spawn one research task"
+    suffix = research[0].first_payload.get("prompt_suffix", "")
+    assert "recurring first-attempt rejections" not in suffix, (
+        "Coaching text must not appear when rejection count is below the 3-rejection threshold"
+    )
+
+
+def test_calibrate_scope_downscopes_via_failure_feedback():
+    """_calibrate_scope falls back to _feedback_scope_override and downscopes medium→small
+    when the direction has >=3 scope_related first-attempt failures and no historical data yet."""
+    import types
+    from app.spawn_calibration import _calibrate_scope
+
+    dir_id = "d-scopedwn01"
+    direction = _active_direction(dir_id, "Scope downgrade test")
+    direction["research_history"] = []  # No historical data → cold-start fallback path
+
+    project = types.SimpleNamespace(
+        directions=[direction],
+        design_doc={
+            "direction_first_attempt_feedback": {
+                dir_id: {
+                    "scope_related": 3,   # 3 failures → triggers downscope
+                    "total": 3,
+                    "last_updated": "2026-01-01",
+                }
+            }
+        },
+    )
+
+    final_scope, calibrated_from = _calibrate_scope("medium", direction, project=project, task_type="create")
+    assert final_scope == "small", (
+        f"Expected medium→small downscope via failure feedback, got {final_scope!r}"
+    )
+    assert calibrated_from == "medium", "calibrated_from should record the original scope"
+
+
+def test_success_pattern_retains_scope_against_cold_start_upgrade():
+    """_calibrate_scope retains the proposed scope when a strong success pattern exists,
+    even when pipeline baseline rates would otherwise trigger a cold-start medium→large upgrade."""
+    import types
+    from app.spawn_calibration import _calibrate_scope
+    from app.shared_state import runtime_config as _runtime_config
+
+    dir_id = "d-scopesucc01"
+    direction = _active_direction(dir_id, "Success pattern scope test")
+    direction["research_history"] = []  # No historical data → cold-start fallback path
+
+    project = types.SimpleNamespace(
+        directions=[direction],
+        design_doc={
+            "playbook/success-create-medium": {
+                "success_count": 6,   # 6 >= 5 → strong success evidence, retain scope
+                "content": "Medium scope works well for create tasks",
+            }
+        },
+    )
+
+    # Pipeline baseline rates that would normally trigger cold-start medium→large upgrade
+    # (medium rate 20% < 40% threshold, small rate healthy at 80%)
+    original_rates = _runtime_config.get("pipeline_scope_baseline_rates")
+    _runtime_config["pipeline_scope_baseline_rates"] = {"medium": 0.2, "small": 0.8}
+    try:
+        final_scope, calibrated_from = _calibrate_scope("medium", direction, project=project, task_type="create")
+        assert final_scope == "medium", (
+            f"Success pattern should prevent cold-start upgrade to large, got {final_scope!r}"
+        )
+        assert calibrated_from is None, "No calibration adjustment when scope is retained by success pattern"
+    finally:
+        if original_rates is None:
+            _runtime_config.pop("pipeline_scope_baseline_rates", None)
+        else:
+            _runtime_config["pipeline_scope_baseline_rates"] = original_rates

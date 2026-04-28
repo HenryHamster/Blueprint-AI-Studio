@@ -4936,17 +4936,134 @@ async def test_residual_fingerprints_requires_auth(unauthenticated_client: Async
     response = await unauthenticated_client.get("/api/admin/residual-fingerprints")
     assert response.status_code in (401, 403)
 
+
+# ---------------------------------------------------------------------------
+# cost_per_merge_exceeds_threshold / median_cost_per_merged_pr tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_cpm_threshold_flags_expensive_direction(client: AsyncClient, db_session):
+    """Directions whose cost_per_merged_pr exceeds median×3 get cost_per_merge_exceeds_threshold=True."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    now = _utcnow()
+    recent_ts = (now - timedelta(hours=1)).isoformat()
+
+    # Three directions: cheap (1h / 3 merges), medium (2h / 2 merges), pricey (8h / 1 merge).
+    # CPMs: ~0.0223, 0.067, 0.536.  Median = 0.067.  Threshold = 0.067 * 3 = 0.201.
+    # Only pricey exceeds the threshold.
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-cheap",
+                "text": "Cheap direction",
+                "status": "active",
+                "research_history": [{"timestamp": recent_ts, "prs_merged": 3}],
+            },
+            {
+                "id": "dir-med",
+                "text": "Medium direction",
+                "status": "active",
+                "research_history": [{"timestamp": recent_ts, "prs_merged": 2}],
+            },
+            {
+                "id": "dir-pricey",
+                "text": "Pricey direction",
+                "status": "active",
+                "research_history": [{"timestamp": recent_ts, "prs_merged": 1}],
+            },
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for dir_id, hours in [("dir-cheap", 1), ("dir-med", 2), ("dir-pricey", 8)]:
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"task-{dir_id}",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": dir_id},
+            vm_provisioned_at=now - timedelta(hours=hours + 1),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=False,
+        ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    by_id = {dp["direction_id"]: dp for dp in data["direction_progress"]}
+    assert set(by_id) == {"dir-cheap", "dir-med", "dir-pricey"}
+
+    assert by_id["dir-cheap"]["cost_per_merge_exceeds_threshold"] is False
+    assert by_id["dir-med"]["cost_per_merge_exceeds_threshold"] is False
+    assert by_id["dir-pricey"]["cost_per_merge_exceeds_threshold"] is True
+
+    median = data["median_cost_per_merged_pr"]
+    assert median is not None
+    assert median > 0
+    # median CPM ≈ dir-med's CPM (middle value when sorted)
+    expected_med_cost = round(ON_DEMAND_RATE * 2 * 3600, 4)
+    expected_med_cpm = round(expected_med_cost / 2, 4)
+    assert abs(median - expected_med_cpm) < 0.001
+
+
+@pytest.mark.asyncio
+async def test_digest_cpm_threshold_false_when_no_merges(client: AsyncClient, db_session):
+    """When no directions have merged PRs, median is None and threshold flag is False for all."""
+    now = _utcnow()
+    recent_ts = (now - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-1",
+                "text": "No merges direction",
+                "status": "active",
+                "research_history": [{"timestamp": recent_ts, "prs_merged": 0}],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="task-1",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1"},
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),
+        vm_spot=False,
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["median_cost_per_merged_pr"] is None
+    dp = data["direction_progress"][0]
+    assert dp["cost_per_merge_exceeds_threshold"] is False
+
+
 @pytest.mark.asyncio
 async def test_digest_direction_progress_cpm_threshold(client: AsyncClient, db_session):
     """median_cost_per_merged_pr is calculated correctly and directions exceeding 3x median are flagged."""
     from app.routers.admin_analytics import SPOT_RATE
-    
+
     dir_configs = [
         ("dir-a", 10.0),
         ("dir-b", 20.0),
         ("dir-c", 100.0),
     ]
-    
+
     recent_ts = (_utcnow() - timedelta(minutes=1)).isoformat()
     project = make_project(
         directions=[
@@ -4991,13 +5108,13 @@ async def test_digest_direction_progress_cpm_threshold(client: AsyncClient, db_s
     data = response.json()
 
     assert data["median_cost_per_merged_pr"] == 20.0
-    
+
     dp_by_id = {dp["direction_id"]: dp for dp in data["direction_progress"]}
     assert dp_by_id["dir-a"]["cost_per_merged_pr"] == 10.0
     assert dp_by_id["dir-a"]["cost_per_merge_exceeds_threshold"] is False
-    
+
     assert dp_by_id["dir-b"]["cost_per_merged_pr"] == 20.0
     assert dp_by_id["dir-b"]["cost_per_merge_exceeds_threshold"] is False
-    
+
     assert dp_by_id["dir-c"]["cost_per_merged_pr"] == 100.0
     assert dp_by_id["dir-c"]["cost_per_merge_exceeds_threshold"] is True

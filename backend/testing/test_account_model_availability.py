@@ -11,7 +11,8 @@ Covers:
 """
 from __future__ import annotations
 
-from datetime import timedelta
+import uuid
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -19,9 +20,11 @@ import pytest
 from app.account_model_availability import (
     account_availability_is_stale,
     account_has_model,
+    account_success_rate_7d,
     refresh_account_available_models,
 )
 from app.models import LLMAuthMode, LLMProviderName
+from app.max_plan_pool import _account_by_id, _max_plan_pool_lock, _max_plan_pools, select_max_plan_account
 from app.providers.registry import get_provider
 
 
@@ -252,3 +255,164 @@ class TestStalenessDetection:
             "available_models_refreshed_at": (now - timedelta(hours=12)).isoformat(),
         }}
         assert account_availability_is_stale(acct, now=now) is True
+
+
+class TestAccountSuccessRate7d:
+    def _naive_now(self):
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def test_returns_none_when_no_events(self):
+        assert account_success_rate_7d({}) is None
+        assert account_success_rate_7d({"outcome_events": []}) is None
+
+    def test_returns_none_when_fewer_than_min_samples(self):
+        now = self._naive_now()
+        acct = {"outcome_events": [
+            {"at": now - timedelta(hours=1), "success": True},
+            {"at": now - timedelta(hours=2), "success": True},
+        ]}
+        assert account_success_rate_7d(acct, now=now) is None
+
+    def test_returns_correct_rate(self):
+        now = self._naive_now()
+        acct = {"outcome_events": [
+            {"at": now - timedelta(hours=1), "success": True},
+            {"at": now - timedelta(hours=2), "success": True},
+            {"at": now - timedelta(hours=3), "success": False},
+            {"at": now - timedelta(hours=4), "success": True},
+        ]}
+        rate = account_success_rate_7d(acct, now=now)
+        assert rate is not None
+        assert abs(rate - 0.75) < 1e-9
+
+    def test_ignores_events_outside_window(self):
+        now = self._naive_now()
+        acct = {"outcome_events": [
+            {"at": now - timedelta(hours=1), "success": True},
+            {"at": now - timedelta(hours=2), "success": True},
+            {"at": now - timedelta(hours=3), "success": True},
+            # Older than 7 days — must not be counted.
+            {"at": now - timedelta(days=8), "success": False},
+            {"at": now - timedelta(days=9), "success": False},
+        ]}
+        rate = account_success_rate_7d(acct, now=now)
+        assert rate == 1.0
+
+    def test_returns_zero_when_all_failures(self):
+        now = self._naive_now()
+        acct = {"outcome_events": [
+            {"at": now - timedelta(hours=i + 1), "success": False} for i in range(5)
+        ]}
+        assert account_success_rate_7d(acct, now=now) == 0.0
+
+    def test_skips_events_with_missing_at(self):
+        now = self._naive_now()
+        acct = {"outcome_events": [
+            {"success": True},  # no "at" — skip
+            {"at": now - timedelta(hours=1), "success": True},
+            {"at": now - timedelta(hours=2), "success": True},
+        ]}
+        # Only 2 valid events → below min sample threshold
+        assert account_success_rate_7d(acct, now=now) is None
+
+    def test_accepts_aware_now_without_typeerror(self):
+        """Passing an aware UTC datetime must not raise TypeError.
+
+        account_availability_is_stale accepts aware `now`; a caller that reuses
+        the same now object for both functions would previously get a TypeError
+        comparing aware cutoff with naive event timestamps.
+        """
+        from datetime import timezone as _tz
+        aware_now = datetime.now(_tz.utc)
+        naive_now = aware_now.replace(tzinfo=None)
+        acct = {"outcome_events": [
+            {"at": naive_now - timedelta(hours=i + 1), "success": True} for i in range(3)
+        ]}
+        # Must not raise; must return a valid rate.
+        rate = account_success_rate_7d(acct, now=aware_now)
+        assert rate == 1.0
+
+
+class TestSuccessRateSelection:
+    @pytest.mark.asyncio
+    async def test_account_lacking_model_is_skipped_even_with_lower_active_tasks(self):
+        """Account confirmed to lack the requested model is skipped even when it
+        has fewer active_tasks than the account that does have the model."""
+        user_id = f"u-{uuid.uuid4().hex}"
+        no_model_id = f"acct-no-model-{uuid.uuid4().hex}"
+        has_model_id = f"acct-has-model-{uuid.uuid4().hex}"
+        no_model = {
+            "id": no_model_id,
+            "name": "no-model",
+            "enabled": True,
+            "oauth_token": "tok-no-model",
+            "active_tasks": 0,  # Would have won without availability filtering.
+            # Confirmed-empty list: account_has_model returns False → skipped.
+            "provider_metadata": {"available_models": []},
+        }
+        has_model = {
+            "id": has_model_id,
+            "name": "has-model",
+            "enabled": True,
+            "oauth_token": "tok-has-model",
+            "active_tasks": 1,
+            "provider_metadata": {"available_models": ["claude-opus-4-7"]},
+        }
+
+        async with _max_plan_pool_lock:
+            _max_plan_pools[user_id] = [no_model, has_model]
+            _account_by_id[no_model_id] = no_model
+            _account_by_id[has_model_id] = has_model
+
+        try:
+            selected = await select_max_plan_account(user_id=user_id, model="claude-opus-4-7")
+            assert selected is not None
+            assert selected["id"] == has_model_id
+        finally:
+            async with _max_plan_pool_lock:
+                _max_plan_pools.pop(user_id, None)
+                _account_by_id.pop(no_model_id, None)
+                _account_by_id.pop(has_model_id, None)
+
+    @pytest.mark.asyncio
+    async def test_success_rate_tiebreaks_within_available_accounts(self):
+        """Among accounts that pass the availability filter, 7d success rate wins
+        over active_tasks as the tiebreaker."""
+        user_id = f"u-{uuid.uuid4().hex}"
+        now = datetime.utcnow()
+        low_success_id = f"acct-low-{uuid.uuid4().hex}"
+        high_success_id = f"acct-high-{uuid.uuid4().hex}"
+        low_success = {
+            "id": low_success_id,
+            "name": "low-success",
+            "enabled": True,
+            "oauth_token": "tok-low",
+            "active_tasks": 0,  # Would have won on active_tasks alone.
+            "provider_metadata": {"available_models": ["claude-opus-4-7"]},
+            "outcome_events": [{"at": now - timedelta(hours=i + 1), "success": i == 0} for i in range(5)],
+        }
+        high_success = {
+            "id": high_success_id,
+            "name": "high-success",
+            "enabled": True,
+            "oauth_token": "tok-high",
+            "active_tasks": 1,
+            "provider_metadata": {"available_models": ["claude-opus-4-7"]},
+            "outcome_events": [{"at": now - timedelta(hours=i + 1), "success": i < 4} for i in range(5)],
+        }
+
+        async with _max_plan_pool_lock:
+            _max_plan_pools[user_id] = [low_success, high_success]
+            _account_by_id[low_success_id] = low_success
+            _account_by_id[high_success_id] = high_success
+
+        try:
+            selected = await select_max_plan_account(user_id=user_id, model="claude-opus-4-7")
+            assert selected is not None
+            assert selected["id"] == high_success_id
+        finally:
+            async with _max_plan_pool_lock:
+                _max_plan_pools.pop(user_id, None)
+                _account_by_id.pop(low_success_id, None)
+                _account_by_id.pop(high_success_id, None)

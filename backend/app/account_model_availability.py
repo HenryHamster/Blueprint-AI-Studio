@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 # indicators in the admin UI and the background sweeper.
 AVAILABILITY_STALE_AFTER = timedelta(hours=6)
 
+# Rolling window and minimum sample count for 7-day success-rate computation.
+# Must match _OUTCOME_WINDOW_SECONDS in max_plan_pool.py (7 × 24 × 3600 s).
+SUCCESS_RATE_WINDOW = timedelta(days=7)
+SUCCESS_RATE_MIN_SAMPLES = 3
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -96,6 +101,36 @@ def account_availability_is_stale(account: Mapping[str, Any], now: datetime | No
         return True
     now = now or _utcnow()
     return (now - refreshed) > AVAILABILITY_STALE_AFTER
+
+
+def account_success_rate_7d(
+    account: Mapping[str, Any],
+    now: datetime | None = None,
+) -> float | None:
+    """Return the 7-day task success rate for ``account``, or None when data is sparse.
+
+    Reads from ``outcome_events`` on the in-memory account dict (each entry:
+    ``{"at": datetime, "success": bool}``). Returns a float in [0.0, 1.0] when
+    at least ``SUCCESS_RATE_MIN_SAMPLES`` outcomes exist in the window, or None
+    for new/low-traffic accounts so a single unlucky failure doesn't unfairly
+    penalise them.
+
+    Uses naive UTC timestamps to match how max_plan_pool records outcome_events
+    (via time_utils._utcnow, which strips tzinfo). Callers that track their own
+    ``now`` should pass it in for consistency.
+    """
+    # Naive UTC — must match the storage format used by max_plan_pool.record_*.
+    # Strip tzinfo from caller-supplied `now` too; the default strips it and
+    # stored events are always naive, so a mixed comparison would TypeError.
+    _now = (now if now is not None else datetime.now(timezone.utc)).replace(tzinfo=None)
+    cutoff = _now - SUCCESS_RATE_WINDOW
+    events = [
+        e for e in account.get("outcome_events", [])
+        if e.get("at") is not None and e["at"] > cutoff
+    ]
+    if len(events) < SUCCESS_RATE_MIN_SAMPLES:
+        return None
+    return sum(1 for e in events if e.get("success")) / len(events)
 
 
 async def refresh_account_available_models(

@@ -255,6 +255,11 @@ async def test_account_health_summary_returns_per_account_data(client, inject_po
         "enabled": True,
         "active_tasks": 0,
         "completion_events": [{"at": now - timedelta(hours=1), "duration_seconds": 30}],
+        "outcome_events": [
+            {"at": now - timedelta(hours=1), "success": True},
+            {"at": now - timedelta(hours=2), "success": True},
+            {"at": now - timedelta(hours=3), "success": False},
+        ],
         "rl_events": [now - timedelta(hours=2)],
     }
     inject_pool("test-user-123", [acct])
@@ -270,6 +275,7 @@ async def test_account_health_summary_returns_per_account_data(client, inject_po
     assert a["completions_24h"] == 1
     assert a["rl_events_24h"] == 1
     assert a["health_score"] == -1.0  # 1 completion - 2 * 1 rl_event
+    assert a["success_rate_7d"] == pytest.approx(2 / 3)
     assert set(a["failure_class_counts"].keys()) == set(
         ["CODE_ERROR", "RATE_LIMIT", "EXTERNAL_API",
          "PROVISION_FAILURE", "MIGRATION_ERROR", "AGENT_TIMEOUT", "SCOPE_OVERFLOW"]

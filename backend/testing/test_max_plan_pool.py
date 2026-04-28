@@ -9,10 +9,12 @@ from datetime import datetime, timedelta, timezone
 from app.max_plan_pool import (
     _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
     _HEALTH_WINDOW_SECONDS,
+    _OUTCOME_WINDOW_SECONDS,
     _QUOTA_EXHAUSTED_COOLDOWN_SECONDS,
     _account_at_cap,
     _account_available_for_model,
     _compute_health_score,
+    _compute_success_rate_7d,
     _cooldown_seconds_for_info,
     _daily_reset_if_elapsed,
     _normalize_rl_model,
@@ -105,6 +107,7 @@ class TestGetAccountHealthStats:
         stats = get_account_health_stats(_acct())
         assert set(stats.keys()) == {
             "rl_events_24h", "completions_24h", "avg_duration_seconds", "health_score",
+            "success_rate_7d",
         }
 
     def test_aggregates_counts_and_durations(self):
@@ -526,3 +529,111 @@ class TestGetAllAccountHealthSummaries:
             assert rl["cooldown_remaining_seconds"] > 23 * 3600
         finally:
             self._reset_pools()
+
+    def test_success_rate_7d_surfaced_in_summary(self):
+        """success_rate_7d appears in each account summary entry."""
+        self._reset_pools()
+        try:
+            now = datetime.utcnow()
+            acct = _acct(id="s1", user_id="u", outcome_events=[
+                {"at": now - timedelta(hours=i + 1), "success": i < 4}
+                for i in range(5)
+            ])
+            _account_by_id["s1"] = acct
+            _max_plan_pools["u"] = [acct]
+            summaries = get_all_account_health_summaries(user_id="u", now=now)
+            assert "success_rate_7d" in summaries[0]
+            assert summaries[0]["success_rate_7d"] == 4 / 5
+        finally:
+            self._reset_pools()
+
+
+# ── _compute_success_rate_7d ─────────────────────────────────────────────────
+
+class TestComputeSuccessRate7d:
+    def test_returns_none_when_no_events(self):
+        assert _compute_success_rate_7d(_acct()) is None
+
+    def test_returns_none_when_fewer_than_3_events(self):
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=[
+            {"at": now - timedelta(hours=1), "success": True},
+            {"at": now - timedelta(hours=2), "success": False},
+        ])
+        assert _compute_success_rate_7d(acct, now) is None
+
+    def test_returns_rate_from_3_plus_events(self):
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=[
+            {"at": now - timedelta(hours=1), "success": True},
+            {"at": now - timedelta(hours=2), "success": True},
+            {"at": now - timedelta(hours=3), "success": False},
+        ])
+        rate = _compute_success_rate_7d(acct, now)
+        assert rate == 2 / 3
+
+    def test_excludes_events_older_than_7d(self):
+        now = datetime.utcnow()
+        old = now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS + 60)
+        acct = _acct(outcome_events=[
+            {"at": old, "success": False},
+            {"at": old, "success": False},
+            {"at": old, "success": False},
+        ])
+        assert _compute_success_rate_7d(acct, now) is None
+
+    def test_perfect_success_rate(self):
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=[
+            {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
+        ])
+        assert _compute_success_rate_7d(acct, now) == 1.0
+
+    def test_zero_success_rate(self):
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=[
+            {"at": now - timedelta(hours=i + 1), "success": False} for i in range(3)
+        ])
+        assert _compute_success_rate_7d(acct, now) == 0.0
+
+
+# ── selection tiebreaking by success rate ─────────────────────────────────────
+
+class TestSuccessRateTiebreaking:
+    def test_higher_success_rate_scores_higher(self):
+        """_compute_success_rate_7d should rank high-success above low-success accounts."""
+        now = datetime.utcnow()
+        good = _acct(id="good", outcome_events=[
+            {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
+        ])
+        bad = _acct(id="bad", outcome_events=[
+            {"at": now - timedelta(hours=i + 1), "success": i < 1}  # 1/5 success
+            for i in range(5)
+        ])
+        good_rate = _compute_success_rate_7d(good, now)
+        bad_rate = _compute_success_rate_7d(bad, now)
+        assert good_rate is not None and bad_rate is not None
+        assert good_rate > bad_rate
+
+    def test_no_data_accounts_score_zero(self):
+        """Accounts with no outcome history contribute 0.0 (or 0.0 via `or`) to key."""
+        now = datetime.utcnow()
+        assert (_compute_success_rate_7d(_acct(id="a"), now) or 0.0) == 0.0
+        assert (_compute_success_rate_7d(_acct(id="b"), now) or 0.0) == 0.0
+
+    def test_selection_key_prefers_high_success(self):
+        """The selection key (health, success_rate, -active_tasks) ranks the
+        high-success account ahead of the low-success account."""
+        now = datetime.utcnow()
+        hi = _acct(id="hi", active_tasks=1, outcome_events=[
+            {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
+        ])
+        lo = _acct(id="lo", active_tasks=0, outcome_events=[
+            {"at": now - timedelta(hours=i + 1), "success": False} for i in range(5)
+        ])
+        key = lambda a: (  # noqa: E731
+            _compute_health_score(a, now),
+            _compute_success_rate_7d(a, now) or 0.0,
+            -a.get("active_tasks", 0),
+        )
+        assert key(hi) > key(lo)

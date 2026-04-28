@@ -242,6 +242,45 @@ describe('DirectionCard diagnosis/remediation section', () => {
   });
 });
 
+describe('DirectionCard paused reason display', () => {
+  it('shows amber text for yield/saturation pause reason', () => {
+    const d = makeDirection({
+      status: 'paused',
+      paused_reason: 'Saturated: last 5 research cycles produced no actionable findings',
+      paused_at: '2026-04-24T10:00:00Z',
+      auto_paused: true,
+    });
+    render(<DirectionCard {...makeProps(d, 'paused')} />);
+    const el = screen.getByText(/Saturated: last 5 research cycles/);
+    expect(el).toBeInTheDocument();
+    expect(el.className).toMatch(/amber/);
+    expect(el.className).not.toMatch(/red/);
+  });
+
+  it('shows red text for budget-exceeded pause reason', () => {
+    const d = makeDirection({
+      status: 'paused',
+      paused_reason: 'Budget exceeded: $6.00 spent of $5.00 limit',
+      paused_at: '2026-04-24T10:00:00Z',
+      auto_paused: true,
+      budget_exceeded: true,
+    });
+    render(<DirectionCard {...makeProps(d, 'paused')} />);
+    const el = screen.getByText(/Budget exceeded:/);
+    expect(el).toBeInTheDocument();
+    expect(el.className).toMatch(/red/);
+    expect(el.className).not.toMatch(/amber/);
+  });
+
+  it('does not render paused reason subtitle when paused_reason is absent', () => {
+    const d = makeDirection({ status: 'paused' });
+    render(<DirectionCard {...makeProps(d, 'paused')} />);
+    // No amber/red reason subtitle should appear — only the status toggle button exists
+    expect(screen.queryByText(/Saturated/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Budget exceeded/)).not.toBeInTheDocument();
+  });
+});
+
 describe('DirectionCard budget utilization indicator', () => {
   it('renders nothing when both spend and budget are absent', () => {
     const d = makeDirection();

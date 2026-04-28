@@ -220,10 +220,86 @@ def _effective_scope_denominator(stats: dict) -> int:
     return stats.get("merged", 0) + stats.get("failed", 0) - infra_excl_overflow
 
 
+def _get_failure_coaching_suffix(direction_id: str, design_doc: dict) -> str | None:
+    """Prompt suffix naming the dominant first-attempt failure category for a direction.
+
+    Returns None when fewer than 3 rejections or no single category accounts for ≥40%.
+    Called at research-task spawn time so the agent can bias findings toward mitigations.
+    """
+    dfa = (design_doc or {}).get("direction_first_attempt_feedback") or {}
+    entry = dfa.get(str(direction_id)) or {}
+    cat_counts = {
+        k: v for k, v in entry.items()
+        if k not in ("total", "last_updated") and isinstance(v, (int, float)) and v > 0
+    }
+    total = sum(cat_counts.values())
+    if total < 3 or not cat_counts:
+        return None
+    top_cat, top_count = max(cat_counts.items(), key=lambda kv: kv[1])
+    if top_count / total < 0.4:
+        return None
+    logger.info(
+        "[RESEARCH] Direction %s: dominant failure category '%s' (%d/%d first-attempt rejections) — injecting coaching",
+        direction_id, top_cat, int(top_count), int(total),
+    )
+    return (
+        f"Note: this direction has recurring first-attempt rejections in the '{top_cat}' category "
+        f"({int(top_count)}/{int(total)} recent cases). Prefer findings that address this failure mode "
+        "and consider smaller scopes to reduce implementation risk."
+    )
+
+
+def _feedback_scope_override(
+    proposed_scope: str,
+    idx: int,
+    direction: dict,
+    project: Any,
+    task_type: str | None,
+) -> tuple[str, str | None] | None:
+    """Check failure feedback and success patterns for a cold-start scope override.
+
+    Returns (scope, calibrated_from) if an override applies, else None.
+    Reads direction_first_attempt_feedback for scope_related failures and
+    playbook/success-{task_type}-{scope} for confirmed success patterns.
+    Only called when historical merge-rate data is insufficient.
+    """
+    doc = getattr(project, "design_doc", None) or {}
+    label = direction.get("title", direction.get("id", "?"))
+    dir_id = str(direction.get("id") or "")
+    # scope_related failure feedback: repeated scope misfits → downscope
+    if idx > 0 and dir_id:
+        sc_count = (
+            (doc.get("direction_first_attempt_feedback") or {})
+            .get(dir_id, {})
+            .get("scope_related", 0)
+        )
+        if isinstance(sc_count, (int, float)) and sc_count >= 3:
+            smaller = _SCOPE_ORDER[idx - 1]
+            logger.info(
+                "[RESEARCH] Downgrading scope %s→%s for direction '%s' "
+                "(failure feedback: %d scope_related first-attempt rejections)",
+                proposed_scope, smaller, label, int(sc_count),
+            )
+            return smaller, proposed_scope
+    # Success-pattern evidence: strong prior success at this scope → retain it
+    if task_type:
+        sp_entry = doc.get(f"playbook/success-{task_type}-{proposed_scope}") or {}
+        cnt = sp_entry.get("success_count", 0)
+        if isinstance(cnt, (int, float)) and cnt >= 5:
+            logger.info(
+                "[RESEARCH] Retaining scope %s for direction '%s' "
+                "(success-pattern: %d %s/%s confirmed successes)",
+                proposed_scope, label, int(cnt), task_type, proposed_scope,
+            )
+            return proposed_scope, None
+    return None
+
+
 def _calibrate_scope(
     proposed_scope: str,
     direction: dict,
     project: Any | None = None,
+    task_type: str | None = None,
 ) -> tuple[str, str | None]:
     """Downgrade scope if historical merge rate at that scope is below threshold.
 
@@ -257,6 +333,9 @@ def _calibrate_scope(
         ]
         proj_agg = _aggregate_scope_breakdown(proj_entries)
         if sum(v["created"] for v in proj_agg.values()) < 3:
+            _ov = _feedback_scope_override(proposed_scope, idx, direction, project, task_type)
+            if _ov is not None:
+                return _ov
             return _maybe_cold_start_upgrade_medium(proposed_scope, direction)
         agg = proj_agg
         threshold = 0.3

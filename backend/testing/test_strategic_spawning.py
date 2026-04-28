@@ -1785,6 +1785,92 @@ async def test_strategic_review_calibration_factor_reflects_history(db_session):
     assert "optimistic" in payload["prediction_calibration_note"]
 
 
+# ---------------------------------------------------------------------------
+# _build_failure_feedback_mitigation unit tests
+# ---------------------------------------------------------------------------
+
+def test_failure_feedback_downscopes_large_to_medium():
+    """3 first-attempt failures in a category downscopes large→medium."""
+    from app.strategic_spawning import _build_failure_feedback_mitigation
+    direction = {"id": "d-abc123"}
+    design_doc = {
+        "direction_first_attempt_feedback": {
+            "d-abc123": {"code_defect": 3, "total": 3, "last_updated": "2026-04-20T00:00:00"},
+        }
+    }
+    scope, note, evidence = _build_failure_feedback_mitigation(direction, "large", "create", design_doc)
+    assert scope == "medium"
+    assert note is not None and "code defect" in note
+    assert evidence["failure_downscope"]["count"] == 3
+    assert evidence["failure_downscope"]["from"] == "large"
+    assert evidence["failure_downscope"]["to"] == "medium"
+
+
+def test_failure_feedback_downscopes_medium_to_small():
+    """3+ first-attempt failures downscopes medium→small and names the category."""
+    from app.strategic_spawning import _build_failure_feedback_mitigation
+    direction = {"id": "d-def456"}
+    design_doc = {
+        "direction_first_attempt_feedback": {
+            "d-def456": {"testing": 5, "scope_related": 1, "total": 6, "last_updated": "2026-04-20T00:00:00"},
+        }
+    }
+    scope, note, evidence = _build_failure_feedback_mitigation(direction, "medium", "create", design_doc)
+    assert scope == "small"
+    assert note is not None and "testing" in note
+    assert evidence["failure_downscope"]["category"] == "testing"
+
+
+def test_failure_feedback_no_downscope_below_threshold():
+    """2 failures (< threshold) leaves scope and note unchanged."""
+    from app.strategic_spawning import _build_failure_feedback_mitigation
+    direction = {"id": "d-ghi789"}
+    design_doc = {
+        "direction_first_attempt_feedback": {
+            "d-ghi789": {"code_defect": 2, "total": 2, "last_updated": "2026-04-20T00:00:00"},
+        }
+    }
+    scope, note, evidence = _build_failure_feedback_mitigation(direction, "medium", "create", design_doc)
+    assert scope == "medium"
+    assert note is None
+    assert "failure_downscope" not in evidence
+
+
+def test_success_pattern_biases_medium_to_small():
+    """playbook/success-create-small with 3+ successes biases medium→small."""
+    from app.strategic_spawning import _build_failure_feedback_mitigation
+    direction = {"id": "d-jkl012"}
+    design_doc = {
+        "playbook/success-create-small": {"source": "success-pattern", "success_count": 4},
+    }
+    scope, note, evidence = _build_failure_feedback_mitigation(direction, "medium", "create", design_doc)
+    assert scope == "small"
+    assert evidence["success_bias"]["success_count"] == 4
+    assert evidence["success_bias"]["to"] == "small"
+
+
+def test_success_pattern_insufficient_count_no_bias():
+    """2 successes (< threshold) leaves scope unchanged."""
+    from app.strategic_spawning import _build_failure_feedback_mitigation
+    direction = {"id": "d-mno345"}
+    design_doc = {
+        "playbook/success-create-small": {"source": "success-pattern", "success_count": 2},
+    }
+    scope, note, evidence = _build_failure_feedback_mitigation(direction, "medium", "create", design_doc)
+    assert scope == "medium"
+    assert "success_bias" not in evidence
+
+
+def test_no_data_returns_proposed_scope_unchanged():
+    """Empty design_doc leaves scope and note unchanged."""
+    from app.strategic_spawning import _build_failure_feedback_mitigation
+    scope, note, evidence = _build_failure_feedback_mitigation({"id": "d-xyz"}, "medium", "create", {})
+    assert scope == "medium"
+    assert note is None
+    assert evidence["proposed_scope"] == "medium"
+    assert evidence["final_scope"] == "medium"
+
+
 # ── pack_under_budget integration ─────────────────────────────────────────────
 
 @pytest.mark.asyncio

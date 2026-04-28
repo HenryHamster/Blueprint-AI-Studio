@@ -312,26 +312,50 @@ async def post_direction_milestone_message(
     reason: str,
     task_id: Optional[uuid.UUID] = None,
     direction_id: Optional[str] = None,
+    evidence: Optional[dict[str, Any]] = None,
 ) -> ProjectMessage:
     """Post a message for direction lifecycle milestones (auto-completed, auto-paused, auto-retired)."""
+    reason_l = reason.lower()
+    reason_code: Optional[str] = None
+    if milestone == "auto-paused":
+        if "budget" in reason_l and ("exceed" in reason_l or "over" in reason_l):
+            reason_code = "budget_exceeded"
+        elif "cost-per-merge" in reason_l or "cost per merge" in reason_l:
+            reason_code = "cost_per_merge_high"
+        elif "low yield" in reason_l or "yield" in reason_l:
+            reason_code = "low_yield"
+
+    context: dict[str, Any] = {
+        "milestone": milestone,
+        "direction_text": direction_text[:120],
+        "reason": reason,
+    }
+    payload: dict[str, Any] = {
+        "direction_text": direction_text[:120],
+        "milestone": milestone,
+        "reason": reason,
+        "direction_id": direction_id,
+    }
+    if reason_code:
+        context["reason_code"] = reason_code
+        payload["reason_code"] = reason_code
+    if evidence:
+        context["evidence"] = evidence
+        payload["evidence"] = evidence
+
     summary = f"Direction {milestone}: {direction_text[:80]} — {reason}"
     msg = await post_event_message(
         session,
         project_id,
         event_type="direction_milestone",
         summary=summary,
-        context={"milestone": milestone, "direction_text": direction_text[:120], "reason": reason},
+        context=context,
         task_id=task_id,
     )
     asyncio.ensure_future(dispatch_external_notification(
         project_id,
         "DIRECTION_MILESTONE",
-        {
-            "direction_text": direction_text[:120],
-            "milestone": milestone,
-            "reason": reason,
-            "direction_id": direction_id,
-        },
+        payload,
     ))
     return msg
 

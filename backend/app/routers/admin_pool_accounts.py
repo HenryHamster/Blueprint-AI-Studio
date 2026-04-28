@@ -188,7 +188,8 @@ async def get_account_health_summary(
     current_user: dict = Depends(get_current_user),
 ):
     """Per-account health summary: state, 24h completions/RL events, health score,
-    rate-limited models with cooldown, and per-failure-class task counts."""
+    7d success rate, rate-limited models with cooldown, and per-failure-class
+    task counts."""
     from datetime import timedelta
 
     from app.failure_classification import classify_failure
@@ -241,6 +242,7 @@ async def get_account_health_summary(
             "state": state,
             "disabled_reason": s.get("disabled_reason"),
             "health_score": s["health_score"],
+            "success_rate_7d": s.get("success_rate_7d"),
             "completions_24h": s["completions_24h"],
             "rl_events_24h": s["rl_events_24h"],
             "rate_limited_models": rate_limited_models,

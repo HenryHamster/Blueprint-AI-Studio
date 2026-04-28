@@ -664,6 +664,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             )
             existing = research_payload.get("prompt_suffix", "")
             research_payload["prompt_suffix"] = f"{existing}\n{product_guidance}".strip() if existing else product_guidance
+        # Inject failure-mode coaching derived from direction's first-attempt rejection history
+        if chosen_direction:
+            from app.spawn_calibration import _get_failure_coaching_suffix  # noqa: PLC0415
+            _dir_id = chosen_direction.get("id")
+            _coaching = _get_failure_coaching_suffix(str(_dir_id), project.design_doc or {}) if _dir_id else None
+            if _coaching:
+                _sfx = research_payload.get("prompt_suffix", "")
+                research_payload["prompt_suffix"] = f"{_sfx}\n{_coaching}".strip() if _sfx else _coaching
         # Pre-extract design doc context for the current direction's system_id
         if chosen_direction:
             dir_system_id = chosen_direction.get("system_id")

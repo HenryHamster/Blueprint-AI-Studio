@@ -30,14 +30,14 @@ from app.retry_budget import failure_class_history_classes
 
 logger = logging.getLogger(__name__)
 
-_CPM_RETIREMENT_MULTIPLIER = 3.0
-
 
 router = APIRouter(
     prefix="/api/admin",
     tags=["admin-digest"],
     dependencies=[Depends(get_current_user)],
 )
+
+_CPM_RETIREMENT_MULTIPLIER = 3.0  # cost_per_merge > median × this → retirement signal
 
 
 def _stash_projected_task_fields(
@@ -1270,6 +1270,7 @@ async def _compute_digest(
 
     # --- Direction progress (only when project_id provided) ---
     direction_progress_list: List[Dict[str, Any]] = []
+    median_cost_per_merged_pr: Optional[float] = None
     dir_id_to_text: Dict[str, str] = {}
     scope_conversion_rates: Dict[str, Dict[str, int]] = {}
     prev_scope_conversion_rates: Dict[str, Dict[str, int]] = {}

@@ -844,6 +844,26 @@ describe('provider runner prompt transport', () => {
     // Trust gate opt-out — ephemeral VM is the isolation boundary.
     expect(command.env?.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
   });
+
+  it('sets GEMINI_CLI_TRUST_WORKSPACE=true on Gemini buildRunCommand (service_account)', () => {
+    const runner = getProviderRunner('gemini', 'service_account');
+    const command = runner.buildRunCommand('Some prompt', 'gemini-2.5-pro');
+    expect(command.env?.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
+  });
+
+  it('sets GEMINI_CLI_TRUST_WORKSPACE=true on Gemini buildValidationCommand (api_key)', () => {
+    const runner = getProviderRunner('gemini', 'api_key');
+    const command = runner.buildValidationCommand('gemini-2.5-pro');
+    expect(command).not.toBeNull();
+    expect(command!.env?.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
+  });
+
+  it('sets GEMINI_CLI_TRUST_WORKSPACE=true on Gemini buildValidationCommand (service_account)', () => {
+    const runner = getProviderRunner('gemini', 'service_account');
+    const command = runner.buildValidationCommand('gemini-2.5-pro');
+    expect(command).not.toBeNull();
+    expect(command!.env?.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
+  });
 });
 
 // ── LLM_CLI_TRANSLATION parsing ───────────────────────────────────────────────
@@ -1033,6 +1053,7 @@ describe('provider runner reliability', () => {
     });
   }
 
+  let savedTaskId: string | undefined;
   beforeEach(() => {
     vi.stubEnv('TASK_ID', '');
     vi.mocked(spawn).mockReset();
@@ -1041,6 +1062,12 @@ describe('provider runner reliability', () => {
     vi.mocked(fs.unlinkSync).mockClear();
     vi.mocked(fs.openSync).mockClear();
     vi.mocked(fs.openSync).mockReturnValue(3);
+    savedTaskId = process.env.TASK_ID;
+    delete process.env.TASK_ID;
+  });
+
+  afterEach(() => {
+    if (savedTaskId !== undefined) process.env.TASK_ID = savedTaskId;
   });
 
   afterEach(() => {

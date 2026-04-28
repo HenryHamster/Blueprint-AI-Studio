@@ -1,7 +1,12 @@
 import pytest
 
 from app.models import Project, Task, TaskStatus
-from app.spawn_calibration import _assess_project_spawn_health
+from app.spawn_calibration import (
+    _assess_project_spawn_health,
+    _calibrate_scope,
+    _feedback_scope_override,
+    _get_failure_coaching_suffix,
+)
 
 
 @pytest.mark.asyncio
@@ -46,3 +51,171 @@ async def test_over_budget_active_project_tasks_degrade_spawn_health(db_session,
     assert degraded is True
     assert reason is not None
     assert "active task backlog" in reason
+
+
+# --- _get_failure_coaching_suffix ---
+
+def _make_dfa(direction_id: str, counts: dict) -> dict:
+    """Build a minimal design_doc with direction_first_attempt_feedback."""
+    return {"direction_first_attempt_feedback": {direction_id: counts}}
+
+
+def test_failure_coaching_no_design_doc():
+    assert _get_failure_coaching_suffix("d1", {}) is None
+    assert _get_failure_coaching_suffix("d1", None) is None
+
+
+def test_failure_coaching_missing_direction_entry():
+    doc = _make_dfa("other_dir", {"code_defect": 5, "total": 5, "last_updated": "2026-01-01"})
+    assert _get_failure_coaching_suffix("d1", doc) is None
+
+
+def test_failure_coaching_total_below_threshold():
+    # Only 2 rejections — below the minimum of 3.
+    doc = _make_dfa("d1", {"code_defect": 2, "total": 2, "last_updated": "2026-01-01"})
+    assert _get_failure_coaching_suffix("d1", doc) is None
+
+
+def test_failure_coaching_no_dominant_category():
+    # 4 total across 3 categories — max share is 2/4 = 50%? No: 2+1+1=4, max=2/4=0.5 ≥ 0.4
+    # Use a more evenly distributed case: 3 categories of 1 each = 3 total, max share 1/3 < 40%.
+    doc = _make_dfa("d1", {
+        "code_defect": 1,
+        "scope_related": 1,
+        "review_quality": 1,
+        "total": 3,
+        "last_updated": "2026-01-01",
+    })
+    assert _get_failure_coaching_suffix("d1", doc) is None
+
+
+def test_failure_coaching_dominant_category_returned():
+    # 4 code_defect out of 5 total = 80% — well above 40%.
+    doc = _make_dfa("d1", {
+        "code_defect": 4,
+        "scope_related": 1,
+        "total": 5,
+        "last_updated": "2026-01-01",
+    })
+    result = _get_failure_coaching_suffix("d1", doc)
+    assert result is not None
+    assert "code_defect" in result
+    assert "4/5" in result
+
+
+def test_failure_coaching_exactly_at_threshold():
+    # 2 out of 5 = 40% — exactly at threshold, should return coaching.
+    doc = _make_dfa("d1", {
+        "scope_related": 2,
+        "code_defect": 1,
+        "review_quality": 1,
+        "other": 1,
+        "total": 5,
+        "last_updated": "2026-01-01",
+    })
+    result = _get_failure_coaching_suffix("d1", doc)
+    assert result is not None
+    assert "scope_related" in result
+
+
+def test_failure_coaching_excludes_total_and_last_updated_from_counts():
+    # If "total" and "last_updated" were not excluded they would skew the computation.
+    doc = _make_dfa("d1", {
+        "code_defect": 4,
+        "total": 10,       # should be ignored
+        "last_updated": "2026-01-01",  # should be ignored (non-numeric anyway)
+    })
+    result = _get_failure_coaching_suffix("d1", doc)
+    # Only code_defect=4, total from cat_counts=4 >= 3, share=100% >= 40%
+    assert result is not None
+    assert "code_defect" in result
+    assert "4/4" in result
+
+
+# --- _feedback_scope_override and _calibrate_scope ---
+
+def _make_project(design_doc: dict):
+    """Minimal project-like object for scope-override tests (no DB needed)."""
+    class _P:
+        directions = []
+
+    p = _P()
+    p.design_doc = design_doc
+    return p
+
+
+def test_feedback_scope_override_downscopes_at_threshold():
+    """Exactly 3 scope_related first-attempt rejections → downscope medium→small."""
+    proj = _make_project({
+        "direction_first_attempt_feedback": {
+            "dir1": {"scope_related": 3, "total": 3, "last_updated": "2026-01-01"}
+        }
+    })
+    scope, calibrated_from = _feedback_scope_override("medium", 1, {"id": "dir1"}, proj, None)
+    assert scope == "small"
+    assert calibrated_from == "medium"
+
+
+def test_feedback_scope_override_no_downscope_below_threshold():
+    """Only 2 scope_related rejections (below 3) → no override."""
+    proj = _make_project({
+        "direction_first_attempt_feedback": {
+            "dir1": {"scope_related": 2, "total": 2, "last_updated": "2026-01-01"}
+        }
+    })
+    assert _feedback_scope_override("medium", 1, {"id": "dir1"}, proj, None) is None
+
+
+def test_feedback_scope_override_no_downscope_at_smallest_scope():
+    """idx=0 (already at 'small') → downscope guard is skipped regardless of counts."""
+    proj = _make_project({
+        "direction_first_attempt_feedback": {
+            "dir1": {"scope_related": 5, "total": 5, "last_updated": "2026-01-01"}
+        }
+    })
+    # idx=0 means there is no smaller scope; the guard `if idx > 0` must prevent downscoping.
+    assert _feedback_scope_override("small", 0, {"id": "dir1"}, proj, None) is None
+
+
+def test_feedback_scope_override_retains_scope_on_strong_success_pattern():
+    """success_count >= 5 for task_type/scope → retain proposed scope."""
+    proj = _make_project({"playbook/success-create-small": {"success_count": 5}})
+    scope, calibrated_from = _feedback_scope_override("small", 0, {"id": "d2"}, proj, "create")
+    assert scope == "small"
+    assert calibrated_from is None
+
+
+def test_feedback_scope_override_no_retain_weak_success_pattern():
+    """success_count < 5 → success-pattern guard does not fire; returns None."""
+    proj = _make_project({"playbook/success-create-small": {"success_count": 4}})
+    assert _feedback_scope_override("small", 0, {"id": "d2"}, proj, "create") is None
+
+
+def test_feedback_scope_override_no_retain_missing_task_type():
+    """task_type=None → success-pattern check is skipped entirely."""
+    proj = _make_project({"playbook/success-create-small": {"success_count": 10}})
+    # Without task_type the playbook key cannot be formed, so no retention override.
+    assert _feedback_scope_override("small", 0, {"id": "d2"}, proj, None) is None
+
+
+def test_calibrate_scope_downscopes_via_failure_feedback_coldstart():
+    """_calibrate_scope propagates failure-feedback downscope when history is sparse."""
+    proj = _make_project({
+        "direction_first_attempt_feedback": {
+            "dir3": {"scope_related": 4, "total": 4, "last_updated": "2026-01-01"}
+        }
+    })
+    direction = {"id": "dir3", "title": "T", "research_history": []}
+    scope, calibrated_from = _calibrate_scope("medium", direction, proj, "create")
+    assert scope == "small"
+    assert calibrated_from == "medium"
+
+
+def test_calibrate_scope_success_pattern_retained_coldstart():
+    """_calibrate_scope returns the success-pattern scope intact when evidence is strong."""
+    proj = _make_project({"playbook/success-create-small": {"success_count": 7}})
+    direction = {"id": "dir4", "title": "T", "research_history": []}
+    # With no failure feedback and strong success-pattern evidence, scope is retained.
+    scope, calibrated_from = _calibrate_scope("small", direction, proj, "create")
+    assert scope == "small"
+    assert calibrated_from is None

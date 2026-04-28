@@ -46,6 +46,7 @@ from app.max_plan_pool import (
     get_task_llm_execution_mode,
     get_task_llm_provider,
     record_completion_event,
+    record_task_outcome,
 )
 from app.task_lifecycle import _process_post_commit, PostCommitLocked
 from app.rollup_management import _check_and_trigger_rollup
@@ -1317,6 +1318,17 @@ async def update_agent_status(
                         + existing_msg[:300]
                     ).strip()
                     session.add(task)
+                # Record CODE_ERROR-class failures to 7-day account success-rate tracking.
+                # RATE_LIMIT is tracked via disable_account_model; COMPLETED via record_completion_event.
+                if failure_class not in ("RATE_LIMIT", "EXTERNAL_API", "PROVISION_FAILURE"):
+                    _acct_id_outcome = get_task_llm_account_id(task)
+                    if _acct_id_outcome:
+                        try:
+                            await record_task_outcome(_acct_id_outcome, success=False)
+                        except Exception as _outcome_err:
+                            logger.warning(
+                                f"[AGENT_STATUS] record_task_outcome failed for {_acct_id_outcome}: {_outcome_err}"
+                            )
                 try:
                     from app.main import _maybe_create_failure_alert  # noqa: PLC0415
                     await _maybe_create_failure_alert(

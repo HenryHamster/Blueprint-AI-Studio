@@ -1221,7 +1221,7 @@ class TestHealthScoreComputation:
         """get_account_health_stats returns the expected keys."""
         acct = _make_acct("a1")
         stats = get_account_health_stats(acct)
-        assert set(stats.keys()) == {"rl_events_24h", "completions_24h", "avg_duration_seconds", "health_score"}
+        assert set(stats.keys()) == {"rl_events_24h", "completions_24h", "avg_duration_seconds", "health_score", "success_rate_7d"}
 
     def test_get_account_health_stats_avg_duration(self):
         """avg_duration_seconds is the mean of recent completion durations."""

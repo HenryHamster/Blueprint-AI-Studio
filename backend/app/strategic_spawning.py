@@ -1090,3 +1090,90 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     await session.commit()
     logger.info(f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project.id}")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Spawn-time failure-feedback mitigation helper
+# ---------------------------------------------------------------------------
+
+# Minimum first-attempt rejections in a single category to trigger downscoping.
+_FAILURE_DOWNSCOPE_THRESHOLD = 3
+# Minimum success-pattern observations to bias scope selection toward a smaller scope.
+_SUCCESS_BIAS_THRESHOLD = 3
+
+_SCOPE_DOWNGRADE: dict[str, str] = {"large": "medium", "medium": "small"}
+_SCOPE_ORDER_LIST = ["small", "medium", "large"]
+
+
+def _build_failure_feedback_mitigation(
+    direction: dict,
+    proposed_scope: str,
+    task_type: str,
+    design_doc: dict | None,
+) -> tuple[str, str | None, dict]:
+    """Return (final_scope, coaching_note, evidence) for spawn-time mitigation.
+
+    Reads direction_first_attempt_feedback for per-category rejection counts and
+    playbook/success-* entries for successful scope shapes.
+
+    - Downscopes by one level when any category reaches _FAILURE_DOWNSCOPE_THRESHOLD
+      first-attempt rejections, and sets a coaching note naming the failure mode.
+    - Biases toward the smallest scope that has _SUCCESS_BIAS_THRESHOLD+ successes
+      in playbook/success-{task_type}-{scope}, applied after failure downscoping.
+
+    Pure — no DB queries. Returns proposed_scope unchanged when no signal fires.
+    """
+    doc = design_doc or {}
+    direction_id = str(direction.get("id") or "")
+    final_scope = proposed_scope
+    coaching_note: str | None = None
+    evidence: dict = {"proposed_scope": proposed_scope}
+
+    # --- Failure-concentration downscoping ---
+    dfa = doc.get("direction_first_attempt_feedback") or {}
+    fa_entry = dfa.get(direction_id) or {}
+    cat_counts = {
+        k: v for k, v in fa_entry.items()
+        if k not in ("total", "last_updated") and isinstance(v, int) and v > 0
+    }
+    if cat_counts:
+        top_cat = max(cat_counts, key=lambda k: cat_counts[k])
+        top_count = cat_counts[top_cat]
+        if top_count >= _FAILURE_DOWNSCOPE_THRESHOLD and final_scope in _SCOPE_DOWNGRADE:
+            downscoped = _SCOPE_DOWNGRADE[final_scope]
+            evidence["failure_downscope"] = {
+                "category": top_cat, "count": top_count,
+                "from": final_scope, "to": downscoped,
+            }
+            logger.info(
+                "[SPAWN] Downscoping %s→%s for direction '%s' (first-attempt %s=%d)",
+                final_scope, downscoped, direction_id, top_cat, top_count,
+            )
+            final_scope = downscoped
+            coaching_note = (
+                f"Historical pattern: {top_count} first-attempt rejections in "
+                f"'{top_cat.replace('_', ' ')}' for this direction. "
+                f"Pay extra attention to {top_cat.replace('_', ' ')} before submitting."
+            )
+
+    # --- Success-pattern scope bias ---
+    proposed_idx = _SCOPE_ORDER_LIST.index(proposed_scope) if proposed_scope in _SCOPE_ORDER_LIST else -1
+    if proposed_idx > 0:
+        for candidate in _SCOPE_ORDER_LIST[:proposed_idx]:
+            key = f"playbook/success-{task_type}-{candidate}"
+            entry = doc.get(key)
+            success_count = entry.get("success_count") if isinstance(entry, dict) else None
+            if isinstance(success_count, int) and success_count >= _SUCCESS_BIAS_THRESHOLD:
+                evidence["success_bias"] = {
+                    "key": key, "success_count": success_count,
+                    "from": final_scope, "to": candidate,
+                }
+                logger.info(
+                    "[SPAWN] Success bias %s→%s for task_type='%s' ('%s': %d successes)",
+                    final_scope, candidate, task_type, key, success_count,
+                )
+                final_scope = candidate
+                break  # use smallest qualifying scope
+
+    evidence["final_scope"] = final_scope
+    return final_scope, coaching_note, evidence

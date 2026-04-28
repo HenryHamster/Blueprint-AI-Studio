@@ -410,6 +410,8 @@ async def _process_direction_lifecycle(
 
     Returns a list of active, non-cooling directions eligible for research.
     """
+    from statistics import median
+
     from app.strategic_completion import _check_direction_health, _check_direction_completion
 
     directions_modified = False
@@ -541,6 +543,34 @@ async def _process_direction_lifecycle(
             directions_modified = True
     active_directions = []
     auto_paused_any = False
+
+    def _cost_per_merge(direction: dict) -> float | None:
+        history = list(direction.get("research_history") or [])
+        if cpm_window > 0:
+            history = history[-cpm_window:]
+        spend = 0.0
+        merged = 0
+        for entry in history:
+            try:
+                spend += max(0.0, float(entry.get("estimated_cost_usd") or 0.0))
+                merged += max(0, int(entry.get("prs_merged") or 0))
+            except (TypeError, ValueError):
+                continue
+        return (spend / merged) if merged > 0 else None
+
+    try:
+        cpm_window = int(_runtime_config.get("direction_cost_per_merge_window", 6) or 6)
+    except (TypeError, ValueError):
+        cpm_window = 6
+    try:
+        cpm_multiplier = float(_runtime_config.get("direction_cost_per_merge_multiplier", 2.0) or 2.0)
+    except (TypeError, ValueError):
+        cpm_multiplier = 2.0
+    project_cpms = [
+        cpm for cpm in (_cost_per_merge(x) for x in (project.directions or []))
+        if cpm is not None and cpm > 0
+    ]
+    project_cpm_median = median(project_cpms) if project_cpms else None
     for d in (project.directions or []):
         if d.get("status") != "active":
             continue
@@ -645,8 +675,47 @@ async def _process_direction_lifecycle(
                     f"{minutes_ago:.1f}m ago (cooldown: {effective_cooldown}m)"
                 )
                 continue
+        # Cost efficiency escalation: flag expensive directions for retirement consideration.
+        direction_cpm = _cost_per_merge(d)
+        threshold = (project_cpm_median * cpm_multiplier) if project_cpm_median else None
+        if direction_cpm and threshold and direction_cpm > threshold:
+            d["retirement_consideration_needed"] = True
+            d["retirement_consideration_at"] = _utcnow().isoformat()
+            d["retirement_consideration_reason"] = (
+                f"Recent cost/merge ${direction_cpm:.2f} exceeded threshold ${threshold:.2f}."
+            )
+            d["retirement_consideration_evidence"] = {
+                "window_cycles": cpm_window,
+                "direction_cost_per_merge_usd": round(direction_cpm, 4),
+                "threshold_usd": round(threshold, 4),
+            }
+            directions_modified = True
+            logger.warning(
+                f"[AUTONOMOUS] Direction {did} flagged for retirement consideration: "
+                f"cost/merge ${direction_cpm:.2f} > ${threshold:.2f}"
+            )
         # Auto-pause check — must come after cooldown to only evaluate directions eligible for research
         pause_reason = _check_direction_health(d)
+        cumulative_cost = 0.0
+        for entry in (d.get("research_history") or []):
+            try:
+                cumulative_cost += max(0.0, float(entry.get("estimated_cost_usd") or 0.0))
+            except (TypeError, ValueError):
+                continue
+        budget = d.get("cost_budget_usd")
+        try:
+            budget_f = float(budget) if budget is not None else None
+        except (TypeError, ValueError):
+            budget_f = None
+        if budget_f and cumulative_cost > budget_f:
+            pause_reason = (
+                f"Budget exceeded: cumulative estimated cost ${cumulative_cost:.2f} "
+                f"> cost budget ${budget_f:.2f}"
+            )
+            d["cost_pause_evidence"] = {
+                "cumulative_estimated_cost_usd": round(cumulative_cost, 4),
+                "cost_budget_usd": round(budget_f, 4),
+            }
         if pause_reason:
             d["status"] = "paused"
             d["paused_reason"] = pause_reason
@@ -773,7 +842,7 @@ async def _process_direction_lifecycle(
             try:
                 if _is_code_failure_pause_reason(pause_reason):
                     await _spawn_direction_diagnosis(project, d, pause_reason, session)
-                else:
+                elif not (pause_reason or "").startswith("Budget exceeded:"):
                     from app.autonomous_research_diagnosis import _spawn_unproductive_diagnosis
                     await _spawn_unproductive_diagnosis(project, d, pause_reason, session)
             except Exception as _e:

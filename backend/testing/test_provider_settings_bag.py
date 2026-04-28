@@ -407,6 +407,9 @@ def test_gemini_cli_translation_writes_settings_alias_for_thinking():
     assert translation.args[m_index + 1] != "gemini-2.5-pro"
     # Approval mode is hardcoded to yolo on every Gemini invocation.
     assert "--approval-mode=yolo" in translation.args
+    # Trust workspace env var forces the directory-trust gate open so the
+    # CLI doesn't override --approval-mode back to default on headless runs.
+    assert translation.env.get("GEMINI_CLI_TRUST_WORKSPACE") == "true"
 
 
 def test_gemini_cli_translation_model_only_uses_direct_flag():
@@ -416,6 +419,7 @@ def test_gemini_cli_translation_model_only_uses_direct_flag():
     # Approval-mode is always yolo — a stalled VM helps nobody.
     assert not translation.settings_files
     assert list(translation.args) == ["-m", "gemini-2.5-flash", "--approval-mode=yolo"]
+    assert translation.env.get("GEMINI_CLI_TRUST_WORKSPACE") == "true"
 
 
 # ---------------------------------------------------------------------------

@@ -360,6 +360,92 @@ async def test_post_direction_milestone_message_fires_webhook(db_session):
 
 
 @pytest.mark.asyncio
+async def test_post_direction_milestone_message_adds_reason_code_and_evidence(db_session):
+    project_id = uuid.uuid4()
+    dispatch_mock = AsyncMock()
+    evidence = {"cost_per_merge": 12.5, "merge_count": 1}
+    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+        msg = await post_direction_milestone_message(
+            db_session, project_id,
+            direction_text="Reduce flaky tests",
+            milestone="auto-paused",
+            reason="Paused: cost per merge is too high",
+            direction_id="d-xyz789",
+            evidence=evidence,
+        )
+        import asyncio as _asyncio  # noqa: PLC0415
+        await _asyncio.sleep(0)
+
+    assert msg.context["reason_code"] == "cost_per_merge_high"
+    assert msg.context["evidence"] == evidence
+    dispatch_mock.assert_called_once()
+    args, _ = dispatch_mock.call_args
+    assert args[2]["reason_code"] == "cost_per_merge_high"
+    assert args[2]["evidence"] == evidence
+
+
+@pytest.mark.asyncio
+async def test_post_direction_milestone_message_no_reason_code_for_non_paused(db_session):
+    project_id = uuid.uuid4()
+    dispatch_mock = AsyncMock()
+    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+        msg = await post_direction_milestone_message(
+            db_session, project_id,
+            direction_text="Improve retention",
+            milestone="auto-completed",
+            reason="Cost per merge improved after rollout",
+            direction_id="d-finish1",
+        )
+        import asyncio as _asyncio  # noqa: PLC0415
+        await _asyncio.sleep(0)
+
+    assert "reason_code" not in msg.context
+    dispatch_mock.assert_called_once()
+    args, _ = dispatch_mock.call_args
+    assert "reason_code" not in args[2]
+
+
+@pytest.mark.asyncio
+async def test_post_direction_milestone_message_reason_code_budget_exceeded(db_session):
+    project_id = uuid.uuid4()
+    dispatch_mock = AsyncMock()
+    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+        msg = await post_direction_milestone_message(
+            db_session, project_id,
+            direction_text="Trim infra spend",
+            milestone="auto-paused",
+            reason="Auto-paused: direction is over budget this cycle",
+            direction_id="d-budget1",
+        )
+        import asyncio as _asyncio  # noqa: PLC0415
+        await _asyncio.sleep(0)
+
+    assert msg.context["reason_code"] == "budget_exceeded"
+    args, _ = dispatch_mock.call_args
+    assert args[2]["reason_code"] == "budget_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_post_direction_milestone_message_reason_code_low_yield(db_session):
+    project_id = uuid.uuid4()
+    dispatch_mock = AsyncMock()
+    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+        msg = await post_direction_milestone_message(
+            db_session, project_id,
+            direction_text="Improve onboarding",
+            milestone="auto-paused",
+            reason="Auto-paused: low yield after 3 cycles",
+            direction_id="d-yield1",
+        )
+        import asyncio as _asyncio  # noqa: PLC0415
+        await _asyncio.sleep(0)
+
+    assert msg.context["reason_code"] == "low_yield"
+    args, _ = dispatch_mock.call_args
+    assert args[2]["reason_code"] == "low_yield"
+
+
+@pytest.mark.asyncio
 async def test_post_cycle_summary_message(db_session):
     project_id = uuid.uuid4()
     msg = await post_cycle_summary_message(

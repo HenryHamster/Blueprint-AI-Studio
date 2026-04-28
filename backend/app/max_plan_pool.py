@@ -494,6 +494,7 @@ def cascade_disabled_models(model: str) -> tuple:
 
 # Rolling window for account health score computation
 _HEALTH_WINDOW_SECONDS = 24 * 3600  # 24-hour rolling window
+_OUTCOME_WINDOW_SECONDS = 7 * 24 * 3600  # 7-day rolling window for success-rate tracking
 
 # Accounts whose 24h health score is below this threshold are excluded from
 # the healthy candidate list when at least one alternative exists. Prevents
@@ -517,6 +518,20 @@ def _compute_health_score(acct: Dict[str, Any], now: datetime | None = None) -> 
     return completion_count - 2.0 * rl_count
 
 
+def _compute_success_rate_7d(acct: Dict[str, Any], now: datetime | None = None) -> float | None:
+    """Return 7-day task success rate, or None when fewer than 3 outcomes exist.
+
+    Requires ≥3 outcomes so brand-new accounts aren't misranked on one unlucky
+    failure. Returns a float in [0.0, 1.0] when enough data is present.
+    """
+    now = now or _utcnow()
+    cutoff = now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS)
+    events = [e for e in acct.get("outcome_events", []) if e["at"] > cutoff]
+    if len(events) < 3:
+        return None
+    return sum(1 for e in events if e["success"]) / len(events)
+
+
 def get_account_health_stats(acct: Dict[str, Any], now: datetime | None = None) -> Dict[str, Any]:
     """Return observable health stats for an account (used by admin endpoints)."""
     now = now or _utcnow()
@@ -529,6 +544,7 @@ def get_account_health_stats(acct: Dict[str, Any], now: datetime | None = None) 
         "completions_24h": len(completion_events),
         "avg_duration_seconds": round(sum(durations) / len(durations), 1) if durations else None,
         "health_score": _compute_health_score(acct, now=now),
+        "success_rate_7d": _compute_success_rate_7d(acct, now=now),
     }
 
 
@@ -539,6 +555,13 @@ def _prune_health_events(acct: Dict[str, Any], now: datetime) -> None:
         acct["rl_events"] = [t for t in acct["rl_events"] if t > cutoff]
     if "completion_events" in acct:
         acct["completion_events"] = [e for e in acct["completion_events"] if e["at"] > cutoff]
+
+
+def _prune_outcome_events(acct: Dict[str, Any], now: datetime) -> None:
+    """Prune outcome_events to the 7-day window (call under lock)."""
+    cutoff = now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS)
+    if "outcome_events" in acct:
+        acct["outcome_events"] = [e for e in acct["outcome_events"] if e["at"] > cutoff]
 
 
 async def record_completion_event(acct_id: str, duration_seconds: float) -> None:
@@ -555,9 +578,30 @@ async def record_completion_event(acct_id: str, duration_seconds: float) -> None
             return
         now = _utcnow()
         _prune_health_events(acct, now)
+        _prune_outcome_events(acct, now)
         acct.setdefault("completion_events", []).append(
             {"at": now, "duration_seconds": duration_seconds}
         )
+        acct.setdefault("outcome_events", []).append({"at": now, "success": True})
+
+
+async def record_task_outcome(acct_id: str, success: bool) -> None:
+    """Record a task outcome for 7-day success-rate tracking.
+
+    Call for CODE_ERROR and ACCOUNT_FAILURE endings where no other hook
+    records the outcome. RATE_LIMIT failures are tracked automatically via
+    disable_account_model; COMPLETED tasks via record_completion_event.
+    Safe to call when acct_id is absent (no-op). Acquires _max_plan_pool_lock.
+    """
+    if not acct_id:
+        return
+    async with _max_plan_pool_lock:
+        acct = _account_by_id.get(acct_id)
+        if acct is None:
+            return
+        now = _utcnow()
+        _prune_outcome_events(acct, now)
+        acct.setdefault("outcome_events", []).append({"at": now, "success": success})
 
 
 # Backward compat: flat view for code that needs all accounts
@@ -651,6 +695,20 @@ async def load_max_plan_pool():
                 if restored_dm:
                     entry["disabled_models"] = restored_dm
                     logger.info(f"[STARTUP] Restored rate-limit state for {acct.name}: {list(restored_dm.keys())}")
+            # Restore outcome_events from rate_limit_state (7d window)
+            outcome_events_raw = rl_state.get("outcome_events", [])
+            if outcome_events_raw:
+                oe_now = _utcnow()
+                oe_cutoff = oe_now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS)
+                restored_oe = []
+                for ev in outcome_events_raw:
+                    at_str = ev.get("at")
+                    if at_str:
+                        at_dt = datetime.fromisoformat(at_str)
+                        if at_dt > oe_cutoff:
+                            restored_oe.append({"at": at_dt, "success": bool(ev.get("success"))})
+                if restored_oe:
+                    entry["outcome_events"] = restored_oe
             _max_plan_pools.setdefault(acct.user_id, []).append(entry)
             _account_by_id[acct_id] = entry
         total_active = sum(active_per_account.values())
@@ -895,6 +953,7 @@ def get_all_account_health_summaries(
             "state": state,
             "disabled_reason": acct.get("disabled_reason"),
             "health_score": health_stats["health_score"],
+            "success_rate_7d": health_stats["success_rate_7d"],
             "completions_24h": health_stats["completions_24h"],
             "rl_events_24h": health_stats["rl_events_24h"],
             "avg_duration_seconds": health_stats["avg_duration_seconds"],
@@ -989,8 +1048,24 @@ def resolve_task_quality_tier(task: Any, runtime_config: Mapping[str, Any]) -> s
     return inferred_tier or DEFAULT_QUALITY_TIER
 
 
+def _build_rate_limit_state_blob(acct: Dict[str, Any]) -> dict | None:
+    """Serialize an account's rate-limit state (disabled_models + outcome_events) for DB."""
+    dm = acct.get("disabled_models") or {}
+    cutoff = _utcnow() - timedelta(seconds=_OUTCOME_WINDOW_SECONDS)
+    pruned_outcomes = [
+        {"at": e["at"].isoformat(), "success": e["success"]}
+        for e in acct.get("outcome_events", []) if e["at"] > cutoff
+    ]
+    out: dict[str, Any] = {}
+    if dm:
+        out["disabled_models"] = {m: _serialize_disabled_model_info(i) for m, i in dm.items()}
+    if pruned_outcomes:
+        out["outcome_events"] = pruned_outcomes
+    return out if out else None
+
+
 async def _persist_rate_limit_state(acct_id: str) -> None:
-    """Persist a single account's in-memory disabled_models to DB.
+    """Persist a single account's in-memory disabled_models + outcome_events to DB.
     Caller MUST hold _max_plan_pool_lock. Raises on DB failure — caller is
     responsible for queuing retries via _pending_rl_persists."""
     from app.models import MaxPlanAccount
@@ -1001,13 +1076,7 @@ async def _persist_rate_limit_state(acct_id: str) -> None:
         db_acct = await rl_session.get(MaxPlanAccount, uuid.UUID(acct_id))
         if db_acct is None:
             return
-        dm = acct.get("disabled_models") or {}
-        db_acct.rate_limit_state = {
-            "disabled_models": {
-                m: _serialize_disabled_model_info(i)
-                for m, i in dm.items()
-            }
-        } if dm else None
+        db_acct.rate_limit_state = _build_rate_limit_state_blob(acct)
         db_acct.enabled = acct.get("enabled", True)
         rl_session.add(db_acct)
         await rl_session.commit()
@@ -1162,9 +1231,12 @@ async def select_max_plan_account(
                 qualified = [a for a in healthy if _compute_health_score(a, now) >= _HEALTH_SCORE_DISQUALIFY_THRESHOLD]
                 if qualified:
                     healthy = qualified
-            # Prefer accounts with higher health scores (fewer rate limits, more completions).
-            # Among equal scores, prefer fewer active tasks for load balancing.
-            account = max(healthy, key=lambda a: (_compute_health_score(a), -a.get("active_tasks", 0)))
+            # Rank by health score, then 7d success rate, then fewest active tasks.
+            account = max(healthy, key=lambda a: (
+                _compute_health_score(a, now),
+                _compute_success_rate_7d(a, now) or 0.0,
+                -a.get("active_tasks", 0),
+            ))
         elif probing:
             # Deterministic by id so concurrent selects under the same lock get
             # distinct probes when multiple accounts are eligible.
@@ -1443,9 +1515,11 @@ async def disable_account_model(
                 info["kind"] = "quota_exhausted"
             if retry_after_seconds is not None:
                 info["retry_after_seconds"] = int(retry_after_seconds)
-        # Record rate-limit event for rolling health score
+        # Record rate-limit event for rolling health score + success-rate tracking
         _prune_health_events(acct, now)
         acct.setdefault("rl_events", []).append(now)
+        _prune_outcome_events(acct, now)
+        acct.setdefault("outcome_events", []).append({"at": now, "success": False})
         # Legacy model names (e.g. claude-sonnet-4-6) may not match any cascade
         # entry directly, so key off the cascade primary we just wrote. Guaranteed
         # non-empty: cascade_disabled_models always returns at least one entry.
@@ -1571,13 +1645,7 @@ async def recheck_disabled_accounts():
                 for acct in changed_accounts:
                     db_acct = await rl_session.get(MaxPlanAccount, uuid.UUID(acct["id"]))
                     if db_acct:
-                        dm = acct.get("disabled_models", {})
-                        db_acct.rate_limit_state = {
-                            "disabled_models": {
-                                m: _serialize_disabled_model_info(i)
-                                for m, i in dm.items()
-                            }
-                        } if dm else None
+                        db_acct.rate_limit_state = _build_rate_limit_state_blob(acct)
                         db_acct.enabled = acct.get("enabled", True)
                         if acct.get("enabled", True):
                             db_acct.disabled_reason = None

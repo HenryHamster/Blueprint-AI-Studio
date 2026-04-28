@@ -528,9 +528,9 @@ function DirectionCardImpl({
             }
             return <p className="text-[10px] text-neutral-600 mt-0.5">Last researched {formatRelativeTime(d.last_researched_at ?? '')}</p>;
           })()}
-          {/* Auto-pause reason subtitle */}
+          {/* Auto-pause reason subtitle — red for budget-exceeded pauses, amber for yield/saturation */}
           {key === 'paused' && d.paused_reason && (
-            <p className="text-[10px] text-amber-500/80 mt-0.5 leading-relaxed">
+            <p className={`text-[10px] mt-0.5 leading-relaxed ${d.budget_exceeded ? 'text-red-400/80' : 'text-amber-500/80'}`}>
               {d.paused_reason}
               {d.paused_at && <span className="text-neutral-600"> · paused {formatRelativeTime(d.paused_at)}</span>}
             </p>

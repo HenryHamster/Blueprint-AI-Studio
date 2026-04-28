@@ -68,7 +68,8 @@ function monitoringDuration(since: string): string {
   return formatDurationSec(Math.floor((Date.now() - parseTimestamp(since).getTime()) / 1000));
 }
 
-const COST_WARN_THRESHOLD = 0.8;
+const COST_AMBER_THRESHOLD = 0.6;
+const COST_RED_THRESHOLD = 0.9;
 
 export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsConnected, lastFetchTime, tasks, pipelineThrottle }: OrchestratorHealthBarProps) {
   const [now, setNow] = useState(() => Date.now());
@@ -431,27 +432,36 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
           </>
         )}
 
-        {(() => {
-          if (!dailyCostCeilingUsd || dailyCostCeilingUsd <= 0 || dailyCostUsd == null) return null;
-          const ratio = dailyCostUsd / dailyCostCeilingUsd;
-          if (ratio < COST_WARN_THRESHOLD) return null;
-          const pct = Math.round(ratio * 100);
-          const over = ratio >= 1;
-          return (
-            <>
-              <div className="w-px h-3 bg-neutral-800 shrink-0" />
-              <button
-                type="button"
-                className={`inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded cursor-pointer ${over ? 'bg-red-900/40 text-red-400' : 'bg-amber-900/40 text-amber-400'}`}
-                title={`Daily cost: $${dailyCostUsd.toFixed(2)} / $${dailyCostCeilingUsd.toFixed(2)} ceiling (${pct}%). Click to view cost section.`}
-                onClick={() => { document.getElementById('cost-section')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }}
-              >
-                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${over ? 'bg-red-500 animate-pulse' : 'bg-amber-400 animate-pulse'}`} />
-                Cost: {pct}%{over ? ' ⚠' : ''}
-              </button>
-            </>
-          );
-        })()}
+        {dailyCostUsd != null && (
+          <>
+            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            {(() => {
+              const hasCeiling = dailyCostCeilingUsd > 0;
+              const ratio = hasCeiling ? dailyCostUsd / dailyCostCeilingUsd : 0;
+              const isRed = hasCeiling && ratio >= COST_RED_THRESHOLD;
+              const isAmber = hasCeiling && !isRed && ratio >= COST_AMBER_THRESHOLD;
+              const dotColor = isRed ? 'bg-red-500 animate-pulse' : isAmber ? 'bg-amber-400' : 'bg-neutral-500';
+              const textColor = isRed ? 'text-red-400' : isAmber ? 'text-amber-400' : 'text-neutral-400';
+              const label = hasCeiling
+                ? `$${dailyCostUsd.toFixed(2)} / $${dailyCostCeilingUsd.toFixed(2)}`
+                : `$${dailyCostUsd.toFixed(2)}`;
+              const titleText = hasCeiling
+                ? `Daily cost: $${dailyCostUsd.toFixed(2)} / $${dailyCostCeilingUsd.toFixed(2)} ceiling (${Math.round(ratio * 100)}%). Click to view cost section.`
+                : `Daily cost: $${dailyCostUsd.toFixed(2)}. Click to view cost section.`;
+              return (
+                <button
+                  type="button"
+                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-xs rounded cursor-pointer ${isRed ? 'bg-red-900/40' : isAmber ? 'bg-amber-900/40' : ''}`}
+                  title={titleText}
+                  onClick={() => { document.getElementById('cost-section')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
+                  <span className={textColor}>{label}{isRed && ratio >= 1 ? ' ⚠' : ''}</span>
+                </button>
+              );
+            })()}
+          </>
+        )}
       </div>
 
       {/* Right: stale heartbeats + last update */}
