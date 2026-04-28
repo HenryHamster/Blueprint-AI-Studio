@@ -1,4 +1,8 @@
-"""Unit tests for rollup_state pure dict helpers."""
+"""Unit tests for rollup_state pure dict helpers and rollup PR body builder."""
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+from app.rollup_management import _build_rollup_pr_body
 from app.rollup_state import (
     _ROLLUP_TRANSIENT_CTX_KEYS,
     _clear_rollup_transient_state,
@@ -83,3 +87,59 @@ class TestIsRollupParentAwaitingMerge:
             )
             is True
         )
+
+
+class TestBuildRollupPrBody:
+    def _make_child(self, task_type: str, spot: bool = True, seconds: float | None = None):
+        from datetime import timedelta
+        prov = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc) if seconds is not None else None
+        stop = (datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=seconds)) if seconds is not None else None
+        return SimpleNamespace(
+            payloads=[{"type": task_type}],
+            vm_spot=spot,
+            vm_provisioned_at=prov,
+            vm_stopped_at=stop,
+        )
+
+    def test_minimal_body_has_required_sections(self):
+        body = _build_rollup_pr_body(3, "rollup/abc")
+        assert "Rollup of 3 subtasks from `rollup/abc`" in body
+        assert "*Automated by Blueprint Pipeline*" in body
+
+    def test_direction_line_included_when_provided(self):
+        body = _build_rollup_pr_body(2, "rollup/xyz", direction_id="abcd1234", direction_title="My Direction")
+        assert "**Direction:** My Direction `abcd1234`" in body
+
+    def test_direction_id_truncated_to_8_chars(self):
+        body = _build_rollup_pr_body(1, "rollup/x", direction_id="abcdef1234567890")
+        assert "`abcdef12`" in body
+
+    def test_task_type_breakdown_from_children(self):
+        children = [
+            self._make_child("create"),
+            self._make_child("create"),
+            self._make_child("fix"),
+        ]
+        body = _build_rollup_pr_body(3, "rollup/x", children=children)
+        assert "**Tasks:**" in body
+        assert "2 create" in body
+        assert "1 fix" in body
+
+    def test_cost_line_present_when_timing_available(self):
+        children = [self._make_child("create", spot=True, seconds=3600)]
+        body = _build_rollup_pr_body(1, "rollup/x", children=children)
+        assert "**Estimated cost:**" in body
+        assert "$" in body
+
+    def test_no_cost_line_when_no_timing(self):
+        children = [self._make_child("create", seconds=None)]
+        body = _build_rollup_pr_body(1, "rollup/x", children=children)
+        assert "Estimated cost" not in body
+
+    def test_rollup_note_included(self):
+        body = _build_rollup_pr_body(2, "rollup/x", "\n\n*1 subtask(s) failed.*")
+        assert "*1 subtask(s) failed.*" in body
+
+    def test_footer_always_last_line(self):
+        body = _build_rollup_pr_body(1, "rollup/x", direction_title="D", direction_id="aaa")
+        assert body.strip().endswith("*Automated by Blueprint Pipeline*")

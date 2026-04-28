@@ -1620,8 +1620,17 @@ async def trigger_rollup(
         select(Task).where(Task.parent_task_id == task.id)
     )).scalars().all()
 
+    from app.rollup_management import _build_rollup_pr_body  # noqa: PLC0415
     pr_title = f"[Blueprint] Rollup: {task.title}"
-    pr_body = f"Rollup of {len(children)} subtasks from `{staging_branch}`\n\n---\n*Automated by Blueprint Pipeline*"
+    _dir_id = task.first_payload.get("current_direction_id") or ctx.get("direction_id")
+    _dir_title = ctx.get("direction_title") or task.title
+    pr_body = _build_rollup_pr_body(
+        len(children),
+        staging_branch,
+        direction_id=str(_dir_id) if _dir_id else None,
+        direction_title=_dir_title,
+        children=list(children),
+    )
 
     pr_result = await create_pull_request(gh_token, owner, repo,
         title=pr_title, head=staging_branch, base=target_branch, body=pr_body)

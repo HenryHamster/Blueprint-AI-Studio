@@ -434,4 +434,62 @@ describe('DashboardHome', () => {
     await user.click(await screen.findByText('Stuck: Repair failing deployment hook'));
     expect(onViewTask).toHaveBeenCalledWith(stuckTask);
   });
+
+  describe('CPM retirement-risk indicator', () => {
+    const baseDirection = {
+      direction_id: 'dir-cpm',
+      direction_text: 'Expensive direction',
+      priority: 'medium',
+      cycles_in_window: 2,
+      tasks_created: 5,
+      prs_merged: 2,
+      possibly_saturated: false,
+    };
+
+    it('shows warning indicator when cost_per_merge_exceeds_threshold is true', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 0,
+          pending_approval_count: 0,
+          completed_count: 0,
+          failure_groups: [],
+          recent_completions: [],
+          median_cost_per_merged_pr: 3.50,
+          direction_progress: [
+            { ...baseDirection, cost_per_merged_pr: 12.75, cost_per_merge_exceeds_threshold: true },
+          ],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      const pill = await screen.findByTitle(/Cost per merged PR exceeds threshold/);
+      expect(pill).toBeInTheDocument();
+      expect(pill.textContent).toContain('$12.75/PR');
+      expect(pill.title).toContain('project median: $3.50');
+    });
+
+    it('does not show warning indicator when cost_per_merge_exceeds_threshold is false', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 0,
+          pending_approval_count: 0,
+          completed_count: 0,
+          failure_groups: [],
+          recent_completions: [],
+          median_cost_per_merged_pr: 3.50,
+          direction_progress: [
+            { ...baseDirection, cost_per_merged_pr: 2.10, cost_per_merge_exceeds_threshold: false },
+          ],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText(/\$2\.10\/PR/);
+      expect(screen.queryByTitle(/Cost per merged PR exceeds threshold/)).not.toBeInTheDocument();
+    });
+  });
 });

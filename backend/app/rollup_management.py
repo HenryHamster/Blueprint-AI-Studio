@@ -321,6 +321,59 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
         except Exception as e:  # noqa: PERF203 — per-branch try is required so one delete failure doesn't abort the rest
             logger.warning(f"[CLEANUP] Failed to delete {branch}: {e}", exc_info=True)
 
+def _build_rollup_pr_body(
+    task_count: int,
+    staging_branch: str,
+    rollup_note: str = "",
+    *,
+    direction_id: str | None = None,
+    direction_title: str | None = None,
+    children: list | None = None,
+) -> str:
+    """Build the Markdown body for a rollup PR.
+
+    Includes direction, task-type breakdown, and aggregate cost when available.
+    """
+    lines: list[str] = [f"Rollup of {task_count} subtasks from `{staging_branch}`"]
+
+    if direction_title or direction_id:
+        dir_label = (direction_title or "")[:80]
+        dir_suffix = f" `{direction_id[:8]}`" if direction_id else ""
+        lines.append("")
+        lines.append(f"**Direction:** {dir_label}{dir_suffix}")
+
+    if children:
+        from collections import Counter  # noqa: PLC0415
+        type_counts: Counter = Counter()
+        total_cost: float = 0.0
+        has_cost = False
+        for c in children:
+            payloads = getattr(c, "payloads", None) or []
+            t = payloads[0].get("type", "create") if payloads else "create"
+            type_counts[t] += 1
+            prov_at = getattr(c, "vm_provisioned_at", None)
+            stop_at = getattr(c, "vm_stopped_at", None)
+            if prov_at and stop_at:
+                from app.admin import SPOT_RATE, ON_DEMAND_RATE  # noqa: PLC0415
+                rate = SPOT_RATE if getattr(c, "vm_spot", False) else ON_DEMAND_RATE
+                total_cost += (stop_at - prov_at).total_seconds() * rate
+                has_cost = True
+        if type_counts:
+            breakdown = ", ".join(f"{cnt} {typ}" for typ, cnt in sorted(type_counts.items()))
+            lines.append("")
+            lines.append(f"**Tasks:** {breakdown}")
+        if has_cost:
+            lines.append(f"**Estimated cost:** ~${total_cost:.2f}")
+
+    if rollup_note:
+        lines.append(rollup_note)
+
+    lines.append("")
+    lines.append("---")
+    lines.append("*Automated by Blueprint Pipeline*")
+    return "\n".join(lines)
+
+
 async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> None:
     """Check if all siblings are done and trigger rollup PR for the parent.
 
@@ -801,7 +854,17 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     logger.info(f"[ROLLUP] Resuming with existing PR #{rollup_pr_number}")
                 else:
                     pr_title = f"[Blueprint] Rollup: {parent.title}"
-                    pr_body = f"Rollup of {completed_count} subtasks from `{staging_branch}`{rollup_note}\n\n---\n*Automated by Blueprint Pipeline*"
+                    _dir_id = parent.first_payload.get("current_direction_id") or parent_ctx.get("direction_id")
+                    _dir_title = parent_ctx.get("direction_title") or parent.title
+                    _completed_children = [c for c in children if c.status == TaskStatus.COMPLETED]
+                    pr_body = _build_rollup_pr_body(
+                        completed_count,
+                        staging_branch,
+                        rollup_note,
+                        direction_id=str(_dir_id) if _dir_id else None,
+                        direction_title=_dir_title,
+                        children=_completed_children,
+                    )
 
                     pr_result = await create_pull_request(gh_token, owner, repo,
                         title=pr_title, head=staging_branch, base=target_branch, body=pr_body, project_id=str(parent.project_id))

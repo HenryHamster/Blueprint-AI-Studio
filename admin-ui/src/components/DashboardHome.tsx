@@ -57,6 +57,7 @@ interface DirectionProgress {
   budget_utilization_pct?: number | null;
   budget_exceeded?: boolean;
   cost_per_merged_pr?: number | null;
+  cost_per_merge_exceeds_threshold?: boolean | null;
   avg_time_to_merge_hours?: number | null;
   cost_by_scope?: Record<string, number> | null;
   cost_by_type?: Record<string, number> | null;
@@ -205,6 +206,7 @@ interface DigestData {
     first_attempt_by_review_category?: Record<string, number> | null;
     [key: string]: unknown;
   } | null;
+  median_cost_per_merged_pr?: number | null;
 }
 
 
@@ -1057,7 +1059,14 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                             <CostBreakdownPill direction={d} />
                           )}
                           {d.cost_per_merged_pr != null && (
-                            <span className="text-neutral-400" title="Cost per merged PR">${d.cost_per_merged_pr.toFixed(2)}/PR</span>
+                            <span
+                              className={d.cost_per_merge_exceeds_threshold ? 'text-red-400 font-semibold' : 'text-neutral-400'}
+                              title={d.cost_per_merge_exceeds_threshold
+                                ? `Cost per merged PR exceeds threshold${digest?.median_cost_per_merged_pr != null ? ` (project median: $${digest.median_cost_per_merged_pr.toFixed(2)})` : ''}`
+                                : 'Cost per merged PR'}
+                            >
+                              {d.cost_per_merge_exceeds_threshold && <span className="mr-0.5">⚠</span>}${d.cost_per_merged_pr.toFixed(2)}/PR
+                            </span>
                           )}
                           {d.avg_time_to_merge_hours != null && (
                             <span className={d.avg_time_to_merge_hours < 2 ? 'text-emerald-400' : d.avg_time_to_merge_hours <= 6 ? 'text-amber-400' : 'text-red-400'} title="Average time from VM start to PR merge">{d.avg_time_to_merge_hours.toFixed(1)}h avg merge</span>

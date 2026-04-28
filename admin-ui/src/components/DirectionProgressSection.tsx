@@ -23,6 +23,7 @@ export interface DirectionProgress {
   first_attempt_success_rate?: number | null;
   quality_score?: number | null;
   cost_per_merged_pr?: number | null;
+  cost_per_merge_exceeds_threshold?: boolean | null;
   estimated_cost_usd?: number | null;
   cost_by_scope?: Record<string, number> | null;
   cost_by_type?: Record<string, number> | null;
@@ -85,7 +86,7 @@ type DirectionSortKey = 'default' | 'acceptance_asc' | 'cost_desc' | 'first_atte
 
 const DIRECTION_SORT_STORAGE_KEY = 'catchup.directionProgress.sort';
 
-export function DirectionProgressSection({ directions }: { directions: DirectionProgress[] }) {
+export function DirectionProgressSection({ directions, medianCostPerMergedPr }: { directions: DirectionProgress[]; medianCostPerMergedPr?: number | null }) {
   const [expandedDirections, setExpandedDirections] = useState<Set<string>>(new Set());
   const [sortKey, setSortKey] = useState<DirectionSortKey>(() => {
     if (typeof window === 'undefined') return 'default';
@@ -225,8 +226,13 @@ export function DirectionProgressSection({ directions }: { directions: Direction
                   </span>
                 )}
                 {typeof dp.cost_per_merged_pr === 'number' && dp.cost_per_merged_pr > 0 && (
-                  <span className="text-[9px] bg-neutral-700/30 text-neutral-400 border border-neutral-700/30 px-1.5 py-0.5 rounded font-mono" title="Average cost per merged PR">
-                    ${dp.cost_per_merged_pr.toFixed(2)}/PR
+                  <span
+                    className={`text-[9px] px-1.5 py-0.5 rounded font-mono border ${dp.cost_per_merge_exceeds_threshold ? 'bg-red-900/30 text-red-400 border-red-500/30' : 'bg-neutral-700/30 text-neutral-400 border-neutral-700/30'}`}
+                    title={dp.cost_per_merge_exceeds_threshold
+                      ? `Cost per merged PR exceeds threshold${medianCostPerMergedPr != null ? ` (project median: $${medianCostPerMergedPr.toFixed(2)})` : ''}`
+                      : 'Average cost per merged PR'}
+                  >
+                    {dp.cost_per_merge_exceeds_threshold && '⚠ '}${dp.cost_per_merged_pr.toFixed(2)}/PR
                   </span>
                 )}
                 {typeof dp.avg_time_to_merge_hours === 'number' && dp.avg_time_to_merge_hours > 0 && (

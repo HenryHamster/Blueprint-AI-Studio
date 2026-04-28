@@ -317,6 +317,7 @@ interface DigestData {
     }>;
     diagnosis_drop_off_by_reason?: Record<string, number>;
   } | null;
+  median_cost_per_merged_pr?: number | null;
 }
 
 export interface CatchUpPanelProps {
@@ -1090,7 +1091,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
 
               {/* Direction progress */}
               {digest!.direction_progress && digest!.direction_progress.length > 0 && (
-                <DirectionProgressSection directions={digest!.direction_progress} />
+                <DirectionProgressSection directions={digest!.direction_progress} medianCostPerMergedPr={digest!.median_cost_per_merged_pr} />
               )}
 
               {/* Needs attention */}
