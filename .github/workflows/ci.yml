@@ -164,16 +164,32 @@ jobs:
         id: run_tests
         continue-on-error: true
         run: |
+          # On main pushes only: enable testmon collection in-line so we
+          # don't have to re-run the suite a second time to refresh the
+          # cache. testmon's coverage tracing adds ~10-30% per-test
+          # overhead, so we bump the timeout from 30→45s and skip the
+          # tracing entirely on PR runs (where the cache is discarded).
+          EXTRA_DOCKER_ARGS=""
+          EXTRA_PYTEST_ARGS=""
+          TIMEOUT=30
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            mkdir -p .testmon-out
+            EXTRA_DOCKER_ARGS="-v $PWD/.testmon-out:/out -e TESTMON_DATAFILE=/out/.testmondata"
+            EXTRA_PYTEST_ARGS="--testmon-noselect"
+            TIMEOUT=45
+          fi
           # Disable -e so pytest's non-zero exit doesn't short-circuit the failure-extraction
           # below. We propagate pytest's exit code at the end via $pytest_status.
           set +e
+          # shellcheck disable=SC2086 # intentional word-split on EXTRA_*_ARGS
           docker run --rm --network host \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
             -e USE_TEST_POSTGRES=true \
             -e AGENT_JWT_SECRET=ci-test-secret \
             -e WS_TICKET_SECRET=ci-test-secret \
+            $EXTRA_DOCKER_ARGS \
             blueprint-backend-test \
-            python -m pytest testing/ -v --tb=short --timeout=30 --timeout-method=signal --log-cli-level=WARNING 2>&1 | tee test-output.txt
+            python -m pytest testing/ -v --tb=short --timeout=$TIMEOUT --timeout-method=signal --log-cli-level=WARNING $EXTRA_PYTEST_ARGS 2>&1 | tee test-output.txt
           pytest_status=${PIPESTATUS[0]}
           set -e
 
@@ -276,25 +292,17 @@ jobs:
           fi
           echo "Migration linter passed"
 
-      # Refresh the testmon dependency cache from main. Agent VMs and local
-      # devs pull this via `git fetch origin testmon-cache` in test-backend.sh,
-      # which lets pytest --testmon-forceselect skip tests whose dependency
-      # hashes are unchanged. Runs only on main push + only after a green
-      # test run, so a partial / broken cache never lands.
-      - name: Refresh testmon cache
+      # The Run tests step above already populated .testmon-out/.testmondata
+      # via --testmon-noselect (main pushes only). Vacuum it so the file
+      # checked into the orphan branch is the compact post-WAL-checkpoint
+      # version, not the larger transient form.
+      - name: Vacuum testmon cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.run_tests.outcome == 'success'
         run: |
-          mkdir -p .testmon-out
-          docker run --rm --network host \
-            -e DATABASE_URL=${{ env.TEST_DB_URL }} \
-            -e USE_TEST_POSTGRES=true \
-            -e AGENT_JWT_SECRET=ci-test-secret \
-            -e WS_TICKET_SECRET=ci-test-secret \
+          docker run --rm \
             -v "$PWD/.testmon-out:/out" \
             blueprint-backend-test \
-            bash -c "python -m pytest testing/ -q --tb=line --timeout=30 --testmon-noselect && \
-                     python -c 'import sqlite3; c = sqlite3.connect(\"/app/.testmondata\"); c.execute(\"PRAGMA wal_checkpoint(FULL)\"); c.execute(\"VACUUM\"); c.close()' && \
-                     cp /app/.testmondata /out/.testmondata"
+            python -c 'import sqlite3; c=sqlite3.connect("/out/.testmondata"); c.execute("PRAGMA wal_checkpoint(FULL)"); c.execute("VACUUM"); c.close()'
           ls -lh .testmon-out/.testmondata
 
       - name: Push testmon cache to orphan branch
