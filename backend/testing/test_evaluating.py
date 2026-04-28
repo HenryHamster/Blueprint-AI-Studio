@@ -287,10 +287,10 @@ async def test_evaluating_ci_backstop_fires_when_ci_wait_started_old(eval_db, mo
     await eval_db.commit()
     await eval_db.refresh(parent)
 
-    # CI wait started 45 minutes ago — over the 30-min backstop.
-    ci_wait_started = _naive_utc_ago(minutes=45)
+    # CI wait started 90 minutes ago — over the 60-min backstop default.
+    ci_wait_started = _naive_utc_ago(minutes=90)
     parent.status_log = [
-        {"t": _naive_utc_ago(minutes=60).isoformat(),
+        {"t": _naive_utc_ago(minutes=120).isoformat(),
          "msg": "Status changed: COMPLETED → EVALUATING"}
     ]
     parent.context = {
@@ -782,9 +782,9 @@ async def test_backstop_reason_names_review_when_ci_passed(eval_db, mocker):
     await eval_db.commit()
     await eval_db.refresh(parent)
 
-    ci_wait_started = _naive_utc_ago(minutes=60)  # well past the 30-min backstop
+    ci_wait_started = _naive_utc_ago(minutes=90)  # well past the 60-min backstop default
     parent.status_log = [{
-        "t": _naive_utc_ago(minutes=75).isoformat(),
+        "t": _naive_utc_ago(minutes=120).isoformat(),
         "msg": "Status changed: IN_PROGRESS → EVALUATING",
     }]
     parent.context = {
@@ -852,9 +852,9 @@ async def test_backstop_spawns_recovery_review_once(eval_db, mocker):
     await eval_db.commit()
     await eval_db.refresh(parent)
 
-    ci_wait_started = _naive_utc_ago(minutes=45)
+    ci_wait_started = _naive_utc_ago(minutes=90)
     parent.status_log = [{
-        "t": _naive_utc_ago(minutes=60).isoformat(),
+        "t": _naive_utc_ago(minutes=120).isoformat(),
         "msg": "Status changed: IN_PROGRESS → EVALUATING",
     }]
     parent.context = {

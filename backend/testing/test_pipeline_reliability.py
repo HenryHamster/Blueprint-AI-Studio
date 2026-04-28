@@ -1784,8 +1784,8 @@ async def test_ci_waiting_backstop_timeout_fails_stuck_task(eval_db, mocker):
     await eval_db.commit()
     await eval_db.refresh(task)
 
-    # Set task to appear 35 minutes into EVALUATING (> 30-min backstop)
-    evaluating_since = _naive_utc_ago(minutes=35)
+    # Set task to appear 90 minutes into EVALUATING (> 60-min backstop default)
+    evaluating_since = _naive_utc_ago(minutes=90)
     task.status_log = [
         {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
     ]
@@ -1798,7 +1798,7 @@ async def test_ci_waiting_backstop_timeout_fails_stuck_task(eval_db, mocker):
     await eval_db.refresh(task)
     assert task.status == TaskStatus.FAILED, (
         f"Expected CI-waiting task with missing ci_wait_started to be FAILED after "
-        f"30-min backstop, got {task.status}"
+        f"backstop, got {task.status}"
     )
     assert "backstop" in (task.latest_status_message or "").lower(), (
         f"Expected 'backstop' in status message, got: {task.latest_status_message!r}"
@@ -1866,7 +1866,7 @@ async def test_backstop_message_accurate_when_ci_wait_started_present(eval_db, m
     await eval_db.refresh(project)
 
     # CI-waiting task with VALID ci_wait_started in review_loop
-    ci_started = _naive_utc_ago(minutes=35).isoformat()
+    ci_started = _naive_utc_ago(minutes=90).isoformat()
     task = Task(
         project_id=project.id,
         payloads=[{"type": "review", "prompt": "backstop message test"}],
@@ -1881,8 +1881,8 @@ async def test_backstop_message_accurate_when_ci_wait_started_present(eval_db, m
     await eval_db.commit()
     await eval_db.refresh(task)
 
-    # 35 minutes into EVALUATING (> 30-min backstop)
-    evaluating_since = _naive_utc_ago(minutes=35)
+    # 90 minutes into EVALUATING (> 60-min backstop default)
+    evaluating_since = _naive_utc_ago(minutes=90)
     task.status_log = [
         {"t": evaluating_since.isoformat(), "msg": "Status changed: IN_PROGRESS → EVALUATING"}
     ]
