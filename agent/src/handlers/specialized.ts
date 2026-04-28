@@ -746,3 +746,127 @@ IMPORTANT:
     logs,
   });
 }
+
+// ── Handler: Self Audit (score system maturity, output findings JSON) ────────
+export async function handleSelfAudit(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+) {
+  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
+
+  statusRef.value = `Cloning ${owner}/${repo} for self audit...`;
+  sendLog(ws, `Starting self audit...\n`);
+  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
+  const disallowedTools = configureAgentPermissions('self_audit');
+
+  const contextPrefix = buildContextPrefix(task);
+  const claudeMd = readClaudeMd();
+  const codebaseSummary = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const fileTreeSection = buildFileTree(ws);
+  const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
+  const retryContext = buildRetryContext(task);
+  const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
+
+  const focusSystemsRaw = Array.isArray(payload.focus_systems) ? (payload.focus_systems as unknown[]) : [];
+  const focusSystems = focusSystemsRaw.filter((s): s is string => typeof s === 'string' && s.length > 0);
+  const maxSystemsRaw = typeof payload.max_systems === 'number' && Number.isFinite(payload.max_systems)
+    ? Math.floor(payload.max_systems as number)
+    : 3;
+  const maxSystems = Math.max(1, Math.min(maxSystemsRaw, 10));
+
+  const focusSection = focusSystems.length > 0
+    ? `Audit ONLY these systems (use these exact system_id values in output): ${JSON.stringify(focusSystems)}\n\n`
+    : `No focus_systems provided. Pick up to ${maxSystems} systems to audit by reading the project design_doc and direction system_id values (round-robin across systems not recently audited). Use the discovered system_id verbatim in output.\n\n`;
+
+  const selfAuditPrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}${focusSection}You are a self-audit agent. You have full read access to this repository. Your job is to score the maturity of one or more systems on four objective signals and output a structured findings report.
+
+For each system, score four components (each 0-100, where 100 is healthy and 0 is broken):
+
+1. **test_coverage** — Are there tests covering the system's core paths? Look at tests directories, count test files mentioning the system, check whether key modules have direct test coverage. Low score: little or no test coverage. High score: each module has direct, runnable tests.
+
+2. **friction_density** — How often does work in this system get stuck? Inspect recent task history (titles, status_log, retry counts in payloads/context) and recent git history. Low score: many recurring failures, retries, or aborts in this area. High score: tasks in this system flow through without recurring blockers.
+
+3. **claim_consistency** — Does what shipped actually match what was claimed? Compare recent task summaries / PR descriptions against the diffs that were merged. Low score: PR titles/summaries do not match what the diff actually does (drift). High score: claims and shipped diffs are consistent.
+
+4. **failure_mix** — What is the failure-class mix in this area? Look at recent FAILED tasks scoped to this system. Low score: heavy CODE_ERROR / parse_failed / auto-remediation churn. High score: most failures are recoverable / transient.
+
+Then assign an overall \`score\` (0-100) and a \`recommended_mode\` based on the worst components:
+- \`audit\` — score < 40 in any component, system is silently broken; pause feature work and investigate
+- \`fundamentals\` — score 40-70, system is functioning but accumulating friction; prioritize structural cleanup over new features
+- \`ship\` — score >= 70, system is healthy; continue feature work
+- \`pause\` — pipeline-wide hold (use sparingly when the audit cannot make a confident assessment)
+
+Output a single JSON object as the VERY LAST thing in your response with this exact shape:
+
+{
+  "findings": [
+    {
+      "system_id": "exact-system-id-from-design-doc",
+      "score": 72,
+      "components": {
+        "test_coverage": 80,
+        "friction_density": 65,
+        "claim_consistency": 75,
+        "failure_mix": 70
+      },
+      "top_issues": [
+        "One short sentence per issue, max 5 issues"
+      ],
+      "recommended_mode": "fundamentals",
+      "evidence": [
+        {"file": "path/to/file.py", "summary": "What this file shows about the system"}
+      ]
+    }
+  ]
+}
+
+Rules:
+- Every score MUST be an integer in [0, 100]
+- recommended_mode MUST be one of: audit, fundamentals, ship, pause
+- Limit findings to ${maxSystems} systems unless focus_systems was provided (then use all focus_systems)
+- Each finding must cite at least one evidence file from the actual repo
+- IMPORTANT: Write the JSON object to /tmp/self_audit_findings_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.
+- Also output the same JSON object as the final output in your logs.`;
+
+  const buildConfig = resolveBuildConfig(task);
+  const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
+  const typeHints = getTaskTypeHints(buildConfig);
+  const typeHint = typeHints['self_audit'] ? '\n\n' + typeHints['self_audit'] : '';
+  statusRef.value = 'Running self audit...';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+
+  // Parse findings: prefer structured file output, then a {findings:[...]} object
+  // anywhere in the output, then a bare array of findings (wrapped on our side).
+  const handlerOutput = readHandlerOutput<{ findings?: unknown[] } | unknown[]>(taskId, 'self_audit_findings', ws);
+  let logs = '';
+  if (handlerOutput !== null) {
+    logs = sanitize(JSON.stringify(handlerOutput));
+  } else {
+    const haystack = (allOutput || '') + '\n' + (lastResultText || '');
+    const objExtract = extractJsonObjectDetailed<{ findings?: unknown[] }>(haystack, 'findings', 'system_id');
+    if (objExtract.ok) {
+      logs = sanitize(JSON.stringify(objExtract.value));
+    } else {
+      const arrExtract = extractJsonArrayDetailed(haystack, 'system_id');
+      if (arrExtract.ok) {
+        logs = sanitize(JSON.stringify({ findings: arrExtract.value }));
+      } else {
+        sendLog(ws, `[WARNING] Could not extract self audit findings JSON: ${describeJsonExtractionResult(objExtract)}\n`);
+        logs = sanitize(lastResultText || allOutput.slice(-50_000));
+      }
+    }
+  }
+
+  await persistAndPostStatus(taskId, {
+    task_id: taskId,
+    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
+    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' } : { artifact_type: 'SELF_AUDIT_REPORT' }),
+    logs,
+  });
+}

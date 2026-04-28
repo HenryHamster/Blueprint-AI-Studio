@@ -1043,3 +1043,184 @@ class TestDirectionPredictionCalibration:
         assert out["created"][0]["prediction"]["estimated_difficulty"] == "high"
         assert out["created"][0]["calibration_delta"] == 3
         assert out["retired"][0]["final_metrics"]["final_cycles_active"] == 5
+
+
+# ── recommended_mode normalization + persistence ─────────────────────────────
+
+class TestRecommendedModeNormalization:
+    """The strategic agent emits `recommended_mode` on direction operations.
+
+    Only canonical values are persisted to project.directions records; unknown
+    or non-string values are dropped silently (the field is optional so unknown
+    values must never block direction-op application)."""
+
+    def test_normalize_canonical_modes(self):
+        from app.strategic_completion import _normalize_recommended_mode
+        for value in ("audit", "fundamentals", "ship", "pause"):
+            assert _normalize_recommended_mode(value) == value
+            assert _normalize_recommended_mode(value.upper()) == value
+            assert _normalize_recommended_mode(f"  {value}  ") == value
+
+    def test_normalize_rejects_unknown(self):
+        from app.strategic_completion import _normalize_recommended_mode
+        for value in ("nonsense", "", "audit_now", None, 42, []):
+            assert _normalize_recommended_mode(value) is None
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_persists_recommended_mode_on_create(db_session, mocker):
+    """Direction-op `create` with `recommended_mode='audit'` persists that
+    value on the new direction record inside project.directions."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review",
+                   "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [
+            {
+                "op": "create",
+                "text": "Audit the auth module",
+                "priority": "high",
+                "rationale": "stale tests",
+                "system_id": "auth",
+                "recommended_mode": "audit",
+            },
+        ],
+    })
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    new_dirs = [d for d in (project.directions or [])
+                if d.get("text") == "Audit the auth module"]
+    assert len(new_dirs) == 1
+    assert new_dirs[0].get("recommended_mode") == "audit", (
+        f"Expected recommended_mode='audit' on created direction; "
+        f"got {new_dirs[0].get('recommended_mode')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_persists_recommended_mode_on_update(db_session, mocker):
+    """Direction-op `update` with `recommended_mode` updates the existing
+    direction's record."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {"id": "d-upd1", "text": "Existing direction", "status": "active",
+             "priority": "medium", "notes": [], "research_history": []},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review",
+                   "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [
+            {
+                "op": "update",
+                "direction_id": "d-upd1",
+                "rationale": "drift detected",
+                "changes": {"recommended_mode": "fundamentals"},
+            },
+        ],
+    })
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-upd1")
+    assert target.get("recommended_mode") == "fundamentals"
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_drops_invalid_recommended_mode(db_session, mocker):
+    """Unknown recommended_mode values are silently dropped on create."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review",
+                   "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [
+            {
+                "op": "create",
+                "text": "A direction",
+                "priority": "medium",
+                "rationale": "x",
+                "recommended_mode": "not-a-canonical-mode",
+            },
+        ],
+    })
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    new_dirs = [d for d in (project.directions or []) if d.get("text") == "A direction"]
+    assert len(new_dirs) == 1
+    # Field should be absent — invalid mode is silently dropped.
+    assert "recommended_mode" not in new_dirs[0]

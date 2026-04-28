@@ -1013,6 +1013,7 @@ async def _process_post_commit(
     from app.task_completion import (
         _handle_plan_completion, _handle_design_doc_completion,
         _handle_security_audit_completion, _handle_perf_completion,
+        _handle_self_audit_completion,
         _handle_investigation_completion, _record_remediation_if_terminal,
         _handle_investigation_terminal_failure, _record_regression_signal_if_matching,
     )
@@ -2429,6 +2430,10 @@ async def _process_post_commit(
                 elif task_type == "perf":
                     perf_logs = payload.logs or task.latest_status_message or ""
                     await _handle_perf_completion(task, perf_logs, session)
+
+                elif task_type == "self_audit":
+                    self_audit_logs = payload.logs or task.latest_status_message or ""
+                    await _handle_self_audit_completion(task, self_audit_logs, session)
 
                 elif payload.artifact_type == ArtifactType.INVESTIGATION_REPORT:
                     await _handle_investigation_completion(task, payload, session)

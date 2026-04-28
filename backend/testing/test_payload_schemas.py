@@ -36,11 +36,11 @@ def _invalid(raw: dict) -> str:
 EXPECTED_TYPES = {
     "create", "review", "fix", "plan", "research", "strategic_review",
     "design_doc_update", "security_audit", "qa", "deps", "docs", "migrate",
-    "smoketest", "refactor", "debug", "perf", "investigate",
+    "smoketest", "refactor", "debug", "perf", "investigate", "self_audit",
 }
 
 
-def test_task_type_enum_has_all_17_types():
+def test_task_type_enum_has_all_18_types():
     values = {t.value for t in TaskType}
     assert values == EXPECTED_TYPES
 
@@ -55,9 +55,9 @@ def test_model_for_type_covers_all_task_types():
     assert set(_MODEL_FOR_TYPE.keys()) == set(TaskType)
 
 
-def test_model_for_type_count_is_17():
+def test_model_for_type_count_is_18():
     from app.payload_schemas import _MODEL_FOR_TYPE
-    assert len(_MODEL_FOR_TYPE) == 17
+    assert len(_MODEL_FOR_TYPE) == 18
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ def test_fix_passes():
 
 @pytest.mark.parametrize("task_type", [
     "debug", "research", "strategic_review", "design_doc_update",
-    "security_audit", "qa", "deps", "docs", "smoketest", "perf",
+    "security_audit", "qa", "deps", "docs", "smoketest", "perf", "self_audit",
 ])
 def test_system_populated_types_pass_with_no_extra_fields(task_type):
     result = _valid({"type": task_type})
@@ -648,3 +648,87 @@ def test_validate_internal_payload_swallows_schema_errors():
     raw = {"type": "create"}
     result = validate_internal_payload(raw, context="test")
     assert result == raw  # returns original dict unchanged
+
+
+# ---------------------------------------------------------------------------
+# SelfAuditPayload
+# ---------------------------------------------------------------------------
+
+def test_self_audit_passes_with_no_fields():
+    result = _valid({"type": "self_audit"})
+    assert result["type"] == "self_audit"
+    assert "prompt" not in result
+    assert "focus_systems" not in result
+    assert "max_systems" not in result
+
+
+def test_self_audit_prompt_accepted():
+    result = _valid({"type": "self_audit", "prompt": "Audit the auth subsystem"})
+    assert result["prompt"] == "Audit the auth subsystem"
+
+
+def test_self_audit_focus_systems_accepted():
+    result = _valid({"type": "self_audit", "focus_systems": ["auth", "billing"]})
+    assert result["focus_systems"] == ["auth", "billing"]
+
+
+def test_self_audit_max_systems_accepted():
+    result = _valid({"type": "self_audit", "max_systems": 5})
+    assert result["max_systems"] == 5
+
+
+def test_self_audit_all_optional_fields_accepted():
+    raw = {
+        "type": "self_audit",
+        "prompt": "Full audit",
+        "focus_systems": ["sys-a", "sys-b"],
+        "max_systems": 3,
+    }
+    result = _valid(raw)
+    assert result["prompt"] == "Full audit"
+    assert result["focus_systems"] == ["sys-a", "sys-b"]
+    assert result["max_systems"] == 3
+
+
+def test_self_audit_focus_systems_wrong_type_rejected():
+    msg = _invalid({"type": "self_audit", "focus_systems": "not-a-list"})
+    assert "self_audit" in msg
+
+
+def test_self_audit_max_systems_wrong_type_rejected():
+    msg = _invalid({"type": "self_audit", "max_systems": "five"})
+    assert "self_audit" in msg
+
+
+def test_self_audit_oversized_payload_raises():
+    big_blob = {"data": ["x" * 100] * 5000}
+    raw = {"type": "self_audit", "prompt": "x", "extra_blob": big_blob}
+    with pytest.raises(PayloadTooLargeError):
+        validate_task_payload(raw)
+
+
+# ---------------------------------------------------------------------------
+# SystemMaturity ORM constraint
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_system_maturity_unique_constraint_project_system(db_session):
+    """Two SystemMaturity rows with the same (project_id, system_id) must violate the unique constraint."""
+    from sqlalchemy.exc import IntegrityError
+    from app.models import SystemMaturity
+    from testing.factories import make_project
+
+    project = make_project(name="Maturity Constraint Test", user_id="test-user-maturity")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    system_id = "sys-unique-constraint-check"
+    row1 = SystemMaturity(project_id=project.id, system_id=system_id, score=80, recommended_mode="ship")
+    db_session.add(row1)
+    await db_session.commit()
+
+    row2 = SystemMaturity(project_id=project.id, system_id=system_id, score=50, recommended_mode="audit")
+    db_session.add(row2)
+    with pytest.raises(IntegrityError):
+        await db_session.commit()

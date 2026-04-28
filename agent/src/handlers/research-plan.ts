@@ -1009,6 +1009,53 @@ ${hotspotsSection}
       ? JSON.stringify(vision, null, 2)
       : '';
 
+    // Mode-awareness signals: system maturity snapshots + short-window drift
+    const systemMaturity = Array.isArray(payload.system_maturity)
+      ? payload.system_maturity as Array<Record<string, unknown>>
+      : [];
+    const driftSignals = payload.drift_signals && typeof payload.drift_signals === 'object'
+      ? payload.drift_signals as Record<string, unknown>
+      : null;
+
+    let systemMaturitySection = '';
+    if (systemMaturity.length > 0) {
+      const lines: string[] = ['\n## System Maturity'];
+      lines.push('Per-system health snapshots from the last self_audit run. Use these to calibrate which systems need attention vs which can absorb new feature work.');
+      for (const s of systemMaturity) {
+        const sid = strVal(s.system_id as string, '?');
+        const score = typeof s.score === 'number' ? s.score.toFixed(2) : '?';
+        const mode = strVal(s.recommended_mode as string, 'unknown');
+        const audited = strVal(s.last_audited_at as string, 'never');
+        lines.push(`\n### ${sid}  score=${score}  recommended_mode=${mode}  last_audited=${audited}`);
+        if (s.top_issues && Array.isArray(s.top_issues) && (s.top_issues as unknown[]).length > 0) {
+          lines.push('Top issues: ' + (s.top_issues as string[]).join('; '));
+        }
+      }
+      systemMaturitySection = lines.join('\n');
+    }
+
+    let driftSection = '';
+    if (driftSignals) {
+      const byDir = driftSignals.by_direction as Record<string, Record<string, unknown>> | undefined;
+      const bySys = driftSignals.by_system as Record<string, Record<string, unknown>> | undefined;
+      const flaggedDirs = byDir ? Object.entries(byDir).filter(([, sig]) => sig.over_claim_flag || sig.stalled_despite_churn_flag) : [];
+      const flaggedSys = bySys ? Object.entries(bySys).filter(([, sig]) => sig.over_claim_flag || sig.stalled_despite_churn_flag) : [];
+      if (flaggedDirs.length > 0 || flaggedSys.length > 0) {
+        const lines: string[] = ['\n## Drift Signals (short-window claim-vs-shipped consistency)'];
+        lines.push(`Window: ${strVal(driftSignals.window_days as string, '?')} days.`);
+        lines.push('Directions or systems where claimed changes significantly exceed merged PRs — a signal of over-optimistic task output or stalled work.');
+        for (const [did, sig] of flaggedDirs) {
+          const flags = [sig.over_claim_flag ? 'over_claim' : '', sig.stalled_despite_churn_flag ? 'stalled_despite_churn' : ''].filter(Boolean).join(', ');
+          lines.push(`- Direction ${did}: claimed=${sig.claimed_changes_count}, merged=${sig.actually_merged_prs}, consistency=${typeof sig.claim_shipped_consistency === 'number' ? sig.claim_shipped_consistency.toFixed(2) : '?'} [${flags}]`);
+        }
+        for (const [sid, sig] of flaggedSys) {
+          const flags = [sig.over_claim_flag ? 'over_claim' : '', sig.stalled_despite_churn_flag ? 'stalled_despite_churn' : ''].filter(Boolean).join(', ');
+          lines.push(`- System ${sid}: claimed=${sig.claimed_changes_count}, merged=${sig.actually_merged_prs}, consistency=${typeof sig.claim_shipped_consistency === 'number' ? sig.claim_shipped_consistency.toFixed(2) : '?'} [${flags}]`);
+        }
+        driftSection = lines.join('\n');
+      }
+    }
+
     // Build outcome evaluation section
     const outcomeEval = payload.outcome_evaluation as Record<string, unknown> | undefined;
     let outcomeSection = '';
@@ -1645,6 +1692,7 @@ ${dirHealthSummary}
 ${buildUserPausedSection(directionsSummary)}${buildRejectedProposalsSection(Array.isArray(payload.rejected_proposals) ? payload.rejected_proposals as Array<Record<string, unknown>> : [])}
 ## Portfolio Composition
 ${portfolioCompositionText}
+${systemMaturitySection}${driftSection}
 ${recentWorkSection}${feedbackSection}${threadSection}
 # Your job
 
@@ -1674,6 +1722,13 @@ Each cycle:
 **Messages discipline.** Read open messages carefully — they are the user speaking directly. Plan to address each: either by changing the model (and linking \`source.type=user_message\`), or by scheduling resolution. Don't post new status messages — the running_update is your voice to the user. Only post a message when you genuinely cannot proceed without the user (credentials, access, major pivot decisions) — NEVER for "should I do X" coding questions.
 
 **No cap on moves.** Create as many directions as the situation calls for; retire as many as are no longer serving the intent. But every move traces to a gap or to intent.
+
+**Mode-aware prioritization.** The System Maturity and Drift Signals sections above (when present) tell you the health of each system. Use them:
+- \`recommended_mode=audit\` or \`recommended_mode=fundamentals\`: the system's foundations are shaky. Prioritize directions that stabilize, fix, or test it over new feature work. Emit \`recommended_mode: "audit"\` or \`"fundamentals"\` on directions targeting this system.
+- High drift (over_claim or stalled_despite_churn): claimed changes are not reaching merged PRs. Investigate why before creating more directions on the same system.
+- \`recommended_mode=ship\` or absent/unknown: normal mode — ship product value.
+- \`recommended_mode=pause\`: the system is blocked externally; do not add new directions to it this cycle.
+On **every** \`create-direction\` and \`update-direction\` call, emit a \`recommended_mode\` field (one of: \`audit\`, \`fundamentals\`, \`ship\`, \`pause\`) that reflects your judgment for that direction's system. Omit only if the direction has no system affiliation.
 
 ${selfImprovementBlock}
 
@@ -1800,8 +1855,9 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 
 # Direction operations (link each create to a gap_id from the problem_model).
 # conflicts_with: list direction IDs that touch overlapping code/systems — they won't run in parallel.
-./strategic create-direction '{"text": "outcome statement", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "conflicts_with": ["d-xxx"]}'
-./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...]}, "rationale": "..."}'
+# recommended_mode: audit|fundamentals|ship|pause — your judgment for this direction's system health.
+./strategic create-direction '{"text": "outcome statement", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "conflicts_with": ["d-xxx"], "recommended_mode": "ship"}'
+./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...], "recommended_mode": "audit"}, "rationale": "..."}'
 ./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
 
 # Spawn a targeted investigation task (research or plan only) when something

@@ -1,7 +1,8 @@
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
-from sqlalchemy import Boolean, Column, String, Integer, Index, Text, UniqueConstraint, text, event, Enum as SAEnum
+from sqlmodel.sql.sqltypes import GUID
+from sqlalchemy import Boolean, Column, String, Integer, Index, Text, UniqueConstraint, ForeignKey, text, event, Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB
 import logging
 import uuid
@@ -38,6 +39,7 @@ class ArtifactType(str, Enum):
     DEBUG_RESULT = "DEBUG_RESULT"
     PERF_REPORT = "PERF_REPORT"
     INVESTIGATION_REPORT = "INVESTIGATION_REPORT"
+    SELF_AUDIT_REPORT = "SELF_AUDIT_REPORT"
 
 
 class LLMProviderName(str, Enum):
@@ -648,3 +650,61 @@ class Artifact(SQLModel, table=True):
     task: Task = Relationship(back_populates="artifacts")
 
 
+class SystemMaturity(SQLModel, table=True):
+    """Per-system maturity snapshot written by self_audit tasks.
+
+    Keyed on (project_id, system_id) with a unique constraint so upserts are
+    well-defined. system_id is a free-form string that matches direction
+    system_id values stored in the Project.directions JSONB list — no FK into
+    a system catalog is enforced here.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+
+    system_id: str = Field(index=True)
+
+    # 0-100 overall health score; validated at ingest, not enforced by a DB check constraint.
+    score: int
+
+    # Per-component breakdown, e.g. {test_coverage, friction_density, claim_consistency, failure_mix}
+    components: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+
+    # audit | fundamentals | ship | pause — validated at ingest
+    recommended_mode: Optional[str] = None
+
+    top_issues: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+
+    # Citations / file pointers / metric snapshots supporting the score
+    evidence: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+
+    last_audited_at: datetime = Field(default_factory=_utcnow)
+
+    source_task_id: Optional[uuid.UUID] = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+    )
+
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column_kwargs={"onupdate": _utcnow},
+    )
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "system_id", name="uq_system_maturity_project_system"),
+    )

@@ -203,9 +203,13 @@ class TestSchemaRevisionSync:
                 for col_m in col_in_create_re.finditer(block):
                     migration_columns.add((table, col_m.group(1)))
 
+        PENDING_MIGRATION_TABLES: set[str] = set()
+
         # Check each SQLModel table's columns against migrations
         missing: list[tuple[str, str]] = []
         for table_name, table in SQLModel.metadata.tables.items():
+            if table_name in PENDING_MIGRATION_TABLES:
+                continue
             for col in table.columns:
                 if (table_name, col.name) not in migration_columns:
                     missing.append((table_name, col.name))
@@ -365,8 +369,12 @@ class TestSchemaRevisionSync:
                 if target:
                     effective.discard(target)
 
+        PENDING_MIGRATION_TABLES: set[str] = set()
+
         missing: list[str] = []
         for table_name, table in SQLModel.metadata.tables.items():
+            if table_name in PENDING_MIGRATION_TABLES:
+                continue
             for idx in table.indexes:
                 cols = frozenset(c.name for c in idx.columns)
                 if (table_name, cols) not in effective:

@@ -37,6 +37,7 @@ export {
 const READ_ONLY_TYPES = new Set([
   'research', 'plan', 'review', 'security_audit', 'smoketest',
   'debug', 'perf', 'investigate', 'design_doc_update', 'strategic_review',
+  'self_audit',
 ]);
 
 // Write types get no restrictions (default behavior). Listed for documentation:
@@ -98,6 +99,7 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
   'qa': 'Focus on writing tests. Run the existing test suite first to understand patterns. Do not modify production code unless fixing a test setup issue.',
   'migrate': 'This is a database migration task. Check existing Alembic migrations in backend/alembic/versions/ for naming conventions. Use `alembic revision --autogenerate` as a starting point only — always review and clean up generated migrations.',
   'security_audit': 'Focus on identifying security vulnerabilities. Do not implement fixes — create a detailed findings report as your output.',
+  'self_audit': 'Score system maturity on four signals: test_coverage, friction_density, claim_consistency, failure_mix. Each component is 0-100. Pick recommended_mode (audit|fundamentals|ship|pause) from the worst component. Do not modify any files — output is a JSON findings report only.',
   'perf': 'Profile before optimizing. Identify the specific bottleneck with measurements before writing any fix.',
   'create': 'Before finishing: Run the relevant lint, build, and test commands for every area you modified (check the Codebase Instructions for commands). Fix any failures. Do not leave broken tests, lint errors, build failures, or conflict markers. If the task involves libraries or frameworks you\'re uncertain about, fetch their official documentation before writing code. IMPORTANT: Do NOT run git commit, git rebase, or git push — the automation framework handles committing, rebasing, and pushing after you exit.',
   'fix': 'You are fixing issues from a code review or a pipeline failure (merge conflict or failing CI). Read ALL feedback carefully and address every point. IMPORTANT: the spawn prompt can be stale — between when this task was queued and when you run, a concurrent rollup may have resolved conflicts, or a new commit may have broken something new. If the prompt includes a "stale-premise notice", trust the latest state over the original description. If the error involves a third-party library, fetch its docs or search for the specific error message. Before declaring done, verify that local lint/type/test suites pass on the changed files. Run the relevant test suite to confirm your fix does not introduce regressions. IMPORTANT: Do NOT run git commit, git rebase, or git push — the automation framework handles committing, rebasing, and pushing after you exit.',

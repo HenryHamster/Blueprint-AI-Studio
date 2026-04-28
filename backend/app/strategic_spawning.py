@@ -14,7 +14,7 @@ from sqlmodel import select
 
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
-from app.models import Task, Project, TaskHistory, TaskStatus, ProjectMessage
+from app.models import Task, Project, TaskHistory, TaskStatus, ProjectMessage, SystemMaturity
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -96,6 +96,80 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
             new_gaps.append(g2)
         trimmed["gaps"] = new_gaps
     return trimmed
+
+
+# Per-system maturity rows can be heavy if `top_issues` and `evidence` carry
+# bulky payloads — cap the count per project to keep the strategic payload
+# under the 256KB ceiling. SystemMaturity is per (project_id, system_id), so
+# the natural ceiling is the count of distinct system_ids on the project.
+_SYSTEM_MATURITY_PAYLOAD_CAP = 25
+
+# Per-row issue and evidence caps so a single noisy system can't dominate the
+# payload. Operators can still see the full record via the API.
+_SYSTEM_MATURITY_TOP_ISSUES_CAP = 5
+
+
+async def _build_system_maturity_payload(
+    project: Project, session: AsyncSession,
+) -> list[dict]:
+    """Fetch SystemMaturity rows for *project* and shape them for the agent.
+
+    Returns at most _SYSTEM_MATURITY_PAYLOAD_CAP entries, ordered by
+    last_audited_at descending (oldest audits get trimmed first when over
+    the cap, so the agent always sees the freshest snapshots). Returns an
+    empty list when no rows exist — strategic_spawning's payload includes
+    the field only when non-empty so cold-start projects don't carry an
+    empty field through the cap.
+    """
+    result = await session.execute(
+        select(SystemMaturity)
+        .where(SystemMaturity.project_id == project.id)
+        .order_by(SystemMaturity.last_audited_at.desc())
+        .limit(_SYSTEM_MATURITY_PAYLOAD_CAP)
+    )
+    rows = result.scalars().all()
+    out: list[dict] = []
+    for row in rows:
+        top_issues = (row.top_issues or [])[:_SYSTEM_MATURITY_TOP_ISSUES_CAP]
+        out.append({
+            "system_id": row.system_id,
+            "score": row.score,
+            "components": dict(row.components or {}),
+            "recommended_mode": row.recommended_mode,
+            "last_audited_at": (
+                row.last_audited_at.isoformat()
+                if row.last_audited_at else None
+            ),
+            "top_issues": top_issues,
+        })
+    return out
+
+
+def _summarize_drift_signals(drift: dict) -> dict:
+    """Return a payload-friendly subset of drift_detection.compute_direction_drift.
+
+    Strips per-direction signals when the project has many directions and
+    keeps only flagged or non-neutral entries, so the strategic payload
+    doesn't carry zero-information rows for every direction.
+    """
+    if not drift:
+        return {}
+    by_direction = drift.get("by_direction") or {}
+    by_system = drift.get("by_system") or {}
+    # Keep flagged directions in full; for others summarize only if the
+    # consistency dropped below 0.8.
+    interesting_directions = {}
+    for did, sig in by_direction.items():
+        if sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag"):
+            interesting_directions[did] = sig
+        elif sig.get("claim_shipped_consistency", 1.0) < 0.8 and sig.get("claimed_changes_count", 0) > 0:
+            interesting_directions[did] = sig
+    return {
+        "by_direction": interesting_directions,
+        "by_system": by_system,
+        "generated_at": drift.get("generated_at"),
+        "window_days": drift.get("window_days"),
+    }
 
 
 # Per-payload caps used by the strategic-spawn schema's summarize_fns. These are
@@ -209,6 +283,9 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "rejected_proposals":              {"priority": "low"},
     "prediction_calibration_factor":   {"priority": "low"},
     "prediction_calibration_note":     {"priority": "low"},
+    # Mode-aware additions: only present when non-empty
+    "system_maturity":                 {"priority": "low"},
+    "drift_signals":                   {"priority": "low"},
 }
 
 
@@ -1029,6 +1106,17 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     recent_interventions = await _build_recent_interventions(
         project, session, last_strategic_at=last_strategic_at
     )
+    # Mode-aware additions: per-system maturity snapshots + short-window
+    # claim-vs-shipped drift. Both are best-effort: empty/None when the
+    # project has no SystemMaturity rows or no in-window task data.
+    system_maturity_payload = await _build_system_maturity_payload(project, session)
+    try:
+        from app.drift_detection import compute_direction_drift
+        drift_raw = await compute_direction_drift(session, project)
+        drift_summary = _summarize_drift_signals(drift_raw)
+    except Exception:  # noqa: BLE001 — drift signals are best-effort
+        logger.exception("[STRATEGIC] drift signal computation failed; continuing")
+        drift_summary = {}
     payload: dict = pack_under_budget({
         "type": "strategic_review",
         "research_mode": "strategic",
@@ -1058,6 +1146,10 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "open_messages": open_msgs,
         "conversation_thread": conversation_thread,
         **({"rejected_proposals": rejected_proposals} if rejected_proposals else {}),
+        # Mode-aware: include only when non-empty so cold-start projects
+        # don't carry empty fields through the strategic payload size cap.
+        **({"system_maturity": system_maturity_payload} if system_maturity_payload else {}),
+        **({"drift_signals": drift_summary} if drift_summary else {}),
         "base_branch": "main",
         **({"model": review_model} if review_model else {}),
         **({"effort": review_effort} if review_effort else {}),

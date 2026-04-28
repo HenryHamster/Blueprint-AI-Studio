@@ -1074,6 +1074,11 @@ describe('provider runner reliability', () => {
     vi.unstubAllEnvs();
   });
 
+  afterEach(() => {
+    if (savedTaskId !== undefined) process.env.TASK_ID = savedTaskId;
+    else delete process.env.TASK_ID;
+  });
+
   it('uses the stderr tail so late rate-limit text is still classified', async () => {
     mockProviderRun(['x'.repeat(60_000), "\nyou've hit your usage limit\n"], 1);
 

@@ -74,6 +74,7 @@ describe('handlers registry', () => {
     'research',
     'docs',
     'security_audit',
+    'self_audit',
     'qa',
     'deps',
     'migrate',
@@ -86,8 +87,8 @@ describe('handlers registry', () => {
     'strategic_review',
   ] as const;
 
-  it('has exactly 17 handler entries', () => {
-    expect(Object.keys(handlers)).toHaveLength(17);
+  it('has exactly 18 handler entries', () => {
+    expect(Object.keys(handlers)).toHaveLength(18);
   });
 
   it.each(EXPECTED_TYPES)('contains handler for task type "%s"', (taskType) => {

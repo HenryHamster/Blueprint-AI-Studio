@@ -2,7 +2,7 @@
 Pydantic-based payload validation for all supported task types.
 
 Provides:
-  - TaskType enum listing all 17 handler types
+  - TaskType enum listing all 18 handler types
   - ALL_TASK_TYPES frozenset for backward-compat consumers
   - Per-type payload models with required-field enforcement
   - validate_task_payload()  — strict, raises ValueError on bad input
@@ -67,6 +67,7 @@ class TaskType(str, Enum):
     debug = "debug"
     perf = "perf"
     investigate = "investigate"
+    self_audit = "self_audit"
 
 
 # Backward-compat frozenset consumed by existing code
@@ -207,10 +208,22 @@ class StrategicReviewPayload(_SystemPopulated):
     conversation_thread: list[dict[str, Any]] | None = None
     project_name: str | None = None
     research_mode: str | None = None
+    # Optional, agent-emitted prioritization mode hint. Allowed canonical
+    # values: 'audit' | 'fundamentals' | 'ship' | 'pause'. Validated softly:
+    # the field is just a string so unknown values still parse, but
+    # strategic_completion only persists canonical values to direction
+    # records.
+    recommended_mode: str | None = None
     max_active_directions: int | None = None
     rejected_proposals: list[dict[str, Any]] | None = None
     anomaly_summary: dict[str, Any] | None = None
     playbook_summary: dict[str, Any] | None = None
+    # Per-system maturity snapshots drawn from the SystemMaturity table; lets
+    # the strategic agent see audit scores when prioritizing.
+    system_maturity: list[dict[str, Any]] | None = None
+    # Short-window claim-vs-shipped drift signals; complements lifetime
+    # prediction calibration with a fast-reacting drift detector.
+    drift_signals: dict[str, Any] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
@@ -225,6 +238,14 @@ class DesignDocUpdatePayload(_SystemPopulated):
 
 class SecurityAuditPayload(_SystemPopulated):
     prompt: str | None = None
+
+
+class SelfAuditPayload(_SystemPopulated):
+    prompt: str | None = None
+    # system_ids to audit this run; None = audit-all with cap
+    focus_systems: list[str] | None = None
+    # per-run cap for round-robin coverage across all systems
+    max_systems: int | None = None
 
 
 class QAPayload(_SystemPopulated):
@@ -277,6 +298,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.smoketest: SmokestestPayload,
     TaskType.debug: DebugPayload,
     TaskType.perf: PerfPayload,
+    TaskType.self_audit: SelfAuditPayload,
 }
 
 

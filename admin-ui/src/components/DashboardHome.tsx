@@ -26,6 +26,14 @@ import type { ProjectDiagnostics } from '../types/diagnostics';
 
 // ---------- local types ----------
 
+interface IssueItem {
+  severity: 'critical' | 'warning' | 'info';
+  icon: typeof AlertTriangle;
+  title: string;
+  detail?: string;
+  onClick?: () => void;
+}
+
 interface DirectionProgress {
   direction_id: string;
   direction_text: string;
@@ -443,6 +451,122 @@ function CostBreakdownPill({ direction: d }: { direction: DirectionProgress }) {
       )}
     </div>
   );
+}
+
+// ---------- issue row ----------
+
+const _SEVERITY_BORDER: Record<string, string> = { critical: 'border-l-red-500', warning: 'border-l-amber-500', info: 'border-l-blue-500' };
+const _SEVERITY_ICON_COLOR: Record<string, string> = { critical: 'text-red-400', warning: 'text-amber-400', info: 'text-blue-400' };
+
+function IssueRow({ severity, icon: Icon, title, detail, onClick }: IssueItem) {
+  const Tag = onClick ? 'button' : 'div';
+  return (
+    <Tag
+      onClick={onClick}
+      className={`w-full text-left bg-neutral-900/50 border border-neutral-800/50 border-l-2 ${_SEVERITY_BORDER[severity]} rounded-lg p-3 flex items-start gap-2 ${onClick ? 'cursor-pointer hover:bg-neutral-800/50 transition-colors' : ''}`}
+    >
+      <Icon className={`w-4 h-4 mt-0.5 shrink-0 ${_SEVERITY_ICON_COLOR[severity]}`} />
+      <div className="min-w-0">
+        <p className="text-xs text-neutral-200">{title}</p>
+        {detail && <p className="text-[10px] text-neutral-500 mt-0.5 truncate">{detail}</p>}
+      </div>
+    </Tag>
+  );
+}
+
+function buildIssues(
+  diagnostics: ProjectDiagnostics | null,
+  digest: DigestData | null,
+  tasks: Task[],
+  onViewTask: (task: Task) => void,
+): IssueItem[] {
+  const items: IssueItem[] = [];
+
+  if (diagnostics?.circuit_breaker && diagnostics.circuit_breaker.state !== 'CLOSED') {
+    items.push({
+      severity: 'critical',
+      icon: AlertTriangle,
+      title: `Circuit breaker ${diagnostics.circuit_breaker.state} (${diagnostics.circuit_breaker.failure_count} failures)`,
+    });
+  }
+
+  const stuckSorted = [...(diagnostics?.stuck_tasks ?? [])].sort((a, b) => b.stuck_for_seconds - a.stuck_for_seconds);
+  for (const st of stuckSorted.slice(0, 3)) {
+    const matchedTask = tasks.find(t => t.id === st.task_id);
+    items.push({
+      severity: 'warning',
+      icon: AlertTriangle,
+      title: `Stuck: ${st.title}`,
+      detail: st.remediation_hint ?? st.stuck_reason,
+      onClick: matchedTask ? () => onViewTask(matchedTask) : undefined,
+    });
+  }
+
+  if (digest && digest.pending_approval_count > 0) {
+    items.push({
+      severity: 'info',
+      icon: Clock,
+      title: `${digest.pending_approval_count} task${digest.pending_approval_count !== 1 ? 's' : ''} awaiting approval`,
+    });
+  }
+
+  if (digest && (digest.daily_cost_ceiling_usd ?? 0) > 0) {
+    const ceiling = digest.daily_cost_ceiling_usd!;
+    const daily = digest.daily_cost_usd ?? 0;
+    if (daily >= ceiling) {
+      items.push({
+        severity: 'warning',
+        icon: AlertTriangle,
+        title: `Daily cost ceiling exceeded ($${daily.toFixed(2)} / $${ceiling.toFixed(2)})`,
+      });
+    } else if (daily >= ceiling * 0.8) {
+      items.push({
+        severity: 'info',
+        icon: AlertTriangle,
+        title: `Daily cost approaching ceiling ($${daily.toFixed(2)} / $${ceiling.toFixed(2)})`,
+      });
+    }
+  }
+
+  if (diagnostics?.zone_health?.exhausted && diagnostics.zone_health.exhausted.length > 0) {
+    const cooldownRecovery = diagnostics.zone_health.cooldown_recovery ?? {};
+    const now = Date.now();
+    const zoneDetails = diagnostics.zone_health.exhausted.map(zone => {
+      const expiresAt = cooldownRecovery[zone];
+      if (expiresAt) {
+        const minsLeft = Math.ceil((new Date(expiresAt).getTime() - now) / 60000);
+        return minsLeft > 0 ? `${zone} — recovering in ${minsLeft}min` : zone;
+      }
+      return zone;
+    });
+    items.push({
+      severity: 'warning',
+      icon: AlertTriangle,
+      title: `Zone${diagnostics.zone_health.exhausted.length !== 1 ? 's' : ''} exhausted: ${zoneDetails.join(', ')}`,
+    });
+  }
+
+  const tax = digest?.failure_taxonomy_distribution;
+  if (tax && tax.total_failures >= 3 && tax.dominant_category) {
+    const cat = tax.categories[tax.dominant_category];
+    if (cat && cat.percentage > 50) {
+      const remediation: Record<string, string> = {
+        scope_related: 'Review task decomposition and scope budgets to keep work within size limits.',
+        review_quality: 'Strengthen self-review and lint configuration to catch defects earlier.',
+        infra_related: 'Check infrastructure health (zones, provisioning, external APIs).',
+        code_defect: 'Review agent code-quality patterns and prompt guidance.',
+      };
+      const label = TAXONOMY_LABELS[tax.dominant_category] ?? tax.dominant_category;
+      items.push({
+        severity: 'info',
+        icon: AlertTriangle,
+        title: `${label} failures dominate (${Math.round(cat.percentage)}% of ${tax.total_failures})`,
+        detail: remediation[tax.dominant_category],
+      });
+    }
+  }
+
+  return items;
 }
 
 // ---------- skeleton ----------
@@ -1488,132 +1612,3 @@ function PoolAccountHealthPanel({ accounts, loading }: {
   );
 }
 
-// ---------- issues ----------
-
-interface IssueItem {
-  severity: 'critical' | 'warning' | 'info';
-  icon: typeof AlertTriangle;
-  title: string;
-  detail?: string;
-  onClick?: () => void;
-}
-
-const SEVERITY_BORDER: Record<string, string> = { critical: 'border-l-red-500', warning: 'border-l-amber-500', info: 'border-l-blue-500' };
-const SEVERITY_ICON_COLOR: Record<string, string> = { critical: 'text-red-400', warning: 'text-amber-400', info: 'text-blue-400' };
-
-function IssueRow({ severity, icon: Icon, title, detail, onClick }: IssueItem) {
-  const Tag = onClick ? 'button' : 'div';
-  return (
-    <Tag
-      onClick={onClick}
-      className={`w-full text-left bg-neutral-900/50 border border-neutral-800/50 border-l-2 ${SEVERITY_BORDER[severity]} rounded-lg p-3 flex items-start gap-2 ${onClick ? 'cursor-pointer hover:bg-neutral-800/50 transition-colors' : ''}`}
-    >
-      <Icon className={`w-4 h-4 mt-0.5 shrink-0 ${SEVERITY_ICON_COLOR[severity]}`} />
-      <div className="min-w-0">
-        <p className="text-xs text-neutral-200">{title}</p>
-        {detail && <p className="text-[10px] text-neutral-500 mt-0.5 truncate">{detail}</p>}
-      </div>
-    </Tag>
-  );
-}
-
-function buildIssues(
-  diagnostics: ProjectDiagnostics | null,
-  digest: DigestData | null,
-  tasks: Task[],
-  onViewTask: (task: Task) => void,
-): IssueItem[] {
-  const items: IssueItem[] = [];
-
-  // Circuit breaker
-  if (diagnostics?.circuit_breaker && diagnostics.circuit_breaker.state !== 'CLOSED') {
-    items.push({
-      severity: 'critical',
-      icon: AlertTriangle,
-      title: `Circuit breaker ${diagnostics.circuit_breaker.state} (${diagnostics.circuit_breaker.failure_count} failures)`,
-    });
-  }
-
-  // Stuck tasks (top 3)
-  const stuckSorted = [...(diagnostics?.stuck_tasks ?? [])].sort((a, b) => b.stuck_for_seconds - a.stuck_for_seconds);
-  for (const st of stuckSorted.slice(0, 3)) {
-    const matchedTask = tasks.find(t => t.id === st.task_id);
-    items.push({
-      severity: 'warning',
-      icon: AlertTriangle,
-      title: `Stuck: ${st.title}`,
-      detail: st.remediation_hint ?? st.stuck_reason,
-      onClick: matchedTask ? () => onViewTask(matchedTask) : undefined,
-    });
-  }
-
-  // Pending approvals
-  if (digest && digest.pending_approval_count > 0) {
-    items.push({
-      severity: 'info',
-      icon: Clock,
-      title: `${digest.pending_approval_count} task${digest.pending_approval_count !== 1 ? 's' : ''} awaiting approval`,
-    });
-  }
-
-  // Cost ceiling
-  if (digest && (digest.daily_cost_ceiling_usd ?? 0) > 0) {
-    const ceiling = digest.daily_cost_ceiling_usd!;
-    const daily = digest.daily_cost_usd ?? 0;
-    if (daily >= ceiling) {
-      items.push({
-        severity: 'warning',
-        icon: AlertTriangle,
-        title: `Daily cost ceiling exceeded ($${daily.toFixed(2)} / $${ceiling.toFixed(2)})`,
-      });
-    } else if (daily >= ceiling * 0.8) {
-      items.push({
-        severity: 'info',
-        icon: AlertTriangle,
-        title: `Daily cost approaching ceiling ($${daily.toFixed(2)} / $${ceiling.toFixed(2)})`,
-      });
-    }
-  }
-
-  // Zone exhaustion
-  if (diagnostics?.zone_health?.exhausted && diagnostics.zone_health.exhausted.length > 0) {
-    const cooldownRecovery = diagnostics.zone_health.cooldown_recovery ?? {};
-    const now = Date.now();
-    const zoneDetails = diagnostics.zone_health.exhausted.map(zone => {
-      const expiresAt = cooldownRecovery[zone];
-      if (expiresAt) {
-        const minsLeft = Math.ceil((new Date(expiresAt).getTime() - now) / 60000);
-        return minsLeft > 0 ? `${zone} — recovering in ${minsLeft}min` : zone;
-      }
-      return zone;
-    });
-    items.push({
-      severity: 'warning',
-      icon: AlertTriangle,
-      title: `Zone${diagnostics.zone_health.exhausted.length !== 1 ? 's' : ''} exhausted: ${zoneDetails.join(', ')}`,
-    });
-  }
-
-  // Taxonomy dominance insight
-  const tax = digest?.failure_taxonomy_distribution;
-  if (tax && tax.total_failures >= 3 && tax.dominant_category) {
-    const cat = tax.categories[tax.dominant_category];
-    if (cat && cat.percentage > 50) {
-      const remediation: Record<string, string> = {
-        scope_related: 'Review task decomposition and scope budgets to keep work within size limits.',
-        review_quality: 'Strengthen self-review and lint configuration to catch defects earlier.',
-        infra_related: 'Check infrastructure health (zones, provisioning, external APIs).',
-        code_defect: 'Review agent code-quality patterns and prompt guidance.',
-      };
-      const label = TAXONOMY_LABELS[tax.dominant_category] ?? tax.dominant_category;
-      items.push({
-        severity: 'info',
-        icon: AlertTriangle,
-        title: `${label} failures dominate (${Math.round(cat.percentage)}% of ${tax.total_failures})`,
-        detail: remediation[tax.dominant_category],
-      });
-    }
-  }
-
-  return items;
-}

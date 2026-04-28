@@ -1785,6 +1785,146 @@ async def test_strategic_review_calibration_factor_reflects_history(db_session):
     assert "optimistic" in payload["prediction_calibration_note"]
 
 
+# ── Mode-aware additions: system_maturity + drift_signals ─────────────────────
+
+@pytest.mark.asyncio
+async def test_strategic_review_includes_system_maturity_when_rows_exist(db_session):
+    """system_maturity payload field is present and non-empty when SystemMaturity
+    rows exist; absent when no rows."""
+    from app.models import SystemMaturity
+    from app.time_utils import _utcnow
+
+    project = _make_project(
+        directions=[
+            {"id": "d-sm01", "status": "active", "text": "x", "priority": "medium",
+             "system_id": "sys-A"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(SystemMaturity(
+        project_id=project.id,
+        system_id="sys-A",
+        score=72,
+        components={"test_coverage": 0.5},
+        recommended_mode="ship",
+        top_issues=[{"description": "thin tests"}],
+        last_audited_at=_utcnow(),
+    ))
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    assert "system_maturity" in payload
+    assert isinstance(payload["system_maturity"], list)
+    assert any(sm["system_id"] == "sys-A" for sm in payload["system_maturity"])
+    sm_row = next(sm for sm in payload["system_maturity"] if sm["system_id"] == "sys-A")
+    assert sm_row["score"] == 72
+    assert sm_row["recommended_mode"] == "ship"
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_omits_system_maturity_when_no_rows(db_session):
+    """Without SystemMaturity rows, the system_maturity field is omitted from the payload."""
+    project = _make_project(
+        directions=[
+            {"id": "d-sm02", "status": "active", "text": "x", "priority": "medium",
+             "system_id": "sys-B"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    assert "system_maturity" not in payload, (
+        f"system_maturity should not appear when no rows; payload keys: {sorted(payload.keys())}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_includes_drift_signals_when_drift_present(db_session):
+    """drift_signals payload field is present when at least one direction has
+    flagged drift; the field shape includes by_system and generated_at."""
+    from app.models import Task as _Task, TaskStatus as _TaskStatus
+
+    project = _make_project(
+        directions=[
+            {"id": "d-drift01", "status": "active", "text": "x", "priority": "medium",
+             "system_id": "sys-C"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create 5 completed claim-tasks with no PR artifacts → stalled_despite_churn
+    for i in range(5):
+        db_session.add(_Task(
+            project_id=project.id,
+            title=f"claim {i}",
+            description="",
+            status=_TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            payloads=[{"type": "create", "prompt": "x", "current_direction_id": "d-drift01"}],
+            context={"direction_id": "d-drift01"},
+            plan_output={"summary": "shipped"},
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        ))
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "strategic_review"]
+    assert tasks
+    payload = tasks[0].payloads[0]
+    assert "drift_signals" in payload
+    drift = payload["drift_signals"]
+    assert "by_system" in drift
+    assert "generated_at" in drift
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_payload_documents_recommended_mode(db_session):
+    """The optional `recommended_mode` field is part of the StrategicReviewPayload
+    schema (validated via validate_internal_payload). Absence in a typical
+    payload should not cause validation failures."""
+    from app.payload_schemas import StrategicReviewPayload
+
+    fields = StrategicReviewPayload.model_fields
+    assert "recommended_mode" in fields, (
+        "recommended_mode should be part of StrategicReviewPayload schema"
+    )
+    # And: the existing strategic_review payload still validates.
+    project = _make_project(
+        directions=[
+            {"id": "d-doc01", "status": "active", "text": "x", "priority": "medium"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+
 # ---------------------------------------------------------------------------
 # _build_failure_feedback_mitigation unit tests
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ from app.models import (
     MessageType,
     Project,
     ProjectMessage,
+    SystemMaturity,
     Task,
     TaskHistory,
     TaskStatus,
@@ -1833,6 +1834,193 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     await broadcast_to_project(str(task.project_id), "autonomous_activity",
                                {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)})
     logger.info(f"[PERF] Created {len(child_tasks)} fix tasks from perf analysis {task.id}")
+
+
+# ---------------------------------------------------------------------------
+# Self audit completion — ingest SELF_AUDIT_REPORT into SystemMaturity rows
+# ---------------------------------------------------------------------------
+
+# Allowed values for SystemMaturity.recommended_mode. Rows with a value outside
+# this set are dropped at ingest with a logged warning rather than persisted.
+_VALID_SELF_AUDIT_MODES = {"audit", "fundamentals", "ship", "pause"}
+
+# Per-component scores must be 0-100 integers; we don't enforce a DB check
+# constraint, so we clamp here to keep downstream consumers safe.
+_SELF_AUDIT_COMPONENT_KEYS = (
+    "test_coverage", "friction_density", "claim_consistency", "failure_mix",
+)
+
+
+def _parse_self_audit_findings(logs: str) -> List[Dict[str, Any]]:
+    """Pull a list of self-audit findings out of a task's status logs.
+
+    The agent writes either ``{"findings": [...]}`` or the bare array. Tolerate
+    both, plus surrounding text, by trying a JSON object decode first, then
+    falling back to bracket-depth array extraction keyed on ``system_id``.
+    Returns ``[]`` when nothing parseable is found.
+    """
+    if not logs:
+        return []
+    text = logs[:500_000]
+
+    # Direct JSON object decode (the common case — agent stringifies a dict).
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        findings = parsed.get("findings")
+        if isinstance(findings, list):
+            return findings
+    if isinstance(parsed, list):
+        return parsed
+
+    # Fallback: extract a JSON array of objects containing "system_id".
+    arr_str = _extract_json_array(text, "system_id")
+    if arr_str:
+        try:
+            arr = json.loads(arr_str)
+            if isinstance(arr, list):
+                return arr
+        except (json.JSONDecodeError, ValueError):
+            return []
+    return []
+
+
+def _normalize_self_audit_finding(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Validate and normalize one self-audit finding.
+
+    Returns a clean dict or ``None`` when the finding is malformed (missing
+    system_id, invalid recommended_mode, non-integer score). Callers should log
+    a warning when this returns ``None``.
+    """
+    if not isinstance(raw, dict):
+        return None
+    system_id = raw.get("system_id")
+    if not isinstance(system_id, str) or not system_id.strip():
+        return None
+    mode = raw.get("recommended_mode")
+    if mode is not None and mode not in _VALID_SELF_AUDIT_MODES:
+        return None
+    try:
+        score = int(raw.get("score", 0))
+    except (TypeError, ValueError):
+        return None
+    score = max(0, min(100, score))
+    components_raw = raw.get("components") or {}
+    components: Dict[str, int] = {}
+    if isinstance(components_raw, dict):
+        for key in _SELF_AUDIT_COMPONENT_KEYS:
+            try:
+                components[key] = max(0, min(100, int(components_raw.get(key, 0))))
+            except (TypeError, ValueError):
+                components[key] = 0
+    top_issues = raw.get("top_issues") or []
+    if not isinstance(top_issues, list):
+        top_issues = []
+    # Normalize each issue to the {issue: str} shape so downstream consumers
+    # don't have to handle plain-string vs dict variations.
+    top_issues_norm: List[Dict[str, Any]] = []
+    for it in top_issues[:10]:
+        if isinstance(it, str):
+            top_issues_norm.append({"issue": it})
+        elif isinstance(it, dict):
+            top_issues_norm.append(it)
+    evidence = raw.get("evidence") or []
+    if not isinstance(evidence, list):
+        evidence = []
+    evidence_norm: List[Dict[str, Any]] = [e for e in evidence[:20] if isinstance(e, dict)]
+    return {
+        "system_id": system_id.strip()[:200],
+        "score": score,
+        "components": components,
+        "recommended_mode": mode,
+        "top_issues": top_issues_norm,
+        "evidence": evidence_norm,
+    }
+
+
+async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSession):
+    """Ingest a SELF_AUDIT_REPORT into SystemMaturity rows.
+
+    Idempotent: re-running an audit for the same (project_id, system_id) updates
+    the existing row in place (overwriting score/components/issues/evidence and
+    bumping last_audited_at + source_task_id). Findings with invalid
+    recommended_mode or missing system_id are dropped with a warning so a single
+    bad entry doesn't sink the whole batch.
+    """
+    raw_findings = _parse_self_audit_findings(logs)
+    if not raw_findings:
+        task.latest_status_message = "Self audit completed with no parseable findings"
+        task.plan_output = []
+        session.add(task)
+        await session.commit()
+        return
+
+    normalized: List[Dict[str, Any]] = []
+    dropped = 0
+    for raw in raw_findings:
+        norm = _normalize_self_audit_finding(raw if isinstance(raw, dict) else {})
+        if norm is None:
+            dropped += 1
+            logger.warning(
+                f"[SELF_AUDIT] Task {task.id}: dropping malformed finding "
+                f"(invalid system_id/mode/score): {str(raw)[:200]}"
+            )
+            continue
+        normalized.append(norm)
+
+    # Persist what we parsed for the admin UI even if everything else fails.
+    task.plan_output = normalized
+    session.add(task)
+
+    upserted = 0
+    for finding in normalized:
+        system_id = finding["system_id"]
+        existing = (await session.execute(
+            select(SystemMaturity).where(
+                SystemMaturity.project_id == task.project_id,
+                SystemMaturity.system_id == system_id,
+            )
+        )).scalars().first()
+        now = _utcnow()
+        if existing is not None:
+            existing.score = finding["score"]
+            existing.components = finding["components"]
+            existing.recommended_mode = finding["recommended_mode"]
+            existing.top_issues = finding["top_issues"]
+            existing.evidence = finding["evidence"]
+            existing.last_audited_at = now
+            existing.source_task_id = task.id
+            flag_modified(existing, "components")
+            flag_modified(existing, "top_issues")
+            flag_modified(existing, "evidence")
+            session.add(existing)
+        else:
+            session.add(SystemMaturity(
+                project_id=task.project_id,
+                system_id=system_id,
+                score=finding["score"],
+                components=finding["components"],
+                recommended_mode=finding["recommended_mode"],
+                top_issues=finding["top_issues"],
+                evidence=finding["evidence"],
+                last_audited_at=now,
+                source_task_id=task.id,
+            ))
+        upserted += 1
+
+    summary = f"Self audit ingested {upserted} system(s)"
+    if dropped:
+        summary += f", dropped {dropped} malformed"
+    task.latest_status_message = summary
+    session.add(task)
+    await session.commit()
+
+    await broadcast_to_project(str(task.project_id), "autonomous_activity",
+                               {"self_audit_task_id": str(task.id), "systems_ingested": upserted})
+    logger.info(f"[SELF_AUDIT] Task {task.id}: upserted {upserted} maturity row(s), dropped {dropped}")
+
 
 # Phrases that unambiguously indicate a structural (direction-level) diagnosis
 # regardless of surrounding context.

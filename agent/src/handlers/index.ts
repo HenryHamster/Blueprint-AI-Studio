@@ -2,7 +2,7 @@ import type WebSocket from 'ws';
 import { handleCreate, handleRefactor, handleDocs, handleDeps, handleQA } from './standard.js';
 import { handleReview, handleFix } from './review-fix.js';
 import { handlePlan, handleResearch } from './research-plan.js';
-import { handleSecurityAudit, handleMigrate, handleSmoketest, handleDebug, handlePerf, handleInvestigate } from './specialized.js';
+import { handleSecurityAudit, handleMigrate, handleSmoketest, handleDebug, handlePerf, handleInvestigate, handleSelfAudit } from './specialized.js';
 import { handleDesignDocUpdate } from './design-doc.js';
 
 export type Handler = (
@@ -19,6 +19,7 @@ export const handlers: Record<string, Handler> = {
   research: handleResearch,
   docs: handleDocs,
   security_audit: handleSecurityAudit,
+  self_audit: handleSelfAudit,
   qa: handleQA,
   deps: handleDeps,
   migrate: handleMigrate,

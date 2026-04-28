@@ -6980,6 +6980,229 @@ async def test_residual_fingerprint_remediation_skipped_when_no_fingerprints(db_
     assert len(result.scalars().all()) == 0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. Mode-aware self_audit dispatch
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_self_audit_no_directions_with_system_ids_falls_through(db_session):
+    """When no directions reference a system_id, _should_dispatch_self_audit
+    falls through (returns None) so the existing tactical/strategic dispatch
+    runs unchanged — there's nothing to audit per-system on a project that
+    hasn't tagged its systems yet."""
+    from app.autonomous_research import _should_dispatch_self_audit
+
+    project = Project(
+        name="No System IDs Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {"id": "d-x", "text": "x", "status": "active", "priority": "medium"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    decision = await _should_dispatch_self_audit(project, db_session)
+    assert decision is None, (
+        "directions without system_ids must not trigger audit dispatch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_self_audit_one_dispatch_then_cooldown(db_session):
+    """First dispatch fires once when a system has no maturity row; subsequent
+    ticks fall through under cool-down so the pipeline never deadlocks on a
+    pending or failed audit."""
+    from app.autonomous_research import _should_dispatch_self_audit, _spawn_self_audit_task
+
+    project = Project(
+        name="Cold Start With Systems",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {"id": "d-cold", "text": "x", "status": "active",
+             "priority": "medium", "system_id": "sys-cold"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    decision = await _should_dispatch_self_audit(project, db_session)
+    assert decision is not None, (
+        "system_id without a maturity row should dispatch audit"
+    )
+    assert "sys-cold" in (decision.get("focus_systems") or [])
+
+    spawned = await _spawn_self_audit_task(project, db_session, decision)
+    assert spawned is True
+
+    # Cool-down should now block subsequent dispatches.
+    decision_again = await _should_dispatch_self_audit(project, db_session)
+    assert decision_again is None, "cool-down must short-circuit after dispatch"
+
+
+@pytest.mark.asyncio
+async def test_self_audit_skipped_when_all_systems_fresh_and_healthy(db_session):
+    """When every direction's SystemMaturity row is fresh AND no high-drift
+    direction exists, _should_dispatch_self_audit returns None (fall through)."""
+    from app.models import SystemMaturity
+    from app.autonomous_research import _should_dispatch_self_audit
+    from app.time_utils import _utcnow
+
+    project = Project(
+        name="Healthy Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {"id": "d-h1", "text": "h1", "status": "active",
+             "priority": "medium", "system_id": "sys-fresh"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(SystemMaturity(
+        project_id=project.id,
+        system_id="sys-fresh",
+        score=85,
+        components={},
+        recommended_mode="ship",
+        last_audited_at=_utcnow() - timedelta(hours=2),  # very recent
+    ))
+    await db_session.commit()
+
+    decision = await _should_dispatch_self_audit(project, db_session)
+    assert decision is None, "fresh + healthy systems must not trigger self_audit"
+
+
+@pytest.mark.asyncio
+async def test_self_audit_dispatched_when_one_system_stale(db_session):
+    """A direction whose system has a stale SystemMaturity row triggers an
+    audit dispatch with that system in focus_systems."""
+    from app.models import SystemMaturity
+    from app.autonomous_research import _should_dispatch_self_audit
+    from app.time_utils import _utcnow
+
+    project = Project(
+        name="Stale System Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {"id": "d-stale", "text": "s", "status": "active",
+             "priority": "medium", "system_id": "sys-old"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(SystemMaturity(
+        project_id=project.id,
+        system_id="sys-old",
+        score=60,
+        components={},
+        recommended_mode="ship",
+        last_audited_at=_utcnow() - timedelta(days=30),  # very stale
+    ))
+    await db_session.commit()
+
+    decision = await _should_dispatch_self_audit(project, db_session)
+    assert decision is not None
+    assert "sys-old" in (decision.get("focus_systems") or [])
+
+
+@pytest.mark.asyncio
+async def test_self_audit_dispatched_for_high_drift_direction(db_session):
+    """A direction whose drift signal flags over_claim_flag triggers self_audit
+    dispatch even when its SystemMaturity row is fresh."""
+    from app.models import SystemMaturity
+    from app.autonomous_research import _should_dispatch_self_audit
+    from app.time_utils import _utcnow
+
+    project = Project(
+        name="High Drift Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {"id": "d-drift", "text": "drift", "status": "active",
+             "priority": "medium", "system_id": "sys-drift"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Fresh SystemMaturity row — would otherwise be healthy.
+    db_session.add(SystemMaturity(
+        project_id=project.id,
+        system_id="sys-drift",
+        score=80,
+        components={},
+        recommended_mode="ship",
+        last_audited_at=_utcnow(),
+    ))
+    # Synthesize over-claim drift: 5 claims, 0 merges → over_claim_flag.
+    for i in range(5):
+        t = Task(
+            project_id=project.id,
+            title=f"claim {i}",
+            description="",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            payloads=[{"type": "create", "prompt": "x", "current_direction_id": "d-drift"}],
+            context={"direction_id": "d-drift"},
+            plan_output={"summary": "shipped"},
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(t)
+    await db_session.commit()
+
+    decision = await _should_dispatch_self_audit(project, db_session)
+    assert decision is not None, "drift-flagged direction must trigger audit"
+
+
+@pytest.mark.asyncio
+async def test_self_audit_skipped_when_force_strategic_with_no_maturity(db_session):
+    """force_strategic + no maturity rows → strategic_review still wins.
+
+    The full _spawn_research_task flow runs. When force_strategic is set
+    (no vision purpose, no active directions, or all saturated) the
+    audit decision is skipped entirely so a strategic_review can spawn.
+    """
+    project = Project(
+        name="Force Strategic No Maturity",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],  # no active directions → force_strategic fires
+        vision={"_research_spawn_count": 1},  # no purpose → also force_strategic
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    types = [(t.first_payload or {}).get("type") for t in tasks]
+    # Strategic spawn must win. self_audit must NOT have been dispatched.
+    assert "self_audit" not in types, (
+        f"force_strategic must preempt self_audit dispatch; got {types}"
+    )
+    assert any(t in ("strategic_review", "design_doc_update") for t in types), (
+        f"expected a strategic task to be spawned; got {types}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_residual_fingerprint_remediation_threshold_for_no_error_cluster(db_session, _clear_residual_state):
     """Heartbeat-only clusters (is_error_shaped=False) require a much higher

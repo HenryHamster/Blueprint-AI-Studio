@@ -120,7 +120,7 @@ from app.strategic_constants import (  # noqa: E402
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0051"
+EXPECTED_SCHEMA_REVISION = "0053"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -1510,6 +1510,7 @@ from app.strategic_completion import (  # noqa: E402
     _check_direction_completion,
     _is_direction_duplicate,
     _handle_strategic_completion,
+    _normalize_recommended_mode,
 )
 
 from app.deploy_health import (  # noqa: E402 — re-exports for backward compatibility
@@ -1996,6 +1997,10 @@ async def strategic_operation(
             new_dir["paths"] = data["paths"]
         if data.get("category") and data["category"] in ("product", "structural"):
             new_dir["category"] = data["category"]
+        if data.get("recommended_mode"):
+            mode = _normalize_recommended_mode(data["recommended_mode"])
+            if mode:
+                new_dir["recommended_mode"] = mode
         directions.append(new_dir)
         project.directions = directions
         flag_modified(project, "directions")
@@ -2039,6 +2044,10 @@ async def strategic_operation(
                         await session.commit()
                         return _resp({"status": "blocked", "reason": "Cannot reactivate user-paused direction"})
                     d["status"] = changes["status"]
+                if "recommended_mode" in changes:
+                    mode = _normalize_recommended_mode(changes["recommended_mode"])
+                    if mode is not None:
+                        d["recommended_mode"] = mode
                 if rationale:
                     notes = d.get("notes", [])
                     notes.append({"text": f"Strategic update: {rationale}", "added_at": _utcnow().isoformat()})

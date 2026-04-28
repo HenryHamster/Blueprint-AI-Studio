@@ -61,6 +61,25 @@ _RETIRED_NOTE_PREFIX = "Retired by strategic review: "
 _RATIONALE_PERSIST_MAX = 200
 _CYCLE_REASONING_MAX = 500
 
+# Canonical values the strategic agent is allowed to emit for recommended_mode
+# on a direction. Anything else is dropped on persist — the field is optional
+# so unknown values never block direction-op application.
+_VALID_RECOMMENDED_MODES = frozenset({"audit", "fundamentals", "ship", "pause"})
+
+
+def _normalize_recommended_mode(value: object) -> str | None:
+    """Return a canonical recommended_mode string or None.
+
+    Lower-cases and trims input; rejects values outside _VALID_RECOMMENDED_MODES
+    so storage stays bounded to the documented set.
+    """
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower()
+    if cleaned in _VALID_RECOMMENDED_MODES:
+        return cleaned
+    return None
+
 
 def _extract_rationale_from_notes(direction: dict | None, prefix: str) -> str | None:
     """Return the latest note rationale matching prefix, or None."""
@@ -892,6 +911,11 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                     new_dir["system_id"] = sid[:STRATEGIC_SYSTEM_ID_MAX]
                 if op_entry.get("category") and op_entry["category"] in ("product", "structural"):
                     new_dir["category"] = op_entry["category"]
+                # Optional mode hint from the strategic agent — persisted only
+                # when canonical (audit | fundamentals | ship | pause).
+                rec_mode = _normalize_recommended_mode(op_entry.get("recommended_mode"))
+                if rec_mode:
+                    new_dir["recommended_mode"] = rec_mode
                 current_active = sum(1 for d in directions if d.get('status') == 'active')
                 if current_active >= _runtime_config.get('max_active_directions', 5):
                     logger.warning(f'[STRATEGIC] Skipping direction create: active count {current_active} >= cap')
@@ -939,6 +963,18 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                                 d["category"] = changes["category"]
                             elif changes["category"] is None:
                                 d.pop("category", None)
+                        if "recommended_mode" in changes:
+                            new_mode = _normalize_recommended_mode(changes["recommended_mode"])
+                            if new_mode:
+                                d["recommended_mode"] = new_mode
+                            elif changes["recommended_mode"] is None:
+                                d.pop("recommended_mode", None)
+                        # Also accept top-level recommended_mode on the
+                        # operation so the agent can emit it without
+                        # nesting it inside a changes block.
+                        top_level_mode = _normalize_recommended_mode(op_entry.get("recommended_mode"))
+                        if top_level_mode:
+                            d["recommended_mode"] = top_level_mode
                         # Record rationale as a note
                         if rationale:
                             notes = d.get("notes", [])

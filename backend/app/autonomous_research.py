@@ -56,6 +56,14 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         return await _spawn_research_task_inner(project, session)
 
 
+# Re-export the self_audit helpers for backwards compat with callers /
+# tests that patch them under ``app.autonomous_research``.
+from app.self_audit_dispatch import (  # noqa: E402, F401 — re-export
+    _should_dispatch_self_audit,
+    _spawn_self_audit_task,
+)
+
+
 async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     """Inner implementation — always called under the per-project spawn lock."""
     from app.main import _maybe_create_circuit_breaker_alert
@@ -342,6 +350,30 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         except Exception:
             logger.exception(f'[STRATEGIC] Retry of pending strategic review failed for project {project.id}')
         return  # Don't spawn tactical research this cycle
+
+    # Mode-aware self_audit dispatch. Runs BEFORE strategic dispatch so a stale
+    # or high-drift project audits before the strategic agent reads stale state.
+    # Force_strategic preempts: when force_strategic is True (no purpose / no
+    # active dirs / all saturated) the project needs strategic spawn, not an
+    # audit, so we skip the audit decision entirely.
+    if not force_strategic:
+        try:
+            audit_decision = await _should_dispatch_self_audit(project, session)
+        except Exception:  # noqa: BLE001 — audit decision must never break dispatch
+            logger.exception(
+                f"[SELF_AUDIT] decision failed for project {project.id}; "
+                "falling through to regular dispatch"
+            )
+            audit_decision = None
+        if audit_decision is not None:
+            try:
+                if await _spawn_self_audit_task(project, session, audit_decision):
+                    return  # Audit dispatched; skip tactical/strategic this tick.
+            except Exception:  # noqa: BLE001 — never break dispatch on audit failure
+                logger.exception(
+                    f"[SELF_AUDIT] spawn failed for project {project.id}; "
+                    "falling through to regular dispatch"
+                )
 
     # Strategic cycle check — runs BEFORE the research blocking guard so it's
     # never blocked by an active tactical research task.  The design_doc_update

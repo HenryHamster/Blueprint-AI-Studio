@@ -1505,6 +1505,70 @@ async def modify_task(
         "requires_approval": task.requires_approval,
     }
 
+class SelfAuditRequest(BaseModel):
+    """Optional body for POST /projects/{project_id}/self-audit.
+
+    Both fields are optional — when omitted, the agent picks up to ``max_systems``
+    systems in round-robin order from the project design_doc.
+    """
+    focus_systems: Optional[List[str]] = Field(default=None, max_length=20)
+    max_systems: Optional[int] = Field(default=None, ge=1, le=10)
+
+
+@router.post("/projects/{project_id}/self-audit")
+async def trigger_self_audit(
+    project_id: uuid.UUID,
+    body: Optional[SelfAuditRequest] = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Enqueue a self_audit task for this project.
+
+    Members and above can trigger a maturity audit. Returns the new task_id.
+    """
+    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
+
+    payload_dict: dict = {"type": "self_audit", "base_branch": "main"}
+    if body is not None:
+        if body.focus_systems is not None:
+            payload_dict["focus_systems"] = [s for s in body.focus_systems if isinstance(s, str) and s.strip()]
+        if body.max_systems is not None:
+            payload_dict["max_systems"] = body.max_systems
+    validated_payload = validate_internal_payload(payload_dict, "admin:self_audit")
+
+    title_suffix = ""
+    if body and body.focus_systems:
+        title_suffix = f" ({', '.join(body.focus_systems[:3])}{'...' if len(body.focus_systems) > 3 else ''})"
+
+    new_task = Task(
+        project_id=project.id,
+        title=f"Self audit{title_suffix}"[:200],
+        description="Self maturity audit triggered manually",
+        payloads=[validated_payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="USER",
+        requires_approval=False,
+    )
+    session.add(new_task)
+    await session.commit()
+    await session.refresh(new_task)
+
+    history = TaskHistory(
+        task_id=new_task.id,
+        action="CREATED",
+        details={"created_by": "USER", "method": "self_audit_manual"},
+    )
+    session.add(history)
+    await session.commit()
+
+    return {
+        "task_id": str(new_task.id),
+        "project_id": str(project.id),
+        "status": new_task.status,
+    }
+
+
 @router.post("/projects/{project_id}/clear-wave-deps")
 async def clear_wave_deps(
     project_id: uuid.UUID,

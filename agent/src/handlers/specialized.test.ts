@@ -88,6 +88,7 @@ import {
   handlePerf,
   handleInvestigate,
   handleMigrate,
+  handleSelfAudit,
 } from './specialized.js';
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode,
@@ -718,5 +719,92 @@ describe('handler statusRef.value updates', () => {
     await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, statusRef);
 
     expect(statusRef.value).toBe('Running investigation...');
+  });
+});
+
+// ── handleSelfAudit — findings parsing and artifact emission ─────────────────
+describe('handleSelfAudit — findings ingestion', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  it('persists findings and emits SELF_AUDIT_REPORT when readHandlerOutput returns a structured object', async () => {
+    const findings = {
+      findings: [{
+        system_id: 'sys-auth',
+        score: 72,
+        components: { test_coverage: 80, friction_density: 65, claim_consistency: 75, failure_mix: 70 },
+        top_issues: ['Missing integration tests'],
+        recommended_mode: 'fundamentals',
+        evidence: [{ file: 'backend/app/auth.py', summary: 'no tests' }],
+      }],
+    };
+    vi.mocked(readHandlerOutput).mockReturnValue(findings);
+
+    await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('SELF_AUDIT_REPORT');
+    expect(call.logs).toBe(JSON.stringify(findings));
+  });
+
+  it('extracts JSON object from allOutput when readHandlerOutput returns null', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    const jsonBlock = '{"findings":[{"system_id":"sys-x","score":50,"recommended_mode":"audit"}]}';
+    const allOutput = `preamble\n${jsonBlock}\ntrailer`;
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput, lastResultText: 'no signal' });
+
+    await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    // We re-stringify after parsing, so just verify the resulting JSON has the same shape
+    const stored = JSON.parse(call.logs as string);
+    expect(stored.findings).toHaveLength(1);
+    expect(stored.findings[0].system_id).toBe('sys-x');
+    expect(call.artifact_type).toBe('SELF_AUDIT_REPORT');
+  });
+
+  it('falls back to wrapping a bare JSON array in {findings: [...]}', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    const arrBlock = '[{"system_id":"sys-y","score":80,"recommended_mode":"ship"}]';
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: `noise ${arrBlock} more noise`, lastResultText: '',
+    });
+
+    await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const stored = JSON.parse(call.logs as string);
+    expect(stored.findings).toHaveLength(1);
+    expect(stored.findings[0].system_id).toBe('sys-y');
+  });
+
+  it('sets status FAILED and ERROR_LOG on non-zero exitCode', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: 'crash', lastResultText: '' });
+
+    await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('claude_code_failed');
+  });
+
+  it('embeds focus_systems list into the prompt when provided', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({ findings: [] });
+
+    await handleSelfAudit(
+      TASK_ID,
+      { ...BASE_PAYLOAD, focus_systems: ['sys-auth', 'sys-billing'], max_systems: 4 },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const promptArg = vi.mocked(runClaudeCode).mock.calls[0][0] as string;
+    expect(promptArg).toContain('sys-auth');
+    expect(promptArg).toContain('sys-billing');
+    expect(promptArg).toContain('Audit ONLY these systems');
   });
 });
