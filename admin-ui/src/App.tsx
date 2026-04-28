@@ -861,6 +861,8 @@ export default function App() {
         <DirectionsPanel
           onClose={() => s.setShowDirections(false)}
           addToast={s.addToast}
+          selectedProjectId={s.selectedProjectId}
+          projects={s.projects}
           onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
           onNavigateToTask={(taskId) => {
             const target = s.tasks.find(t => t.id === taskId);

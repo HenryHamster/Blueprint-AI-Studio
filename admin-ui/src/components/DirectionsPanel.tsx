@@ -10,12 +10,7 @@ import { useDirectionForm } from '../hooks/useDirectionForm';
 import { useAutonomousConfig } from '../hooks/useAutonomousConfig';
 import { formatRelativeTime } from '../utils/directionHelpers';
 import type { ProblemModel } from '../types';
-
-interface Project {
-  id: string;
-  name?: string;
-  [key: string]: unknown;
-}
+import type { Project } from '../types/project';
 
 export interface ResearchHistoryEntry {
   timestamp: string;
@@ -124,9 +119,7 @@ const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'paused' | 'completed'
 
 const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
-export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateToTask }: { onClose: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void; onViewFindings?: (directionId: string) => void; onNavigateToTask?: (taskId: string) => void }) {
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState<string>('');
+export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateToTask, selectedProjectId, projects = [] }: { onClose: () => void; addToast: (message: string, type: 'success' | 'error' | 'info') => void; onViewFindings?: (directionId: string) => void; onNavigateToTask?: (taskId: string) => void; selectedProjectId: string | null; projects?: Project[] }) {
   const [directions, setDirections] = useState<Direction[]>([]);
   const [autonomousEnabled, setAutonomousEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -164,7 +157,6 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
   const config = useAutonomousConfig({ setError, addToast });
 
   useEffect(() => {
-    fetchProjects();
     config.fetchCooldownSetting();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -176,20 +168,6 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectId]);
-
-  async function fetchProjects() {
-    try {
-      const res = await apiFetch('/api/admin/projects');
-      if (!res.ok) throw new Error('Failed to fetch projects');
-      const data = await res.json();
-      const list = Array.isArray(data) ? data : data.projects ?? [];
-      setProjects(list);
-      if (list.length > 0 && !selectedProjectId) setSelectedProjectId(list[0].id);
-    } catch (err) {
-      console.error('Failed to fetch projects:', err);
-      addToast('Failed to load projects', 'error');
-    }
-  }
 
   async function fetchDirections() {
     setLoading(true);
@@ -509,6 +487,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
         <div className="flex items-center justify-between px-5 py-3 border-b border-neutral-800 shrink-0">
           <div className="flex items-center gap-2">
             <h2 className="text-sm font-semibold text-neutral-100 uppercase tracking-wider">Strategic</h2>
+            {selectedProjectId && projects.length > 0 && (
+              <span className="text-xs text-neutral-500 truncate max-w-[140px]">{projects.find(p => p.id === selectedProjectId)?.name || selectedProjectId}</span>
+            )}
             {proposedCount > 0 && activeTab === 'directions' && (
               <span className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold bg-purple-950/60 text-purple-400 border border-purple-900/50">
                 {proposedCount} pending
@@ -520,18 +501,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           </button>
         </div>
 
-        {/* Project selector + spawn triggers. Triggers live here so they're
-            always visible and don't compete with the tabs row for width. */}
+        {/* Spawn triggers */}
         <div className="px-5 py-2 border-b border-neutral-800 shrink-0 flex items-center gap-2">
-          <select
-            value={selectedProjectId}
-            onChange={e => setSelectedProjectId(e.target.value)}
-            className="flex-1 min-w-0 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
-          >
-            {projects.map(p => (
-              <option key={p.id} value={p.id}>{p.name || p.id}</option>
-            ))}
-          </select>
           <div className="shrink-0 flex items-center gap-1">
             <button
               type="button"
