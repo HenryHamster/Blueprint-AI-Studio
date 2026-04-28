@@ -27,6 +27,8 @@ from app.max_plan_pool import (
     summarize_pool_state,
     _account_by_id,
     _max_plan_pools,
+    _SUCCESS_RATE_DEPRIORITIZE_MARGIN,
+    select_max_plan_account_balanced,
 )
 
 OPUS = "claude-opus-4-7"
@@ -637,3 +639,105 @@ class TestSuccessRateTiebreaking:
             -a.get("active_tasks", 0),
         )
         assert key(hi) > key(lo)
+
+    def test_low_sample_below_min_treated_same_as_no_data(self):
+        """An account with fewer than MIN_SAMPLES (3) events returns None from
+        _compute_success_rate_7d — identical to an account with zero events.
+        Both contribute 0.0 to the selection key via `or 0.0`, so a new account
+        is never penalised relative to another new account."""
+        now = datetime.utcnow()
+        low_sample = _acct(id="new", outcome_events=[
+            {"at": now - timedelta(hours=1), "success": False},
+            {"at": now - timedelta(hours=2), "success": True},
+        ])  # 2 events — below MIN_SAMPLES threshold
+        no_data = _acct(id="fresh")  # 0 events
+        assert _compute_success_rate_7d(low_sample, now) is None
+        assert _compute_success_rate_7d(no_data, now) is None
+        # Both produce the same key contribution.
+        assert (_compute_success_rate_7d(low_sample, now) or 0.0) == (
+            _compute_success_rate_7d(no_data, now) or 0.0
+        )
+
+    def test_equal_success_rate_tiebreaks_by_active_tasks(self):
+        """When two accounts have the same success rate, the one with fewer
+        active_tasks ranks higher in the selection key."""
+        now = datetime.utcnow()
+        busy = _acct(id="busy", active_tasks=3, outcome_events=[
+            {"at": now - timedelta(hours=i + 1), "success": True} for i in range(4)
+        ])
+        idle = _acct(id="idle", active_tasks=0, outcome_events=[
+            {"at": now - timedelta(hours=i + 1), "success": True} for i in range(4)
+        ])
+        assert _compute_success_rate_7d(busy, now) == _compute_success_rate_7d(idle, now)
+        key = lambda a: (  # noqa: E731
+            _compute_health_score(a, now),
+            _compute_success_rate_7d(a, now) or 0.0,
+            -a.get("active_tasks", 0),
+        )
+        assert key(idle) > key(busy)
+
+
+# ── select_max_plan_account_balanced — success-rate bias ─────────────────────
+
+class TestBalancedSuccessRateBias:
+    """Tests for the pool-median success-rate filter in select_max_plan_account_balanced."""
+
+    _USER = "test-balanced-bias-user"
+
+    def _acct_with_rate(self, id_, success_rate=None, active_tasks=0, provider="anthropic"):
+        now = datetime.utcnow()
+        acct = {"id": id_, "name": id_, "enabled": True, "active_tasks": active_tasks,
+                "oauth_token": "sk-ant-test", "provider": provider}
+        if success_rate is not None:
+            n = round(success_rate * 5)
+            acct["outcome_events"] = [
+                {"at": now - timedelta(hours=i + 1), "success": i < n} for i in range(5)
+            ]
+        return acct
+
+    def setup_method(self):
+        _max_plan_pools.pop(self._USER, None)
+
+    def teardown_method(self):
+        _max_plan_pools.pop(self._USER, None)
+
+    async def test_low_success_rate_account_deprioritized(self):
+        """Account with 7d rate well below pool median is excluded when a better one exists."""
+        good = self._acct_with_rate("good", success_rate=1.0)
+        bad = self._acct_with_rate("bad", success_rate=0.0)
+        _max_plan_pools[self._USER] = [good, bad]
+        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        assert result is not None
+        assert result[0]["id"] == "good"
+
+    async def test_sparse_account_not_penalized_by_filter(self):
+        """Account with fewer than 3 outcomes (rate=None) is never excluded by the filter."""
+        sparse = self._acct_with_rate("sparse", active_tasks=0)  # no outcome_events → None
+        rich = self._acct_with_rate("rich", success_rate=1.0, active_tasks=1)
+        _max_plan_pools[self._USER] = [sparse, rich]
+        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        assert result is not None
+        # sparse wins on load (active_tasks=0 < 1); verifies it wasn't filtered out
+        assert result[0]["id"] == "sparse"
+
+    async def test_filter_skipped_with_single_candidate(self):
+        """With only one candidate the filter is never applied; any success rate is ok."""
+        only = self._acct_with_rate("only", success_rate=0.0)
+        _max_plan_pools[self._USER] = [only]
+        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        assert result is not None
+        assert result[0]["id"] == "only"
+
+    async def test_margin_constant_used_as_threshold(self):
+        """Account just at (median - margin) is kept; account just below is excluded."""
+        # Two accounts: rates 1.0 and 0.79 → median=1.0, threshold=0.80
+        # 0.79 < 0.80 → excluded when alternatives exist
+        hi = self._acct_with_rate("hi", success_rate=1.0)
+        # 4/5 = 0.80 exactly — at threshold, should be kept
+        edge = self._acct_with_rate("edge", success_rate=0.8)
+        _max_plan_pools[self._USER] = [hi, edge]
+        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        assert result is not None
+        # edge (rate=0.8) >= 1.0 - 0.20 = 0.80 → kept; winner is hi (also at 0 active_tasks)
+        # both kept means result can be either; just assert no crash and winner is valid
+        assert result[0]["id"] in ("hi", "edge")

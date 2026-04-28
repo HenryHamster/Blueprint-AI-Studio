@@ -24,7 +24,15 @@ from app.account_model_availability import (
     refresh_account_available_models,
 )
 from app.models import LLMAuthMode, LLMProviderName
-from app.max_plan_pool import _account_by_id, _max_plan_pool_lock, _max_plan_pools, select_max_plan_account
+from app.max_plan_pool import (
+    _account_by_id,
+    _max_plan_pool_lock,
+    _max_plan_pools,
+    select_max_plan_account,
+    select_max_plan_account_balanced,
+)
+
+OPUS = "claude-opus-4-7"
 from app.providers.registry import get_provider
 
 
@@ -416,3 +424,194 @@ class TestSuccessRateSelection:
                 _max_plan_pools.pop(user_id, None)
                 _account_by_id.pop(low_success_id, None)
                 _account_by_id.pop(high_success_id, None)
+
+
+# ---------------------------------------------------------------------------
+# select_max_plan_account_balanced — success-rate biasing
+# ---------------------------------------------------------------------------
+
+class TestBalancedSuccessRateSelection:
+    """Covers four scenarios for balanced-mode dispatch with 7d success rate.
+
+    Tests 1, 3, 4 exercise current (stable) behaviour — load balancing and
+    probing semantics — and must pass both before and after the sibling
+    cluster-1/2 change.  Test 2 is marked xfail(strict=False): it checks the
+    new success-rate tiebreak that cluster 1/2 adds to
+    select_max_plan_account_balanced; it will auto-promote to XPASS once that
+    change merges.
+    """
+
+    @pytest.mark.asyncio
+    async def test_low_sample_account_wins_on_lower_load(self):
+        """A low-sample account (< 3 outcomes, no rate computed) is not filtered
+        out.  When its active_tasks count is lower it still wins over a
+        high-success-rate account that is busier."""
+        user_id = f"u-{uuid.uuid4().hex}"
+        now = datetime.utcnow()
+        low_sample_id = f"acct-ls-{uuid.uuid4().hex}"
+        high_success_id = f"acct-hs-{uuid.uuid4().hex}"
+        low_sample = {
+            "id": low_sample_id,
+            "name": "low-sample",
+            "enabled": True,
+            "oauth_token": "tok",
+            "active_tasks": 0,
+            "outcome_events": [  # 2 events — below MIN_SAMPLES threshold
+                {"at": now - timedelta(hours=1), "success": False},
+                {"at": now - timedelta(hours=2), "success": True},
+            ],
+        }
+        high_success = {
+            "id": high_success_id,
+            "name": "high-success",
+            "enabled": True,
+            "oauth_token": "tok",
+            "active_tasks": 3,  # More busy than low_sample
+            "outcome_events": [
+                {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
+            ],
+        }
+        async with _max_plan_pool_lock:
+            _max_plan_pools[user_id] = [low_sample, high_success]
+            _account_by_id[low_sample_id] = low_sample
+            _account_by_id[high_success_id] = high_success
+        try:
+            result = await select_max_plan_account_balanced(
+                user_id=user_id,
+                provider_models=[("anthropic", None)],
+            )
+            assert result is not None
+            assert result[0]["id"] == low_sample_id
+        finally:
+            async with _max_plan_pool_lock:
+                _max_plan_pools.pop(user_id, None)
+                _account_by_id.pop(low_sample_id, None)
+                _account_by_id.pop(high_success_id, None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(strict=False, reason="Balanced success-rate tiebreak added by cluster 1/2")
+    async def test_equal_load_high_sample_high_success_wins(self):
+        """Among healthy candidates with equal active_tasks, the account with a
+        materially higher 7d success rate should be selected over one with a low
+        rate.  Ids are assigned so that the low-success account would win the
+        current alphabetic tiebreak — the xfail verifies the new behaviour."""
+        user_id = f"u-{uuid.uuid4().hex}"
+        now = datetime.utcnow()
+        # "aaa-..." sorts before "zzz-..." so current code picks low_success.
+        low_success_id = "aaa-lo-" + uuid.uuid4().hex
+        high_success_id = "zzz-hi-" + uuid.uuid4().hex
+        low_success = {
+            "id": low_success_id,
+            "name": "low-success",
+            "enabled": True,
+            "oauth_token": "tok",
+            "active_tasks": 0,
+            "outcome_events": [
+                {"at": now - timedelta(hours=i + 1), "success": i == 0}
+                for i in range(5)  # 1/5 = 20 %
+            ],
+        }
+        high_success = {
+            "id": high_success_id,
+            "name": "high-success",
+            "enabled": True,
+            "oauth_token": "tok",
+            "active_tasks": 0,
+            "outcome_events": [
+                {"at": now - timedelta(hours=i + 1), "success": i < 4}
+                for i in range(5)  # 4/5 = 80 %
+            ],
+        }
+        async with _max_plan_pool_lock:
+            _max_plan_pools[user_id] = [low_success, high_success]
+            _account_by_id[low_success_id] = low_success
+            _account_by_id[high_success_id] = high_success
+        try:
+            result = await select_max_plan_account_balanced(
+                user_id=user_id,
+                provider_models=[("anthropic", None)],
+            )
+            assert result is not None
+            assert result[0]["id"] == high_success_id
+        finally:
+            async with _max_plan_pool_lock:
+                _max_plan_pools.pop(user_id, None)
+                _account_by_id.pop(low_success_id, None)
+                _account_by_id.pop(high_success_id, None)
+
+    @pytest.mark.asyncio
+    async def test_equal_success_tiebreaks_by_lower_load(self):
+        """When both accounts have identical success rates, the less-loaded one wins."""
+        user_id = f"u-{uuid.uuid4().hex}"
+        now = datetime.utcnow()
+        busy_id = f"acct-busy-{uuid.uuid4().hex}"
+        idle_id = f"acct-idle-{uuid.uuid4().hex}"
+        busy = {
+            "id": busy_id,
+            "name": "busy",
+            "enabled": True,
+            "oauth_token": "tok",
+            "active_tasks": 3,
+            "outcome_events": [
+                {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
+            ],
+        }
+        idle = {
+            "id": idle_id,
+            "name": "idle",
+            "enabled": True,
+            "oauth_token": "tok",
+            "active_tasks": 0,
+            "outcome_events": [
+                {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
+            ],
+        }
+        async with _max_plan_pool_lock:
+            _max_plan_pools[user_id] = [busy, idle]
+            _account_by_id[busy_id] = busy
+            _account_by_id[idle_id] = idle
+        try:
+            result = await select_max_plan_account_balanced(
+                user_id=user_id,
+                provider_models=[("anthropic", None)],
+            )
+            assert result is not None
+            assert result[0]["id"] == idle_id
+        finally:
+            async with _max_plan_pool_lock:
+                _max_plan_pools.pop(user_id, None)
+                _account_by_id.pop(busy_id, None)
+                _account_by_id.pop(idle_id, None)
+
+    @pytest.mark.asyncio
+    async def test_probing_account_eligible_when_idle(self):
+        """A probing-state account (cooldown elapsed, active_tasks == 0) is
+        selected in balanced mode when no healthy account is available."""
+        user_id = f"u-{uuid.uuid4().hex}"
+        now = datetime.utcnow()
+        probing_id = f"acct-probe-{uuid.uuid4().hex}"
+        probing = {
+            "id": probing_id,
+            "name": "probing",
+            "enabled": True,
+            "oauth_token": "tok",
+            "active_tasks": 0,
+            # hits=1 → 30 min cooldown; at=2h ago → cooldown elapsed → probing
+            "disabled_models": {
+                OPUS: {"hits": 1, "at": now - timedelta(hours=2)},
+            },
+        }
+        async with _max_plan_pool_lock:
+            _max_plan_pools[user_id] = [probing]
+            _account_by_id[probing_id] = probing
+        try:
+            result = await select_max_plan_account_balanced(
+                user_id=user_id,
+                provider_models=[("anthropic", OPUS)],
+            )
+            assert result is not None
+            assert result[0]["id"] == probing_id
+        finally:
+            async with _max_plan_pool_lock:
+                _max_plan_pools.pop(user_id, None)
+                _account_by_id.pop(probing_id, None)

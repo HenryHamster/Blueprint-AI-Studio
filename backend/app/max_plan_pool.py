@@ -502,6 +502,11 @@ _OUTCOME_WINDOW_SECONDS = 7 * 24 * 3600  # 7-day rolling window for success-rate
 # allowing the account to be selected as a last resort (no deadlock).
 _HEALTH_SCORE_DISQUALIFY_THRESHOLD = -4
 
+# Balanced-mode success-rate bias: accounts whose 7d success rate is more than
+# this margin below the pool median are deprioritized when alternatives exist.
+# Sparse accounts (< 3 outcomes) return None and are never penalized.
+_SUCCESS_RATE_DEPRIORITIZE_MARGIN = 0.20
+
 
 def _compute_health_score(acct: Dict[str, Any], now: datetime | None = None) -> float:
     """Compute a rolling 24h health score. Higher is healthier.
@@ -1144,12 +1149,10 @@ async def select_max_plan_account_balanced(
         winner: tuple[Dict[str, Any], str, str | None] | None = None
         if candidates_healthy:
             # Gate decisively-negative accounts when alternatives exist — but
-            # otherwise rank purely by load. Ranking by health_score across
+            # otherwise rank primarily by load. Ranking by health_score across
             # providers is unfair: a mature anthropic account with 100
             # completions scores 100 while a brand-new openai account scores 0,
-            # so balanced mode would never pick the new account. Among healthy
-            # candidates we only care about "which is least busy"; health score
-            # is a disqualifier, not a tiebreak.
+            # so balanced mode would never pick the new account.
             if len(candidates_healthy) > 1:
                 qualified = [
                     c for c in candidates_healthy
@@ -1157,12 +1160,32 @@ async def select_max_plan_account_balanced(
                 ]
                 if qualified:
                     candidates_healthy = qualified
+                # Success-rate soft bias: deprioritize accounts whose 7-day success
+                # rate is materially below the pool median when alternatives exist.
+                # Sparse accounts (< 3 outcomes) return None and are treated as
+                # neutral so brand-new accounts are never starved.
+                if len(candidates_healthy) > 1:
+                    rates = [_compute_success_rate_7d(c[0], now) for c in candidates_healthy]
+                    sampled = [r for r in rates if r is not None]
+                    if sampled:
+                        pool_median = sorted(sampled)[len(sampled) // 2]
+                        preferred = [
+                            c for c, r in zip(candidates_healthy, rates)
+                            if r is None or r >= pool_median - _SUCCESS_RATE_DEPRIORITIZE_MARGIN
+                        ]
+                        if preferred:
+                            candidates_healthy = preferred
             winner = min(
                 candidates_healthy,
-                # Primary: fewest active_tasks. Tiebreak: deterministic by id
-                # so concurrent selects under the same lock give different
-                # results when load is equal.
-                key=lambda c: (c[0].get("active_tasks", 0), c[0]["id"]),
+                # Primary: fewest active_tasks. Secondary: higher 7d success rate
+                # (None → neutral 0.5 so sparse accounts aren't penalised).
+                # Tiebreak: deterministic by id so concurrent selects give
+                # different results when load is equal.
+                key=lambda c: (
+                    c[0].get("active_tasks", 0),
+                    -(_compute_success_rate_7d(c[0], now) or 0.5),
+                    c[0]["id"],
+                ),
             )
         elif candidates_probing:
             # Deterministic tiebreak on id — same contract as the single-provider selector.
