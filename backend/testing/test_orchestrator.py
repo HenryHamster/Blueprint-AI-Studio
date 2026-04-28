@@ -1754,3 +1754,39 @@ class TestPipelineSlotCap:
             cap = max(1, runtime_config["max_concurrent_vms"] // 2)
         assert cap >= 1
         assert cap <= runtime_config["max_concurrent_vms"]
+
+
+class TestOrchestratorClosureSafety:
+    """Regression: a `from app.compute import X` inside orchestrator_worker
+    silently shadows the module-level X for the *entire* function, which then
+    makes any reference to X from a nested closure (like _provision_and_handle)
+    resolve to an unbound enclosing-scope cell when the import branch hasn't
+    run yet. Production saw this on every successful provision via 8294c265 →
+    `cannot access free variable 'get_vm_zone'` → vm_provisioned_at refresh
+    skipped → tasks stuck in PROVISIONING. Guard the names that matter."""
+
+    def test_provision_and_handle_has_no_get_vm_zone_freevar(self):
+        """Static check: the inner _provision_and_handle closure must not
+        treat get_vm_zone as a free variable. If it does, orchestrator_worker
+        is locally re-importing get_vm_zone somewhere, and provisioning will
+        crash silently the moment the local import branch hasn't run."""
+        from app import orchestrator
+
+        # Find the nested _provision_and_handle code object inside orchestrator_worker
+        worker_code = orchestrator.orchestrator_worker.__code__
+        provision_code = None
+        for const in worker_code.co_consts:
+            if hasattr(const, "co_name") and const.co_name == "_provision_and_handle":
+                provision_code = const
+                break
+        assert provision_code is not None, "_provision_and_handle not found in orchestrator_worker"
+
+        # If get_vm_zone is in co_freevars, it's being captured from the
+        # enclosing scope as a closure cell — which means orchestrator_worker
+        # has it as a local. That's the bug.
+        assert "get_vm_zone" not in provision_code.co_freevars, (
+            "_provision_and_handle is capturing get_vm_zone as a closure variable, "
+            "which means orchestrator_worker has it as a local (likely from a "
+            "`from app.compute import get_vm_zone` somewhere). Move the import "
+            "to module level."
+        )

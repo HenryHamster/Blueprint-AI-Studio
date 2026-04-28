@@ -24,6 +24,7 @@ from sqlmodel import select
 
 from app.compute import (
     INFRA_PROVISION_PATTERNS,
+    _capture_serial_for_vm,
     any_zone_available,
     get_provision_error,
     get_vm_zone,
@@ -891,10 +892,6 @@ async def orchestrator_worker():
                         old_vm_for_serial = fresh_t.vm_instance_id
                         serial_log: str | None = None
                         if old_vm_for_serial:
-                            from app.compute import (
-                                _capture_serial_for_vm,
-                                get_vm_zone,
-                            )
                             prov_zone = (fresh_t.context or {}).get("provision_zone")
                             if not prov_zone:
                                 cached_zone = get_vm_zone(old_vm_for_serial)
@@ -2243,7 +2240,6 @@ async def orchestrator_worker():
                                 serial_log = None
                                 try:
                                     if prov_zone and prov_zone != "unknown":
-                                        from app.compute import _capture_serial_for_vm
                                         serial_log = await asyncio.to_thread(_capture_serial_for_vm, vm_id, prov_zone)
                                         if serial_log:
                                             logger.error(f"[ORCHESTRATOR] Serial log for failed VM {vm_id}:\n{serial_log}")
