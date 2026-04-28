@@ -593,6 +593,8 @@ _PIPELINE_ACTIVE_STATUSES = (
     TaskStatus.EVALUATING,
 )
 
+SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY = "scope_overflow_pr_signal_emitted"
+
 
 def _pipeline_task_idempotency_key(
     *,
@@ -1220,6 +1222,44 @@ async def _spawn_pipeline_task(
         source_ctx_updated['scope_overflow_warning'] = overflow_warning
         source_task.context = source_ctx_updated
         source_ctx = source_ctx_updated
+        signal_already_emitted = bool(
+            source_ctx.get(SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY)
+            or ((orig.context or {}).get(SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY) if orig else False)
+        )
+        if not signal_already_emitted:
+            try:
+                from app.github import add_issue_label, create_pr_comment  # noqa: PLC0415
+                from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+
+                token_task_id = (orig.id if orig is not None else source_task.id)
+                gh_token, owner, repo = await get_github_token_for_task(token_task_id, session)
+                changed_paths = overflow_warning.get("changed_files") or []
+                file_lines = "\n".join(f"- `{path}`" for path in changed_paths)
+                scope_label = overflow_warning.get("scope") or propagated_scope
+                comment_body = (
+                    "⚠️ Scope overflow detected for this PR.\n\n"
+                    f"- Declared scope: `{scope_label}`\n"
+                    f"- Non-test files changed: `{overflow_warning['non_test_file_count']}`\n"
+                    f"- Scope budget: `{overflow_warning['threshold']}`\n\n"
+                    "Affected files (capped):\n"
+                    f"{file_lines}"
+                )
+                await add_issue_label(gh_token, owner, repo, pr_number, "scope-overflow")
+                await create_pr_comment(gh_token, owner, repo, pr_number, comment_body)
+
+                source_ctx_updated[SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY] = True
+                source_task.context = source_ctx_updated
+                source_ctx = source_ctx_updated
+                if orig is not None:
+                    orig_ctx = dict(orig.context or {})
+                    orig_ctx[SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY] = True
+                    orig.context = orig_ctx
+                    session.add(orig)
+            except Exception as e:
+                logger.warning(
+                    f"[PIPELINE] Failed to emit scope-overflow PR signal for PR #{pr_number}: {e}",
+                    exc_info=True,
+                )
         if task_type == "review":
             overflow_instruction = (
                 "Scope-overflow context: this PR exceeded the declared scope file "

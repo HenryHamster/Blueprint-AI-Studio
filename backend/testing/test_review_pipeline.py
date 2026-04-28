@@ -4107,6 +4107,87 @@ async def test_scope_overflow_warning_propagates_to_review_context_and_prompt(db
     assert (source_ctx.get("scope_overflow_warning") or {}).get("threshold") == 6
 
 
+@pytest.mark.asyncio
+async def test_scope_overflow_pr_signal_emitted_once(db_session, mocker):
+    """Overflow label/comment should be emitted once, then suppressed on later spawns."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("ghs_test", "acme", "repo"),
+    )
+    label_mock = mocker.patch("app.github.add_issue_label", new_callable=AsyncMock)
+    comment_mock = mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    overflow_files = [
+        "backend/app/a.py",
+        "backend/app/b.py",
+        "backend/app/c.py",
+        "backend/app/d.py",
+        "backend/app/e.py",
+        "backend/app/f.py",
+        "backend/app/g.py",
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{
+            "type": "create", "pr_number": 992, "branch": "feat/overflow-once",
+            "base_branch": "main", "prompt": "Implement feature Y",
+        }],
+        context={
+            "scope": "small",
+            "_pr_changed_files": overflow_files,
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    first_result, first_spawned = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=992, branch="feat/overflow-once", base_branch="main",
+        original_prompt="Implement feature Y",
+    )
+    assert first_spawned is True and first_result is not None
+    assert label_mock.await_count == 1
+    assert comment_mock.await_count == 1
+    first_comment = comment_mock.await_args.args[4]
+    assert "Scope overflow detected" in first_comment
+    assert "- Declared scope: `small`" in first_comment
+    assert "- Non-test files changed: `7`" in first_comment
+    assert "- Scope budget: `6`" in first_comment
+    for path in overflow_files:
+        assert f"- `{path}`" in first_comment
+
+    await db_session.refresh(source_task)
+    assert (source_task.context or {}).get("scope_overflow_pr_signal_emitted") is True
+
+    first_result.status = TaskStatus.COMPLETED
+    db_session.add(first_result)
+    await db_session.commit()
+
+    source_task.status = TaskStatus.IN_PROGRESS
+    source_task.context = {
+        **(source_task.context or {}),
+        "review_loop": {"iteration": 1},
+    }
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    second_result, second_spawned = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=992, branch="feat/overflow-once", base_branch="main",
+        original_prompt="Implement feature Y",
+    )
+    assert second_spawned is True and second_result is not None
+    assert label_mock.await_count == 1
+    assert comment_mock.await_count == 1
+
+
 # ── post_merge_summary_comment ────────────────────────────────────────────────
 
 

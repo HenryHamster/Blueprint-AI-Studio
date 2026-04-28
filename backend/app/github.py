@@ -792,6 +792,40 @@ async def create_pr_comment(
 
     return response.json()
 
+
+async def add_issue_label(
+    token: str,
+    owner: str,
+    repo: str,
+    issue_number: int,
+    label: str,
+) -> dict:
+    """Apply a label to an issue/PR via GitHub's labels endpoint.
+
+    Idempotent by API contract: posting an already-present label is a no-op
+    and still returns success.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {"labels": [label]}
+    response = await _github_request(
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/labels",
+        headers,
+        json=payload,
+    )
+    if response.status_code != 200:
+        logger.error(f"Failed to apply issue label '{label}': {response.text}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to apply issue label on GitHub.",
+        )
+    return response.json()
+
+
 async def create_pr_review_comment(
     token: str,
     owner: str,

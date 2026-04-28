@@ -204,6 +204,36 @@ async def test_reopen_pull_request_failure(mocker):
     assert result is False
 
 
+@pytest.mark.asyncio
+async def test_add_issue_label_success(mocker):
+    """add_issue_label() returns response JSON on a 200 response."""
+    from app.github import add_issue_label
+
+    mock_request = mocker.patch("httpx.AsyncClient.request")
+    mock_request.return_value = MockResponse(200, [{"name": "scope-overflow"}])
+
+    result = await add_issue_label("token", "owner", "repo", 42, "scope-overflow")
+
+    assert result == [{"name": "scope-overflow"}]
+    _, kwargs = mock_request.call_args
+    assert kwargs.get("json") == {"labels": ["scope-overflow"]}
+
+
+@pytest.mark.asyncio
+async def test_add_issue_label_failure_raises_http_exception(mocker):
+    """add_issue_label() raises HTTPException(500) on non-200 response."""
+    from app.github import add_issue_label
+
+    mock_request = mocker.patch("httpx.AsyncClient.request")
+    mock_request.return_value = MockResponse(404, {"message": "Not Found"}, text="Not Found")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await add_issue_label("token", "owner", "repo", 42, "scope-overflow")
+
+    assert exc_info.value.status_code == 500
+    assert "Failed to apply issue label on GitHub." in str(exc_info.value.detail)
+
+
 # ---------------------------------------------------------------------------
 # enable_auto_merge — GraphQL enablePullRequestAutoMerge mutation
 # ---------------------------------------------------------------------------
