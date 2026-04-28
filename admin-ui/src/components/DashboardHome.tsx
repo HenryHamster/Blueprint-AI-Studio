@@ -21,6 +21,7 @@ import { RemediationFunnelSection } from './RemediationFunnelSection';
 import { FailureStageWidget } from './FailureStageWidget';
 import { ScopeConversionRatesSection } from './ScopeConversionRatesSection';
 import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSection';
+import { DriftSignalsCard } from './DriftSignalsCard';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
@@ -1133,6 +1134,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           {!!selectedProjectId && (
             <PoolAccountHealthPanel accounts={accountHealth} loading={loading} />
           )}
+
+          {/* Drift Signals */}
+          {!!selectedProjectId && <DriftSignalsCard projectId={selectedProjectId} />}
 
           {/* Section 3: Top Actionable Issues */}
           <section>

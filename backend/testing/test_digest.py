@@ -5118,3 +5118,93 @@ async def test_digest_direction_progress_cpm_threshold(client: AsyncClient, db_s
 
     assert dp_by_id["dir-c"]["cost_per_merged_pr"] == 100.0
     assert dp_by_id["dir-c"]["cost_per_merge_exceeds_threshold"] is True
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/drift-snapshot tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_drift_snapshot_missing_project_returns_empty(client: AsyncClient):
+    """Unknown project_id → empty snapshot with correct shape, not a 4xx."""
+    import uuid as _uuid
+    project_id = _uuid.uuid4()
+    response = await client.get(f"/api/admin/drift-snapshot?project_id={project_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["flagged_count"] == 0
+    assert data["flagged_directions"] == []
+    assert data["total_directions"] == 0
+    assert data["any_system_flagged"] is False
+    assert "generated_at" in data
+    assert data["window_days"] == 7
+
+
+@pytest.mark.asyncio
+async def test_drift_snapshot_no_flags_when_healthy(client: AsyncClient, db_session):
+    """Project with directions but no drift activity → zero flagged directions."""
+    project = make_project(
+        directions=[
+            {"id": "d-healthy", "text": "Keep CI green", "status": "active", "priority": "high"},
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/drift-snapshot?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["flagged_count"] == 0
+    assert data["flagged_directions"] == []
+    assert data["total_directions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_drift_snapshot_over_claim_direction_flagged(client: AsyncClient, db_session):
+    """Direction with many claims but zero merges appears in flagged_directions."""
+    from app.models import Artifact, ArtifactType, Task, TaskStatus
+    from app.time_utils import _utcnow as _now
+    from datetime import timedelta
+
+    dir_id = "d-over-claim"
+    project = make_project(
+        directions=[{"id": dir_id, "text": "Reduce flakiness", "status": "active", "priority": "high"}]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Add enough COMPLETED tasks with plan_output to trip over_claim threshold (>=3 claims, <40% consistency)
+    for _ in range(4):
+        task = Task(
+            project_id=project.id,
+            title="Claim task",
+            description="",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            payloads=[{"type": "create", "current_direction_id": dir_id}],
+            context={"direction_id": dir_id},
+            plan_output={"summary": "claimed a change"},
+            vm_instance_id=f"vm-{_now().timestamp()}",
+            created_at=_now() - timedelta(hours=2),
+        )
+        db_session.add(task)
+
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/drift-snapshot?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["flagged_count"] == 1
+    assert len(data["flagged_directions"]) == 1
+    flagged = data["flagged_directions"][0]
+    assert flagged["direction_id"] == dir_id
+    assert flagged["direction_text"] == "Reduce flakiness"
+    assert flagged["over_claim_flag"] is True
+    assert flagged["claimed_changes_count"] == 4
+    assert flagged["actually_merged_prs"] == 0
+    assert "claim_shipped_consistency" in flagged
+    assert "window_days" in data
+    assert "generated_at" in data

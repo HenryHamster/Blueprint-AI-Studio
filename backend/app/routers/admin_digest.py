@@ -1104,6 +1104,65 @@ async def clear_residual_fingerprints(
     return {"cleared": count}
 
 
+@router.get("/drift-snapshot")
+async def get_drift_snapshot(
+    project_id: uuid.UUID,
+    window_days: int = Query(7, ge=1, le=30),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """Return per-direction drift signals for a project.
+
+    Calls compute_direction_drift on-demand and returns the flagged directions
+    (over_claim or stalled_despite_churn) plus the per-system rollup. The UI
+    uses this to surface claim-vs-shipped divergence without requiring operators
+    to understand the raw signal format.
+    """
+    from app.drift_detection import compute_direction_drift  # noqa: PLC0415
+
+    project = await session.get(Project, project_id)
+    if project is None:
+        return {
+            "flagged_directions": [],
+            "flagged_count": 0,
+            "total_directions": 0,
+            "any_system_flagged": False,
+            "by_system": {},
+            "generated_at": _utcnow().isoformat(),
+            "window_days": window_days,
+        }
+
+    snapshot = await compute_direction_drift(session, project, window_days=window_days)
+    direction_map = {d["id"]: d.get("text", "") for d in (project.directions or []) if d.get("id")}
+
+    flagged = [
+        {
+            "direction_id": did,
+            "direction_text": direction_map.get(did, ""),
+            "over_claim_flag": sig["over_claim_flag"],
+            "stalled_despite_churn_flag": sig["stalled_despite_churn_flag"],
+            "claimed_changes_count": sig["claimed_changes_count"],
+            "actually_merged_prs": sig["actually_merged_prs"],
+            "claim_shipped_consistency": sig["claim_shipped_consistency"],
+        }
+        for did, sig in snapshot["by_direction"].items()
+        if sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag")
+    ]
+
+    return {
+        "flagged_directions": flagged,
+        "flagged_count": len(flagged),
+        "total_directions": len(snapshot["by_direction"]),
+        "any_system_flagged": any(
+            s.get("over_claim_flag") or s.get("stalled_despite_churn_flag")
+            for s in snapshot["by_system"].values()
+        ),
+        "by_system": snapshot["by_system"],
+        "generated_at": snapshot["generated_at"],
+        "window_days": snapshot["window_days"],
+    }
+
+
 async def _compute_digest(
     *,
     hours: int,
