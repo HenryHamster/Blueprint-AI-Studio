@@ -23,9 +23,16 @@ from app.notification_dispatch import (
     post_issue_implementation_spawned_message,
     post_pr_merged_message,
     post_remediation_escalation_message,
+    post_residual_fix_escalation_message,
+    post_residual_fix_result_message,
+    post_residual_fix_spawned_message,
     post_review_feedback_message,
 )
-from app.models import MessageType, Project, ProjectMessage
+from app.models import (
+    MessageType, Project, ProjectMessage,
+    ResidualCaseStatus, ResidualRemediationCase,
+)
+from sqlmodel import select as _select
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +354,7 @@ async def test_post_direction_milestone_message_fires_webhook(db_session):
             reason="Saturated with 5 PRs",
             direction_id="d-abc123",
         )
-        import asyncio as _asyncio  # noqa: PLC0415
+        import asyncio as _asyncio
         await _asyncio.sleep(0)
     dispatch_mock.assert_called_once()
     args, _ = dispatch_mock.call_args
@@ -373,7 +380,7 @@ async def test_post_direction_milestone_message_adds_reason_code_and_evidence(db
             direction_id="d-xyz789",
             evidence=evidence,
         )
-        import asyncio as _asyncio  # noqa: PLC0415
+        import asyncio as _asyncio
         await _asyncio.sleep(0)
 
     assert msg.context["reason_code"] == "cost_per_merge_high"
@@ -396,7 +403,7 @@ async def test_post_direction_milestone_message_no_reason_code_for_non_paused(db
             reason="Cost per merge improved after rollout",
             direction_id="d-finish1",
         )
-        import asyncio as _asyncio  # noqa: PLC0415
+        import asyncio as _asyncio
         await _asyncio.sleep(0)
 
     assert "reason_code" not in msg.context
@@ -417,7 +424,7 @@ async def test_post_direction_milestone_message_reason_code_budget_exceeded(db_s
             reason="Auto-paused: direction is over budget this cycle",
             direction_id="d-budget1",
         )
-        import asyncio as _asyncio  # noqa: PLC0415
+        import asyncio as _asyncio
         await _asyncio.sleep(0)
 
     assert msg.context["reason_code"] == "budget_exceeded"
@@ -437,7 +444,7 @@ async def test_post_direction_milestone_message_reason_code_low_yield(db_session
             reason="Auto-paused: low yield after 3 cycles",
             direction_id="d-yield1",
         )
-        import asyncio as _asyncio  # noqa: PLC0415
+        import asyncio as _asyncio
         await _asyncio.sleep(0)
 
     assert msg.context["reason_code"] == "low_yield"
@@ -604,7 +611,7 @@ async def test_post_remediation_escalation_message_fires_webhook(db_session):
             remediation_summary="Added retry wrapper; same fingerprint recurred",
         )
         # Allow the ensure_future-scheduled coroutine to run
-        import asyncio as _asyncio  # noqa: PLC0415
+        import asyncio as _asyncio
         await _asyncio.sleep(0)
     dispatch_mock.assert_called_once()
     args, _ = dispatch_mock.call_args
@@ -771,7 +778,7 @@ async def test_merged_resets_counter(db_session):
 @pytest.mark.asyncio
 async def test_escalation_at_threshold_suspends_branch(db_session):
     """Three consecutive failures suspend the branch and post an escalation message."""
-    from sqlmodel import select  # noqa: PLC0415
+    from sqlmodel import select
     project = await _create_ar_project(db_session, design_doc={
         "_auto_remediation": {"enabled": True, "branch_failure_counts": {"main": 2}},
     })
@@ -802,7 +809,7 @@ async def test_escalation_webhook_payload_is_enriched(db_session):
     dispatch_mock = AsyncMock()
     with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
         await post_auto_fix_result_message(db_session, project.id, branch="main", result="failed")
-        import asyncio as _asyncio  # noqa: PLC0415
+        import asyncio as _asyncio
         await _asyncio.sleep(0)
     dispatch_mock.assert_called_once()
     args, _ = dispatch_mock.call_args
@@ -834,3 +841,245 @@ async def test_merged_clears_suspension(db_session):
     ar = (project.design_doc or {}).get("_auto_remediation", {})
     assert "main" not in ar.get("suspended_branches", [])
     assert "main" not in ar.get("branch_failure_counts", {})
+
+
+# ─── Residual remediation lifecycle (mirror of CI auto-fix) ──────────────────
+
+async def _load_case(session, project_id, fingerprint):
+    result = await session.execute(
+        _select(ResidualRemediationCase).where(
+            ResidualRemediationCase.project_id == project_id,
+            ResidualRemediationCase.fingerprint == fingerprint,
+        )
+    )
+    return result.scalars().first()
+
+
+@pytest.mark.asyncio
+async def test_post_residual_fix_spawned_creates_case_in_remediating(db_session):
+    """Spawn helper UPSERTs the case row, sets REMEDIATING + last_spawned_*,
+    and emits residual_fix_spawned. Future idle-tick spawn-dedup queries
+    look at exactly these fields."""
+    from app.models import Task, TaskStatus
+    project = Project(name="Residual Spawned", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    # Real Task row needed: ProjectMessage.from_task_id is FK-enforced.
+    fix_task = Task(
+        project_id=project.id, status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix"}],
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    msg = await post_residual_fix_spawned_message(
+        db_session, project.id, fingerprint="abcfp",
+        sample_message="AssertionError in test_foo",
+        task_id=fix_task.id,
+    )
+    await db_session.commit()
+    assert msg.context["event_type"] == "residual_fix_spawned"
+    assert msg.context["fingerprint"] == "abcfp"
+    case = await _load_case(db_session, project.id, "abcfp")
+    assert case is not None
+    assert case.status == ResidualCaseStatus.REMEDIATING
+    assert case.last_spawned_task_id == fix_task.id
+    assert case.last_spawned_at is not None
+
+
+@pytest.mark.asyncio
+async def test_post_residual_fix_result_merged_resets_counter(db_session):
+    """Merged result transitions case to MERGED and zeroes the failure
+    counter so a future regression starts fresh, mirroring CI auto-fix."""
+    project = Project(name="Residual Merged", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    # Pre-populate a case with prior failures
+    case = ResidualRemediationCase(
+        project_id=project.id, fingerprint="fp-merge",
+        status=ResidualCaseStatus.REMEDIATING,
+        consecutive_failure_count=2,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await post_residual_fix_result_message(
+        db_session, project.id, fingerprint="fp-merge",
+        result="merged", pr_number=42,
+    )
+    await db_session.commit()
+    refreshed = await _load_case(db_session, project.id, "fp-merge")
+    assert refreshed.status == ResidualCaseStatus.MERGED
+    assert refreshed.consecutive_failure_count == 0
+    assert refreshed.last_spawned_pr_number == 42
+
+
+@pytest.mark.asyncio
+async def test_post_residual_fix_result_failed_increments_counter(db_session):
+    """Each failed result bumps consecutive_failure_count. Below threshold
+    the case stays FAILED (re-spawnable), not yet SUSPENDED."""
+    project = Project(name="Residual Failed", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    case = ResidualRemediationCase(
+        project_id=project.id, fingerprint="fp-fail",
+        status=ResidualCaseStatus.REMEDIATING,
+        consecutive_failure_count=0,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await post_residual_fix_result_message(
+        db_session, project.id, fingerprint="fp-fail", result="failed",
+    )
+    await db_session.commit()
+    refreshed = await _load_case(db_session, project.id, "fp-fail")
+    assert refreshed.consecutive_failure_count == 1
+    assert refreshed.status == ResidualCaseStatus.FAILED
+    assert refreshed.suspended_at is None
+
+
+@pytest.mark.asyncio
+async def test_post_residual_fix_result_threshold_suspends_and_escalates(db_session):
+    """At _AUTO_REMEDIATION_ESCALATION_THRESHOLD consecutive failures the
+    case auto-suspends, a BLOCKER escalation message gets posted, and the
+    RESIDUAL_FIX_ESCALATED webhook fires. This is the auto-suspend path
+    that prevents a permanently-broken fingerprint from burning pipeline
+    cycles forever."""
+    project = Project(name="Residual Escalate", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    case = ResidualRemediationCase(
+        project_id=project.id, fingerprint="fp-esc",
+        status=ResidualCaseStatus.REMEDIATING,
+        consecutive_failure_count=nd._AUTO_REMEDIATION_ESCALATION_THRESHOLD - 1,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    dispatch_mock = AsyncMock()
+    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+        await post_residual_fix_result_message(
+            db_session, project.id, fingerprint="fp-esc", result="failed",
+        )
+        await db_session.commit()
+
+    refreshed = await _load_case(db_session, project.id, "fp-esc")
+    assert refreshed.status == ResidualCaseStatus.SUSPENDED
+    assert refreshed.consecutive_failure_count == nd._AUTO_REMEDIATION_ESCALATION_THRESHOLD
+    assert refreshed.suspended_at is not None
+
+    # Escalation BLOCKER message + webhook were both fired
+    msgs_q = await db_session.execute(
+        _select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+    )
+    blocker_msgs = [m for m in msgs_q.scalars().all() if m.message_type == MessageType.BLOCKER]
+    assert any(m.context.get("event_type") == "residual_fix_escalated" for m in blocker_msgs)
+    dispatch_mock.assert_called_once()
+    args = dispatch_mock.call_args.args
+    assert args[1] == "RESIDUAL_FIX_ESCALATED"
+    assert args[2]["fingerprint"] == "fp-esc"
+    assert args[2]["severity"] == "blocker"
+    assert args[2]["manual_intervention_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_post_residual_fix_result_review_needed_preserves_state(db_session):
+    """review_needed stops short of touching the failure counter — a
+    human review is the next gate. Case stays REMEDIATING with the PR
+    number stamped for the admin UI."""
+    project = Project(name="Residual Review", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    case = ResidualRemediationCase(
+        project_id=project.id, fingerprint="fp-rev",
+        status=ResidualCaseStatus.REMEDIATING,
+        consecutive_failure_count=2,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await post_residual_fix_result_message(
+        db_session, project.id, fingerprint="fp-rev",
+        result="review_needed", pr_number=77,
+    )
+    await db_session.commit()
+    refreshed = await _load_case(db_session, project.id, "fp-rev")
+    assert refreshed.status == ResidualCaseStatus.REMEDIATING
+    assert refreshed.consecutive_failure_count == 2
+    assert refreshed.last_spawned_pr_number == 77
+
+
+@pytest.mark.asyncio
+async def test_post_residual_fix_escalation_message(db_session):
+    """Escalation helper emits a BLOCKER ProjectMessage with the
+    residual_fix_escalated event_type so external subscribers can filter."""
+    project_id = uuid.uuid4()
+    msg = await post_residual_fix_escalation_message(
+        db_session, project_id, fingerprint="abc", failure_count=3,
+    )
+    assert msg.message_type == MessageType.BLOCKER
+    assert msg.context["event_type"] == "residual_fix_escalated"
+    assert msg.context["fingerprint"] == "abc"
+    assert msg.context["consecutive_failures"] == 3
+
+
+# ─── post_remediation_result_message — discriminator at outcome sites ────────
+
+@pytest.mark.asyncio
+async def test_remediation_discriminator_routes_residual_to_residual_helper(db_session):
+    """A task with spawned_by=residual_fingerprint_remediation routes to
+    post_residual_fix_result_message, which writes residual_fix_result
+    NOT auto_fix_result. This is the contract task_lifecycle and
+    agent_status rely on."""
+    from app.models import Task, TaskStatus  # noqa: PLC0415
+    from app.notification_dispatch import post_remediation_result_message  # noqa: PLC0415
+    project = Project(name="Discriminator Residual", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    fix_task = Task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        payloads=[{"type": "fix"}],
+        context={
+            "auto_remediation": True,
+            "spawned_by": "residual_fingerprint_remediation",
+            "error_fingerprint": "fp-route-r",
+        },
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+
+    msg = await post_remediation_result_message(
+        db_session, fix_task, result="failed",
+    )
+    await db_session.commit()
+    assert msg.context["event_type"] == "residual_fix_result"
+    assert msg.context["fingerprint"] == "fp-route-r"
+
+
+@pytest.mark.asyncio
+async def test_remediation_discriminator_routes_ci_to_auto_fix_helper(db_session):
+    """A CI auto-fix task (no spawned_by marker) routes to the existing
+    post_auto_fix_result_message — preserves backwards-compatible behavior
+    for the bulk of auto_remediation tasks that aren't residual."""
+    from app.models import Task, TaskStatus  # noqa: PLC0415
+    from app.notification_dispatch import post_remediation_result_message  # noqa: PLC0415
+    project = Project(name="Discriminator CI", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    fix_task = Task(
+        project_id=project.id, status=TaskStatus.FAILED,
+        payloads=[{"type": "fix"}],
+        context={
+            "auto_remediation": True,
+            "ci_failure_branch": "feat/x",
+        },
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+
+    msg = await post_remediation_result_message(
+        db_session, fix_task, result="failed",
+    )
+    await db_session.commit()
+    assert msg.context["event_type"] == "auto_fix_result"
+    assert msg.context["branch"] == "feat/x"

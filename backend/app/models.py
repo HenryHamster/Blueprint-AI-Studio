@@ -2,7 +2,7 @@ from enum import Enum
 from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
 from sqlmodel.sql.sqltypes import GUID
-from sqlalchemy import Boolean, Column, String, Integer, Index, Text, UniqueConstraint, ForeignKey, text, event, Enum as SAEnum
+from sqlalchemy import Boolean, CheckConstraint, Column, String, Integer, Index, Text, UniqueConstraint, ForeignKey, text, event, Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB
 import logging
 import uuid
@@ -579,10 +579,19 @@ class MaxPlanAccount(SQLModel, table=True):
 
 
 class ResidualCaseStatus(str, Enum):
+    # Passive states (existing): set by record_residual_fingerprint + reaper
     ACTIVE = "ACTIVE"
     CLOSED_ORGANICALLY = "CLOSED_ORGANICALLY"
     IGNORED = "IGNORED"
     RESOLVED = "RESOLVED"
+    # Lifecycle states (added 0054): set by autonomous_research spawn path +
+    # notification_dispatch.post_residual_fix_result_message. Mirror the
+    # CI auto-remediation lifecycle (open → remediating → merged|failed →
+    # suspended after threshold) using existing ACTIVE as the open state.
+    REMEDIATING = "REMEDIATING"
+    MERGED = "MERGED"
+    FAILED = "FAILED"
+    SUSPENDED = "SUSPENDED"
 
 
 # Backward-compatible alias used by admin_digest.py and autonomous_research.py
@@ -595,6 +604,8 @@ class ResidualRemediationCase(SQLModel, table=True):
     Created or updated whenever record_residual_fingerprint fires; closed by
     the reaper after 72 h of silence on the fingerprint.
     Status IGNORED suppresses auto-remediation spawning for that fingerprint.
+    Status SUSPENDED suppresses auto-spawn after consecutive_failure_count
+    reaches the escalation threshold; cleared manually via admin endpoint.
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     project_id: Optional[uuid.UUID] = Field(default=None, foreign_key="project.id", index=True)
@@ -607,11 +618,50 @@ class ResidualRemediationCase(SQLModel, table=True):
     last_seen_at: datetime = Field(default_factory=_utcnow)
     hit_count: int = Field(default=1)
     sample_message: Optional[str] = Field(default=None)
+    # Lifecycle fields (added 0054). All nullable / default-0 / default-[]
+    # so existing rows backfilled by the migration's server_default work
+    # without a Python-side touch.
+    last_spawned_task_id: Optional[uuid.UUID] = Field(
+        default=None,
+        sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True),
+    )
+    last_spawned_pr_number: Optional[int] = Field(default=None)
+    last_spawned_at: Optional[datetime] = Field(default=None)
+    consecutive_failure_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    suspended_at: Optional[datetime] = Field(default=None)
+    sample_messages: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    sample_statuses: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    task_ids: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
     __table_args__ = (
         Index("ix_residual_case_status_last_seen", "status", "last_seen_at"),
+        Index(
+            "ix_residualremediationcase_project_status_spawned",
+            "project_id", "status", "last_spawned_at",
+        ),
+        UniqueConstraint(
+            "project_id", "fingerprint",
+            name="ux_residualremediationcase_project_fingerprint",
+        ),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'IGNORED', 'CLOSED_ORGANICALLY', 'RESOLVED', "
+            "'REMEDIATING', 'SUSPENDED', 'MERGED', 'FAILED')",
+            name="ck_residualremediationcase_status",
+        ),
     )
 
 

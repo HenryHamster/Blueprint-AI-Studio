@@ -478,13 +478,9 @@ async def _propagate_pipeline_failure_to_original(task: Task, session: AsyncSess
         # so propagate via the original create task. (Audit W1: column now.)
         if orig.auto_remediation:
             try:
-                from app.notification_dispatch import post_auto_fix_result_message  # noqa: PLC0415
-                _ar_branch = (orig.context or {}).get("ci_failure_branch", "main")
-                await post_auto_fix_result_message(
-                    session, orig.project_id,
-                    branch=_ar_branch,
-                    result="failed",
-                    task_id=orig.id,
+                from app.notification_dispatch import post_remediation_result_message
+                await post_remediation_result_message(
+                    session, orig, result="failed",
                 )
                 await session.commit()
             except Exception as _ar_exc:

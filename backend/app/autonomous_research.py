@@ -10,7 +10,6 @@ This module handles all aspects of autonomous research task spawning:
 import asyncio
 import logging
 import os
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -34,11 +33,6 @@ logger = logging.getLogger(__name__)
 # Per-project lock to prevent concurrent _spawn_research_task calls
 # (post-merge hook and idle check can race on the same project)
 _spawn_locks: dict[str, asyncio.Lock] = {}
-
-# Cooldown tracking for residual-fingerprint remediation spawns.
-# Key: "{project_id}:{fingerprint}", value: epoch float of last spawn time.
-_residual_remediation_cooldowns: dict[str, float] = {}
-
 
 def _get_spawn_lock(project_id: str) -> asyncio.Lock:
     if project_id not in _spawn_locks:
@@ -1542,36 +1536,45 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
     Returns the number of tasks spawned (0 or 1).
     """
     from app.failure_classification import get_top_residual_fingerprints
-    from app.models import ResidualRemediationCase, ResidualRemediationCaseStatus
-    from sqlalchemy import cast, func, select, String
+    from app.models import ResidualCaseStatus, ResidualRemediationCase, ResidualRemediationCaseStatus
+    from sqlalchemy import func, select
 
     fingerprints = get_top_residual_fingerprints(window_seconds=86400, top_n=10)
     if not fingerprints:
         return 0
 
-    # Load IGNORED fingerprints for this project so we skip them below.
-    ignored_result = await session.execute(
-        select(ResidualRemediationCase.fingerprint).where(
-            ResidualRemediationCase.project_id == project.id,
-            ResidualRemediationCase.status == ResidualRemediationCaseStatus.IGNORED,
-        )
+    # Load case rows we need for spawn-side filters in one query:
+    # IGNORED + SUSPENDED block re-spawn; REMEDIATING + last_spawned_at
+    # drive the per-fingerprint cooldown. Row count for REMEDIATING
+    # also drives the project-wide concurrency cap (see below).
+    case_rows_result = await session.execute(
+        select(ResidualRemediationCase.fingerprint,
+               ResidualRemediationCase.status,
+               ResidualRemediationCase.last_spawned_at)
+        .where(ResidualRemediationCase.project_id == project.id)
     )
-    ignored_fingerprints: set[str] = {row[0] for row in ignored_result.all()}
+    case_rows = case_rows_result.all()
+    blocked_fingerprints: set[str] = {
+        fp for fp, status, _ in case_rows
+        if status in (ResidualCaseStatus.IGNORED, ResidualCaseStatus.SUSPENDED)
+    }
+    last_spawned_by_fp: dict[str, datetime] = {
+        fp: ts for fp, _, ts in case_rows if ts is not None
+    }
 
-    # Global cap check. Active = QUEUED | PROVISIONING | IN_PROGRESS tasks
-    # whose context marks them as auto_remediation. Reading from JSONB with
-    # a cast to text + containment works across PG / SQLite fixtures.
+    # Project-wide concurrency cap. Count case rows currently in the
+    # in-flight REMEDIATING state — independent of the CI auto-fix
+    # quota since that lives on project.design_doc._auto_remediation.
+    # The DB row count is authoritative; old in-memory dedup is gone.
     max_concurrent = int(_runtime_config.get("max_concurrent_auto_remediations", 2))
-    active_stmt = select(func.count()).select_from(Task).where(
-        Task.project_id == project.id,
-        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
-        cast(Task.context, String).like('%"auto_remediation": true%'),
+    active_count = sum(
+        1 for _, status, _ in case_rows
+        if status == ResidualCaseStatus.REMEDIATING
     )
-    active_count = (await session.execute(active_stmt)).scalar() or 0
     if active_count >= max_concurrent:
         logger.info(
-            "[AUTO REMEDIATION] %d active/queued auto-remediation task(s) "
-            "already at or above cap (%d); skipping spawn (project %s).",
+            "[AUTO REMEDIATION] %d residual case(s) already REMEDIATING, "
+            "at or above cap (%d); skipping spawn (project %s).",
             active_count, max_concurrent, project.id,
         )
         return 0
@@ -1584,16 +1587,19 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
     # A single one-off task dying with such a status is noise; many tasks
     # dying with the same heartbeat is a real signal worth investigating.
     no_error_min_count = int(_runtime_config.get("residual_remediation_no_error_min_count", 20))
-    now = time.time()
-    project_id_str = str(project.id)
+    now_dt = _utcnow()
+    cooldown_delta = timedelta(seconds=cooldown_seconds)
 
     for fp_entry in fingerprints:
         fp = fp_entry["fingerprint"]
-        if fp in ignored_fingerprints:
-            logger.debug("[AUTO REMEDIATION] Skipping IGNORED fingerprint %s (project %s).", fp[:32], project.id)
+        if fp in blocked_fingerprints:
+            logger.debug(
+                "[AUTO REMEDIATION] Skipping IGNORED/SUSPENDED fingerprint %s (project %s).",
+                fp[:32], project.id,
+            )
             continue
-        cooldown_key = f"{project_id_str}:{fp}"
-        if now - _residual_remediation_cooldowns.get(cooldown_key, 0.0) < cooldown_seconds:
+        last_spawned = last_spawned_by_fp.get(fp)
+        if last_spawned is not None and (now_dt - last_spawned) < cooldown_delta:
             continue
 
         # Require a high count before remediating non-error-shaped clusters.
@@ -1721,7 +1727,20 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
                 "error_fingerprint": fp,
             },
         ))
-        _residual_remediation_cooldowns[cooldown_key] = now
+        # Stamp REMEDIATING + last_spawned_* on the case row and emit the
+        # spawn message. Subsequent ticks read the same row to enforce the
+        # per-fingerprint cooldown — no in-memory dedup dict.
+        from app.notification_dispatch import post_residual_fix_spawned_message
+        try:
+            await post_residual_fix_spawned_message(
+                session, project.id, fingerprint=fp,
+                sample_message=primary_sample, task_id=new_task.id,
+            )
+        except Exception as _spawn_msg_exc:
+            logger.warning(
+                "[AUTO REMEDIATION] Failed to post spawned message for %s: %s",
+                fp[:32], _spawn_msg_exc,
+            )
         logger.info(
             f"[AUTO REMEDIATION] Spawned create task {new_task.id} for residual "
             f"fingerprint {fp[:40]} (project {project.id})"

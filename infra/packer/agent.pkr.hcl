@@ -35,7 +35,8 @@ build {
       "sudo apt-get update || (sudo sed -i 's|http://archive.ubuntu.com|http://us.archive.ubuntu.com|g' /etc/apt/sources.list && sudo apt-get update) || (sudo sed -i 's|http://us.archive.ubuntu.com|http://mirrors.edge.kernel.org|g' /etc/apt/sources.list && sudo apt-get update)",
       "sudo apt-get install -y curl git wget gnupg",
       "curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -",
-      "sudo apt-get install -y nodejs",
+      "sudo apt-get install -y nodejs docker.io",
+      "sudo systemctl enable docker",
       "sudo npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
       "git config --global user.email 'blueprint-agent@automated.dev'",
       "git config --global user.name 'Blueprint Agent'",
@@ -68,6 +69,7 @@ build {
   provisioner "shell" {
     inline = [
       "sudo useradd -m -s /bin/bash agent",
+      "sudo usermod -aG docker agent",
       "cd /opt/agent && npm ci",
       "sudo chown -R agent:agent /opt/agent",
       "sudo touch /etc/agent.env",

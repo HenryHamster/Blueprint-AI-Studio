@@ -20,7 +20,11 @@ from typing import Any, Optional
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import MessageType, Project, ProjectMessage, Task, _utcnow
+from app.models import (
+    MessageType, Project, ProjectMessage,
+    ResidualCaseStatus, ResidualRemediationCase,
+    Task, _utcnow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +174,7 @@ async def dispatch_external_notification(
     global total_dispatched, total_delivered, total_failed, last_failure_reason
 
     try:
-        from app.shared_state import runtime_config  # noqa: PLC0415
+        from app.shared_state import runtime_config
         nc = runtime_config.get("notification_config", {})
         webhook_url = nc.get("webhook_url", "")
         enabled_events = nc.get("enabled_events", [])
@@ -181,7 +185,7 @@ async def dispatch_external_notification(
         if event_type not in enabled_events:
             return
         # SSRF guard: only allow http(s) and block internal/metadata IPs
-        from urllib.parse import urlparse  # noqa: PLC0415
+        from urllib.parse import urlparse
         parsed_url = urlparse(webhook_url)
         if parsed_url.scheme not in ("http", "https"):
             logger.warning(f"[NOTIFY] Rejecting non-http(s) webhook URL: {parsed_url.scheme}")
@@ -471,7 +475,7 @@ async def post_auto_fix_result_message(
     # Update per-branch failure tracking in the project's auto_remediation config
     if result in ('failed', 'merged'):
         try:
-            from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+            from sqlalchemy.orm.attributes import flag_modified
             project = await session.get(Project, project_id)
             if project is not None:
                 design_doc = dict(project.design_doc or {})
@@ -574,6 +578,242 @@ async def post_auto_fix_escalation_message(
     ctx: dict[str, Any] = {
         'event_type': 'auto_fix_escalated',
         'branch': branch,
+        'consecutive_failures': failure_count,
+    }
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType.BLOCKER,
+        from_type='system',
+        from_task_id=task_id,
+        content=summary,
+        context=ctx,
+    )
+    session.add(msg)
+    return msg
+
+
+# ─── Residual remediation lifecycle (mirror of CI auto-fix) ──────────────────
+# Lives on ResidualRemediationCase rows (per-fingerprint), not on
+# project.design_doc._auto_remediation (per-branch). Otherwise the lifecycle
+# is the same: spawned → result(merged|failed|review_needed) →
+# suspended after _AUTO_REMEDIATION_ESCALATION_THRESHOLD consecutive failures.
+
+async def _get_or_create_residual_case(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    fingerprint: str,
+) -> ResidualRemediationCase:
+    """Return the case row for (project_id, fingerprint), creating it if
+    missing. The UNIQUE(project_id, fingerprint) added in 0054 means one
+    row per fingerprint. Caller is responsible for the surrounding commit.
+    """
+    from sqlmodel import select
+    result = await session.execute(
+        select(ResidualRemediationCase).where(
+            ResidualRemediationCase.project_id == project_id,
+            ResidualRemediationCase.fingerprint == fingerprint,
+        )
+    )
+    case = result.scalars().first()
+    if case is None:
+        case = ResidualRemediationCase(
+            project_id=project_id,
+            fingerprint=fingerprint,
+        )
+        session.add(case)
+    return case
+
+
+async def post_residual_fix_spawned_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    fingerprint: str,
+    sample_message: str,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a message when residual-fingerprint remediation spawns a fix task.
+
+    Also transitions the case row to REMEDIATING and stamps last_spawned_*
+    so the next idle-tick spawn-dedup query sees the in-flight attempt.
+    """
+    case = await _get_or_create_residual_case(session, project_id, fingerprint)
+    case.status = ResidualCaseStatus.REMEDIATING
+    case.last_spawned_task_id = task_id
+    case.last_spawned_at = _utcnow()
+    case.updated_at = _utcnow()
+    session.add(case)
+
+    summary = f'Residual auto-fix spawned for fingerprint {fingerprint[:32]}'
+    return await post_event_message(
+        session,
+        project_id,
+        event_type='residual_fix_spawned',
+        summary=summary,
+        context={
+            'fingerprint': fingerprint,
+            'sample_message': (sample_message or '')[:400],
+            'task_id': str(task_id) if task_id else None,
+        },
+        task_id=task_id,
+    )
+
+
+async def post_residual_fix_result_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    fingerprint: str,
+    result: str,  # 'merged', 'failed', 'review_needed'
+    pr_number: Optional[int] = None,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a message when a residual auto-fix task completes.
+
+    For result='failed': increments consecutive_failure_count on the case
+    row, transitions to FAILED. When the count crosses
+    _AUTO_REMEDIATION_ESCALATION_THRESHOLD, the row goes SUSPENDED, an
+    escalation message + RESIDUAL_FIX_ESCALATED webhook fire.
+    For result='merged': resets the counter, transitions to MERGED.
+    For result='review_needed': leaves the row in REMEDIATING with a
+    result message but does not change the failure counter — a human
+    review is the next gate.
+    """
+    if result == 'merged':
+        summary = f'Residual auto-fix merged: PR #{pr_number} resolved {fingerprint[:32]}'
+    elif result == 'failed':
+        summary = f'Residual auto-fix failed for {fingerprint[:32]} — manual intervention may be needed'
+    else:
+        summary = f'Residual auto-fix needs review: PR #{pr_number} for {fingerprint[:32]}'
+
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type='residual_fix_result',
+        summary=summary,
+        context={
+            'fingerprint': fingerprint,
+            'result': result,
+            'pr_number': pr_number,
+        },
+        task_id=task_id,
+    )
+
+    if result == 'review_needed':
+        # Don't touch the failure counter or status — wait for the human
+        # gate. The case stays REMEDIATING.
+        if pr_number is not None:
+            case = await _get_or_create_residual_case(session, project_id, fingerprint)
+            case.last_spawned_pr_number = pr_number
+            case.updated_at = _utcnow()
+            session.add(case)
+        return msg
+
+    try:
+        case = await _get_or_create_residual_case(session, project_id, fingerprint)
+        if pr_number is not None:
+            case.last_spawned_pr_number = pr_number
+        case.updated_at = _utcnow()
+
+        if result == 'merged':
+            case.consecutive_failure_count = 0
+            case.status = ResidualCaseStatus.MERGED
+            case.suspended_at = None
+            session.add(case)
+            return msg
+
+        # result == 'failed'
+        case.consecutive_failure_count = (case.consecutive_failure_count or 0) + 1
+        count = case.consecutive_failure_count
+
+        if count >= _AUTO_REMEDIATION_ESCALATION_THRESHOLD and case.status != ResidualCaseStatus.SUSPENDED:
+            case.status = ResidualCaseStatus.SUSPENDED
+            case.suspended_at = _utcnow()
+            session.add(case)
+            await post_residual_fix_escalation_message(
+                session, project_id, fingerprint=fingerprint,
+                failure_count=count, task_id=task_id,
+            )
+            asyncio.ensure_future(dispatch_external_notification(
+                project_id,
+                'RESIDUAL_FIX_ESCALATED',
+                {
+                    'fingerprint': fingerprint,
+                    'consecutive_failures': count,
+                    'threshold': _AUTO_REMEDIATION_ESCALATION_THRESHOLD,
+                    'suspended_at': case.suspended_at.isoformat() if case.suspended_at else None,
+                    'severity': 'blocker',
+                    'manual_intervention_required': True,
+                    'summary': summary,
+                },
+            ))
+            return msg
+
+        case.status = ResidualCaseStatus.FAILED
+        session.add(case)
+    except Exception as exc:
+        logger.warning(
+            '[RESIDUAL-REMEDIATION] Failed to update case row for %s: %s',
+            fingerprint, exc,
+        )
+
+    return msg
+
+
+def is_residual_remediation_task(task: Task) -> bool:
+    """True if `task` was spawned by autonomous_research's residual-fingerprint
+    remediation path. Used by outcome wire-ups to discriminate between CI
+    auto-fix events (post_auto_fix_*) and residual events (post_residual_fix_*)
+    so a residual task does NOT fire the CI events as well."""
+    return (task.context or {}).get("spawned_by") == "residual_fingerprint_remediation"
+
+
+async def post_remediation_result_message(
+    session: AsyncSession,
+    task: Task,
+    result: str,  # 'merged' | 'failed' | 'review_needed'
+    pr_number: Optional[int] = None,
+) -> ProjectMessage:
+    """Discriminator: routes to post_residual_fix_result_message for tasks
+    spawned by residual fingerprint remediation, otherwise to
+    post_auto_fix_result_message for CI auto-fix tasks. Lets call sites
+    treat the two lifecycles uniformly without each one re-implementing
+    the spawned_by check."""
+    if is_residual_remediation_task(task):
+        return await post_residual_fix_result_message(
+            session, task.project_id,
+            fingerprint=(task.context or {}).get("error_fingerprint", ""),
+            result=result,
+            pr_number=pr_number,
+            task_id=task.id,
+        )
+    branch = (task.context or {}).get("ci_failure_branch", "main")
+    return await post_auto_fix_result_message(
+        session, task.project_id,
+        branch=branch,
+        result=result,
+        pr_number=pr_number,
+        task_id=task.id,
+    )
+
+
+async def post_residual_fix_escalation_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    fingerprint: str,
+    failure_count: int,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a BLOCKER-severity escalation message when residual auto-fix
+    is suspended for a fingerprint after the threshold of consecutive
+    failures. Mirrors post_auto_fix_escalation_message but per-fingerprint.
+    """
+    summary = (
+        f'Residual auto-fix suspended for fingerprint {fingerprint[:32]} '
+        f'after {failure_count} consecutive failures. Manual intervention '
+        f'required. Re-enable by clearing suspended_at on the case row.'
+    )
+    ctx: dict[str, Any] = {
+        'event_type': 'residual_fix_escalated',
+        'fingerprint': fingerprint,
         'consecutive_failures': failure_count,
     }
     msg = ProjectMessage(

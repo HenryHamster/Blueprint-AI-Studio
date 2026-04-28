@@ -68,7 +68,7 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
     return {
         "webhook_url": "",
         "webhook_url_configured": bool(config.get("webhook_url")),
-        "enabled_events": config.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE"]),
+        "enabled_events": config.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE", "RESIDUAL_FIX_ESCALATED"]),
         "throttle_seconds": config.get("throttle_seconds", 30),
     }
 
@@ -133,7 +133,7 @@ async def get_settings(
         "notification_config": _build_notification_config_response(
             _runtime_config.get("notification_config", {
                 "webhook_url": "",
-                "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE"],
+                "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE", "RESIDUAL_FIX_ESCALATED"],
                 "throttle_seconds": 30,
             }),
             is_admin=current_user.get("role") == "admin",
@@ -655,8 +655,13 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             "TASK_FAILED", "TASK_COMPLETED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT",
             "PR_MERGED", "BUDGET_EXCEEDED", "AUTO_FIX_SPAWNED", "AUTO_FIX_MERGED",
             "AUTO_FIX_ESCALATED", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE",
+            # Residual remediation lifecycle (mirrors AUTO_FIX_*).
+            # SPAWNED/MERGED are noisier — opt-in only. ESCALATED is BLOCKER
+            # severity and joins the default-on list per the
+            # direction-milestone-webhook-pattern playbook.
+            "RESIDUAL_FIX_SPAWNED", "RESIDUAL_FIX_MERGED", "RESIDUAL_FIX_ESCALATED",
         ])
-        enabled_events = val.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE"])
+        enabled_events = val.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE", "RESIDUAL_FIX_ESCALATED"])
         if not isinstance(enabled_events, list):
             raise HTTPException(status_code=400, detail="notification_config.enabled_events must be a list")
         invalid_events = [e for e in enabled_events if e not in _VALID_NOTIFICATION_EVENTS]
@@ -757,7 +762,7 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "max_pipeline_slots": _runtime_config.get("max_pipeline_slots", 4),
                     "notification_config": _runtime_config.get("notification_config", {
                         "webhook_url": "",
-                        "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED"],
+                        "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "RESIDUAL_FIX_ESCALATED"],
                         "throttle_seconds": 30,
                     }),
                 }

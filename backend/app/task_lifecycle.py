@@ -31,7 +31,10 @@ from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCO
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
-from app.notification_dispatch import post_auto_fix_result_message
+from app.notification_dispatch import (
+    is_residual_remediation_task,
+    post_remediation_result_message,
+)
 from app.failure_classification import (
     classify_failure,
     INFRA_CLASSES,
@@ -1090,15 +1093,13 @@ async def _process_post_commit(
                 except Exception as _res_exc:
                     logger.error(f"[RESEARCH] Failed to record research failure for {task.id}: {_res_exc!r}", exc_info=True)
 
-            # Post result message for permanently failed auto-remediation tasks
+            # Post result message for permanently failed auto-remediation tasks.
+            # Routes to residual lifecycle for residual-fingerprint tasks,
+            # CI auto-fix lifecycle otherwise.
             if task.auto_remediation:
                 try:
-                    _ar_branch = (task.context or {}).get("ci_failure_branch", "main")
-                    await post_auto_fix_result_message(
-                        session, task.project_id,
-                        branch=_ar_branch,
-                        result="failed",
-                        task_id=task.id,
+                    await post_remediation_result_message(
+                        session, task, result="failed",
                     )
                     await session.commit()
                 except Exception as _ar_exc:
@@ -1216,12 +1217,8 @@ async def _process_post_commit(
                                 session.add(task)
                                 if task.auto_remediation:
                                     try:
-                                        await post_auto_fix_result_message(
-                                            session, task.project_id,
-                                            branch=(task.context or {}).get("ci_failure_branch", base_branch),
-                                            result="review_needed",
-                                            pr_number=pr_number,
-                                            task_id=task.id,
+                                        await post_remediation_result_message(
+                                            session, task, result="review_needed", pr_number=pr_number,
                                         )
                                     except Exception as _ar_exc:
                                         logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
@@ -1244,12 +1241,8 @@ async def _process_post_commit(
                                         session.add(task)
                                         if task.auto_remediation:
                                             try:
-                                                await post_auto_fix_result_message(
-                                                    session, task.project_id,
-                                                    branch=(task.context or {}).get("ci_failure_branch", base_branch),
-                                                    result="review_needed",
-                                                    pr_number=pr_number,
-                                                    task_id=task.id,
+                                                await post_remediation_result_message(
+                                                    session, task, result="review_needed", pr_number=pr_number,
                                                 )
                                             except Exception as _ar_exc:
                                                 logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
@@ -1267,12 +1260,8 @@ async def _process_post_commit(
                                     session.add(task)
                                     if task.auto_remediation:
                                         try:
-                                            await post_auto_fix_result_message(
-                                                session, task.project_id,
-                                                branch=(task.context or {}).get("ci_failure_branch", base_branch),
-                                                result="review_needed",
-                                                pr_number=pr_number,
-                                                task_id=task.id,
+                                            await post_remediation_result_message(
+                                                session, task, result="review_needed", pr_number=pr_number,
                                             )
                                         except Exception as _ar_exc:
                                             logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
@@ -1285,12 +1274,8 @@ async def _process_post_commit(
                                 session.add(task)
                                 if task.auto_remediation:
                                     try:
-                                        await post_auto_fix_result_message(
-                                            session, task.project_id,
-                                            branch=(task.context or {}).get("ci_failure_branch", base_branch),
-                                            result="review_needed",
-                                            pr_number=pr_number,
-                                            task_id=task.id,
+                                        await post_remediation_result_message(
+                                            session, task, result="review_needed", pr_number=pr_number,
                                         )
                                     except Exception as _ar_exc:
                                         logger.warning("[AUTO-REMEDIATION] Failed to post review_needed message: %s", _ar_exc)
@@ -1894,25 +1879,29 @@ async def _process_post_commit(
                                             except Exception as _rr_exc:
                                                 logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome on merge for task {orig.id}: {_rr_exc!r}")
                                         # Post result message for auto-remediation tasks
+                                        # (routes between CI auto-fix and residual lifecycles).
                                         if orig.auto_remediation:
                                             try:
-                                                _ar_branch = (orig.context or {}).get("ci_failure_branch", base_branch)
-                                                await post_auto_fix_result_message(
-                                                    session, orig.project_id,
-                                                    branch=_ar_branch,
-                                                    result="merged",
-                                                    pr_number=pr_number,
-                                                    task_id=orig.id,
+                                                await post_remediation_result_message(
+                                                    session, orig, result="merged", pr_number=pr_number,
                                                 )
                                                 try:
                                                     from app.notification_dispatch import dispatch_external_notification
+                                                    if is_residual_remediation_task(orig):
+                                                        _wh_event = "RESIDUAL_FIX_MERGED"
+                                                        _wh_payload = {
+                                                            "fingerprint": (orig.context or {}).get("error_fingerprint", ""),
+                                                            "pr_number": pr_number,
+                                                        }
+                                                    else:
+                                                        _ar_branch = (orig.context or {}).get("ci_failure_branch", base_branch)
+                                                        _wh_event = "AUTO_FIX_MERGED"
+                                                        _wh_payload = {"branch": _ar_branch, "pr_number": pr_number}
                                                     asyncio.ensure_future(dispatch_external_notification(  # noqa: RUF006 — fire-and-forget webhook dispatch from background flow
-                                                        orig.project_id,
-                                                        "AUTO_FIX_MERGED",
-                                                        {"branch": _ar_branch, "pr_number": pr_number},
+                                                        orig.project_id, _wh_event, _wh_payload,
                                                     ))
                                                 except Exception as _wh_exc:
-                                                    logger.warning("[AUTO-REMEDIATION] Failed to dispatch AUTO_FIX_MERGED webhook: %s", _wh_exc)
+                                                    logger.warning("[AUTO-REMEDIATION] Failed to dispatch merged webhook: %s", _wh_exc)
                                             except Exception as _ar_exc:
                                                 logger.warning("[AUTO-REMEDIATION] Failed to post result message: %s", _ar_exc)
                                         # Extract review feedback as persistent playbook entries

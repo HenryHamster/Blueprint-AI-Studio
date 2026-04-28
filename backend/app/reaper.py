@@ -1010,12 +1010,12 @@ async def reaper_service():
                             from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
                             from app.github import close_pull_request, create_pr_comment  # noqa: PLC0415
                             gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-                            reason = task.latest_status_message or "review-fix retries exhausted"
+                            reason = task.latest_status_message or "fix task reached terminal failure"
                             try:
                                 await create_pr_comment(
                                     gh_token, owner, repo, int(pr_number),
-                                    f":warning: Abandoning this PR — automated review-fix retries exhausted.\n\n"
-                                    f"Task `{str(task.id)[:8]}` reached terminal failure: {reason[:400]}\n\n"
+                                    f":warning: Abandoning this PR — fix task `{str(task.id)[:8]}` reached terminal failure.\n\n"
+                                    f"{reason[:400]}\n\n"
                                     f"Closing so sibling rollups aren't blocked waiting for this branch.",
                                 )
                             except Exception as ce:

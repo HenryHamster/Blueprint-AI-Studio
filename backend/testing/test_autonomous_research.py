@@ -6789,14 +6789,13 @@ async def test_direction_score_prefers_higher_acceptance_rate(db_session, mocker
 
 @pytest.fixture()
 def _clear_residual_state():
-    """Clear residual fingerprint store and cooldown dict between tests."""
+    """Clear residual fingerprint store between tests. Cooldowns now live
+    on ResidualRemediationCase rows, which the db_session fixture truncates
+    after each test."""
     from app.failure_classification import _residual_store
-    from app.autonomous_research import _residual_remediation_cooldowns
     _residual_store.clear()
-    _residual_remediation_cooldowns.clear()
     yield
     _residual_store.clear()
-    _residual_remediation_cooldowns.clear()
 
 
 @pytest.mark.asyncio
@@ -6842,10 +6841,13 @@ async def test_residual_fingerprint_remediation_spawns_task(db_session, _clear_r
 
 @pytest.mark.asyncio
 async def test_residual_fingerprint_remediation_cooldown_blocks_respawn(db_session, _clear_residual_state):
-    """Active cooldown prevents re-spawning for the same fingerprint."""
+    """Active cooldown prevents re-spawning for the same fingerprint.
+    Cooldown now reads ResidualRemediationCase.last_spawned_at."""
     import time
+    from datetime import timedelta as _td
     from app.failure_classification import _residual_store
-    from app.autonomous_research import _spawn_residual_fingerprint_remediation, _residual_remediation_cooldowns
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+    from app.models import ResidualCaseStatus, ResidualRemediationCase, _utcnow
 
     project = Project(
         name="Residual Cooldown Block",
@@ -6865,8 +6867,14 @@ async def test_residual_fingerprint_remediation_cooldown_blocks_respawn(db_sessi
         "sample_message": "some error",
         "task_ids": [],
     }
-    # Seed cooldown as if spawned just now
-    _residual_remediation_cooldowns[f"{project.id}:{fp}"] = time.time()
+    # Seed cooldown via case row: last_spawned_at = now (within 24h cooldown)
+    case = ResidualRemediationCase(
+        project_id=project.id, fingerprint=fp,
+        status=ResidualCaseStatus.MERGED,  # any non-blocked status
+        last_spawned_at=_utcnow() - _td(minutes=10),
+    )
+    db_session.add(case)
+    await db_session.commit()
 
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
     assert spawned == 0
@@ -6877,10 +6885,13 @@ async def test_residual_fingerprint_remediation_cooldown_blocks_respawn(db_sessi
 
 @pytest.mark.asyncio
 async def test_residual_fingerprint_remediation_cooldown_expired_allows_respawn(db_session, _clear_residual_state):
-    """Expired cooldown (>24 h ago) allows a new remediation task to be spawned."""
+    """Expired cooldown (>24 h ago) allows a new remediation task to be spawned.
+    Cooldown reads ResidualRemediationCase.last_spawned_at."""
     import time
+    from datetime import timedelta as _td
     from app.failure_classification import _residual_store
-    from app.autonomous_research import _spawn_residual_fingerprint_remediation, _residual_remediation_cooldowns
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+    from app.models import ResidualCaseStatus, ResidualRemediationCase, _utcnow
 
     project = Project(
         name="Residual Cooldown Expired",
@@ -6900,8 +6911,15 @@ async def test_residual_fingerprint_remediation_cooldown_expired_allows_respawn(
         "sample_message": "expired error pattern",
         "task_ids": [],
     }
-    # Seed expired cooldown (25 hours ago, past the 24 h default window)
-    _residual_remediation_cooldowns[f"{project.id}:{fp}"] = time.time() - 90000
+    # Seed expired cooldown via case row: last_spawned_at = 25h ago,
+    # past the 24h default window.
+    case = ResidualRemediationCase(
+        project_id=project.id, fingerprint=fp,
+        status=ResidualCaseStatus.MERGED,
+        last_spawned_at=_utcnow() - _td(hours=25),
+    )
+    db_session.add(case)
+    await db_session.commit()
 
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
     assert spawned == 1
