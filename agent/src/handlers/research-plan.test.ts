@@ -14,6 +14,7 @@ import {
   calcMessageAge,
   parseResearchContext,
   aggregateDirectionStats,
+  buildStrategicCompletionLogs,
   classifyFailureCategory,
   buildScopeCalibrationSignal,
   buildFilteredFindingsSection,
@@ -233,6 +234,54 @@ describe('aggregateDirectionStats', () => {
     const history = [{ tasks_created: 3, prs_merged: 2, scope_breakdown: { small: { created: 3, merged: 2 } } }];
     const result = aggregateDirectionStats(history, {});
     expect(result).not.toContain('by type:');
+  });
+});
+
+describe('buildStrategicCompletionLogs', () => {
+  it('does not warn for successful command-based strategic output without legacy JSON', () => {
+    const result = buildStrategicCompletionLogs(
+      'Problem model set at revision 38.\nRunning update set (2387 chars).',
+      'Both commands ran successfully.',
+    );
+
+    expect(result.warning).toBeUndefined();
+    expect(result.logs).toBe('Both commands ran successfully.');
+  });
+
+  it('extracts legacy inline strategic JSON when both required keys are present', () => {
+    const result = buildStrategicCompletionLogs(
+      'done\n{"vision":"build great things","direction_operations":[]}',
+      '',
+    );
+
+    expect(result.warning).toBeUndefined();
+    expect(JSON.parse(result.logs)).toEqual({
+      vision: 'build great things',
+      direction_operations: [],
+    });
+  });
+
+  it('extracts problem-model inline strategic JSON without requiring vision', () => {
+    const result = buildStrategicCompletionLogs(
+      'done\n{"problem_model":{"revision":39},"direction_operations":[]}',
+      '',
+    );
+
+    expect(result.warning).toBeUndefined();
+    expect(JSON.parse(result.logs)).toEqual({
+      problem_model: { revision: 39 },
+      direction_operations: [],
+    });
+  });
+
+  it('warns only when legacy-looking strategic JSON cannot be extracted', () => {
+    const result = buildStrategicCompletionLogs(
+      'Legacy keys mentioned: "vision" and "direction_operations", but no JSON object.',
+      'fallback summary',
+    );
+
+    expect(result.warning).toContain('Could not extract strategic JSON');
+    expect(result.logs).toBe('fallback summary');
   });
 });
 

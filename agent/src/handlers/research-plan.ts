@@ -126,6 +126,43 @@ export function aggregateDirectionStats(
   return `Stats: ${parts.join(', ')}`;
 }
 
+export function buildStrategicCompletionLogs(
+  allOutput: string,
+  lastResultText: string | null | undefined,
+): { logs: string; warning?: string } {
+  const fallbackLogs = sanitize(lastResultText || allOutput.slice(-50_000));
+  const hasDirectionOperations = allOutput.includes('"direction_operations"');
+  const hasProblemModel = allOutput.includes('"problem_model"');
+  const hasVision = allOutput.includes('"vision"');
+
+  // Current strategic cycles apply state through ./strategic commands. A final
+  // inline strategic JSON object is a legacy artifact, so its absence should
+  // not warn after a command-based run succeeds.
+  if (!hasDirectionOperations || (!hasProblemModel && !hasVision)) {
+    return { logs: fallbackLogs };
+  }
+
+  const requiredKeys = hasProblemModel
+    ? ['problem_model', 'direction_operations']
+    : ['vision', 'direction_operations'];
+
+  try {
+    const stratObj = extractJsonObjectDetailed(allOutput, ...requiredKeys);
+    if (stratObj.ok) {
+      return { logs: sanitize(JSON.stringify(stratObj.value)) };
+    }
+    return {
+      logs: fallbackLogs,
+      warning: `Could not extract strategic JSON: ${describeJsonExtractionResult(stratObj)}`,
+    };
+  } catch (err: unknown) {
+    return {
+      logs: fallbackLogs,
+      warning: `Could not extract strategic JSON: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
 /** Maps raw agent-reported failure_category to a high-level failure class. */
 export function classifyFailureCategory(rawCat: string): string {
   const CODE_ERROR_CATS: Record<string, true> = {
@@ -2007,15 +2044,19 @@ ${analysisText.slice(0, 50_000)}
       sendLog(ws, `[WARNING] Could not verify strategic direction ops: ${e}\n`);
     }
 
-    // Legacy: try to read /tmp output file (backward compat)
-    const strategicOutput = readHandlerOutput(taskId, 'strategic_output', ws);
-    let logs = strategicOutput !== null ? sanitize(JSON.stringify(strategicOutput)) : '';
+    // Legacy: try to read /tmp output file when present (backward compat).
+    // The command-based strategic flow does not write this file.
+    let logs = '';
+    if (fs.existsSync(`/tmp/strategic_output_${taskId}.json`)) {
+      const strategicOutput = readHandlerOutput(taskId, 'strategic_output', ws);
+      logs = strategicOutput !== null ? sanitize(JSON.stringify(strategicOutput)) : '';
+    }
     if (!logs) {
-      const stratObj = extractJsonObjectDetailed(allOutput, 'vision', 'direction_operations');
-      if (!stratObj.ok) {
-        sendLog(ws, `[WARNING] Could not extract strategic JSON: ${describeJsonExtractionResult(stratObj)}\n`);
+      const completionLogs = buildStrategicCompletionLogs(allOutput, lastResultText);
+      if (completionLogs.warning) {
+        sendLog(ws, `[WARNING] ${completionLogs.warning}\n`);
       }
-      logs = sanitize(stratObj.ok ? JSON.stringify(stratObj.value) : (lastResultText || allOutput.slice(-50_000)));
+      logs = completionLogs.logs;
     }
 
     const strategicProgress = readProgressArtifact(taskId, 'research');
