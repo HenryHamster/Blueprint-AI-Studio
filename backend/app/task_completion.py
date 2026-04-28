@@ -1593,6 +1593,48 @@ async def _ensure_branch(
 # Completion handlers
 # ---------------------------------------------------------------------------
 
+async def _maybe_release_safeguard_gate(
+    safeguard_task: Task, findings: list | None, session: AsyncSession
+) -> None:
+    """Release or maintain the cross-cutting merge gate when a safeguard audit completes.
+
+    No-ops immediately if the task is not a safeguard (no safeguard_for_task_id in context).
+    Releases the gate (clears orig.requires_approval) when no critical/high findings exist.
+    If the original task is already EVALUATING (review approved while safeguard was pending),
+    sets review_loop.ci_waiting=True so the orchestrator's CI loop attempts the merge.
+    """
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    safeguard_for_id = (safeguard_task.context or {}).get("safeguard_for_task_id")
+    if not safeguard_for_id:
+        return
+    has_blocker = bool(
+        findings and any(f.get("severity") in ("critical", "high") for f in findings)
+    )
+    try:
+        orig = await session.get(Task, uuid.UUID(safeguard_for_id))
+    except Exception:
+        orig = None
+    if orig is None:
+        logger.warning(f"[SAFEGUARD] orig {safeguard_for_id[:8]} not found — gate not updated")
+        return
+    if has_blocker:
+        logger.info(f"[SAFEGUARD] Gate maintained on {safeguard_for_id[:8]} — critical/high findings")
+        return
+    orig.requires_approval = False
+    pr_num = (safeguard_task.context or {}).get("safeguard_pr_number")
+    orig_ctx = dict(orig.context or {})
+    if orig.status == TaskStatus.EVALUATING and pr_num:
+        # Review already approved while safeguard was pending; hand off to CI polling loop.
+        orig_ctx["review_loop"] = {**(orig_ctx.get("review_loop") or {}),
+                                   "ci_waiting": True, "pr_number": pr_num}
+        orig.context = orig_ctx
+        flag_modified(orig, "context")
+    orig.latest_status_message = f"Cross-cutting safeguard passed — merge gate released (PR #{pr_num})"
+    session.add(orig)
+    await session.commit()
+    logger.info(f"[SAFEGUARD] Gate released on {safeguard_for_id[:8]} for PR #{pr_num}")
+
+
 async def _handle_security_audit_completion(task: Task, logs: str, session: AsyncSession):
     """Parse security audit findings and spawn create tasks for critical/high severity issues."""
     # Parse the JSON findings array from logs
@@ -1611,6 +1653,7 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
         task.plan_output = []
         session.add(task)
         await session.commit()
+        await _maybe_release_safeguard_gate(task, findings, session)
         return
 
     # Store all findings for display
@@ -1628,6 +1671,7 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
         task.latest_status_message = f"Security audit found {len(findings)} finding(s), none critical/high — no tasks spawned"
         session.add(task)
         await session.commit()
+        await _maybe_release_safeguard_gate(task, findings, session)
         return
 
     create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
@@ -1719,6 +1763,7 @@ async def _handle_security_audit_completion(task: Task, logs: str, session: Asyn
     await broadcast_to_project(str(task.project_id), "autonomous_activity",
                                {"security_audit_task_id": str(task.id), "tasks_created": len(child_tasks)})
     logger.info(f"[SECURITY AUDIT] Created {len(child_tasks)} fix tasks from audit {task.id}")
+    await _maybe_release_safeguard_gate(task, findings, session)
 
 async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     """Parse perf findings and spawn create tasks for high-severity issues."""

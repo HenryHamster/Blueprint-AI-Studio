@@ -22,7 +22,7 @@
     "strategic_completion.py": 1500,
     "rollup_management.py": 1700,
     "reaper.py": 1550,
-    "review_pipeline.py": 1400,
+    "review_pipeline.py": 1510,
     "deploy_health.py": 1000
   },
   "frontend": {

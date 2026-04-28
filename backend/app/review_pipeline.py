@@ -627,6 +627,118 @@ def _set_spawn_reason(task: Task, reason: str) -> None:
     task.context = ctx
 
 
+# ---------------------------------------------------------------------------
+# Cross-cutting safeguard gate
+# ---------------------------------------------------------------------------
+
+TOP_LEVEL_MODULES = frozenset({"backend", "agent", "admin-ui"})
+
+
+def _is_cross_cutting_pr(source_task: Task) -> tuple[bool, str]:
+    """Return (True, reason) when the PR qualifies for a cross-cutting safeguard gate.
+
+    Three conditions, any one of which triggers the gate:
+    (a) scope=large — large PRs always get a safeguard review.
+    (b) scope=medium AND changed files span >= cross_cutting_gate_medium_module_threshold
+        distinct top-level modules (backend / agent / admin-ui).
+    (c) scope_overflow_warned=True AND diff lines exceed
+        cross_cutting_gate_overflow_line_threshold.
+    """
+    if not _runtime_config.get("cross_cutting_gate_enabled", True):
+        return (False, "gate disabled")
+    ctx = source_task.context or {}
+    scope = ctx.get("scope", "medium")
+    if scope == "large":
+        return (True, "scope=large")
+    if scope == "medium":
+        changed = ctx.get("_pr_changed_files") or []
+        mods = len({f.split("/")[0] for f in changed if f.split("/")[0] in TOP_LEVEL_MODULES})
+        threshold = int(_runtime_config.get("cross_cutting_gate_medium_module_threshold", 3))
+        if mods >= threshold:
+            return (True, f"scope=medium,{mods}_modules")
+    if (ctx.get("review_loop") or {}).get("scope_overflow_warned"):
+        lines = _diff_lines_changed(ctx.get("_pr_diff_summary"))
+        overflow_threshold = int(_runtime_config.get("cross_cutting_gate_overflow_line_threshold", 100))
+        if lines and lines > overflow_threshold:
+            return (True, f"overflow+{lines}_lines")
+    return (False, "not cross-cutting")
+
+
+async def maybe_spawn_cross_cutting_safeguard(
+    orig: Task, pr_number: int, branch: str, base_branch: str, session: AsyncSession
+) -> bool:
+    """Spawn a security_audit safeguard task if the PR is cross-cutting.
+
+    Sets orig.requires_approval=True and stores the safeguard task ID in
+    orig.context so the orchestrator and completion handlers can coordinate.
+    Returns True if a safeguard was spawned, False otherwise.
+    Idempotent: no-ops if orig.context already has a safeguard_task_id.
+    """
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    ctx = orig.context or {}
+    if ctx.get("safeguard_task_id"):
+        return False
+    is_cross, reason = _is_cross_cutting_pr(orig)
+    if not is_cross:
+        return False
+
+    safeguard_id = uuid.uuid4()
+    changed = ctx.get("_pr_changed_files") or []
+    files_str = ", ".join(changed[:15]) or "all changed files"
+    payload_data = validate_internal_payload({
+        "type": "security_audit",
+        "prompt": (
+            f"Cross-cutting safeguard review for PR #{pr_number} ({reason}). "
+            "Assess: (1) security vulnerabilities introduced by cross-module changes, "
+            "(2) interface breakage across module boundaries, "
+            "(3) test coverage for cross-module interactions. "
+            f"Changed files: {files_str}. Return findings as a JSON array."
+        ),
+        "base_branch": base_branch,
+    }, "review_pipeline:cross_cutting_safeguard")
+    safeguard = Task(
+        id=safeguard_id,
+        project_id=orig.project_id,
+        title=f"Cross-cutting safeguard: PR #{pr_number}",
+        description=f"Security/QA safeguard ({reason})",
+        parent_task_id=orig.id,
+        payloads=[payload_data],
+        context={
+            "safeguard_for_task_id": str(orig.id),
+            "safeguard_pr_number": pr_number,
+            "safeguard_base_branch": base_branch,
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(safeguard)
+    orig.requires_approval = True
+    orig.context = {**ctx,
+                    "safeguard_task_id": str(safeguard_id),
+                    "safeguard_reason": reason,
+                    "safeguard_pr_number": pr_number}
+    flag_modified(orig, "context")
+    orig.latest_status_message = (
+        f"Merge gated — awaiting cross-cutting safeguard for PR #{pr_number} ({reason})"
+    )
+    session.add(orig)
+    session.add(TaskHistory(
+        task_id=safeguard_id, action="SPAWNED",
+        details={"spawned_by": "CROSS_CUTTING_GATE", "pr_number": pr_number, "reason": reason},
+    ))
+    await session.commit()
+    logger.info(
+        f"[PIPELINE] Cross-cutting safeguard {safeguard_id} spawned "
+        f"for PR #{pr_number} ({reason}) — merge gated on orig {orig.id}"
+    )
+    await broadcast_to_project(
+        str(orig.project_id), "task_updated",
+        {"task_id": str(safeguard_id), "status": TaskStatus.QUEUED},
+    )
+    return True
+
+
 async def _spawn_pipeline_task(
     source_task: Task, task_type: str, session: AsyncSession,
     pr_number: int, branch: str, base_branch: str,
@@ -908,6 +1020,16 @@ async def _spawn_pipeline_task(
             inherited_priority = orig.priority
     except Exception:
         logger.debug(f"[PIPELINE] Could not inherit properties from original task {resolved_original_id[:8] if resolved_original_id else '?'}")
+
+    # Cross-cutting safeguard gate: on the first review spawn for a PR that spans
+    # multiple top-level modules, is large-scope, or has an overflow warning on a
+    # large diff, spawn a security_audit safeguard task and block auto-merge until
+    # it completes. Skip for rollup reviews — those are already aggregated.
+    if task_type == "review" and iteration == 1 and orig is not None and not is_rollup:
+        try:
+            await maybe_spawn_cross_cutting_safeguard(orig, pr_number, branch, base_branch, session)
+        except Exception as _sg_err:
+            logger.warning(f"[PIPELINE] Cross-cutting safeguard spawn failed for PR #{pr_number}: {_sg_err}", exc_info=True)
 
     # Apply per-task-type model/effort defaults from settings
     type_model = _runtime_config.get("task_type_models", {}).get(task_type) or None

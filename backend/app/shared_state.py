@@ -242,6 +242,17 @@ runtime_config: Dict = {
     # keeping the small-scope fast-path enabled.
     "auto_approve_medium_max_lines": 30,
     "auto_approve_medium_max_files": 2,
+    # Cross-cutting safeguard gate: automatically spawns a security_audit task and
+    # blocks merge (requires_approval) for PRs that span multiple top-level modules
+    # or are large-scope. Thresholds are operator-adjustable.
+    #   enabled:                False disables the gate entirely.
+    #   medium_module_threshold: minimum number of top-level modules (backend/agent/
+    #                            admin-ui) a medium-scope PR must span to be gated.
+    #   overflow_line_threshold: a PR with scope_overflow_warned=True is also gated
+    #                            when its diff exceeds this many lines.
+    "cross_cutting_gate_enabled": True,
+    "cross_cutting_gate_medium_module_threshold": 3,
+    "cross_cutting_gate_overflow_line_threshold": 100,
     # TTL (days) for deferred findings carried forward by autonomous_research.
     # Findings older than this window are dropped rather than reprocessed, so
     # stale context doesn't keep surfacing work the system already declined to

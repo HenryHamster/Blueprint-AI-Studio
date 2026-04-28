@@ -36,10 +36,12 @@ from app.review_pipeline import (
     _format_repeating_issues_section,
     _feedback_jaccard,
     _feedback_token_set,
+    _is_cross_cutting_pr,
     _is_pipeline_task_stale,
     _is_test_file,
     _max_review_iterations,
     _spawn_pipeline_task,
+    maybe_spawn_cross_cutting_safeguard,
     post_merge_summary_comment,
     should_auto_approve_diff,
 )
@@ -4285,3 +4287,390 @@ class TestPostMergeSummaryComment:
         ci = self._make_ci(iteration=1)
         # Should not raise
         await post_merge_summary_comment(orig, ci, "tok", "owner", "repo", 42)
+
+
+# ── _is_cross_cutting_pr ──────────────────────────────────────────────────────
+
+
+class TestIsCrossCuttingPr:
+    """Pure unit tests — no DB required."""
+
+    def _task(self, scope="small", changed_files=None, overflow_warned=False, diff_lines=None):
+        review_loop: dict = {}
+        if overflow_warned:
+            review_loop["scope_overflow_warned"] = True
+        ctx: dict = {"scope": scope}
+        if changed_files is not None:
+            ctx["_pr_changed_files"] = changed_files
+        if review_loop:
+            ctx["review_loop"] = review_loop
+        if diff_lines is not None:
+            ctx["_pr_diff_summary"] = [{"added": diff_lines, "removed": 0}]
+        return make_task(context=ctx)
+
+    def test_gate_disabled_returns_false(self):
+        import app.shared_state as ss
+        original = ss.runtime_config.get("cross_cutting_gate_enabled")
+        try:
+            ss.runtime_config["cross_cutting_gate_enabled"] = False
+            t = self._task(scope="large")
+            ok, reason = _is_cross_cutting_pr(t)
+            assert ok is False
+            assert "disabled" in reason
+        finally:
+            ss.runtime_config["cross_cutting_gate_enabled"] = original if original is not None else True
+
+    def test_large_scope_always_triggers(self):
+        t = self._task(scope="large")
+        ok, reason = _is_cross_cutting_pr(t)
+        assert ok is True
+        assert "large" in reason
+
+    def test_medium_scope_all_three_modules_triggers(self):
+        files = ["backend/app/foo.py", "agent/src/bar.ts", "admin-ui/src/baz.tsx"]
+        t = self._task(scope="medium", changed_files=files)
+        ok, reason = _is_cross_cutting_pr(t)
+        assert ok is True
+        assert "medium" in reason
+
+    def test_medium_scope_two_modules_no_trigger(self):
+        files = ["backend/app/foo.py", "agent/src/bar.ts"]
+        t = self._task(scope="medium", changed_files=files)
+        ok, _ = _is_cross_cutting_pr(t)
+        assert ok is False
+
+    def test_medium_scope_no_files_no_trigger(self):
+        t = self._task(scope="medium", changed_files=[])
+        ok, _ = _is_cross_cutting_pr(t)
+        assert ok is False
+
+    def test_overflow_warned_large_diff_triggers(self):
+        t = self._task(scope="small", overflow_warned=True, diff_lines=200)
+        ok, reason = _is_cross_cutting_pr(t)
+        assert ok is True
+        assert "overflow" in reason
+
+    def test_overflow_warned_small_diff_no_trigger(self):
+        t = self._task(scope="small", overflow_warned=True, diff_lines=50)
+        ok, _ = _is_cross_cutting_pr(t)
+        assert ok is False
+
+    def test_overflow_not_warned_even_with_large_diff_no_trigger(self):
+        t = self._task(scope="small", overflow_warned=False, diff_lines=500)
+        ok, _ = _is_cross_cutting_pr(t)
+        assert ok is False
+
+    def test_small_scope_no_overflow_no_trigger(self):
+        t = self._task(scope="small")
+        ok, _ = _is_cross_cutting_pr(t)
+        assert ok is False
+
+
+# ── maybe_spawn_cross_cutting_safeguard ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_maybe_spawn_cross_cutting_safeguard_not_cross_cutting(db_session, mocker):
+    """Non-cross-cutting PRs return False without spawning anything."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig = make_task(
+        project_id=project.id,
+        context={"scope": "small"},
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    result = await maybe_spawn_cross_cutting_safeguard(orig, 99, "feat/x", "main", db_session)
+    assert result is False
+    assert orig.requires_approval is False
+    assert (orig.context or {}).get("safeguard_task_id") is None
+
+
+@pytest.mark.asyncio
+async def test_maybe_spawn_cross_cutting_safeguard_spawns_for_large_scope(db_session, mocker):
+    """Large-scope PRs trigger a safeguard task and sets requires_approval."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig = make_task(
+        project_id=project.id,
+        context={"scope": "large"},
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    result = await maybe_spawn_cross_cutting_safeguard(orig, 42, "feat/x", "main", db_session)
+    assert result is True
+    assert orig.requires_approval is True
+    assert (orig.context or {}).get("safeguard_task_id") is not None
+    assert (orig.context or {}).get("safeguard_reason") == "scope=large"
+
+    # Safeguard task must exist in DB
+    safeguard_id = uuid.UUID((orig.context or {})["safeguard_task_id"])
+    safeguard = await db_session.get(Task, safeguard_id)
+    assert safeguard is not None
+    assert safeguard.parent_task_id == orig.id
+
+
+@pytest.mark.asyncio
+async def test_maybe_spawn_cross_cutting_safeguard_idempotent(db_session, mocker):
+    """If safeguard_task_id already set, second call is a no-op."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    existing_id = str(uuid.uuid4())
+    orig = make_task(
+        project_id=project.id,
+        context={"scope": "large", "safeguard_task_id": existing_id},
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    result = await maybe_spawn_cross_cutting_safeguard(orig, 42, "feat/x", "main", db_session)
+    assert result is False
+    # safeguard_task_id unchanged
+    assert (orig.context or {}).get("safeguard_task_id") == existing_id
+
+
+# ── _maybe_release_safeguard_gate ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_release_safeguard_gate_noop_for_non_safeguard(db_session):
+    """Task with no safeguard_for_task_id is a no-op."""
+    from app.task_completion import _maybe_release_safeguard_gate
+    t = make_task(context={})
+    # Should not raise and should not touch DB
+    await _maybe_release_safeguard_gate(t, [], db_session)
+
+
+@pytest.mark.asyncio
+async def test_release_safeguard_gate_maintains_on_critical_finding(db_session):
+    """Gate stays on (requires_approval=True) when a critical finding is present."""
+    from app.task_completion import _maybe_release_safeguard_gate
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig = make_task(project_id=project.id, requires_approval=True)
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    safeguard = make_task(
+        project_id=project.id,
+        context={"safeguard_for_task_id": str(orig.id), "safeguard_pr_number": 7},
+    )
+    findings = [{"severity": "critical", "description": "SQL injection"}]
+    await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+    await db_session.refresh(orig)
+    assert orig.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_release_safeguard_gate_releases_on_low_findings(db_session):
+    """Gate is released (requires_approval=False) when findings are low severity."""
+    from app.task_completion import _maybe_release_safeguard_gate
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig = make_task(project_id=project.id, requires_approval=True)
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    safeguard = make_task(
+        project_id=project.id,
+        context={"safeguard_for_task_id": str(orig.id), "safeguard_pr_number": 7},
+    )
+    findings = [{"severity": "low", "description": "Unused import"}]
+    await _maybe_release_safeguard_gate(safeguard, findings, db_session)
+
+    await db_session.refresh(orig)
+    assert orig.requires_approval is False
+
+
+@pytest.mark.asyncio
+async def test_release_safeguard_gate_sets_ci_waiting_when_evaluating(db_session):
+    """When orig is EVALUATING, gate release sets ci_waiting=True."""
+    from app.task_completion import _maybe_release_safeguard_gate
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig = make_task(
+        project_id=project.id,
+        requires_approval=True,
+        status=TaskStatus.EVALUATING,
+        context={"review_loop": {"iteration": 1}},
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    safeguard = make_task(
+        project_id=project.id,
+        context={"safeguard_for_task_id": str(orig.id), "safeguard_pr_number": 7},
+    )
+    await _maybe_release_safeguard_gate(safeguard, [], db_session)
+
+    await db_session.refresh(orig)
+    assert orig.requires_approval is False
+    assert (orig.context or {}).get("review_loop", {}).get("ci_waiting") is True
+    assert (orig.context or {}).get("review_loop", {}).get("pr_number") == 7
+
+
+# ── Cross-cutting gate: integration (spawn + merge-gate) ──────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(strict=False, reason="Pending _spawn_cross_cutting_safeguard_task call in _spawn_pipeline_task sibling subtask")
+async def test_safeguard_spawned_and_merge_gate_set_for_large_scope_pr(db_session, mocker):
+    """When a review is triggered for a large-scope PR, the pipeline must spawn a
+    safeguard (security_audit or qa) task AND set requires_approval=True on the
+    original task so it cannot be merged until the safeguard approves.
+
+    The agent spawn is mocked via _spawn_cross_cutting_safeguard_task; the test
+    verifies both that the spawn was attempted and that the merge gate is armed."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock, return_value=("tok", "o", "r"),
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch("app.github.add_issue_label", new_callable=AsyncMock)
+
+    safeguard_mock = mocker.patch(
+        "app.review_pipeline._spawn_cross_cutting_safeguard_task",
+        create=True,
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Ship big feature", "base_branch": "main"}],
+        context={
+            "scope": "large",
+            "_pr_changed_files": [
+                "backend/app/a.py",
+                "agent/src/index.ts",
+                "admin-ui/src/App.tsx",
+            ],
+        },
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{
+            "type": "review", "pr_number": 700, "branch": "feat/big",
+            "base_branch": "main", "original_task_id": str(original_task.id),
+        }],
+        context={
+            "scope": "large",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=700, branch="feat/big", base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    safeguard_mock.assert_awaited_once(), (
+        "A cross-cutting safeguard task must be spawned for large-scope PRs"
+    )
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True, (
+        "Original task must be merge-gated (requires_approval=True) until the safeguard approves"
+    )
+
+
+@pytest.mark.asyncio
+async def test_safeguard_not_spawned_for_small_scope_pr(db_session, mocker):
+    """Small-scope PRs must never trigger the cross-cutting safeguard gate,
+    even when they happen to touch multiple top-level modules."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    safeguard_mock = mocker.patch(
+        "app.review_pipeline._spawn_cross_cutting_safeguard_task",
+        create=True,
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Small fix", "base_branch": "main"}],
+        context={
+            "scope": "small",
+            "_pr_changed_files": [
+                "backend/app/foo.py",
+                "agent/src/index.ts",
+                "admin-ui/src/App.tsx",
+            ],
+        },
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{
+            "type": "review", "pr_number": 701, "branch": "feat/small",
+            "base_branch": "main", "original_task_id": str(original_task.id),
+        }],
+        context={
+            "scope": "small",
+            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=701, branch="feat/small", base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    safeguard_mock.assert_not_awaited(), (
+        "Small-scope PRs must never trigger the cross-cutting safeguard gate"
+    )
