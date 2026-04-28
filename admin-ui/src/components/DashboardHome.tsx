@@ -21,6 +21,7 @@ import { RemediationFunnelSection } from './RemediationFunnelSection';
 import { FailureStageWidget } from './FailureStageWidget';
 import { ScopeConversionRatesSection } from './ScopeConversionRatesSection';
 import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSection';
+import { ProviderCostPanel } from './ProviderCostPanel';
 import { DriftSignalsCard } from './DriftSignalsCard';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
@@ -205,6 +206,28 @@ interface DigestData {
     sample_size?: number | null;
     first_attempt_by_review_category?: Record<string, number> | null;
     [key: string]: unknown;
+  } | null;
+  self_review_effectiveness?: {
+    with_self_review_approval_rate?: number | null;
+    without_self_review_approval_rate?: number | null;
+    clean_verdict_approval_rate?: number | null;
+    fixed_verdict_approval_rate?: number | null;
+    sample_size?: number | null;
+  } | null;
+  review_accuracy?: {
+    total_reviews?: number | null;
+    overrides?: number | null;
+    dismissals?: number | null;
+    misses?: number | null;
+    total_approvals?: number | null;
+    precision?: number | null;
+    recall?: number | null;
+  } | null;
+  self_review_prediction_accuracy?: {
+    prediction_hit_rate?: number | null;
+    miss_rate?: number | null;
+    false_alarm_rate?: number | null;
+    sample_size?: number | null;
   } | null;
   median_cost_per_merged_pr?: number | null;
 }
@@ -864,7 +887,68 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             );
           })()}
 
-          {/* Section 1d3: Cost of Failures */}
+          {/* Section 1d3: Review Quality */}
+          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null) && (
+            <section>
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">Review Quality</p>
+              <div className="flex flex-wrap gap-3">
+                {digest?.review_accuracy?.precision != null && (
+                  <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
+                    <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Precision</p>
+                    <p className={`text-xl font-bold font-mono ${digest.review_accuracy.precision >= 0.8 ? 'text-emerald-400' : digest.review_accuracy.precision >= 0.6 ? 'text-amber-400' : 'text-red-400'}`}>
+                      {Math.round(digest.review_accuracy.precision * 100)}%
+                    </p>
+                    <p className="text-[9px] text-neutral-600 mt-0.5">{digest.review_accuracy.total_reviews} reviews</p>
+                  </div>
+                )}
+                {digest?.review_accuracy?.recall != null && (
+                  <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
+                    <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Recall</p>
+                    <p className={`text-xl font-bold font-mono ${digest.review_accuracy.recall >= 0.8 ? 'text-emerald-400' : digest.review_accuracy.recall >= 0.6 ? 'text-amber-400' : 'text-red-400'}`}>
+                      {Math.round(digest.review_accuracy.recall * 100)}%
+                    </p>
+                    <p className="text-[9px] text-neutral-600 mt-0.5">{digest.review_accuracy.total_approvals} approvals</p>
+                  </div>
+                )}
+                {digest?.self_review_effectiveness?.with_self_review_approval_rate != null && (
+                  <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]">
+                    <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Approval Lift</p>
+                    {(() => {
+                      const sre = digest.self_review_effectiveness ?? {};
+                      const withSR = sre.with_self_review_approval_rate ?? 0;
+                      const withoutSR = sre.without_self_review_approval_rate;
+                      const lift = withoutSR != null ? withSR - withoutSR : null;
+                      return (
+                        <>
+                          <p className={`text-xl font-bold font-mono ${withSR >= 0.7 ? 'text-emerald-400' : withSR >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}>
+                            {Math.round(withSR * 100)}%
+                          </p>
+                          {lift != null && (
+                            <p className={`text-[9px] mt-0.5 ${lift > 0 ? 'text-emerald-500' : lift < 0 ? 'text-red-500' : 'text-neutral-600'}`}>
+                              {lift > 0 ? '+' : ''}{Math.round(lift * 100)}pp vs no SR
+                            </p>
+                          )}
+                        </>
+                      );
+                    })()}
+                  </div>
+                )}
+                {digest?.self_review_prediction_accuracy?.prediction_hit_rate != null && (
+                  <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
+                    <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Prediction Hit</p>
+                    <p className={`text-xl font-bold font-mono ${digest.self_review_prediction_accuracy.prediction_hit_rate >= 0.7 ? 'text-emerald-400' : digest.self_review_prediction_accuracy.prediction_hit_rate >= 0.4 ? 'text-amber-400' : 'text-red-400'}`}>
+                      {Math.round(digest.self_review_prediction_accuracy.prediction_hit_rate * 100)}%
+                    </p>
+                    {digest.self_review_prediction_accuracy.false_alarm_rate != null && (
+                      <p className="text-[9px] text-neutral-600 mt-0.5">{Math.round(digest.self_review_prediction_accuracy.false_alarm_rate * 100)}% false alarms</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
+
+          {/* Section 1d4: Cost of Failures */}
           {!loading && (digest?.total_failed_cost_usd ?? 0) > 0 && (
             <section>
               <div className="flex flex-wrap gap-1.5 items-center">
@@ -1143,6 +1227,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           {!!selectedProjectId && (
             <PoolAccountHealthPanel accounts={accountHealth} loading={loading} />
           )}
+
+          {/* Section 2e: Provider Cost & Success */}
+          <ProviderCostPanel selectedProjectId={selectedProjectId} windowHours={windowHours} />
 
           {/* Drift Signals */}
           {!!selectedProjectId && <DriftSignalsCard projectId={selectedProjectId} />}

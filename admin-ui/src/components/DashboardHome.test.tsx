@@ -45,6 +45,10 @@ vi.mock('./ScopeTrendsSection', () => ({
   ScopeTrendsSection: () => <div data-testid="scope-trends-section">ScopeTrendsSection</div>,
 }));
 
+vi.mock('./ProviderCostPanel', () => ({
+  ProviderCostPanel: () => <div data-testid="provider-cost-panel">ProviderCostPanel</div>,
+}));
+
 vi.mock('recharts', () => ({
   ResponsiveContainer: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   AreaChart: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,

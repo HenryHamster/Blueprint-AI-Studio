@@ -19,6 +19,7 @@ from app.database import get_session
 from app.digest_cache import DigestCache, get_digest_cache
 from app.models import (
     Task, TaskStatus, Project, Artifact, ArtifactType, _utcnow,
+    MaxPlanAccount,
     ResidualRemediationCase, ResidualRemediationCaseStatus,
 )
 from app.auth import get_current_user, require_admin
@@ -1132,6 +1133,88 @@ async def clear_residual_fingerprints(
     _residual_store.clear()
     _residual_seen_task_ids.clear()
     return {"cleared": count}
+
+
+@router.get("/provider-cost-summary")
+async def get_provider_cost_summary(
+    hours: int = Query(24, ge=1, le=168),
+    project_id: uuid.UUID | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Aggregate per-provider/account cost and success metrics for a rolling window.
+
+    Groups terminal tasks by the account they ran on (stored in task.context),
+    computing: total tasks, success rate, total spend, cost per merged PR.
+    Returns rows sorted by total spend descending.
+    """
+    window_start = _utcnow() - timedelta(hours=hours)
+    filters = [
+        Task.created_at >= window_start,
+        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+    ]
+    if project_id:
+        filters.append(Task.project_id == project_id)
+
+    tasks = (await session.execute(
+        select(Task)
+        .where(*filters)
+        .options(load_only(
+            Task.id, Task.status, Task.context,
+            Task.vm_spot, Task.vm_provisioned_at, Task.vm_stopped_at,
+        ))
+        .limit(5000)
+    )).scalars().all()
+
+    def _acct_id(ctx: Dict[str, Any] | None) -> str | None:
+        if not ctx:
+            return None
+        return ctx.get("llm_account_id") or ctx.get("max_plan_account_id")
+
+    acct_ids = {a for t in tasks if (a := _acct_id(t.context))}
+    acct_map: Dict[str, Dict[str, str]] = {}
+    if acct_ids:
+        parsed = [uuid.UUID(a) for a in acct_ids if a]
+        if parsed:
+            rows = (await session.execute(
+                select(MaxPlanAccount).where(MaxPlanAccount.id.in_(parsed))
+            )).scalars().all()
+            for a in rows:
+                acct_map[str(a.id)] = {"name": a.name, "provider": a.provider.value}
+
+    groups: Dict[str, Dict[str, Any]] = {}
+    for t in tasks:
+        acct_id = _acct_id(t.context)
+        info = acct_map.get(acct_id or "", {"name": "unknown", "provider": "unknown"})
+        key = f"{info['provider']}|{acct_id or 'untracked'}"
+        g = groups.setdefault(key, {
+            "provider": info["provider"],
+            "account_id": acct_id,
+            "account_name": info["name"],
+            "total_tasks": 0,
+            "success_count": 0,
+            "merged_count": 0,
+            "total_cost_usd": 0.0,
+        })
+        g["total_tasks"] += 1
+        if t.status == TaskStatus.COMPLETED:
+            g["success_count"] += 1
+            if (t.context or {}).get("pr_merged"):
+                g["merged_count"] += 1
+        if t.vm_provisioned_at and t.vm_stopped_at:
+            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+            g["total_cost_usd"] += (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() * rate
+
+    result_rows = []
+    for g in groups.values():
+        result_rows.append({
+            **g,
+            "total_cost_usd": round(g["total_cost_usd"], 2),
+            "success_rate": round(g["success_count"] / g["total_tasks"], 3) if g["total_tasks"] else None,
+            "cost_per_merged_pr": round(g["total_cost_usd"] / g["merged_count"], 2) if g["merged_count"] else None,
+        })
+    result_rows.sort(key=lambda x: x["total_cost_usd"], reverse=True)
+    return {"window_hours": hours, "rows": result_rows}
 
 
 @router.get("/drift-snapshot")
