@@ -1,25 +1,64 @@
 #!/usr/bin/env bash
 # Run backend tests in Docker (mirrors CI).
+#
+# Defaults: real Postgres sidecar + warm testmon cache (selecting only
+# tests whose dependency hashes changed since the last main snapshot).
+# Both default to ON because they catch real bugs CI would otherwise
+# surface only after a push (Postgres) or save 5–7 min of redundant
+# pytest collection (testmon). Opt out for fast local iteration.
+#
 # Usage:
-#   scripts/test-backend.sh                              # full suite, in-memory SQLite (fast)
+#   scripts/test-backend.sh                              # full suite, Postgres + testmon if warm cache present
 #   scripts/test-backend.sh testing/test_agent.py        # specific file
 #   scripts/test-backend.sh -k "test_name"               # specific test by name
 #   scripts/test-backend.sh --standalone                 # standalone tests only (no DB fixtures)
-#   scripts/test-backend.sh --postgres [...]             # use real Postgres sidecar (catches enum/JSONB/migration drift)
+#   scripts/test-backend.sh --no-postgres                # SQLite (fast local; misses Postgres-only failures)
+#   scripts/test-backend.sh --no-testmon                 # ignore warm cache, run full suite
+#   scripts/test-backend.sh --postgres                   # accepted for back-compat; default is already on
 set -euo pipefail
 cd "$(dirname "$0")/../backend"
 
-# --- Argument parsing: extract --postgres without disturbing other args ---
-USE_POSTGRES=0
+# --- Argument parsing ---
+# --postgres: kept as a no-op flag for callers that pass it explicitly.
+# --no-postgres: opt out (use in-memory SQLite for fast local dev).
+# --no-testmon: opt out of warm-cache selection (run full suite).
+USE_POSTGRES=1
+USE_TESTMON=1
 ARGS=()
 for arg in "$@"; do
-  if [ "$arg" = "--postgres" ]; then
-    USE_POSTGRES=1
-  else
-    ARGS+=("$arg")
-  fi
+  case "$arg" in
+    --postgres) ;;  # default; no-op
+    --no-postgres) USE_POSTGRES=0 ;;
+    --no-testmon) USE_TESTMON=0 ;;
+    *) ARGS+=("$arg") ;;
+  esac
 done
 if [ "${#ARGS[@]}" -gt 0 ]; then set -- "${ARGS[@]}"; else set --; fi
+
+# --- Fetch warm testmon cache from orphan branch (best-effort) ---
+# CI on main refreshes the orphan testmon-cache branch with a vacuumed
+# .testmondata. Pulling it lets pytest --testmon-forceselect skip tests
+# whose dependency hashes are unchanged from the main snapshot.
+# Falls back silently to the full suite when the branch doesn't exist
+# or git can't reach origin (offline, no remote, etc.).
+# Pass --no-testmon (or set TESTMON_NO_FETCH=1) to opt out.
+TESTMON_ARGS=()
+if [ "$USE_TESTMON" = "1" ] && [ -z "${TESTMON_NO_FETCH:-}" ]; then
+  if git -C .. fetch --depth=1 origin testmon-cache 2>/dev/null; then
+    if git -C .. show origin/testmon-cache:.testmondata > .testmondata.tmp 2>/dev/null \
+       && [ -s .testmondata.tmp ]; then
+      mv .testmondata.tmp .testmondata
+    else
+      rm -f .testmondata.tmp
+    fi
+  fi
+  if [ -f .testmondata ]; then
+    TESTMON_ARGS=(--testmon-forceselect)
+  fi
+fi
+# When USE_TESTMON=0 we just don't append the flag; the plugin sits inert
+# without an explicit --testmon* arg, so a leftover .testmondata on disk
+# has no effect on the run and is preserved for the next opt-in.
 
 # --- Cleanup: combined trap for CLAUDE.md copy + Postgres sidecar ---
 PG_CONTAINER=""
@@ -152,6 +191,9 @@ echo "=== Standalone tests ==="
 _run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py -v --noconftest
 
 echo "=== Full test suite ==="
-_run python3 -m pytest testing/ -q --tb=short
+if [ "${#TESTMON_ARGS[@]}" -gt 0 ]; then
+  echo "(warm testmon cache present — selecting only tests with changed dependencies)"
+fi
+_run python3 -m pytest testing/ -q --tb=short "${TESTMON_ARGS[@]}"
 
 echo "=== All backend tests passed ==="

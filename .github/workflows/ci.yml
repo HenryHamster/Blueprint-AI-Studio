@@ -276,6 +276,50 @@ jobs:
           fi
           echo "Migration linter passed"
 
+      # Refresh the testmon dependency cache from main. Agent VMs and local
+      # devs pull this via `git fetch origin testmon-cache` in test-backend.sh,
+      # which lets pytest --testmon-forceselect skip tests whose dependency
+      # hashes are unchanged. Runs only on main push + only after a green
+      # test run, so a partial / broken cache never lands.
+      - name: Refresh testmon cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.run_tests.outcome == 'success'
+        run: |
+          mkdir -p .testmon-out
+          docker run --rm --network host \
+            -e DATABASE_URL=${{ env.TEST_DB_URL }} \
+            -e USE_TEST_POSTGRES=true \
+            -e AGENT_JWT_SECRET=ci-test-secret \
+            -e WS_TICKET_SECRET=ci-test-secret \
+            -v "$PWD/.testmon-out:/out" \
+            blueprint-backend-test \
+            bash -c "python -m pytest testing/ -q --tb=line --timeout=30 --testmon-noselect && \
+                     python -c 'import sqlite3; c = sqlite3.connect(\"/app/.testmondata\"); c.execute(\"PRAGMA wal_checkpoint(FULL)\"); c.execute(\"VACUUM\"); c.close()' && \
+                     cp /app/.testmondata /out/.testmondata"
+          ls -lh .testmon-out/.testmondata
+
+      - name: Push testmon cache to orphan branch
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.run_tests.outcome == 'success'
+        run: |
+          # Move the artifact out of the working tree before we wipe it.
+          cp .testmon-out/.testmondata /tmp/.testmondata-cache
+          git config user.name "blueprint-bot"
+          git config user.email "blueprint-bot@users.noreply.github.com"
+          # Orphan branch: no merge history, single commit per main push.
+          # Force-push because each refresh fully replaces the previous one;
+          # there's nothing meaningful to preserve in the binary diff.
+          git checkout --orphan testmon-cache-tmp
+          git rm -rf --cached . > /dev/null 2>&1 || true
+          git clean -fdx -e .testmon-out
+          cp /tmp/.testmondata-cache .testmondata
+          cat > .gitignore <<'EOF'
+          *
+          !.testmondata
+          !.gitignore
+          EOF
+          git add .testmondata .gitignore
+          git commit -m "testmon: refresh from ${GITHUB_SHA}"
+          git push --force origin testmon-cache-tmp:testmon-cache
+
   agent:
     name: CI / Agent
     runs-on: ubuntu-latest
