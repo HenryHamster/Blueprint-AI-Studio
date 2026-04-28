@@ -44,9 +44,18 @@ if [ "${#ARGS[@]}" -gt 0 ]; then set -- "${ARGS[@]}"; else set --; fi
 # Pass --no-testmon (or set TESTMON_NO_FETCH=1) to opt out.
 TESTMON_ARGS=()
 if [ "$USE_TESTMON" = "1" ] && [ -z "${TESTMON_NO_FETCH:-}" ]; then
-  if git -C .. fetch --depth=1 origin testmon-cache 2>/dev/null; then
-    if git -C .. show origin/testmon-cache:.testmondata > .testmondata.tmp 2>/dev/null \
-       && [ -s .testmondata.tmp ]; then
+  # MSYS_NO_PATHCONV: stop Git Bash on Windows from rewriting
+  # `origin/testmon-cache:.testmondata` to `origin\testmon-cache;.testmondata`
+  # (the colon + slashes look like a Windows path to MSYS, so it
+  # "translates" them and git then can't resolve the ref). On Linux this
+  # env var is a harmless no-op.
+  if MSYS_NO_PATHCONV=1 git -C .. fetch --depth=1 origin testmon-cache 2>/dev/null; then
+    if MSYS_NO_PATHCONV=1 git -C .. show origin/testmon-cache:.testmondata > .testmondata.tmp 2>/dev/null \
+       && [ -s .testmondata.tmp ] \
+       && head -c 15 .testmondata.tmp | grep -q "SQLite format 3"; then
+      # Validated as an actual SQLite file (not a stray git error message
+      # that happened to land in stdout — see the MSYS path-conv comment
+      # above; the corruption can also come from a partial fetch).
       mv .testmondata.tmp .testmondata
     else
       rm -f .testmondata.tmp
