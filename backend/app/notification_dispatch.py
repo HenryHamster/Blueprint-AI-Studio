@@ -624,6 +624,7 @@ async def _get_or_create_residual_case(
     return case
 
 
+
 async def post_residual_fix_spawned_message(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -683,6 +684,7 @@ async def post_residual_fix_result_message(
         summary = f'Residual auto-fix failed for {fingerprint[:32]} — manual intervention may be needed'
     else:
         summary = f'Residual auto-fix needs review: PR #{pr_number} for {fingerprint[:32]}'
+
 
     msg = await post_event_message(
         session,
