@@ -241,6 +241,14 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 1440):
             raise HTTPException(status_code=400, detail="autonomous_research_interval_minutes must be between 1 and 1440")
         _runtime_config["autonomous_research_interval_minutes"] = val
+    if "evaluating_pipeline_timeout_minutes" in payload:
+        try:
+            val = int(payload["evaluating_pipeline_timeout_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="evaluating_pipeline_timeout_minutes must be a number")
+        if not (1 <= val <= 1440):
+            raise HTTPException(status_code=400, detail="evaluating_pipeline_timeout_minutes must be between 1 and 1440")
+        _runtime_config["evaluating_pipeline_timeout_minutes"] = val
     if "max_concurrent_auto_remediations" in payload:
         try:
             val = int(payload["max_concurrent_auto_remediations"])

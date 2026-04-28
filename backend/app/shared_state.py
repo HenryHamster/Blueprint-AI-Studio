@@ -88,6 +88,11 @@ runtime_config: Dict = {
     "max_autonomous_tasks_per_hour": 12,
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
+    # Long-EVALUATING parents stop blocking new research on the same direction
+    # once their pipeline-side merge cycle exceeds this threshold. Set above
+    # the typical PR lifecycle (CI + review + fix + re-review + merge) so new
+    # research only spawns when a parent is genuinely stuck, not just slow.
+    "evaluating_pipeline_timeout_minutes": int(os.getenv("EVALUATING_PIPELINE_TIMEOUT_MINUTES", "120")),
     # Auto-remediation governors (residual CODE_ERROR fingerprint spawner).
     # Global cap on concurrent/queued auto-remediation tasks prevents queue
     # ballooning when many distinct fingerprints accumulate. Cooldown is
