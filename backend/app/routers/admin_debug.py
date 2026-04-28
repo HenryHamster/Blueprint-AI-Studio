@@ -622,8 +622,14 @@ async def get_strategic_debug(
 
     if strategic_frequency > 0:
         remainder = research_spawn_count % strategic_frequency
-        next_strategic_in = strategic_frequency if remainder == 0 and research_spawn_count > 0 \
-            else strategic_frequency - remainder
+        # When count > 0 and remainder == 0, strategic is due to spawn this cycle
+        # (autonomous_research.py:365 triggers on the same condition). Reporting
+        # 0 lets the UI show "ready now" instead of jumping back to `frequency`,
+        # which looked like the counter overflowing/resetting.
+        if research_spawn_count == 0:
+            next_strategic_in = strategic_frequency
+        else:
+            next_strategic_in = (strategic_frequency - remainder) % strategic_frequency
     else:
         next_strategic_in = None
 
@@ -684,8 +690,10 @@ async def get_strategic_debug(
     capability_keys = [k for k in design_doc.keys() if isinstance(k, str) and k.startswith("capabilities/")]
     if arch_frequency > 0:
         arch_remainder = strategic_cycle_count % arch_frequency
-        next_arch_in_cycles = arch_frequency if arch_remainder == 0 and strategic_cycle_count > 0 \
-            else arch_frequency - arch_remainder
+        if strategic_cycle_count == 0:
+            next_arch_in_cycles = arch_frequency
+        else:
+            next_arch_in_cycles = (arch_frequency - arch_remainder) % arch_frequency
     else:
         next_arch_in_cycles = None
     architecture_info = {
