@@ -32,7 +32,6 @@ import { CatchUpPanel } from './components/CatchUpPanel';
 import { MessagesPanel } from './components/MessagesPanel';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
 // StatusBar removed — redundant connection info
-// HealthOverviewCard removed — redundant with CatchUp panel
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { DiagnosticsPanel } from './components/DiagnosticsPanel';

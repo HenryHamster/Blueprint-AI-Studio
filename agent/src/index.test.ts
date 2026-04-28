@@ -55,7 +55,7 @@ vi.mock('ws', () => ({
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
 import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, type FailureCategory } from './index.js';
-import { execFileSync, spawn } from 'child_process';
+import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
 
@@ -957,15 +957,19 @@ describe('captureTestBaseline timeout selection', () => {
   });
 });
 
-// ── Auto-detect: scripts/test-backend.sh runs with --postgres ────────────────
+// ── Auto-detect: scripts/test-backend.sh postgres flag follows Docker availability ─
 // Without --postgres, test-backend.sh defaults to in-memory SQLite. CI runs
 // Postgres. SQLite-passing-Postgres-failing fixes get pushed and only fail on
-// CI, costing a full review-fix iteration. Force --postgres on the auto-detect
-// path so the local gate matches CI.
-describe('detectTestRunners auto-detect appends --postgres', () => {
+// CI, costing a full review-fix iteration. When Docker is available, auto-detect
+// passes --postgres so the local gate matches CI. When Docker is absent, pass
+// --no-postgres so tests still run via the in-memory SQLite path.
+describe('detectTestRunners auto-detect postgres flag', () => {
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
     vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execSync).mockReset();
+    // Default: Docker is available (execSync('docker version') succeeds)
+    vi.mocked(execSync).mockReturnValue('' as unknown as ReturnType<typeof execSync>);
     vi.mocked(spawn).mockReset();
     configureSpawnMock();
     vi.mocked(fs.existsSync).mockReset();
@@ -981,7 +985,7 @@ describe('detectTestRunners auto-detect appends --postgres', () => {
     });
   }
 
-  it('appends --postgres when auto-detecting backend/pytest.ini + scripts/test-backend.sh', async () => {
+  it('appends --postgres when Docker is available (backend/pytest.ini + scripts/test-backend.sh)', async () => {
     fakeSelfRepoFs();
     // No buildConfig = auto-detect path
     await captureTestBaseline(null, { value: '' });
@@ -990,9 +994,10 @@ describe('detectTestRunners auto-detect appends --postgres', () => {
     const args = bashCall![1] as string[];
     expect(args).toContain('scripts/test-backend.sh');
     expect(args).toContain('--postgres');
+    expect(args).not.toContain('--no-postgres');
   });
 
-  it('appends --postgres when auto-detecting in testFixLoop', async () => {
+  it('appends --postgres when Docker is available in testFixLoop', async () => {
     fakeSelfRepoFs();
     await testFixLoop(null, { value: '' });
     const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
@@ -1000,6 +1005,32 @@ describe('detectTestRunners auto-detect appends --postgres', () => {
     const args = bashCall![1] as string[];
     expect(args).toContain('scripts/test-backend.sh');
     expect(args).toContain('--postgres');
+    expect(args).not.toContain('--no-postgres');
+  });
+
+  it('appends --no-postgres when Docker is unavailable (captureTestBaseline)', async () => {
+    fakeSelfRepoFs();
+    // Simulate Docker absent: execSync throws
+    vi.mocked(execSync).mockImplementation(() => { throw new Error('docker not found'); });
+    await captureTestBaseline(null, { value: '' });
+    const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
+    expect(bashCall).toBeDefined();
+    const args = bashCall![1] as string[];
+    expect(args).toContain('scripts/test-backend.sh');
+    expect(args).toContain('--no-postgres');
+    expect(args).not.toContain('--postgres');
+  });
+
+  it('appends --no-postgres when Docker is unavailable in testFixLoop', async () => {
+    fakeSelfRepoFs();
+    vi.mocked(execSync).mockImplementation(() => { throw new Error('docker not found'); });
+    await testFixLoop(null, { value: '' });
+    const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
+    expect(bashCall).toBeDefined();
+    const args = bashCall![1] as string[];
+    expect(args).toContain('scripts/test-backend.sh');
+    expect(args).toContain('--no-postgres');
+    expect(args).not.toContain('--postgres');
   });
 });
 

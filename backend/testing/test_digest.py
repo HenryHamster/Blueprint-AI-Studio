@@ -4937,6 +4937,80 @@ async def test_residual_fingerprints_requires_auth(unauthenticated_client: Async
     assert response.status_code in (401, 403)
 
 
+@pytest.mark.asyncio
+async def test_clear_residual_fingerprints_empties_store(client: AsyncClient):
+    """POST /residual-fingerprints/clear wipes the in-memory store and seen-task set."""
+    from app.failure_classification import _residual_store, _residual_seen_task_ids
+
+    _residual_store.clear()
+    _residual_seen_task_ids.clear()
+    _residual_store["fp-aaa"] = {"count": 2, "sample_message": "error: foo"}
+    _residual_store["fp-bbb"] = {"count": 1, "sample_message": "error: bar"}
+    _residual_seen_task_ids.add("task-id-x")
+
+    response = await client.post("/api/admin/residual-fingerprints/clear")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["cleared"] == 2
+    assert len(_residual_store) == 0
+    assert len(_residual_seen_task_ids) == 0
+
+
+@pytest.mark.asyncio
+async def test_clear_residual_fingerprints_requires_auth(unauthenticated_client: AsyncClient):
+    """Clear endpoint requires admin auth."""
+    response = await unauthenticated_client.post("/api/admin/residual-fingerprints/clear")
+    assert response.status_code in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_ignore_residual_case_creates_db_row(client: AsyncClient, db_session):
+    """POST /residual-cases/{fp}/ignore creates an IGNORED row and returns it."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "err-fingerprint-abc"
+    response = await client.post(
+        f"/api/admin/residual-cases/{fingerprint}/ignore",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["fingerprint"] == fingerprint
+    assert data["status"] == "IGNORED"
+    assert "id" in data
+
+
+@pytest.mark.asyncio
+async def test_ignore_residual_case_idempotent(client: AsyncClient, db_session):
+    """Calling ignore twice for the same fingerprint/project is idempotent."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "err-fingerprint-dup"
+    for _ in range(2):
+        response = await client.post(
+            f"/api/admin/residual-cases/{fingerprint}/ignore",
+            params={"project_id": str(project.id)},
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "IGNORED"
+
+
+@pytest.mark.asyncio
+async def test_ignore_residual_case_requires_auth(unauthenticated_client: AsyncClient):
+    """Ignore endpoint requires admin auth."""
+    response = await unauthenticated_client.post(
+        "/api/admin/residual-cases/some-fp/ignore",
+        params={"project_id": "00000000-0000-0000-0000-000000000000"},
+    )
+    assert response.status_code in (401, 403)
+
+
 # ---------------------------------------------------------------------------
 # ResidualRemediationCase lifecycle status enrichment
 # ---------------------------------------------------------------------------

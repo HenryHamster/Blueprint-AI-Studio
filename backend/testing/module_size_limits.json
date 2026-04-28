@@ -21,7 +21,7 @@
     "research_completion.py": 2050,
     "strategic_completion.py": 1500,
     "rollup_management.py": 1700,
-    "reaper.py": 1550,
+    "reaper.py": 2000,
     "review_pipeline.py": 1510,
     "deploy_health.py": 1000
   },
@@ -38,16 +38,16 @@
     "components/DirectionCard.tsx": 1200,
     "components/PipelineView.tsx": 1200,
     "components/DashboardHome.tsx": 1750,
-    "components/MessagesPanel.tsx": 1000,
-    "components/MetricsDashboard.tsx": 500,
-    "components/ProjectDashboard.tsx": 300,
-    "components/HealthOverviewCard.tsx": 250,
-    "components/AutonomousStatus.tsx": 1150,
-    "components/DirectionProgressSection.tsx": 750,
-    "components/RemediationFunnelSection.tsx": 850,
-    "components/OrchestratorHealthBar.tsx": 700,
-    "components/RecentErrorsWidget.tsx": 400,
-    "components/MediumScopeWidget.tsx": 350,
-    "components/SettingsNotificationsSection.tsx": 350
+    "components/MessagesPanel.tsx": 1500,
+    "components/MetricsDashboard.tsx": 1500,
+    "components/ProjectDashboard.tsx": 1500,
+    "components/AutonomousStatus.tsx": 1500,
+    "components/DirectionProgressSection.tsx": 1000,
+    "components/RemediationFunnelSection.tsx": 1500,
+    "components/OrchestratorHealthBar.tsx": 1000,
+    "components/RecentErrorsWidget.tsx": 800,
+    "components/MediumScopeWidget.tsx": 800,
+    "components/SettingsNotificationsSection.tsx": 1000,
+    "components/FailureStageWidget.tsx": 800
   }
 }

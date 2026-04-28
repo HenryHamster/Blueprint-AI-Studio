@@ -1,4 +1,4 @@
-import { spawn, execFileSync } from 'child_process';
+import { spawn, execFileSync, execSync } from 'child_process';
 import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
@@ -1307,6 +1307,15 @@ function isDockerRunner(runner: TestRunner): boolean {
   return cmdAndArgs.includes('docker') || cmdAndArgs.includes('scripts/test-backend.sh');
 }
 
+function isDockerAvailable(): boolean {
+  try {
+    execSync('docker version', { stdio: 'ignore', timeout: 2000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
   const { existsSync, readFileSync } = fs;
   const runners: TestRunner[] = [];
@@ -1365,9 +1374,12 @@ function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
       // local run matches CI. Without it, the script defaults to in-memory
       // SQLite and Postgres-only failures (enum/JSONB/migration drift) only
       // surface on CI, after a push, burning a full review-fix iteration.
+      // When Docker is unavailable, fall back to --no-postgres so tests still
+      // run locally via the in-memory SQLite path rather than hard-failing.
+      const pgFlag = isDockerAvailable() ? '--postgres' : '--no-postgres';
       if (existsSync(backendPytestIni)) {
         if (existsSync(backendTestScript)) {
-          runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh', '--postgres'], cwd: WORKSPACE, label: 'pytest (backend)' });
+          runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh', pgFlag], cwd: WORKSPACE, label: 'pytest (backend)' });
         } else {
           runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend)' });
         }
@@ -1375,7 +1387,7 @@ function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
         try {
           if (readFileSync(backendPyproject, 'utf-8').includes('pytest')) {
             if (existsSync(backendTestScript)) {
-              runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh', '--postgres'], cwd: WORKSPACE, label: 'pytest (backend pyproject)' });
+              runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh', pgFlag], cwd: WORKSPACE, label: 'pytest (backend pyproject)' });
             } else {
               runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend pyproject)' });
             }

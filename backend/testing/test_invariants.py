@@ -855,9 +855,6 @@ class TestFrontendSizeGuardrails:
     def test_project_dashboard(self):
         self._check_frontend("components/ProjectDashboard.tsx")
 
-    def test_health_overview_card(self):
-        self._check_frontend("components/HealthOverviewCard.tsx")
-
     def test_autonomous_status(self):
         self._check_frontend("components/AutonomousStatus.tsx")
 
@@ -879,6 +876,8 @@ class TestFrontendSizeGuardrails:
     def test_settings_notifications_section(self):
         self._check_frontend("components/SettingsNotificationsSection.tsx")
 
+    def test_failure_stage_widget(self):
+        self._check_frontend("components/FailureStageWidget.tsx")
 
 # ── Failure Classification Taxonomy ────────────────────────────────────────
 
