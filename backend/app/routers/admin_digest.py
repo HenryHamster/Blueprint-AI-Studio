@@ -28,6 +28,8 @@ from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SP
 from app.direction_metrics import _compute_direction_quality_score
 from app.direction_outcomes import synthesize_prompt_quality_patterns
 from app.retry_budget import failure_class_history_classes
+from app import strategic_cycle as _strategic_cycle
+from app.strategic_analysis import _compute_prediction_calibration
 
 logger = logging.getLogger(__name__)
 
@@ -2717,8 +2719,9 @@ async def _compute_digest(
                     "assessment": _assessment,
                 }
 
-    # --- Latest strategic cycle ---
+    # --- Latest strategic cycle + prediction calibration ---
     latest_cycle = None
+    prediction_calibration: Dict[str, Any] | None = None
     if project_id:
         _proj = await session.get(Project, project_id)
         if _proj:
@@ -2736,6 +2739,10 @@ async def _compute_digest(
                     "vision_updated": last.get("vision_updated", False),
                     "summary_text": last.get("summary_text"),
                 }
+            _sc_history = await _strategic_cycle.recent_for_agent_context(
+                session, project_id, limit=20,
+            )
+            prediction_calibration = _compute_prediction_calibration(_proj, _sc_history)
 
     _rejected_in_window = [
         t for t in all_tasks
@@ -3478,4 +3485,7 @@ async def _compute_digest(
         "investigation_conversion": investigation_conversion,
         "anomaly_adjustment": anomaly_adjustment_summary,
         "migration_health": migration_health,
+        "prediction_calibration_factor": prediction_calibration["factor"] if prediction_calibration else None,
+        "prediction_calibration_note": prediction_calibration["note"] if prediction_calibration else None,
+        "prediction_calibration_sample_count": prediction_calibration["sample_count"] if prediction_calibration else None,
     }

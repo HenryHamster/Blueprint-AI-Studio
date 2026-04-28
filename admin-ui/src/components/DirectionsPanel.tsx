@@ -106,6 +106,7 @@ export interface Direction {
   estimated_cost_usd?: number | null;
   budget_utilization_pct?: number | null;
   budget_exceeded?: boolean;
+  quality_score?: number | null;
 }
 
 

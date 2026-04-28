@@ -587,3 +587,52 @@ def _compute_prediction_calibration_factor(
         raw = weight * raw + (1.0 - weight) * 1.0
 
     return max(0.5, min(1.5, round(raw, 4)))
+
+
+def _compute_prediction_calibration(
+    project, cycle_history: list | None = None, lookback_cycles: int = 5, min_samples: int = 3,
+) -> dict:
+    """Return calibration factor, human-readable note, and raw sample count.
+
+    Wraps ``_compute_prediction_calibration_factor`` and adds the canonical
+    note string and the number of raw data points so callers share wording.
+
+    Returns a dict with keys: ``factor`` (float), ``note`` (str),
+    ``sample_count`` (int — raw points before blending).
+    """
+    cycle_history = list(cycle_history or [])
+    directions_by_id = {
+        d.get("id"): d for d in (project.directions or []) if d.get("id")
+    }
+    sample_count = 0
+    cycles_seen = 0
+    for entry in reversed(cycle_history):
+        if entry.get("outcome") != "completed":
+            continue
+        created_predictions = entry.get("created_predictions") or {}
+        if not created_predictions:
+            continue
+        cycles_seen += 1
+        if cycles_seen > lookback_cycles:
+            break
+        for direction_id, prediction in created_predictions.items():
+            predicted = prediction.get("similar_past_merges") or 0
+            if predicted <= 0:
+                continue
+            if directions_by_id.get(direction_id) is None:
+                continue
+            sample_count += 1
+
+    factor = _compute_prediction_calibration_factor(
+        project, cycle_history, lookback_cycles=lookback_cycles, min_samples=min_samples,
+    )
+    if abs(factor - 1.0) < 0.05:
+        note = f"Predictions are well-calibrated (factor {factor})."
+    elif factor < 1.0:
+        pct = round((1.0 - factor) * 100)
+        note = f"Predictions have been running ~{pct}% optimistic — factor {factor} applied to future merge estimates."
+    else:
+        pct = round((factor - 1.0) * 100)
+        note = f"Predictions have been running ~{pct}% conservative — factor {factor} applied to future merge estimates."
+
+    return {"factor": factor, "note": note, "sample_count": sample_count}

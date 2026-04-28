@@ -5624,3 +5624,43 @@ async def test_cost_per_merge_by_type_threshold(client: AsyncClient, db_session)
     assert cpm_by_type["debug"]["exceeds_threshold"] is True
     assert cpm_by_type["create"]["exceeds_threshold"] is False
     assert cpm_by_type["fix"]["exceeds_threshold"] is False
+
+
+# ---------------------------------------------------------------------------
+# prediction_calibration fields
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_calibration_fields_present_when_project_selected(client: AsyncClient, db_session):
+    """Digest includes prediction_calibration_* fields when project_id is provided.
+
+    With no StrategicCycle rows the factor defaults to 1.0 and sample_count to 0.
+    """
+    project = make_project(directions=[])
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert "prediction_calibration_factor" in data
+    assert "prediction_calibration_note" in data
+    assert "prediction_calibration_sample_count" in data
+    assert data["prediction_calibration_factor"] == 1.0
+    assert data["prediction_calibration_sample_count"] == 0
+    assert "well-calibrated" in (data["prediction_calibration_note"] or "")
+
+
+@pytest.mark.asyncio
+async def test_digest_calibration_fields_null_without_project(client: AsyncClient):
+    """Digest omits calibration values when no project_id is provided."""
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["prediction_calibration_factor"] is None
+    assert data["prediction_calibration_note"] is None
+    assert data["prediction_calibration_sample_count"] is None

@@ -60,6 +60,7 @@ async def get_directions(
     current_user: dict = Depends(get_current_user)
 ):
     from app.shared_state import get_direction_hold_info as _get_direction_hold_info  # noqa: PLC0415
+    from app.direction_metrics import _compute_direction_quality_score  # noqa: PLC0415
     project = await _get_user_project(project_id, current_user["user_id"], session)
     directions = project.directions or []
     enriched = []
@@ -70,6 +71,7 @@ async def get_directions(
         enriched.append({
             **d,
             "merge_rate": _compute_direction_merge_rate(d),
+            "quality_score": round(_compute_direction_quality_score(d), 3),
             "held": bool(hold_info["held"]),
             "held_reason": hold_info["reason"] if hold_info["held"] else None,
             "held_at": held_at.isoformat() if isinstance(held_at, datetime) else None,

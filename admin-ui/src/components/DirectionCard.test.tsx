@@ -242,6 +242,51 @@ describe('DirectionCard diagnosis/remediation section', () => {
   });
 });
 
+describe('DirectionCard quality score badge', () => {
+  it('renders green badge when quality_score >= 0.6', () => {
+    const d = makeDirection({ quality_score: 0.75 });
+    render(<DirectionCard {...makeProps(d)} />);
+    const badge = screen.getByText('75% quality');
+    expect(badge).toBeInTheDocument();
+    expect(badge.className).toMatch(/emerald/);
+  });
+
+  it('renders amber badge when quality_score >= 0.3 and < 0.6', () => {
+    const d = makeDirection({ quality_score: 0.4 });
+    render(<DirectionCard {...makeProps(d)} />);
+    const badge = screen.getByText('40% quality');
+    expect(badge).toBeInTheDocument();
+    expect(badge.className).toMatch(/amber/);
+  });
+
+  it('renders red badge when quality_score < 0.3', () => {
+    const d = makeDirection({ quality_score: 0.2 });
+    render(<DirectionCard {...makeProps(d)} />);
+    const badge = screen.getByText('20% quality');
+    expect(badge).toBeInTheDocument();
+    expect(badge.className).toMatch(/red/);
+  });
+
+  it('hides badge when quality_score is absent', () => {
+    const d = makeDirection();
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.queryByText(/quality/)).not.toBeInTheDocument();
+  });
+
+  it('hides badge when quality_score is null', () => {
+    const d = makeDirection({ quality_score: null });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.queryByText(/quality/)).not.toBeInTheDocument();
+  });
+
+  it('renders at threshold: 0.6 is green, 0.3 is amber', () => {
+    const { rerender } = render(<DirectionCard {...makeProps(makeDirection({ quality_score: 0.6 }))} />);
+    expect(screen.getByText('60% quality').className).toMatch(/emerald/);
+    rerender(<DirectionCard {...makeProps(makeDirection({ quality_score: 0.3 }))} />);
+    expect(screen.getByText('30% quality').className).toMatch(/amber/);
+  });
+});
+
 describe('DirectionCard paused reason display', () => {
   it('shows amber text for yield/saturation pause reason', () => {
     const d = makeDirection({

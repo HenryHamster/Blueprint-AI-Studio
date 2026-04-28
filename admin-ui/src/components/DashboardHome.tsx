@@ -230,6 +230,13 @@ interface DigestData {
     sample_size?: number | null;
   } | null;
   median_cost_per_merged_pr?: number | null;
+  prediction_calibration_factor?: number | null;
+  prediction_calibration_note?: string | null;
+  prediction_calibration_sample_count?: number | null;
+  rejection_pattern_summary?: {
+    total_rejected: number;
+    top_notes: { snippet: string; count: number }[];
+  } | null;
 }
 
 
@@ -476,6 +483,35 @@ function CostBreakdownPill({ direction: d }: { direction: DirectionProgress }) {
         </div>
       )}
     </div>
+  );
+}
+
+// ---------- calibration chip ----------
+
+function CalibrationChip({ factor, note, sampleCount }: { factor: number | null | undefined; note: string | null | undefined; sampleCount: number | null | undefined }) {
+  if (factor == null || sampleCount == null || sampleCount < 3) return null;
+  const diff = factor - 1.0;
+  let label: string;
+  let colorClass: string;
+  if (Math.abs(diff) < 0.05) {
+    label = 'Predictions: well-calibrated';
+    colorClass = 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30';
+  } else if (diff < 0) {
+    const pct = Math.round((1.0 - factor) * 100);
+    label = `Predictions: ~${pct}% optimistic`;
+    colorClass = 'bg-amber-500/15 text-amber-400 border-amber-500/30';
+  } else {
+    const pct = Math.round((factor - 1.0) * 100);
+    label = `Predictions: ~${pct}% pessimistic`;
+    colorClass = 'bg-blue-500/15 text-blue-400 border-blue-500/30';
+  }
+  return (
+    <span
+      className={`text-[9px] font-medium px-1.5 py-0.5 rounded border ${colorClass} cursor-default`}
+      title={note ?? undefined}
+    >
+      {label}
+    </span>
   );
 }
 
@@ -1082,6 +1118,34 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             </section>
           )}
 
+          {/* Section 1h: Rejection Pattern Summary */}
+          {(() => {
+            const rps = digest?.rejection_pattern_summary;
+            if (!rps || rps.total_rejected === 0 || rps.top_notes.length === 0) return null;
+            return (
+              <section>
+                <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+                  Human Rejection Patterns <span className="text-neutral-600 font-normal normal-case tracking-normal">· {rps.total_rejected} rejected</span>
+                </h2>
+                <div className="flex flex-col gap-1">
+                  {rps.top_notes.map((note, i) => (
+                    <div
+                      key={i}
+                      className="flex items-start gap-2 text-xs bg-neutral-900/50 border border-neutral-800/50 px-2 py-1.5 rounded"
+                    >
+                      <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20 tabular-nums">
+                        ×{note.count}
+                      </span>
+                      <span className="flex-1 text-neutral-400 font-mono text-[10px] break-words" title={note.snippet}>
+                        {note.snippet.length > 160 ? note.snippet.slice(0, 160) + '…' : note.snippet}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            );
+          })()}
+
           {/* Section 2: Direction Portfolio Health */}
           <section>
             <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Direction Portfolio</h2>
@@ -1107,6 +1171,11 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   )}
                   <span className="text-neutral-600">&middot;</span>
                   <span>{totalDirPRs} PR{totalDirPRs !== 1 ? 's' : ''} merged</span>
+                  <CalibrationChip
+                    factor={digest?.prediction_calibration_factor}
+                    note={digest?.prediction_calibration_note}
+                    sampleCount={digest?.prediction_calibration_sample_count}
+                  />
                 </div>
 
                 {/* Scrollable direction cards */}

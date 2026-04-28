@@ -683,6 +683,19 @@ function DirectionCardImpl({
                 Mixed
               </span>
             )}
+            {/* Quality score badge — taxonomy-based structural health */}
+            {typeof d.quality_score === 'number' && (() => {
+              const score = d.quality_score;
+              const color = score >= 0.6 ? 'emerald' : score >= 0.3 ? 'amber' : 'red';
+              return (
+                <span
+                  title="Direction quality score: taxonomy-based structural health (0–1)"
+                  className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
+                >
+                  {Math.round(score * 100)}% quality
+                </span>
+              );
+            })()}
             {/* Aggregate product ratio badge from latest research history entry */}
             {(() => {
               const entries = d.research_history?.filter(e => e.product_ratio != null);

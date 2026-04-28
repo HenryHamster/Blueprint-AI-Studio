@@ -1087,22 +1087,16 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     review_effort = _runtime_config.get("task_type_efforts", {}).get("strategic_review") or \
                     _runtime_config.get("task_type_efforts", {}).get("research") or None
 
-    from app.strategic_analysis import _build_outcome_evaluation, _compute_prediction_calibration_factor
+    from app.strategic_analysis import _build_outcome_evaluation, _compute_prediction_calibration
     # Audit W2: cycle history is in the StrategicCycle table; pre-fetch once
     # and pass into all the sync analysis helpers so they don't need the session.
     cycle_history = await strategic_cycle.recent_for_agent_context(
         session, project.id, limit=20,
     )
     last_strategic_at = await _find_last_strategic_cycle_time(project, session)
-    calibration_factor = _compute_prediction_calibration_factor(project, cycle_history)
-    if abs(calibration_factor - 1.0) < 0.05:
-        calibration_note = f"Predictions are well-calibrated (factor {calibration_factor})."
-    elif calibration_factor < 1.0:
-        pct = round((1.0 - calibration_factor) * 100)
-        calibration_note = f"Predictions have been running ~{pct}% optimistic — factor {calibration_factor} applied to future merge estimates."
-    else:
-        pct = round((calibration_factor - 1.0) * 100)
-        calibration_note = f"Predictions have been running ~{pct}% conservative — factor {calibration_factor} applied to future merge estimates."
+    _cal = _compute_prediction_calibration(project, cycle_history)
+    calibration_factor = _cal["factor"]
+    calibration_note = _cal["note"]
     recent_interventions = await _build_recent_interventions(
         project, session, last_strategic_at=last_strategic_at
     )

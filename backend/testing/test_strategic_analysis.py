@@ -4,6 +4,7 @@ from unittest.mock import patch
 from app.strategic_analysis import (
     _build_outcome_evaluation as _real_build_outcome_evaluation,
     _compute_prediction_calibration_factor as _real_compute_prediction_calibration_factor,
+    _compute_prediction_calibration,
 )
 from app.direction_metrics import _compute_difficulty_index
 
@@ -1102,3 +1103,68 @@ class TestPredictionCalibrationFactor:
             },
         )
         assert _compute_prediction_calibration_factor(project, (project.vision or {}).get("_strategic_cycle_history") or []) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# _compute_prediction_calibration tests
+# ---------------------------------------------------------------------------
+
+class TestComputePredictionCalibration:
+    def _make_cycle(self, direction_id: str, predicted: float) -> dict:
+        return {
+            "outcome": "completed",
+            "created_predictions": {direction_id: {"similar_past_merges": predicted}},
+        }
+
+    def test_returns_dict_with_required_keys(self):
+        project = _make_project(vision={})
+        result = _compute_prediction_calibration(project, [])
+        assert set(result.keys()) == {"factor", "note", "sample_count"}
+
+    def test_no_history_returns_well_calibrated(self):
+        project = _make_project(vision={})
+        result = _compute_prediction_calibration(project, [])
+        assert result["factor"] == 1.0
+        assert result["sample_count"] == 0
+        assert "well-calibrated" in result["note"]
+
+    def test_optimistic_note_when_over_predicting(self):
+        # Direction predicted 10 merges but only got 5 → factor = 0.5 → optimistic
+        project = _make_project(
+            directions=[{"id": "d1", "research_history": [{"prs_merged": 5}], "history_aggregate": {}}],
+        )
+        cycle = self._make_cycle("d1", 10)
+        result = _compute_prediction_calibration(project, [cycle, cycle, cycle])
+        assert result["factor"] < 1.0
+        assert "optimistic" in result["note"]
+        assert result["sample_count"] >= 3
+
+    def test_conservative_note_when_under_predicting(self):
+        # Direction predicted 2 merges but got 6 → factor > 1 → pessimistic/conservative
+        project = _make_project(
+            directions=[{"id": "d1", "research_history": [{"prs_merged": 6}], "history_aggregate": {}}],
+        )
+        cycle = self._make_cycle("d1", 2)
+        result = _compute_prediction_calibration(project, [cycle, cycle, cycle])
+        assert result["factor"] > 1.0
+        assert "conservative" in result["note"]
+
+    def test_sparse_history_returns_low_sample_count(self):
+        # Only 1 data point — factor blended toward 1.0, sample_count == 1
+        project = _make_project(
+            directions=[{"id": "d1", "research_history": [{"prs_merged": 0}], "history_aggregate": {}}],
+        )
+        cycle = self._make_cycle("d1", 10)
+        result = _compute_prediction_calibration(project, [cycle])
+        assert result["sample_count"] == 1
+        # Blended factor should be close to 1.0 (sparse)
+        assert abs(result["factor"] - 1.0) < 0.5
+
+    def test_factor_matches_calibration_factor_helper(self):
+        project = _make_project(
+            directions=[{"id": "d1", "research_history": [{"prs_merged": 3}], "history_aggregate": {}}],
+        )
+        cycles = [self._make_cycle("d1", 3)] * 5
+        result = _compute_prediction_calibration(project, cycles)
+        expected_factor = _real_compute_prediction_calibration_factor(project, cycles)
+        assert result["factor"] == expected_factor
