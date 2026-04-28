@@ -8,6 +8,10 @@ const { mockReadFileSync } = vi.hoisted(() => {
   // Build the fs mock object here so both vi.mock factory and test bodies
   // can reference the same vi.fn() instances.
   const mockReadFileSync = vi.fn();
+  // Keep module-level provider/auth defaults deterministic across local and CI
+  // environments. Some test cases call helpers without explicit provider args.
+  process.env.PROVIDER = 'anthropic';
+  process.env.AUTH_MODE = 'oauth';
   // Clear before index.ts loads so the module-level LLM_CLI_TRANSLATION
   // constant is null. Tests that verify translation behavior set the env var
   // themselves and call parseLLMCliTranslation() directly.

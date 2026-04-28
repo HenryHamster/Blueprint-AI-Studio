@@ -749,13 +749,27 @@ async def capture_success_pattern(
 
     scope: str = (task.context or {}).get("scope") or "unspecified"
     related_files: list[str] = list((task.context or {}).get("related_files") or [])
+    direction_id: str = (task.context or {}).get("direction_id") or ""
     num_files = len(related_files)
-    tests_added = any(
-        "/test_" in f or f.startswith("test_")
-        or ".test." in f or ".spec." in f
-        or "/tests/" in f or "/testing/" in f
-        for f in related_files
-    )
+
+    # Richer implementation-shape signals: file-type distribution and test count.
+    file_type_dist: dict[str, int] = {}
+    test_file_count = 0
+    for f in related_files:
+        if (
+            "/test_" in f
+            or f.startswith("test_")
+            or ".test." in f
+            or ".spec." in f
+            or "/testing/" in f
+            or "/tests/" in f
+        ):
+            test_file_count += 1
+        ext = f.rsplit(".", 1)[-1] if "." in f else ""
+        if ext and len(ext) <= 6:
+            file_type_dist[ext] = file_type_dist.get(ext, 0) + 1
+
+    tests_added = test_file_count > 0
 
     project = await session.get(Project, task.project_id)
     if not project:
@@ -795,10 +809,17 @@ async def capture_success_pattern(
         count = entry.get("success_count", 1) + 1
         scope_dist = dict(entry.get("scope_distribution") or {})
         scope_dist[scope] = scope_dist.get(scope, 0) + 1
+        raw_dir_succ = entry.get("direction_successes")
+        dir_succ = dict(raw_dir_succ) if isinstance(raw_dir_succ, dict) else {}
+        if direction_id:
+            dir_succ[direction_id] = dir_succ.get(direction_id, 0) + 1
         entry["success_count"] = count
         entry["scope_distribution"] = scope_dist
+        entry["direction_successes"] = dir_succ
         entry["num_files_changed"] = num_files
         entry["tests_added"] = tests_added
+        entry["test_file_count"] = test_file_count
+        entry["file_type_distribution"] = file_type_dist
         entry["updated_at"] = _utcnow().isoformat()
         entry["content"] = (
             f"First-attempt success pattern for {task_type} tasks "
@@ -824,6 +845,9 @@ async def capture_success_pattern(
             "scope": scope,
             "num_files_changed": num_files,
             "tests_added": tests_added,
+            "test_file_count": test_file_count,
+            "file_type_distribution": file_type_dist,
+            "direction_successes": {direction_id: 1} if direction_id else {},
             "first_attempt_success": True,
             "scope_distribution": {scope: 1},
         }

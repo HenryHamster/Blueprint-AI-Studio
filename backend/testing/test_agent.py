@@ -3731,6 +3731,104 @@ async def test_playbook_claim_ordering_confirmed_count(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
+async def test_playbook_claim_prioritises_local_relevance_and_includes_reasons(client: AsyncClient, db_session):
+    """
+    Claim prioritises entries that locally match task direction/system/related files and
+    includes relevance metadata in response payload.
+    """
+    now = datetime.utcnow().isoformat()
+    project = Project(name="Playbook Relevance Test", user_id="test-user-relevance")
+    project.design_doc = {
+        "_file_to_system": {
+            "backend/app/routers/agent.py": "routing",
+        },
+        "playbook/high-ratio-generic": {
+            "content": "generic guidance",
+            "updated_at": now,
+            "confirmed_count": 10,
+            "reference_count": 1,
+        },
+        "playbook/local-match": {
+            "content": "specific guidance",
+            "updated_at": now,
+            "confirmed_count": 1,
+            "reference_count": 10,
+            "direction_successes": {"dir-123": 2},
+            "learned_from_system": "routing",
+            "related_files": ["backend/app/routers/agent.py"],
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-relevance-1",
+        context={
+            "direction_id": "dir-123",
+            "related_files": ["backend/app/routers/agent.py"],
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-relevance-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "playbook" in data
+    keys = list(data["playbook"].keys())
+    assert keys.index("local-match") < keys.index("high-ratio-generic"), f"Order: {keys}"
+    relevance = data["playbook"]["local-match"]["relevance"]
+    assert relevance["local_match"] is True
+    assert "same direction" in relevance["reasons"]
+    assert "same system" in relevance["reasons"]
+    assert "1 overlapping file(s)" in relevance["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_handles_non_dict_file_to_system(client: AsyncClient, db_session):
+    """
+    Claim tolerates malformed _file_to_system metadata without crashing.
+    """
+    now = datetime.utcnow().isoformat()
+    project = Project(name="Playbook Bad Metadata Test", user_id="test-user-bad-metadata")
+    project.design_doc = {
+        "_file_to_system": ["not", "a", "dict"],
+        "playbook/safe-entry": {
+            "content": "safe guidance",
+            "updated_at": now,
+            "confirmed_count": 1,
+            "reference_count": 1,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-bad-metadata-1",
+        context={"related_files": ["backend/app/routers/agent.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-bad-metadata-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "playbook" in data
+    assert "safe-entry" in data["playbook"]
+
+
+@pytest.mark.asyncio
 async def test_playbook_claim_age_penalty_deprioritises_old_entries(client: AsyncClient, db_session):
     """
     Old entries (>30 days, confirmed_count < 3) are deprioritised in claim ordering.

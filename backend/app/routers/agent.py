@@ -1126,6 +1126,17 @@ async def claim_task(
         task_type = (task.first_payload).get("type", "create")
         playbook_entries = {}
         _playbook_candidates = []
+        _task_direction_id = str((task.context or {}).get("direction_id") or "")
+        _task_related_files = {
+            str(f) for f in ((task.context or {}).get("related_files") or []) if isinstance(f, str) and f
+        }
+        _file_to_system_raw = (project_for_playbook.design_doc or {}).get("_file_to_system") or {}
+        _file_to_system = _file_to_system_raw if isinstance(_file_to_system_raw, dict) else {}
+        _task_systems = {
+            str(_file_to_system.get(f))
+            for f in _task_related_files
+            if isinstance(_file_to_system.get(f), str) and _file_to_system.get(f)
+        }
         for k, v in (project_for_playbook.design_doc or {}).items():
             if k.startswith("playbook/") and isinstance(v, dict):
                 applicable_types = v.get("applicable_types")
@@ -1171,6 +1182,31 @@ async def claim_task(
                     )
                 # Effectiveness score: confirmed / referenced ratio (higher = better)
                 effectiveness_score = confirmed / max(referenced, 1)
+                entry_direction = str(v.get("learned_from_direction") or v.get("direction_key") or "")
+                raw_direction_successes = v.get("direction_successes")
+                direction_successes = raw_direction_successes if isinstance(raw_direction_successes, dict) else {}
+                direction_success_count = direction_successes.get(_task_direction_id, 0) if _task_direction_id else 0
+                direction_match = int(bool(
+                    _task_direction_id and (
+                        (entry_direction and entry_direction == _task_direction_id)
+                        or (isinstance(direction_success_count, (int, float)) and direction_success_count > 0)
+                    )
+                ))
+                entry_systems = {
+                    str(s)
+                    for s in ([v.get("learned_from_system")] if v.get("learned_from_system") else (v.get("systems") or []))
+                    if isinstance(s, str) and s
+                }
+                system_match = int(bool(_task_systems and entry_systems and (_task_systems & entry_systems)))
+                entry_related = {str(f) for f in (v.get("related_files") or []) if isinstance(f, str) and f}
+                file_overlap_count = len(_task_related_files & entry_related)
+                relevance_reasons: list[str] = []
+                if direction_match:
+                    relevance_reasons.append("same direction")
+                if system_match:
+                    relevance_reasons.append("same system")
+                if file_overlap_count > 0:
+                    relevance_reasons.append(f"{file_overlap_count} overlapping file(s)")
                 # Age in days for metadata (0 if updated_at unavailable)
                 age_days = 0
                 if updated_at_str:
@@ -1184,6 +1220,9 @@ async def claim_task(
                     except (ValueError, TypeError):
                         pass
                 _playbook_candidates.append((
+                    -direction_match,
+                    -system_match,
+                    -file_overlap_count,
                     ineffective,
                     stale_penalty,
                     age_penalty,
@@ -1195,16 +1234,21 @@ async def claim_task(
                     confirmed,
                     age_days,
                     bool(age_penalty or stale_penalty),
+                    relevance_reasons,
                 ))
         _playbook_candidates.sort()
-        for (_, _, _, _, _, short_key, content,
-             eff_score, conf_count, age_days_val, is_stale) in _playbook_candidates:
+        for (_, _, _, _, _, _, _, _, short_key, content,
+             eff_score, conf_count, age_days_val, is_stale, relevance_reasons) in _playbook_candidates:
             playbook_entries[short_key] = {
                 "content": content,
                 "effectiveness_score": round(eff_score, 3),
                 "confirmed_count": conf_count,
                 "age_days": age_days_val,
                 "stale": is_stale,
+                "relevance": {
+                    "reasons": relevance_reasons,
+                    "local_match": bool(relevance_reasons),
+                },
             }
         total_playbook_count = sum(
             1 for k in (project_for_playbook.design_doc or {}) if k.startswith("playbook/")
@@ -1768,7 +1812,8 @@ async def claim_task(
     # Inject scoped architecture context for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
         design_doc = project_for_playbook.design_doc or {}
-        file_to_system = design_doc.get("_file_to_system", {})
+        file_to_system_raw = design_doc.get("_file_to_system", {})
+        file_to_system = file_to_system_raw if isinstance(file_to_system_raw, dict) else {}
         if file_to_system:
             arch_related_files = (task.context or {}).get("related_files", [])
             seen_systems: dict[str, dict] = {}

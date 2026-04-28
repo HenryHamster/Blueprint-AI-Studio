@@ -219,3 +219,40 @@ def test_calibrate_scope_success_pattern_retained_coldstart():
     scope, calibrated_from = _calibrate_scope("small", direction, proj, "create")
     assert scope == "small"
     assert calibrated_from is None
+
+
+def test_feedback_scope_override_retains_scope_on_direction_affinity():
+    """2+ direction-local successes retain scope even when global success_count < 5."""
+    proj = _make_project({
+        "playbook/success-create-small": {
+            "success_count": 3,  # below global threshold of 5
+            "direction_successes": {"dir-local": 2},
+        }
+    })
+    scope, calibrated_from = _feedback_scope_override(
+        "small", 0, {"id": "dir-local"}, proj, "create"
+    )
+    assert scope == "small"
+    assert calibrated_from is None
+
+
+def test_feedback_scope_override_no_retain_on_single_direction_success():
+    """Only 1 direction-local success (below threshold of 2) does not retain scope."""
+    proj = _make_project({
+        "playbook/success-create-small": {
+            "success_count": 3,
+            "direction_successes": {"dir-local": 1},
+        }
+    })
+    assert _feedback_scope_override("small", 0, {"id": "dir-local"}, proj, "create") is None
+
+
+def test_feedback_scope_override_ignores_malformed_direction_successes():
+    """Malformed persisted direction_successes does not crash and is treated as empty."""
+    proj = _make_project({
+        "playbook/success-create-small": {
+            "success_count": 3,
+            "direction_successes": "bad",
+        }
+    })
+    assert _feedback_scope_override("small", 0, {"id": "dir-local"}, proj, "create") is None

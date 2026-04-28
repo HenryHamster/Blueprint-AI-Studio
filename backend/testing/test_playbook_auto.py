@@ -59,10 +59,13 @@ async def _make_completed_task(
     task_type: str = "create",
     scope: str = "small",
     related_files: list | None = None,
+    direction_id: str | None = None,
 ) -> Task:
     ctx: dict = {"scope": scope}
     if related_files:
         ctx["related_files"] = related_files
+    if direction_id:
+        ctx["direction_id"] = direction_id
     task = Task(
         project_id=project_id,
         title="Successful task",
@@ -384,6 +387,28 @@ async def test_capture_success_metadata_fields(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_capture_success_metadata_detects_tests_dir(db_session: AsyncSession):
+    """Files under /tests/ count as test files for tests_added/test_file_count."""
+    from app.playbook_learning import capture_success_pattern
+
+    project = await _make_project(db_session, design_doc={})
+    files = ["backend/tests/test_router.py", "backend/app/foo.py"]
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    task = await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small", related_files=files
+    )
+
+    key = await capture_success_pattern(task, db_session)
+    await db_session.flush()
+
+    assert key == "success-create-small"
+    entry = (project.design_doc or {})["playbook/success-create-small"]
+    assert entry["tests_added"] is True
+    assert entry["test_file_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_capture_success_per_scope_key(db_session: AsyncSession):
     """Different scopes produce separate playbook entries."""
     from app.playbook_learning import capture_success_pattern
@@ -433,6 +458,45 @@ async def test_capture_success_scope_distribution_accumulates(db_session: AsyncS
     entry = (project.design_doc or {}).get("playbook/success-fix-small", {})
     assert entry.get("success_count") == 2
     assert entry.get("scope_distribution") == {"small": 2}
+
+
+@pytest.mark.asyncio
+async def test_capture_success_direction_affinity(db_session: AsyncSession):
+    """direction_successes accumulates per-direction counts; file_type_distribution
+    records extension breakdown; test_file_count reflects actual test file count."""
+    from app.playbook_learning import capture_success_pattern
+
+    project = await _make_project(db_session, design_doc={})
+    files = ["backend/app/foo.py", "backend/app/bar.py", "backend/testing/test_foo.py"]
+    dir_id = "dir-abc"
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    t1 = await _make_completed_task(
+        db_session, project.id,
+        task_type="create", scope="small",
+        related_files=files, direction_id=dir_id,
+    )
+
+    await capture_success_pattern(t1, db_session)
+    await db_session.flush()
+
+    entry = (project.design_doc or {})["playbook/success-create-small"]
+    assert entry["direction_successes"] == {dir_id: 1}
+    assert entry["file_type_distribution"] == {"py": 3}
+    assert entry["test_file_count"] == 1
+
+    # Second success for the same direction increments its count
+    t2 = await _make_completed_task(
+        db_session, project.id,
+        task_type="create", scope="small",
+        related_files=files, direction_id=dir_id,
+    )
+    await capture_success_pattern(t2, db_session)
+    await db_session.flush()
+
+    entry = (project.design_doc or {})["playbook/success-create-small"]
+    assert entry["direction_successes"] == {dir_id: 2}
+    assert entry["success_count"] == 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────

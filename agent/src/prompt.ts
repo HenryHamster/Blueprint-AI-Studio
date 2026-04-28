@@ -256,6 +256,10 @@ export interface PlaybookEntry {
   confirmed_count: number;
   age_days: number;
   stale: boolean;
+  relevance?: {
+    reasons?: string[];
+    local_match?: boolean;
+  };
 }
 
 export function formatPlaybook(
@@ -269,10 +273,17 @@ export function formatPlaybook(
       if (typeof value === 'string') {
         content = value;
       } else {
+        const reasons = Array.isArray(value.relevance?.reasons)
+          ? value.relevance.reasons.filter((r): r is string => typeof r === 'string' && r.length > 0)
+          : [];
+        const relevanceLine = reasons.length > 0
+          ? `> Relevance: ${reasons.join('; ')}\n\n`
+          : '';
         content = value.content;
         if (value.stale || value.effectiveness_score < 0.3) {
           caveat = '> ⚠ Possibly outdated or low confidence — verify before applying.\n\n';
         }
+        caveat = `${relevanceLine}${caveat}`;
       }
       return `### ${key}\n${caveat}${content}`;
     })

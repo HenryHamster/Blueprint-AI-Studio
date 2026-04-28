@@ -122,6 +122,21 @@ describe('formatPlaybook', () => {
     expect(result).not.toContain('Possibly outdated');
     expect(result).toContain('solid advice');
   });
+
+  it('renders relevance reasons for object entries', () => {
+    const result = formatPlaybook({
+      'targeted-tip': {
+        content: 'use this when touching router code',
+        effectiveness_score: 0.7,
+        confirmed_count: 3,
+        age_days: 2,
+        stale: false,
+        relevance: { reasons: ['same direction', '2 overlapping file(s)'] },
+      },
+    });
+    expect(result).toContain('Relevance: same direction; 2 overlapping file(s)');
+    expect(result).toContain('use this when touching router code');
+  });
 });
 
 // ── buildContextPrefix ────────────────────────────────────────────────────────

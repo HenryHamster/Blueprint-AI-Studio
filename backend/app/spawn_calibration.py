@@ -281,7 +281,9 @@ def _feedback_scope_override(
                 proposed_scope, smaller, label, int(sc_count),
             )
             return smaller, proposed_scope
-    # Success-pattern evidence: strong prior success at this scope → retain it
+    # Success-pattern evidence: retain scope on strong global history OR
+    # on direction-local history (lower threshold because direction-specific
+    # data is more precise than project-wide task-type/scope counts).
     if task_type:
         sp_entry = doc.get(f"playbook/success-{task_type}-{proposed_scope}") or {}
         cnt = sp_entry.get("success_count", 0)
@@ -292,6 +294,19 @@ def _feedback_scope_override(
                 proposed_scope, label, int(cnt), task_type, proposed_scope,
             )
             return proposed_scope, None
+        # Direction-affinity: 2+ local successes for this specific direction
+        # override the global 5-success threshold.
+        if dir_id:
+            raw_dir_succ = sp_entry.get("direction_successes")
+            dir_succ = raw_dir_succ if isinstance(raw_dir_succ, dict) else {}
+            dir_cnt = dir_succ.get(dir_id, 0)
+            if isinstance(dir_cnt, (int, float)) and dir_cnt >= 2:
+                logger.info(
+                    "[RESEARCH] Retaining scope %s for direction '%s' "
+                    "(direction-affinity: %d local %s/%s successes)",
+                    proposed_scope, label, int(dir_cnt), task_type, proposed_scope,
+                )
+                return proposed_scope, None
     return None
 
 
