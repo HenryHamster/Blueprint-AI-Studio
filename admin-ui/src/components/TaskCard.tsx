@@ -167,7 +167,26 @@ export function useElapsedTime(startIso: string, endIso?: string): string {
 
 type DurationStats = Record<string, { p50_seconds: number; sample_count: number }>;
 const _durationStatsCache: Record<string, { data: DurationStats; fetchedAt: number }> = {};
+const _durationStatsInFlight = new Map<string, Promise<DurationStats>>();
 const DURATION_STATS_TTL_MS = 5 * 60 * 1000;
+
+function fetchDurationStats(cacheKey: string, projectId?: string): Promise<DurationStats> {
+  const existing = _durationStatsInFlight.get(cacheKey);
+  if (existing) return existing;
+  const url = projectId
+    ? `${API_BASE_URL}/api/admin/task-duration-stats?project_id=${projectId}`
+    : `${API_BASE_URL}/api/admin/task-duration-stats`;
+  const p = authGet(url)
+    .then(r => r.json())
+    .then(data => {
+      const d = (data?.stats ?? {}) as DurationStats;
+      _durationStatsCache[cacheKey] = { data: d, fetchedAt: Date.now() };
+      return d;
+    })
+    .finally(() => { _durationStatsInFlight.delete(cacheKey); });
+  _durationStatsInFlight.set(cacheKey, p);
+  return p;
+}
 
 export function useDurationStats(projectId?: string): DurationStats {
   const cacheKey = projectId ?? 'global';
@@ -181,17 +200,11 @@ export function useDurationStats(projectId?: string): DurationStats {
       setStats(cached.data);
       return;
     }
-    const url = projectId
-      ? `${API_BASE_URL}/api/admin/task-duration-stats?project_id=${projectId}`
-      : `${API_BASE_URL}/api/admin/task-duration-stats`;
-    authGet(url)
-      .then(r => r.json())
-      .then(data => {
-        const d = (data?.stats ?? {}) as DurationStats;
-        _durationStatsCache[cacheKey] = { data: d, fetchedAt: Date.now() };
-        setStats(d);
-      })
+    let cancelled = false;
+    fetchDurationStats(cacheKey, projectId)
+      .then(d => { if (!cancelled) setStats(d); })
       .catch(() => {});
+    return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cacheKey]);
   return stats;
