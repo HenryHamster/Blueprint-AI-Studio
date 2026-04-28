@@ -1929,8 +1929,21 @@ ${analysisText.slice(0, 50_000)}
     // source of truth, running_update is the voice to the user. If either
     // is missing the cycle is incomplete; retry once with a focused prompt.
     try {
-      const problemModelSetInOutput = /"op"\s*:\s*"set_problem_model"/.test(allOutput);
-      const runningUpdateSetInOutput = /"op"\s*:\s*"set_running_update"/.test(allOutput);
+      // Accept three forms of evidence the call landed:
+      //   1. JSON op name in API request/response: "op":"set_problem_model"
+      //   2. CLI invocation:                       ./strategic set-problem-model
+      //   3. Success message from the strategic CLI: "Problem model set at revision N"
+      // Earlier this only matched form 1, so agents that used the CLI happy-path
+      // (which prints the success message but never echoes the JSON op key) got
+      // tagged as "missing" → unnecessary retry double-writing the same data.
+      const problemModelSetInOutput =
+        /"op"\s*:\s*"set_problem_model"/.test(allOutput)
+        || /\.\/strategic\s+set-problem-model\b/.test(allOutput)
+        || /Problem model set at revision/i.test(allOutput);
+      const runningUpdateSetInOutput =
+        /"op"\s*:\s*"set_running_update"/.test(allOutput)
+        || /\.\/strategic\s+set-running-update\b/.test(allOutput)
+        || /Running update set/i.test(allOutput);
 
       if (exitCode === 0 && (!problemModelSetInOutput || !runningUpdateSetInOutput)) {
         const missing: string[] = [];
