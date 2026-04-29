@@ -36,6 +36,28 @@ class AgentStatusPayload(BaseModel):
     diff_summary: List[Dict[str, Any]] | None = Field(None, max_length=50)
     file_change_details: List[Dict[str, Any]] | None = Field(None, max_length=50)
     analysis_plan: str | None = Field(None, max_length=5000)
+    # Warm-VM continuity telemetry (Phase 0). Captured by the agent for each
+    # role and persisted into task.context["_timing"] so cold-vs-warm setup
+    # cost is observable from the dashboard. Optional — older agents that
+    # don't yet send these fields silently skip persistence.
+    setup_secs: float | None = None
+    warm_start: bool | None = None
+    prior_role_vm_id: str | None = Field(None, min_length=1, max_length=200)
+    # Wave 5 follow-up (warm-VM continuity, deferred): handler-level wall-time
+    # measured agent-side as `Date.now() - role_claim_timestamp` after the
+    # role's handler returns. setup_secs measures provisioning latency before
+    # the handler runs; handler_duration_secs measures the work-loop itself.
+    # Together they decompose total role time so cold-vs-warm gains can be
+    # attributed to the right phase. Bounded conservatively (24h) so a
+    # broken agent clock can't write nonsense to the timing record.
+    handler_duration_secs: float | None = Field(None, ge=0, le=86400)
+    # Structured fix-agent rationale for disputed reviewer issues. The fix
+    # agent writes one entry per CRITICAL/MAJOR issue it leaves unaddressed,
+    # naming the issue and providing mechanically-verifiable claims that the
+    # next reviewer must run before re-flagging. Capped at 5 per iteration
+    # (review_pipeline cap-enforcer drops excess); each verify list capped
+    # 10 entries; each string fields capped to keep context lean.
+    fix_agent_responses: List[Dict[str, Any]] | None = Field(None, max_length=5)
 
 class UploadUrlRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")

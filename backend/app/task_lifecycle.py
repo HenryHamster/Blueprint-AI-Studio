@@ -116,6 +116,37 @@ def _build_scope_overflow_details(ctx: dict, task_scope: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _append_approve_to_review_history(
+    review_loop: dict, changed_files: "list[str] | None" = None,
+) -> list:
+    """Append an APPROVE entry to ``review_history`` so the trajectory section
+    shown to fix agents includes approved iterations alongside REQUEST_CHANGES
+    ones.  PR #3435's iter 1 was approved, then iter 2's rebase regressed it —
+    every later fix agent saw only the rejected iterations and could not see
+    that the PR had ever been correct.  Surfacing the APPROVE entry lets the
+    drift detector compute "files in current diff but absent from any approved
+    iteration" — the load-bearing signal.
+
+    Idempotent on (iteration, verdict) so re-entering the ci_waiting transition
+    (e.g. retry after merge failure) does not append duplicate entries.
+    """
+    history = list(review_loop.get("review_history") or [])
+    iteration = int(review_loop.get("iteration") or 0)
+    if (
+        history
+        and history[-1].get("iteration") == iteration
+        and history[-1].get("verdict") == "APPROVE"
+    ):
+        return history
+    history.append({
+        "iteration": iteration,
+        "feedback": "",
+        "verdict": "APPROVE",
+        "changed_files": list(changed_files or [])[:30],
+    })
+    return history
+
+
 def _record_parent_failure(parent: Task, failure_class: str) -> None:
     """Record a parent-task FAILED transition in deploy_monitoring and direction health."""
     from app.routers.agent_status import record_task_result
@@ -1050,6 +1081,32 @@ async def _process_post_commit(
                 f"task {task_id} row held by peer after 3 retries"
             )
 
+        # Phase 0 telemetry: persist warm-VM continuity timing fields into
+        # task.context["_timing"] so cold-vs-warm setup cost is observable.
+        # Mirrors the existing _shown_playbook_keys storage pattern in
+        # routers/agent.py — write all non-None fields under a stable key,
+        # respect prior _timing entries (e.g. claim_latency_secs from claim).
+        _timing_payload: dict = {}
+        if payload.setup_secs is not None:
+            _timing_payload["setup_secs"] = float(payload.setup_secs)
+        if payload.warm_start is not None:
+            _timing_payload["warm_start"] = bool(payload.warm_start)
+        if payload.prior_role_vm_id is not None:
+            _timing_payload["prior_role_vm_id"] = str(payload.prior_role_vm_id)
+        if payload.handler_duration_secs is not None:
+            # Wave 5 follow-up: wall-time of the role's handler (post-claim,
+            # post-setup). Combined with setup_secs this decomposes total
+            # role time so cold-vs-warm gains can be attributed correctly.
+            _timing_payload["handler_duration_secs"] = float(payload.handler_duration_secs)
+        if _timing_payload:
+            ctx = dict(task.context or {})
+            existing = dict(ctx.get("_timing") or {})
+            existing.update(_timing_payload)
+            ctx["_timing"] = existing
+            task.context = ctx
+            flag_modified(task, "context")
+            session.add(task)
+
         # Immediately unblock dependents when task terminally fails (retries exhausted).
         # Uses the same session (not a separate one) to avoid self-deadlock: a second
         # session scanning the task table would block on the FOR UPDATE lock held by
@@ -1774,10 +1831,23 @@ async def _process_post_commit(
 
                         if ci_status and ci_status["status"] != "completed":
                             # CI still running — park task in EVALUATING (no VM consumed)
+                            try:
+                                _approve_files = [
+                                    f.get("filename", "") for f in (
+                                        await get_pr_files(gh_token, owner, repo, pr_number)
+                                    ) if isinstance(f, dict) and f.get("filename")
+                                ]
+                            except Exception as _af_e:
+                                logger.warning(
+                                    f"[REVIEW PIPELINE] APPROVE entry: failed to fetch PR files for #{pr_number}: {_af_e}"
+                                )
+                                _approve_files = []
+                            _approved_history = _append_approve_to_review_history(review_loop, _approve_files)
                             task.status = TaskStatus.EVALUATING
                             task.latest_status_message = f"Review approved, waiting for CI on PR #{pr_number}..."
                             task.context = {**(task.context or {}), "review_loop": {
                                 **review_loop, "ci_waiting": True, "review_approved": True,
+                                "review_history": _approved_history,
                                 "head_sha": head_sha, "pr_number": pr_number,
                                 "branch": branch, "base_branch": base_branch,
                                 "original_task_id": original_task_id,
@@ -1799,12 +1869,17 @@ async def _process_post_commit(
                                 f"Fix only the build/lint/test errors. The code review is already "
                                 f"approved — don't change logic, just fix CI failures."
                             )
+                            # Phase 2d: APPROVE branch must NOT propagate warm-VM
+                            # continuity onto downstream spawns. The reviewer's VM
+                            # is releasing on this APPROVE, so the new fix must
+                            # cold-provision rather than wait for a dying poll.
                             fix_task, _ = await _spawn_pipeline_task(
                                 task, "fix", session, pr_number, branch, base_branch,
                                 fix_prompt=ci_fix_prompt,
                                 original_task_id=original_task_id,
                                 fix_reason="ci_failure",
                                 ci_failure_logs=ci_errors,
+                                suppress_warm_handoff=True,
                             )
                             if fix_task:
                                 logger.error(f"[CI] PR #{pr_number} CI failed, spawned fix → {fix_task.id}")
@@ -2052,7 +2127,19 @@ async def _process_post_commit(
                             await create_pr_comment(gh_token, owner, repo, pr_number,
                                 f"**Blueprint Review Pipeline**: Merge blocked — {merge_msg}. Retrying with backoff.")
                             from app import pause_clock  # noqa: PLC0415
+                            try:
+                                _approve_files = [
+                                    f.get("filename", "") for f in (
+                                        await get_pr_files(gh_token, owner, repo, pr_number)
+                                    ) if isinstance(f, dict) and f.get("filename")
+                                ]
+                            except Exception as _af_e:
+                                logger.warning(
+                                    f"[REVIEW PIPELINE] APPROVE entry: failed to fetch PR files for #{pr_number}: {_af_e}"
+                                )
+                                _approve_files = []
                             merge_wait_loop = dict(review_loop)
+                            merge_wait_loop["review_history"] = _append_approve_to_review_history(review_loop, _approve_files)
                             merge_wait_loop["ci_waiting"] = True
                             merge_wait_loop["review_approved"] = True
                             merge_wait_loop["ci_passed"] = True  # CI was already verified green above
@@ -2077,10 +2164,23 @@ async def _process_post_commit(
                         # the orchestrator's CI monitoring loop retries the merge instead
                         # of silently orphaning the PR.
                         logger.error(f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}, parking in CI-wait: {e}", exc_info=True)
+                        # Best-effort: gh_token may not be in scope if the failure
+                        # happened before the auth call.  An empty file list here
+                        # still records that the iteration was approved.
+                        try:
+                            _approve_files = [
+                                f.get("filename", "") for f in (
+                                    await get_pr_files(gh_token, owner, repo, pr_number)
+                                ) if isinstance(f, dict) and f.get("filename")
+                            ]
+                        except Exception:
+                            _approve_files = []
+                        _approved_history = _append_approve_to_review_history(review_loop, _approve_files)
                         task.status = TaskStatus.EVALUATING
                         task.latest_status_message = f"Review approved, merge attempt failed ({type(e).__name__}) — CI monitor will retry"
                         task.context = {**(task.context or {}), "review_loop": {
                             **review_loop, "ci_waiting": True, "review_approved": True,
+                            "review_history": _approved_history,
                             "head_sha": head_sha, "pr_number": pr_number,
                             "branch": branch, "base_branch": base_branch,
                             "original_task_id": original_task_id,

@@ -8,6 +8,7 @@ Covers:
   5. Edge cases: empty review_history, issues without severity,
      zero issues in current iteration.
 """
+import os
 import uuid
 from datetime import timedelta
 
@@ -34,6 +35,7 @@ from app.review_pipeline import (
     _detect_issue_churn,
     _repeating_issue_descriptions,
     _format_repeating_issues_section,
+    compute_drift_signal,
     _feedback_jaccard,
     _feedback_token_set,
     _is_cross_cutting_pr,
@@ -2620,8 +2622,284 @@ async def test_investigated_files_capped_at_25(db_session, mocker):
     assert propagated == big_list[:25]
 
 
+# ── Phase 2c: warm-VM continuity pin ─────────────────────────────────────────
+
+
 @pytest.mark.asyncio
-async def test_self_review_outcome_propagates_to_spawned_review(db_session, mocker):
+async def test_warm_pin_not_set_when_flag_disabled(db_session, mocker):
+    """With warm_continuity_enabled=False, no warm fields should land on the
+    spawned task's context (default behavior — feature ships dark)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch.dict(
+        "app.review_pipeline._runtime_config",
+        {"warm_continuity_enabled": False},
+        clear=False,
+    )
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-source-disabled",
+        payloads=[{"type": "create", "pr_number": 8001, "branch": "feat/wp1",
+                   "base_branch": "main", "prompt": "X"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=8001, branch="feat/wp1", base_branch="main",
+    )
+
+    assert created is True
+    assert result is not None
+    ctx = result.context or {}
+    assert "warm_target_vm_id" not in ctx, "warm pin must not be set when feature is disabled"
+    assert "warm_target_pr" not in ctx
+    assert "warm_handoff_deadline" not in ctx
+    # Spawned task should still get a fresh VM ID since no warm pin is active.
+    assert result.vm_instance_id is not None
+
+
+@pytest.mark.asyncio
+async def test_warm_pin_set_when_flag_enabled_and_source_in_progress(db_session, mocker):
+    """With warm_continuity_enabled=True and source IN_PROGRESS with a vm_instance_id,
+    the spawned task carries warm_target_vm_id, warm_target_pr, and a
+    warm_handoff_deadline in the future, and is created with vm_instance_id=None."""
+    from datetime import datetime
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch.dict(
+        "app.review_pipeline._runtime_config",
+        {"warm_continuity_enabled": True},
+        clear=False,
+    )
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-source-warm",
+        payloads=[{"type": "create", "pr_number": 8002, "branch": "feat/wp2",
+                   "base_branch": "main", "prompt": "X"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=8002, branch="feat/wp2", base_branch="main",
+    )
+
+    assert created is True
+    assert result is not None
+    ctx = result.context or {}
+    assert ctx.get("warm_target_vm_id") == "agent-vm-source-warm"
+    assert str(ctx.get("warm_target_pr")) == "8002"
+    deadline_iso = ctx.get("warm_handoff_deadline")
+    assert deadline_iso, "warm_handoff_deadline should be set"
+    deadline = datetime.fromisoformat(str(deadline_iso))
+    if deadline.tzinfo is not None:
+        deadline = deadline.replace(tzinfo=None)
+    assert deadline > datetime.utcnow(), "deadline should be in the future"
+    # Spawned task must have vm_instance_id=NULL so the orchestrator's
+    # provisioning loop knows to consult the heartbeat map.
+    assert result.vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_warm_pin_not_set_when_source_completed_long_ago(db_session, mocker):
+    """When source task is terminal AND its last_heartbeat is older than
+    WARM_HANDOFF_WINDOW_SECS, warm pin must not propagate."""
+    from datetime import datetime, timedelta
+    from app.review_pipeline import WARM_HANDOFF_WINDOW_SECS
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch.dict(
+        "app.review_pipeline._runtime_config",
+        {"warm_continuity_enabled": True},
+        clear=False,
+    )
+
+    project = await _make_db_project(db_session)
+    long_ago = datetime.utcnow() - timedelta(seconds=WARM_HANDOFF_WINDOW_SECS + 60)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_instance_id="agent-vm-source-stale",
+        last_heartbeat=long_ago,
+        payloads=[{"type": "create", "pr_number": 8003, "branch": "feat/wp3",
+                   "base_branch": "main", "prompt": "X"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=8003, branch="feat/wp3", base_branch="main",
+    )
+
+    assert created is True
+    ctx = result.context or {}
+    assert "warm_target_vm_id" not in ctx, (
+        "warm pin must not propagate when source completed beyond WARM_HANDOFF_WINDOW_SECS"
+    )
+    assert result.vm_instance_id is not None
+
+
+@pytest.mark.asyncio
+async def test_warm_pin_suppressed_for_approve_path(db_session, mocker):
+    """suppress_warm_handoff=True (passed by the APPROVE-CI-failure spawn)
+    must NOT propagate warm pin even when the source/flag would otherwise allow it."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch.dict(
+        "app.review_pipeline._runtime_config",
+        {"warm_continuity_enabled": True},
+        clear=False,
+    )
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-source-approve",
+        payloads=[{"type": "create", "pr_number": 8004, "branch": "feat/wp4",
+                   "base_branch": "main", "prompt": "X"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=8004, branch="feat/wp4", base_branch="main",
+        fix_prompt="CI fix",
+        fix_reason="ci_failure",
+        ci_failure_logs="FAILED test_x",
+        suppress_warm_handoff=True,
+    )
+
+    assert created is True
+    assert result is not None
+    ctx = result.context or {}
+    assert "warm_target_vm_id" not in ctx, (
+        "suppress_warm_handoff must prevent warm-pin propagation on APPROVE path"
+    )
+    assert result.vm_instance_id is not None
+
+
+@pytest.mark.asyncio
+async def test_warm_target_pr_stored_as_int(db_session, mocker):
+    """Issue 6: warm_target_pr must be stored as an int, not a string. The
+    routers/agent.py:next_role query reads via .as_string() (which on Postgres
+    reads ->> and always returns text). Storing an int matches production —
+    SQLite test backend serializes JSONB as JSON text but the in-memory dict
+    on the freshly refreshed Task instance preserves the original Python
+    type, so we can assert directly here.
+
+    This is the lighter SQLite-friendly assertion. The Postgres-tagged
+    round-trip variant below additionally exercises the .as_string() query
+    that next_role uses."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch.dict(
+        "app.review_pipeline._runtime_config",
+        {"warm_continuity_enabled": True},
+        clear=False,
+    )
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-source-int-pr",
+        payloads=[{"type": "create", "pr_number": 8765, "branch": "feat/intpr",
+                   "base_branch": "main", "prompt": "X"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=8765, branch="feat/intpr", base_branch="main",
+    )
+    assert created is True
+    assert result is not None
+    await db_session.refresh(result)
+
+    ctx = result.context or {}
+    assert "warm_target_pr" in ctx, "warm_target_pr should be set when warm-pin propagates"
+    stored_pr = ctx["warm_target_pr"]
+    # Accept int — the production fix is to coerce explicitly to int().
+    # On SQLite, JSON deserialization should preserve numeric type. If the
+    # backend ever ends up returning a string ("8765"), the next_role query
+    # `.as_string() == str(req.prior_pr_number)` still succeeds on Postgres
+    # (->> always produces text), but the in-memory representation diverges.
+    # The test asserts the consistent int contract.
+    assert isinstance(stored_pr, int), (
+        f"warm_target_pr must be stored as int, got {type(stored_pr).__name__} "
+        f"with value {stored_pr!r}"
+    )
+    assert stored_pr == 8765
+
+
+@pytest.mark.skipif(
+    os.getenv("USE_TEST_POSTGRES", "").lower() != "true"
+    or not os.getenv("DATABASE_URL", "").startswith("postgresql"),
+    reason="JSONB ->> round-trip semantics require real PostgreSQL",
+)
+@pytest.mark.asyncio
+async def test_warm_target_pr_roundtrip_postgres(db_session, mocker):
+    """Issue 6 (Postgres-tagged): write an int via _spawn_pipeline_task, then
+    issue the same `Task.context['warm_target_pr'].as_string() == str(pr)`
+    query that routers/agent.py:next_role uses. The value stored as an int
+    must round-trip through ->> as the matching numeric string."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch.dict(
+        "app.review_pipeline._runtime_config",
+        {"warm_continuity_enabled": True},
+        clear=False,
+    )
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-source-pgrt",
+        payloads=[{"type": "create", "pr_number": 4242, "branch": "feat/pgrt",
+                   "base_branch": "main", "prompt": "X"}],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task, "review", db_session,
+        pr_number=4242, branch="feat/pgrt", base_branch="main",
+    )
+    assert created is True
+    assert result is not None
+
+    # Mirror the exact query routers/agent.py:next_role uses.
+    matched = (await db_session.execute(
+        select(Task).where(
+            Task.id == result.id,
+            Task.context["warm_target_pr"].as_string() == str(4242),
+        )
+    )).scalars().first()
+    assert matched is not None, (
+        "Task.context['warm_target_pr'].as_string() == '4242' must match — "
+        "this is the query next_role uses to find the pinned task"
+    )
     """When the source task carries `_self_review_outcome` (set by the create
     handler's self-review), it must be carried forward to the spawned review
     task's context so the review agent can surface blind spots. This is a
@@ -4776,3 +5054,130 @@ async def test_safeguard_not_spawned_for_small_scope_pr(db_session, mocker):
     safeguard_mock.assert_not_awaited(), (
         "Small-scope PRs must never trigger the cross-cutting safeguard gate"
     )
+
+
+# ── compute_drift_signal ──────────────────────────────────────────────────────
+
+
+class TestComputeDriftSignal:
+    """Unit tests for the drift detector that powers the fix-agent trajectory
+    section. drift_in lists files in the current diff that have never been
+    planned or part of an APPROVE iteration; drift_out lists files that were
+    expected (planned or approved) but are missing from the current diff."""
+
+    def test_empty_history_falls_back_to_planned_only(self):
+        result = compute_drift_signal(
+            review_history=[],
+            planned_files=["a.py", "b.py"],
+            current_files=["a.py", "c.py"],
+        )
+        # c.py is in current but not planned and never approved → drift_in.
+        assert [d["file"] for d in result["drift_in"]] == ["c.py"]
+        # b.py was planned but is missing from current → drift_out.
+        assert result["drift_out"] == ["b.py"]
+
+    def test_approve_iteration_extends_acceptable_set(self):
+        history = [{
+            "iteration": 1,
+            "verdict": "APPROVE",
+            "changed_files": ["a.py", "extra.py"],
+        }]
+        result = compute_drift_signal(
+            review_history=history,
+            planned_files=["a.py"],
+            current_files=["a.py", "extra.py"],
+        )
+        # extra.py was approved at iter 1, so even though unplanned it is not drift.
+        assert result["drift_in"] == []
+        assert result["drift_out"] == []
+
+    def test_drift_in_annotated_with_first_seen_and_flag_count(self):
+        history = [
+            {
+                "iteration": 1,
+                "verdict": "REQUEST_CHANGES",
+                "changed_files": ["a.py", "alien.py"],
+                "issues": [
+                    {"severity": "major", "file": "alien.py", "description": "out of plan"},
+                ],
+            },
+            {
+                "iteration": 2,
+                "verdict": "REQUEST_CHANGES",
+                "changed_files": ["a.py", "alien.py"],
+                "issues": [
+                    {"severity": "major", "file": "alien.py", "description": "still here"},
+                ],
+            },
+        ]
+        result = compute_drift_signal(
+            review_history=history,
+            planned_files=["a.py"],
+            current_files=["a.py", "alien.py"],
+        )
+        assert len(result["drift_in"]) == 1
+        entry = result["drift_in"][0]
+        assert entry["file"] == "alien.py"
+        # alien.py first appeared in iter 1's changed_files snapshot.
+        assert entry["first_appeared_iteration"] == 1
+        # Two reviewers cited alien.py in their issue list.
+        assert entry["flag_count"] == 2
+
+    def test_pr_3435_replay(self):
+        """Reproduces PR #3435: iter 1 APPROVE with test_reaper.py changes,
+        iter 2 rebase-fix replaced those with main.py edit, iters 3+ flagged
+        main.py. With trajectory data, drift_in = main.py (post-iter-1 leftover)
+        and drift_out = test_reaper.py (lost from approved iter)."""
+        history = [
+            {
+                "iteration": 1,
+                "verdict": "APPROVE",
+                "changed_files": ["backend/testing/test_reaper.py"],
+            },
+            {
+                "iteration": 3,
+                "verdict": "REQUEST_CHANGES",
+                "changed_files": ["backend/app/main.py"],
+                "issues": [{
+                    "severity": "major",
+                    "file": "backend/app/main.py",
+                    "description": "unrelated EXPECTED_SCHEMA_REVISION edit",
+                }],
+            },
+            {
+                "iteration": 5,
+                "verdict": "REQUEST_CHANGES",
+                "changed_files": ["backend/app/main.py"],
+                "issues": [{
+                    "severity": "major",
+                    "file": "backend/app/main.py",
+                    "description": "unrelated EXPECTED_SCHEMA_REVISION edit",
+                }],
+            },
+        ]
+        result = compute_drift_signal(
+            review_history=history,
+            planned_files=["backend/testing/test_reaper.py"],
+            current_files=["backend/app/main.py"],
+        )
+        drift_in_files = [d["file"] for d in result["drift_in"]]
+        assert drift_in_files == ["backend/app/main.py"]
+        assert result["drift_in"][0]["flag_count"] == 2
+        assert result["drift_out"] == ["backend/testing/test_reaper.py"]
+
+    def test_handles_malformed_entries(self):
+        # Non-dict entries, missing fields, non-string filenames must not crash.
+        history = [
+            None,  # type: ignore[list-item]
+            {"iteration": 1, "verdict": "APPROVE"},  # no changed_files
+            {"iteration": 2, "changed_files": [None, 123, "ok.py"]},
+        ]
+        result = compute_drift_signal(
+            review_history=history,  # type: ignore[arg-type]
+            planned_files=["a.py"],
+            current_files=["ok.py", "a.py"],
+        )
+        # ok.py was in iter 2's changed_files (REQUEST_CHANGES, no verdict
+        # field defaults to non-APPROVE) so it's drift_in.
+        assert [d["file"] for d in result["drift_in"]] == ["ok.py"]
+        assert result["drift_out"] == []

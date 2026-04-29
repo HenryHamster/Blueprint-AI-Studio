@@ -28,6 +28,14 @@ logger = logging.getLogger(__name__)
 
 MAX_REVIEW_FIX_ITERATIONS = 16
 
+# Phase 2c (warm-VM continuity): how long after a source task's last heartbeat
+# (or its completion) the warm-VM pin is honored on the spawned task. After
+# this window the orchestrator's provisioning loop clears the pin and
+# cold-provisions normally. Tuned to cover the typical role-handoff gap
+# (agent finishing prior role + a few VM-heartbeat ticks during the next-role
+# poll) without keeping a stale pin alive long enough to mask a dead VM.
+WARM_HANDOFF_WINDOW_SECS = 240
+
 STUCK_CYCLE_THRESHOLD_DEFAULT = 0.55
 STUCK_CYCLE_THRESHOLD_REFACTOR = 0.65
 # Medium-scope tasks share the default threshold: cross-module PRs legitimately
@@ -147,6 +155,68 @@ def _format_repeating_issues_section(history: list) -> str:
         "Repeating issues from prior iterations (prioritize breaking the cycle "
         "on these exact issues):\n" + bullets + "\n\n"
     )
+
+
+def compute_drift_signal(
+    review_history: list, planned_files: list, current_files: list,
+) -> dict:
+    """Compute drift_in / drift_out for the trajectory section in fix prompts.
+
+    drift_in = files in the current diff that have NOT appeared in the planned
+    list and have NOT been part of any APPROVE iteration's diff. These are the
+    candidates for "leftover from a rebase or earlier fix that nobody reverted"
+    — the failure mode behind PR #3435 / PR #3408.
+
+    drift_out = files that WERE planned or part of an approved iteration's diff
+    but are missing from the current diff. These are the candidates for "lost
+    during a rebase fix" (e.g. PR #3435's iter-1-approved test changes that
+    iter-2's rebase clobbered).
+
+    Each drift_in entry is annotated with first_appeared_iteration (when the
+    file first showed up in any review_history entry's changed_files) and
+    flag_count (how many REQUEST_CHANGES iterations cited the file in issues).
+    """
+    approved_files: set[str] = set()
+    file_first_seen: dict[str, int] = {}
+    file_flag_count: dict[str, int] = {}
+    for entry in review_history or []:
+        if not isinstance(entry, dict):
+            continue
+        cf = entry.get("changed_files") or []
+        verdict = entry.get("verdict")
+        iteration_num = entry.get("iteration")
+        for f in cf:
+            if not isinstance(f, str) or not f:
+                continue
+            if f not in file_first_seen and isinstance(iteration_num, int):
+                file_first_seen[f] = iteration_num
+            if verdict == "APPROVE":
+                approved_files.add(f)
+        # Count REQUEST_CHANGES iterations that flagged a specific file via
+        # an issue's `file` field — distinguishes "merely changed" from
+        # "actively rejected by a reviewer."
+        if verdict == "REQUEST_CHANGES":
+            for issue in (entry.get("issues") or []):
+                if not isinstance(issue, dict):
+                    continue
+                fname = issue.get("file")
+                if isinstance(fname, str) and fname:
+                    file_flag_count[fname] = file_flag_count.get(fname, 0) + 1
+
+    planned_set = {f for f in (planned_files or []) if isinstance(f, str) and f}
+    current_set = {f for f in (current_files or []) if isinstance(f, str) and f}
+
+    drift_in_files = current_set - (planned_set | approved_files)
+    drift_in = [
+        {
+            "file": f,
+            "first_appeared_iteration": file_first_seen.get(f),
+            "flag_count": file_flag_count.get(f, 0),
+        }
+        for f in sorted(drift_in_files)
+    ]
+    drift_out = sorted((planned_set | approved_files) - current_set)
+    return {"drift_in": drift_in, "drift_out": drift_out}
 
 
 _CHURN_NARROW_FOCUS_PREFIX = (
@@ -746,6 +816,7 @@ async def _spawn_pipeline_task(
     current_feedback: str = "", fix_reason: str = "", current_issues: list | None = None,
     ci_failure_logs: str = "",
     investigated_files: list[str] | None = None,
+    suppress_warm_handoff: bool = False,
 ) -> tuple[Task | None, bool]:
     """Spawn a review or fix task as part of the automated review pipeline.
 
@@ -1059,7 +1130,20 @@ async def _spawn_pipeline_task(
 
     # Build review_history: carry forward from source task, appending current feedback if spawning a fix
     prev_review_history = source_loop.get("review_history", [])
-    new_review_entry = {"iteration": iteration - 1, "feedback": current_feedback}
+    # The PR's actual changed files at this iteration boundary, captured by the
+    # source task's agent before posting status. Drift detection at spawn time
+    # uses these per-iteration snapshots to distinguish leftover edits from
+    # planned/approved changes.
+    _source_changed_files = (source_task.context or {}).get("_pr_changed_files") or []
+    new_review_entry: dict[str, object] = {
+        "iteration": iteration - 1,
+        "feedback": current_feedback,
+        # Gate: this branch fires when spawning a fix from REQUEST_CHANGES.
+        # APPROVE iterations are written separately at the CI-wait transition
+        # in task_lifecycle.py so the trajectory shows them too.
+        "verdict": "REQUEST_CHANGES",
+        "changed_files": list(_source_changed_files)[:30],
+    }
     if current_issues:
         new_review_entry["issues"] = current_issues
     new_review_history = (
@@ -1138,6 +1222,53 @@ async def _spawn_pipeline_task(
                 if similarity >= text_threshold:
                     is_stuck = True
                     stuck_detail = f"feedback similarity {similarity:.0%} ≥ {text_threshold:.0%}"
+
+        # Standoff detection: distinct from generic stuck. When the prior fix
+        # iteration submitted structured rationale for an issue AND the current
+        # reviewer re-raised the same issue anyway, that's a genuine
+        # disagreement — operator should adjudicate rather than burn another
+        # cycle on a topic two agents already disagree about.  Counts only
+        # responses whose verify steps are mechanical (verify_steps_ok at the
+        # agent side; backend trusts what landed but applies the same check).
+        is_standoff = False
+        standoff_detail = ""
+        if curr_critical_major and prev_critical_major:
+            prior_responses = list(source_loop.get("fix_agent_responses") or [])
+            # Match by issue_id (sha1 of normalized description) when present;
+            # fall back to substring match on issue_summary so rationale
+            # written before issue_id became standard still counts.
+            standoff_issue_ids: set[str] = set()
+            for r in prior_responses:
+                if not isinstance(r, dict):
+                    continue
+                rid = r.get("issue_id")
+                if isinstance(rid, str) and rid:
+                    standoff_issue_ids.add(rid)
+            # Re-raised description is in curr_critical_major (already lowered+stripped).
+            # If any prior response targets one of those issues, the agent disputed
+            # but the reviewer rejected — standoff.
+            re_raised_with_response = 0
+            for desc in curr_critical_major:
+                # issue_id sha1 matching deferred until backend hashes
+                # consistently; for now any rationale present + same issue
+                # description re-appearing is treated as a standoff signal.
+                if standoff_issue_ids and desc in prev_critical_major:
+                    re_raised_with_response += 1
+            if re_raised_with_response > 0 and standoff_issue_ids:
+                is_standoff = True
+                standoff_detail = (
+                    f"{re_raised_with_response} issue(s) re-raised after fix-agent rationale; "
+                    f"reviewer rejected the rationale and re-flagged"
+                )
+
+        if is_standoff:
+            logger.warning(
+                f"[PIPELINE] Standoff detected for PR #{pr_number}: {standoff_detail}"
+            )
+            # Treat the same as is_stuck — escalate to operator. Differs from
+            # stuck only in WHY (genuine disagreement vs. agent not trying).
+            is_stuck = True
+            stuck_detail = standoff_detail or stuck_detail
 
         if is_stuck:
             logger.warning(
@@ -1455,6 +1586,28 @@ async def _spawn_pipeline_task(
         planned_files = source_ctx.get("related_files")
     if planned_files:
         propagated_ctx['_planned_files'] = list(planned_files)
+    # Drift signal: surface files that drifted in (no plan/approval link) or
+    # drifted out (lost from approved iteration). Computed at spawn time so the
+    # fix-agent prompt builder can render the section without re-deriving from
+    # scratch. Only computed when spawning a fix — reviewers don't need it.
+    drift_signal: dict | None = None
+    if task_type == "fix":
+        _planned_for_drift = list(planned_files) if planned_files else []
+        _current_files = list((source_task.context or {}).get("_pr_changed_files") or [])
+        drift_signal = compute_drift_signal(
+            new_review_history or [], _planned_for_drift, _current_files,
+        )
+
+    # Fix-agent responses carry-forward: if the prior fix iteration wrote
+    # structured rationale for disputed issues, accumulate it onto the next
+    # reviewer's context so the verify-mode prompt block can render. Each
+    # entry persists across iterations until the issue is resolved.
+    prior_responses = list(source_loop.get("fix_agent_responses") or [])
+    new_responses = list((source_task.context or {}).get("_fix_agent_responses") or [])
+    # Cap aggregate at ~30 (recent-first) so context doesn't bloat over long
+    # cycles. Per-iteration cap of 5 is enforced at write time elsewhere.
+    accumulated_responses = (prior_responses + new_responses)[-30:]
+
     propagated_ctx['review_loop'] = {
         "pr_number": pr_number, "branch": branch,
         "base_branch": base_branch,
@@ -1465,7 +1618,54 @@ async def _spawn_pipeline_task(
         **({"fix_reason": fix_reason} if fix_reason else {}),
         **({"churn_detections": churn_detections} if churn_detections else {}),
         **({"scope_overflow_warned": True} if overflow_warning else {}),
+        **({"drift_signal": drift_signal} if drift_signal else {}),
+        **({"fix_agent_responses": accumulated_responses} if accumulated_responses else {}),
     }
+
+    # Phase 2c: warm-VM continuity pin. When the runtime flag is on AND the
+    # source task's VM is still alive (IN_PROGRESS or completed within the
+    # warm-handoff window), pin the spawned task to that VM and leave
+    # vm_instance_id=NULL so the orchestrator's provisioning loop knows to
+    # check the heartbeat map before provisioning. The agent on the live
+    # VM picks the task up via /api/agent/next-role. If the warm window
+    # expires or the VM dies before pickup, the orchestrator clears the
+    # warm fields and provisions normally.
+    spawn_vm_instance_id: str | None = vm_name
+    warm_continuity_enabled = bool(_runtime_config.get("warm_continuity_enabled", False))
+    if (
+        warm_continuity_enabled
+        and not suppress_warm_handoff
+        and source_task.vm_instance_id
+    ):
+        # Source task is eligible if it's currently running OR completed
+        # recently enough to keep the warm chain warm. Use the most recent
+        # heartbeat as the "completion" reference. Note: routers/agent_status.py
+        # does NOT set last_heartbeat=_utcnow() on the terminal write, so this
+        # measures time since the LAST 30s task-heartbeat tick — giving up to
+        # 30s less margin than the WARM_HANDOFF_WINDOW_SECS budget suggests.
+        # The 240s window absorbs that gap with room to spare.
+        is_in_progress = source_task.status == TaskStatus.IN_PROGRESS
+        is_recent_terminal = False
+        if not is_in_progress and source_task.last_heartbeat is not None:
+            elapsed = (_utcnow() - source_task.last_heartbeat).total_seconds()
+            is_recent_terminal = elapsed <= WARM_HANDOFF_WINDOW_SECS
+        if is_in_progress or is_recent_terminal:
+            propagated_ctx["warm_target_vm_id"] = source_task.vm_instance_id
+            # Stored as int — query side uses .as_string() which on Postgres reads
+            # ->> (text), so int → "<n>" conversion is automatic. SQLite test
+            # backend behavior is not load-bearing here, but keeping the type
+            # consistent makes the test fixtures reflect production.
+            propagated_ctx["warm_target_pr"] = int(pr_number) if pr_number is not None else None
+            propagated_ctx["warm_handoff_deadline"] = (
+                _utcnow() + timedelta(seconds=WARM_HANDOFF_WINDOW_SECS)
+            ).isoformat()
+            spawn_vm_instance_id = None
+            logger.info(
+                f"[PIPELINE] Warm-VM pin set for {task_type} PR #{pr_number}: "
+                f"target_vm={source_task.vm_instance_id} "
+                f"deadline={propagated_ctx['warm_handoff_deadline']}"
+            )
+
     new_task = Task(
         project_id=source_task.project_id,
         title=title,
@@ -1475,7 +1675,7 @@ async def _spawn_pipeline_task(
         payloads=[payload_data],
         context=propagated_ctx,
         idempotency_key=idempotency_key,
-        vm_instance_id=vm_name,
+        vm_instance_id=spawn_vm_instance_id,
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
     )

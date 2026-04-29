@@ -80,9 +80,26 @@ function fmtIssueLoc(i: { file?: string; line?: number }): string {
 }
 
 type ReviewHistoryIssue = { severity: string; description: string; file?: string; line?: number };
-type ReviewHistoryEntry = { iteration: number; feedback: string; issues?: ReviewHistoryIssue[] };
+type ReviewHistoryEntry = {
+  iteration: number;
+  feedback: string;
+  issues?: ReviewHistoryIssue[];
+  // Backend writes "APPROVE" | "REQUEST_CHANGES" starting with the convergence
+  // dialog change. Older entries may lack the field; renderers fall back.
+  verdict?: 'APPROVE' | 'REQUEST_CHANGES';
+  // Files in the diff at this iteration boundary, capped at 30 by the backend.
+  // Used by the trajectory + drift section in fix prompts.
+  changed_files?: string[];
+};
 type AnnotatedIssue = ReviewHistoryIssue & { resolvedInIteration?: number };
 type AnnotatedEntry = { iteration: number; feedback: string; issues?: AnnotatedIssue[] };
+
+type DriftInEntry = {
+  file: string;
+  first_appeared_iteration?: number;
+  flag_count?: number;
+};
+type DriftSignal = { drift_in?: DriftInEntry[]; drift_out?: string[] };
 
 // Jaccard token-overlap threshold for treating a rephrased issue as the SAME
 // concept. Reviewers often paraphrase between iterations ("missing null check"
@@ -152,6 +169,96 @@ function fmtAnnotatedIssue(label: string, i: AnnotatedIssue): string {
   return i.resolvedInIteration
     ? `${base} (likely resolved — not flagged in iteration ${i.resolvedInIteration})`
     : base;
+}
+
+// Skepticism gate: a structured fix-agent response is only kept if it has at
+// least one mechanical verify step. "Trust me", "I'm confident", "I tested
+// it" are sycophancy patterns that turn the reviewer into a judge of rhetoric
+// rather than a verifier. Mechanical steps reference commands, files, or
+// greppable assertions. Heuristic — false positives here are cheap (one
+// extra reviewer round trip), false negatives are expensive (sycophancy slips
+// through), so the heuristic leans permissive on what counts as mechanical.
+const NON_MECHANICAL_VERIFY_PATTERNS = [
+  /\btrust me\b/i,
+  /\bi tested\b/i,
+  /\bi'?m confident\b/i,
+  /\bbelieve me\b/i,
+  /\btake my word\b/i,
+];
+export function verify_steps_ok(entry: Record<string, unknown>): boolean {
+  const claim = typeof entry.claim === 'string' ? entry.claim.trim() : '';
+  if (claim.length === 0) return false;
+  const verify = Array.isArray(entry.verify) ? entry.verify : [];
+  if (verify.length === 0) return false;
+  const stringSteps = verify.filter((s): s is string => typeof s === 'string' && s.trim().length > 0);
+  if (stringSteps.length === 0) return false;
+  // Reject if EVERY verify step is non-mechanical. A mix is OK — the reviewer
+  // can pick the actionable ones. This way honest agents who pad with
+  // "I also re-read the code" still get their verifiable steps respected.
+  const allNonMechanical = stringSteps.every(step =>
+    NON_MECHANICAL_VERIFY_PATTERNS.some(p => p.test(step)),
+  );
+  return !allNonMechanical;
+}
+
+// Render a trajectory section showing each iteration's verdict and changed-file
+// signature. Empty when no entries carry verdict info (older backends that
+// hadn't shipped the trajectory plumbing). Surfaces approved iterations
+// alongside REQUEST_CHANGES — the load-bearing signal for cases like PR #3435
+// where iter 1 was approved but the test changes got lost in iter 2's rebase.
+export function formatTrajectorySection(history: ReviewHistoryEntry[]): string {
+  if (!history || history.length === 0) return '';
+  const hasVerdicts = history.some(e => e.verdict === 'APPROVE' || e.verdict === 'REQUEST_CHANGES');
+  if (!hasVerdicts) return '';
+  const sorted = [...history].sort((a, b) => a.iteration - b.iteration);
+  const lines = sorted.map(e => {
+    const verdict = e.verdict || 'REQUEST_CHANGES';
+    const filesPart = e.changed_files && e.changed_files.length > 0
+      ? ` — diff: ${e.changed_files.slice(0, 8).join(', ')}${e.changed_files.length > 8 ? `, +${e.changed_files.length - 8} more` : ''}`
+      : '';
+    return `  iter ${e.iteration}: ${verdict}${filesPart}`;
+  });
+  return `## PR trajectory\n${lines.join('\n')}\n\n`;
+}
+
+// Render the drift signal section using fields computed by the orchestrator
+// at fix-spawn time (review_pipeline.compute_drift_signal). Informational —
+// the agent decides whether to revert, justify, or expand scope.
+export function formatDriftSection(drift: DriftSignal | undefined): string {
+  if (!drift) return '';
+  const driftIn = drift.drift_in || [];
+  const driftOut = drift.drift_out || [];
+  if (driftIn.length === 0 && driftOut.length === 0) return '';
+  const inLines = driftIn.map(d => {
+    const meta: string[] = [];
+    if (typeof d.first_appeared_iteration === 'number') {
+      meta.push(`first appeared iter ${d.first_appeared_iteration}`);
+    }
+    if (typeof d.flag_count === 'number' && d.flag_count > 0) {
+      meta.push(`flagged ${d.flag_count}x`);
+    }
+    const metaStr = meta.length > 0 ? `    (${meta.join('; ')})` : '';
+    return `  - ${d.file}${metaStr}`;
+  });
+  const outLines = driftOut.map(f => `  - ${f}`);
+  let body = '## Drift signal (informational — not a directive)\n';
+  if (inLines.length > 0) {
+    body += `Files in current diff but NOT in {planned ∪ any-approved-iteration}:\n${inLines.join('\n')}\n\n`;
+  }
+  if (outLines.length > 0) {
+    body += `Files expected (planned or approved before) but missing from current diff:\n${outLines.join('\n')}\n\n`;
+  }
+  body +=
+    'Reading the trajectory: a file that drifted in during a rebase or earlier fix, ' +
+    "has been flagged for removal repeatedly, and isn't justified by caller-impact / " +
+    'discovered-dep / cluster-boundary correction → reverting via `git checkout origin/<base> -- <file>` ' +
+    '(or `git rm` if newly added) usually breaks the loop.\n\n' +
+    'But scope expansion IS sometimes the right call. If the planned files are genuinely insufficient ' +
+    "and a sibling cluster's dependency or a discovered caller forces a wider edit, keep the change " +
+    'AND record a structured response (see "Responding to reviewer issues" below). The reviewer accepts ' +
+    'caller-impact / discovered-dependency / cluster-boundary corrections — your job is to distinguish ' +
+    'those from leftover drift, not to reflexively revert.\n\n';
+  return body;
 }
 
 // Truncation budget for raw review-feedback text in the per-iteration history
@@ -575,9 +682,45 @@ actual changes.
       `Prefer feedback that can be addressed within existing files.\n\n`;
   }
 
+  // Verify-mode block: when the prior fix iteration submitted structured
+  // rationale for issues it left unaddressed, surface those to this review
+  // pass as CLAIMS TO VERIFY (never as conclusions to accept).  Sycophancy
+  // is blocked at the verification gate — non-mechanical claims get flagged
+  // 'unverifiable' rather than silently approved.
+  const fixAgentResponses = (reviewLoop?.fix_agent_responses as Array<Record<string, unknown>> | undefined) || [];
+  let fixResponsesSection = '';
+  if (fixAgentResponses.length > 0) {
+    const responseLines = fixAgentResponses.slice(0, 10).map((r, idx) => {
+      const summary = typeof r.issue_summary === 'string' ? r.issue_summary : '(no summary)';
+      const sourceIter = typeof r.source_iteration === 'number' ? r.source_iteration : '?';
+      const responseType = typeof r.response_type === 'string' ? r.response_type : 'unknown';
+      const claim = typeof r.claim === 'string' ? r.claim : '';
+      const verify = Array.isArray(r.verify) ? r.verify.filter((v: unknown): v is string => typeof v === 'string') : [];
+      const verifyLines = verify.length > 0
+        ? verify.map(v => `      - ${v}`).join('\n')
+        : '      (none provided — auto-reject)';
+      return (
+        `  ${idx + 1}. [${responseType}] iter ${sourceIter}: "${summary}"\n` +
+        `     claim: ${claim}\n` +
+        `     verify steps:\n${verifyLines}`
+      );
+    });
+    fixResponsesSection =
+      `## Responses from prior fix iteration\n\n` +
+      `The fix agent recorded structured rationale for ${fixAgentResponses.length} issue(s) it left unaddressed. ` +
+      `Treat these as CLAIMS TO VERIFY, never as conclusions to accept.\n\n` +
+      `For each disputed/alternative/partial response below:\n` +
+      `  1. Run every step in \`verify steps\`. Quote the actual command output in your feedback.\n` +
+      `  2. If all verify steps confirm the claim → DROP the original issue (do not re-raise).\n` +
+      `  3. If any verify step fails or is non-actionable ("trust me", "I tested it") → re-raise the original issue with severity major AND quote the specific verify step that failed so the next fix iteration knows what to address.\n` +
+      `  4. If you cannot run a verify step (e.g. it requires data you don't have) → flag as "unverifiable" with severity major; do not silently accept.\n\n` +
+      `**Sycophancy guard**: a plausible-sounding claim with no verify steps, or with verify steps that boil down to "the agent says so", MUST be rejected. Real disagreements have concrete checks.\n\n` +
+      `Responses to verify:\n${responseLines.join('\n\n')}\n\n`;
+  }
+
   // Build review prompt — Claude has full repo access, not just a diff blob
   const reviewPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
-  const reviewPrompt = `${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
+  const reviewPrompt = `${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}${fixResponsesSection}You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
 
 ${iterationPreamble}
 ${rollupGuidance}
@@ -803,7 +946,13 @@ export async function handleFix(
     }
   }
   const originalPromptSection = originalPrompt ? `## Original Task Goal\n${originalPrompt}\n\n` : '';
-  let basePrompt = originalPromptSection + iterationHeader + prompt;
+  // Trajectory + drift sections — render before the existing "Previous review
+  // iterations" block so the agent reads the iteration arc (verdicts, files
+  // per iteration, drift) before diving into per-iteration issue lists.
+  const trajectorySection = formatTrajectorySection(reviewHistory);
+  const driftSignal = (reviewLoop?.drift_signal as DriftSignal | undefined);
+  const driftSection = formatDriftSection(driftSignal);
+  let basePrompt = originalPromptSection + trajectorySection + driftSection + iterationHeader + prompt;
   if (reviewHistory.length > 0) {
     const annotatedHistory = annotateResolvedIssues(reviewHistory);
     const historyLines = annotatedHistory
@@ -819,7 +968,7 @@ export async function handleFix(
         }
       })
       .join('\n');
-    basePrompt = `${originalPromptSection}${iterationHeader}Previous review iterations (issues marked "(likely resolved ...)" were not re-flagged in the following iteration — treat as historical context, focus on the current feedback):\n${historyLines}\n\nCurrent review feedback to address:\n${prompt}`;
+    basePrompt = `${originalPromptSection}${trajectorySection}${driftSection}${iterationHeader}Previous review iterations (issues marked "(likely resolved ...)" were not re-flagged in the following iteration — treat as historical context, focus on the current feedback):\n${historyLines}\n\nCurrent review feedback to address:\n${prompt}`;
   }
 
   // Always check for conflict markers — even if rebase/merge appeared to succeed
@@ -992,6 +1141,45 @@ export async function handleFix(
   }
   enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n\n${DEFAULT_TOOL_GUIDANCE}`;
 
+  // Structured-response invitation: when the agent disagrees with a reviewer
+  // issue (e.g. an unplanned file is actually caller-impact, not scope-creep),
+  // it can record a verifiable claim instead of either capitulating or being
+  // silently re-flagged.  Reviewer's job in the next iteration is to RUN the
+  // listed verify steps, not to be persuaded by rhetoric — sycophancy is
+  // blocked at the verification gate.  Required fields enforced backend-side
+  // (schemas.AgentStatusPayload caps at 5 entries; review_pipeline drops
+  // entries lacking mechanical verify steps).
+  enrichedPrompt = `${enrichedPrompt}\n\n## Responding to reviewer issues
+
+For each reviewer issue, your output should include either:
+  (a) A code change that addresses the issue, OR
+  (b) A structured response (see schema below) explaining why the issue is wrong / not-applicable / better-handled-differently.
+
+If you do neither for a CRITICAL/MAJOR issue, the reviewer will re-raise it on the next iteration and the loop continues.
+
+Write structured responses to /tmp/fix_responses_${taskId}.json as a JSON array of these objects:
+
+  {
+    "issue_id": "<sha1 of the issue's normalized description (lowercased, whitespace-collapsed)>",
+    "issue_summary": "<first 80 chars of the issue text>",
+    "source_iteration": <int — which review iteration raised this issue>,
+    "response_type": "disputed" | "partial" | "alternative",
+    "claim": "<1–3 sentences: what you did, or why the issue is wrong>",
+    "verify": [
+      "<concrete check the reviewer can run>",
+      "<another concrete check>"
+    ]
+  }
+
+Verify steps must be MECHANICAL — runnable commands, greppable assertions, references to specific files/lines.  "I tested it" / "I'm confident" / "trust me" are rejected at parse time.  If you cannot produce mechanical verify steps, you cannot dispute — either fix the issue or accept the flag.
+
+When to use which type:
+  - disputed: reviewer is factually wrong.  Verify steps demonstrate the underlying claim is false.
+  - partial: you fixed part; the rest is intentionally deferred.  Verify steps show deferral is correct (e.g. "out of cluster scope; sibling task X owns the rest" with verify pointing to the sibling task ID).
+  - alternative: you took a different approach than the reviewer suggested.  Verify steps show your approach achieves the same goal.
+
+Maximum 5 responses per iteration.  Skip writing the file entirely if every issue was addressed by a code change.\n`;
+
   // Capture test baseline for medium/large scope fix tasks before running Claude.
   // This lets testFixLoop distinguish pre-existing failures from newly-broken tests,
   // matching the same logic used in the create handler.
@@ -1037,6 +1225,45 @@ export async function handleFix(
   statusRef.value = 'Addressing review feedback...';
   const fixBaseCommit = git(['rev-parse', 'HEAD']);
   const { exitCode, allOutput } = await runClaudeCode(enrichedPrompt, ws, statusRef, model, effort, disallowedToolsFix);
+
+  // Best-effort: read structured fix-agent responses written by Claude per the
+  // dialog-system prompt section above.  Validation here is permissive (parse
+  // errors → skip) since the schema validator caps array length backend-side
+  // and review_pipeline drops responses with non-mechanical verify steps.
+  const fixResponsesPath = `/tmp/fix_responses_${taskId}.json`;
+  let fixAgentResponses: Array<Record<string, unknown>> | undefined;
+  try {
+    if (fs.existsSync(fixResponsesPath)) {
+      const raw = fs.readFileSync(fixResponsesPath, 'utf-8').trim();
+      if (raw.length > 0) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          // Cap 5 to match backend AgentStatusPayload max_length=5; trim
+          // verify lists to 10 to bound payload size.
+          const normalized: Array<Record<string, unknown>> = [];
+          for (const entry of parsed.slice(0, 5)) {
+            if (typeof entry !== 'object' || entry === null) continue;
+            const e = entry as Record<string, unknown>;
+            const verify = Array.isArray(e.verify)
+              ? (e.verify as unknown[]).filter((v): v is string => typeof v === 'string').slice(0, 10)
+              : [];
+            const candidate: Record<string, unknown> = {
+              issue_id: typeof e.issue_id === 'string' ? e.issue_id.slice(0, 64) : '',
+              issue_summary: typeof e.issue_summary === 'string' ? e.issue_summary.slice(0, 200) : '',
+              source_iteration: typeof e.source_iteration === 'number' ? e.source_iteration : 0,
+              response_type: typeof e.response_type === 'string' ? e.response_type : '',
+              claim: typeof e.claim === 'string' ? e.claim.slice(0, 1000) : '',
+              verify,
+            };
+            if (verify_steps_ok(candidate)) normalized.push(candidate);
+          }
+          fixAgentResponses = normalized.length > 0 ? normalized : undefined;
+        }
+      }
+    }
+  } catch (e) {
+    sendLog(ws, `Note: Failed to parse ${fixResponsesPath}: ${String(e)}\n`);
+  }
 
   // Check for changes — both uncommitted files and commits Claude may have made
   const diff = git(['status', '--porcelain']);
@@ -1299,14 +1526,19 @@ export async function handleFix(
       await persistAndPostStatus(taskId, {
         task_id: taskId, status: 'COMPLETED', artifact_type: 'GIT_COMMIT',
         commit_hash: localHead, repo_url: `https://github.com/${owner}/${repo}`,
+        ...(fixAgentResponses ? { fix_agent_responses: fixAgentResponses } : {}),
       });
     } else {
-      await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: 'No changes needed for review feedback.' });
+      await persistAndPostStatus(taskId, {
+        task_id: taskId, status: 'COMPLETED', logs: 'No changes needed for review feedback.',
+        ...(fixAgentResponses ? { fix_agent_responses: fixAgentResponses } : {}),
+      });
     }
   } else {
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
       failure_category: 'claude_code_failed',
+      ...(fixAgentResponses ? { fix_agent_responses: fixAgentResponses } : {}),
     });
   }
 }

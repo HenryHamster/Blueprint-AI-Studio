@@ -72,7 +72,7 @@ vi.mock('child_process', () => ({
 import fs from 'fs';
 import { execFileSync } from 'child_process';
 import * as indexMod from '../index.js';
-import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS, annotateResolvedIssues, detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying, detectMigrationConflict, buildMigrationConflictGuidance, buildBlueprintPrFooter } from './review-fix.js';
+import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS, annotateResolvedIssues, detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying, detectMigrationConflict, buildMigrationConflictGuidance, buildBlueprintPrFooter, formatTrajectorySection, formatDriftSection, verify_steps_ok } from './review-fix.js';
 
 const statusRef = () => ({ value: '' });
 
@@ -1471,5 +1471,120 @@ describe('buildMigrationConflictGuidance', () => {
     expect(out).toMatch(/revision = "0052"/);
     expect(out).toMatch(/down_revision = "0051"/);
     expect(out).toMatch(/EXPECTED_SCHEMA_REVISION = "0052"/);
+  });
+});
+
+// ── formatTrajectorySection ───────────────────────────────────────────────────
+describe('formatTrajectorySection — fix-prompt iteration arc renderer', () => {
+  it('returns empty when history is empty', () => {
+    expect(formatTrajectorySection([])).toBe('');
+  });
+
+  it('returns empty when no entries carry verdict info (older backends)', () => {
+    const out = formatTrajectorySection([
+      { iteration: 1, feedback: 'foo' },
+      { iteration: 2, feedback: 'bar' },
+    ]);
+    expect(out).toBe('');
+  });
+
+  it('renders APPROVE and REQUEST_CHANGES entries with diff signature', () => {
+    const out = formatTrajectorySection([
+      { iteration: 1, feedback: '', verdict: 'APPROVE', changed_files: ['a.py', 'b.py'] },
+      { iteration: 2, feedback: 'review feedback', verdict: 'REQUEST_CHANGES', changed_files: ['main.py'] },
+    ]);
+    expect(out).toContain('## PR trajectory');
+    expect(out).toContain('iter 1: APPROVE');
+    expect(out).toContain('iter 2: REQUEST_CHANGES');
+    expect(out).toContain('a.py, b.py');
+    expect(out).toContain('main.py');
+  });
+
+  it('truncates long file lists with a +N more suffix', () => {
+    const manyFiles = Array.from({ length: 12 }, (_, i) => `f${i}.py`);
+    const out = formatTrajectorySection([
+      { iteration: 1, feedback: '', verdict: 'APPROVE', changed_files: manyFiles },
+    ]);
+    expect(out).toMatch(/f0\.py.*f7\.py.*\+4 more/s);
+  });
+});
+
+// ── formatDriftSection ────────────────────────────────────────────────────────
+describe('formatDriftSection — drift signal renderer', () => {
+  it('returns empty when no drift', () => {
+    expect(formatDriftSection({ drift_in: [], drift_out: [] })).toBe('');
+    expect(formatDriftSection(undefined)).toBe('');
+  });
+
+  it('renders drift_in with first_appeared + flag_count metadata', () => {
+    const out = formatDriftSection({
+      drift_in: [
+        { file: 'main.py', first_appeared_iteration: 2, flag_count: 3 },
+        { file: 'other.py' }, // bare entry — no metadata
+      ],
+      drift_out: ['test_reaper.py'],
+    });
+    expect(out).toContain('main.py');
+    expect(out).toContain('first appeared iter 2');
+    expect(out).toContain('flagged 3x');
+    // Bare entry should not show metadata.
+    expect(out).toMatch(/- other\.py(?!.*first appeared)/s);
+    expect(out).toContain('test_reaper.py');
+  });
+
+  it('frames drift as informational with explicit "scope expansion is sometimes correct" guidance', () => {
+    const out = formatDriftSection({
+      drift_in: [{ file: 'foo.py' }],
+      drift_out: [],
+    });
+    // Must NOT be directive — agent should retain judgment.
+    expect(out).toContain('informational — not a directive');
+    // Must explicitly acknowledge justified scope expansion (the user-flagged
+    // concern that drift signaling shouldn't push the agent to reflexively revert).
+    expect(out).toContain('scope expansion IS sometimes the right call');
+    expect(out).toContain('caller-impact');
+    expect(out).toContain('discovered-dep');
+    expect(out).toContain('cluster-boundary correction');
+  });
+});
+
+// ── verify_steps_ok ───────────────────────────────────────────────────────────
+describe('verify_steps_ok — sycophancy guard for fix_agent_responses', () => {
+  it('rejects entries with no verify steps', () => {
+    expect(verify_steps_ok({
+      claim: 'this is fine',
+      verify: [],
+    })).toBe(false);
+  });
+
+  it('rejects entries where every verify step is non-mechanical (sycophancy patterns)', () => {
+    expect(verify_steps_ok({
+      claim: 'I disagree',
+      verify: ['trust me, I tested it', "I'm confident this works"],
+    })).toBe(false);
+  });
+
+  it('accepts entries with at least one mechanical verify step even if other steps are non-mechanical', () => {
+    expect(verify_steps_ok({
+      claim: 'caller-impact justification',
+      verify: [
+        'I re-read the code',  // non-mechanical
+        'grep -n "newApi" backend/app/auth.py',  // mechanical
+      ],
+    })).toBe(true);
+  });
+
+  it('accepts purely mechanical verify steps', () => {
+    expect(verify_steps_ok({
+      claim: 'fix is in helper file',
+      verify: ['cat backend/app/helpers.py | head -20', 'pytest backend/testing/test_helpers.py::test_X'],
+    })).toBe(true);
+  });
+
+  it('rejects entries with empty claim', () => {
+    expect(verify_steps_ok({
+      claim: '',
+      verify: ['grep "foo" file.py'],
+    })).toBe(false);
   });
 });

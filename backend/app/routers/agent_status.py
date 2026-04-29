@@ -701,7 +701,7 @@ async def update_agent_status(
                     )
                     return {"status": "accepted_dedup_race"}
                 # Store changed files and enriched retry info in task context
-                if payload.changed_files or payload.diff_summary or payload.self_review_outcome:
+                if payload.changed_files or payload.diff_summary or payload.self_review_outcome or payload.fix_agent_responses:
                     ctx = dict(task.context or {})
                     if payload.changed_files:
                         ctx['_pr_changed_files'] = payload.changed_files[:50]
@@ -715,6 +715,10 @@ async def update_agent_status(
                         ctx['_self_review_outcome'] = payload.self_review_outcome
                     if payload.test_failure_summary:
                         ctx['_test_failure_summary'] = payload.test_failure_summary[:5000]
+                    if payload.fix_agent_responses:
+                        # _spawn_pipeline_task carries this forward to the next
+                        # reviewer's review_loop.fix_agent_responses for verify-mode.
+                        ctx['_fix_agent_responses'] = payload.fix_agent_responses
                     task.context = ctx
                     flag_modified(task, 'context')
         else:
@@ -729,7 +733,7 @@ async def update_agent_status(
             )
             session.add(artifact)
             # Persist enriched retry info for non-PR failures (e.g. test/lint failures)
-            if payload.changed_files or payload.diff_summary or payload.test_failure_summary or payload.analysis_plan:
+            if payload.changed_files or payload.diff_summary or payload.test_failure_summary or payload.analysis_plan or payload.fix_agent_responses:
                 ctx = dict(task.context or {})
                 if payload.changed_files:
                     ctx['_pr_changed_files'] = payload.changed_files[:50]
@@ -742,6 +746,8 @@ async def update_agent_status(
                     ctx['_test_failure_summary'] = payload.test_failure_summary[:5000]
                 if payload.analysis_plan:
                     ctx['_analysis_plan'] = payload.analysis_plan[:5000]
+                if payload.fix_agent_responses:
+                    ctx['_fix_agent_responses'] = payload.fix_agent_responses
                 task.context = ctx
                 flag_modified(task, 'context')
 
