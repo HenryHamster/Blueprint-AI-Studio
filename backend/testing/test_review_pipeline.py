@@ -2519,6 +2519,40 @@ async def test_strategic_context_propagates_to_spawned_fix(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_ci_failure_logs_propagate_to_spawned_fix_context(db_session, mocker):
+    """CI-failure fix tasks carry structured failed-log context so the agent can
+    derive targeted pytest selectors instead of treating the text prompt as the
+    only source of truth."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 502, "branch": "feat/ci",
+                   "base_branch": "main", "prompt": "Build X"}],
+        context={"scope": "medium", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    ci_logs = "FAILED backend/testing/test_models.py::test_create - AssertionError"
+    result, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=502, branch="feat/ci", base_branch="main",
+        fix_prompt="Fix CI",
+        fix_reason="ci_failure",
+        ci_failure_logs=ci_logs,
+    )
+
+    assert created is True
+    assert result is not None
+    assert (result.context or {}).get("ci_failure_logs") == ci_logs
+    assert (result.context or {}).get("review_loop", {}).get("fix_reason") == "ci_failure"
+
+
+@pytest.mark.asyncio
 async def test_self_review_outcome_propagates_to_spawned_review(db_session, mocker):
     """When the source task carries `_self_review_outcome` (set by the create
     handler's self-review), it must be carried forward to the spawned review

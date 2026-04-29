@@ -58,7 +58,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, type FailureCategory } from './index.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
@@ -1012,6 +1012,54 @@ describe('detectTestRunners auto-detect postgres flag', () => {
     expect(args).not.toContain('--no-postgres');
   });
 
+  it('runs targeted pytest selectors before impact coverage when requested', async () => {
+    const buildConfig = {
+      directories: [{ path: '', type: 'python', test_cmd: 'bash scripts/test-backend.sh --postgres' }],
+    };
+
+    await testFixLoop(
+      null, { value: '' }, undefined, undefined, buildConfig,
+      undefined, undefined, undefined,
+      {
+        targetPytestSelectors: ['backend/testing/test_models.py::test_create'],
+        runImpactAfterTargeted: true,
+        requireTestmonForImpact: true,
+      },
+    );
+
+    const bashCalls = vi.mocked(spawn).mock.calls.filter(c => c[0] === 'bash');
+    expect(bashCalls).toHaveLength(2);
+    expect(bashCalls[0][1]).toEqual([
+      'scripts/test-backend.sh',
+      '--postgres',
+      'testing/test_models.py::test_create',
+    ]);
+    expect(bashCalls[1][1]).toEqual(['scripts/test-backend.sh', '--postgres', '--require-testmon']);
+  });
+
+  it('does not scope away backend targeted runners when related files point elsewhere', async () => {
+    const buildConfig = {
+      directories: [
+        { path: 'agent', type: 'node', test_cmd: 'npm test' },
+        { path: '', type: 'python', test_cmd: 'bash scripts/test-backend.sh --postgres' },
+      ],
+    };
+
+    await testFixLoop(
+      null, { value: '' }, undefined, undefined, buildConfig,
+      undefined, ['agent/src/index.ts'], undefined,
+      { targetPytestSelectors: ['backend/testing/test_models.py::test_create'] },
+    );
+
+    const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
+    expect(bashCall).toBeDefined();
+    expect(bashCall![1]).toEqual([
+      'scripts/test-backend.sh',
+      '--postgres',
+      'testing/test_models.py::test_create',
+    ]);
+  });
+
   it('appends --no-postgres when Docker is unavailable (captureTestBaseline)', async () => {
     fakeSelfRepoFs();
     // Simulate Docker absent: execSync throws
@@ -1547,6 +1595,54 @@ describe('parseFailingTests', () => {
     const output = '⨯ some test failed';
     const result = parseFailingTests(output);
     expect(result).toEqual(new Set(['some test failed']));
+  });
+});
+
+describe('pytest CI selector extraction', () => {
+  it('extracts pytest selectors from CI FAILED lines and normalizes backend script args', () => {
+    const output = [
+      'FAILED backend/testing/test_models.py::test_create - AssertionError',
+      'FAILED testing/test_pipeline.py::test_queue[case-1] - RuntimeError',
+      'PASSED backend/testing/test_ok.py::test_ok',
+    ].join('\n');
+
+    const selectors = extractPytestSelectorsFromOutput(output);
+    expect(selectors).toEqual([
+      'backend/testing/test_models.py::test_create',
+      'testing/test_pipeline.py::test_queue[case-1]',
+    ]);
+
+    const runner = {
+      cmd: 'bash',
+      args: ['scripts/test-backend.sh', '--postgres'],
+      cwd: '/tmp/workspace',
+      label: 'pytest (backend pyproject)',
+    };
+    expect(normalizePytestSelectorForRunner(selectors[0], runner)).toBe('testing/test_models.py::test_create');
+
+    const directScriptRunner = {
+      cmd: 'scripts/test-backend.sh',
+      args: ['--postgres'],
+      cwd: '/tmp/workspace',
+      label: 'pytest (backend direct script)',
+    };
+    expect(normalizePytestSelectorForRunner(selectors[0], directScriptRunner)).toBe('testing/test_models.py::test_create');
+  });
+
+  it('builds targeted pytest runners by appending selectors only to pytest-compatible runners', () => {
+    const runners = [
+      { cmd: 'bash', args: ['scripts/test-backend.sh', '--postgres'], cwd: '/tmp/workspace', label: 'backend' },
+      { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace/agent', label: 'agent' },
+    ];
+
+    const targeted = buildTargetedPytestRunners(runners, ['backend/testing/test_models.py::test_create']);
+
+    expect(targeted).toHaveLength(1);
+    expect(targeted[0].args).toEqual([
+      'scripts/test-backend.sh',
+      '--postgres',
+      'testing/test_models.py::test_create',
+    ]);
   });
 });
 

@@ -14,6 +14,7 @@
 #   scripts/test-backend.sh --standalone                 # standalone tests only (no DB fixtures)
 #   scripts/test-backend.sh --no-postgres                # SQLite (fast local; misses Postgres-only failures)
 #   scripts/test-backend.sh --no-testmon                 # ignore warm cache, run full suite
+#   scripts/test-backend.sh --require-testmon            # skip instead of running full suite when no warm cache exists
 #   scripts/test-backend.sh --postgres                   # accepted for back-compat; default is already on
 set -euo pipefail
 cd "$(dirname "$0")/../backend"
@@ -22,14 +23,17 @@ cd "$(dirname "$0")/../backend"
 # --postgres: kept as a no-op flag for callers that pass it explicitly.
 # --no-postgres: opt out (use in-memory SQLite for fast local dev).
 # --no-testmon: opt out of warm-cache selection (run full suite).
+# --require-testmon: opt out of the full-suite fallback when no cache exists.
 USE_POSTGRES=1
 USE_TESTMON=1
+REQUIRE_TESTMON=0
 ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --postgres) ;;  # default; no-op
     --no-postgres) USE_POSTGRES=0 ;;
     --no-testmon) USE_TESTMON=0 ;;
+    --require-testmon) REQUIRE_TESTMON=1 ;;
     *) ARGS+=("$arg") ;;
   esac
 done
@@ -64,6 +68,10 @@ if [ "$USE_TESTMON" = "1" ] && [ -z "${TESTMON_NO_FETCH:-}" ]; then
   if [ -f .testmondata ]; then
     TESTMON_ARGS=(--testmon-forceselect)
   fi
+fi
+if [ "$REQUIRE_TESTMON" = "1" ] && [ "${#TESTMON_ARGS[@]}" -eq 0 ]; then
+  echo "=== Warm testmon cache unavailable — skipping impact coverage instead of running full suite ==="
+  exit 0
 fi
 # When USE_TESTMON=0 we just don't append the flag; the plugin sits inert
 # without an explicit --testmon* arg, so a leftover .testmondata on disk

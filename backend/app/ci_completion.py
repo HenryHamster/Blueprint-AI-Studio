@@ -794,7 +794,8 @@ async def handle_ci_completion(
             task, "fix", session, ci_pr_number, ci_branch, ci_base,
             fix_prompt=ci_fix_prompt,
             original_task_id=ci_orig_id,
-            fix_reason="ci_failure"
+            fix_reason="ci_failure",
+            ci_failure_logs=ci_errors,
         )
         if fix_task:
             from app.rollup_state import _is_rollup_parent_awaiting_merge

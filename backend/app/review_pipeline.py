@@ -743,7 +743,8 @@ async def _spawn_pipeline_task(
     source_task: Task, task_type: str, session: AsyncSession,
     pr_number: int, branch: str, base_branch: str,
     original_prompt: str = "", fix_prompt: str = "", original_task_id: str = "",
-    current_feedback: str = "", fix_reason: str = "", current_issues: list | None = None
+    current_feedback: str = "", fix_reason: str = "", current_issues: list | None = None,
+    ci_failure_logs: str = "",
 ) -> tuple[Task | None, bool]:
     """Spawn a review or fix task as part of the automated review pipeline.
 
@@ -1430,6 +1431,12 @@ async def _spawn_pipeline_task(
         ):
             if orig_ctx_src.get(_dk) is not None:
                 propagated_ctx[_dk] = orig_ctx_src[_dk]
+
+    if task_type == "fix" and fix_reason == "ci_failure" and ci_failure_logs:
+        # Truncate from the start, not the end — pytest's FAILED summary lines
+        # (the ones the agent extracts selectors from) sit at the tail of each
+        # job's log section.
+        propagated_ctx["ci_failure_logs"] = str(ci_failure_logs)[-5000:]
 
     # Propagate the original create task's planned file list so the reviewer can
     # objectively detect scope creep (files changed but not in the original plan).

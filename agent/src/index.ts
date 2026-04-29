@@ -1294,7 +1294,7 @@ export async function lintFixLoop(
 }
 
 // ── Test runner detection (shared by testFixLoop and captureTestBaseline) ───
-interface TestRunner {
+export interface TestRunner {
   cmd: string;
   args: string[];
   cwd: string;
@@ -1447,6 +1447,79 @@ export function parseFailingTests(output: string): Set<string> {
     if (vitestMatch) failing.add(vitestMatch[1].trim());
   }
   return failing;
+}
+
+export function normalizePytestSelectorForRunner(selector: string, runner?: TestRunner): string {
+  const normalized = selector.trim().replace(/\\/g, '/');
+  if (!normalized) return '';
+  const invokesBackendScript = Boolean(
+    runner && [runner.cmd, ...runner.args].some(arg => arg.includes('scripts/test-backend.sh'))
+  );
+  const cwd = runner?.cwd.replace(/\\/g, '/') || '';
+  const runsFromBackend = invokesBackendScript || cwd.endsWith('/backend');
+  if (runsFromBackend && normalized.startsWith('backend/')) {
+    return normalized.slice('backend/'.length);
+  }
+  if (!runsFromBackend && normalized.startsWith('testing/')) {
+    return `backend/${normalized}`;
+  }
+  return normalized;
+}
+
+export function extractPytestSelectorsFromOutput(output: string): string[] {
+  const selectors = new Set<string>();
+  for (const id of parseFailingTests(output)) {
+    const normalized = id.trim().replace(/\\/g, '/');
+    if (/^(backend\/)?testing\/.+\.py(?:::|$)/.test(normalized)) {
+      selectors.add(normalized);
+    }
+  }
+
+  const selectorPattern = /\b((?:backend\/)?testing\/[A-Za-z0-9_./-]+\.py(?:::[^\s\r\n]+)?)/g;
+  for (const line of output.split('\n')) {
+    if (!/\b(?:FAILED|ERROR)\b|::error\b/i.test(line)) continue;
+    for (const match of line.matchAll(selectorPattern)) {
+      selectors.add(match[1].trim().replace(/\\/g, '/'));
+    }
+  }
+
+  return Array.from(selectors);
+}
+
+function acceptsPytestSelectors(runner: TestRunner): boolean {
+  const cmdAndArgs = [runner.cmd, ...runner.args].join(' ');
+  return cmdAndArgs.includes('pytest') || cmdAndArgs.includes('scripts/test-backend.sh');
+}
+
+function withPytestSelectors(runner: TestRunner, selectors: string[]): TestRunner | null {
+  if (!acceptsPytestSelectors(runner)) return null;
+  const normalized = Array.from(new Set(
+    selectors
+      .map(selector => normalizePytestSelectorForRunner(selector, runner))
+      .filter(Boolean)
+  ));
+  if (normalized.length === 0) return null;
+  return {
+    ...runner,
+    args: [...runner.args, ...normalized],
+    label: `${runner.label} (targeted CI failures)`,
+  };
+}
+
+export function buildTargetedPytestRunners(runners: TestRunner[], selectors: string[]): TestRunner[] {
+  return runners
+    .map(runner => withPytestSelectors(runner, selectors))
+    .filter((runner): runner is TestRunner => runner !== null);
+}
+
+function withRequiredTestmon(runner: TestRunner): TestRunner {
+  const invokesBackendScript = [runner.cmd, ...runner.args].some(arg => arg.includes('scripts/test-backend.sh'));
+  if (!invokesBackendScript || runner.args.includes('--require-testmon')) return runner;
+  return {
+    ...runner,
+    args: [...runner.args, '--require-testmon'],
+    label: `${runner.label} (testmon impact)`,
+  };
 }
 
 // Minimal vitest JSON reporter shape — we only need the failed-test names.
@@ -1664,19 +1737,30 @@ export function condensedAnalysisSections(analysisContext: string): string {
   return wanted.map(s => s.trim()).join('\n\n');
 }
 
+export interface TestFixLoopOptions {
+  targetPytestSelectors?: string[];
+  runImpactAfterTargeted?: boolean;
+  requireTestmonForImpact?: boolean;
+  maxFixAttempts?: number;
+  phaseLabel?: string;
+  runnersOverride?: TestRunner[];
+}
+
 export async function testFixLoop(
   ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string, buildConfig?: BuildConfig,
   baselineFailures?: Set<string>,
   relatedFiles?: string[],
   analysisContext?: string,
+  options: TestFixLoopOptions = {},
 ): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; failureSummary?: string }> {
-  let runners = detectTestRunners(buildConfig);
+  let runners = options.runnersOverride ?? detectTestRunners(buildConfig);
+  const targetPytestSelectors = Array.from(new Set(options.targetPytestSelectors ?? []));
 
   // Scope-limit to runners relevant to the files being changed. Same logic as
   // captureTestBaseline — avoids running the full backend Docker test suite
   // when only agent files changed.
-  if (relatedFiles && relatedFiles.length > 0) {
+  if (!options.runnersOverride && targetPytestSelectors.length === 0 && relatedFiles && relatedFiles.length > 0) {
     const touchesAgent = relatedFiles.some(f => f.startsWith('agent/'));
     const touchesBackend = relatedFiles.some(f => f.startsWith('backend/'));
     if (touchesAgent || touchesBackend) {
@@ -1696,10 +1780,50 @@ export async function testFixLoop(
 
   sendLog(ws, `Detected test runner(s): ${runners.map(r => r.label).join(', ')}\n`);
 
+  if (!options.runnersOverride && targetPytestSelectors.length > 0) {
+    const targetedRunners = buildTargetedPytestRunners(runners, targetPytestSelectors);
+    if (targetedRunners.length > 0) {
+      sendLog(ws, `Running targeted CI failure tests first: ${targetPytestSelectors.slice(0, 8).join(', ')}${targetPytestSelectors.length > 8 ? ` (+${targetPytestSelectors.length - 8} more)` : ''}\n`);
+      const targetedResult = await testFixLoop(
+        ws, statusRef, model, effort, buildConfig,
+        undefined, relatedFiles, analysisContext,
+        {
+          ...options,
+          targetPytestSelectors: [],
+          runImpactAfterTargeted: false,
+          phaseLabel: 'Targeted CI failure verification',
+          runnersOverride: targetedRunners,
+        },
+      );
+      if (!targetedResult.passed || !options.runImpactAfterTargeted) {
+        return targetedResult;
+      }
+      sendLog(ws, 'Targeted CI failure tests passed; running impact coverage with the detected test runner(s).\n');
+      const impactRunners = options.requireTestmonForImpact
+        ? runners.map(runner => withRequiredTestmon(runner))
+        : runners;
+      return testFixLoop(
+        ws, statusRef, model, effort, buildConfig,
+        baselineFailures, relatedFiles, analysisContext,
+        {
+          ...options,
+          targetPytestSelectors: [],
+          runImpactAfterTargeted: false,
+          phaseLabel: 'Impact coverage',
+          runnersOverride: impactRunners,
+        },
+      );
+    }
+    sendLog(ws, 'No pytest-compatible runner found for targeted CI failures — falling back to detected test runner(s).\n');
+  }
+
   let prevFingerprint: string | null = null;
-  for (let attempt = 0; attempt <= MAX_TEST_FIX_ATTEMPTS; attempt++) {
-    statusRef.value = attempt === 0 ? 'Running test suite...' : `Re-running tests (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})...`;
-    sendLog(ws, `Running tests (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})...\n`);
+  const maxFixAttempts = Math.max(0, options.maxFixAttempts ?? MAX_TEST_FIX_ATTEMPTS);
+  const totalAttempts = maxFixAttempts + 1;
+  const phasePrefix = options.phaseLabel ? `${options.phaseLabel}: ` : '';
+  for (let attempt = 0; attempt <= maxFixAttempts; attempt++) {
+    statusRef.value = attempt === 0 ? `${phasePrefix}Running test suite...` : `${phasePrefix}Re-running tests (attempt ${attempt + 1}/${totalAttempts})...`;
+    sendLog(ws, `${phasePrefix}Running tests (attempt ${attempt + 1}/${totalAttempts})...\n`);
 
     // structuredIds is populated for vitest runners from the JSON reporter
     // output file. When present, baseline comparison uses it as the source
@@ -1858,9 +1982,9 @@ export async function testFixLoop(
       return { passed: false, testFailuresDetected: true, failureSummary };
     }
     prevFingerprint = fingerprint;
-    if (attempt < MAX_TEST_FIX_ATTEMPTS) {
+    if (attempt < maxFixAttempts) {
       const preExistingHint = preExistingNote ? ' (pre-existing failures excluded)' : '';
-      sendLog(ws, `Tests failed (attempt ${attempt + 1}/${MAX_TEST_FIX_ATTEMPTS + 1})${preExistingHint}:\n${combinedFailures.slice(-5000)}\nClaude will attempt to fix...\n`);
+      sendLog(ws, `${phasePrefix}Tests failed (attempt ${attempt + 1}/${totalAttempts})${preExistingHint}:\n${combinedFailures.slice(-5000)}\nClaude will attempt to fix...\n`);
       const analysisSections = analysisContext ? condensedAnalysisSections(analysisContext) : '';
       const analysisPrefix = analysisSections ? `## Module Analysis\n\n${analysisSections}\n\n` : '';
       // Broader, investigation-first prompt. The previous "These tests
@@ -1902,7 +2026,10 @@ export async function testFixLoop(
       await runClaudeCode(fixPrompt, ws, statusRef, model, effort);
       git(['add', '-A']);
     } else {
-      sendLog(ws, `WARNING: Tests still failing after ${MAX_TEST_FIX_ATTEMPTS} fix attempts. Proceeding with commit.\n`);
+      const exhaustedMessage = maxFixAttempts === 0
+        ? `${phasePrefix}Tests failed during focused verification.\n`
+        : `WARNING: ${phasePrefix}Tests still failing after ${maxFixAttempts} fix attempts. Proceeding with commit.\n`;
+      sendLog(ws, exhaustedMessage);
       const failureSummary = combinedFailures.slice(-8000);
       return { passed: false, testFailuresDetected: true, failureSummary };
     }

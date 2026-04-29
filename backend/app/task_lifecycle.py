@@ -1796,7 +1796,8 @@ async def _process_post_commit(
                                 task, "fix", session, pr_number, branch, base_branch,
                                 fix_prompt=ci_fix_prompt,
                                 original_task_id=original_task_id,
-                                fix_reason="ci_failure"
+                                fix_reason="ci_failure",
+                                ci_failure_logs=ci_errors,
                             )
                             if fix_task:
                                 logger.error(f"[CI] PR #{pr_number} CI failed, spawned fix → {fix_task.id}")

@@ -5,7 +5,7 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, apiGet, git, gitAsync, gitCommit, cloneWithRetry,
   runClaudeCode, runProjectLintChecks, lintFixLoop, testFixLoop,
-  captureTestBaseline, sendHeartbeatSync,
+  captureTestBaseline, sendHeartbeatSync, extractPytestSelectorsFromOutput,
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT } from '../constants.js';
@@ -689,7 +689,6 @@ export async function handleFix(
   const prNumber = Number(payload.pr_number);
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
   const originalPrompt = strVal(payload.original_prompt);
-  const buildConfig = (task.build_config || {}) as BuildConfig;
 
   if (!prompt) throw new Error('Fix task missing prompt');
 
@@ -737,6 +736,17 @@ export async function handleFix(
 
   // Prepend accumulated review history so the agent knows what was previously requested
   const reviewLoop = (task.context as Record<string, unknown> | undefined)?.review_loop as Record<string, unknown> | undefined;
+  const fixReason = reviewLoop?.fix_reason as string | undefined;
+  const taskContext = (task.context as Record<string, unknown> | undefined) || {};
+  const ciFailureLogs = [
+    strVal(taskContext.ci_failure_logs),
+    strVal(taskContext._ci_failure_logs),
+    strVal(taskContext._test_failure_summary),
+    fixReason === 'ci_failure' ? prompt : '',
+  ].map(s => s.trim()).filter(Boolean).join('\n\n');
+  const ciFailureSelectors = fixReason === 'ci_failure'
+    ? extractPytestSelectorsFromOutput(ciFailureLogs)
+    : [];
   const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string; issues?: Array<{severity: string; description: string; file?: string; line?: number}> }> | undefined) || [];
   const iteration = (reviewLoop?.iteration as number | undefined) || 1;
   const maxIterations = computeMaxFixIterations(task);
@@ -951,9 +961,40 @@ export async function handleFix(
   // matching the same logic used in the create handler.
   const fixScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
   let fixBaselineFailures: Set<string> | undefined;
-  if (fixScope === 'medium' || fixScope === 'large') {
+  if (fixReason === 'ci_failure') {
+    sendLog(ws, '[Baseline] Skipped — this is a CI-failure fix; all existing test failures on the PR are in scope.\n');
+  } else if (fixScope === 'medium' || fixScope === 'large') {
     const captured = await captureTestBaseline(ws, statusRef, fixBuildConfig, fixRelatedFiles);
     fixBaselineFailures = captured ?? undefined;
+  }
+
+  if (fixReason === 'ci_failure') {
+    if (ciFailureSelectors.length > 0) {
+      sendLog(ws, `CI failure selectors extracted: ${ciFailureSelectors.slice(0, 8).join(', ')}${ciFailureSelectors.length > 8 ? ` (+${ciFailureSelectors.length - 8} more)` : ''}\n`);
+      const repro = await testFixLoop(
+        ws, statusRef, model, effort, fixBuildConfig,
+        undefined, fixRelatedFiles, undefined,
+        {
+          targetPytestSelectors: ciFailureSelectors,
+          maxFixAttempts: 0,
+          phaseLabel: 'CI failure repro',
+        },
+      );
+      if (repro.failureSummary) {
+        enrichedPrompt =
+          `## Local targeted CI repro\n` +
+          `The CI-failing pytest selector(s) were reproduced locally before edits. Use this focused output as the primary failure evidence:\n\n` +
+          `${repro.failureSummary.slice(-5000)}\n\n` +
+          enrichedPrompt;
+      } else if (repro.passed) {
+        enrichedPrompt =
+          `## Local targeted CI repro\n` +
+          `The CI-failing pytest selector(s) passed locally before edits. Re-check whether the CI failure is stale, environment-specific, or covered by another failing check before changing code.\n\n` +
+          enrichedPrompt;
+      }
+    } else {
+      sendLog(ws, 'No pytest selectors could be extracted from CI failure logs — skipping targeted repro and relying on CI context plus impact tests.\n');
+    }
   }
 
   // Run Claude with the review feedback as the prompt
@@ -986,7 +1027,13 @@ export async function handleFix(
       return;
     }
 
-    const { testFailuresDetected: fixTestFailures, passed: fixTestsPassed, setupFailed: fixTestSetupFailed, failureSummary: fixTestFailureSummary } = await testFixLoop(ws, statusRef, model, effort, buildConfig, fixBaselineFailures);
+    const { testFailuresDetected: fixTestFailures, passed: fixTestsPassed, setupFailed: fixTestSetupFailed, failureSummary: fixTestFailureSummary } = await testFixLoop(
+      ws, statusRef, model, effort, fixBuildConfig,
+      fixBaselineFailures, fixRelatedFiles, undefined,
+      fixReason === 'ci_failure' && ciFailureSelectors.length > 0
+        ? { targetPytestSelectors: ciFailureSelectors, runImpactAfterTargeted: true, requireTestmonForImpact: true }
+        : {},
+    );
 
     // Setup failure: tests couldn't run at all (npm ci / runner timeout).
     // Fail the task with a build_failed category — pushing code that was

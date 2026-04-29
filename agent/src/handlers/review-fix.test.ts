@@ -22,6 +22,10 @@ vi.mock('../index.js', () => ({
   lintFixLoop: vi.fn(),
   testFixLoop: vi.fn().mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' }),
   captureTestBaseline: vi.fn().mockResolvedValue(null),
+  extractPytestSelectorsFromOutput: vi.fn((output: string) => {
+    const match = output.match(/FAILED\s+(backend\/testing\/\S+\.py::\S+)/);
+    return match ? [match[1].replace(/\s+-.*$/, '')] : [];
+  }),
   runProjectLintChecks: vi.fn(),
   cloneWithRetry: vi.fn(),
   sendHeartbeatSync: vi.fn(),
@@ -666,6 +670,63 @@ describe('handleFix — conflict marker detection', () => {
     expect(prompt).toContain('CONFLICT MARKERS FOUND');
     expect(prompt).toContain('backend/app/foo.py');
     expect(prompt).toContain('agent/src/bar.ts');
+  });
+});
+
+describe('handleFix — baseline capture', () => {
+  it('captures baseline for medium non-CI review fixes', async () => {
+    await handleFix(
+      'task-fix-baseline-1',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 7, prompt: 'address review feedback' },
+      { context: { scope: 'medium', review_loop: { fix_reason: 'code_review' }, related_files: ['backend/app/foo.py'] } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(vi.mocked(indexMod.captureTestBaseline)).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips baseline for CI-failure fixes so existing PR failures remain in scope', async () => {
+    await handleFix(
+      'task-fix-baseline-2',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 7, prompt: 'fix CI failures' },
+      { context: { scope: 'medium', review_loop: { fix_reason: 'ci_failure' }, related_files: ['backend/app/foo.py'] } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(vi.mocked(indexMod.captureTestBaseline)).not.toHaveBeenCalled();
+    expect(vi.mocked(indexMod.sendLog)).toHaveBeenCalledWith(
+      null,
+      expect.stringContaining('CI-failure fix'),
+    );
+  });
+
+  it('runs a targeted CI repro when pytest selectors are available', async () => {
+    await handleFix(
+      'task-fix-baseline-3',
+      {
+        branch: 'feature/x',
+        base_branch: 'main',
+        pr_number: 7,
+        prompt: 'CI failed:\nFAILED backend/testing/test_models.py::test_create - AssertionError',
+      },
+      { context: { scope: 'medium', review_loop: { fix_reason: 'ci_failure' }, related_files: ['backend/app/foo.py'] } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(vi.mocked(indexMod.testFixLoop)).toHaveBeenCalledWith(
+      null,
+      expect.any(Object),
+      undefined,
+      undefined,
+      expect.any(Object),
+      undefined,
+      ['backend/app/foo.py'],
+      undefined,
+      expect.objectContaining({
+        targetPytestSelectors: ['backend/testing/test_models.py::test_create'],
+        maxFixAttempts: 0,
+      }),
+    );
   });
 });
 
