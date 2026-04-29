@@ -8,7 +8,13 @@ const STORAGE_KEY = 'blueprint-admin:warmVmPanelCollapsed';
 
 function ageSecs(iso: string | null): number | null {
   if (!iso) return null;
-  const t = new Date(iso).getTime();
+  // Backend emits naive UTC datetimes (project-wide convention — see
+  // project_timestamptz_migration). `new Date(naiveIso)` interprets as
+  // local time, so a heartbeat from a UTC backend appears N hours in the
+  // future for any non-UTC client and clamps to 0. Append 'Z' if the
+  // string has no explicit timezone marker.
+  const hasTz = /[zZ]|[+-]\d{2}:?\d{2}$/.test(iso);
+  const t = new Date(hasTz ? iso : iso + 'Z').getTime();
   if (Number.isNaN(t)) return null;
   return Math.max(0, Math.round((Date.now() - t) / 1000));
 }
