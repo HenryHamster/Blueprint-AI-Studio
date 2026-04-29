@@ -72,7 +72,7 @@ vi.mock('child_process', () => ({
 import fs from 'fs';
 import { execFileSync } from 'child_process';
 import * as indexMod from '../index.js';
-import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS, annotateResolvedIssues, detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying, detectMigrationConflict, buildMigrationConflictGuidance, buildBlueprintPrFooter, formatTrajectorySection, formatDriftSection, verify_steps_ok } from './review-fix.js';
+import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS, annotateResolvedIssues, detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying, detectMigrationConflict, buildMigrationConflictGuidance, buildBlueprintPrFooter, formatTrajectorySection, formatDriftSection, verifyStepsOk } from './review-fix.js';
 
 const statusRef = () => ({ value: '' });
 
@@ -550,6 +550,58 @@ describe('handleReview — self-review blind-spots surfacing', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
     expect(promptMod.formatSelfReviewBlindSpots).toHaveBeenCalledWith(undefined, ['a.ts']);
+  });
+});
+
+// ── handleReview: PR changed_files emission ─────────────────────────────────
+describe('handleReview — emits changed_files for downstream drift detection', () => {
+  it('includes changed_files in persistAndPostStatus so the next fix-spawn drift detector has fresh PR state', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tbackend/app/main.py\nA\tbackend/app/new.py';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-changed-files',
+      { pr_number: 600, branch: 'feat/cf', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const calls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    const lastCall = calls[calls.length - 1];
+    const payload = lastCall[1] as { changed_files?: string[] };
+    // Without my audit fix, this would be undefined and review_history entries
+    // and drift_signal current_files would all fall back to stale orig data.
+    expect(payload.changed_files).toEqual(['backend/app/main.py', 'backend/app/new.py']);
+  });
+
+  it('omits changed_files when the diff command yielded nothing parseable', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        // The handler defaults to "(could not generate file list)" on failure;
+        // simulate that path by returning the same sentinel.
+        return '(could not generate file list)';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-no-diff',
+      { pr_number: 601, branch: 'feat/no-diff', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const calls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
+    const lastCall = calls[calls.length - 1];
+    const payload = lastCall[1] as { changed_files?: string[] };
+    // When the diff list is unusable, omit the field rather than ship a
+    // sentinel-string that downstream consumers would treat as a real path.
+    expect(payload.changed_files).toBeUndefined();
   });
 });
 
@@ -1548,24 +1600,24 @@ describe('formatDriftSection — drift signal renderer', () => {
   });
 });
 
-// ── verify_steps_ok ───────────────────────────────────────────────────────────
-describe('verify_steps_ok — sycophancy guard for fix_agent_responses', () => {
+// ── verifyStepsOk ───────────────────────────────────────────────────────────
+describe('verifyStepsOk — sycophancy guard for fix_agent_responses', () => {
   it('rejects entries with no verify steps', () => {
-    expect(verify_steps_ok({
+    expect(verifyStepsOk({
       claim: 'this is fine',
       verify: [],
     })).toBe(false);
   });
 
   it('rejects entries where every verify step is non-mechanical (sycophancy patterns)', () => {
-    expect(verify_steps_ok({
+    expect(verifyStepsOk({
       claim: 'I disagree',
       verify: ['trust me, I tested it', "I'm confident this works"],
     })).toBe(false);
   });
 
   it('accepts entries with at least one mechanical verify step even if other steps are non-mechanical', () => {
-    expect(verify_steps_ok({
+    expect(verifyStepsOk({
       claim: 'caller-impact justification',
       verify: [
         'I re-read the code',  // non-mechanical
@@ -1575,14 +1627,14 @@ describe('verify_steps_ok — sycophancy guard for fix_agent_responses', () => {
   });
 
   it('accepts purely mechanical verify steps', () => {
-    expect(verify_steps_ok({
+    expect(verifyStepsOk({
       claim: 'fix is in helper file',
       verify: ['cat backend/app/helpers.py | head -20', 'pytest backend/testing/test_helpers.py::test_X'],
     })).toBe(true);
   });
 
   it('rejects entries with empty claim', () => {
-    expect(verify_steps_ok({
+    expect(verifyStepsOk({
       claim: '',
       verify: ['grep "foo" file.py'],
     })).toBe(false);

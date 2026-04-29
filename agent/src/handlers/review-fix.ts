@@ -185,7 +185,7 @@ const NON_MECHANICAL_VERIFY_PATTERNS = [
   /\bbelieve me\b/i,
   /\btake my word\b/i,
 ];
-export function verify_steps_ok(entry: Record<string, unknown>): boolean {
+export function verifyStepsOk(entry: Record<string, unknown>): boolean {
   const claim = typeof entry.claim === 'string' ? entry.claim.trim() : '';
   if (claim.length === 0) return false;
   const verify = Array.isArray(entry.verify) ? entry.verify : [];
@@ -831,6 +831,14 @@ IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (N
     logs = sanitize(lastResultText || allOutput.slice(-50_000));
   }
 
+  // Surface the PR's current changed-file list to the orchestrator so the
+  // next fix iteration's drift detector has a fresh snapshot. Without this,
+  // drift falls back to the original create task's _pr_changed_files (which
+  // is stale once a rebase-fix or new commits land), leaving drift_in/drift_out
+  // empty for exactly the cases we need them to fire (PR #3435-style rebase
+  // damage). Cap at 50 to match AgentStatusPayload.changed_files limit.
+  const reviewChangedFiles = changedFilePathList.slice(0, 50);
+
   await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
@@ -838,6 +846,7 @@ IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (N
     logs,
     ...(verdictJsonField ? { verdict_json: verdictJsonField } : {}),
     ...(exitCode !== 0 ? { failure_category: 'claude_code_failed' } : {}),
+    ...(reviewChangedFiles.length > 0 ? { changed_files: reviewChangedFiles } : {}),
   });
 }
 
@@ -1255,7 +1264,7 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
               claim: typeof e.claim === 'string' ? e.claim.slice(0, 1000) : '',
               verify,
             };
-            if (verify_steps_ok(candidate)) normalized.push(candidate);
+            if (verifyStepsOk(candidate)) normalized.push(candidate);
           }
           fixAgentResponses = normalized.length > 0 ? normalized : undefined;
         }

@@ -1130,11 +1130,15 @@ async def _spawn_pipeline_task(
 
     # Build review_history: carry forward from source task, appending current feedback if spawning a fix
     prev_review_history = source_loop.get("review_history", [])
-    # The PR's actual changed files at this iteration boundary, captured by the
-    # source task's agent before posting status. Drift detection at spawn time
-    # uses these per-iteration snapshots to distinguish leftover edits from
-    # planned/approved changes.
-    _source_changed_files = (source_task.context or {}).get("_pr_changed_files") or []
+    # The PR's actual changed files at this iteration boundary, used by drift
+    # detection. The review task itself doesn't push commits and so won't have
+    # _pr_changed_files in its own context — fall back to the original task
+    # (which is the create/fix that pushed the commits being reviewed).
+    _source_changed_files = (
+        (source_task.context or {}).get("_pr_changed_files")
+        or ((orig.context or {}).get("_pr_changed_files") if orig else None)
+        or []
+    )
     new_review_entry: dict[str, object] = {
         "iteration": iteration - 1,
         "feedback": current_feedback,
@@ -1593,7 +1597,14 @@ async def _spawn_pipeline_task(
     drift_signal: dict | None = None
     if task_type == "fix":
         _planned_for_drift = list(planned_files) if planned_files else []
-        _current_files = list((source_task.context or {}).get("_pr_changed_files") or [])
+        # As above: review tasks don't push commits, fall back to the original
+        # task's _pr_changed_files (the create/fix that produced the PR state
+        # the review verdict was made against).
+        _current_files = list(
+            (source_task.context or {}).get("_pr_changed_files")
+            or ((orig.context or {}).get("_pr_changed_files") if orig else None)
+            or []
+        )
         drift_signal = compute_drift_signal(
             new_review_history or [], _planned_for_drift, _current_files,
         )
