@@ -11,10 +11,11 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Task, TaskStatus, TaskHistory, Project, ProjectMessage, MessageType, _utcnow
+from app.models import Task, TaskStatus, TaskHistory, ProjectMessage, MessageType, _utcnow
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role
 from app.payload_schemas import validate_internal_payload
+from app.task_locking import lock_project_or_429
 
 logger = logging.getLogger(__name__)
 
@@ -533,9 +534,9 @@ async def trigger_strategic_cycle(
     # Guard: no strategic task already running. Lock the project row so the
     # check+insert is transactionally atomic with concurrent spawn attempts
     # (design_doc completion chain, autonomous-research tick, other manual triggers).
-    await session.execute(
-        select(Project.id).where(Project.id == project.id).with_for_update()
-    )
+    # Phase A1: skip_locked + 429 on contention so 30s lock_timeout doesn't
+    # propagate as 500 and trigger Cloud Run instance quarantine.
+    await lock_project_or_429(session, project.id)
     active = (await session.execute(
         select(Task).where(
             Task.project_id == project.id,

@@ -17,6 +17,7 @@ import asyncio
 from typing import Dict
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -403,12 +404,41 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     atomic. Without it, two concurrent callers (e.g. design_doc completion chaining
     to phase 2 and an autonomous-research tick) can both read "none active" in the
     same window and each insert a duplicate strategic task.
+
+    Phase A1: skip_locked=True. If the project row is held by another caller,
+    we return True (fail-safe — defer this spawn to the next cycle); the
+    other caller will resolve the spawn in their own transaction. Returning
+    False under contention would risk both callers concluding "none active"
+    and double-spawning, the exact race this lock is here to prevent.
+
+    Phase L-C4 audit: this aggregate read after the project lock is NOT
+    upgraded to SERIALIZABLE because the Project lock acquired here is the
+    canonical (Project before Task) gate for any strategic spawn — every
+    spawn path goes through the same lock helper (now centralized in
+    ``lock_project_for_strategic_transition``), so phantom ``Task`` rows
+    appearing between this SELECT and the eventual INSERT are impossible
+    by construction: any concurrent inserter would have to be holding the
+    same project row, which our SKIP LOCKED here just rejected (we already
+    returned True). Symmetry assumption confirmed: as long as Project is
+    locked before any strategic-task SELECT/INSERT, repeatable-read is
+    sufficient and SERIALIZABLE upgrades aren't required. See
+    ``docs/concurrency.md`` for the full canonical-order argument.
     """
-    await session.execute(
-        select(Project.id).where(Project.id == project_id).with_for_update()
+    result = await session.execute(
+        select(Project.id).where(Project.id == project_id).with_for_update(skip_locked=True)
     )
+    if result.first() is None:
+        # Row missing or held — fail safe. The other holder will spawn (or
+        # already has); our caller will skip and re-evaluate next cycle.
+        return True
+    # Phase B4 (H-P6): we only need first_payload.type per row to filter, so
+    # drop status_log/plan_output JSONB. Loading payloads keeps first_payload
+    # cheap (L-P2 — without payloads loaded, accessing first_payload would
+    # trigger a per-row reload).
     active = (await session.execute(
-        select(Task).where(
+        select(Task)
+        .options(load_only(Task.id, Task.status, Task.payloads, Task.project_id))
+        .where(
             Task.project_id == project_id,
             Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
         )
@@ -1136,7 +1166,17 @@ async def _process_post_commit(
             # Record strategic task failures for the circuit breaker and cycle history
             if task.first_payload.get("type") in ("design_doc_update", "strategic_review"):
                 try:
-                    await _record_strategic_task_failure(task, session)
+                    # Phase C3: acquire the project lock once at the top of
+                    # the strategic-completion chain and pass it down rather
+                    # than letting _record_strategic_task_failure (and any
+                    # follow-on chain) re-acquire. Canonical order is
+                    # Project before Task (see docs/concurrency.md). The
+                    # helper returns None on contention or missing — we
+                    # fall back to the legacy unlocked path so we still
+                    # record the failure (better than silently dropping it).
+                    from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
+                    _strat_project = await lock_project_for_strategic_transition(session, task.project_id)
+                    await _record_strategic_task_failure(task, session, project=_strat_project)
                 except Exception as _strat_exc:
                     logger.error(f"[STRATEGIC] Failed to record strategic failure for {task.id}: {_strat_exc!r}", exc_info=True)
 
@@ -1766,10 +1806,24 @@ async def _process_post_commit(
                                 _attempt_merge_with_retry_and_escalation,
                             )
                             from app.routers.agent import get_github_token_for_task
-                            _orig_q = select(Task).where(
-                                Task.id == uuid.UUID(original_task_id)
-                            ).with_for_update()
-                            _orig = (await session.execute(_orig_q)).scalars().first()
+                            # Phase A1: skip_locked + bounded retry. If the parent
+                            # task row is held by a peer, defer the handoff —
+                            # the parent's own poll will pick up review_approved
+                            # on the next iteration once the lock clears.
+                            _orig = None
+                            for _attempt in range(3):
+                                _orig_q = select(Task).where(
+                                    Task.id == uuid.UUID(original_task_id)
+                                ).with_for_update(skip_locked=True)
+                                _orig = (await session.execute(_orig_q)).scalars().first()
+                                if _orig is not None:
+                                    break
+                                _orig_exists = (await session.execute(
+                                    select(Task.id).where(Task.id == uuid.UUID(original_task_id))
+                                )).first()
+                                if _orig_exists is None:
+                                    break  # Genuinely missing
+                                await asyncio.sleep(0.5 * (_attempt + 1))
                             _orig_loop = (_orig.context or {}).get("review_loop", {}) if _orig else {}
                             if _orig and _orig_loop.get("ci_waiting"):
                                 _orig_loop["review_approved"] = True
@@ -2229,8 +2283,24 @@ async def _process_post_commit(
                             logger.warning(f"[REVIEW PIPELINE] Failed to close empty PR #{pr_number}: {_close_err}")
                         if original_task_id:
                             try:
-                                _orig_q = select(Task).where(Task.id == uuid.UUID(original_task_id)).with_for_update()
-                                _orig = (await session.execute(_orig_q)).scalars().first()
+                                # Phase A1: skip_locked + bounded retry. If the
+                                # parent row is held, defer the empty-PR cleanup;
+                                # the next poll cycle will retry. Better than
+                                # 500'ing the review handler.
+                                _orig = None
+                                for _attempt in range(3):
+                                    _orig_q = select(Task).where(
+                                        Task.id == uuid.UUID(original_task_id)
+                                    ).with_for_update(skip_locked=True)
+                                    _orig = (await session.execute(_orig_q)).scalars().first()
+                                    if _orig is not None:
+                                        break
+                                    _orig_exists = (await session.execute(
+                                        select(Task.id).where(Task.id == uuid.UUID(original_task_id))
+                                    )).first()
+                                    if _orig_exists is None:
+                                        break
+                                    await asyncio.sleep(0.5 * (_attempt + 1))
                                 if _orig:
                                     _orig_loop = (_orig.context or {}).get("review_loop", {}) or {}
                                     _orig_loop.pop("ci_waiting", None)
@@ -2241,6 +2311,10 @@ async def _process_post_commit(
                                         f"✓ Rollup PR #{pr_number} closed — branch equivalent to {base_branch}, no new changes to merge"
                                     )
                                     session.add(_orig)
+                                else:
+                                    logger.warning(
+                                        f"[REVIEW PIPELINE] Empty-PR cleanup deferred — parent {original_task_id[:8]} contended"
+                                    )
                             except Exception as _orig_err:
                                 logger.warning(f"[REVIEW PIPELINE] Failed to update rollup parent after empty-PR close: {_orig_err}")
                         task.status = TaskStatus.COMPLETED
@@ -2310,10 +2384,26 @@ async def _process_post_commit(
                         # mid-pipeline.
                         if original_task_id:
                             try:
-                                _orig_q = select(Task).where(
-                                    Task.id == uuid.UUID(original_task_id)
-                                ).with_for_update()
-                                _orig = (await session.execute(_orig_q)).scalars().first()
+                                # Phase A1: skip_locked + bounded retry. If the
+                                # parent row is held, skip the ci_wait reset —
+                                # it's an optimization (resets the 30-min
+                                # backstop clock), not correctness; the parent
+                                # will still terminate, just on the original
+                                # baseline if reset is missed.
+                                _orig = None
+                                for _attempt in range(3):
+                                    _orig_q = select(Task).where(
+                                        Task.id == uuid.UUID(original_task_id)
+                                    ).with_for_update(skip_locked=True)
+                                    _orig = (await session.execute(_orig_q)).scalars().first()
+                                    if _orig is not None:
+                                        break
+                                    _orig_exists = (await session.execute(
+                                        select(Task.id).where(Task.id == uuid.UUID(original_task_id))
+                                    )).first()
+                                    if _orig_exists is None:
+                                        break
+                                    await asyncio.sleep(0.5 * (_attempt + 1))
                                 if _orig:
                                     _orig_loop = dict((_orig.context or {}).get("review_loop", {}) or {})
                                     if _orig_loop.get("ci_waiting"):
@@ -2323,6 +2413,10 @@ async def _process_post_commit(
                                         _orig.context = {**(_orig.context or {}), "review_loop": _orig_loop}
                                         flag_modified(_orig, "context")
                                         session.add(_orig)
+                                else:
+                                    logger.info(
+                                        f"[REVIEW PIPELINE] ci_wait reset skipped for parent {original_task_id[:8]} — row contended"
+                                    )
                             except Exception as _reset_err:
                                 logger.warning(
                                     f"[REVIEW PIPELINE] Failed to reset ci_wait_started on parent {original_task_id[:8]}: {_reset_err}"
@@ -2511,11 +2605,23 @@ async def _process_post_commit(
 
                 elif task_type == "design_doc_update":
                     doc_logs = payload.logs or task.latest_status_message or ""
-                    await _handle_design_doc_completion(task, doc_logs, session)
+                    # Phase C3: acquire the project lock ONCE at the top of
+                    # the strategic-completion chain and pass it down; the
+                    # handler skips its own re-acquisition when given a
+                    # locked Project. None propagates the legacy bounded-
+                    # retry path inside the handler (also surfaces the
+                    # contended-deferral alert). Canonical order is
+                    # Project before Task — see docs/concurrency.md.
+                    from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
+                    _doc_project = await lock_project_for_strategic_transition(session, task.project_id)
+                    await _handle_design_doc_completion(task, doc_logs, session, project=_doc_project)
 
                 elif task_type == "strategic_review":
                     review_logs = payload.logs or task.latest_status_message or ""
-                    await _handle_strategic_completion(task, review_logs, session)
+                    # Phase C3: see _handle_design_doc_completion above.
+                    from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
+                    _strat_project = await lock_project_for_strategic_transition(session, task.project_id)
+                    await _handle_strategic_completion(task, review_logs, session, project=_strat_project)
 
                 elif task_type == "research":
                     research_logs = payload.logs or task.latest_status_message or ""

@@ -875,7 +875,14 @@ async def _upsert_residual_case_async(
             .values(**vals)
         )
 
-    async def _apply_update(session) -> None:
+    async def _apply_update(session) -> bool:
+        """Return True if the row was processed; False if it was held by another worker.
+
+        Phase A1: skip_locked=True so a contended row doesn't queue behind the
+        30s lock_timeout. The next residual hit (or the in-memory cache flush
+        on next failure) re-tries the upsert — losing one increment is far
+        cheaper than a 500-quarantined orchestrator instance.
+        """
         # SELECT FOR UPDATE acquires a row lock on Postgres, preventing
         # concurrent transactions from racing on hit_count.
         stmt = (
@@ -884,16 +891,27 @@ async def _upsert_residual_case_async(
                 ResidualRemediationCase.project_id == project_id,
                 ResidualRemediationCase.fingerprint == fingerprint,
             )
-            .with_for_update()
+            .with_for_update(skip_locked=True)
         )
-        existing = (await session.execute(stmt)).scalars().first()
-        if existing is not None:
-            await _atomic_increment(
-                session,
-                existing.id,
-                reopen=existing.status == ResidualCaseStatus.CLOSED_ORGANICALLY,
-            )
-        else:
+        result = await session.execute(stmt)
+        existing = result.scalars().first()
+        # If the SELECT returned nothing, distinguish "row doesn't exist" from
+        # "row held under skip_locked" with a non-locking probe.
+        if existing is None:
+            probe = (await session.execute(
+                select(ResidualRemediationCase.id).where(
+                    ResidualRemediationCase.project_id == project_id,
+                    ResidualRemediationCase.fingerprint == fingerprint,
+                )
+            )).first()
+            if probe is not None:
+                # Row exists but is held — skip this upsert; next hit will retry.
+                logger.info(
+                    "[FAILURE_CLASS] residual upsert: row %r held by peer; skipping",
+                    fingerprint,
+                )
+                return False
+            # Genuinely missing — INSERT.
             session.add(ResidualRemediationCase(
                 project_id=project_id,
                 fingerprint=fingerprint,
@@ -903,6 +921,13 @@ async def _upsert_residual_case_async(
                 hit_count=1,
                 sample_message=sample_message or None,
             ))
+            return True
+        await _atomic_increment(
+            session,
+            existing.id,
+            reopen=existing.status == ResidualCaseStatus.CLOSED_ORGANICALLY,
+        )
+        return True
 
     try:
         async with AsyncSessionLocal() as session:
@@ -918,7 +943,7 @@ async def _upsert_residual_case_async(
                             ResidualRemediationCase.project_id == project_id,
                             ResidualRemediationCase.fingerprint == fingerprint,
                         )
-                        .with_for_update()
+                        .with_for_update(skip_locked=True)
                     )
                     existing = (await session.execute(stmt)).scalars().first()
                     if existing is not None:
@@ -927,6 +952,8 @@ async def _upsert_residual_case_async(
                             existing.id,
                             reopen=existing.status == ResidualCaseStatus.CLOSED_ORGANICALLY,
                         )
+                    # If still None here, the contending writer is mid-INSERT;
+                    # leave it — they'll commit and our next hit will see it.
     except Exception:
         logger.exception(
             "[FAILURE_CLASS] Residual case DB upsert failed (fingerprint=%r)", fingerprint

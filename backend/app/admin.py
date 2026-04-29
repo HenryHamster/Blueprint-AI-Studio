@@ -19,6 +19,7 @@ from app.database import get_session
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
 from app.models import Task, TaskStatus, TaskHistory, Project, ProjectMember, Artifact, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, ProjectMessage, MessageType, _utcnow
 from app.auth import get_current_user, require_admin
+from app.task_locking import task_lock
 
 from app.github import generate_installation_access_token
 from app.broadcast import broadcast_to_project
@@ -433,6 +434,93 @@ class BulkActionRequest(BaseModel):
     action: str  # 'approve' or 'retry'
     task_ids: List[str]
 
+async def _bulk_retry_one_task(
+    task_id: uuid.UUID,
+    request_session: AsyncSession,
+) -> Optional[str]:
+    """Run the retry mutation for a single task in its own short-lived session.
+
+    Phase C2 (H-C3): the bulk-action retry path used to share the request
+    session across all tasks AND call ``_requeue_parent_task`` (which clones
+    failed children and remaps depends_on) inside that shared transaction.
+    Two problems compounded: the long-held lock window blocked concurrent
+    heartbeats, and a per-task failure rolled back the whole batch.
+
+    Splitting per-task into its own session means: (a) each row lock is
+    bounded by one task's mutation window, (b) a single failure doesn't
+    nuke siblings, and (c) ``_requeue_parent_task`` runs scoped to one
+    parent rather than queueing on the bulk transaction.
+
+    The scoped session is built from ``request_session.bind`` so it shares
+    the same engine — in production that's the module-level engine; in
+    tests it's the test engine (in-memory SQLite or test Postgres). Mirrors
+    the agent_status.py post-commit pattern.
+
+    Returns the old vm_instance_id when the caller should schedule a VM
+    delete after commit, or ``None`` for parent-type tasks (which clone
+    children rather than spinning a VM here).
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: PLC0415
+    from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+    from app.task_lifecycle import _requeue_parent_task  # noqa: PLC0415
+
+    scoped_factory = async_sessionmaker(
+        request_session.bind, class_=AsyncSession, expire_on_commit=False,
+    )
+    async with scoped_factory() as scoped_session:
+        async with task_lock(scoped_session, task_id, skip_locked=False, timeout=10) as task:
+            if task is None:
+                # Row missing or unreachable — the caller already validated
+                # membership in the claim-IDs phase, so this is a genuine
+                # "deleted between phases" race; report it.
+                raise HTTPException(status_code=404, detail="Task not found")
+
+            task.status = TaskStatus.QUEUED
+            # If the task was FAILED/CANCELLED, the SQLAlchemy set event added
+            # task.id to _terminated_task_ids, revoking any outstanding JWT.
+            # Drop the cache entry so the next provisioned VM can claim.
+            _terminated_task_ids.pop(str(task.id), None)
+            task_type = (task.first_payload).get("type", "")
+            is_parent_type = task_type in ("research", "plan")
+            children = []
+            if is_parent_type:
+                children = (await scoped_session.execute(
+                    select(Task).where(Task.parent_task_id == task.id)
+                )).scalars().all()
+            old_vm: Optional[str] = None
+            if children:
+                await _requeue_parent_task(task, scoped_session)
+            else:
+                old_vm = task.vm_instance_id
+                task.attempt_count = 0
+                task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                task.last_heartbeat = None
+                # Reset retry counters for a clean slate — matches single-task admin retry
+                bulk_ctx = dict(task.context or {})
+                bulk_ctx.pop("provision_failures", None)
+                bulk_ctx.pop("retry_after", None)
+                bulk_ctx.pop("max_plan_account_id", None)
+                bulk_ctx.pop("llm_account_id", None)
+                bulk_ctx.pop("llm_provider", None)
+                bulk_ctx.pop("llm_auth_mode", None)
+                bulk_ctx.pop("llm_model", None)
+                bulk_ctx.pop("llm_execution_mode", None)
+                bulk_ctx.pop("blacklisted_accounts", None)
+                bulk_ctx.pop("provision_failed_accounts", None)
+                bulk_ctx.pop("_slot_released", None)
+                bulk_ctx.pop("_api_failure_retries", None)
+                task.context = bulk_ctx
+            history = TaskHistory(
+                task_id=task.id,
+                action="MODIFIED",
+                details={"changes": {"status": "QUEUED"}, "modified_by": "BULK_ACTION"}
+            )
+            scoped_session.add(task)
+            scoped_session.add(history)
+        await scoped_session.commit()
+        return old_vm
+
+
 @router.post("/tasks/bulk-action")
 @limiter.limit("60/minute")
 async def bulk_action_tasks(
@@ -446,7 +534,10 @@ async def bulk_action_tasks(
 
     results = []
 
-    # Pre-fetch all tasks in a single query (with membership/role check)
+    # ── Phase 1: claim IDs ──────────────────────────────────────────────────
+    # Validate UUIDs and resolve membership in a single short transaction on
+    # the shared request session. The pre-fetch returns light Task rows we
+    # use to surface "not found" before falling through to per-task work.
     valid_map: dict[str, uuid.UUID] = {}  # raw_id -> parsed UUID
     for raw_id in body.task_ids:
         try:
@@ -464,6 +555,12 @@ async def bulk_action_tasks(
     else:
         fetched = {}
 
+    # ── Phase 2: per-task processing ────────────────────────────────────────
+    # Phase C2 (H-C3): retry path runs in its own scoped session per task so
+    # _requeue_parent_task is not called inside the bulk transaction's lock
+    # window. approve/cancel still use the shared session — they don't call
+    # _requeue_parent_task and their per-task commits already release locks
+    # immediately.
     for raw_id in body.task_ids:
         if raw_id not in valid_map:
             continue  # already reported as invalid
@@ -474,51 +571,7 @@ async def bulk_action_tasks(
 
         try:
             if body.action == 'retry':
-                task.status = TaskStatus.QUEUED
-                # If the task was FAILED/CANCELLED, the SQLAlchemy set event added
-                # task.id to _terminated_task_ids, revoking any outstanding JWT.
-                # Drop the cache entry so the next provisioned VM can claim.
-                from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
-                _terminated_task_ids.pop(str(task.id), None)
-                task_type = (task.first_payload).get("type", "")
-                is_parent_type = task_type in ("research", "plan")
-                from app.task_lifecycle import _requeue_parent_task
-                children = []
-                if is_parent_type:
-                    children = (await session.execute(
-                        select(Task).where(Task.parent_task_id == task.id)
-                    )).scalars().all()
-                old_vm = None
-                if children:
-                    await _requeue_parent_task(task, session)
-                else:
-                    old_vm = task.vm_instance_id
-                    task.attempt_count = 0
-                    task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                    task.last_heartbeat = None
-                    # Reset retry counters for a clean slate — matches single-task admin retry
-                    bulk_ctx = dict(task.context or {})
-                    bulk_ctx.pop("provision_failures", None)
-                    bulk_ctx.pop("retry_after", None)
-                    bulk_ctx.pop("max_plan_account_id", None)
-                    bulk_ctx.pop("llm_account_id", None)
-                    bulk_ctx.pop("llm_provider", None)
-                    bulk_ctx.pop("llm_auth_mode", None)
-                    bulk_ctx.pop("llm_model", None)
-                    bulk_ctx.pop("llm_execution_mode", None)
-                    bulk_ctx.pop("blacklisted_accounts", None)
-                    bulk_ctx.pop("provision_failed_accounts", None)
-                    bulk_ctx.pop("_slot_released", None)
-                    bulk_ctx.pop("_api_failure_retries", None)
-                    task.context = bulk_ctx
-                history = TaskHistory(
-                    task_id=task.id,
-                    action="MODIFIED",
-                    details={"changes": {"status": "QUEUED"}, "modified_by": "BULK_ACTION"}
-                )
-                session.add(task)
-                session.add(history)
-                await session.commit()
+                old_vm = await _bulk_retry_one_task(valid_map[raw_id], session)
 
                 # Delete old VM after commit, same as modify_task
                 if old_vm:

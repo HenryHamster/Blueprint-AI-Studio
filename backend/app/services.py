@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Dict
 
 from sqlalchemy import or_, cast, func, update, text
+from sqlalchemy.orm import load_only
 from sqlalchemy.types import String
 from sqlmodel import select
 
@@ -646,9 +647,22 @@ async def _run_auto_archive_cycle() -> Dict[str, int]:
     age_total = 0
     count_total = 0
 
-    async with AsyncSessionLocal() as session:
-        # --- Pass 1: age-based ---
-        while True:
+    # --- Pass 1: age-based ---
+    # Audit Phase C4 (M-C5): open a FRESH session per batch instead of holding
+    # one session for the entire cycle. A long-lived session pins a connection
+    # from the pool for the full archive run (potentially minutes if the backlog
+    # is large), and an unhandled error mid-loop leaks the connection until GC
+    # closes it. Per-batch sessions return the connection to the pool between
+    # iterations and cap the blast radius of any one batch's failure.
+    while True:
+        async with AsyncSessionLocal() as session:
+            # Audit Phase C2 (H-C3): bulk lock fan-out is acceptable here — every
+            # row we lock is terminal (COMPLETED/FAILED/CANCELLED), and the only
+            # mutation inside the lock window is a flat UPDATE that flips
+            # archived=True. No external calls (GitHub, GCE, secret manager) run
+            # while the lock is held, so the lock window is bounded by Postgres
+            # round-trip time. Keep skip_locked=True so a concurrent writer on
+            # one row doesn't stall the rest of the batch.
             select_stmt = select(Task.id).where(
                 Task.archived.is_(False),
                 Task.status.in_(terminal),
@@ -665,37 +679,44 @@ async def _run_auto_archive_cycle() -> Dict[str, int]:
             if len(ids) < _AUTO_ARCHIVE_BATCH_SIZE:
                 break
 
-        # --- Pass 2: per-project count cap ---
-        # Window-function ranks unarchived-terminal tasks per project by
-        # updated_at DESC; anything beyond rank N is archived. Done as a single
-        # query returning all candidate IDs, then batched update with
-        # skip_locked so a concurrent writer on one row doesn't block the rest.
-        if per_project_cap > 0:
-            # Bind-param the archived=false literal so asyncpg/aiosqlite each
-            # coerce the python bool to their native representation (Postgres
-            # boolean vs SQLite integer 0/1); a raw `false` literal is not
-            # cross-dialect.
-            candidate_sql = text(
-                """
-                WITH ranked AS (
-                    SELECT id, row_number() OVER (
-                        PARTITION BY project_id ORDER BY updated_at DESC, id DESC
-                    ) AS rn
-                    FROM task
-                    WHERE archived = :archived_false
-                      AND status IN ('COMPLETED', 'FAILED', 'CANCELLED')
-                )
-                SELECT id FROM ranked WHERE rn > :cap
-                """
+    # --- Pass 2: per-project count cap ---
+    # Window-function ranks unarchived-terminal tasks per project by
+    # updated_at DESC; anything beyond rank N is archived. Done as a single
+    # query returning all candidate IDs, then batched update with
+    # skip_locked so a concurrent writer on one row doesn't block the rest.
+    # Same audit-C2 reasoning as Pass 1: no external calls inside lock,
+    # bulk lock fan-out is safe.
+    if per_project_cap > 0:
+        # Bind-param the archived=false literal so asyncpg/aiosqlite each
+        # coerce the python bool to their native representation (Postgres
+        # boolean vs SQLite integer 0/1); a raw `false` literal is not
+        # cross-dialect.
+        candidate_sql = text(
+            """
+            WITH ranked AS (
+                SELECT id, row_number() OVER (
+                    PARTITION BY project_id ORDER BY updated_at DESC, id DESC
+                ) AS rn
+                FROM task
+                WHERE archived = :archived_false
+                  AND status IN ('COMPLETED', 'FAILED', 'CANCELLED')
             )
+            SELECT id FROM ranked WHERE rn > :cap
+            """
+        )
+        # Audit Phase C4 (M-C5): candidate-ID query gets its own short-lived
+        # session — read-only, no lock held during the result iteration below.
+        async with AsyncSessionLocal() as session:
             candidate_ids = [
                 row[0]
                 for row in (await session.execute(
                     candidate_sql, {"cap": per_project_cap, "archived_false": False}
                 )).all()
             ]
-            for i in range(0, len(candidate_ids), _AUTO_ARCHIVE_BATCH_SIZE):
-                batch = candidate_ids[i : i + _AUTO_ARCHIVE_BATCH_SIZE]
+        for i in range(0, len(candidate_ids), _AUTO_ARCHIVE_BATCH_SIZE):
+            batch = candidate_ids[i : i + _AUTO_ARCHIVE_BATCH_SIZE]
+            # Audit Phase C4 (M-C5): fresh session per batch — see Pass 1.
+            async with AsyncSessionLocal() as session:
                 # Re-acquire row locks with skip_locked before updating so a
                 # row held by the orchestrator is deferred, not blocked.
                 lockable = (await session.execute(
@@ -1124,12 +1145,40 @@ async def _check_evaluating_timeouts():
             # Fetch DeployState once per cycle so CI backstop can subtract
             # pause windows from elapsed (admin pause + auto-pause both count).
             _deploy_state = await session.get(DeploymentState, 1)
+            # Phase B4 (H-P2): drop ``plan_output`` JSONB; the EVALUATING-timeout
+            # loop only reads context/payloads/status_log of the heavy JSONB
+            # columns. status_log is consumed at lines ~1216 and ~1384 to find
+            # the last EVALUATING transition, so it must remain loaded.
             evaluating_tasks = (await session.execute(
-                select(Task).where(
+                select(Task)
+                .options(load_only(
+                    Task.id, Task.status, Task.title, Task.project_id,
+                    Task.parent_task_id, Task.archived, Task.requires_approval,
+                    Task.created_at, Task.started_at, Task.updated_at,
+                    Task.latest_status_message, Task.context, Task.payloads,
+                    Task.status_log, Task.last_heartbeat, Task.attempt_count,
+                    Task.account_id, Task.vm_instance_id,
+                ))
+                .where(
                     Task.status == TaskStatus.EVALUATING,
                     Task.archived.is_(False),
                 )
             )).scalars().all()
+
+            # Phase B4 (H-P2): batch-fetch children for all evaluating parents
+            # in a single ``IN (...)`` query. The previous code fired one query
+            # per parent inside the loop (lines ~1345 and ~1396), an N+1 pattern.
+            # Children are loaded with full columns because per-child mutations
+            # below (status, latest_status_message, vm_instance_id) need to flow
+            # through the session.
+            _eval_children_by_parent: Dict[uuid.UUID, list] = {}
+            if evaluating_tasks:
+                _eval_parent_ids = [t.id for t in evaluating_tasks]
+                _eval_all_children = (await session.execute(
+                    select(Task).where(Task.parent_task_id.in_(_eval_parent_ids))
+                )).scalars().all()
+                for _ec in _eval_all_children:
+                    _eval_children_by_parent.setdefault(_ec.parent_task_id, []).append(_ec)
 
             for task in evaluating_tasks:
                 ctx = task.context or {}
@@ -1342,9 +1391,7 @@ async def _check_evaluating_timeouts():
                     persist_failure_category(task, _fc)
                     record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""))
                     session.add(task)
-                    children = (await session.execute(
-                        select(Task).where(Task.parent_task_id == task.id)
-                    )).scalars().all()
+                    children = _eval_children_by_parent.get(task.id, [])
                     from app.main import _ensure_vm_deleted
                     from app.max_plan_pool import release_max_plan_account
                     non_terminal_children = [c for c in children if c.status not in TERMINAL]
@@ -1392,10 +1439,8 @@ async def _check_evaluating_timeouts():
 
                 elapsed = (now - evaluating_since).total_seconds()
 
-                # Fetch children
-                children = (await session.execute(
-                    select(Task).where(Task.parent_task_id == task.id)
-                )).scalars().all()
+                # Children fetched in the batched IN query at the top of the loop.
+                children = _eval_children_by_parent.get(task.id, [])
 
                 all_children_terminal = bool(children) and all(
                     c.status in TERMINAL for c in children
@@ -1745,8 +1790,17 @@ async def _recover_orphaned_tasks():
         async with AsyncSessionLocal() as session:
             five_min_ago = _utcnow() - timedelta(minutes=5)
             one_hour_ago = _utcnow() - timedelta(hours=1)
+            # Phase B4 (H-P6): drop status_log/plan_output JSONB. The recovery
+            # loop only reads first_payload / context / description / project_id /
+            # id and writes context. status_log is not consumed in this branch.
             candidates = (await session.execute(
-                select(Task).where(
+                select(Task)
+                .options(load_only(
+                    Task.id, Task.status, Task.project_id,
+                    Task.created_by, Task.created_at,
+                    Task.description, Task.payloads, Task.context,
+                ))
+                .where(
                     Task.status == TaskStatus.COMPLETED,
                     Task.created_by == "ORCHESTRATOR",
                     Task.created_at <= five_min_ago,

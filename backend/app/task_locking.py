@@ -261,3 +261,145 @@ async def project_lock(
         )
         raise OperationalError("project_lock acquisition timed out", None, e) from e
     yield result.scalar_one_or_none()
+
+
+@asynccontextmanager
+async def lock_project_then_task(
+    session: AsyncSession,
+    project_id,
+    task_id,
+    *,
+    skip_locked: bool = True,
+    timeout: float = 30.0,
+) -> AsyncIterator[tuple[Project | None, Task | None]]:
+    """Acquire row locks on Project then Task in canonical order.
+
+    Phase C1 (CRITICAL C5): the audit found cross-table lock-ordering
+    deadlock potential. Some paths locked Project then Task; others
+    locked Task then Project. Two flows holding opposite orders deadlock
+    until the 30s ``lock_timeout`` fires and surfaces ``LockNotAvailable``
+    as 500 — Cloud Run then quarantines the instance.
+
+    The canonical order is **Project before Task, always**. This helper
+    enforces it. Sites that need both locks should use this helper rather
+    than rolling their own pair.
+
+    Args:
+        session: AsyncSession to issue the locks against. Both locks are
+            held until commit/rollback.
+        project_id: UUID or str of the project.
+        task_id: UUID or str of the task.
+        skip_locked: If True (default), yield ``(None, None)`` when
+            either row is held by a peer; on contention with the project
+            row the task lock is never attempted (so the caller backs off
+            cleanly without holding a stale half-pair). If False, wait up
+            to ``timeout`` per row and raise on timeout.
+        timeout: Max seconds to wait per row when ``skip_locked=False``.
+
+    Yields:
+        Tuple ``(project, task)``. Either may be ``None`` if the
+        corresponding row is held under ``skip_locked=True`` or missing;
+        the caller must check both before mutating.
+
+    Example:
+        async with lock_project_then_task(session, pid, tid) as (project, task):
+            if project is None or task is None:
+                return  # contended or missing; defer to next cycle
+            ...
+        await session.commit()  # release both locks atomically
+    """
+    project_stmt = (
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=skip_locked)
+    )
+    try:
+        project_result = await asyncio.wait_for(
+            session.execute(project_stmt), timeout=timeout,
+        )
+    except asyncio.TimeoutError as e:
+        logger.warning(
+            "[lock_project_then_task] timeout acquiring project %s after %.1fs (skip_locked=%s)",
+            project_id, timeout, skip_locked,
+        )
+        raise OperationalError("project lock acquisition timed out", None, e) from e
+    project = project_result.scalar_one_or_none()
+    if project is None:
+        # Don't attempt the task lock — caller backs off without holding
+        # a half-pair. This preserves the canonical ordering invariant
+        # under contention (project never released while task held).
+        yield (None, None)
+        return
+    task_stmt = (
+        select(Task)
+        .where(Task.id == task_id)
+        .with_for_update(skip_locked=skip_locked)
+    )
+    try:
+        task_result = await asyncio.wait_for(
+            session.execute(task_stmt), timeout=timeout,
+        )
+    except asyncio.TimeoutError as e:
+        logger.warning(
+            "[lock_project_then_task] timeout acquiring task %s after %.1fs (skip_locked=%s)",
+            task_id, timeout, skip_locked,
+        )
+        raise OperationalError("task lock acquisition timed out", None, e) from e
+    task = task_result.scalar_one_or_none()
+    yield (project, task)
+
+
+async def lock_project_for_strategic_transition(
+    session: AsyncSession,
+    project_id,
+    *,
+    max_retries: int = 3,
+) -> Project | None:
+    """Acquire a project lock for the strategic post-commit chain.
+
+    Phase C3 (HIGH H-C4): ``_handle_design_doc_completion`` and
+    ``_handle_strategic_completion`` (formerly ``_record_strategic_*``)
+    each acquired a project-row lock. They're called sequentially from
+    the same post-commit chain, so two simultaneous strategic completions
+    in the same project would queue lock attempts back-to-back — and the
+    chain's downstream calls (``_spawn_strategic_review`` →
+    ``_has_active_strategic_task``) re-attempted the same lock again,
+    deepening the queue. This helper centralises the acquisition.
+
+    Returns the locked Project under skip_locked semantics with a small
+    bounded retry, or None when the row is held past the retry window
+    (caller defers; the next cycle re-attempts). On a genuinely missing
+    project, returns None and the caller surfaces the appropriate error.
+
+    The legacy retry pattern (3 attempts × 0.5s backoff) is preserved so
+    existing tests that simulate "row held under contention" continue to
+    pass deterministically.
+
+    Args:
+        session: AsyncSession to issue the lock against.
+        project_id: UUID or str of the project.
+        max_retries: Number of skip_locked attempts before giving up.
+
+    Returns:
+        Locked Project, or None if held past max_retries / missing.
+    """
+    project: Project | None = None
+    for attempt in range(max_retries):
+        result = await session.execute(
+            select(Project)
+            .where(Project.id == project_id)
+            .with_for_update(skip_locked=True)
+        )
+        project = result.scalars().first()
+        if project is not None:
+            return project
+        # Distinguish "held" from "missing" with a non-locking probe.
+        exists = (
+            await session.execute(
+                select(Project.id).where(Project.id == project_id)
+            )
+        ).first()
+        if exists is None:
+            return None  # genuinely missing
+        await asyncio.sleep(0.5 * (attempt + 1))
+    return None  # row held past retry window — caller defers

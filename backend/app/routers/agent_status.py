@@ -1724,6 +1724,21 @@ async def update_agent_status(
         # This ensures the helper's fresh session doesn't bypass test DB overrides.
         _bind = session.bind
         _factory = async_sessionmaker(_bind, class_=AsyncSession, expire_on_commit=False)
+        # Audit Phase C4 (M-C6): release the request-session connection back to
+        # the pool now. _process_post_commit and _persist_post_commit_pending
+        # both use `_factory` (a fresh session), and the early-commit above
+        # already persisted the row state. Holding the request session open
+        # during the 240s post-commit timeout below pins one pool slot per
+        # in-flight status update — at 1k users that's pool exhaustion.
+        # Note: subsequent code paths (success and exception branches) MUST
+        # use `_factory`, not `session`. Verified at audit time: the only
+        # remaining `session.*` reference would be on the FastAPI generator
+        # exit path (get_session's `async with`), which tolerates an
+        # already-closed session.
+        try:
+            await session.close()
+        except Exception as _close_exc:
+            logger.debug(f"[PIPELINE] Early session close failed (non-fatal): {_close_exc}")
         # Cloud Run's default request timeout is 300s. Post-commit makes
         # multiple GitHub calls (review posting, check-run update, PR state
         # check, merge attempts) that each retry with up to 3x120s backoff on

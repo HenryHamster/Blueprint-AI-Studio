@@ -31,13 +31,27 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
-async def _record_strategic_task_failure(task: Task, session: AsyncSession) -> None:
+async def _record_strategic_task_failure(
+    task: Task,
+    session: AsyncSession,
+    *,
+    project: Project | None = None,
+) -> None:
     """Record a FAILED strategic task in the circuit breaker and cycle history.
 
     Called from _process_post_commit when a design_doc_update or strategic_review
     task terminates with FAILED status (VM crash, timeout, etc.).
+
+    Phase C3 (HIGH H-C4): the post-commit chain pre-acquires the project
+    lock via ``lock_project_for_strategic_transition`` and passes the
+    locked Project here as ``project=``. Direct callers can omit it; this
+    helper falls back to ``session.get(Project, ...)`` (no lock) since the
+    failure-recording path historically didn't take a row lock. Canonical
+    ordering (Project before Task) is preserved by callers — see
+    ``docs/concurrency.md``.
     """
-    project = await session.get(Project, task.project_id)
+    if project is None:
+        project = await session.get(Project, task.project_id)
     if not project:
         return
     vision = dict(project.vision or {})
@@ -540,17 +554,35 @@ async def _check_direction_starvation(
             )
 
 
-async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSession):
+async def _handle_strategic_completion(
+    task: Task,
+    logs: str,
+    session: AsyncSession,
+    *,
+    project: Project | None = None,
+):
     """Handle strategic review completion.
 
     Vision and direction updates were already applied incrementally via POST /api/agent/strategic
     during agent execution. This handler just records final status and checks for issues.
     Falls back to log parsing for backward compatibility if the agent used the old approach.
+
+    Phase C3 (HIGH H-C4): callers in the post-commit chain pre-acquire the
+    project lock once at the top via ``lock_project_for_strategic_transition``
+    and pass it here as ``project=``. The legacy fallback path below
+    (parseable-JSON branch) historically also acquired its own lock — that
+    inner acquisition is preserved as a defensive no-op when the caller
+    already holds the row (FOR UPDATE SKIP LOCKED returns the row to the
+    holding transaction, so the same-session re-lock is a cheap re-read).
     """
     # Deferred imports to avoid circular dependency
     from app.main import _create_strategic_alert
 
-    project = await session.get(Project, task.project_id)
+    # Phase C3: track whether the caller pre-acquired the project lock so
+    # the legacy fallback path below can reuse it instead of re-acquiring.
+    caller_holds_lock = project is not None
+    if project is None:
+        project = await session.get(Project, task.project_id)
     if not project:
         logger.error(f"[STRATEGIC] Task {task.id}: project {task.project_id} not found")
         return
@@ -674,14 +706,29 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
     new_running_update = parsed.get("running_update")
     direction_ops = parsed.get("direction_operations", [])
 
-    # Lock project row to prevent concurrent direction/vision mutations
-    result = await session.execute(
-        select(Project).where(Project.id == task.project_id).with_for_update()
-    )
-    project = result.scalars().first()
-    if not project:
-        logger.error(f"[STRATEGIC] Task {task.id}: project {task.project_id} not found")
-        return
+    # Lock project row to prevent concurrent direction/vision mutations.
+    # Phase C3: when the caller pre-acquired the lock (post-commit chain),
+    # reuse it directly. Otherwise, acquire via the centralized
+    # ``lock_project_for_strategic_transition`` helper.
+    if not caller_holds_lock:
+        from app.task_locking import lock_project_for_strategic_transition
+        project = await lock_project_for_strategic_transition(session, task.project_id)
+        if project is None:
+            # Helper returns None for both "missing" and "held past retries";
+            # disambiguate so we surface the right error.
+            exists = (await session.execute(
+                select(Project.id).where(Project.id == task.project_id)
+            )).first()
+            if exists is None:
+                logger.error(f"[STRATEGIC] Task {task.id}: project {task.project_id} not found")
+                return
+            logger.warning(
+                f"[STRATEGIC] Task {task.id}: project {task.project_id} held under contention "
+                f"after retries; deferring mutation to next cycle"
+            )
+            await _create_strategic_alert(task.project_id, session,
+                f"Strategic completion: project row contended (task {str(task.id)[:8]}) — mutation deferred")
+            return
 
     # Store raw output for admin visibility
     task.plan_output = parsed

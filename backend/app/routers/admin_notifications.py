@@ -14,10 +14,11 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Alert, ProjectMember, ProjectMessage, MessageType, Project, _utcnow
+from app.models import Alert, ProjectMember, ProjectMessage, MessageType, _utcnow
 from app.auth import get_current_user
 from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
+from app.task_locking import lock_project_or_429
 
 logger = logging.getLogger(__name__)
 
@@ -441,10 +442,9 @@ async def admin_playbook_set(
                 detail=f"Invalid task type(s): {invalid}. Must be one of: {sorted(_VALID_TASK_TYPES)}",
             )
 
-    result = await session.execute(
-        select(Project).where(Project.id == project_id).with_for_update()
-    )
-    project = result.scalars().first()
+    # Phase A1: skip_locked + 429 on contention so 30s lock_timeout doesn't
+    # propagate as 500 and trigger Cloud Run instance quarantine.
+    project = await lock_project_or_429(session, project_id)
 
     doc = dict(project.design_doc or {})
     playbook_key = f"playbook/{key}"
@@ -494,10 +494,9 @@ async def admin_playbook_delete(
     """Delete a playbook entry by key."""
     await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
-    result = await session.execute(
-        select(Project).where(Project.id == project_id).with_for_update()
-    )
-    project = result.scalars().first()
+    # Phase A1: skip_locked + 429 on contention so 30s lock_timeout doesn't
+    # propagate as 500 and trigger Cloud Run instance quarantine.
+    project = await lock_project_or_429(session, project_id)
 
     doc = dict(project.design_doc or {})
     playbook_key = f"playbook/{key}"
@@ -531,10 +530,9 @@ async def admin_playbook_seed(
     """Populate the playbook with default operational knowledge. Skips entries that already exist."""
     await _get_user_project_with_role(project_id, current_user["user_id"], session, "member")
 
-    result = await session.execute(
-        select(Project).where(Project.id == project_id).with_for_update()
-    )
-    project = result.scalars().first()
+    # Phase A1: skip_locked + 429 on contention so 30s lock_timeout doesn't
+    # propagate as 500 and trigger Cloud Run instance quarantine.
+    project = await lock_project_or_429(session, project_id)
 
     doc = dict(project.design_doc or {})
     added = []

@@ -13,6 +13,7 @@ from app.shared_state import limiter
 from app.models import Task, TaskStatus, Project, ProjectMember, _utcnow
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
+from app.task_locking import lock_project_or_429
 
 router = APIRouter(
     prefix="/api/admin",
@@ -248,7 +249,12 @@ async def delete_project_admin(
 ):
     """Delete a project and cascade to tasks/artifacts/history.
     Refuses if active tasks exist unless force=true."""
-    project = await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+    # Phase C2 (L-C3): role check first (404/403 before lock contention surfaces
+    # as 429), then acquire a Project row lock with skip_locked. Closes the
+    # heartbeat-arrives-mid-delete race where a concurrent agent status POST
+    # could mutate task rows between our cancel and FK-cascade delete.
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "owner")
+    project = await lock_project_or_429(session, project_id)
 
     ACTIVE_STATUSES = [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
     active_tasks = (await session.execute(

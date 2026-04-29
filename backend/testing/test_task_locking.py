@@ -411,9 +411,11 @@ async def test_handle_design_doc_completion_defers_on_lock_contention(
     create_alert = AsyncMock()
     mocker.patch("app.main._create_strategic_alert", new=create_alert)
 
-    # Patch asyncio.sleep to no-op so retries don't slow the test
+    # Phase C3: the bounded-retry sleep now lives in task_locking, not
+    # task_completion. Patch the canonical site so retries don't slow
+    # the test.
     mocker.patch(
-        "app.task_completion.asyncio.sleep",
+        "app.task_locking.asyncio.sleep",
         new=AsyncMock(return_value=None),
     )
 
@@ -456,7 +458,9 @@ async def test_handle_strategic_completion_defers_on_lock_contention(
 ):
     """When the project row is held during the legacy fallback path,
     _handle_strategic_completion must alert + return rather than 500.
-    Phase A1, was site strategic_completion.py:679.
+    Phase A1, was site strategic_completion.py:679. Phase C3 centralized
+    the bounded-retry into ``task_locking.lock_project_for_strategic_transition``;
+    this test patches ``app.task_locking.asyncio.sleep`` accordingly.
     """
     from app.strategic_completion import _handle_strategic_completion
 
@@ -478,8 +482,11 @@ async def test_handle_strategic_completion_defers_on_lock_contention(
     create_alert = AsyncMock()
     mocker.patch("app.main._create_strategic_alert", new=create_alert)
 
+    # Phase C3: the bounded-retry sleep now lives in task_locking, not
+    # strategic_completion. Patch the canonical site so retries don't
+    # slow the test.
     mocker.patch(
-        "app.strategic_completion.asyncio.sleep",
+        "app.task_locking.asyncio.sleep",
         new=AsyncMock(return_value=None),
     )
 

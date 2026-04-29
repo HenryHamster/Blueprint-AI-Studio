@@ -2677,26 +2677,57 @@ async def _spawn_investigation_remediation(
     session.add(history)
     return new_task
 
-async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSession):
+async def _handle_design_doc_completion(
+    task: Task,
+    logs: str,
+    session: AsyncSession,
+    *,
+    project: Project | None = None,
+):
     """Handle Phase 1 completion: chain to Phase 2 (strategic review).
 
     The design doc itself was already updated incrementally via POST /api/agent/design-doc
     during agent execution. This handler records status and spawns the next phase.
     Chain and status are committed together so a failed Phase 2 spawn doesn't leave
     the task marked COMPLETED with no follow-up.
+
+    Phase C3 (HIGH H-C4): callers in the post-commit chain pre-acquire the
+    project lock once at the top via ``lock_project_for_strategic_transition``
+    and pass it as ``project=`` so this handler does NOT re-acquire. When
+    ``project=None`` (legacy / direct callers), we fall back to acquiring
+    the lock here ourselves with the same bounded-retry semantics. The
+    canonical order is Project before Task — see ``docs/concurrency.md``.
     """
     # Deferred imports to avoid circular dependency
     from app.strategic_spawning import _spawn_strategic_review  # noqa: PLC0415
     from app.main import _create_strategic_alert  # noqa: PLC0415
+    from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
 
-    result = await session.execute(
-        select(Project).where(Project.id == task.project_id).with_for_update()
-    )
-    project = result.scalars().first()
-    if not project:
-        logger.error(f"[DESIGN DOC] Task {task.id}: project {task.project_id} not found")
+    if project is None:
+        # Legacy / direct-caller path: acquire the lock here. Post-commit
+        # chain callers (task_lifecycle._process_post_commit) are expected
+        # to pass ``project=`` to share the single acquisition across the
+        # strategic-completion chain — see Phase C3 in the audit plan.
+        project = await lock_project_for_strategic_transition(session, task.project_id)
+    if project is None:
+        # Distinguish "missing" from "held past retries" — the helper
+        # returns None for both. We re-probe non-lockingly to choose the
+        # right alert message; a missing project is a hard error, while
+        # contention defers to the next cycle.
+        exists = (await session.execute(
+            select(Project.id).where(Project.id == task.project_id)
+        )).first()
+        if exists is None:
+            logger.error(f"[DESIGN DOC] Task {task.id}: project {task.project_id} not found")
+            await _create_strategic_alert(task.project_id, session,
+                f"Design doc update failed: project not found (task {str(task.id)[:8]})")
+            return
+        logger.warning(
+            f"[DESIGN DOC] Task {task.id}: project {task.project_id} held under contention "
+            f"after retries; deferring strategic chain"
+        )
         await _create_strategic_alert(task.project_id, session,
-            f"Design doc update failed: project not found (task {str(task.id)[:8]})")
+            f"Design doc update: project row contended (task {str(task.id)[:8]}) — strategic chain deferred")
         return
 
     doc = project.design_doc or {}
