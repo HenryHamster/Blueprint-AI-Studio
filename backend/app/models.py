@@ -2,11 +2,11 @@ from enum import Enum
 from typing import Optional, Dict, Any, List
 from sqlmodel import SQLModel, Field, Relationship
 from sqlmodel.sql.sqltypes import GUID
-from sqlalchemy import Boolean, CheckConstraint, Column, String, Integer, Float, Index, Text, UniqueConstraint, ForeignKey, text, event, Enum as SAEnum
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, String, Integer, Float, Index, Text, UniqueConstraint, ForeignKey, text, event, func, Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -91,7 +91,14 @@ class AllowedUser(SQLModel, table=True):
     firebase_uid: Optional[str] = Field(default=None, index=True)
     role: str = Field(default="user")  # "admin" or "user"
     display_name: Optional[str] = None
-    created_at: datetime = Field(default_factory=_utcnow)
+    # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5):
+    # default_factory is retained as an additive Python-side guard so ORM
+    # callers don't see ``None`` between construction and commit; the
+    # server_default protects raw-SQL INSERT paths that bypass the ORM.
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
     last_login_at: Optional[datetime] = None
 
 
@@ -100,7 +107,12 @@ class UserIntegration(SQLModel, table=True):
     Stores third-party integrations for a user, such as GitHub App installations.
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    user_id: str = Field(index=True)
+    # ``user_id`` previously had ``index=True`` (yielding the unique index
+    # ``ix_userintegration_user_id`` from migration 0001) — superseded by the
+    # named ``uq_userintegration_user_id`` UNIQUE constraint added in 0049 and
+    # dropped in 0060 (audit 2026-04-29 / H-S3). The constraint's underlying
+    # index is the canonical lookup path; do not re-add ``index=True`` here.
+    user_id: str = Field()
 
     # GitHub App Installation ID
     github_installation_id: Optional[str] = None
@@ -123,7 +135,11 @@ class Project(SQLModel, table=True):
     status: ProjectStatus = Field(default=ProjectStatus.DRAFT, sa_column=Column(String, default=ProjectStatus.DRAFT))
     github_owner: Optional[str] = None
     github_repo: Optional[str] = None
-    created_at: datetime = Field(default_factory=_utcnow)
+    # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5).
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
 
     # Autonomous improvement: user-defined high-level directions for research agents
     # Includes directions with status: 'active', 'paused', 'proposed', 'rejected', 'expired'
@@ -256,14 +272,25 @@ class Task(SQLModel, table=True):
     priority: int = Field(default=50, sa_column=Column(Integer, nullable=False, server_default=text("50")))
 
     attempt_count: int = Field(default=0)
-    created_at: datetime = Field(default_factory=_utcnow)
+    # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5).
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
     started_at: Optional[datetime] = Field(default=None)
-    # Auto-populated on INSERT (default_factory) and UPDATE (onupdate). Consumed by
-    # reaper.py's EVALUATING stale sweep and rollup_management.py age calculations
-    # so "last touched" can be distinguished from "first started".
+    # Auto-populated on INSERT (default_factory + server_default) and UPDATE
+    # (onupdate). Consumed by reaper.py's EVALUATING stale sweep and
+    # rollup_management.py age calculations so "last touched" can be
+    # distinguished from "first started". TIMESTAMPTZ as of migration 0061;
+    # ``server_default=now()`` was already in place per migration 0033.
     updated_at: datetime = Field(
         default_factory=_utcnow,
-        sa_column_kwargs={"onupdate": _utcnow},
+        sa_column=Column(
+            DateTime(timezone=True),
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
     )
     archived: bool = Field(default=False)
 
@@ -321,7 +348,12 @@ class Task(SQLModel, table=True):
         return (self.payloads or [{}])[0]
 
     __table_args__ = (
-        Index("ix_task_status_priority", "status", "priority"),
+        # Note: ``ix_task_status_priority`` (status, priority) and
+        # ``ix_task_project_id_created_at`` (project_id, created_at) were
+        # dropped in alembic 0060 — both fully shadowed by the broader
+        # composites below via left-prefix matching (audit 2026-04-29 / H-S1,
+        # H-S2). Don't reintroduce without confirming a query needs only the
+        # narrower prefix.
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),
         Index("ix_task_project_status_created", "project_id", "status", "created_at"),
         Index(
@@ -355,6 +387,15 @@ class Task(SQLModel, table=True):
             postgresql_where=text("archived = false"),
             sqlite_where=text("archived = false"),
         ),
+        # Defense-in-depth size cap on payloads JSONB (audit 2026-04-29 D4 /
+        # finding M-S5). The Python layer's ``pack_under_budget`` already caps
+        # strategic-spawn payloads at 120 KB, but a future code path could
+        # insert a runaway. The 200 KB CHECK constraint chk_task_payloads_size
+        # is enforced server-side by alembic 0063 (Postgres-only). Not declared
+        # here in __table_args__ because the constraint expression
+        # ``octet_length(payloads::text) < 200000`` is Postgres-specific syntax
+        # that breaks SQLite-fixture tests using metadata.create_all.
+        # See alembic 0063 / memory ``reference_strategic_payload_bloat.md``.
     )
 
     # Optimistic concurrency: SQLAlchemy bumps ``version`` and adds
@@ -430,7 +471,11 @@ class Alert(SQLModel, table=True):
         default=None,
         sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True),
     )
-    created_at: datetime = Field(default_factory=_utcnow)
+    # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5).
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
     dismissed_at: Optional[datetime] = None
 
     __table_args__ = (
@@ -502,7 +547,7 @@ class OrchestratorErrorAck(SQLModel, table=True):
     key is "exception_class|source" for a specific bucket, or "*" for a
     global ack covering every bucket whose last_seen_iso <= acknowledged_at.
     """
-    key: str = Field(primary_key=True)
+    key: str = Field(primary_key=True, max_length=255)
     acknowledged_at: datetime = Field(default_factory=_utcnow)
     acknowledged_by: str = Field(default="")
 
@@ -526,7 +571,11 @@ class ProjectMessage(SQLModel, table=True):
     status: str = Field(default="open")  # "open" | "resolved"
     resolution: Optional[str] = None
     resolved_at: Optional[datetime] = None
-    created_at: datetime = Field(default_factory=_utcnow)
+    # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5).
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
 
     __table_args__ = (
         Index("ix_projectmessage_project_status", "project_id", "status"),
@@ -607,7 +656,7 @@ class MaxPlanAccount(SQLModel, table=True):
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     user_id: str = Field(index=True)
-    name: str
+    name: str = Field(max_length=255)
     provider: LLMProviderName = Field(
         default=LLMProviderName.ANTHROPIC,
         sa_column=Column(
@@ -690,7 +739,7 @@ class ResidualRemediationCase(SQLModel, table=True):
     """
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     project_id: Optional[uuid.UUID] = Field(default=None, foreign_key="project.id", index=True)
-    fingerprint: str = Field(index=True)
+    fingerprint: str = Field(index=True, max_length=512)
     status: str = Field(
         default=ResidualCaseStatus.ACTIVE,
         sa_column=Column(String, nullable=False, default=ResidualCaseStatus.ACTIVE),

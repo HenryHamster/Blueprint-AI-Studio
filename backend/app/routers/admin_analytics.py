@@ -86,6 +86,10 @@ def _compute_direction_auto_pause_stats(
         ts = msg.created_at
         if ts is None:
             continue
+        # ProjectMessage.created_at is TIMESTAMPTZ (migration 0061); window_start
+        # is naive. Strip tz for comparison rather than assume both sides match.
+        if ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
         if ts >= window_start:
             if milestone == "auto-paused":
                 cur_paused += 1
