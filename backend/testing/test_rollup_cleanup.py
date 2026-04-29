@@ -1014,15 +1014,20 @@ async def test_marker_commit_failure_rescues_pr_number(cleanup_db, mocker):
         context={"pr_merged": True},
     )
 
-    # Fail the first commit inside _check_and_trigger_rollup (the marker
-    # commit right after PR creation).  Subsequent commits use the real
-    # impl so the retry-counter update can land.
+    # Fail the marker commit inside _check_and_trigger_rollup. Phase B3
+    # added two lock-window-break commits ahead of the marker commit:
+    #   1. _release_parent_lock before get_open_pull_requests (read cluster)
+    #   2. _release_parent_lock before create_pull_request
+    #   3. The marker commit itself (the bug-target — failure here orphans the PR)
+    # We let the first two commits succeed and only fail the marker so the
+    # rescue path is what we observe.
     real_commit = cleanup_db.commit
     commit_calls = {"n": 0}
+    MARKER_COMMIT_INDEX = 3
 
     async def flaky_commit(*args, **kwargs):
         commit_calls["n"] += 1
-        if commit_calls["n"] == 1:
+        if commit_calls["n"] == MARKER_COMMIT_INDEX:
             raise RuntimeError("connection reset during marker commit")
         return await real_commit(*args, **kwargs)
 
@@ -1101,10 +1106,12 @@ async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(cle
 
     real_commit = cleanup_db.commit
     commit_calls = {"n": 0}
+    # See companion test for the commit-index numbering after Phase B3.
+    MARKER_COMMIT_INDEX = 3
 
     async def flaky_commit(*args, **kwargs):
         commit_calls["n"] += 1
-        if commit_calls["n"] == 1:
+        if commit_calls["n"] == MARKER_COMMIT_INDEX:
             raise RuntimeError("connection reset during marker commit")
         return await real_commit(*args, **kwargs)
 

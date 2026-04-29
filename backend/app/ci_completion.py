@@ -21,6 +21,7 @@ import re
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -295,8 +296,12 @@ async def _attempt_merge_with_retry_and_escalation(
             # update_branch failures exceeded dynamic threshold — escalate to fix task with rebase.
             from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
             from app.rollup_state import _is_rollup_parent_awaiting_merge  # noqa: PLC0415
+            # Phase B4 (H-P6): Python-side filter on first_payload.type/pr_number.
+            # Drop status_log/plan_output/context — only id + payloads needed.
             active_tasks = (await session.execute(
-                select(Task).where(
+                select(Task)
+                .options(load_only(Task.id, Task.status, Task.payloads, Task.project_id))
+                .where(
                     Task.project_id == task.project_id,
                     Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
                 )
@@ -375,8 +380,12 @@ async def _attempt_merge_with_retry_and_escalation(
             # Dedup guard: if a fix task for this PR is already active, don't spawn another.
             # Mirrors the CI-failure path in handle_ci_completion to prevent duplicate fixes
             # contending on the same PR.
+            # Phase B4 (H-P6): Python-side filter on first_payload.type/pr_number.
+            # Drop status_log/plan_output/context — only id + payloads needed.
             active_tasks = (await session.execute(
-                select(Task).where(
+                select(Task)
+                .options(load_only(Task.id, Task.status, Task.payloads, Task.project_id))
+                .where(
                     Task.project_id == task.project_id,
                     Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
                 )
@@ -539,8 +548,11 @@ async def _attempt_merge_with_retry_and_escalation(
             # cleanly without spawning.
             if not (_deterministic or _repeated_identical or _merge_failures >= _hard_cap):
                 from app.review_pipeline import _spawn_pipeline_task
+                # Phase B4 (H-P6): drop status_log/plan_output/context.
                 active_tasks = (await session.execute(
-                    select(Task).where(
+                    select(Task)
+                    .options(load_only(Task.id, Task.status, Task.payloads, Task.project_id))
+                    .where(
                         Task.project_id == task.project_id,
                         Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
                     )
@@ -755,8 +767,11 @@ async def handle_ci_completion(
         )
     else:
         # CI failed — spawn fix task
+        # Phase B4 (H-P6): drop status_log/plan_output/context.
         active_tasks = (await session.execute(
-            select(Task).where(
+            select(Task)
+            .options(load_only(Task.id, Task.status, Task.payloads, Task.project_id))
+            .where(
                 Task.project_id == task.project_id,
                 Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
             )

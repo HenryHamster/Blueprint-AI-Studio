@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict
 
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
@@ -283,8 +284,30 @@ async def reaper_service():
         try:
             async with AsyncSessionLocal() as session:
                 # Step 1: Read active tasks WITHOUT locks (avoids blocking heartbeat writes)
-                stmt = select(Task).where(
-                    Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
+                # Phase B4 (H-P1): drop heavy ``plan_output`` JSONB from the projection.
+                # ``status_log`` MUST stay loaded because the Task.status / Task.
+                # latest_status_message event listeners (models.py ~360) read it on
+                # every assignment; under async sessions an unloaded status_log
+                # triggers MissingGreenlet. ``context`` and ``payloads`` stay loaded
+                # because _heartbeat_stale_cutoff / _preclaim_stale_cutoff read both
+                # via task.first_payload (L-P2). The reaper mutates status,
+                # latest_status_message, vm_instance_id, last_heartbeat, started_at,
+                # context, payloads, attempt_count downstream.
+                stmt = (
+                    select(Task)
+                    .options(load_only(
+                        Task.id, Task.status, Task.last_heartbeat,
+                        Task.started_at, Task.created_at,
+                        Task.vm_instance_id, Task.vm_provisioned_at,
+                        Task.project_id, Task.parent_task_id,
+                        Task.latest_status_message, Task.attempt_count,
+                        Task.context, Task.payloads, Task.status_log,
+                        Task.retry_after_until, Task.previous_error_fingerprint,
+                        Task.requeue_in_flight, Task.description,
+                    ))
+                    .where(
+                        Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
+                    )
                 )
                 active_tasks = (await session.execute(stmt)).scalars().all()
 
@@ -368,8 +391,17 @@ async def reaper_service():
                     if force_lock_ids:
                         try:
                             session.expire_all()
-                            # Extend lock_timeout for force-lock — 30s default is too short
-                            # when competing with long-running operations. Reverts on commit/rollback.
+                            # Audit C4 (M-C3): the SET LOCAL lock_timeout=60s
+                            # below is a defensive no-op as long as the
+                            # acquisition uses skip_locked=True — Postgres'
+                            # SKIP LOCKED returns immediately for any row
+                            # held by another transaction, never blocking, so
+                            # lock_timeout never fires on this path. The
+                            # statement is kept (a) to document intent for
+                            # operators reading logs, and (b) so a future
+                            # change that replaces skip_locked with a NOWAIT
+                            # or blocking variant inherits the bounded wait
+                            # automatically. Reverts on commit/rollback.
                             from sqlalchemy import text as _text
                             await session.execute(_text("SET LOCAL lock_timeout = '60000'"))
                             force_stmt = select(Task).where(
@@ -1173,22 +1205,52 @@ async def reaper_service():
                 # When the initial review spawn after a child completes fails silently,
                 # no event re-triggers _check_and_trigger_rollup.  This sweep catches
                 # those stuck parents and lets the stale-PR recovery path respawn reviews.
+                #
+                # Phase B4 (H-P1): batch-fetch all children for ALL evaluating parents
+                # in a single ``IN (...)`` query (mirrors the Step 4 pattern at the
+                # batched fetch below). The previous code fired N queries — one per
+                # parent — to find a single COMPLETED child for the rollup trigger.
+                # ``load_only`` keeps each row narrow but MUST include ``status_log``
+                # because the ``Task.latest_status_message``/``Task.status`` event
+                # listeners (models.py ~360) read status_log on every set; under
+                # async sessions a deferred-column fetch raises MissingGreenlet.
+                _children_by_parent: Dict[uuid.UUID, list] = {}
+                evaluating_parents = []
                 try:
                     stale_cutoff = now - timedelta(minutes=15)
                     evaluating_parents = (await session.execute(
-                        select(Task).where(
+                        select(Task)
+                        .options(load_only(
+                            Task.id, Task.status, Task.updated_at, Task.context,
+                            Task.payloads, Task.project_id, Task.parent_task_id,
+                            Task.latest_status_message, Task.status_log,
+                            Task.attempt_count, Task.created_at,
+                        ))
+                        .where(
                             Task.status == TaskStatus.EVALUATING,
                             Task.updated_at < stale_cutoff,
                         )
                     )).scalars().all()
+                    if evaluating_parents:
+                        _parent_ids = [p.id for p in evaluating_parents]
+                        _all_children = (await session.execute(
+                            select(Task)
+                            .options(load_only(
+                                Task.id, Task.status, Task.parent_task_id,
+                                Task.context, Task.status_log,
+                                Task.latest_status_message, Task.payloads,
+                            ))
+                            .where(Task.parent_task_id.in_(_parent_ids))
+                        )).scalars().all()
+                        for _c in _all_children:
+                            _children_by_parent.setdefault(_c.parent_task_id, []).append(_c)
                     for parent in evaluating_parents:
                         # Find a completed child to use as the trigger for _check_and_trigger_rollup
-                        child = (await session.execute(
-                            select(Task).where(
-                                Task.parent_task_id == parent.id,
-                                Task.status == TaskStatus.COMPLETED,
-                            ).limit(1)
-                        )).scalars().first()
+                        child = next(
+                            (c for c in _children_by_parent.get(parent.id, [])
+                             if c.status == TaskStatus.COMPLETED),
+                            None,
+                        )
                         if child:
                             try:
                                 await _check_and_trigger_rollup(child, session)
@@ -1202,19 +1264,10 @@ async def reaper_service():
                 # Step 4: Rescue EVALUATING parents whose children ALL terminated without
                 # any completing successfully.  These parents have no COMPLETED child to
                 # trigger _check_and_trigger_rollup, so they stay EVALUATING forever.
+                # Reuses _children_by_parent populated in Step 3.
                 try:
                     _terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
                     rescued = 0
-                    # Batch-fetch all children for all evaluating parents in a single query
-                    # to avoid an N+1 pattern (one query per parent).
-                    _children_by_parent: Dict[uuid.UUID, list] = {}
-                    if evaluating_parents:
-                        _parent_ids = [p.id for p in evaluating_parents]
-                        _all_children = (await session.execute(
-                            select(Task).where(Task.parent_task_id.in_(_parent_ids))
-                        )).scalars().all()
-                        for _c in _all_children:
-                            _children_by_parent.setdefault(_c.parent_task_id, []).append(_c)
                     for parent in evaluating_parents:
                         children = _children_by_parent.get(parent.id, [])
                         if not children:

@@ -11,8 +11,10 @@ import uuid
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import or_
+from sqlalchemy import cast, or_
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.auth import get_current_user
@@ -211,16 +213,39 @@ async def get_account_health_summary(
     account_ids = {s["id"] for s in summaries}
     failure_counts: dict[str, dict[str, int]] = {}
     if account_ids:
+        # Phase B4 (M-P5/H-P3): GIN-friendly containment on context. The
+        # previous .as_string().in_(...) text-cast bypassed ix_task_context_gin,
+        # forcing a sequential scan. Switching to ``context @> {...}`` lets
+        # Postgres use the GIN index for each per-account predicate.
+        # Phase B4 (H-P3): drop status_log/payloads/plan_output JSONB. The
+        # downstream consumer reads context, account_id, latest_status_message
+        # via classify_failure(); payloads/status_log are not consumed.
+        _account_id_list = list(account_ids)
+        _llm_predicates = [
+            Task.context.op("@>")(cast({"llm_account_id": aid}, JSONB))
+            for aid in _account_id_list
+        ]
+        _mp_predicates = [
+            Task.context.op("@>")(cast({"max_plan_account_id": aid}, JSONB))
+            for aid in _account_id_list
+        ]
         failed_tasks = (
             await session.execute(
-                select(Task).where(
+                select(Task)
+                .options(load_only(
+                    Task.id, Task.status, Task.account_id, Task.context,
+                    Task.latest_status_message, Task.updated_at,
+                    Task.project_id,  # classify_failure → record_residual_fingerprint
+                    Task.payloads,  # classify_failure reads first_payload (L-P2)
+                ))
+                .where(
                     Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
                     Task.updated_at >= cutoff,
                     Task.latest_status_message.isnot(None),
                     or_(
-                        Task.account_id.in_(account_ids),
-                        Task.context["llm_account_id"].as_string().in_(account_ids),
-                        Task.context["max_plan_account_id"].as_string().in_(account_ids),
+                        Task.account_id.in_(_account_id_list),
+                        *_llm_predicates,
+                        *_mp_predicates,
                     ),
                 )
             )

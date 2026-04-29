@@ -5,12 +5,13 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -767,11 +768,20 @@ async def claim_task(
 
     task_type = task.first_payload.get("type", "")
     if task_type in ("research", "plan", "create", "fix", "refactor", "review"):
-        # Active tasks (IN_PROGRESS or EVALUATING) in the same project
-        active_stmt = select(Task).where(
-            Task.project_id == task.project_id,
-            Task.id != task.id,
-            Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
+        # Active tasks (IN_PROGRESS or EVALUATING) in the same project.
+        # Phase B4 (H-P6): load_only drops status_log/plan_output JSONB.
+        # Reads below: id, title, first_payload (payloads), status, context.
+        active_stmt = (
+            select(Task)
+            .options(load_only(
+                Task.id, Task.title, Task.status, Task.payloads, Task.context,
+                Task.project_id,
+            ))
+            .where(
+                Task.project_id == task.project_id,
+                Task.id != task.id,
+                Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
+            )
         )
         active_tasks_rows = (await session.execute(active_stmt)).scalars().all()
         active_tasks = []
@@ -787,11 +797,18 @@ async def claim_task(
                 "direction_id": (t.context or {}).get("direction_id"),
             })
 
-        # Queued tasks in the same project
-        queued_stmt = select(Task).where(
-            Task.project_id == task.project_id,
-            Task.id != task.id,
-            Task.status == TaskStatus.QUEUED
+        # Queued tasks in the same project. Same projection as active_stmt.
+        queued_stmt = (
+            select(Task)
+            .options(load_only(
+                Task.id, Task.title, Task.status, Task.payloads, Task.context,
+                Task.project_id,
+            ))
+            .where(
+                Task.project_id == task.project_id,
+                Task.id != task.id,
+                Task.status == TaskStatus.QUEUED
+            )
         )
         queued_tasks_rows = (await session.execute(queued_stmt)).scalars().all()
         queued_tasks = []
@@ -806,19 +823,35 @@ async def claim_task(
                 "direction_id": (t.context or {}).get("direction_id"),
             })
 
-        # Recently completed tasks (10 most recent): completed first, then failed/cancelled
-        completed_stmt = select(Task).where(
-            Task.project_id == task.project_id,
-            Task.id != task.id,
-            Task.status == TaskStatus.COMPLETED
-        ).order_by(Task.created_at.desc()).limit(10)
+        # Recently completed tasks (10 most recent): completed first, then failed/cancelled.
+        # Phase B4 (H-P6): drop status_log/plan_output JSONB. Loop reads below
+        # also call classify_failure(t) which touches latest_status_message,
+        # context, payloads — all included.
+        _completed_loadonly = load_only(
+            Task.id, Task.title, Task.status, Task.payloads, Task.context,
+            Task.project_id, Task.description, Task.created_at,
+            Task.latest_status_message, Task.account_id, Task.provider, Task.model,
+        )
+        completed_stmt = (
+            select(Task)
+            .options(_completed_loadonly)
+            .where(
+                Task.project_id == task.project_id,
+                Task.id != task.id,
+                Task.status == TaskStatus.COMPLETED
+            ).order_by(Task.created_at.desc()).limit(10)
+        )
         completed_tasks_rows = list((await session.execute(completed_stmt)).scalars().all())
 
-        failed_cancelled_stmt = select(Task).where(
-            Task.project_id == task.project_id,
-            Task.id != task.id,
-            Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED])
-        ).order_by(Task.created_at.desc()).limit(max(0, 15 - len(completed_tasks_rows)))
+        failed_cancelled_stmt = (
+            select(Task)
+            .options(_completed_loadonly)
+            .where(
+                Task.project_id == task.project_id,
+                Task.id != task.id,
+                Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED])
+            ).order_by(Task.created_at.desc()).limit(max(0, 15 - len(completed_tasks_rows)))
+        )
         failed_cancelled_rows = (await session.execute(failed_cancelled_stmt)).scalars().all()
         completed_tasks_rows = completed_tasks_rows + list(failed_cancelled_rows)
 
@@ -873,10 +906,17 @@ async def claim_task(
                 "changed_files": t_changed_files,
             })
 
-        # Build lessons from high-iteration tasks (3+ review cycles)
+        # Build lessons from high-iteration tasks (3+ review cycles).
+        # Phase B4 (H-P6): drop status_log/plan_output. Loop reads context,
+        # title, status, latest_status_message, plus classify_failure() inputs.
         lessons = []
         high_iter_stmt = (
             select(Task)
+            .options(load_only(
+                Task.id, Task.title, Task.status, Task.payloads, Task.context,
+                Task.latest_status_message, Task.created_at, Task.project_id,
+                Task.account_id, Task.provider, Task.model,
+            ))
             .where(
                 Task.project_id == task.project_id,
                 Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),
@@ -934,11 +974,21 @@ async def claim_task(
         current_direction_id = (task.context or {}).get("direction_id")
         direction_recent_tasks = []
         if current_direction_id:
-            dir_stmt = select(Task).where(
-                Task.project_id == task.project_id,
-                Task.id != task.id,
-                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
-            ).order_by(Task.created_at.desc()).limit(50)
+            # Phase B4 (H-P6): drop status_log/plan_output. Loop reads same
+            # set as completed_stmt — id/title/status/context/payloads/etc.
+            dir_stmt = (
+                select(Task)
+                .options(load_only(
+                    Task.id, Task.title, Task.status, Task.payloads, Task.context,
+                    Task.project_id, Task.description, Task.created_at,
+                    Task.latest_status_message, Task.account_id, Task.provider, Task.model,
+                ))
+                .where(
+                    Task.project_id == task.project_id,
+                    Task.id != task.id,
+                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+                ).order_by(Task.created_at.desc()).limit(50)
+            )
             dir_rows = (await session.execute(dir_stmt)).scalars().all()
             dir_matches = [
                 t for t in dir_rows
@@ -1004,8 +1054,18 @@ async def claim_task(
 
         sibling_tasks = []
         if task.parent_task_id:
+            # Phase B4 (H-P6): drop status_log/plan_output. Reads: id/title/
+            # status/context/payloads — all included.
+            _sibling_loadonly = load_only(
+                Task.id, Task.title, Task.status, Task.payloads, Task.context,
+                Task.latest_status_message, Task.description, Task.created_at,
+                Task.parent_task_id, Task.project_id,
+                Task.account_id, Task.provider, Task.model,
+            )
             sibling_result = await session.execute(
-                select(Task).where(
+                select(Task)
+                .options(_sibling_loadonly)
+                .where(
                     Task.parent_task_id == task.parent_task_id,
                     Task.id != task.id,
                     Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
@@ -1024,7 +1084,9 @@ async def claim_task(
             )
 
             terminal_sibling_result = await session.execute(
-                select(Task).where(
+                select(Task)
+                .options(_sibling_loadonly)
+                .where(
                     Task.parent_task_id == task.parent_task_id,
                     Task.id != task.id,
                     Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED])
@@ -2106,25 +2168,72 @@ async def agent_heartbeat(
                 req.task_id, token.get("vm_instance_id"), msg[:300],
             )
     if req.metrics or req.tool_trace is not None:
-        ctx = dict(task.context or {})
+        # Phase B2 (audit 2026-04-29 / finding C3): hot fields (last_metrics,
+        # last_tool_use_at) are now dedicated columns — cheap in-place column
+        # UPDATEs, no whole-blob TOAST page rewrites every 30s/VM. The JSONB
+        # mirror writes continue (dual-write) so unmigrated readers still see
+        # the values; mirror writes are retired in Phase F.
+        #
+        # Audit-trail fields (metrics_history ring buffer, _tool_trace death-
+        # trace window) are post-mortem-only, so we persist them every 5th
+        # heartbeat (~2.5 min at 30s cadence) instead of every cycle. The
+        # agent-side ring buffer is the in-flight source of truth.
+        metrics_dump: dict | None = None
         if req.metrics:
             metrics_dump = req.metrics.model_dump(exclude_none=True)
+
+        # Derive last_tool_use_at from the tail of the tool_trace ring buffer.
+        # The agent stamps each entry's ``t`` as ISO-8601. Fall back to current
+        # time if parsing fails so we never crash a heartbeat on a bad value.
+        latest_tool_use_at: datetime | None = None
+        if req.tool_trace:
+            try:
+                last_t = req.tool_trace[-1].t
+                latest_tool_use_at = datetime.fromisoformat(last_t.replace('Z', '+00:00'))
+                # Strip tz so the column (naive DateTime, matching the rest of
+                # the timestamp columns on Task) doesn't reject tz-aware values.
+                if latest_tool_use_at.tzinfo is not None:
+                    latest_tool_use_at = latest_tool_use_at.astimezone(timezone.utc).replace(tzinfo=None)
+            except (ValueError, AttributeError, IndexError):
+                latest_tool_use_at = _utcnow()
+
+        # Hot-path writes: dedicated columns. Cheap in-place column UPDATE.
+        if metrics_dump is not None:
+            task.last_metrics_json = metrics_dump
+        if latest_tool_use_at is not None:
+            task.last_tool_use_at = latest_tool_use_at
+
+        # Every-5th-heartbeat gate for the audit-trail ring buffers. Use
+        # second-of-epoch on last_heartbeat (just stamped above) mod 5 — at
+        # 30s cadence this fires roughly every 2.5 min, evenly distributed.
+        hb_seconds = int(task.last_heartbeat.timestamp()) if task.last_heartbeat else 0
+        persist_audit_trail = (hb_seconds % 5 == 0)
+
+        # Dual-write: keep the JSONB mirror so unmigrated readers still see
+        # the values. Phase F will drop these once readers migrate. Always
+        # mirror hot fields; ring buffers only on the every-5th cycle.
+        ctx = dict(task.context or {})
+        if metrics_dump is not None:
             ctx['last_metrics'] = metrics_dump
-            history = list(ctx.get('metrics_history', []))
-            entry: dict = {'t': _utcnow().isoformat()}
-            for k in ('rss_mb', 'heap_used_mb', 'disk_free_mb', 'disk_total_mb', 'cgroup_mb', 'cgroup_limit_mb'):
-                if metrics_dump.get(k) is not None:
-                    entry[k] = metrics_dump[k]
-            history.append(entry)
-            if len(history) > 30:
-                history = history[-30:]
-            ctx['metrics_history'] = history
-        if req.tool_trace is not None:
-            # Overwrite rather than append — the agent already maintains a
-            # ring buffer of the latest entries, so each heartbeat carries the
-            # authoritative recent-tool-calls window. Last-successful
-            # heartbeat's value is the death trace after reap.
-            ctx['_tool_trace'] = [t.model_dump() for t in req.tool_trace]
+        if latest_tool_use_at is not None:
+            ctx['last_tool_use_at'] = latest_tool_use_at.isoformat()
+        if persist_audit_trail:
+            if metrics_dump is not None:
+                history = list(ctx.get('metrics_history', []))
+                entry: dict = {'t': _utcnow().isoformat()}
+                for k in ('rss_mb', 'heap_used_mb', 'disk_free_mb', 'disk_total_mb', 'cgroup_mb', 'cgroup_limit_mb'):
+                    if metrics_dump.get(k) is not None:
+                        entry[k] = metrics_dump[k]
+                history.append(entry)
+                if len(history) > 30:
+                    history = history[-30:]
+                ctx['metrics_history'] = history
+            if req.tool_trace is not None:
+                # Overwrite — the agent's ring buffer already trims to the
+                # latest window, so each heartbeat carries the authoritative
+                # recent-tool-calls window. Last-successful value is the
+                # death trace after reap.
+                ctx['_tool_trace'] = [t.model_dump() for t in req.tool_trace]
         task.context = ctx
 
     session.add(task)

@@ -68,8 +68,16 @@ async def _lock_task_for_mutation(
     *,
     allowed_statuses: tuple[TaskStatus, ...] | None = None,
     reason: str = "task mutation",
+    expected_updated_at=None,
 ) -> Task | None:
-    """Lock a task before a hot-path mutation and rollback on skipped rows."""
+    """Lock a task before a hot-path mutation and rollback on skipped rows.
+
+    Phase B3: ``expected_updated_at`` enables the commit-release-relock pattern
+    used to break lock windows around long-running GitHub I/O. When set, the
+    re-acquired row's ``updated_at`` must match the snapshot — if a peer
+    mutated the row during the unlocked window we defer (return None) so the
+    caller can either retry on the next sweep or surface a conflict.
+    """
     async with task_lock(session, task_id) as task:
         if task is None:
             logger.info("[ORCHESTRATOR] %s for task %s deferred: task row locked", reason, task_id)
@@ -81,6 +89,14 @@ async def _lock_task_for_mutation(
                 reason,
                 task_id,
                 task.status,
+            )
+            await session.rollback()
+            return None
+        if expected_updated_at is not None and task.updated_at != expected_updated_at:
+            logger.info(
+                "[ORCHESTRATOR] %s for task %s deferred: row mutated during unlocked window "
+                "(expected updated_at=%s, found %s)",
+                reason, task_id, expected_updated_at, task.updated_at,
             )
             await session.rollback()
             return None
@@ -2627,9 +2643,25 @@ async def orchestrator_worker():
 
                         if need_pr_fetch:
                             ci_loop["polls_since_pr_fetch"] = 0
+                            # ── Phase B3: release lock around get_pull_request ──
+                            # GitHub rate-limit can hold this call for minutes;
+                            # holding the lock starves concurrent heartbeats on
+                            # the same task. Release, fetch, re-acquire-validate.
+                            ci_pre_pr_updated_at = ci_task.updated_at
+                            await session.commit()
                             try:
                                 pr_data = await get_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
                             except HTTPException as exc:
+                                # Re-acquire to apply error-path mutations
+                                ci_task = await _lock_task_for_mutation(
+                                    session, ci_task_id,
+                                    allowed_statuses=(TaskStatus.EVALUATING,),
+                                    reason="CI polling after PR fetch error",
+                                    expected_updated_at=ci_pre_pr_updated_at,
+                                )
+                                if ci_task is None:
+                                    continue
+                                ci_loop = dict((ci_task.context or {}).get("review_loop", {}) or {})
                                 if exc.status_code in (404, 410):
                                     _pr_gone_msg = f"PR #{ci_pr_number} no longer exists (deleted or repo archived)"
                                     logger.exception(f"[CI] {_pr_gone_msg} for task {ci_task.id}")
@@ -2666,6 +2698,17 @@ async def orchestrator_worker():
                             if not pr_data:
                                 await session.rollback()
                                 continue
+
+                            # Re-acquire lock after successful PR fetch.
+                            ci_task = await _lock_task_for_mutation(
+                                session, ci_task_id,
+                                allowed_statuses=(TaskStatus.EVALUATING,),
+                                reason="CI polling after PR fetch",
+                                expected_updated_at=ci_pre_pr_updated_at,
+                            )
+                            if ci_task is None:
+                                continue
+                            ci_loop = dict((ci_task.context or {}).get("review_loop", {}) or {})
 
                             if ci_loop.get("pr_fetch_failures"):
                                 ci_loop["pr_fetch_failures"] = 0
@@ -2862,14 +2905,32 @@ async def orchestrator_worker():
                             _ms = (pr_data.get("mergeable_state") or "").lower()
                             _behind_fallthrough = False
                             if _ms == "behind":
+                                # ── Phase B3: release lock around update_branch_with_sha_retry ──
+                                # The retry helper internally retries on 422; cumulative
+                                # wait can be 30s+. Drop the lock so concurrent heartbeats
+                                # on this same task (rollup parents share a row) don't queue.
+                                ci_pre_update_branch_updated_at = ci_task.updated_at
+                                ci_pid_str = str(ci_task.project_id)
+                                _expected_head_sha = pr_data.get("head", {}).get("sha") or None
+                                await session.commit()
                                 # Trivially resolvable via GitHub's update-branch API.
                                 # Update the branch in-place; the merge-commit
                                 # triggers fresh CI and the next poll re-evaluates.
                                 _upd = await update_branch_with_sha_retry(
                                     ci_gh_token, ci_owner, ci_repo, ci_pr_number,
-                                    expected_head_sha=pr_data.get("head", {}).get("sha") or None,
-                                    project_id=str(ci_task.project_id),
+                                    expected_head_sha=_expected_head_sha,
+                                    project_id=ci_pid_str,
                                 )
+                                # Re-acquire to apply downstream mutations.
+                                ci_task = await _lock_task_for_mutation(
+                                    session, ci_task_id,
+                                    allowed_statuses=(TaskStatus.EVALUATING,),
+                                    reason="CI polling after update_branch",
+                                    expected_updated_at=ci_pre_update_branch_updated_at,
+                                )
+                                if ci_task is None:
+                                    continue
+                                ci_loop = dict((ci_task.context or {}).get("review_loop", {}) or {})
                                 if _upd.get("updated"):
                                     ci_task.latest_status_message = (
                                         f"PR #{ci_pr_number} was behind base — updated branch via GitHub API, awaiting fresh CI"
@@ -3105,9 +3166,26 @@ async def orchestrator_worker():
                             logger.info(f"[CI] PR #{ci_pr_number} has no HEAD SHA — skipping CI check this cycle")
                             continue
 
+                        # ── Phase B3: release lock around get_check_runs_cached ──
+                        # Even with TTL caching, a cache miss makes a real GitHub
+                        # API call that can hang during rate-limit. Drop the lock
+                        # so concurrent heartbeats proceed.
+                        ci_pre_check_updated_at = ci_task.updated_at
+                        ci_project_id_str = str(ci_task.project_id)
+                        await session.commit()
                         # Dedup cached — siblings on the same head_sha collapse
                         # into one underlying GitHub call within the 30s TTL.
-                        ci_result = await get_check_runs_cached(ci_gh_token, ci_owner, ci_repo, ci_head_sha, project_id=str(ci_task.project_id))
+                        ci_result = await get_check_runs_cached(ci_gh_token, ci_owner, ci_repo, ci_head_sha, project_id=ci_project_id_str)
+                        # Re-acquire to apply downstream mutations.
+                        ci_task = await _lock_task_for_mutation(
+                            session, ci_task_id,
+                            allowed_statuses=(TaskStatus.EVALUATING,),
+                            reason="CI polling after check_runs fetch",
+                            expected_updated_at=ci_pre_check_updated_at,
+                        )
+                        if ci_task is None:
+                            continue
+                        ci_loop = dict((ci_task.context or {}).get("review_loop", {}) or {})
 
                         # Track whether CI checks have ever been observed for this PR
                         ci_details = ci_result.get("details", [])

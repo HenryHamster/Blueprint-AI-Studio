@@ -11,7 +11,7 @@ and preserve test-patchability.
 import logging
 import time
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 
 # Module-level negative cache for PR-merge verification keyed by task.id.
@@ -45,6 +45,67 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
     _ROLLUP_TRANSIENT_CTX_KEYS,
     _clear_rollup_transient_state,
 )
+
+
+# Phase B3 (lock-window break): each GitHub API call inside
+# _check_and_trigger_rollup can hang 5-30s (worst case minutes during
+# rate-limit). Holding the parent's FOR UPDATE lock across that window
+# starves concurrent heartbeats on sibling children — they see 30s
+# lock_timeout and the reaper false-orphans them. The fix is to commit
+# any pending mutations to release the lock, perform the GitHub call(s)
+# without lock held, then re-acquire and validate `updated_at` to detect
+# whether the staging-state changed during the unlocked window.
+async def _release_parent_lock(parent: Task, session: AsyncSession) -> datetime:
+    """Commit any pending mutations on parent and release the FOR UPDATE lock.
+
+    Returns the parent's `updated_at` snapshot (the value SQLAlchemy will compare
+    against in the re-acquire step). Caller must reload from DB after the GitHub
+    call via `_relock_parent`.
+    """
+    from app.main import _utcnow
+    session.add(parent)
+    await session.commit()
+    # Snapshot updated_at *after* the commit — the onupdate trigger will have
+    # bumped it if any mutation occurred. Return it so the next re-acquire can
+    # compare against this exact value.
+    snapshot = parent.updated_at or _utcnow()
+    return snapshot
+
+
+async def _relock_parent(
+    session: AsyncSession,
+    parent_id,
+    expected_updated_at,
+) -> Task | None:
+    """Re-acquire FOR UPDATE on the parent row and validate staging-state.
+
+    Returns the freshly-loaded Task if the row is still ours and unchanged,
+    or None if:
+        - the row is held by another writer (skip_locked yielded nothing), OR
+        - the row's updated_at has advanced past the snapshot (someone wrote
+          to it during the unlocked window — the mutation we were about to
+          apply may now be stale).
+
+    Mirrors the early-commit pattern in routers/agent_status.py:1694: release
+    the lock around long-running I/O, then resume on a fresh row read.
+    """
+    fresh = (await session.execute(
+        select(Task).where(Task.id == parent_id).with_for_update(skip_locked=True)
+    )).scalars().first()
+    if fresh is None:
+        logger.info(
+            "[ROLLUP] Re-lock skipped for parent %s — row held by peer, "
+            "deferring to next cycle", parent_id,
+        )
+        return None
+    if expected_updated_at is not None and fresh.updated_at != expected_updated_at:
+        logger.info(
+            "[ROLLUP] Re-lock detected concurrent mutation on parent %s "
+            "(expected updated_at=%s, found %s) — deferring to next cycle",
+            parent_id, expected_updated_at, fresh.updated_at,
+        )
+        return None
+    return fresh
 
 
 def _record_rollup_failure_signals(task: Task, failure_class: str) -> None:
@@ -707,6 +768,29 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             try:
                 gh_token, owner, repo = await get_github_token_for_task(parent.id, session)
 
+                # ── Phase B3 lock-window break ──
+                # The next three GitHub calls (get_open_pull_requests,
+                # get_branch_sha x2) are read-only verifications that can
+                # collectively hang 5-30s during rate-limit. Release the
+                # parent lock so concurrent heartbeats on sibling children
+                # don't queue behind us.
+                #
+                # Audit Phase C4 (M-C1): with `expire_on_commit=False` (see
+                # database.py), attributes on `parent` are NOT refreshed after
+                # the commit below. Code between this release and the
+                # `_relock_parent` call at the bottom of this block MUST treat
+                # `parent` as snapshot-stale: only stable identifiers (id,
+                # project_id) and the captured `pre_gh_updated_at` are safe to
+                # read. Any mutable attribute (status, context, payloads,
+                # latest_status_message) is potentially out-of-date and MUST
+                # be re-read from the freshly-locked instance returned by
+                # `_relock_parent`. The `parent_id_local` / `project_id_local`
+                # captures below exist precisely so error logs and follow-up
+                # GitHub calls don't accidentally trigger a stale read.
+                parent_id_local = parent.id
+                project_id_local = parent.project_id
+                pre_gh_updated_at = await _release_parent_lock(parent, session)
+
                 # Verify all PRs targeting the staging branch are resolved before rolling up
                 from app.github import get_open_pull_requests
                 try:
@@ -714,22 +798,15 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 except HTTPException as api_err:
                     if api_err.status_code == 401:
                         from app.routers.agent import invalidate_github_token_cache
-                        invalidate_github_token_cache(str(parent.project_id))
+                        invalidate_github_token_cache(str(project_id_local))
                         logger.warning(f"[ROLLUP] Auth failure listing open PRs for {owner}/{repo} — retrying with fresh token")
-                        gh_token, owner, repo = await get_github_token_for_task(parent.id, session, force_refresh=True)
+                        gh_token, owner, repo = await get_github_token_for_task(parent_id_local, session, force_refresh=True)
                         open_prs = await get_open_pull_requests(gh_token, owner, repo, staging_branch)
                     elif api_err.status_code in (403, 500, 502, 503):
                         logger.warning(f"[ROLLUP] GitHub error {api_err.status_code} listing open PRs — deferring to next cycle")
                         return
                     else:
                         raise
-                if open_prs:
-                    pr_nums = [f"#{p['number']}" for p in open_prs]
-                    parent.latest_status_message = f"Rollup waiting: {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)}"
-                    session.add(parent)
-                    await session.commit()
-                    logger.info(f"[ROLLUP] Parent {parent.id} has {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)} — waiting")
-                    return
 
                 # Verify target branch exists before creating PR.
                 # Distinguish 404 (actually deleted) from transient GitHub errors
@@ -760,7 +837,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     await get_branch_sha(gh_token, owner, repo, staging_branch)
                 except HTTPException as http_err:
                     if http_err.status_code == 404:
-                        logger.warning(f"[ROLLUP] Staging branch '{staging_branch}' not found (404) for task {parent.id}")
+                        # Use `parent_id_local` (captured pre-release) instead
+                        # of `parent.id` to make the snapshot-stale contract
+                        # explicit: see audit-C4 (M-C1) note above.
+                        logger.warning(f"[ROLLUP] Staging branch '{staging_branch}' not found (404) for task {parent_id_local}")
                         staging_branch_missing = True
                     elif http_err.status_code in (401, 403):
                         logger.exception(f"[ROLLUP] Auth error {http_err.status_code} checking staging branch — deferring")
@@ -771,6 +851,27 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 except Exception as e:
                     logger.warning(f"[ROLLUP] Error checking staging branch '{staging_branch}': {e} — deferring")
                     return
+
+                # ── Phase B3: re-acquire the lock before applying mutations ──
+                # The three GitHub reads above were performed without the lock.
+                # Validate updated_at hasn't changed; if it has, another writer
+                # mutated the parent during our window — defer to next cycle.
+                parent = await _relock_parent(session, parent_id_local, pre_gh_updated_at)
+                if parent is None:
+                    return
+                parent_ctx = parent.context or {}
+                # Re-validate parent status — a peer may have moved it past EVALUATING.
+                if parent.status != TaskStatus.EVALUATING:
+                    return
+
+                if open_prs:
+                    pr_nums = [f"#{p['number']}" for p in open_prs]
+                    parent.latest_status_message = f"Rollup waiting: {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)}"
+                    session.add(parent)
+                    await session.commit()
+                    logger.info(f"[ROLLUP] Parent {parent.id} has {len(open_prs)} open PR(s) targeting {staging_branch}: {', '.join(pr_nums)} — waiting")
+                    return
+
                 if staging_branch_missing:
                     # Check if all children completed — if so, work already landed
                     all_children_ok = completed_count > 0 and failed_count == 0
@@ -823,9 +924,26 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # Resume from prior crash — skip PR creation if already done
                 existing_pr = parent_ctx.get("rollup_pr_number")
                 if existing_pr:
-                    # Validate PR is still open — it may have been merged/closed since crash
+                    # ── Phase B3: release lock around get_pull_request ──
+                    pre_existing_pr_updated_at = await _release_parent_lock(parent, session)
+                    pr_state: dict | None = None
+                    pr_state_err: Exception | None = None
                     try:
                         pr_state = await get_pull_request(gh_token, owner, repo, existing_pr)
+                    except Exception as e:
+                        pr_state_err = e
+                    # Re-acquire and validate
+                    parent = await _relock_parent(session, parent_id_local, pre_existing_pr_updated_at)
+                    if parent is None:
+                        return
+                    parent_ctx = parent.context or {}
+                    if parent.status != TaskStatus.EVALUATING:
+                        return
+                    # Re-read existing_pr from fresh context (a peer may have cleared it)
+                    existing_pr = parent_ctx.get("rollup_pr_number")
+                    if pr_state_err is not None:
+                        logger.warning(f"[ROLLUP] Could not verify PR #{existing_pr} state: {pr_state_err} — proceeding with existing marker")
+                    elif existing_pr is not None and pr_state is not None:
                         if pr_state.get("merged"):
                             logger.info(f"[ROLLUP] PR #{existing_pr} already merged — marking COMPLETED")
                             parent.status = TaskStatus.COMPLETED
@@ -845,8 +963,6 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             existing_pr = None
                             session.add(parent)
                             await session.commit()
-                    except Exception as e:
-                        logger.warning(f"[ROLLUP] Could not verify PR #{existing_pr} state: {e} — proceeding with existing marker")
 
                 if existing_pr:
                     rollup_pr_number = existing_pr
@@ -866,8 +982,34 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         children=_completed_children,
                     )
 
+                    # ── Phase B3: release lock around create_pull_request ──
+                    # PR creation is the longest-running call in this function:
+                    # 5-15s on the happy path, minutes during rate-limit. The
+                    # rollup_pr_number/rollup_pr_url written below are the
+                    # marker for crash-recovery, so the post-create re-acquire
+                    # MUST validate and persist before any other writer can
+                    # observe an empty marker.
+                    project_id_str = str(parent.project_id)
+                    pre_create_updated_at = await _release_parent_lock(parent, session)
+
                     pr_result = await create_pull_request(gh_token, owner, repo,
-                        title=pr_title, head=staging_branch, base=target_branch, body=pr_body, project_id=str(parent.project_id))
+                        title=pr_title, head=staging_branch, base=target_branch, body=pr_body, project_id=project_id_str)
+
+                    parent = await _relock_parent(session, parent_id_local, pre_create_updated_at)
+                    if parent is None:
+                        # Concurrent writer mutated the parent during PR creation.
+                        # The orphan-PR rescue path in the except handler will
+                        # persist the marker via a fresh session if we raise.
+                        # Re-fetch without lock and bail safely.
+                        logger.info(
+                            f"[ROLLUP] Parent {parent_id_local} mutated during create_pull_request — "
+                            f"orphan-PR rescue will persist marker"
+                        )
+                        rollup_pr_number = pr_result.get("number")
+                        rollup_pr_url = pr_result.get("html_url", "")
+                        # Trigger orphan-PR rescue path
+                        raise Exception("Parent state changed during create_pull_request — deferring")
+                    parent_ctx = parent.context or {}
 
                     # Empty diff — branches are identical, nothing to merge
                     if pr_result.get("empty_diff"):
@@ -949,11 +1091,17 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
                 # Auto-merge small rollups on intermediate branches; review large ones
                 # Measure by total lines changed (additions + deletions)
+                # ── Phase B3: release lock around diff-size check + close on zero-diff ──
+                # get_pull_request can hang 5-30s; close_pull_request + delete_branch
+                # are also synchronous I/O. Releasing the lock around this cluster
+                # lets concurrent heartbeats on sibling children proceed.
+                project_id_str = str(parent.project_id)
+                pre_diff_updated_at = await _release_parent_lock(parent, session)
                 try:
-                    pr_detail = await get_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id))
+                    pr_detail = await get_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=project_id_str)
                     lines_changed = pr_detail.get("additions", 0) + pr_detail.get("deletions", 0)
                 except Exception as e:
-                    logger.warning(f"[ROLLUP] Failed to fetch PR #{rollup_pr_number} diff size for task {parent.id}: {e}")
+                    logger.warning(f"[ROLLUP] Failed to fetch PR #{rollup_pr_number} diff size for task {parent_id_local}: {e}")
                     lines_changed = 999  # assume large if we can't check
                     pr_detail = None
 
@@ -962,13 +1110,17 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 if pr_detail is not None and lines_changed == 0:
                     logger.info(f"[ROLLUP] PR #{rollup_pr_number} has zero lines changed — closing and marking COMPLETED")
                     try:
-                        await close_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id))
+                        await close_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=project_id_str)
                     except Exception as e:
                         logger.warning(f"[ROLLUP] Failed to close zero-diff PR #{rollup_pr_number}: {e}")
                     try:
                         await delete_branch(gh_token, owner, repo, staging_branch)
                     except Exception as e:
-                        logger.warning(f"[ROLLUP] Failed to delete staging branch '{staging_branch}' for task {parent.id}: {e}")
+                        logger.warning(f"[ROLLUP] Failed to delete staging branch '{staging_branch}' for task {parent_id_local}: {e}")
+                    # Re-acquire to apply mutation
+                    parent = await _relock_parent(session, parent_id_local, pre_diff_updated_at)
+                    if parent is None:
+                        return
                     parent.status = TaskStatus.COMPLETED
                     parent.latest_status_message = f"✓ All {completed_count} subtasks completed — rollup PR #{rollup_pr_number} had no file changes (already on {target_branch})"
                     _cleared = _clear_rollup_transient_state(parent.context)
@@ -979,6 +1131,14 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     await _cleanup_branches(parent, session)
                     await broadcast_to_project(str(parent.project_id), "task_updated",
                                                {"task_id": str(parent.id), "status": TaskStatus.COMPLETED})
+                    return
+
+                # Non-zero-diff path: re-acquire for downstream mutations.
+                parent = await _relock_parent(session, parent_id_local, pre_diff_updated_at)
+                if parent is None:
+                    return
+                parent_ctx = parent.context or {}
+                if parent.status != TaskStatus.EVALUATING:
                     return
 
                 # If diff size is unverifiable (metadata fetch failed), defer the
@@ -1002,41 +1162,78 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 is_small_rollup = lines_changed <= 100
                 logger.info(f"[ROLLUP] PR #{rollup_pr_number}: {lines_changed} lines changed, {'auto-merge' if is_small_rollup and is_target_intermediate else 'review'}")
                 if is_target_intermediate and is_small_rollup:
-                    # Always run security scan before any merge
+                    # ── Phase B3: release lock around security scan + comment + merge ──
+                    # The scan inspects PR diffs (multiple GH API calls), the comment
+                    # is a write, and the merge is the slowest call of all. Holding
+                    # the lock across this cluster previously starved sibling-child
+                    # heartbeats during minutes-long rate-limit windows.
+                    pre_merge_updated_at = await _release_parent_lock(parent, session)
+                    rollup_scan: dict | None = None
+                    rollup_scan_err: Exception | None = None
                     try:
                         rollup_scan = await scan_pr_for_injection(gh_token, owner, repo, rollup_pr_number)
                         logger.info(f"[SECURITY] Rollup scan: {rollup_scan['summary']}")
-                        if rollup_scan["blocked"]:
-                            parent.requires_approval = True
-                            parent.latest_status_message = f"Rollup security scan blocked: {rollup_scan['summary']}"
-                            parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
-                            if rollup_scan["findings"]:
-                                await create_pr_comment(gh_token, owner, repo, rollup_pr_number, rollup_scan["report"])
-                            session.add(parent)
-                            await _dispatch_rollup_approval_alert(
-                                parent, session,
-                                f"Rollup PR #{rollup_pr_number} blocked by security scan: {rollup_scan['summary']}",
-                                pr_number=rollup_pr_number,
-                            )
-                            await session.commit()
-                            return
-                        if rollup_scan["findings"]:
-                            await create_pr_comment(gh_token, owner, repo, rollup_pr_number, rollup_scan["report"])
                     except Exception as e:
+                        rollup_scan_err = e
                         logger.error(f"[SECURITY] Rollup scan failed for PR #{rollup_pr_number}, blocking: {e}", exc_info=True)
+
+                    # Re-acquire to apply mutations / dispatch alerts.
+                    parent = await _relock_parent(session, parent_id_local, pre_merge_updated_at)
+                    if parent is None:
+                        return
+                    parent_ctx = parent.context or {}
+                    if parent.status != TaskStatus.EVALUATING:
+                        return
+
+                    if rollup_scan_err is not None:
                         parent.requires_approval = True
-                        parent.latest_status_message = f"Rollup security scan failed — requires manual approval: {type(e).__name__}: {e!r}"[:500]
+                        parent.latest_status_message = f"Rollup security scan failed — requires manual approval: {type(rollup_scan_err).__name__}: {rollup_scan_err!r}"[:500]
                         parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
                         session.add(parent)
                         await _dispatch_rollup_approval_alert(
                             parent, session,
-                            f"Rollup PR #{rollup_pr_number} security scan failed — requires manual approval: {type(e).__name__}",
+                            f"Rollup PR #{rollup_pr_number} security scan failed — requires manual approval: {type(rollup_scan_err).__name__}",
                             pr_number=rollup_pr_number,
                         )
                         await session.commit()
                         return
 
+                    if rollup_scan["blocked"]:
+                        parent.requires_approval = True
+                        parent.latest_status_message = f"Rollup security scan blocked: {rollup_scan['summary']}"
+                        parent.context = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                        # Persist + commit BEFORE the comment (releases lock for I/O).
+                        session.add(parent)
+                        await _dispatch_rollup_approval_alert(
+                            parent, session,
+                            f"Rollup PR #{rollup_pr_number} blocked by security scan: {rollup_scan['summary']}",
+                            pr_number=rollup_pr_number,
+                        )
+                        await session.commit()
+                        # Comment after the lock is released — it's an external side-effect.
+                        if rollup_scan["findings"]:
+                            try:
+                                await create_pr_comment(gh_token, owner, repo, rollup_pr_number, rollup_scan["report"])
+                            except Exception as e:
+                                logger.warning(f"[ROLLUP] Failed to post scan-block comment on PR #{rollup_pr_number}: {e}")
+                        return
+                    if rollup_scan["findings"]:
+                        # Findings but not blocked — post comment outside lock window
+                        # is fine; we don't mutate the parent for this case.
+                        try:
+                            await create_pr_comment(gh_token, owner, repo, rollup_pr_number, rollup_scan["report"])
+                        except Exception as e:
+                            logger.warning(f"[ROLLUP] Failed to post scan comment on PR #{rollup_pr_number}: {e}")
+
+                    # Release lock around the actual merge call (slowest of all).
+                    pre_actual_merge_updated_at = await _release_parent_lock(parent, session)
                     merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id))
+                    parent = await _relock_parent(session, parent_id_local, pre_actual_merge_updated_at)
+                    if parent is None:
+                        # Concurrent mutation; merge call already completed externally,
+                        # next sweep will pick up the merged state.
+                        return
+                    parent_ctx = parent.context or {}
                     if merge_result.get("merged"):
                         parent.status = TaskStatus.COMPLETED
                         parent.context = {

@@ -48,6 +48,11 @@ async def get_health_overview(
     else:
         window_start = now - timedelta(hours=lookback_hours)
         prev_window_start = window_start - timedelta(hours=lookback_hours)
+        # Phase B4 (H-P4): cap unbounded scan at 5000 rows (was 20000) and
+        # warn if truncated. The status_log JSONB column is required because
+        # _derive_at() reads its last entry. Other heavy JSONBs (context,
+        # payloads, plan_output) stay deferred via load_only.
+        _XP_LIMIT = 5000
         xp_result = await session.execute(
             select(Task).where(
                 Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
@@ -55,9 +60,16 @@ async def get_health_overview(
                 Task.archived.is_(False),
             ).options(
                 load_only(Task.id, Task.status, Task.created_at, Task.status_log)
-            ).limit(20000)
+            ).limit(_XP_LIMIT)
         )
         xp_tasks = xp_result.scalars().all()
+        if len(xp_tasks) >= _XP_LIMIT:
+            logger.warning(
+                "[HEALTH-OVERVIEW] success-rate scan hit cap=%d rows over %dh — "
+                "result truncated; consider narrowing the lookback window or "
+                "adding a project_id filter",
+                _XP_LIMIT, lookback_hours * 2,
+            )
 
         def _derive_at(t: Task):
             if t.status_log:

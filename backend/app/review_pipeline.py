@@ -13,6 +13,7 @@ from datetime import timedelta
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.github import post_pipeline_merge_summary_comment as post_merge_summary_comment  # noqa: F401
@@ -986,27 +987,40 @@ async def _spawn_pipeline_task(
         # replacement task in the same transaction.
         await session.flush()
 
-    # Per-PR iteration cap: count completed review/fix tasks for this PR across all chains
-    # Filter to tasks matching this PR number (check payloads JSONB).
+    # Per-PR iteration cap: count completed review/fix tasks for this PR across all chains.
     # Excludes archived tasks (manual iteration-cap reset path) and infra-class
     # failures: a task that died in VM provisioning / rate limit / agent timeout
     # / external API / stale-info push never actually ran a review, so counting
     # it toward the per-PR iteration cap would trip the cap with zero real
     # reviews on the PR.
+    #
+    # Push pr_number + type filters into SQL via the partial expression index
+    # ``ix_task_payloads_pr_number`` (alembic 0057). The infra-class failure
+    # filter remains Python-side because INFRA_CLASSES is composed dynamically.
+    # ``load_only`` keeps the row narrow — we only need status/context/payloads
+    # for the post-filter; status_log and other JSONB columns stay deferred.
     from app.failure_classification import INFRA_CLASSES  # noqa: PLC0415
     pr_pipeline_tasks = (await session.execute(
-        select(Task).where(
+        select(Task)
+        .options(load_only(
+            Task.id,
+            Task.status,
+            Task.context,
+            Task.payloads,
+            Task.archived,
+            Task.project_id,
+            Task.created_at,
+        ))
+        .where(
             Task.project_id == source_task.project_id,
             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
             Task.archived.is_(False),
+            Task.payloads[0]["pr_number"].as_string() == str(pr_number),
+            Task.payloads[0]["type"].as_string().in_(("review", "fix")),
         )
     )).scalars().all()
 
     def _counts_toward_cap(t: Task) -> bool:
-        if t.first_payload.get("pr_number") != pr_number:
-            return False
-        if t.first_payload.get("type") not in ("review", "fix"):
-            return False
         if t.status == TaskStatus.FAILED:
             fc = (t.context or {}).get("failure_category")
             if fc in INFRA_CLASSES:
