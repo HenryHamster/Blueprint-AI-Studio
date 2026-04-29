@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type React from 'react';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
+import type { UserLaunchableTaskType } from '../taskCapabilities';
 
 interface RepoOption {
   full_name: string;
@@ -8,7 +9,7 @@ interface RepoOption {
 }
 
 export function useTaskModal(
-  defaultTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor',
+  defaultTaskType: UserLaunchableTaskType,
   addToast: (msg: string, type: 'success' | 'error') => void,
   fetchTasksRef: React.MutableRefObject<() => void>,
 ) {
@@ -20,9 +21,7 @@ export function useTaskModal(
   const [newTaskBranch, setNewTaskBranch] = useState('main');
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskPrompt, setNewTaskPrompt] = useState('');
-  const [newTaskType, setNewTaskType] = useState<
-    'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor'
-  >('create');
+  const [newTaskType, setNewTaskType] = useState<UserLaunchableTaskType>('create');
   const [newTaskPrNumber, setNewTaskPrNumber] = useState('');
   const [newTaskPrBranch, setNewTaskPrBranch] = useState('');
   const [newTaskModel, setNewTaskModel] = useState('');

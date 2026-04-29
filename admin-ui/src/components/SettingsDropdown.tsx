@@ -11,6 +11,8 @@ import { ProjectAutoReviewSection } from './ProjectAutoReviewSection';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from '../types/project';
 import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench, Tag, HelpCircle, Plus, ChevronDown, ChevronUp, RefreshCw } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
+import { USER_LAUNCHABLE_TASK_TYPE_OPTIONS } from '../taskCapabilities';
+import type { UserLaunchableTaskType } from '../taskCapabilities';
 export type { MaxPlanAccount } from '../types/settings';
 import type { AuthMode, CategoryRoutingEntry, DeployState, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import { DeploySection } from './SettingsDeploySection';
@@ -21,8 +23,8 @@ interface SettingsDropdownProps {
   onToggleSettings: () => void;
   settingsRef: React.RefObject<HTMLDivElement | null>;
   // Defaults
-  defaultTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor';
-  onUpdateDefaultTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor') => void;
+  defaultTaskType: UserLaunchableTaskType;
+  onUpdateDefaultTaskType: (value: UserLaunchableTaskType) => void;
   viewMode: 'kanban' | 'pipeline' | 'home';
   onSetViewMode: (mode: 'kanban' | 'pipeline' | 'home') => void;
   // Notifications
@@ -502,16 +504,12 @@ export function SettingsDropdown({
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Default Task Type</label>
               <select
                 value={defaultTaskType}
-                onChange={e => onUpdateDefaultTaskType(e.target.value as 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor')}
+                onChange={e => onUpdateDefaultTaskType(e.target.value as UserLaunchableTaskType)}
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
               >
-                <option value="create">Create</option>
-                <option value="refactor">Refactor</option>
-                <option value="plan">Plan</option>
-                <option value="research">Research</option>
-                <option value="review">Review</option>
-                <option value="fix">Fix</option>
-                <option value="migrate">Migrate</option>
+                {USER_LAUNCHABLE_TASK_TYPE_OPTIONS.map(option => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
               </select>
             </div>
             <div>

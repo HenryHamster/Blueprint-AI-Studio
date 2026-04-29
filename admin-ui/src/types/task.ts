@@ -1,5 +1,7 @@
+import type { TaskType } from '../taskCapabilities';
+
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
-export type TaskType = 'create' | 'plan' | 'research' | 'review' | 'fix' | 'refactor' | 'docs' | 'security_audit' | 'qa' | 'deps' | 'migrate' | 'investigate' | 'debug' | 'smoketest' | 'rollup' | 'perf' | 'strategic_review' | 'design_doc_update';
+export type { TaskType };
 
 export interface ResearchFinding {
   type?: string;

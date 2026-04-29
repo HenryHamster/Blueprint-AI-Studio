@@ -8,18 +8,11 @@ import type {
   TaskTypeRoutingEntry,
 } from '../types/settings';
 import { EFFORT_LEVELS } from '../types/settings';
-
-// Must match backend payload_schemas.py::TaskType. `investigate` is omitted —
-// exists in the enum but no spawner wires it.
-const ALL_TASK_TYPES = [
-  'create', 'review', 'fix', 'plan', 'research',
-  'strategic_review', 'design_doc_update', 'security_audit',
-  'qa', 'deps', 'docs', 'migrate', 'smoketest',
-  'refactor', 'debug', 'perf',
-] as const;
+import { PROVIDER_ROUTABLE_TASK_TYPE_IDS } from '../taskCapabilities';
 
 const DEFAULT_CATEGORY_KEY = '_default';
 type SelectionMode = 'balanced' | 'preferred' | 'exclusive';
+const ALL_TASK_TYPES = [...PROVIDER_ROUTABLE_TASK_TYPE_IDS];
 
 const MODE_DESCRIPTIONS: Record<SelectionMode, string> = {
   balanced: 'Pool accounts across listed providers; pick by health + current load. Adding an account immediately puts it into rotation.',
@@ -165,7 +158,7 @@ export function ProviderCategoriesPanel({
         name={DEFAULT_CATEGORY_KEY}
         isDefault
         members={[]}
-        allTaskTypes={ALL_TASK_TYPES as unknown as string[]}
+        allTaskTypes={[...PROVIDER_ROUTABLE_TASK_TYPE_IDS]}
         taskTypeCategories={taskTypeCategories}
         providerNames={providerNames}
         entry={defaultEntry}
@@ -207,7 +200,7 @@ export function ProviderCategoriesPanel({
               key={category}
               name={category}
               members={members || []}
-              allTaskTypes={ALL_TASK_TYPES as unknown as string[]}
+              allTaskTypes={[...PROVIDER_ROUTABLE_TASK_TYPE_IDS]}
               taskTypeCategories={taskTypeCategories}
               providerNames={providerNames}
               entry={categoryRouting[category] ?? { providers: defaultEntry.providers, effort: defaultEntry.effort }}

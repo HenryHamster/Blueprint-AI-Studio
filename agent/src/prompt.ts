@@ -3,6 +3,7 @@ import { execFileSync } from 'child_process';
 import { WORKSPACE } from './index.js';
 import type { BuildConfig } from './index.js';
 import { formatProjectContext } from './prompts/project-context.js';
+import { isReadOnlyTaskType } from './taskCapabilities.js';
 
 // ── Re-exports from sub-modules (facade) ────────────────────────────────────
 // The bulky helpers have been split out into prompts/* modules so that small
@@ -34,12 +35,6 @@ export {
 // Write .claude/settings.json in the workspace to restrict what the inner
 // Claude Code agent can do.  Each task type gets appropriate permissions.
 
-const READ_ONLY_TYPES = new Set([
-  'research', 'plan', 'review', 'security_audit', 'smoketest',
-  'debug', 'perf', 'investigate', 'design_doc_update', 'strategic_review',
-  'self_audit',
-]);
-
 // Write types get no restrictions (default behavior). Listed for documentation:
 // create, fix, refactor, docs, qa, deps, migrate
 
@@ -50,7 +45,7 @@ const READ_ONLY_TYPES = new Set([
  * Call this AFTER cloning the repo but BEFORE running Claude Code.
  */
 export function configureAgentPermissions(taskType: string): string[] {
-  if (READ_ONLY_TYPES.has(taskType)) {
+  if (isReadOnlyTaskType(taskType)) {
     // Strip GitHub token from git remote so the agent can't push
     try {
       execFileSync('git', ['remote', 'set-url', 'origin', 'https://github.com/readonly/readonly.git'], { cwd: WORKSPACE });

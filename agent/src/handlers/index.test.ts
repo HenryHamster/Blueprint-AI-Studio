@@ -66,30 +66,12 @@ vi.mock('ws', () => ({
 }));
 
 // ── Import under test ─────────────────────────────────────────────────────────
+import { ALL_AGENT_TASK_TYPES } from '../taskCapabilities.js';
 import { handlers } from './index.js';
 
 // ── Handler registry tests ────────────────────────────────────────────────────
 describe('handlers registry', () => {
-  const EXPECTED_TYPES = [
-    'create',
-    'review',
-    'fix',
-    'plan',
-    'research',
-    'docs',
-    'security_audit',
-    'self_audit',
-    'qa',
-    'deps',
-    'migrate',
-    'smoketest',
-    'refactor',
-    'debug',
-    'perf',
-    'investigate',
-    'design_doc_update',
-    'strategic_review',
-  ] as const;
+  const EXPECTED_TYPES = ALL_AGENT_TASK_TYPES;
 
   it('has exactly 18 handler entries', () => {
     expect(Object.keys(handlers)).toHaveLength(18);

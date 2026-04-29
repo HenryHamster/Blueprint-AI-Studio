@@ -61,6 +61,7 @@ import {
   synthesizeFailureHotspots,
   formatSelfReviewBlindSpots,
 } from './prompt.js';
+import { READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES } from './taskCapabilities.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
 describe('formatPlaybook', () => {
@@ -1611,30 +1612,7 @@ describe('configureAgentPermissions', () => {
     vi.clearAllMocks();
   });
 
-  const READ_ONLY_TYPES = [
-    'research',
-    'plan',
-    'review',
-    'security_audit',
-    'smoketest',
-    'debug',
-    'perf',
-    'investigate',
-    'design_doc_update',
-    'strategic_review',
-  ] as const;
-
-  const WRITE_TYPES = [
-    'create',
-    'fix',
-    'refactor',
-    'docs',
-    'qa',
-    'deps',
-    'migrate',
-  ] as const;
-
-  it.each(READ_ONLY_TYPES)(
+  it.each(READ_ONLY_TASK_TYPES)(
     'returns [Write, Edit, NotebookEdit] for read-only type "%s"',
     (taskType) => {
       const result = configureAgentPermissions(taskType);
@@ -1642,7 +1620,7 @@ describe('configureAgentPermissions', () => {
     },
   );
 
-  it.each(WRITE_TYPES)(
+  it.each(WRITE_TASK_TYPES)(
     'returns [] (no restrictions) for write type "%s"',
     (taskType) => {
       const result = configureAgentPermissions(taskType);

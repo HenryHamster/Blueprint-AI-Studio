@@ -1,4 +1,5 @@
 import type { DateRange } from '../hooks/useSearchFilters';
+import { FILTER_TASK_TYPE_IDS } from '../taskCapabilities';
 
 interface QuickFilterPresetsProps {
   statusFilter: string[];
@@ -21,7 +22,7 @@ interface QuickFilterPresetsProps {
 }
 
 const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED'];
-const ALL_TYPES = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup', 'perf', 'strategic_review', 'design_doc_update'];
+const ALL_TYPES = [...FILTER_TASK_TYPE_IDS];
 
 export function QuickFilterPresets({
   statusFilter, dateRange, requiresApproval, blockedFilter, stuckFilter, stuckCount, stuckCount1h, stuckMinSeconds, searchQuery,

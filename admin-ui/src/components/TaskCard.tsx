@@ -80,6 +80,7 @@ export const TASK_TYPE_STYLES: Record<string, { bg: string; text: string; icon: 
   perf: { bg: 'bg-pink-500/10 border-pink-500/20', text: 'text-pink-400', icon: Gauge, label: 'Perf' },
   strategic_review: { bg: 'bg-emerald-500/10 border-emerald-500/20', text: 'text-emerald-400', icon: Compass, label: 'Strategic Review' },
   design_doc_update: { bg: 'bg-slate-500/10 border-slate-500/20', text: 'text-slate-400', icon: FileText, label: 'Design Doc' },
+  self_audit: { bg: 'bg-fuchsia-500/10 border-fuchsia-500/20', text: 'text-fuchsia-400', icon: Shield, label: 'Self Audit' },
 };
 
 function parsePhase(statusMessage: string): string {
@@ -457,6 +458,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
     perf: 'border-l-pink-400',
     strategic_review: 'border-l-emerald-400',
     design_doc_update: 'border-l-sky-400',
+    self_audit: 'border-l-fuchsia-400',
   };
   const borderColor = task.task_type ? (taskTypeBorderColor[task.task_type] ?? 'border-l-neutral-700') : 'border-l-neutral-700';
 

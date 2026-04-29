@@ -1,14 +1,11 @@
 import { useState } from 'react';
+import { FILTER_TASK_TYPE_IDS } from '../taskCapabilities';
 
 export type DateRange = 'all' | '1h' | '6h' | '24h' | '7d';
 
 export function useSearchFilters() {
   const [searchQuery, setSearchQuery] = useState('');
-  const [taskTypeFilter, setTaskTypeFilter] = useState<string[]>([
-    'create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor',
-    'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup',
-    'perf', 'strategic_review', 'design_doc_update',
-  ]);
+  const [taskTypeFilter, setTaskTypeFilter] = useState<string[]>([...FILTER_TASK_TYPE_IDS]);
   const [statusFilter, setStatusFilter] = useState<string[]>([
     'QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED',
   ]);

@@ -1,19 +1,31 @@
 import { useState, useRef } from 'react';
 import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench } from 'lucide-react';
+import { USER_LAUNCHABLE_TASK_TYPE_OPTIONS } from '../taskCapabilities';
+import type { UserLaunchableTaskType } from '../taskCapabilities';
+
+const TASK_TYPE_OPTION_ICONS: Record<UserLaunchableTaskType, typeof Plus> = {
+  create: Plus,
+  refactor: Wrench,
+  plan: GitFork,
+  research: Microscope,
+  review: CheckCircle,
+  fix: AlertCircle,
+  migrate: ArrowUpDown,
+};
 
 interface NewTaskModalProps {
   newTaskRepo: string;
   newTaskBranch: string;
   newTaskTitle: string;
   newTaskPrompt: string;
-  newTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor';
+  newTaskType: UserLaunchableTaskType;
   newTaskPrNumber: string;
   newTaskPrBranch: string;
   setNewTaskRepo: (value: string) => void;
   setNewTaskBranch: (value: string) => void;
   setNewTaskTitle: (value: string) => void;
   setNewTaskPrompt: (value: string) => void;
-  setNewTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor') => void;
+  setNewTaskType: (value: UserLaunchableTaskType) => void;
   setNewTaskPrNumber: (value: string) => void;
   setNewTaskPrBranch: (value: string) => void;
   newTaskModel: string;
@@ -80,7 +92,7 @@ export function NewTaskModal({
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const prNumberRef = useRef<HTMLInputElement>(null);
 
-  const handleTaskTypeChange = (value: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor') => {
+  const handleTaskTypeChange = (value: UserLaunchableTaskType) => {
     setNewTaskType(value);
     setNewTaskModel(getDefaultModelForType(value));
     setNewTaskEffort(getDefaultEffortForType(value));
@@ -206,32 +218,27 @@ export function NewTaskModal({
           <div className="mb-4">
             <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Type</label>
             <div className="flex gap-2">
-              {([
-                { value: 'create' as const, label: 'Create', desc: 'Write code, open PR', icon: Plus },
-                { value: 'refactor' as const, label: 'Refactor', desc: 'Improve code quality', icon: Wrench },
-                { value: 'plan' as const, label: 'Plan', desc: 'Decompose into subtasks', icon: GitFork },
-                { value: 'research' as const, label: 'Research', desc: 'Analyze codebase', icon: Microscope },
-                { value: 'review' as const, label: 'Review', desc: 'Review existing PR', icon: CheckCircle },
-                { value: 'fix' as const, label: 'Fix', desc: 'Fix PR from feedback', icon: AlertCircle },
-                { value: 'migrate' as const, label: 'Migrate', desc: 'Generate DB migration', icon: ArrowUpDown },
-              ]).map(opt => (
-                <button
-                  key={opt.value}
-                  type="button"
-                  onClick={() => handleTaskTypeChange(opt.value)}
-                  className={`flex-1 flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
-                    newTaskType === opt.value
-                      ? 'bg-white/5 border-neutral-600 text-neutral-100'
-                      : 'bg-neutral-950 border-neutral-800 text-neutral-500 hover:border-neutral-700'
-                  }`}
-                >
-                  <opt.icon className="w-3.5 h-3.5" />
-                  <div className="text-left">
-                    <div>{opt.label}</div>
-                    <div className="text-[10px] text-neutral-500 font-normal">{opt.desc}</div>
-                  </div>
-                </button>
-              ))}
+              {USER_LAUNCHABLE_TASK_TYPE_OPTIONS.map(opt => {
+                const Icon = TASK_TYPE_OPTION_ICONS[opt.value];
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => handleTaskTypeChange(opt.value)}
+                    className={`flex-1 flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
+                      newTaskType === opt.value
+                        ? 'bg-white/5 border-neutral-600 text-neutral-100'
+                        : 'bg-neutral-950 border-neutral-800 text-neutral-500 hover:border-neutral-700'
+                    }`}
+                  >
+                    <Icon className="w-3.5 h-3.5" />
+                    <div className="text-left">
+                      <div>{opt.label}</div>
+                      <div className="text-[10px] text-neutral-500 font-normal">{opt.description}</div>
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           </div>
           <div className={`transition-all duration-150 ${(newTaskType === 'review' || newTaskType === 'fix') ? 'opacity-100 h-auto mb-4' : 'opacity-0 h-0 overflow-hidden'}`}>

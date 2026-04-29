@@ -2,6 +2,7 @@ import { Search, ChevronDown, Check, GitFork } from 'lucide-react';
 import { useRef, useState, useEffect } from 'react';
 import type { RefObject } from 'react';
 import type { DateRange } from '../hooks/useSearchFilters';
+import { FILTER_TASK_TYPE_OPTIONS } from '../taskCapabilities';
 
 interface SearchFilterBarProps {
   searchQuery: string;
@@ -16,8 +17,6 @@ interface SearchFilterBarProps {
   onBlockedFilterChange: (v: boolean) => void;
   inputRef?: RefObject<HTMLInputElement | null>;
 }
-
-const TYPE_OPTIONS = ['create', 'plan', 'research', 'review', 'fix', 'refactor', 'migrate', 'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup', 'perf', 'strategic_review', 'design_doc_update'] as const;
 
 interface MultiSelectDropdownProps {
   label: string;
@@ -174,7 +173,7 @@ const DATE_RANGE_OPTIONS: { label: string; value: DateRange }[] = [
 
 export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
-  const typeOptions = TYPE_OPTIONS.map(opt => ({ label: opt.charAt(0).toUpperCase() + opt.slice(1), value: opt }));
+  const typeOptions = FILTER_TASK_TYPE_OPTIONS;
   useEffect(() => {
     const timer = setTimeout(() => {
       onSearchChange(inputValue);

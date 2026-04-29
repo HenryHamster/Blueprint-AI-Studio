@@ -1,11 +1,12 @@
 import { usePersistedState } from './usePersistedState';
+import type { UserLaunchableTaskType } from '../taskCapabilities';
 
 export function useViewPreferences() {
   const [viewMode, setViewMode] = usePersistedState<'kanban' | 'pipeline' | 'home'>('viewMode', 'kanban');
   const [compactMode, setCompactMode] = usePersistedState<boolean>('compactMode', false);
   const [groupBy, setGroupBy] = usePersistedState<'status' | 'type' | 'project'>('groupBy', 'status');
   const [columnPrefs, setColumnPrefs] = usePersistedState<{ id: string; visible: boolean }[]>('kanban_column_prefs', []);
-  const [defaultTaskType, setDefaultTaskType] = usePersistedState<'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor'>('defaultTaskType', 'create');
+  const [defaultTaskType, setDefaultTaskType] = usePersistedState<UserLaunchableTaskType>('defaultTaskType', 'create');
 
   return {
     viewMode, setViewMode,

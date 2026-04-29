@@ -37,6 +37,7 @@ import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { PlaybookPanel } from './components/PlaybookPanel';
 import { WarmVmPanel } from './components/WarmVmPanel';
+import { FILTER_TASK_TYPE_IDS } from './taskCapabilities';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -217,7 +218,7 @@ export default function App() {
     const cutoff = s.dateRange !== 'all' ? now - dateRangeCutoffs[s.dateRange] : null;
     return s.tasks.filter(t => {
       const taskType = t.task_type || (t.payloads?.[0] as Record<string, unknown>)?.type as string || 'create';
-      const knownTypes = ['create', 'plan', 'research', 'review', 'fix', 'migrate', 'refactor', 'docs', 'deps', 'qa', 'security_audit', 'investigate', 'debug', 'smoketest', 'rollup', 'perf', 'strategic_review', 'design_doc_update'];
+      const knownTypes: readonly string[] = FILTER_TASK_TYPE_IDS;
       const typeMatch = s.taskTypeFilter.includes(taskType) || (!knownTypes.includes(taskType) && s.taskTypeFilter.length === knownTypes.length);
       const statusMatch = s.statusFilter.includes(t.status);
       const query = s.searchQuery.toLowerCase();

@@ -10,6 +10,7 @@ import type {
   TaskTypeProviderOverrides,
 } from '../types/settings';
 import { EFFORT_LEVELS } from '../types/settings';
+import { PROVIDER_ROUTABLE_TASK_TYPE_OPTIONS } from '../taskCapabilities';
 
 // Keep in sync with backend/app/providers/gemini.py::_GEMINI_PREVIEW_MODELS
 // and _PREVIEW_TO_GA_FALLBACK. When the backend adds a preview model (or
@@ -62,17 +63,6 @@ interface Props {
   onUpdateOverrides: UpdateOverrides;
   onUpdateProviderSettingsByEffort: (value: ProviderSettingsByEffort) => void | Promise<void>;
 }
-
-// Full list of known task types (matches backend payload_schemas.py::TaskType).
-// `investigate` is omitted — it exists in the enum but no spawner wires it,
-// so surfacing it here would just mislead operators into configuring a dead
-// code path.
-const TASK_TYPES = [
-  'create', 'review', 'fix', 'plan', 'research',
-  'strategic_review', 'design_doc_update', 'security_audit',
-  'qa', 'deps', 'docs', 'migrate', 'smoketest',
-  'refactor', 'debug', 'perf',
-] as const;
 
 export function ProviderSettingsPanel({
   providers,
@@ -194,8 +184,8 @@ export function ProviderSettingsPanel({
             onChange={e => setSelectedTaskType(e.target.value)}
             className="flex-1 bg-neutral-900 border border-neutral-700 rounded px-2 py-1.5 text-xs text-neutral-100"
           >
-            {TASK_TYPES.map(t => (
-              <option key={t} value={t}>{t}</option>
+            {PROVIDER_ROUTABLE_TASK_TYPE_OPTIONS.map(t => (
+              <option key={t.value} value={t.value}>{t.label}</option>
             ))}
           </select>
         </div>

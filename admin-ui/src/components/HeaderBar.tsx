@@ -6,6 +6,7 @@ import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { AuthMode, CategoryRoutingEntry, DeployState, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import type { Task } from '../types/task';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from '../types/project';
+import type { UserLaunchableTaskType } from '../taskCapabilities';
 
 export interface HeaderBarProps {
   tasks: Task[];
@@ -39,8 +40,8 @@ export interface HeaderBarProps {
   showSettings: boolean;
   onToggleSettings: () => void;
   settingsRef: RefObject<HTMLDivElement | null>;
-  defaultTaskType: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor';
-  onUpdateDefaultTaskType: (value: 'create' | 'plan' | 'research' | 'review' | 'fix' | 'migrate' | 'refactor') => void;
+  defaultTaskType: UserLaunchableTaskType;
+  onUpdateDefaultTaskType: (value: UserLaunchableTaskType) => void;
   notifyOnComplete: boolean;
   onUpdateNotifyOnComplete: (value: boolean) => void;
   notifyOnFail: boolean;
