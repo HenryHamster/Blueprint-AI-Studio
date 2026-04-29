@@ -178,6 +178,16 @@ function DirectionCardImpl({
     const aggFailed = d.history_aggregate?.total_tasks_failed ?? 0;
     const totalMerged = historyMerged + (aggMerged as number);
     const totalFailed = historyFailed + (aggFailed as number);
+
+    // Attribution split — only present when sibling cluster has landed
+    const hasAttribution = history.some(e => e.autonomous_prs_merged != null || e.assisted_prs_merged != null);
+    const totalAutonomous = hasAttribution
+      ? history.reduce((sum, e) => sum + (e.autonomous_prs_merged ?? 0), 0) + ((d.history_aggregate?.total_autonomous_prs_merged as number | null) ?? 0)
+      : null;
+    const totalAssisted = hasAttribution
+      ? history.reduce((sum, e) => sum + (e.assisted_prs_merged ?? 0), 0) + ((d.history_aggregate?.total_assisted_prs_merged as number | null) ?? 0)
+      : null;
+    const totalOperatorActions = ((d.history_aggregate?.total_operator_actions as number | null) ?? null);
     const totalTasks = totalMerged + totalFailed;
     const successRate = totalTasks >= 3 ? Math.round((totalMerged / totalTasks) * 100) : null;
 
@@ -209,6 +219,9 @@ function DirectionCardImpl({
       truncatedTitle,
       sparkData,
       lastCycleLabel,
+      totalAutonomous,
+      totalAssisted,
+      totalOperatorActions,
     };
   }, [d.research_history, d.history_aggregate]);
 
@@ -1001,9 +1014,34 @@ function DirectionCardImpl({
           {lifetimeMetrics && (
             <div className="mt-1.5 space-y-0.5">
               <div className="flex flex-wrap items-center gap-1.5">
-                <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${lifetimeMetrics.totalMerged > 0 ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400' : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-500'}`}>
-                  {lifetimeMetrics.totalMerged} PRs shipped
-                </span>
+                {lifetimeMetrics.totalAutonomous != null || lifetimeMetrics.totalAssisted != null ? (
+                  <>
+                    {(lifetimeMetrics.totalAutonomous ?? 0) > 0 && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-emerald-950/40 border-emerald-900/50 text-emerald-400">
+                        {lifetimeMetrics.totalAutonomous} auto
+                      </span>
+                    )}
+                    {(lifetimeMetrics.totalAssisted ?? 0) > 0 && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-blue-950/40 border-blue-900/50 text-blue-400">
+                        {lifetimeMetrics.totalAssisted} assisted
+                      </span>
+                    )}
+                    {(lifetimeMetrics.totalAutonomous ?? 0) === 0 && (lifetimeMetrics.totalAssisted ?? 0) === 0 && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
+                        0 PRs shipped
+                      </span>
+                    )}
+                    {(lifetimeMetrics.totalAutonomous ?? 0) >= 10 && lifetimeMetrics.totalOperatorActions === 0 && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-emerald-900/30 border-emerald-700/50 text-emerald-300" title="Direction ships autonomously — eligible for retirement review">
+                        ✓ self-sufficient
+                      </span>
+                    )}
+                  </>
+                ) : (
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${lifetimeMetrics.totalMerged > 0 ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400' : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-500'}`}>
+                    {lifetimeMetrics.totalMerged} PRs shipped
+                  </span>
+                )}
                 {lifetimeMetrics.successRate !== null && (() => {
                   const rate = lifetimeMetrics.successRate;
                   const color = rate >= 70 ? 'emerald' : rate >= 40 ? 'amber' : 'red';

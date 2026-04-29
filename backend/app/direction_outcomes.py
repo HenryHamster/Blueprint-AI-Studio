@@ -62,6 +62,22 @@ def _counts_as_failure(task: Task) -> bool:
     return task.status == TaskStatus.CANCELLED and not _is_cascade_cancelled(task)
 
 
+def is_autonomous_merge(task: Task) -> bool:
+    """Return True if the task merged without any operator intervention.
+
+    Precedence (first match wins):
+    1. created_by == "USER" → operator-assisted (user created it directly)
+    2. review_dismissed or user_overrode_review in context → operator stepped in
+    3. Otherwise → autonomous (ORCHESTRATOR-spawned, merged without override)
+    """
+    if (task.created_by or "").upper() == "USER":
+        return False
+    ctx = task.context or {}
+    if ctx.get("review_dismissed") or ctx.get("user_overrode_review"):
+        return False
+    return True
+
+
 def _longest_chain_length(deps_map: dict[str, list[str]]) -> int:
     """Longest path length in a subtask dependency DAG.
 
@@ -210,6 +226,19 @@ async def _update_direction_research_outcomes(
     entry["prs_rejected"] = sum(
         1 for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_rejected")
+    )
+    _merged_rows = [
+        ct for ct in child_tasks_rows
+        if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
+    ]
+    entry["autonomous_prs_merged"] = sum(1 for ct in _merged_rows if is_autonomous_merge(ct))
+    entry["assisted_prs_merged"] = sum(1 for ct in _merged_rows if not is_autonomous_merge(ct))
+    # operator_action_count: tasks in this cycle with any detectable operator intervention
+    entry["operator_action_count"] = sum(
+        1 for ct in child_tasks_rows
+        if (ct.created_by or "").upper() == "USER"
+        or (ct.context or {}).get("review_dismissed")
+        or (ct.context or {}).get("user_overrode_review")
     )
     _prev_rows = [
         ct for ct in child_tasks_rows

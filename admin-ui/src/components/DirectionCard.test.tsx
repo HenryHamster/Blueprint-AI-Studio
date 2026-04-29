@@ -446,3 +446,77 @@ describe('DirectionCard cost-per-merge retirement warning', () => {
     expect(screen.queryByText(/gpt-5\.4/)).not.toBeInTheDocument();
   });
 });
+
+function makeResearchEntry(overrides: Partial<import('./DirectionsPanel').ResearchHistoryEntry> = {}): import('./DirectionsPanel').ResearchHistoryEntry {
+  return {
+    timestamp: '2026-01-01T00:00:00Z',
+    task_id: 't-1',
+    tasks_created: 1,
+    finding_titles: [],
+    key_finding_descriptions: [],
+    ...overrides,
+  };
+}
+
+describe('DirectionCard autonomous/assisted merge split', () => {
+  it('falls back to legacy PRs shipped badge when attribution fields absent', () => {
+    const d = makeDirection({
+      research_history: [makeResearchEntry({ prs_merged: 5 })],
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('5 PRs shipped')).toBeInTheDocument();
+  });
+
+  it('shows only auto badge when all merges are autonomous', () => {
+    const d = makeDirection({
+      research_history: [makeResearchEntry({ prs_merged: 8, autonomous_prs_merged: 8, assisted_prs_merged: 0 })],
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('8 auto')).toBeInTheDocument();
+    expect(screen.queryByText(/assisted/)).not.toBeInTheDocument();
+  });
+
+  it('shows only assisted badge when all merges are assisted', () => {
+    const d = makeDirection({
+      research_history: [makeResearchEntry({ prs_merged: 3, autonomous_prs_merged: 0, assisted_prs_merged: 3 })],
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('3 assisted')).toBeInTheDocument();
+    expect(screen.queryByText(/auto/)).not.toBeInTheDocument();
+  });
+
+  it('shows both auto and assisted badges when split', () => {
+    const d = makeDirection({
+      research_history: [makeResearchEntry({ prs_merged: 10, autonomous_prs_merged: 8, assisted_prs_merged: 2 })],
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('8 auto')).toBeInTheDocument();
+    expect(screen.getByText('2 assisted')).toBeInTheDocument();
+  });
+
+  it('shows 0 PRs shipped badge when attribution present but both zero', () => {
+    const d = makeDirection({
+      research_history: [makeResearchEntry({ prs_merged: 0, autonomous_prs_merged: 0, assisted_prs_merged: 0 })],
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('0 PRs shipped')).toBeInTheDocument();
+  });
+
+  it('shows self-sufficient badge when >=10 autonomous and zero operator actions', () => {
+    const d = makeDirection({
+      research_history: [makeResearchEntry({ prs_merged: 12, autonomous_prs_merged: 12, assisted_prs_merged: 0 })],
+      history_aggregate: { total_operator_actions: 0 },
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('✓ self-sufficient')).toBeInTheDocument();
+  });
+
+  it('does not show self-sufficient badge when operator_action_count > 0', () => {
+    const d = makeDirection({
+      research_history: [makeResearchEntry({ prs_merged: 12, autonomous_prs_merged: 12, assisted_prs_merged: 0 })],
+      history_aggregate: { total_operator_actions: 1 },
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.queryByText('✓ self-sufficient')).not.toBeInTheDocument();
+  });
+});

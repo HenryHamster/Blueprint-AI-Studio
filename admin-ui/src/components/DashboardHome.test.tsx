@@ -568,4 +568,67 @@ describe('DashboardHome', () => {
     expect(await screen.findByText('System Maturity')).toBeInTheDocument();
     expect(screen.getByText('No audits have run yet')).toBeInTheDocument();
   });
+
+  describe('project-level autonomous/assisted split', () => {
+    const baseDigest = {
+      failed_count: 0,
+      pending_approval_count: 0,
+      completed_count: 0,
+      failure_groups: [],
+      recent_completions: [],
+    };
+
+    it('shows autonomous and assisted counts when attribution fields present', async () => {
+      setupApiMocks({
+        digest: {
+          ...baseDigest,
+          direction_progress: [
+            { direction_id: 'd1', direction_text: 'Dir A', priority: 'high', cycles_in_window: 1, tasks_created: 3, prs_merged: 5, possibly_saturated: false, autonomous_prs_merged: 4, assisted_prs_merged: 1 },
+            { direction_id: 'd2', direction_text: 'Dir B', priority: 'low', cycles_in_window: 1, tasks_created: 2, prs_merged: 3, possibly_saturated: false, autonomous_prs_merged: 2, assisted_prs_merged: 1 },
+          ],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByText('6 autonomous')).toBeInTheDocument();
+      expect(screen.getByText('2 assisted')).toBeInTheDocument();
+    });
+
+    it('does not show split when attribution fields absent', async () => {
+      setupApiMocks({
+        digest: {
+          ...baseDigest,
+          direction_progress: [
+            { direction_id: 'd1', direction_text: 'Dir A', priority: 'high', cycles_in_window: 1, tasks_created: 3, prs_merged: 5, possibly_saturated: false },
+          ],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('Dir A');
+      expect(screen.queryByText(/autonomous/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/assisted/)).not.toBeInTheDocument();
+    });
+
+    it('shows only autonomous when all merges are autonomous', async () => {
+      setupApiMocks({
+        digest: {
+          ...baseDigest,
+          direction_progress: [
+            { direction_id: 'd1', direction_text: 'Dir A', priority: 'high', cycles_in_window: 1, tasks_created: 3, prs_merged: 7, possibly_saturated: false, autonomous_prs_merged: 7, assisted_prs_merged: 0 },
+          ],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByText('7 autonomous')).toBeInTheDocument();
+      expect(screen.getByText('0 assisted')).toBeInTheDocument();
+    });
+  });
 });

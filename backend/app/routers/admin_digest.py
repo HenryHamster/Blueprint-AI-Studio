@@ -1494,6 +1494,8 @@ async def _compute_digest(
 
                 # Single pass over research_history: aggregate PR/scope/product/type/taxonomy
                 prs_merged = 0
+                autonomous_prs_merged = 0
+                assisted_prs_merged = 0
                 prs_rejected = 0
                 findings_tasks_created = 0
                 merge_time_values: List[float] = []
@@ -1523,6 +1525,9 @@ async def _compute_digest(
                         continue
                     if entry_ts >= window_start:
                         prs_merged += entry.get("prs_merged") or 0
+                        # Legacy fallback: pre-attribution entries lack autonomous_prs_merged.
+                        autonomous_prs_merged += entry.get("autonomous_prs_merged", entry.get("prs_merged")) or 0
+                        assisted_prs_merged += entry.get("assisted_prs_merged", 0) or 0
                         prs_rejected += entry.get("prs_rejected") or 0
                         dir_reviews_dismissed += entry.get("reviews_dismissed") or 0
                         dir_reviews_overridden += entry.get("reviews_overridden") or 0
@@ -1780,6 +1785,8 @@ async def _compute_digest(
                     "cycles_in_window": cycles_in_window,
                     "tasks_created": tasks_created_in_window,
                     "prs_merged": prs_merged,
+                    "autonomous_prs_merged": autonomous_prs_merged,
+                    "assisted_prs_merged": assisted_prs_merged,
                     "prs_rejected": prs_rejected,
                     "acceptance_rate": acceptance_rate,
                     "conversion_rate": conversion_rate,
@@ -1807,7 +1814,7 @@ async def _compute_digest(
                     "cost_by_status": cost_by_status or None,
                     "cost_by_type": cost_by_type or None,
                     "cost_by_provider_model": cost_by_provider_model or None,
-                    "cost_per_merged_pr": round(dir_cost / prs_merged, 4) if prs_merged > 0 else None,
+                    "cost_per_merged_pr": round(dir_cost / autonomous_prs_merged, 4) if autonomous_prs_merged > 0 else None,
                     "scope_breakdown": dir_scope_agg or None,
                     "taxonomy_summary": dir_taxonomy_summary or None,
                     "stage_dropout": dir_stage_dropout or None,

@@ -23,6 +23,9 @@ _HISTORY_AGG_DEFAULTS = {
     "total_tasks_failed": 0,
     "total_tasks_cancelled": 0,
     "first_cycle_at": None,
+    "total_autonomous_prs_merged": 0,
+    "total_assisted_prs_merged": 0,
+    "total_operator_actions": 0,
 }
 
 _DECOMP_AGG_DEFAULTS = {
@@ -52,6 +55,11 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         agg["total_prs_rejected"] += ev.get("prs_rejected", 0)
         agg["total_tasks_failed"] += ev.get("tasks_failed", 0)
         agg["total_tasks_cancelled"] += ev.get("tasks_cancelled", 0)
+        # Legacy fallback: pre-attribution entries have no autonomous_prs_merged;
+        # treat all merges as autonomous so CPM is conservative for old data.
+        agg["total_autonomous_prs_merged"] += ev.get("autonomous_prs_merged", ev.get("prs_merged", 0))
+        agg["total_assisted_prs_merged"] += ev.get("assisted_prs_merged", 0)
+        agg["total_operator_actions"] += ev.get("operator_action_count", 0)
         if not agg["first_cycle_at"] and ev.get("timestamp"):
             agg["first_cycle_at"] = ev["timestamp"]
         for scope, stats in (ev.get("scope_breakdown") or {}).items():

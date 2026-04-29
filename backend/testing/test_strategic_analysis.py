@@ -1168,3 +1168,89 @@ class TestComputePredictionCalibration:
         result = _compute_prediction_calibration(project, cycles)
         expected_factor = _real_compute_prediction_calibration_factor(project, cycles)
         assert result["factor"] == expected_factor
+
+
+# ---------------------------------------------------------------------------
+# Autonomous attribution: CPM uses autonomous_prs_merged
+# ---------------------------------------------------------------------------
+
+class TestAutonomousCPM:
+    """cost_per_merged_pr uses autonomous_prs_merged as denominator."""
+
+    def test_cpm_absent_when_all_assisted_merges(self):
+        """CPM is None when autonomous_prs_merged == 0 even if prs_merged > 0."""
+        from app.routers.admin_analytics import ON_DEMAND_RATE
+        directions = [{
+            "id": "dir-1", "status": "active",
+            "research_history": [{
+                "timestamp": "2026-01-01T00:00:00",
+                "prs_merged": 3,
+                "autonomous_prs_merged": 0,
+                "assisted_prs_merged": 3,
+                "tasks_created": 3,
+                "avg_time_to_merge_hours": 2.0,
+            }],
+        }]
+        d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+        assert "cost_per_merged_pr" not in d
+
+    def test_fully_autonomous_cpm_equals_legacy_cpm(self):
+        """Fully-autonomous direction: CPM with autonomous_prs_merged == CPM with prs_merged."""
+        from app.routers.admin_analytics import ON_DEMAND_RATE
+        prs = 4
+        hours = 1.5
+        tasks = 4
+        expected_cost = round(tasks * hours * 3600 * ON_DEMAND_RATE, 2)
+        directions = [{
+            "id": "dir-1", "status": "active",
+            "research_history": [{
+                "timestamp": "2026-01-01T00:00:00",
+                "prs_merged": prs,
+                "autonomous_prs_merged": prs,
+                "assisted_prs_merged": 0,
+                "tasks_created": tasks,
+                "avg_time_to_merge_hours": hours,
+            }],
+        }]
+        d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+        assert d.get("cost_per_merged_pr") == round(expected_cost / prs, 2)
+
+    def test_legacy_entry_without_autonomous_field_uses_prs_merged_fallback(self):
+        """Legacy entries lacking autonomous_prs_merged default to prs_merged (all-autonomous)."""
+        from app.routers.admin_analytics import ON_DEMAND_RATE
+        prs = 2
+        hours = 1.0
+        tasks = 2
+        expected_cost = round(tasks * hours * 3600 * ON_DEMAND_RATE, 2)
+        # No autonomous_prs_merged key — pre-attribution legacy entry
+        directions = [{
+            "id": "dir-1", "status": "active",
+            "research_history": [{
+                "timestamp": "2026-01-01T00:00:00",
+                "prs_merged": prs,
+                "tasks_created": tasks,
+                "avg_time_to_merge_hours": hours,
+            }],
+        }]
+        d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+        assert d.get("cost_per_merged_pr") == round(expected_cost / prs, 2)
+
+    def test_mixed_attribution_cpm_uses_autonomous_count(self):
+        """CPM denominator is autonomous count, not total merged."""
+        from app.routers.admin_analytics import ON_DEMAND_RATE
+        tasks = 5
+        hours = 2.0
+        expected_cost = round(tasks * hours * 3600 * ON_DEMAND_RATE, 2)
+        directions = [{
+            "id": "dir-1", "status": "active",
+            "research_history": [{
+                "timestamp": "2026-01-01T00:00:00",
+                "prs_merged": 5,
+                "autonomous_prs_merged": 3,
+                "assisted_prs_merged": 2,
+                "tasks_created": tasks,
+                "avg_time_to_merge_hours": hours,
+            }],
+        }]
+        d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+        assert d.get("cost_per_merged_pr") == round(expected_cost / 3, 2)

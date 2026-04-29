@@ -49,6 +49,12 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
 
         cycles = len(window_history)
         merged = sum(h.get("prs_merged", 0) for h in window_history)
+        # For CPM, count only autonomous merges; legacy entries without the field
+        # are treated as all-autonomous (conservative fallback for old data).
+        autonomous_merged = sum(
+            h.get("autonomous_prs_merged", h.get("prs_merged", 0))
+            for h in window_history
+        )
         rejected = sum(h.get("prs_rejected", 0) for h in window_history)
         failed = sum(h.get("tasks_failed", 0) for h in window_history)
         failed_infra = sum(h.get("tasks_failed_infra", 0) for h in window_history)
@@ -115,8 +121,8 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
         cost_budget_usd = d.get("cost_budget_usd")
         if estimated_cost_usd > 0:
             outcome["estimated_cost_usd"] = estimated_cost_usd
-            if merged > 0:
-                outcome["cost_per_merged_pr"] = round(estimated_cost_usd / merged, 2)
+            if autonomous_merged > 0:
+                outcome["cost_per_merged_pr"] = round(estimated_cost_usd / autonomous_merged, 2)
         if isinstance(cost_budget_usd, (int, float)) and cost_budget_usd > 0:
             outcome["cost_budget_usd"] = cost_budget_usd
             if estimated_cost_usd > cost_budget_usd:

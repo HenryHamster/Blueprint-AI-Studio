@@ -549,14 +549,18 @@ async def _process_direction_lifecycle(
         if cpm_window > 0:
             history = history[-cpm_window:]
         spend = 0.0
-        merged = 0
+        autonomous = 0
         for entry in history:
             try:
                 spend += max(0.0, float(entry.get("estimated_cost_usd") or 0.0))
-                merged += max(0, int(entry.get("prs_merged") or 0))
+                # Legacy fallback: pre-attribution entries lack autonomous_prs_merged;
+                # treat all merges as autonomous so CPM is conservative for old data.
+                autonomous += max(0, int(
+                    entry.get("autonomous_prs_merged", entry.get("prs_merged")) or 0
+                ))
             except (TypeError, ValueError):
                 continue
-        return (spend / merged) if merged > 0 else None
+        return (spend / autonomous) if autonomous > 0 else None
 
     def _cost_by_provider_model_window(direction: dict) -> tuple[dict[str, float], float]:
         """Sum per-(provider, model) cost across the same rolling window.

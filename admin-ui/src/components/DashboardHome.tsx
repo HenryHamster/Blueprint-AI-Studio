@@ -44,6 +44,8 @@ interface DirectionProgress {
   tasks_created: number;
   prs_merged: number;
   prs_rejected?: number | null;
+  autonomous_prs_merged?: number | null;
+  assisted_prs_merged?: number | null;
   possibly_saturated: boolean;
   auto_paused?: boolean;
   paused_reason?: string | null;
@@ -823,6 +825,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
   const directions = [...(digest?.direction_progress ?? [])].sort((a, b) => (priorityOrder[a.priority] ?? 9) - (priorityOrder[b.priority] ?? 9));
   const totalDirPRs = directions.reduce((s, d) => s + d.prs_merged, 0);
+  const hasAttribution = directions.some(d => d.autonomous_prs_merged != null || d.assisted_prs_merged != null);
+  const totalAutonomousPRs = hasAttribution ? directions.reduce((s, d) => s + (d.autonomous_prs_merged ?? 0), 0) : null;
+  const totalAssistedPRs = hasAttribution ? directions.reduce((s, d) => s + (d.assisted_prs_merged ?? 0), 0) : null;
   const productPct = digest?.overall_product_ratio != null ? Math.round(digest.overall_product_ratio * 100) : null;
 
   return (
@@ -1242,6 +1247,14 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   )}
                   <span className="text-neutral-600">&middot;</span>
                   <span>{totalDirPRs} PR{totalDirPRs !== 1 ? 's' : ''} merged</span>
+                  {hasAttribution && (totalAutonomousPRs != null || totalAssistedPRs != null) && (
+                    <>
+                      <span className="text-neutral-600">&middot;</span>
+                      <span className="text-emerald-400">{totalAutonomousPRs ?? 0} autonomous</span>
+                      <span className="text-neutral-600">·</span>
+                      <span className="text-blue-400">{totalAssistedPRs ?? 0} assisted</span>
+                    </>
+                  )}
                   <CalibrationChip
                     factor={digest?.prediction_calibration_factor}
                     note={digest?.prediction_calibration_note}

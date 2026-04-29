@@ -26,6 +26,8 @@ export interface ResearchHistoryEntry {
   prs_merged?: number | null;
   prs_rejected?: number | null;
   taxonomy_summary?: Record<string, number> | null;
+  autonomous_prs_merged?: number | null;
+  assisted_prs_merged?: number | null;
 }
 
 export interface RemediationHistoryEntry {
@@ -100,6 +102,9 @@ export interface Direction {
     total_prs_merged?: number | null;
     total_prs_rejected?: number | null;
     total_tasks_failed?: number | null;
+    total_autonomous_prs_merged?: number | null;
+    total_assisted_prs_merged?: number | null;
+    total_operator_actions?: number | null;
     [key: string]: unknown;
   } | null;
   cost_budget_usd?: number | null;

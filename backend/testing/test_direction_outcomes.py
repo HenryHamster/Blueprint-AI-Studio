@@ -77,6 +77,7 @@ async def _create_child_task(
     latest_status_message: str | None = None,
     created_at: datetime | None = None,
     vm_stopped_at: datetime | None = None,
+    created_by: str = "ORCHESTRATOR",
 ) -> Task:
     task = Task(
         project_id=project_id,
@@ -85,7 +86,7 @@ async def _create_child_task(
         payloads=payloads or [{"type": "create", "scope": "small"}],
         context=context or {},
         status=status,
-        created_by="ORCHESTRATOR",
+        created_by=created_by,
         latest_status_message=latest_status_message,
     )
     if created_at is not None:
@@ -2413,3 +2414,208 @@ def test_summarize_review_quality_feedback_no_dfa_unchanged():
     result = summarize_review_quality_feedback(history)
     assert result is not None
     assert "top_categories" not in result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Autonomous / operator-assisted classification
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestIsAutonomousMerge:
+    """Unit tests for is_autonomous_merge — pure function, no DB required."""
+
+    def _make_task(self, created_by="ORCHESTRATOR", context=None) -> Task:
+        t = Task(
+            project_id=uuid.uuid4(),
+            title="test",
+            payloads=[{"type": "create"}],
+            context=context or {},
+            status=TaskStatus.COMPLETED,
+            created_by=created_by,
+        )
+        return t
+
+    def test_orchestrator_created_no_override_is_autonomous(self):
+        from app.direction_outcomes import is_autonomous_merge
+        task = self._make_task(created_by="ORCHESTRATOR")
+        assert is_autonomous_merge(task) is True
+
+    def test_user_created_is_operator_assisted(self):
+        from app.direction_outcomes import is_autonomous_merge
+        task = self._make_task(created_by="USER")
+        assert is_autonomous_merge(task) is False
+
+    def test_review_dismissed_is_operator_assisted(self):
+        from app.direction_outcomes import is_autonomous_merge
+        task = self._make_task(context={"review_dismissed": True})
+        assert is_autonomous_merge(task) is False
+
+    def test_user_overrode_review_is_operator_assisted(self):
+        from app.direction_outcomes import is_autonomous_merge
+        task = self._make_task(context={"user_overrode_review": True})
+        assert is_autonomous_merge(task) is False
+
+    def test_orchestrator_with_pr_merged_and_no_override_is_autonomous(self):
+        from app.direction_outcomes import is_autonomous_merge
+        task = self._make_task(context={"pr_merged": True})
+        assert is_autonomous_merge(task) is True
+
+    def test_user_created_even_with_pr_merged_is_operator_assisted(self):
+        from app.direction_outcomes import is_autonomous_merge
+        task = self._make_task(created_by="USER", context={"pr_merged": True})
+        assert is_autonomous_merge(task) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aggregation: autonomous_prs_merged + assisted_prs_merged sum invariant
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_autonomous_assisted_sum_equals_prs_merged(db_session: AsyncSession):
+    """autonomous_prs_merged + assisted_prs_merged == prs_merged for any mix."""
+    direction_id = "d-attribution"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=4)]
+    await db_session.flush()
+
+    # 2 autonomous merges, 1 operator-assisted merge, 1 rejected
+    await _create_child_task(db_session, research_task.id, project.id,
+                              context={"pr_merged": True}, created_by="ORCHESTRATOR")
+    await _create_child_task(db_session, research_task.id, project.id,
+                              context={"pr_merged": True}, created_by="ORCHESTRATOR")
+    await _create_child_task(db_session, research_task.id, project.id,
+                              context={"pr_merged": True}, created_by="USER")
+    await _create_child_task(db_session, research_task.id, project.id,
+                              context={"pr_rejected": True})
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 3
+    assert entry["autonomous_prs_merged"] == 2
+    assert entry["assisted_prs_merged"] == 1
+    assert entry["autonomous_prs_merged"] + entry["assisted_prs_merged"] == entry["prs_merged"]
+
+
+@pytest.mark.asyncio
+async def test_all_autonomous_direction_counts(db_session: AsyncSession):
+    """All merges autonomous → assisted==0 and autonomous==prs_merged."""
+    direction_id = "d-all-auto"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    for _ in range(2):
+        await _create_child_task(db_session, research_task.id, project.id,
+                                  context={"pr_merged": True}, created_by="ORCHESTRATOR")
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["autonomous_prs_merged"] == 2
+    assert entry["assisted_prs_merged"] == 0
+    assert entry["operator_action_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_zero_autonomous_all_assisted(db_session: AsyncSession):
+    """All merges operator-assisted → autonomous==0."""
+    direction_id = "d-all-assisted"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    for _ in range(2):
+        await _create_child_task(db_session, research_task.id, project.id,
+                                  context={"pr_merged": True, "review_dismissed": True})
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["autonomous_prs_merged"] == 0
+    assert entry["assisted_prs_merged"] == 2
+    assert entry["prs_merged"] == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _fold_evicted_into_aggregate: attribution rollup
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_fold_evicted_attribution_fields():
+    """total_autonomous/assisted/operator aggregate correctly; legacy entries fall back to prs_merged."""
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    # One pre-attribution entry (no autonomous_prs_merged → fallback to prs_merged)
+    # One post-attribution entry with split counts
+    evicted = [
+        {"timestamp": "2025-01-01T00:00:00", "tasks_created": 3, "prs_merged": 3},
+        {
+            "timestamp": "2025-02-01T00:00:00",
+            "tasks_created": 5,
+            "prs_merged": 3,
+            "autonomous_prs_merged": 2,
+            "assisted_prs_merged": 1,
+            "operator_action_count": 2,
+        },
+    ]
+    agg = _fold_evicted_into_aggregate(None, evicted)
+
+    # Legacy entry contributes prs_merged=3 to autonomous (conservative fallback)
+    # Post-attribution entry contributes autonomous=2
+    assert agg["total_autonomous_prs_merged"] == 5  # 3 + 2
+    assert agg["total_assisted_prs_merged"] == 1
+    assert agg["total_operator_actions"] == 2
+
+
+def test_fold_evicted_attribution_accumulates_on_prior_agg():
+    """New evictions accumulate on top of an existing aggregate with attribution fields."""
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    prior = {
+        "total_cycles": 2,
+        "total_autonomous_prs_merged": 4,
+        "total_assisted_prs_merged": 1,
+        "total_operator_actions": 1,
+    }
+    evicted = [{
+        "timestamp": "2025-03-01T00:00:00",
+        "tasks_created": 2,
+        "prs_merged": 2,
+        "autonomous_prs_merged": 1,
+        "assisted_prs_merged": 1,
+        "operator_action_count": 1,
+    }]
+    agg = _fold_evicted_into_aggregate(prior, evicted)
+
+    assert agg["total_autonomous_prs_merged"] == 5  # 4 + 1
+    assert agg["total_assisted_prs_merged"] == 2    # 1 + 1
+    assert agg["total_operator_actions"] == 2        # 1 + 1
