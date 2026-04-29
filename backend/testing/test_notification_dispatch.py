@@ -20,6 +20,7 @@ from app.notification_dispatch import (
     post_direction_milestone_message,
     post_event_message,
     post_account_model_regression_message,
+    post_account_model_regression_recovered_message,
     post_failure_alert_message,
     post_feedback_acknowledgment,
     post_issue_implementation_spawned_message,
@@ -520,6 +521,52 @@ async def test_post_account_model_regression_message(db_session):
     assert msg.context["sample_size"] == 20
     assert msg.context["distinct_accounts"] == 3
     assert msg.context["started_at"] == "2026-04-29T00:00:00+00:00"
+    assert msg in db_session
+
+
+@pytest.mark.asyncio
+async def test_post_account_model_regression_recovered_message(db_session):
+    project_id = uuid.uuid4()
+    msg = await post_account_model_regression_recovered_message(
+        db_session, project_id,
+        account_id="acct-123",
+        account_label="ProdKey",
+        provider="anthropic",
+        model="claude-opus-4-7",
+        account_rate=0.20,
+        project_median=0.85,
+        sample_size=10,
+    )
+    assert msg.project_id == project_id
+    assert "ProdKey" in msg.content
+    assert "anthropic/claude-opus-4-7" in msg.content
+    assert "restored after probe success" in msg.content
+    assert msg.context["event_type"] == "account_model_regression_recovered"
+    assert msg.context["account_id"] == "acct-123"
+    assert msg.context["account_label"] == "ProdKey"
+    assert msg.context["provider"] == "anthropic"
+    assert msg.context["model"] == "claude-opus-4-7"
+    assert msg.context["account_rate"] == 0.20
+    assert msg.context["project_median"] == 0.85
+    assert msg.context["sample_size"] == 10
+    assert msg in db_session
+
+
+@pytest.mark.asyncio
+async def test_post_account_model_regression_recovered_message_no_stats(db_session):
+    project_id = uuid.uuid4()
+    msg = await post_account_model_regression_recovered_message(
+        db_session, project_id,
+        account_id="acct-456",
+        account_label="DevKey",
+        provider="google",
+        model="gemini-pro",
+    )
+    assert "DevKey" in msg.content
+    assert "google/gemini-pro" in msg.content
+    assert msg.context["event_type"] == "account_model_regression_recovered"
+    assert msg.context["account_rate"] is None
+    assert msg.context["sample_size"] is None
     assert msg in db_session
 
 

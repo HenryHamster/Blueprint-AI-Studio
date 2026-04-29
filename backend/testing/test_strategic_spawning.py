@@ -2391,3 +2391,107 @@ async def test_strategic_review_packer_keeps_payload_under_cap_on_bloated_projec
     assert "directions_summary" in trimmed_keys, (
         f"Trimmed list must include directions_summary; meta={meta}"
     )
+
+
+@pytest.mark.asyncio
+async def test_drift_signals_survives_budget_pressure(db_session):
+    """drift_signals must not be dropped when low-priority fields are evicted.
+
+    Constructs a bloated project that forces the packer to drop low-priority
+    fields, then asserts drift_signals (now medium priority) is still present
+    while at least one low-priority field is absent from the payload.
+    """
+    import json as _json
+    from app.payload_schemas import _MAX_PAYLOAD_BYTES
+
+    # 50 bulky directions to force budget pressure
+    directions = [
+        {
+            "id": f"d-dp{i:02d}",
+            "status": "active",
+            "text": f"Direction {i} " + ("pressure filler " * 40),
+            "priority": "medium",
+            "system_id": "sys-dp",
+            "research_history": [
+                {
+                    "prs_merged": 1,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                    "tasks_created": 1,
+                    "key_finding_descriptions": [f"finding {j} " * 20 for j in range(5)],
+                    "failed_task_details": [],
+                    "timestamp": "2026-04-01T00:00:00Z",
+                }
+                for _ in range(8)
+            ],
+            "research_context": "context narrative " * 200,
+        }
+        for i in range(50)
+    ]
+    project = _make_project(
+        directions=directions,
+        vision={"purpose": "budget pressure test"},
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": "x"},
+            "gaps": [
+                {"id": f"g{i}", "name": f"gap {i}", "description": "x" * 500,
+                 "history": [f"h{j}" * 10 for j in range(20)],
+                 "past_moves": [f"m{j}" * 10 for j in range(20)],
+                 "evidence": [f"e{j}" * 10 for j in range(20)]}
+                for i in range(20)
+            ],
+            "archived_gaps": [{"id": f"ag{i}", "name": "archived"} for i in range(40)],
+            "friction": [],
+            "capabilities": [],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    # Add stalled tasks so drift_signals is non-empty and included in the payload
+    for i in range(5):
+        db_session.add(Task(
+            project_id=project.id,
+            title=f"drift claim {i}",
+            description="",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            payloads=[{"type": "create", "prompt": "x", "current_direction_id": "d-dp00"}],
+            context={"direction_id": "d-dp00"},
+            plan_output={"summary": "shipped"},
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        ))
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "strategic_review"]
+    assert tasks
+    payload = tasks[0].payloads[0]
+
+    # Payload must stay under hard cap
+    serialized_size = len(_json.dumps(payload, default=str).encode())
+    assert serialized_size < _MAX_PAYLOAD_BYTES
+
+    meta = payload["_packer_meta"]
+    dropped_keys = {entry["key"] for entry in meta.get("dropped", [])}
+
+    # drift_signals (medium priority) must survive budget pressure
+    assert "drift_signals" in payload, (
+        f"drift_signals was dropped under budget pressure; dropped={dropped_keys}"
+    )
+
+    # Confirm budget pressure existed (something was trimmed or dropped)
+    trimmed_keys = {entry["key"] for entry in meta.get("trimmed", [])}
+    assert dropped_keys or trimmed_keys, (
+        f"Expected budget pressure (trims or drops); meta={meta}"
+    )
+
+    # drift_signals must not be among the dropped fields
+    assert "drift_signals" not in dropped_keys, (
+        f"drift_signals should not be dropped; dropped={dropped_keys}"
+    )

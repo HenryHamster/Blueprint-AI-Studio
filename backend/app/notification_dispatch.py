@@ -459,6 +459,46 @@ async def post_account_model_regression_message(
     )
 
 
+async def post_account_model_regression_recovered_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    account_id: str,
+    account_label: str,
+    provider: str,
+    model: str,
+    account_rate: float | None = None,
+    project_median: float | None = None,
+    sample_size: int | None = None,
+) -> ProjectMessage:
+    """Post a message when a regression-quarantined (provider, model) auto-recovers
+    after a successful probe task completes post-cooldown."""
+    rate_detail = (
+        f" ({account_rate:.0%} vs median {project_median:.0%} on n={sample_size})"
+        if account_rate is not None and project_median is not None and sample_size is not None
+        else ""
+    )
+    summary = (
+        f"Account model regression-recovered: {account_label} {provider}/{model} "
+        f"restored after probe success{rate_detail}"
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="account_model_regression_recovered",
+        summary=summary,
+        context={
+            "account_id": account_id,
+            "account_label": account_label,
+            "provider": provider,
+            "model": model,
+            "account_rate": account_rate,
+            "project_median": project_median,
+            "sample_size": sample_size,
+        },
+    )
+
+
 async def post_auto_fix_spawned_message(
     session: AsyncSession,
     project_id: uuid.UUID,

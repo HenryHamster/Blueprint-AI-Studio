@@ -1347,6 +1347,80 @@ class TestRegressionQuarantine:
         # Entry must still be present.
         assert OPUS in acct["disabled_models"]
 
+    async def test_clear_regression_on_success_clears_entry(self):
+        """Successful probe removes the regression entry and returns metadata."""
+        from app.max_plan_pool import clear_regression_on_success, disable_account_model
+
+        acct_id = "a"
+        acct = _acct(id=acct_id, user_id="u1", name="TestAcct")
+        _account_by_id[acct_id] = acct
+        stats = {"account_rate": 0.2, "project_median": 0.8, "sample_size": 5,
+                 "distinct_accounts": 2, "started_at": "2026-04-29T00:00:00+00:00"}
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(acct_id, OPUS, kind="regression",
+                                        regression_stats=stats, provider="anthropic")
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            result = await clear_regression_on_success(acct_id, OPUS)
+        assert result is not None
+        assert result["model"] == OPUS
+        assert result["provider"] == "anthropic"
+        assert result["account_rate"] == 0.2
+        assert result["project_median"] == 0.8
+        assert result["sample_size"] == 5
+        assert result["user_id"] == "u1"
+        assert result["account_label"] == "TestAcct"
+        assert "disabled_models" not in acct
+
+    async def test_clear_regression_on_success_returns_none_without_entry(self):
+        """Returns None when no regression entry exists — also ensures second call is a no-op."""
+        from app.max_plan_pool import clear_regression_on_success
+
+        acct = _acct(id="a")
+        _account_by_id["a"] = acct
+        assert await clear_regression_on_success("a", OPUS) is None
+
+    async def test_clear_regression_on_success_ignores_quota_exhausted(self):
+        """Must not clear a quota_exhausted entry on the same model."""
+        from app.max_plan_pool import clear_regression_on_success, disable_account_model
+
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(acct_id, OPUS, kind="quota_exhausted")
+        result = await clear_regression_on_success(acct_id, OPUS)
+        assert result is None
+        assert OPUS in acct["disabled_models"]
+        assert acct["disabled_models"][OPUS]["kind"] == "quota_exhausted"
+
+    async def test_clear_regression_on_success_leaves_quota_exhausted_sibling(self):
+        """Clearing regression on one model must not touch quota_exhausted on another."""
+        from app.max_plan_pool import clear_regression_on_success
+        from datetime import datetime
+
+        acct_id = "a"
+        acct = _acct(id=acct_id, name="A")
+        sonnet = "claude-sonnet-4-5"
+        # Inject directly to avoid cascade interference between model tiers.
+        acct["disabled_models"] = {
+            sonnet: {
+                "kind": "regression", "hits": 1, "at": datetime.utcnow(),
+                "provider": "anthropic",
+                "regression_stats": {"account_rate": 0.1, "project_median": 0.9,
+                                     "sample_size": 5, "distinct_accounts": 2,
+                                     "started_at": "2026-04-29T00:00:00+00:00"},
+            },
+            OPUS: {"kind": "quota_exhausted", "hits": 1, "at": datetime.utcnow()},
+        }
+        _account_by_id[acct_id] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            result = await clear_regression_on_success(acct_id, sonnet)
+        assert result is not None
+        assert result["model"] == sonnet
+        dm = acct.get("disabled_models") or {}
+        assert sonnet not in dm
+        assert OPUS in dm and dm[OPUS]["kind"] == "quota_exhausted"
+
 
 # ── scan_account_model_regressions dedupe ───────────────────────────────────
 

@@ -329,7 +329,9 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "prediction_calibration_note":     {"priority": "low"},
     # Mode-aware additions: only present when non-empty
     "system_maturity":                 {"priority": "low"},
-    "drift_signals":                   {"priority": "low"},
+    # drift_signals is actionable mode-switch input (audit/pause triggers), so it
+    # must survive budget pressure — promoted to medium alongside conversation_thread.
+    "drift_signals":                   {"priority": "medium"},
 }
 
 

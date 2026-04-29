@@ -1853,6 +1853,53 @@ async def clear_account_model_regression(acct_id: str, model: str, provider: str
         return True
 
 
+async def clear_regression_on_success(acct_id: str, model: str) -> dict | None:
+    """Clear a regression-kind disabled_models entry after a successful probe task.
+
+    Returns the cleared entry's metadata dict (account_id, account_label,
+    user_id, provider, model, and regression_stats fields) if cleared, else None.
+    No cascade: regression entries are keyed under the literal model name (not
+    normalized), so only the exact model key is examined and removed.
+
+    Acquires _max_plan_pool_lock. On DB persist failure appends to
+    _pending_rl_persists for retry (same contract as clear_rate_limit_state_on_success).
+    """
+    if not acct_id or not model:
+        return None
+    async with _max_plan_pool_lock:
+        acct = _account_by_id.get(acct_id)
+        if acct is None:
+            return None
+        dm = acct.get("disabled_models") or {}
+        info = dm.get(model)
+        if info is None or info.get("kind") != "regression":
+            return None
+        stats = info.get("regression_stats") or {}
+        recovery_info = {
+            "account_id": acct_id,
+            "account_label": acct.get("name") or acct_id,
+            "user_id": acct.get("user_id"),
+            "provider": info.get("provider"),
+            "model": model,
+            "account_rate": stats.get("account_rate"),
+            "project_median": stats.get("project_median"),
+            "sample_size": stats.get("sample_size"),
+            "distinct_accounts": stats.get("distinct_accounts"),
+            "started_at": stats.get("started_at"),
+        }
+        del dm[model]
+        if not dm:
+            acct.pop("disabled_models", None)
+        logger.info(f"[POOL] Account {acct['name']} auto-recovered regression on {model} after probe success")
+        try:
+            await _persist_rate_limit_state(acct_id)
+        except SQLAlchemyError as e:
+            logger.warning(f"[POOL] Failed to persist regression recovery for {acct_id}: {e} — queued for retry")
+            if acct_id not in _pending_rl_persists:
+                _pending_rl_persists.append(acct_id)
+        return recovery_info
+
+
 async def scan_account_model_regressions(session) -> list[dict[str, Any]]:
     """Periodic scan: detect (account, provider, model) regressions vs project
     median, write disabled_models entries with kind='regression', and return

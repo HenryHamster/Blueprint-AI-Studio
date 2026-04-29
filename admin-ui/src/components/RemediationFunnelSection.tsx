@@ -91,6 +91,8 @@ interface ResidualFingerprint {
   last_spawned_pr_number?: number | null;
   consecutive_failure_count?: number | null;
   suspended_at?: string | null;
+  audit_defer_count?: number | null;
+  audit_deferred_system_id?: string | null;
 }
 
 interface ResidualFingerprintsData {
@@ -369,6 +371,22 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
           </button>
         )}
       </div>
+
+      {(() => {
+        const deferred = (residuals?.top_residuals ?? []).filter(r => (r.audit_defer_count ?? 0) > 0);
+        if (deferred.length === 0) return null;
+        const systemIds = Array.from(new Set(deferred.map(r => r.audit_deferred_system_id).filter(Boolean) as string[]));
+        const sysLabel = systemIds.length > 0 && systemIds.length <= 3
+          ? ` on systems ${systemIds.join(', ')}`
+          : '';
+        return (
+          <div className="mb-2 text-[10px]">
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-400 border-amber-500/30">
+              {deferred.length} {deferred.length === 1 ? 'case' : 'cases'} audit-deferred{sysLabel}
+            </span>
+          </div>
+        );
+      })()}
 
       {/* Horizontal funnel */}
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 mb-2">

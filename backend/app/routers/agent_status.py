@@ -40,6 +40,7 @@ from app.max_plan_pool import (
     _max_plan_pools,
     _extract_task_model,
     clear_rate_limit_state_on_success,
+    clear_regression_on_success,
     disable_account_model,
     get_task_llm_account_id,
     get_task_llm_auth_mode,
@@ -996,6 +997,14 @@ async def update_agent_status(
                         await clear_rate_limit_state_on_success(acct_id_clear, model_clear)
                     except Exception as e:
                         logger.warning(f"[STATUS] clear_rate_limit_state_on_success failed for {acct_id_clear}: {e}", exc_info=True)
+                    try:
+                        _rr = await clear_regression_on_success(acct_id_clear, model_clear)
+                        if _rr and task.project_id:
+                            from app.notification_dispatch import post_account_model_regression_recovered_message, dispatch_external_notification  # noqa: PLC0415
+                            await post_account_model_regression_recovered_message(session, task.project_id, account_id=_rr["account_id"], account_label=_rr["account_label"], provider=_rr.get("provider") or "", model=_rr["model"], account_rate=_rr.get("account_rate"), project_median=_rr.get("project_median"), sample_size=_rr.get("sample_size"))
+                            asyncio.ensure_future(dispatch_external_notification(task.project_id, "account_model_regression_recovered", {k: _rr.get(k) for k in ("account_id", "account_label", "provider", "model")}))  # noqa: RUF006
+                    except Exception as e:
+                        logger.warning(f"[STATUS] regression recovery failed for {acct_id_clear}: {e}", exc_info=True)
                 if acct_id_clear and task.vm_provisioned_at:
                     try:
                         duration_secs = (_utcnow() - task.vm_provisioned_at).total_seconds()

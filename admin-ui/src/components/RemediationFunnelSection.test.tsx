@@ -509,6 +509,46 @@ describe('RemediationFunnelSection unsuspend button', () => {
   });
 });
 
+describe('RemediationFunnelSection audit-deferred sub-metric', () => {
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+  });
+
+  it('shows audit-deferred sub-metric when cases have audit_defer_count > 0', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+      baseCluster({ fingerprint: 'fp-1', audit_defer_count: 2, audit_deferred_system_id: 'sys-a' }),
+      baseCluster({ fingerprint: 'fp-2', audit_defer_count: 1, audit_deferred_system_id: 'sys-b' }),
+    ])));
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} />);
+    await act(async () => {});
+    expect(screen.getByText(/2 cases audit-deferred/i)).toBeInTheDocument();
+    expect(screen.getByText(/sys-a/)).toBeInTheDocument();
+    expect(screen.getByText(/sys-b/)).toBeInTheDocument();
+  });
+
+  it('is hidden when no cases have audit_defer_count > 0', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+      baseCluster({ fingerprint: 'fp-1', audit_defer_count: 0 }),
+    ])));
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} />);
+    await act(async () => {});
+    expect(screen.queryByText(/audit-deferred/i)).toBeNull();
+  });
+
+  it('shows only count (no system list) when unique systems exceed 3', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+      baseCluster({ fingerprint: 'fp-1', audit_defer_count: 1, audit_deferred_system_id: 'sys-a' }),
+      baseCluster({ fingerprint: 'fp-2', audit_defer_count: 1, audit_deferred_system_id: 'sys-b' }),
+      baseCluster({ fingerprint: 'fp-3', audit_defer_count: 1, audit_deferred_system_id: 'sys-c' }),
+      baseCluster({ fingerprint: 'fp-4', audit_defer_count: 1, audit_deferred_system_id: 'sys-d' }),
+    ])));
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} />);
+    await act(async () => {});
+    expect(screen.getByText(/4 cases audit-deferred/i)).toBeInTheDocument();
+    expect(screen.queryByText(/on systems/i)).toBeNull();
+  });
+});
+
 describe('RemediationFunnelSection residuals status pill', () => {
   beforeEach(() => {
     apiFetchMock.mockReset();
