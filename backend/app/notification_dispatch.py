@@ -413,6 +413,52 @@ async def post_failure_alert_message(
     )
 
 
+async def post_account_model_regression_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    account_id: str,
+    account_label: str,
+    provider: str,
+    model: str,
+    account_rate: float,
+    project_median: float,
+    sample_size: int,
+    distinct_accounts: int,
+    started_at: str,
+) -> ProjectMessage:
+    """Post a message when a (provider, model) combination is auto-quarantined
+    on an account due to a success-rate regression vs the project median.
+
+    Mirrors the post_failure_alert_message shape — same NOTE/system surface
+    operators already watch for circuit-breaker events. The richer numeric
+    detail (account_rate, project_median, sample_size) is preserved on
+    ``context`` so the UI can surface a structured drill-in alongside the
+    plain-text summary.
+    """
+    summary = (
+        f"Account model regression-quarantined: {account_label} {provider}/{model} "
+        f"({account_rate:.0%} success vs project median {project_median:.0%} on n={sample_size})"
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="account_model_regression_quarantined",
+        summary=summary,
+        context={
+            "account_id": account_id,
+            "account_label": account_label,
+            "provider": provider,
+            "model": model,
+            "account_rate": account_rate,
+            "project_median": project_median,
+            "sample_size": sample_size,
+            "distinct_accounts": distinct_accounts,
+            "started_at": started_at,
+        },
+    )
+
+
 async def post_auto_fix_spawned_message(
     session: AsyncSession,
     project_id: uuid.UUID,

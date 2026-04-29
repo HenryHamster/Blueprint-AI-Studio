@@ -750,14 +750,20 @@ async def load_max_plan_pool():
                             "hits": info.get("hits", 1),
                             "at": at_dt,
                         }
-                        # Preserve structured fields (kind, retry_after_seconds)
-                        # across restarts so quota_exhausted accounts aren't
-                        # silently demoted to an exponential-rate-limit cooldown.
-                        if info.get("kind") == "quota_exhausted":
-                            restored_info["kind"] = "quota_exhausted"
+                        # Preserve structured fields (kind, retry_after_seconds,
+                        # regression metadata) across restarts so quota_exhausted
+                        # / regression accounts aren't silently demoted to an
+                        # exponential-rate-limit cooldown.
+                        if info.get("kind") in ("quota_exhausted", "regression", "quarantine"):
+                            restored_info["kind"] = info["kind"]
                         hint = info.get("retry_after_seconds")
                         if isinstance(hint, (int, float)) and hint > 0:
                             restored_info["retry_after_seconds"] = int(hint)
+                        if info.get("provider"):
+                            restored_info["provider"] = info["provider"]
+                        stats = info.get("regression_stats")
+                        if isinstance(stats, dict):
+                            restored_info["regression_stats"] = dict(stats)
                         if (now - at_dt).total_seconds() < _cooldown_seconds_for_info(restored_info):
                             restored_dm[model_name] = restored_info
                 if restored_dm:
@@ -820,6 +826,7 @@ def _account_at_cap(acct: dict) -> str | None:
 
 _QUOTA_EXHAUSTED_COOLDOWN_SECONDS = 24 * 60 * 60  # flat 24h for billing walls
 _QUARANTINE_COOLDOWN_SECONDS = 15 * 60  # flat 15-min recheck for confidence-gated quarantine
+_REGRESSION_COOLDOWN_SECONDS = 6 * 60 * 60  # flat 6h reprobe for regression quarantine
 QUARANTINE_CONSECUTIVE_N = 3  # consecutive qualifying failures to trip the quarantine
 QUARANTINE_CONFIDENCE_THRESHOLD = 0.8  # minimum per-record confidence to count
 _QUARANTINE_ELIGIBLE_CLASSES = frozenset({"RATE_LIMIT", "PROVISION_FAILURE"})
@@ -835,11 +842,16 @@ def _serialize_disabled_model_info(info: dict) -> dict:
         "hits": info.get("hits", 1),
         "at": info["at"].isoformat(),
     }
-    if info.get("kind") in ("quota_exhausted", "quarantine"):
+    if info.get("kind") in ("quota_exhausted", "quarantine", "regression"):
         out["kind"] = info["kind"]
     hint = info.get("retry_after_seconds")
     if isinstance(hint, (int, float)) and hint > 0:
         out["retry_after_seconds"] = int(hint)
+    if info.get("provider"):
+        out["provider"] = info["provider"]
+    stats = info.get("regression_stats")
+    if isinstance(stats, dict):
+        out["regression_stats"] = dict(stats)
     return out
 
 
@@ -850,6 +862,9 @@ def _cooldown_seconds_for_info(info: dict) -> int:
     - kind="quota_exhausted" → flat 24h. These are billing walls; the
       exponential-backoff curve doesn't apply because the error doesn't
       resolve on clock.
+    - kind="regression" → flat 6h reprobe. Regression triggers on slow
+      drift in success rate; a short cooldown would keep cycling the
+      bad combination.
     - Otherwise exponential: min(30 * 2^(hits-1), 240) minutes.
     - Server-provided retry_after_seconds is treated as a floor — we never
       shorten below it, and we never extend below the exponential value.
@@ -858,6 +873,8 @@ def _cooldown_seconds_for_info(info: dict) -> int:
         return _QUOTA_EXHAUSTED_COOLDOWN_SECONDS
     if info.get("kind") == "quarantine":
         return _QUARANTINE_COOLDOWN_SECONDS
+    if info.get("kind") == "regression":
+        return _REGRESSION_COOLDOWN_SECONDS
     hits = info.get("hits", 1)
     exponential = min(30 * (2 ** (hits - 1)), 240) * 60
     hint = info.get("retry_after_seconds")
@@ -926,8 +943,13 @@ def _account_state_for_model(acct: dict, model: str | None, now: datetime | None
         # the existing behavior for health checks and the autonomous-research gate.
         return "unavailable"
     # Haiku shares Opus's meter — look up Opus's entry.
+    orig_model = model
     model = _normalize_rl_model(model)
     info = dm.get(model)
+    # Regression entries are keyed under the actual model name (not normalized),
+    # so fall back to the un-normalized key if the normalized lookup misses.
+    if info is None and model != orig_model:
+        info = dm.get(orig_model)
     if info is None:
         return "healthy"
     at_dt = info.get("at")
@@ -1606,6 +1628,8 @@ async def disable_account_model(
     *,
     retry_after_seconds: int | None = None,
     kind: str = "rate_limit",
+    regression_stats: dict | None = None,
+    provider: str | None = None,
 ) -> None:
     """Mark an account's cascade of models as rate-limited and persist.
 
@@ -1622,15 +1646,34 @@ async def disable_account_model(
     - `kind="quota_exhausted"`: billing wall (insufficient_quota, out-of-credits).
       Uses a flat 24h cooldown instead of exponential — these don't resolve on
       clock, they need operator action (refill credits / raise budget).
+    - `kind="regression"`: per-(provider, model) success-rate regression
+      detected by scan_account_model_regressions. Disables ONLY the specific
+      model (no Opus→Sonnet→Haiku cascade — regression is per-(provider, model)
+      and the rate-limit cascade does not apply); confidence-gated quarantine
+      trip-wire is also bypassed. Cooldown is a flat 6h reprobe. When provided,
+      ``regression_stats`` (account_rate, project_median, sample_size,
+      distinct_accounts, started_at) is persisted on the entry so operators
+      can see why the model was quarantined.
+
+    Model names like ``claude-opus-4-7`` are already provider-disambiguated
+    in this codebase, so disabled_models stays keyed by model name; the
+    explicit ``provider`` is stashed on the entry as metadata for richer
+    notification payloads but does NOT participate in the dict key.
 
     Acquires _max_plan_pool_lock. On DB persist failure, appends to
     _pending_rl_persists for retry (same contract as clear_rate_limit_state_on_success).
     """
     if not acct_id or not model:
         return
-    # Normalize Haiku → Opus so the meter is keyed correctly.
-    model = _normalize_rl_model(model)
-    cascade = cascade_disabled_models(model)
+    # Normalize Haiku → Opus so the meter is keyed correctly. Regression is
+    # per-(provider, model) and operates on the actual model name — skip the
+    # Haiku→Opus normalization and the cascade since cascade-disabling other
+    # models on a regression of one would be over-broad.
+    if kind != "regression":
+        model = _normalize_rl_model(model)
+        cascade = cascade_disabled_models(model)
+    else:
+        cascade = (model,)
     async with _max_plan_pool_lock:
         acct = _account_by_id.get(acct_id)
         if acct is None:
@@ -1643,8 +1686,31 @@ async def disable_account_model(
             info["at"] = now
             if kind == "quota_exhausted":
                 info["kind"] = "quota_exhausted"
+            elif kind == "regression":
+                info["kind"] = "regression"
+                if provider:
+                    info["provider"] = provider
+                if regression_stats is not None:
+                    info["regression_stats"] = dict(regression_stats)
             if retry_after_seconds is not None:
                 info["retry_after_seconds"] = int(retry_after_seconds)
+        # Regression quarantine is driven by aggregated success-rate trends, not
+        # by an individual rate-limit/provision event — skip rl_events / health
+        # bookkeeping, the auto-disable counter, and the confidence-gated
+        # quarantine trip-wire (those are scoped to per-event failure signals).
+        if kind == "regression":
+            primary_key = cascade[0]
+            logger.warning(
+                f"[POOL] Account {acct['name']} regression-quarantined on model {primary_key} "
+                f"(flat {_REGRESSION_COOLDOWN_SECONDS // 60}min reprobe cooldown)"
+            )
+            try:
+                await _persist_rate_limit_state(acct_id)
+            except SQLAlchemyError as e:
+                logger.warning(f"[POOL] Failed to persist regression state for {acct_id}: {e} — queued for retry")
+                if acct_id not in _pending_rl_persists:
+                    _pending_rl_persists.append(acct_id)
+            return
         # Record rate-limit event for rolling health score + success-rate tracking
         _prune_health_events(acct, now)
         acct.setdefault("rl_events", []).append(now)
@@ -1740,6 +1806,142 @@ async def clear_rate_limit_state_on_success(acct_id: str, model: str) -> bool:
             if acct_id not in _pending_rl_persists:
                 _pending_rl_persists.append(acct_id)
         return True
+
+
+async def clear_account_model_regression(acct_id: str, model: str, provider: str | None = None) -> bool:
+    """Manually clear a regression-kind disabled_models entry for (account, model).
+
+    Returns True iff an entry existed AND its kind was 'regression' (untouched
+    otherwise). When ``provider`` is supplied and the stored entry also carries
+    a provider tag, the two must match — a mismatch returns False so operators
+    get a hard rejection rather than silently clearing the wrong entry.
+
+    This is the manual override behind the recovery endpoint —
+    rate_limit / quota_exhausted / quarantine entries have their own recovery
+    semantics and must not be cleared here. The 6h time-based reprobe is the
+    automatic recovery; this function is for operators who want to re-enable
+    a (provider, model) before the cooldown elapses.
+
+    Acquires _max_plan_pool_lock. On DB persist failure, appends to
+    _pending_rl_persists for retry.
+    """
+    if not acct_id or not model:
+        return False
+    async with _max_plan_pool_lock:
+        acct = _account_by_id.get(acct_id)
+        if acct is None:
+            return False
+        dm = acct.get("disabled_models") or {}
+        info = dm.get(model)
+        if info is None or info.get("kind") != "regression":
+            return False
+        # Validate provider when both sides have it — reject mismatches so
+        # operators can't silently clear an entry for a different provider.
+        stored_provider = info.get("provider")
+        if provider and stored_provider and stored_provider != provider:
+            return False
+        del dm[model]
+        if not dm:
+            acct.pop("disabled_models", None)
+        logger.info(f"[POOL] Account {acct['name']} cleared regression-quarantine on {model} (manual override)")
+        try:
+            await _persist_rate_limit_state(acct_id)
+        except SQLAlchemyError as e:
+            logger.warning(f"[POOL] Failed to persist regression clear for {acct_id}: {e} — queued for retry")
+            if acct_id not in _pending_rl_persists:
+                _pending_rl_persists.append(acct_id)
+        return True
+
+
+async def scan_account_model_regressions(session) -> list[dict[str, Any]]:
+    """Periodic scan: detect (account, provider, model) regressions vs project
+    median, write disabled_models entries with kind='regression', and return
+    NEWLY-fired events for callers to dispatch notifications.
+
+    Idempotency: if an account already has a regression entry on the same
+    (provider, model) and that entry's cooldown has not expired, do nothing —
+    the lock-held read-modify-write keeps the dedupe atomic so concurrent
+    ticks cannot double-fire.
+
+    Each newly-fired event dict carries enough payload (account_id,
+    account_label, user_id, provider, model, account_rate, project_median,
+    sample_size, distinct_accounts, started_at) for the notification layer
+    to fan out to the user's projects.
+
+    Tolerant on errors: a DB failure inside the regression query is logged
+    and returns an empty list rather than poisoning the calling reaper loop.
+    """
+    from app.account_model_regression import find_account_model_regressions  # noqa: PLC0415
+
+    async with _max_plan_pool_lock:
+        account_ids = list(_account_by_id.keys())
+    if not account_ids:
+        return []
+
+    try:
+        candidates = await find_account_model_regressions(session, account_ids)
+    except Exception as e:
+        logger.warning(f"[POOL] regression scan query failed: {e}")
+        return []
+    if not candidates:
+        return []
+
+    fired: list[dict[str, Any]] = []
+    now = _utcnow()
+    for cand in candidates:
+        acct_id = cand.account_id
+        if not acct_id:
+            continue
+        async with _max_plan_pool_lock:
+            acct = _account_by_id.get(acct_id)
+            if acct is None:
+                continue
+            dm = acct.get("disabled_models") or {}
+            existing = dm.get(cand.model)
+            if existing is not None and existing.get("kind") == "regression":
+                # Already quarantined for this (provider, model). Re-fire only if
+                # the prior cooldown has elapsed AND the regression still holds —
+                # find_account_model_regressions only returns currently-failing
+                # cells, so the cooldown check alone is the dedupe boundary.
+                at_dt = existing.get("at")
+                if at_dt is not None:
+                    cooldown = _cooldown_seconds_for_info(existing)
+                    if (now - at_dt).total_seconds() < cooldown:
+                        continue
+            user_id = acct.get("user_id")
+            account_label = acct.get("name") or acct_id
+
+        stats = {
+            "account_rate": cand.account_rate,
+            "project_median": cand.project_median,
+            "sample_size": cand.sample_size,
+            "distinct_accounts": cand.distinct_accounts,
+            "started_at": now.isoformat(),
+        }
+        try:
+            await disable_account_model(
+                acct_id,
+                cand.model,
+                kind="regression",
+                regression_stats=stats,
+                provider=cand.provider,
+            )
+        except Exception as e:
+            logger.warning(f"[POOL] Failed to apply regression quarantine for {acct_id}/{cand.model}: {e}")
+            continue
+        fired.append({
+            "account_id": acct_id,
+            "account_label": account_label,
+            "user_id": user_id,
+            "provider": cand.provider,
+            "model": cand.model,
+            "account_rate": cand.account_rate,
+            "project_median": cand.project_median,
+            "sample_size": cand.sample_size,
+            "distinct_accounts": cand.distinct_accounts,
+            "started_at": stats["started_at"],
+        })
+    return fired
 
 
 async def recheck_disabled_accounts():

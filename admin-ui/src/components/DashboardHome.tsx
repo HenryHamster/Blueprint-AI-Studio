@@ -23,6 +23,7 @@ import { TaskDurationWidget, type TaskDurationStats } from './TaskDurationWidget
 import { ScopeConversionRatesSection } from './ScopeConversionRatesSection';
 import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSection';
 import { ProviderCostPanel } from './ProviderCostPanel';
+import { ProviderModelBreakdownPanel } from './ProviderModelBreakdownPanel';
 import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
@@ -1402,7 +1403,13 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             <PoolAccountHealthPanel accounts={accountHealth} loading={loading} />
           )}
 
-          {/* Section 2e: Provider Cost & Success */}
+          {/* Section 2e: Provider / Model Breakdown */}
+          <ProviderModelBreakdownPanel
+            selectedProjectId={selectedProjectId}
+            accounts={accountHealth}
+          />
+
+          {/* Section 2f: Provider Cost & Success */}
           <ProviderCostPanel selectedProjectId={selectedProjectId} windowHours={windowHours} />
 
           {/* Drift Signals */}

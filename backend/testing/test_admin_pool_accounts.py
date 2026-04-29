@@ -400,3 +400,608 @@ async def test_account_health_summary_disabled_models_with_kind(client, inject_p
     assert mods["claude-opus-4-7"]["cooldown_type"] == "rate_limit"
     assert mods["claude-sonnet-4-6"]["cooldown_type"] == "quota_exhausted"
     assert mods["claude-sonnet-4-6"]["cooldown_seconds_remaining"] > 3600  # flat 24h
+
+
+async def test_provider_model_breakdown_aggregation_and_median(client, db_session):
+    """Breakdown groups by (provider, model), computes median, filters low-sample rows."""
+    project = Project(name="pm-test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    acct_a_id, acct_b_id = uuid.uuid4(), uuid.uuid4()
+    acct_a, acct_b = str(acct_a_id), str(acct_b_id)
+    mp_a = MaxPlanAccount(
+        id=acct_a_id, user_id="test-user-123", name="PM-A",
+        provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH,
+    )
+    mp_b = MaxPlanAccount(
+        id=acct_b_id, user_id="test-user-123", name="PM-B",
+        provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH,
+    )
+    db_session.add_all([mp_a, mp_b])
+    await db_session.flush()
+
+    # anthropic/claude-3-5: acct_a=5C+1F (rate≈0.833), acct_b=2C+1F (rate≈0.667)
+    # Both have >= 3 tasks, so both are included in the median calculation.
+    tasks = [
+        Task(project_id=project.id, provider="anthropic", model="claude-3-5",
+             account_id=acct_a, status=TaskStatus.COMPLETED)
+        for _ in range(5)
+    ] + [
+        Task(project_id=project.id, provider="anthropic", model="claude-3-5",
+             account_id=acct_a, status=TaskStatus.FAILED),
+        Task(project_id=project.id, provider="anthropic", model="claude-3-5",
+             account_id=acct_b, status=TaskStatus.COMPLETED),
+        Task(project_id=project.id, provider="anthropic", model="claude-3-5",
+             account_id=acct_b, status=TaskStatus.COMPLETED),
+        Task(project_id=project.id, provider="anthropic", model="claude-3-5",
+             account_id=acct_b, status=TaskStatus.FAILED),
+    ] + [
+        # openai/gpt-4: only 3 tasks — below _PROVIDER_MODEL_MIN_SAMPLE=5, excluded
+        Task(project_id=project.id, provider="openai", model="gpt-4",
+             account_id=acct_a, status=TaskStatus.COMPLETED)
+        for _ in range(3)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    res = await client.get("/api/admin/max-plan-accounts/provider-model-breakdown")
+    assert res.status_code == 200
+    rows = res.json()["rows"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["provider"] == "anthropic"
+    assert row["model"] == "claude-3-5"
+    assert row["total_tasks"] == 9
+    assert row["success_count"] == 7
+    assert row["distinct_accounts"] == 2
+    # Median of sorted per-account rates [0.667, 0.833] = (0.667 + 0.833) / 2 = 0.750
+    assert abs(row["project_median_success_rate"] - 0.750) < 0.001
+
+
+async def test_provider_model_breakdown_expand_accounts(client, db_session):
+    """expand_accounts=true adds per-account breakdown with below_median flag."""
+    project = Project(name="pm-expand", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    acct_good_id, acct_bad_id = uuid.uuid4(), uuid.uuid4()
+    acct_good, acct_bad = str(acct_good_id), str(acct_bad_id)
+    mp_good = MaxPlanAccount(
+        id=acct_good_id, user_id="test-user-123", name="Expand-Good",
+        provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH,
+    )
+    mp_bad = MaxPlanAccount(
+        id=acct_bad_id, user_id="test-user-123", name="Expand-Bad",
+        provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH,
+    )
+    db_session.add_all([mp_good, mp_bad])
+    await db_session.flush()
+
+    tasks = [
+        Task(project_id=project.id, provider="anthropic", model="sonnet",
+             account_id=acct_good, status=TaskStatus.COMPLETED)
+        for _ in range(5)
+    ] + [
+        Task(project_id=project.id, provider="anthropic", model="sonnet",
+             account_id=acct_bad, status=TaskStatus.FAILED)
+        for _ in range(5)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    res = await client.get("/api/admin/max-plan-accounts/provider-model-breakdown?expand_accounts=true")
+    assert res.status_code == 200
+    row = res.json()["rows"][0]
+    assert "accounts" in row
+    acct_data = {a["account_id"]: a for a in row["accounts"]}
+    assert acct_data[acct_good]["success_rate"] == 1.0
+    assert acct_data[acct_bad]["success_rate"] == 0.0
+    assert acct_data[acct_bad]["below_median"] is True
+    assert acct_data[acct_good]["below_median"] is False
+
+
+# ── account_model_regression helpers ─────────────────────────────────────────
+
+async def test_provider_model_breakdown_excludes_infra_failures(client, db_session):
+    """RATE_LIMIT/PROVISION_FAILURE tasks are excluded from total_tasks and success_count."""
+    project = Project(name="infra-excl", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    acct_a_id, acct_b_id = uuid.uuid4(), uuid.uuid4()
+    acct_a, acct_b = str(acct_a_id), str(acct_b_id)
+    db_session.add_all([
+        MaxPlanAccount(id=acct_a_id, user_id="test-user-123", name="Infra-A",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+        MaxPlanAccount(id=acct_b_id, user_id="test-user-123", name="Infra-B",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+    ])
+    await db_session.flush()
+
+    # 5 legit completions (should count)
+    tasks = [
+        Task(project_id=project.id, provider="anthropic", model="claude-3",
+             account_id=acct_a, status=TaskStatus.COMPLETED)
+        for _ in range(3)
+    ] + [
+        Task(project_id=project.id, provider="anthropic", model="claude-3",
+             account_id=acct_b, status=TaskStatus.COMPLETED)
+        for _ in range(2)
+    ] + [
+        # Infra failures — should be excluded
+        Task(project_id=project.id, provider="anthropic", model="claude-3",
+             account_id=acct_a, status=TaskStatus.FAILED,
+             context={"failure_category": "RATE_LIMIT"}),
+        Task(project_id=project.id, provider="anthropic", model="claude-3",
+             account_id=acct_b, status=TaskStatus.FAILED,
+             context={"failure_category": "PROVISION_FAILURE"}),
+        Task(project_id=project.id, provider="anthropic", model="claude-3",
+             account_id=acct_a, status=TaskStatus.CANCELLED,
+             context={"failure_category": "AGENT_TIMEOUT"}),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    res = await client.get("/api/admin/max-plan-accounts/provider-model-breakdown")
+    assert res.status_code == 200
+    rows = res.json()["rows"]
+    assert len(rows) == 1
+    row = rows[0]
+    # Only the 5 non-infra tasks should be counted
+    assert row["total_tasks"] == 5
+    assert row["success_count"] == 5
+    assert row["success_rate"] == 1.0
+
+
+async def test_provider_model_breakdown_code_error_failures_included(client, db_session):
+    """CODE_ERROR failures are counted in the denominator (non-infra failures stay in)."""
+    project = Project(name="code-err", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    acct_a_id, acct_b_id = uuid.uuid4(), uuid.uuid4()
+    acct_a, acct_b = str(acct_a_id), str(acct_b_id)
+    db_session.add_all([
+        MaxPlanAccount(id=acct_a_id, user_id="test-user-123", name="Code-A",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+        MaxPlanAccount(id=acct_b_id, user_id="test-user-123", name="Code-B",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+    ])
+    await db_session.flush()
+
+    tasks = [
+        Task(project_id=project.id, provider="anthropic", model="sonnet",
+             account_id=acct_a, status=TaskStatus.COMPLETED)
+        for _ in range(3)
+    ] + [
+        Task(project_id=project.id, provider="anthropic", model="sonnet",
+             account_id=acct_b, status=TaskStatus.COMPLETED)
+        for _ in range(2)
+    ] + [
+        # CODE_ERROR — not infra, should remain in denominator
+        Task(project_id=project.id, provider="anthropic", model="sonnet",
+             account_id=acct_a, status=TaskStatus.FAILED,
+             context={"failure_category": "CODE_ERROR"}),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    res = await client.get("/api/admin/max-plan-accounts/provider-model-breakdown")
+    assert res.status_code == 200
+    row = res.json()["rows"][0]
+    assert row["total_tasks"] == 6  # CODE_ERROR still counted
+    assert row["success_count"] == 5
+
+
+async def test_find_regressions_skips_single_account_groups(db_session):
+    """find_account_model_regressions returns nothing for a single-account (provider, model) group."""
+    from app.account_model_regression import find_account_model_regressions
+
+    project = Project(name="single-acct", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    acct_id = uuid.uuid4()
+    acct = str(acct_id)
+    db_session.add(MaxPlanAccount(
+        id=acct_id, user_id="test-user-123", name="Solo",
+        provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH,
+    ))
+    await db_session.flush()
+
+    # 5 failed tasks — would look like a regression, but only one account
+    tasks = [
+        Task(project_id=project.id, provider="anthropic", model="opus",
+             account_id=acct, status=TaskStatus.FAILED)
+        for _ in range(5)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    candidates = await find_account_model_regressions(db_session, [acct])
+    assert candidates == []
+
+
+async def test_find_regressions_requires_both_thresholds(db_session):
+    """Regression fires only when BOTH relative (< 80%) AND absolute (>= 0.15) gaps are met."""
+    from app.account_model_regression import find_account_model_regressions
+
+    project = Project(name="threshold-test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    # Two accounts; acct_good has very high rate (~0.90), acct_bad has rate 0.75.
+    # Relative gap: 0.75 < 0.90 * 0.8 = 0.72 → NOT met (0.75 > 0.72).
+    # So no regression should fire.
+    acct_good_id, acct_bad_id = uuid.uuid4(), uuid.uuid4()
+    acct_good, acct_bad = str(acct_good_id), str(acct_bad_id)
+    db_session.add_all([
+        MaxPlanAccount(id=acct_good_id, user_id="test-user-123", name="TGood",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+        MaxPlanAccount(id=acct_bad_id, user_id="test-user-123", name="TBad",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+    ])
+    await db_session.flush()
+
+    # acct_good: 9 success, 1 fail → rate 0.9
+    # acct_bad:  3 success, 1 fail → rate 0.75; median of [0.75, 0.9] = 0.825
+    # relative gap: 0.75 < 0.825 * 0.8 = 0.66 → NOT met
+    tasks = [
+        Task(project_id=project.id, provider="anthropic", model="haiku",
+             account_id=acct_good, status=TaskStatus.COMPLETED)
+        for _ in range(9)
+    ] + [
+        Task(project_id=project.id, provider="anthropic", model="haiku",
+             account_id=acct_good, status=TaskStatus.FAILED),
+        Task(project_id=project.id, provider="anthropic", model="haiku",
+             account_id=acct_bad, status=TaskStatus.COMPLETED),
+        Task(project_id=project.id, provider="anthropic", model="haiku",
+             account_id=acct_bad, status=TaskStatus.COMPLETED),
+        Task(project_id=project.id, provider="anthropic", model="haiku",
+             account_id=acct_bad, status=TaskStatus.COMPLETED),
+        Task(project_id=project.id, provider="anthropic", model="haiku",
+             account_id=acct_bad, status=TaskStatus.FAILED),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    candidates = await find_account_model_regressions(
+        db_session, [acct_good, acct_bad]
+    )
+    assert candidates == []
+
+
+async def test_find_regressions_returns_below_median_accounts(db_session):
+    """A two-account group where one account clearly underperforms returns a candidate."""
+    from app.account_model_regression import find_account_model_regressions
+
+    project = Project(name="regression-hit", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    acct_good_id, acct_bad_id = uuid.uuid4(), uuid.uuid4()
+    acct_good, acct_bad = str(acct_good_id), str(acct_bad_id)
+    db_session.add_all([
+        MaxPlanAccount(id=acct_good_id, user_id="test-user-123", name="RGood",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+        MaxPlanAccount(id=acct_bad_id, user_id="test-user-123", name="RBad",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+    ])
+    await db_session.flush()
+
+    # acct_good: 5 success → rate 1.0
+    # acct_bad:  0 success, 5 fail → rate 0.0
+    # median of [0.0, 1.0] = 0.5; relative: 0.0 < 0.5*0.8=0.4 ✓; absolute: 0.5-0.0=0.5 ≥ 0.15 ✓
+    tasks = [
+        Task(project_id=project.id, provider="anthropic", model="claude-r",
+             account_id=acct_good, status=TaskStatus.COMPLETED)
+        for _ in range(5)
+    ] + [
+        Task(project_id=project.id, provider="anthropic", model="claude-r",
+             account_id=acct_bad, status=TaskStatus.FAILED)
+        for _ in range(5)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    candidates = await find_account_model_regressions(
+        db_session, [acct_good, acct_bad]
+    )
+    assert len(candidates) == 1
+    c = candidates[0]
+    assert c.account_id == acct_bad
+    assert c.provider == "anthropic"
+    assert c.model == "claude-r"
+    assert c.account_rate == 0.0
+    assert c.project_median == 0.5
+    assert c.sample_size == 5
+    assert c.distinct_accounts == 2
+
+
+async def test_provider_model_breakdown_quarantine_status(client, db_session):
+    """quarantine_status is populated when rate_limit_state has a regression entry."""
+    project = Project(name="qs-test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    acct_good_id, acct_bad_id = uuid.uuid4(), uuid.uuid4()
+    acct_good, acct_bad = str(acct_good_id), str(acct_bad_id)
+
+    quarantine_entry = {
+        "disabled_models": {
+            "claude-q": {
+                "kind": "regression",
+                "at": "2026-04-28T12:00:00+00:00",
+                "account_rate": 0.1,
+                "project_median": 0.9,
+                "sample_size": 7,
+            }
+        }
+    }
+    db_session.add_all([
+        MaxPlanAccount(id=acct_good_id, user_id="test-user-123", name="QGood",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+        MaxPlanAccount(id=acct_bad_id, user_id="test-user-123", name="QBad",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH,
+                       rate_limit_state=quarantine_entry),
+    ])
+    await db_session.flush()
+
+    tasks = [
+        Task(project_id=project.id, provider="anthropic", model="claude-q",
+             account_id=acct_good, status=TaskStatus.COMPLETED)
+        for _ in range(5)
+    ] + [
+        Task(project_id=project.id, provider="anthropic", model="claude-q",
+             account_id=acct_bad, status=TaskStatus.FAILED)
+        for _ in range(5)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    res = await client.get(
+        "/api/admin/max-plan-accounts/provider-model-breakdown?expand_accounts=true"
+    )
+    assert res.status_code == 200
+    row = res.json()["rows"][0]
+    acct_data = {a["account_id"]: a for a in row["accounts"]}
+
+    qs = acct_data[acct_bad]["quarantine_status"]
+    assert qs is not None
+    assert qs["kind"] == "regression"
+    assert qs["started_at"] == "2026-04-28T12:00:00+00:00"
+    assert qs["account_rate"] == pytest.approx(0.1)
+    assert qs["project_median"] == pytest.approx(0.9)
+    assert qs["sample_size"] == 7
+
+    # Good account has no quarantine entry
+    assert acct_data[acct_good]["quarantine_status"] is None
+
+
+# ── auto-quarantine + recovery endpoint integration ──────────────────────────
+
+async def test_find_regressions_excludes_account_with_only_infra_failures(db_session):
+    """An account whose only failures are infra (RATE_LIMIT, PROVISION_FAILURE,
+    AGENT_TIMEOUT, etc.) must NOT be flagged as a regression — those failures
+    reflect infrastructure issues, not account/model quality."""
+    from app.account_model_regression import find_account_model_regressions
+
+    project = Project(name="infra-only", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    acct_good_id, acct_bad_id = uuid.uuid4(), uuid.uuid4()
+    acct_good, acct_bad = str(acct_good_id), str(acct_bad_id)
+    db_session.add_all([
+        MaxPlanAccount(id=acct_good_id, user_id="test-user-123", name="IGood",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+        MaxPlanAccount(id=acct_bad_id, user_id="test-user-123", name="IBad",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+    ])
+    await db_session.flush()
+
+    # acct_good: 5 successes (rate 1.0)
+    # acct_bad:  5 RATE_LIMIT failures — infra-only, must be filtered out so
+    #            the account drops below the 3-task floor.
+    tasks = [
+        Task(project_id=project.id, provider="anthropic", model="claude-i",
+             account_id=acct_good, status=TaskStatus.COMPLETED)
+        for _ in range(5)
+    ] + [
+        Task(project_id=project.id, provider="anthropic", model="claude-i",
+             account_id=acct_bad, status=TaskStatus.FAILED,
+             context={"failure_category": "RATE_LIMIT"})
+        for _ in range(5)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    candidates = await find_account_model_regressions(
+        db_session, [acct_good, acct_bad]
+    )
+    # acct_bad's infra failures are stripped, leaving 0 samples, which is
+    # below the per-(account, provider, model) min-sample threshold (3).
+    # No regression should fire.
+    assert candidates == []
+
+
+async def test_clear_regression_endpoint_clears_only_regression_kind(client, db_session):
+    """POST /max-plan-accounts/{id}/regression-quarantine/clear removes a
+    regression entry but refuses to touch a rate_limit entry."""
+    from app.max_plan_pool import _account_by_id, _max_plan_pool_lock
+
+    acct_id = uuid.uuid4()
+    db_session.add(MaxPlanAccount(
+        id=acct_id, user_id="test-user-123", name="ClearMe",
+        provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH,
+    ))
+    await db_session.commit()
+
+    # Seed in-memory regression entry directly.
+    async with _max_plan_pool_lock:
+        _account_by_id[str(acct_id)] = {
+            "id": str(acct_id), "name": "ClearMe", "enabled": True,
+            "active_tasks": 0, "user_id": "test-user-123",
+            "provider": "anthropic",
+            "disabled_models": {
+                "claude-q": {
+                    "kind": "regression",
+                    "at": datetime.utcnow(),
+                    "hits": 1,
+                    "provider": "anthropic",
+                    "regression_stats": {
+                        "account_rate": 0.1, "project_median": 0.9,
+                        "sample_size": 5, "distinct_accounts": 2,
+                        "started_at": "2026-04-29T00:00:00+00:00",
+                    },
+                },
+                # And a rate_limit entry on a different model — must be untouched.
+                "other-model": {
+                    "kind": None, "at": datetime.utcnow(), "hits": 1,
+                },
+            },
+        }
+    try:
+        from unittest.mock import AsyncMock as _AM
+        from unittest.mock import patch as _P
+
+        with _P("app.max_plan_pool._persist_rate_limit_state", new=_AM(return_value=None)):
+            res = await client.post(
+                f"/api/admin/max-plan-accounts/{acct_id}/regression-quarantine/clear"
+                "?provider=anthropic&model=claude-q"
+            )
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["cleared"] is True
+        assert body["model"] == "claude-q"
+
+        # claude-q is gone, other-model still present.
+        dm = _account_by_id[str(acct_id)]["disabled_models"]
+        assert "claude-q" not in dm
+        assert "other-model" in dm
+
+        # A second clear of the same model must 404 (no regression entry left).
+        with _P("app.max_plan_pool._persist_rate_limit_state", new=_AM(return_value=None)):
+            res = await client.post(
+                f"/api/admin/max-plan-accounts/{acct_id}/regression-quarantine/clear"
+                "?provider=anthropic&model=claude-q"
+            )
+        assert res.status_code == 404
+
+        # And clearing the non-regression "other-model" must also 404.
+        with _P("app.max_plan_pool._persist_rate_limit_state", new=_AM(return_value=None)):
+            res = await client.post(
+                f"/api/admin/max-plan-accounts/{acct_id}/regression-quarantine/clear"
+                "?provider=anthropic&model=other-model"
+            )
+        assert res.status_code == 404
+        # other-model entry must still be present.
+        assert "other-model" in _account_by_id[str(acct_id)]["disabled_models"]
+    finally:
+        async with _max_plan_pool_lock:
+            _account_by_id.pop(str(acct_id), None)
+
+
+async def test_clear_regression_endpoint_rejects_other_users_accounts(client, db_session):
+    """An account owned by another user must not be clearable."""
+    from app.max_plan_pool import _account_by_id, _max_plan_pool_lock
+
+    acct_id = uuid.uuid4()
+    db_session.add(MaxPlanAccount(
+        id=acct_id, user_id="some-other-user", name="NotMine",
+        provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH,
+    ))
+    await db_session.commit()
+
+    async with _max_plan_pool_lock:
+        _account_by_id[str(acct_id)] = {
+            "id": str(acct_id), "name": "NotMine", "enabled": True,
+            "active_tasks": 0, "user_id": "some-other-user",
+            "provider": "anthropic",
+            "disabled_models": {
+                "claude-q": {"kind": "regression", "at": datetime.utcnow(), "hits": 1}
+            },
+        }
+    try:
+        res = await client.post(
+            f"/api/admin/max-plan-accounts/{acct_id}/regression-quarantine/clear"
+            "?provider=anthropic&model=claude-q"
+        )
+        assert res.status_code == 404
+        # Entry untouched.
+        assert "claude-q" in _account_by_id[str(acct_id)]["disabled_models"]
+    finally:
+        async with _max_plan_pool_lock:
+            _account_by_id.pop(str(acct_id), None)
+
+
+async def test_scan_account_model_regressions_dedupes_notifications(db_session):
+    """Calling the scanner twice in a row must only produce one fire event for
+    the same (account, provider, model) — dedupe holds across ticks while the
+    cooldown is active."""
+    from app.max_plan_pool import (
+        _account_by_id,
+        _max_plan_pool_lock,
+        scan_account_model_regressions,
+    )
+
+    project = Project(name="dedupe-test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    acct_good_id, acct_bad_id = uuid.uuid4(), uuid.uuid4()
+    acct_good, acct_bad = str(acct_good_id), str(acct_bad_id)
+    db_session.add_all([
+        MaxPlanAccount(id=acct_good_id, user_id="test-user-123", name="DGood",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+        MaxPlanAccount(id=acct_bad_id, user_id="test-user-123", name="DBad",
+                       provider=LLMProviderName.ANTHROPIC, auth_mode=LLMAuthMode.OAUTH),
+    ])
+    await db_session.flush()
+
+    # 5 success on good, 5 fail on bad → bad regresses.
+    tasks = [
+        Task(project_id=project.id, provider="anthropic", model="claude-d",
+             account_id=acct_good, status=TaskStatus.COMPLETED)
+        for _ in range(5)
+    ] + [
+        Task(project_id=project.id, provider="anthropic", model="claude-d",
+             account_id=acct_bad, status=TaskStatus.FAILED)
+        for _ in range(5)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    # Inject in-memory pool entries so the scanner sees the accounts.
+    async with _max_plan_pool_lock:
+        _account_by_id[acct_good] = {
+            "id": acct_good, "name": "DGood", "enabled": True,
+            "active_tasks": 0, "user_id": "test-user-123", "provider": "anthropic",
+        }
+        _account_by_id[acct_bad] = {
+            "id": acct_bad, "name": "DBad", "enabled": True,
+            "active_tasks": 0, "user_id": "test-user-123", "provider": "anthropic",
+        }
+
+    try:
+        from unittest.mock import AsyncMock as _AM
+        from unittest.mock import patch as _P
+        with _P("app.max_plan_pool._persist_rate_limit_state", new=_AM(return_value=None)):
+            fired_first = await scan_account_model_regressions(db_session)
+            fired_second = await scan_account_model_regressions(db_session)
+        assert len(fired_first) == 1
+        ev = fired_first[0]
+        assert ev["account_id"] == acct_bad
+        assert ev["provider"] == "anthropic"
+        assert ev["model"] == "claude-d"
+        # Notification payload must include the numeric stats.
+        assert ev["account_rate"] == 0.0
+        assert ev["project_median"] == 0.5
+        assert ev["sample_size"] == 5
+        # Second tick must dedupe — same regression, no new fire event.
+        assert fired_second == []
+    finally:
+        async with _max_plan_pool_lock:
+            _account_by_id.pop(acct_good, None)
+            _account_by_id.pop(acct_bad, None)

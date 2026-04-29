@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 # Reaper: track tasks skipped by skip_locked to force-reap after repeated skips
 _reaper_skip_counts: Dict[uuid.UUID, int] = {}
 
+# Per-(provider, model) regression scan cadence. The reaper itself fires every
+# ~60s; the regression scan is gated to ~15min so we don't pay the per-account
+# Task aggregation cost on every reaper tick. Aligned with the existing
+# _QUARANTINE_COOLDOWN_SECONDS (15 min) referenced in the task spec.
+_REGRESSION_SCAN_INTERVAL_SECONDS = 15 * 60
+_last_regression_scan: datetime | None = None
+
 
 _TRANSIENT_5XX_PATTERNS = frozenset({
     "http 502", "http 503", "http 504",
@@ -254,6 +261,94 @@ async def _sweep_stale_residual_cases(session) -> int:
         await session.commit()
         logger.info("[REAPER] Closed %d stale residual remediation case(s)", closed)
     return closed
+
+
+async def _run_regression_scan_and_notify(session) -> int:
+    """Run the (provider, model) regression scan and fan out alerts per fired event.
+
+    Each newly-fired quarantine becomes (a) a ProjectMessage on every project
+    the owning user is a member of and (b) one external webhook dispatch per
+    project (matching the existing per-project notification routing). This
+    matches how _emit_all_accounts_blocked_stall fans out — accounts are
+    user-scoped, so any project the user owns is a valid landing spot for the
+    operator-facing notification.
+
+    Returns the number of newly-fired quarantine events.
+    """
+    from app.max_plan_pool import scan_account_model_regressions  # noqa: PLC0415
+    from app.notification_dispatch import (  # noqa: PLC0415
+        dispatch_external_notification,
+        post_account_model_regression_message,
+    )
+    from app.models import ProjectMember  # noqa: PLC0415
+
+    fired = await scan_account_model_regressions(session)
+    if not fired:
+        return 0
+
+    # Cache user_id → list[project_id] across this scan so multi-account users
+    # don't re-query for every fired event.
+    user_projects_cache: dict[str, list[uuid.UUID]] = {}
+    for event in fired:
+        user_id = event.get("user_id")
+        if not user_id:
+            logger.warning(
+                f"[REAPER] regression-quarantine for {event['account_id']} has no user_id — "
+                "skipping notification fan-out"
+            )
+            continue
+        if user_id not in user_projects_cache:
+            rows = (await session.execute(
+                select(ProjectMember.project_id).where(ProjectMember.user_id == user_id)
+            )).scalars().all()
+            user_projects_cache[user_id] = list(rows)
+        project_ids = user_projects_cache[user_id]
+        if not project_ids:
+            logger.info(
+                f"[REAPER] regression-quarantine fired for user {user_id} with no projects — "
+                "skipping notification fan-out (event recorded in pool state)"
+            )
+            continue
+        payload = {
+            "account_id": event["account_id"],
+            "account_label": event["account_label"],
+            "provider": event["provider"],
+            "model": event["model"],
+            "account_rate": event["account_rate"],
+            "project_median": event["project_median"],
+            "sample_size": event["sample_size"],
+            "distinct_accounts": event["distinct_accounts"],
+            "started_at": event["started_at"],
+        }
+        for pid in project_ids:
+            try:
+                await post_account_model_regression_message(
+                    session,
+                    pid,
+                    account_id=event["account_id"],
+                    account_label=event["account_label"],
+                    provider=event["provider"],
+                    model=event["model"],
+                    account_rate=event["account_rate"],
+                    project_median=event["project_median"],
+                    sample_size=event["sample_size"],
+                    distinct_accounts=event["distinct_accounts"],
+                    started_at=event["started_at"],
+                )
+            except Exception:
+                logger.exception(f"[REAPER] post_account_model_regression_message failed for project {pid}")
+            asyncio.ensure_future(dispatch_external_notification(  # noqa: RUF006
+                pid, "account_model_regression_quarantined", payload,
+            ))
+    try:
+        await session.commit()
+    except Exception:
+        logger.exception("[REAPER] Failed to commit regression quarantine notifications")
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception("[REAPER] Rollback after regression-notify commit failed")
+    return len(fired)
 
 
 async def reaper_service():
@@ -1681,6 +1776,26 @@ async def reaper_service():
                         logger.info(f"[REAPER] Marked {len(stalled)} strategic cycle(s) stalled")
                 except Exception as e:
                     logger.error(f"[REAPER] Stalled-cycle sweep error: {e}", exc_info=True)
+
+                # Step 8: Per-(provider, model) regression scan.
+                # Detects accounts whose (provider, model) success-rate has
+                # drifted significantly below the project median and, on
+                # transition, quarantines the model + dispatches notifications.
+                # Gated to ~15min cadence — the underlying Task aggregation
+                # query is non-trivial, and a faster cadence wouldn't change
+                # quarantine outcomes (the regression criteria need 7 days of
+                # samples and don't shift minute-to-minute).
+                global _last_regression_scan
+                now_scan = _utcnow()
+                if (
+                    _last_regression_scan is None
+                    or (now_scan - _last_regression_scan).total_seconds() >= _REGRESSION_SCAN_INTERVAL_SECONDS
+                ):
+                    _last_regression_scan = now_scan
+                    try:
+                        await _run_regression_scan_and_notify(session)
+                    except Exception as e:
+                        logger.error(f"[REAPER] Regression scan error: {e}", exc_info=True)
             consecutive_errors = 0
         except asyncio.CancelledError:
             logger.info("[REAPER] Service shutting down.")
