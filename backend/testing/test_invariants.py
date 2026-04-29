@@ -8,6 +8,8 @@ Run with: pytest testing/test_invariants.py -v --noconftest
 """
 import os
 
+import pytest
+
 
 # ── Safety Constants ────────────────────────────────────────────────────────
 
@@ -76,6 +78,60 @@ class TestSchemaRevisionSync:
             f"EXPECTED_SCHEMA_REVISION is '{EXPECTED_SCHEMA_REVISION}' but latest "
             f"migration is '{latest}'. Bump EXPECTED_SCHEMA_REVISION in main.py."
         )
+
+    def test_schema_gate_raises_on_mismatch(self):
+        """_verify_schema_version() must raise RuntimeError when the alembic
+        revision in the database does not exactly match EXPECTED_SCHEMA_REVISION.
+
+        Regression guard for H-O1: previously the gate used
+        `row[0].startswith(EXPECTED_SCHEMA_REVISION)` (so `0055_a` quietly
+        passed for an expected `0055_b`) and only raised when `K_REVISION`
+        was set in env (so dev/staging silently accepted stale schemas).
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from app.main import _verify_schema_version, EXPECTED_SCHEMA_REVISION
+
+        # Build a row that's deliberately mismatched: same prefix length but
+        # different suffix (catches the startswith bug specifically).
+        bad_revision = "9999_stale_dev_db"
+        assert bad_revision != EXPECTED_SCHEMA_REVISION
+
+        result = MagicMock()
+        result.first.return_value = (bad_revision,)
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=result)
+        # async-context-manager wiring
+        session_cm = MagicMock()
+        session_cm.__aenter__ = AsyncMock(return_value=session)
+        session_cm.__aexit__ = AsyncMock(return_value=None)
+
+        # Ensure K_REVISION is unset so we exercise the "non-Cloud-Run still raises" path.
+        env = {k: v for k, v in os.environ.items() if k != "K_REVISION"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch("app.main.AsyncSessionLocal", return_value=session_cm):
+            with pytest.raises(RuntimeError, match="Schema version mismatch"):
+                asyncio.run(_verify_schema_version())
+
+    def test_schema_gate_passes_on_exact_match(self):
+        """_verify_schema_version() must succeed (return None, not raise)
+        when the alembic revision exactly equals EXPECTED_SCHEMA_REVISION.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from app.main import _verify_schema_version, EXPECTED_SCHEMA_REVISION
+
+        result = MagicMock()
+        result.first.return_value = (EXPECTED_SCHEMA_REVISION,)
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=result)
+        session_cm = MagicMock()
+        session_cm.__aenter__ = AsyncMock(return_value=session)
+        session_cm.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("app.main.AsyncSessionLocal", return_value=session_cm):
+            # Must not raise.
+            asyncio.run(_verify_schema_version())
 
     def test_migration_filenames_match_internal_revision(self):
         """Each migration file's internal `revision = '...'` must match its

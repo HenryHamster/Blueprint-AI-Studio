@@ -1,0 +1,238 @@
+"""Project deletion cascade regression tests.
+
+Audit 2026-04-29 (Phase A2 / finding C1+M-S3): project deletion would
+FK-violate before this fix because several Project-FK tables had no
+ondelete clause and the ORM cascade only covered Project.tasks. Migration
+0056 normalizes ON DELETE CASCADE across every Project-FK table and adds
+the missing ``alert.task_id`` FK with ON DELETE SET NULL.
+
+These tests are gated to PostgreSQL because:
+ - SQLite (default test path) does not enforce FK ondelete unless
+   ``PRAGMA foreign_keys = ON`` is set, which the project doesn't.
+ - The conftest cleanup loop already deletes child tables explicitly
+   before deleting their parent; that path bypasses cascade entirely.
+The Postgres path is the production reality, and the only path where
+the cascade vs. caller-side-cleanup distinction actually matters.
+"""
+import os
+import uuid
+
+import pytest
+from sqlalchemy import delete as sql_delete, select, text
+
+from app.models import (
+    Alert,
+    Project,
+    ProjectMember,
+    ProjectMessage,
+    ResidualCaseStatus,
+    ResidualRemediationCase,
+    StrategicCycle,
+    SystemMaturity,
+    Task,
+    TaskStatus,
+)
+
+
+USE_POSTGRES = (
+    os.getenv("USE_TEST_POSTGRES", "").lower() == "true"
+    and os.getenv("DATABASE_URL", "").startswith("postgresql")
+)
+
+
+pytestmark = pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="FK cascade behavior is Postgres-specific (SQLite default has FKs off)",
+)
+
+
+@pytest.mark.asyncio
+async def test_project_delete_cascades_all_dependents(db_session):
+    """Deleting a Project must cascade to every Project-FK child row, and
+    must NULL out alert.task_id when the parent task is gone (vs. dropping
+    the alert)."""
+    project = Project(name="cascade-test", user_id="user-cascade-test")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # ProjectMember
+    member = ProjectMember(project_id=project.id, user_id="user-cascade-test", role="owner")
+    db_session.add(member)
+
+    # Task (parent of Alert.task_id)
+    task = Task(
+        project_id=project.id,
+        title="cascade child task",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Alert (project_id FK + task_id FK)
+    alert = Alert(
+        project_id=project.id,
+        task_id=task.id,
+        severity="ERROR",
+        title="cascade child alert",
+        message="cascade child alert",
+    )
+    db_session.add(alert)
+
+    # ProjectMessage
+    message = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        content="cascade child message",
+    )
+    db_session.add(message)
+
+    # StrategicCycle
+    cycle = StrategicCycle(
+        id=uuid.uuid4().hex,
+        project_id=project.id,
+        outcome="in_progress",
+    )
+    db_session.add(cycle)
+
+    # ResidualRemediationCase
+    rcase = ResidualRemediationCase(
+        project_id=project.id,
+        fingerprint="cascade-fingerprint-" + uuid.uuid4().hex[:8],
+        status=ResidualCaseStatus.ACTIVE,
+    )
+    db_session.add(rcase)
+
+    # SystemMaturity
+    maturity = SystemMaturity(
+        project_id=project.id,
+        system_id="cascade-system",
+        score=50,
+    )
+    db_session.add(maturity)
+
+    await db_session.commit()
+
+    # Capture child IDs for the post-delete assertions.
+    member_id = member.id
+    task_id = task.id
+    alert_id = alert.id
+    message_id = message.id
+    cycle_id = cycle.id
+    rcase_id = rcase.id
+    maturity_id = maturity.id
+
+    # Delete the project. This should NOT raise an FK violation.
+    await db_session.delete(project)
+    await db_session.commit()
+
+    # Project gone.
+    assert (await db_session.execute(
+        select(Project).where(Project.id == project.id)
+    )).scalar_one_or_none() is None
+
+    # Every Project-FK child row is gone (CASCADE).
+    for model, row_id in [
+        (ProjectMember, member_id),
+        (Task, task_id),
+        (Alert, alert_id),
+        (ProjectMessage, message_id),
+        (StrategicCycle, cycle_id),
+        (ResidualRemediationCase, rcase_id),
+        (SystemMaturity, maturity_id),
+    ]:
+        result = await db_session.execute(select(model).where(model.id == row_id))
+        assert result.scalar_one_or_none() is None, (
+            f"{model.__name__}({row_id}) survived project delete — FK cascade missing"
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_delete_nulls_alert_task_id(db_session):
+    """When a Task is deleted (e.g. via project cascade), child Alert rows
+    must have ``task_id`` set to NULL — not be cascaded away. Alerts survive
+    so the admin alert UI keeps the historical record."""
+    project = Project(name="alert-task-null-test", user_id="user-alert-null")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="alert parent task",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    alert = Alert(
+        project_id=project.id,
+        task_id=task.id,
+        severity="ERROR",
+        title="orphanable alert",
+        message="orphanable alert",
+    )
+    db_session.add(alert)
+    await db_session.commit()
+    alert_id = alert.id
+
+    # Sanity-check: the FK on alert.task_id must exist with ondelete=SET NULL.
+    # If the migration didn't apply, fail here with a clear message rather
+    # than the downstream assertion's confusing "task_id still set" error.
+    # pg_constraint.confdeltype codes:
+    #   'a' = NO ACTION, 'r' = RESTRICT, 'c' = CASCADE,
+    #   'n' = SET NULL,  'd' = SET DEFAULT.
+    fk_check = (await db_session.execute(text(
+        "SELECT confdeltype FROM pg_constraint WHERE conname = 'alert_task_id_fkey'"
+    ))).scalar_one_or_none()
+    # asyncpg returns the single-char as bytes; normalize.
+    if isinstance(fk_check, (bytes, bytearray)):
+        fk_check = fk_check.decode("ascii")
+    assert fk_check == 'n', (
+        f"alert_task_id_fkey ondelete is {fk_check!r}, expected 'n' (SET NULL). "
+        f"Migration 0056 may not have applied."
+    )
+
+    # Delete the task; Alert row should remain with task_id=NULL.
+    await db_session.delete(task)
+    await db_session.commit()
+
+    # Read the column directly via raw SQL — SQLAlchemy's identity-map can
+    # serve a cached Alert entity here, so a typed select(Alert) would mask
+    # whether the DB-level SET NULL actually fired.
+    raw_task_id = (await db_session.execute(text(
+        "SELECT task_id FROM alert WHERE id = :id"
+    ), {"id": alert_id})).scalar_one_or_none()
+    assert raw_task_id is None, (
+        f"alert.task_id={raw_task_id!r} after parent task delete, expected NULL "
+        f"(FK ondelete=SET NULL did not fire)"
+    )
+
+    # Sanity: the alert row still exists (SET NULL, not CASCADE).
+    raw_id = (await db_session.execute(text(
+        "SELECT id FROM alert WHERE id = :id"
+    ), {"id": alert_id})).scalar_one_or_none()
+    assert raw_id == alert_id, (
+        "alert row was cascaded away — should have been SET NULL"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_nonexistent_project_is_clean(db_session):
+    """Deleting a Project that doesn't exist must not raise. SQLAlchemy's
+    session.delete on a transient/non-persisted instance is a no-op; the
+    test guards against any future change that would FK-error or 500 on
+    the no-op path."""
+    fake_id = uuid.uuid4()
+    # Raw DELETE on a non-existent row: must not raise. SQLAlchemy's
+    # session.delete() requires a persistent instance; the production
+    # delete-by-id path issues a SQL DELETE directly, so that's what
+    # we exercise here.
+    await db_session.execute(sql_delete(Project).where(Project.id == fake_id))
+    await db_session.commit()
+
+    assert (await db_session.execute(
+        select(Project).where(Project.id == fake_id)
+    )).scalar_one_or_none() is None

@@ -193,6 +193,15 @@ class ProjectMember(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+# Module-level Column instance shared between ``Task.version`` (the SQLModel
+# Field) and ``Task.__mapper_args__["version_id_col"]`` (the SQLAlchemy mapper
+# arg). The mapper arg requires an actual ``Column`` object, but SQLModel's
+# ``Field(sa_column=...)`` consumes the same Column for the attribute mapping,
+# so we declare it once here and reference it from both places. (Audit
+# 2026-04-29 Phase C4 / finding M-C4 — optimistic-concurrency on Task.)
+_TASK_VERSION_COL = Column("version", Integer, nullable=False, server_default=text("1"))
+
+
 class Task(SQLModel, table=True):
     """
     Extensible Task model. The 'payloads' JSONB column holds a flexible list
@@ -234,6 +243,16 @@ class Task(SQLModel, table=True):
     # Agent Heartbeat mechanism
     last_heartbeat: Optional[datetime] = Field(default=None)
 
+    # Heartbeat-hot fields promoted from Task.context JSONB (audit 2026-04-29 B2 / C3).
+    # The heartbeat handler rewrote the whole context blob every 30s/VM — at 200
+    # VMs that's 6.6 full-blob TOAST page rewrites per second. Promoting these
+    # two hot subkeys to dedicated columns lets Postgres do in-place column
+    # updates without TOAST churn. Audit-trail-ish ring buffers
+    # (metrics_history, _tool_trace) stay in context but only persist every
+    # 5th heartbeat (handler-side modulo).
+    last_metrics_json: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    last_tool_use_at: Optional[datetime] = Field(default=None)
+
     priority: int = Field(default=50, sa_column=Column(Integer, nullable=False, server_default=text("50")))
 
     attempt_count: int = Field(default=0)
@@ -273,6 +292,20 @@ class Task(SQLModel, table=True):
     model: Optional[str] = Field(default=None)
     estimated_cost_usd: Optional[float] = Field(default=None, sa_column=Column(Float, nullable=True))
 
+    # Optimistic-concurrency version (audit 2026-04-29 Phase C4 / finding M-C4):
+    # SQLAlchemy enforces version-mismatch on UPDATE via ``__mapper_args__``
+    # below. Concurrent stale writes raise ``sqlalchemy.exc.StaleDataError`` so
+    # callers can detect lost-write hazards without holding row locks across
+    # long post-commit cycles. Mirrors the ``DeploymentState.version`` idiom
+    # but wired through ``version_id_col`` for automatic enforcement.
+    #
+    # Default 1 (not 0) so freshly-constructed rows match what the server
+    # default emits on raw INSERTs that bypass the ORM (e.g. backfill SQL).
+    version: int = Field(
+        default=1,
+        sa_column=_TASK_VERSION_COL,
+    )
+
     @property
     def first_payload(self) -> Dict[str, Any]:
         """First payload dict, defaulting to empty dict if none exist.
@@ -308,7 +341,28 @@ class Task(SQLModel, table=True):
         Index("ix_task_depends_on_gin", "depends_on", postgresql_using="gin"),
         Index("ix_task_provider_created_at", "provider", "created_at"),
         Index("ix_task_account_id_created_at", "account_id", "created_at"),
+        # Partial expression index on the leading payload's pr_number so the
+        # review-pipeline per-PR iteration-cap query (review_pipeline.py) can
+        # filter in SQL rather than loading every terminal Task row in the
+        # project and filtering in Python. See alembic 0057 / audit C2.
+        # The metadata Index registers a column reference (``payloads``) for
+        # the test_model_indexes_covered_by_migrations invariant; the alembic
+        # 0057 migration creates the actual expression index on
+        # ``(payloads -> 0 ->> 'pr_number')`` via raw SQL on Postgres.
+        Index(
+            "ix_task_payloads_pr_number",
+            "payloads",
+            postgresql_where=text("archived = false"),
+            sqlite_where=text("archived = false"),
+        ),
     )
+
+    # Optimistic concurrency: SQLAlchemy bumps ``version`` and adds
+    # ``WHERE version = :v`` to every UPDATE. A concurrent write whose
+    # ``version`` no longer matches raises ``sqlalchemy.exc.StaleDataError``
+    # without the caller having to hold a row lock for the whole post-commit
+    # cycle (audit 2026-04-29 Phase C4 / finding M-C4).
+    __mapper_args__ = {"version_id_col": _TASK_VERSION_COL}
 
     project: Project = Relationship(back_populates="tasks")
     artifacts: List["Artifact"] = Relationship(
@@ -370,7 +424,12 @@ class Alert(SQLModel, table=True):
     severity: AlertSeverity = Field(default=AlertSeverity.ERROR, sa_column=Column(String, default=AlertSeverity.ERROR))
     title: str
     message: str
-    task_id: Optional[uuid.UUID] = None
+    # Audit 2026-04-29 (M-S3): FK to task.id with ondelete=SET NULL added in
+    # migration 0056. Alert messages survive parent-task GC for the admin UI.
+    task_id: Optional[uuid.UUID] = Field(
+        default=None,
+        sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True),
+    )
     created_at: datetime = Field(default_factory=_utcnow)
     dismissed_at: Optional[datetime] = None
 

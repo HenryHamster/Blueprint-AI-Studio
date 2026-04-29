@@ -120,7 +120,7 @@ from app.strategic_constants import (  # noqa: E402
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0055"
+EXPECTED_SCHEMA_REVISION = "0059"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -245,12 +245,13 @@ async def _verify_schema_version():
             if not row:
                 logger.warning("[STARTUP] No alembic_version row — database may be uninitialized")
                 return
-            if not row[0].startswith(EXPECTED_SCHEMA_REVISION):
+            # Exact equality required — `0055_a` != `0055_b` would slip past startswith.
+            # Raise unconditionally so dev environments catch mismatches the same way Cloud Run does.
+            if row[0] != EXPECTED_SCHEMA_REVISION:
                 msg = (f"Schema version mismatch: database at '{row[0]}', "
                        f"code expects '{EXPECTED_SCHEMA_REVISION}'")
                 logger.error(f"[STARTUP] {msg}")
-                if os.getenv("K_REVISION"):  # Only hard-fail in Cloud Run
-                    raise RuntimeError(msg)
+                raise RuntimeError(msg)
         except Exception as e:
             if "alembic_version" in str(e).lower():
                 logger.warning("[STARTUP] alembic_version table not found — skipping schema check")
@@ -1524,34 +1525,8 @@ from app.deploy_health import (  # noqa: E402 — re-exports for backward compat
     broadcast_deploy_state,
 )
 
-async def _lock_project_or_429(session: AsyncSession, project_id: uuid.UUID) -> Project:
-    """Acquire a row lock on a Project for atomic read-modify-write.
-
-    Uses SKIP LOCKED so concurrent agent writes don't queue behind the 30s
-    lock_timeout set in database.py. If another handler currently holds the
-    lock, returns 429 Retry-After so the agent retries (same contract as
-    agent_status.py uses for task-row contention; see commit 88a77903).
-    Cloud Run flags any 5xx as ContainerError and quarantines the instance,
-    so 429 is deliberate — it conveys "temporary, retry" without tripping
-    container-fault classification.
-    """
-    result = await session.execute(
-        select(Project).where(Project.id == project_id).with_for_update(skip_locked=True)
-    )
-    project = result.scalars().first()
-    if project is not None:
-        return project
-    # Distinguish "row locked" from "row missing" with a non-locking read.
-    exists = (await session.execute(
-        select(Project.id).where(Project.id == project_id)
-    )).first()
-    if exists is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-    raise HTTPException(
-        status_code=429,
-        detail="Project row locked by concurrent write, retry",
-        headers={"Retry-After": "2"},
-    )
+from app.task_locking import lock_project_or_429 as _lock_project_or_429  # noqa: E402, F401
+# Backward-compat re-export. Canonical home is ``app.task_locking`` (Phase A1).
 
 
 class DesignDocUpdate(BaseModel):
