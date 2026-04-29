@@ -14,10 +14,11 @@ from __future__ import annotations
 import json
 import logging
 import re
-from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.task_capabilities import ALL_TASK_TYPES, TaskType
 
 logger = logging.getLogger(__name__)
 
@@ -47,31 +48,6 @@ class PayloadTooLargeError(ValueError):
             f"Payload is {size} bytes, exceeds limit of {limit} "
             f"(top keys by size: {preview})"
         )
-
-
-class TaskType(str, Enum):
-    create = "create"
-    review = "review"
-    fix = "fix"
-    plan = "plan"
-    research = "research"
-    strategic_review = "strategic_review"
-    design_doc_update = "design_doc_update"
-    security_audit = "security_audit"
-    qa = "qa"
-    deps = "deps"
-    docs = "docs"
-    migrate = "migrate"
-    smoketest = "smoketest"
-    refactor = "refactor"
-    debug = "debug"
-    perf = "perf"
-    investigate = "investigate"
-    self_audit = "self_audit"
-
-
-# Backward-compat frozenset consumed by existing code
-ALL_TASK_TYPES: frozenset[str] = frozenset(t.value for t in TaskType)
 
 
 def _validate_branch_name(v: str | None) -> str | None:
