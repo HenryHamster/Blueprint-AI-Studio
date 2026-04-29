@@ -26,6 +26,11 @@ Usage:
     python scripts/ops.py restart-orchestrator      — restart background loops
     python scripts/ops.py message "text"            — send a message to the autonomous system
     python scripts/ops.py messages [--all]          — list open messages
+    python scripts/ops.py fingerprints              — list open residual remediation cases
+    python scripts/ops.py fingerprints --all        — every status
+    python scripts/ops.py fingerprints --ignore <fp-substring>
+    python scripts/ops.py fingerprints --unignore <fp-substring>
+    python scripts/ops.py fingerprints --clear      — wipe in-memory residual store
 """
 import json
 import sys
@@ -946,6 +951,111 @@ def cmd_trim_playbook_archive(args):
     print(f"Trimmed archive to {len(trimmed)} entries ({before_bytes - after_bytes:,} bytes freed)")
 
 
+def _resolve_fingerprint(query: str, project_id: str | None = None) -> dict | None:
+    """Find a residual case by fingerprint substring (case-insensitive).
+
+    Fingerprints are long opaque strings; the CLI accepts a unique prefix or
+    substring and matches against open cases. Returns None on no/ambiguous
+    match (with a printed hint).
+    """
+    path = "/api/admin/residual-cases?limit=200"
+    if project_id:
+        path += f"&project_id={project_id}"
+    cases = api("GET", path).get("cases", [])
+    needle = query.lower()
+    matches = [c for c in cases if needle in (c.get("fingerprint") or "").lower()]
+    if not matches:
+        print(f"No open residual case matches: {query!r}")
+        return None
+    if len(matches) > 1:
+        print(f"Ambiguous — {len(matches)} cases match {query!r}:")
+        for c in matches[:5]:
+            print(f"  - {c['fingerprint'][:120]}")
+        print("Use a longer substring to disambiguate.")
+        return None
+    return matches[0]
+
+
+def cmd_fingerprints(args):
+    """List or manage residual remediation cases.
+
+    Usage:
+        python scripts/ops.py fingerprints
+        python scripts/ops.py fingerprints --status IGNORED [--status RESOLVED]
+        python scripts/ops.py fingerprints --all                    — every status
+        python scripts/ops.py fingerprints --ignore <fp-substring>
+        python scripts/ops.py fingerprints --unignore <fp-substring>
+        python scripts/ops.py fingerprints --clear                  — wipe in-memory store
+    """
+    # Mutations first.
+    if args and args[0] == '--ignore' and len(args) > 1:
+        from blueprint_api import get_project_id
+        pid = get_project_id()
+        case = _resolve_fingerprint(args[1], pid)
+        if not case:
+            return
+        from urllib.parse import quote
+        result = api("POST", f"/api/admin/residual-cases/{quote(case['fingerprint'], safe='')}/ignore?project_id={pid}")
+        print(f"Ignored: {result.get('fingerprint', '')[:100]} → status={result.get('status')}")
+        return
+    if args and args[0] == '--unignore' and len(args) > 1:
+        from blueprint_api import get_project_id
+        pid = get_project_id()
+        # IGNORED cases aren't in the default open-status list, look across all
+        ignored_path = f"/api/admin/residual-cases?status=IGNORED&limit=200&project_id={pid}"
+        cases = api("GET", ignored_path).get("cases", [])
+        needle = args[1].lower()
+        matches = [c for c in cases if needle in (c.get("fingerprint") or "").lower()]
+        if not matches:
+            print(f"No IGNORED case matches: {args[1]!r}")
+            return
+        if len(matches) > 1:
+            print(f"Ambiguous — {len(matches)} IGNORED cases match. Use a longer substring.")
+            return
+        from urllib.parse import quote
+        result = api("POST", f"/api/admin/residual-cases/{quote(matches[0]['fingerprint'], safe='')}/unignore?project_id={pid}")
+        print(f"Unignored: {result.get('fingerprint', '')[:100]} → status={result.get('status')}")
+        return
+    if args and args[0] == '--clear':
+        result = api("POST", "/api/admin/residual-fingerprints/clear")
+        print(f"Cleared in-memory store: {result}")
+        return
+
+    # List mode.
+    statuses: list[str] = []
+    show_all = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == '--status' and i + 1 < len(args):
+            statuses.append(args[i + 1])
+            i += 2
+            continue
+        if a == '--all':
+            show_all = True
+            i += 1
+            continue
+        i += 1
+    path = "/api/admin/residual-cases?limit=100"
+    if show_all:
+        for s in ('ACTIVE', 'REMEDIATING', 'SUSPENDED', 'IGNORED', 'RESOLVED', 'CLOSED_ORGANICALLY', 'MERGED', 'FAILED'):
+            path += f"&status={s}"
+    else:
+        for s in statuses:
+            path += f"&status={s}"
+    result = api("GET", path)
+    cases = result.get("cases", [])
+    filt = result.get("status_filter", [])
+    print(f"=== RESIDUAL CASES ({len(cases)}) status={','.join(filt)} ===")
+    if not cases:
+        print("(none)")
+        return
+    for c in cases:
+        fp = (c.get("fingerprint") or "").replace("\n", " ")
+        print(f"  [{c['status']:18}] hits={c['hit_count']:<3} consec={c.get('consecutive_failure_count', 0)}  last_seen={(c.get('last_seen_at') or '')[:19]}  pr={c.get('last_spawned_pr_number') or '-'}")
+        print(f"    fp: {fp[:200]}")
+
+
 COMMANDS = {
     'status': cmd_status,
     'resume': cmd_resume,
@@ -973,6 +1083,7 @@ COMMANDS = {
     'messages': cmd_messages,
     'trim-playbook-archive': cmd_trim_playbook_archive,
     'strategic-cycle': cmd_strategic_cycle,
+    'fingerprints': cmd_fingerprints,
 }
 
 if __name__ == '__main__':

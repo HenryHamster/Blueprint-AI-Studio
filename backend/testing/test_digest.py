@@ -5153,6 +5153,101 @@ async def test_unignore_residual_case_requires_auth(unauthenticated_client: Asyn
     assert response.status_code in (401, 403)
 
 
+# ── GET /residual-cases (list endpoint for ops.py fingerprints) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_list_residual_cases_default_returns_open_states(client: AsyncClient, db_session):
+    """Default response includes ACTIVE/REMEDIATING/SUSPENDED, excludes others."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for fp, status in [
+        ("active-fp", ResidualCaseStatus.ACTIVE),
+        ("remediating-fp", ResidualCaseStatus.REMEDIATING),
+        ("suspended-fp", ResidualCaseStatus.SUSPENDED),
+        ("ignored-fp", ResidualCaseStatus.IGNORED),
+        ("resolved-fp", ResidualCaseStatus.RESOLVED),
+    ]:
+        db_session.add(ResidualRemediationCase(
+            project_id=project.id, fingerprint=fp, status=status,
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/residual-cases")
+    assert response.status_code == 200
+    data = response.json()
+    fps = {c["fingerprint"] for c in data["cases"]}
+    assert fps == {"active-fp", "remediating-fp", "suspended-fp"}
+    assert sorted(data["status_filter"]) == ["ACTIVE", "REMEDIATING", "SUSPENDED"]
+
+
+@pytest.mark.asyncio
+async def test_list_residual_cases_explicit_status_filter(client: AsyncClient, db_session):
+    """Passing ?status=IGNORED returns only IGNORED cases."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(ResidualRemediationCase(
+        project_id=project.id, fingerprint="ignored-only", status=ResidualCaseStatus.IGNORED,
+    ))
+    db_session.add(ResidualRemediationCase(
+        project_id=project.id, fingerprint="active-other", status=ResidualCaseStatus.ACTIVE,
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/residual-cases", params={"status": "IGNORED"})
+    assert response.status_code == 200
+    data = response.json()
+    fps = {c["fingerprint"] for c in data["cases"]}
+    assert fps == {"ignored-only"}
+
+
+@pytest.mark.asyncio
+async def test_list_residual_cases_rejects_invalid_status(client: AsyncClient):
+    """Unknown status values must 400 — typos shouldn't silently return everything."""
+    response = await client.get("/api/admin/residual-cases", params={"status": "BOGUS_STATUS"})
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_list_residual_cases_orders_by_last_seen_desc(client: AsyncClient, db_session):
+    """Most recently-seen cases should surface first so the operator sees pressure."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    from datetime import datetime, timedelta
+    now = datetime.utcnow()
+    db_session.add(ResidualRemediationCase(
+        project_id=project.id, fingerprint="older", status=ResidualCaseStatus.ACTIVE,
+        last_seen_at=now - timedelta(hours=12),
+    ))
+    db_session.add(ResidualRemediationCase(
+        project_id=project.id, fingerprint="newer", status=ResidualCaseStatus.ACTIVE,
+        last_seen_at=now - timedelta(minutes=5),
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/residual-cases")
+    assert response.status_code == 200
+    fps = [c["fingerprint"] for c in response.json()["cases"]]
+    assert fps[0] == "newer"
+    assert fps[1] == "older"
+
+
+@pytest.mark.asyncio
+async def test_list_residual_cases_requires_auth(unauthenticated_client: AsyncClient):
+    """List endpoint requires admin auth."""
+    response = await unauthenticated_client.get("/api/admin/residual-cases")
+    assert response.status_code in (401, 403)
+
+
 # ---------------------------------------------------------------------------
 # ResidualRemediationCase lifecycle status enrichment
 # ---------------------------------------------------------------------------

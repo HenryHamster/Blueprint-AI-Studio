@@ -1082,6 +1082,72 @@ async def get_residual_fingerprints(
     }
 
 
+@router.get("/residual-cases")
+async def list_residual_cases(
+    status: list[str] | None = Query(None, description="Filter by ResidualRemediationCaseStatus values; repeatable"),
+    project_id: uuid.UUID | None = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """List residual remediation cases.
+
+    Defaults to open cases (ACTIVE / REMEDIATING / SUSPENDED) so operators can
+    see what's currently driving auto-remediation pressure. Pass ``status`` to
+    filter — e.g. ``?status=IGNORED&status=RESOLVED`` for a closed-cases view.
+    Ordered by last_seen_at desc so the most recently-active fingerprints
+    surface first.
+    """
+    if status:
+        valid = {s.value for s in ResidualRemediationCaseStatus}
+        invalid = [s for s in status if s not in valid]
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status values: {invalid}. Valid: {sorted(valid)}",
+            )
+        status_filter = list(status)
+    else:
+        status_filter = [
+            ResidualRemediationCaseStatus.ACTIVE.value,
+            ResidualRemediationCaseStatus.REMEDIATING.value,
+            ResidualRemediationCaseStatus.SUSPENDED.value,
+        ]
+
+    filters = [ResidualRemediationCase.status.in_(status_filter)]
+    if project_id:
+        filters.append(ResidualRemediationCase.project_id == project_id)
+    query = (
+        select(ResidualRemediationCase)
+        .where(*filters)
+        .order_by(ResidualRemediationCase.last_seen_at.desc())
+        .limit(limit)
+    )
+    rows = (await session.execute(query)).scalars().all()
+    return {
+        "count": len(rows),
+        "status_filter": status_filter,
+        "cases": [
+            {
+                "id": str(c.id),
+                "project_id": str(c.project_id) if c.project_id else None,
+                "fingerprint": c.fingerprint,
+                "status": c.status,
+                "hit_count": c.hit_count,
+                "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
+                "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
+                "last_spawned_at": c.last_spawned_at.isoformat() if c.last_spawned_at else None,
+                "last_spawned_pr_number": c.last_spawned_pr_number,
+                "last_spawned_task_id": str(c.last_spawned_task_id) if c.last_spawned_task_id else None,
+                "consecutive_failure_count": c.consecutive_failure_count,
+                "suspended_at": c.suspended_at.isoformat() if c.suspended_at else None,
+                "sample_message": (c.sample_messages[0] if c.sample_messages else c.sample_message),
+            }
+            for c in rows
+        ],
+    }
+
+
 @router.post("/residual-cases/{fingerprint}/ignore")
 async def ignore_residual_case(
     fingerprint: str,
