@@ -227,6 +227,26 @@ describe('DashboardHome', () => {
           vision_updated: false,
           summary_text: 'Cycle completed successfully.',
         },
+        remediation_funnel: {
+          residual_remediation_funnel: {
+            open_cases_by_error_class: [
+              {
+                error_class: 'CODE_ERROR',
+                count: 2,
+                most_recent_at: '2026-04-24T00:30:00Z',
+                cases: [
+                  {
+                    fingerprint: 'fp-1234567890abcdef',
+                    status: 'ACTIVE',
+                    hit_count: 4,
+                    last_seen_at: '2026-04-24T00:30:00Z',
+                    sample_message: 'gemini cli auth failed',
+                  },
+                ],
+              },
+            ],
+          },
+        },
         trend_history: [
           {
             period_end: '2026-04-23T22:00:00Z',
@@ -275,6 +295,9 @@ describe('DashboardHome', () => {
     expect(screen.getByText(/Last cycle:/)).toBeInTheDocument();
     expect(screen.getByText(/2 created, 1 retired/)).toBeInTheDocument();
     expect(screen.getByText('Improve retry handling in CI path')).toBeInTheDocument();
+    expect(screen.getByText('Open Residual Cases')).toBeInTheDocument();
+    expect(screen.getByText('CODE_ERROR · 2')).toBeInTheDocument();
+    expect(screen.getByText(/ACTIVE · 4 hits/)).toBeInTheDocument();
   });
 
   it('calls onDirectionClick when a direction card is clicked', async () => {

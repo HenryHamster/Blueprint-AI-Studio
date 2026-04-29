@@ -7722,3 +7722,73 @@ async def test_fundamentals_mode_direction_injects_mode_hint(db_session):
     assert "fundamentals" in suffix_l and ("fix/test/refactor" in suffix or "tests" in suffix_l or "maintainability" in suffix_l), (
         f"fundamentals-mode direction must inject mode hint in prompt_suffix; got: {suffix!r}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DB-driven residual selection (sibling cluster 1/2 pending)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(strict=False, reason="DB-driven selection not yet implemented; sibling cluster 1/2 will replace in-memory get_top_residual_fingerprints with a project-scoped DB query")
+async def test_residual_db_selection_spawns_top_active_case_by_hit_count(db_session, _clear_residual_state):
+    """Without seeding _residual_store, DB ACTIVE rows should drive selection.
+    The highest hit_count ACTIVE case should be picked and spawn one task.
+    This validates the DB-first path that sibling cluster 1/2 will add to
+    _spawn_residual_fingerprint_remediation."""
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+
+    project = Project(
+        name="DB Selection Hit Count",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-dbhit01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fp_low = "fp_db_low_hits_abc"
+    fp_high = "fp_db_high_hits_xyz"
+    db_session.add(_make_residual_case(project.id, fp_low, hit_count=3, sample_message="low count error"))
+    db_session.add(_make_residual_case(project.id, fp_high, hit_count=20, sample_message="TypeError: high count error"))
+    await db_session.commit()
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+
+    assert spawned == 1
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    create_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "create"]
+    assert len(create_tasks) == 1
+    assert create_tasks[0].context["error_fingerprint"] == fp_high
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(strict=False, reason="DB-driven selection not yet implemented; sibling cluster 1/2 pending")
+async def test_residual_db_selection_skips_non_active_statuses(db_session, _clear_residual_state):
+    """MERGED, FAILED, and SUSPENDED case rows must not be selected even when
+    _residual_store is empty. Only ACTIVE rows qualify for spawn in the DB path."""
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+    from app.models import ResidualCaseStatus
+
+    project = Project(
+        name="DB Selection Non-Active",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-dbskip01")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for status, fp in [
+        (ResidualCaseStatus.MERGED, "fp_merged_skip"),
+        (ResidualCaseStatus.FAILED, "fp_failed_skip"),
+        (ResidualCaseStatus.SUSPENDED, "fp_suspended_skip"),
+    ]:
+        case = _make_residual_case(project.id, fp, hit_count=50, sample_message="TypeError: stale error")
+        case.status = status
+        db_session.add(case)
+    await db_session.commit()
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 0, "Non-ACTIVE DB cases must not trigger spawn in DB-driven selection"

@@ -5528,6 +5528,10 @@ async def test_digest_residual_remediation_funnel(client: AsyncClient, db_sessio
     assert rr["merged"] == 1
     assert rr["failed"] == 2          # FAILED + SUSPENDED
     assert rr["remediating"] == 2     # live count: both REMEDIATING cases regardless of window
+    groups = rr["open_cases_by_error_class"]
+    assert groups and groups[0]["error_class"] == "CODE_ERROR"
+    assert groups[0]["count"] == 4
+    assert len(groups[0]["cases"]) == 4
 
 
 @pytest.mark.asyncio

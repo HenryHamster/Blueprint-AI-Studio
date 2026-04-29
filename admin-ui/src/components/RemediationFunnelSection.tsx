@@ -46,6 +46,20 @@ interface RemediationFunnelData {
     merged?: number;
     failed?: number;
     remediating?: number;
+    open_cases_by_error_class?: {
+      error_class: string;
+      count: number;
+      most_recent_at: string | null;
+      cases: {
+        fingerprint: string;
+        status: string;
+        hit_count: number;
+        last_seen_at: string | null;
+        last_spawned_at?: string | null;
+        sample_message?: string | null;
+        consecutive_failure_count?: number | null;
+      }[];
+    }[];
   } | null;
   prior_investigation_reuse?: {
     total_with_prior?: number;

@@ -1148,3 +1148,32 @@ async def test_post_residual_fix_spawned_null_task_id_in_context(db_session):
     await db_session.commit()
     assert msg.context["task_id"] is None
     assert msg.context["event_type"] == "residual_fix_spawned"
+
+
+# ─── RESOLVED transition on PR merge ─────────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(strict=False, reason="close_residual_case_resolved not yet implemented; sibling cluster 1/2 will add it to notification_dispatch")
+async def test_close_residual_case_resolved_transitions_to_resolved(db_session):
+    """After a residual fix PR merges, close_residual_case_resolved() should
+    transition the case to RESOLVED so it is excluded from future DB selection
+    and treated as definitively closed by the reaper and admin UI."""
+    from app.notification_dispatch import close_residual_case_resolved  # noqa: PLC0415
+
+    project = Project(name="Resolved On Merge", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    case = ResidualRemediationCase(
+        project_id=project.id, fingerprint="fp-resolved-merge",
+        status=ResidualCaseStatus.MERGED,
+        consecutive_failure_count=0,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await close_residual_case_resolved(db_session, project.id, fingerprint="fp-resolved-merge")
+    await db_session.commit()
+
+    refreshed = await _load_case(db_session, project.id, "fp-resolved-merge")
+    assert refreshed.status == ResidualCaseStatus.RESOLVED

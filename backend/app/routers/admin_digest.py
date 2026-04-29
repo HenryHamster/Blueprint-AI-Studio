@@ -3094,6 +3094,19 @@ async def _compute_digest(
     _rr_active_result = await session.execute(
         select(ResidualRemediationCase).where(*_rr_active_filters)
     )
+    _rr_open_filters = [
+        ResidualRemediationCase.status.in_([
+            ResidualRemediationCaseStatus.ACTIVE,
+            ResidualRemediationCaseStatus.REMEDIATING,
+            ResidualRemediationCaseStatus.SUSPENDED,
+        ]),
+    ]
+    if project_id:
+        _rr_open_filters.append(ResidualRemediationCase.project_id == project_id)
+    _rr_open_result = await session.execute(
+        select(ResidualRemediationCase).where(*_rr_open_filters).order_by(ResidualRemediationCase.last_seen_at.desc())
+    )
+    _rr_open_cases = list(_rr_open_result.scalars().all())
     residual_remediation_funnel: Dict[str, Any] = {
         "spawned": len(_rr_cases),
         "merged": sum(1 for c in _rr_cases if c.status == ResidualRemediationCaseStatus.MERGED),
@@ -3101,6 +3114,25 @@ async def _compute_digest(
             ResidualRemediationCaseStatus.FAILED, ResidualRemediationCaseStatus.SUSPENDED
         )),
         "remediating": len(list(_rr_active_result.scalars().all())),
+        "open_cases_by_error_class": [
+            {
+                "error_class": "CODE_ERROR",
+                "count": len(_rr_open_cases),
+                "most_recent_at": _rr_open_cases[0].last_seen_at.isoformat() if _rr_open_cases else None,
+                "cases": [
+                    {
+                        "fingerprint": c.fingerprint,
+                        "status": c.status,
+                        "hit_count": c.hit_count,
+                        "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
+                        "last_spawned_at": c.last_spawned_at.isoformat() if c.last_spawned_at else None,
+                        "sample_message": c.sample_message,
+                        "consecutive_failure_count": c.consecutive_failure_count,
+                    }
+                    for c in _rr_open_cases[:30]
+                ],
+            }
+        ] if _rr_open_cases else [],
     }
 
     _prior_tasks = [t for t in _ci_rem_tasks if (t.context or {}).get("prior_diagnosis_task_id")]
