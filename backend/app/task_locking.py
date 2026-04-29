@@ -15,19 +15,30 @@ For the singleton ``DeploymentState`` row, use ``deployment_state_lock``
 which adds an optimistic-concurrency ``version`` bump alongside the
 SELECT FOR UPDATE so callers that mutate without holding the lock for
 the entire write window can still detect lost-update races.
+
+Audit 2026-04-29 (Phase A1) added project-row helpers for the same
+rationale: 9 sites used plain ``with_for_update()`` without
+``skip_locked``, so the 30s ``lock_timeout`` could fire and propagate
+``LockNotAvailableError`` as a 500 — Cloud Run then quarantines the
+instance. ``lock_project_or_429`` is the canonical helper for handler
+paths (returns 429 Retry-After on contention); ``project_lock`` is the
+context-manager variant for background / post-commit chains that need
+``skip_locked`` + structured retry.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator
 
-from sqlalchemy import select
+import uuid
+from fastapi import HTTPException
+from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import DeploymentState, Task
+from app.models import DeploymentState, Project, Task
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +50,7 @@ async def task_lock(
     *,
     skip_locked: bool = True,
     timeout: float = 30.0,
-) -> AsyncIterator[Optional[Task]]:
+) -> AsyncIterator[Task | None]:
     """Acquire SELECT FOR UPDATE on a task row, yield freshly-loaded Task or None.
 
     Args:
@@ -90,7 +101,7 @@ async def deployment_state_lock(
     *,
     skip_locked: bool = True,
     timeout: float = 30.0,
-) -> AsyncIterator[Optional[DeploymentState]]:
+) -> AsyncIterator[DeploymentState | None]:
     """Acquire SELECT FOR UPDATE on the singleton DeploymentState row.
 
     Bumps ``version`` automatically when the caller exits the block normally
@@ -127,3 +138,126 @@ async def deployment_state_lock(
         return
     if ds in session.dirty or ds.version == starting_version:
         ds.version = starting_version + 1
+
+
+async def lock_project_or_429(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> Project:
+    """Acquire a row lock on a Project for atomic read-modify-write (handler path).
+
+    Uses SKIP LOCKED so concurrent agent writes don't queue behind the 30s
+    lock_timeout set in database.py. If another handler currently holds the
+    lock, returns 429 Retry-After so the client retries (same contract as
+    agent_status.py uses for task-row contention; see commit 88a77903).
+    Cloud Run flags any 5xx as ContainerError and quarantines the instance,
+    so 429 is deliberate — it conveys "temporary, retry" without tripping
+    container-fault classification.
+
+    Use this from request handlers where the user can retry on 429. For
+    background loops or post-commit chains that should not bubble up an
+    HTTPException, use ``project_lock`` instead.
+    """
+    result = await session.execute(
+        select(Project).where(Project.id == project_id).with_for_update(skip_locked=True)
+    )
+    project = result.scalars().first()
+    if project is not None:
+        return project
+    # Distinguish "row locked" from "row missing" with a non-locking read.
+    exists = (await session.execute(
+        select(Project.id).where(Project.id == project_id)
+    )).first()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    raise HTTPException(
+        status_code=429,
+        detail="Project row locked by concurrent write, retry",
+        headers={"Retry-After": "2"},
+    )
+
+
+async def acquire_pr_spawn_lock(session: AsyncSession, pr_number: int) -> None:
+    """Serialize pipeline-task spawns for a single PR via a Postgres advisory lock.
+
+    The dedup logic at the top of ``_spawn_pipeline_task`` reads existing
+    pipeline tasks (SELECT … status IN active), decides whether to dedup /
+    supersede / proceed, then inserts a new task. Two concurrent callers
+    for the same PR can both pass the SELECT before either commits — and
+    because each spawn computes its own ``idempotency_key``, the existing
+    partial UNIQUE on ``ux_task_active_idempotency_key`` does NOT catch
+    that race. The result is a double-spawn that wastes an agent slot and
+    has both review/fix tasks running against the same PR.
+
+    ``pg_advisory_xact_lock(pr_number)`` makes the SELECT-decide-INSERT
+    window structurally serial across concurrent transactions on the same
+    PR. The lock is held until the surrounding transaction commits or
+    rolls back, so the caller MUST commit (or rollback) at the end of the
+    spawn flow to release it. Different PRs hash to different lock keys
+    and proceed in parallel.
+
+    No-op on non-Postgres dialects (SQLite tests rely on
+    serialization-by-event-loop within a single process and don't need
+    the lock).
+
+    Args:
+        session: AsyncSession to issue the lock against. Must be the same
+            session that performs the subsequent SELECT/INSERT — the lock
+            is transaction-scoped, not session-scoped.
+        pr_number: Integer PR number. Cast to int for the int8 advisory
+            key; numbers up to 2**63-1 are valid keys.
+    """
+    bind = session.bind
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:pr)"),
+        {"pr": int(pr_number)},
+    )
+
+
+@asynccontextmanager
+async def project_lock(
+    session: AsyncSession,
+    project_id,
+    *,
+    skip_locked: bool = True,
+    timeout: float = 30.0,
+) -> AsyncIterator[Project | None]:
+    """Acquire SELECT FOR UPDATE on a project row, yield freshly-loaded Project or None.
+
+    Mirror of ``task_lock`` for the project row. Use from background
+    loops or post-commit chains that should react to contention rather
+    than surface a 5xx — when ``skip_locked=True`` (the default) the
+    contextmanager yields ``None`` immediately if the row is held by
+    another session, and the caller must check for None and choose
+    whether to skip or retry.
+
+    For request handlers that should bubble a retry-friendly 429 to the
+    client, use ``lock_project_or_429`` instead.
+
+    Args:
+        session: AsyncSession to issue the lock against. Lock is held
+            until commit/rollback.
+        project_id: UUID or str of the project.
+        skip_locked: If True (default), yield ``None`` when the row is
+            held; if False, wait up to ``timeout`` and raise on timeout.
+        timeout: Max seconds to wait when ``skip_locked=False``.
+
+    Yields:
+        The freshly-loaded Project object, or None if held under skip_locked.
+    """
+    stmt = (
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=skip_locked)
+    )
+    try:
+        result = await asyncio.wait_for(session.execute(stmt), timeout=timeout)
+    except asyncio.TimeoutError as e:
+        logger.warning(
+            "[project_lock] timeout acquiring lock on project %s after %.1fs (skip_locked=%s)",
+            project_id, timeout, skip_locked,
+        )
+        raise OperationalError("project_lock acquisition timed out", None, e) from e
+    yield result.scalar_one_or_none()

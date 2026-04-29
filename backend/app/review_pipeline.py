@@ -845,6 +845,14 @@ async def _spawn_pipeline_task(
                                 requested a fix.
     """
     source_task_id = source_task.id
+    # Serialize concurrent spawn attempts for the same PR. Without this, two
+    # callers can both pass the SELECT in the dedup guard below before either
+    # commits — each spawn has a distinct idempotency_key so the active-key
+    # partial UNIQUE doesn't catch the race, and we end up with a double
+    # review/fix on the same PR/chain. Lock is held until commit/rollback.
+    from app.task_locking import acquire_pr_spawn_lock  # local import to keep top of file lean
+    await acquire_pr_spawn_lock(session, pr_number)
+
     # Resolve the chain identifier once, so the "already merged" guard, the
     # dedup guard, and the spawn path all agree on which chain this is.
     # A chain is identified by the *create* task that opened the PR; review/fix
