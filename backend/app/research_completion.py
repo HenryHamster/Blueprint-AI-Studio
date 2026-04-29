@@ -43,6 +43,7 @@ from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCO
 from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/callers
     _SCOPE_ORDER,
     SCOPE_FILE_BUDGETS,
+    MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
     _DEGRADED_SPAWN_CAP,
     _assess_spawn_health,
     _assess_project_spawn_health,
@@ -50,6 +51,7 @@ from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/call
     _calibrate_scope,
     _poor_decomp_history,
     predict_spawn_success,
+    check_scope_budget_mismatch,
 )
 from app.task_completion import (
     _extract_json_array,
@@ -857,6 +859,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         title = finding.get("title", f"Research finding #{orig_i+1}")
         prompt = finding.get("prompt", finding.get("description", ""))
 
+        # Pre-spawn scope-budget gate: catch obvious file-count/scope mismatch before
+        # an agent is dispatched. Runs before history-based calibration so all
+        # subsequent steps work on the corrected scope.
+        _sbg_files = finding.get("related_files") or []
+        scope, _sbg_cal_from, _scope_budget_warning, _budget_requires_approval = (
+            check_scope_budget_mismatch(scope, _sbg_files)
+        )
+
         # Determine task type early — some findings don't spawn tasks
         finding_type = finding.get("type", "improvement")
 
@@ -926,7 +936,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             continue
 
         # Apply scope calibration from direction's historical merge rates (skip if already calibrated)
-        scope_calibrated_from: str | None = finding.get("scope_calibrated_from")
+        scope_calibrated_from: str | None = finding.get("scope_calibrated_from") or _sbg_cal_from
         _history_calibration_fired = False
         if not (scope_calibrated_from or (task.context or {}).get("scope_calibrated_from")):
             _dir_id = finding.get("direction_id") or _parent_direction_id
@@ -996,7 +1006,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         # Pre-spawn approval removed: the review pipeline handles quality gates.
         # Only final merge to main requires human approval (critical files gate).
-        needs_approval = False
+        # Exception: large-scope findings that far exceed the large-scope file budget
+        # require operator confirmation before dispatching (scope_budget_mismatch gate).
+        needs_approval = _budget_requires_approval
 
         direction_id = finding.get("direction_id")
         # Ignore finding.model: it's a legacy anthropic-only hint that
@@ -1407,6 +1419,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **({"auto_decomposed": True} if finding.get("auto_decomposed") else {}),
                 **({"_predicted_file_utilization": _predicted_utilization} if _predicted_utilization is not None else {}),
                 **({"_file_budget_warning": _file_budget_warning} if _file_budget_warning else {}),
+                **({"scope_budget_warning": _scope_budget_warning} if _scope_budget_warning else {}),
                 **({"preventive_context": _preventive, "has_preventive_context": True} if _preventive else {}),
                 "prompt_telemetry": _compute_prompt_telemetry(full_prompt, related_files, scope),
                 **prior_retry_ctx,

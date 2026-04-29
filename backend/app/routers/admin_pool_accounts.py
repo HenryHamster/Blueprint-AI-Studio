@@ -182,6 +182,12 @@ _HEALTH_FAILURE_CLASSES = (
     "PROVISION_FAILURE", "MIGRATION_ERROR", "AGENT_TIMEOUT", "SCOPE_OVERFLOW",
 )
 
+_FAILURE_CLASS_BUCKET_GROUPS: dict[str, list[str]] = {
+    "provider": ["RATE_LIMIT", "EXTERNAL_API"],
+    "infrastructure": ["PROVISION_FAILURE", "AGENT_TIMEOUT", "SCOPE_OVERFLOW"],
+    "code": ["CODE_ERROR", "MIGRATION_ERROR"],
+}
+
 
 @router.get("/max-plan-accounts/health")
 async def get_account_health_summary(
@@ -256,6 +262,13 @@ async def get_account_health_summary(
             "rl_events_24h": s["rl_events_24h"],
             "rate_limited_models": rate_limited_models,
             "failure_class_counts": failure_counts.get(acct_id, {c: 0 for c in _HEALTH_FAILURE_CLASSES}),
+            "failure_class_buckets": {
+                bucket: sum(
+                    failure_counts.get(acct_id, {}).get(cls, 0)
+                    for cls in classes
+                )
+                for bucket, classes in _FAILURE_CLASS_BUCKET_GROUPS.items()
+            },
         })
 
     return {"accounts": accounts}

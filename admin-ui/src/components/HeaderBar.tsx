@@ -5,7 +5,7 @@ import { MetricsBar } from './MetricsBar';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { AuthMode, CategoryRoutingEntry, DeployState, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import type { Task } from '../types/task';
-import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig } from '../types/project';
+import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from '../types/project';
 
 export interface HeaderBarProps {
   tasks: Task[];
@@ -140,6 +140,9 @@ export interface HeaderBarProps {
   zoneHealth: Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null;
   showUserManagement: boolean;
   onToggleUserManagement: () => void;
+  showProjectMembers: boolean;
+  onToggleProjectMembers: () => void;
+  selectedProjectMyRole: string | null;
   userRole: 'admin' | 'user' | null;
   notificationConfig: import('./SettingsNotificationsSection').NotificationConfig;
   onUpdateNotificationConfig: (config: Partial<import('./SettingsNotificationsSection').NotificationConfig>) => void;
@@ -149,6 +152,7 @@ export interface HeaderBarProps {
   selectedProjectId: string | null;
   selectedProjectOwner: string | null;
   selectedProjectRepo: string | null;
+  selectedProjectRole?: 'owner' | 'member' | 'viewer' | null;
   buildConfig: BuildConfig | null;
   onUpdateBuildConfig: (config: BuildConfig) => Promise<void>;
   onDetectBuildConfig: () => Promise<void>;
@@ -159,6 +163,8 @@ export interface HeaderBarProps {
   // Issue implementation config (project-scoped)
   issueImplementationConfig: IssueImplementationConfig | null;
   onUpdateIssueImplementationConfig: (config: IssueImplementationConfig) => Promise<void>;
+  autoReviewConfig: AutoReviewConfig | null;
+  onUpdateAutoReviewConfig: (patch: Partial<AutoReviewConfig>) => Promise<void>;
 }
 
 
@@ -495,6 +501,9 @@ export function HeaderBar(props: HeaderBarProps) {
           onSignOut={props.onSignOut}
           showUserManagement={props.showUserManagement}
           onToggleUserManagement={props.onToggleUserManagement}
+          showProjectMembers={props.showProjectMembers}
+          onToggleProjectMembers={props.onToggleProjectMembers}
+          selectedProjectMyRole={props.selectedProjectMyRole}
           notificationConfig={props.notificationConfig}
           onUpdateNotificationConfig={props.onUpdateNotificationConfig}
           dailyCostCeilingUsd={props.dailyCostCeilingUsd}
@@ -502,6 +511,7 @@ export function HeaderBar(props: HeaderBarProps) {
           selectedProjectId={props.selectedProjectId}
           selectedProjectOwner={props.selectedProjectOwner}
           selectedProjectRepo={props.selectedProjectRepo}
+          selectedProjectRole={props.selectedProjectRole}
           buildConfig={props.buildConfig}
           onUpdateBuildConfig={props.onUpdateBuildConfig}
           onDetectBuildConfig={props.onDetectBuildConfig}
@@ -510,6 +520,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateAutoRemediationConfig={props.onUpdateAutoRemediationConfig}
           issueImplementationConfig={props.issueImplementationConfig}
           onUpdateIssueImplementationConfig={props.onUpdateIssueImplementationConfig}
+          autoReviewConfig={props.autoReviewConfig}
+          onUpdateAutoReviewConfig={props.onUpdateAutoReviewConfig}
         />
 
         {/* More secondary buttons — desktop only */}

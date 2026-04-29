@@ -42,6 +42,10 @@ SCOPE_FILE_BUDGETS: dict[str, dict[str, int]] = {
     "large": {"total_files_max": 20},
 }
 
+# Mirrors agent/src/constants.ts MEDIUM_ANALYSIS_PLAN_FILE_LIMIT. If a medium-scope
+# finding lists more files than this, the pre-spawn gate auto-upgrades to large.
+MEDIUM_ANALYSIS_PLAN_FILE_LIMIT: int = 10
+
 # Maximum implementation tasks to spawn when pipeline health is degraded.
 # Remaining findings are deferred to task.context['deferred_findings'] for
 # the next research cycle.
@@ -913,3 +917,57 @@ def _compute_scope_overflow_warning(
         "file_count": len(changed_files),
         "changed_files": changed_files[:50],
     }
+
+
+def check_scope_budget_mismatch(
+    scope: str,
+    related_files: list[str] | None,
+) -> tuple[str, str | None, str | None, bool]:
+    """Pre-spawn scope-budget gate: detect obvious file-count/scope mismatches.
+
+    Checks the declared scope against the number of related_files before
+    dispatching a task, so the mismatch is caught at research time rather
+    than after a task overflows during implementation.
+
+    Returns (new_scope, scope_calibrated_from, scope_budget_warning, requires_approval).
+    - scope_calibrated_from is set when the scope is upgraded.
+    - scope_budget_warning is a human-readable string when a mismatch is detected.
+    - requires_approval is True only for large-scope findings with too many files.
+    """
+    n = len(related_files) if related_files else 0
+    _large_limit = (SCOPE_FILE_BUDGETS.get("large") or {}).get("total_files_max") or 20
+
+    if scope == "small" and n > 2:
+        warning = (
+            f"scope_budget_mismatch: small scope with {n} related_files exceeds "
+            f"small-scope practical limit (2); auto-upgraded to medium."
+        )
+        logger.info(
+            "[RESEARCH] pre-spawn budget gate: small→medium (%d related_files > 2)", n
+        )
+        return "medium", "small", warning, False
+
+    if scope == "medium" and n > MEDIUM_ANALYSIS_PLAN_FILE_LIMIT:
+        warning = (
+            f"scope_budget_mismatch: medium scope with {n} related_files exceeds "
+            f"MEDIUM_ANALYSIS_PLAN_FILE_LIMIT ({MEDIUM_ANALYSIS_PLAN_FILE_LIMIT}); auto-upgraded to large."
+        )
+        logger.info(
+            "[RESEARCH] pre-spawn budget gate: medium→large (%d related_files > %d)",
+            n, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
+        )
+        return "large", "medium", warning, False
+
+    if scope == "large" and n > _large_limit:
+        warning = (
+            f"scope_budget_mismatch: large scope with {n} related_files exceeds "
+            f"large-scope budget ({_large_limit} files); requires operator approval."
+        )
+        logger.info(
+            "[RESEARCH] pre-spawn budget gate: large scope with %d related_files > %d "
+            "— marking requires_approval=True",
+            n, _large_limit,
+        )
+        return scope, None, warning, True
+
+    return scope, None, None, False

@@ -2,6 +2,7 @@
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -9,6 +10,12 @@ if TYPE_CHECKING:
     from app.models import Task
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FailureClassification:
+    failure_class: str
+    confidence: float
 
 
 def _resolve_task_provider_auth(task: "Task"):
@@ -439,7 +446,12 @@ def worst_child_failure_category(children: list["Task"]) -> str:
     return best_cat
 
 
-def persist_failure_category(task: "Task", failure_class: str, logs: str | None = None) -> None:
+def persist_failure_category(
+    task: "Task",
+    failure_class: str,
+    logs: str | None = None,
+    confidence: float | None = None,
+) -> None:
     """Write ``failure_class`` onto ``task.context['failure_category']`` in place.
 
     All terminal-FAILED code paths must call this (or write the key themselves)
@@ -461,7 +473,7 @@ def persist_failure_category(task: "Task", failure_class: str, logs: str | None 
     task.context = ctx
     account_id = ctx.get("llm_account_id") or ctx.get("max_plan_account_id")
     if account_id:
-        record_account_failure_class(str(account_id), failure_class)
+        record_account_failure_class(str(account_id), failure_class, confidence=confidence)
 
 
 def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
@@ -649,8 +661,9 @@ def _reactivate_residual_case(fingerprint: str) -> None:
     _residual_closed_fingerprints.discard(fingerprint)
 
 
-# Per-account failure class log — rolling 24h window, keyed account_id → {class → [timestamps]}.
-_account_failure_log: dict[str, dict[str, list[float]]] = {}
+# Per-account failure class log — rolling 24h window, keyed account_id →
+# list[(failure_class, confidence, timestamp)].
+_account_failure_log: dict[str, list[tuple[str, float | None, float]]] = {}
 
 _RE_UUID = re.compile(
     r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b',
@@ -959,26 +972,81 @@ def get_top_residual_fingerprints(window_seconds: int = 86400, top_n: int = 10) 
     return results[:top_n]
 
 
-def record_account_failure_class(account_id: str, failure_class: str) -> None:
+def record_account_failure_class(
+    account_id: str,
+    failure_class: str,
+    confidence: float | None = None,
+) -> None:
     """Record a failure-class event for an account in the rolling 24h window."""
     if not account_id:
         return
     now = time.time()
-    by_class = _account_failure_log.setdefault(account_id, {})
-    timestamps = by_class.setdefault(failure_class, [])
-    timestamps.append(now)
     cutoff = now - 86400
-    by_class[failure_class] = [t for t in timestamps if t >= cutoff]
+    records = _account_failure_log.setdefault(account_id, [])
+    records.append((failure_class, confidence, now))
+    _account_failure_log[account_id] = [rec for rec in records if rec[2] >= cutoff]
+
+
+def get_account_failure_class_records(
+    account_id: str,
+    window_seconds: int = 86400,
+) -> list[tuple[str, float | None, float]]:
+    """Return raw per-failure-class records (class, confidence, timestamp)."""
+    cutoff = time.time() - window_seconds
+    records = _account_failure_log.get(account_id, [])
+    return [rec for rec in records if rec[2] >= cutoff]
 
 
 def get_account_failure_class_counts(account_id: str, window_seconds: int = 86400) -> dict[str, int]:
     """Return per-failure-class counts for an account within the time window."""
-    cutoff = time.time() - window_seconds
-    by_class = _account_failure_log.get(account_id, {})
-    return {cls: sum(1 for t in by_class.get(cls, []) if t >= cutoff) for cls in ALL_FAILURE_CLASSES}
+    records = get_account_failure_class_records(account_id, window_seconds=window_seconds)
+    return {
+        cls: sum(1 for failure_class, _confidence, _ts in records if failure_class == cls)
+        for cls in ALL_FAILURE_CLASSES
+    }
 
 
-def classify_failure(task: "Task", logs: str | None = None) -> str:
+def classify_failure_with_confidence(task: "Task", logs: str | None = None) -> FailureClassification:
+    """Classify a failure and return a cheap rule-derived confidence score."""
+    failure_class = _classify_failure_class(task, logs)
+    agent_category = (task.context or {}).get("failure_category")
+    combined = ((task.latest_status_message or "").lower() + " " + (logs or "").lower()).strip()
+    combined_lower = combined.lower()
+    if agent_category:
+        return FailureClassification(failure_class=failure_class, confidence=0.9)
+    if failure_class == MIGRATION_ERROR:
+        if any(kw in combined_lower for kw in _MIGRATION_PATTERNS):
+            return FailureClassification(failure_class=failure_class, confidence=0.9)
+        if "downgrade" in combined_lower and any(
+            kw in combined_lower for kw in ("notimplementederror", "operationalerror")
+        ):
+            return FailureClassification(failure_class=failure_class, confidence=0.9)
+        return FailureClassification(failure_class=failure_class, confidence=0.8)
+    if failure_class == RATE_LIMIT:
+        if _task_rate_limit_signal(task, combined_lower) is not None:
+            return FailureClassification(failure_class=failure_class, confidence=0.8)
+        if any(kw in combined_lower for kw in _task_rate_limit_patterns(task)):
+            return FailureClassification(failure_class=failure_class, confidence=0.8)
+    if failure_class == PROVISION_FAILURE and _PROVISION_PHRASE_RE.search(combined):
+        return FailureClassification(failure_class=failure_class, confidence=0.8)
+    if failure_class == EXTERNAL_API:
+        if any(kw in combined_lower for kw in (
+            "could not connect to server", "connection to server", "database connection",
+            "psycopg", "asyncpg", "operator does not exist",
+        )):
+            return FailureClassification(failure_class=failure_class, confidence=0.8)
+        if _provider_model_config_rejection(combined_lower):
+            return FailureClassification(failure_class=failure_class, confidence=0.8)
+    if failure_class == AGENT_TIMEOUT and any(
+        kw in combined_lower for kw in ("no heartbeat", "reaped", "never started", "cancelled:", "superseded")
+    ):
+        return FailureClassification(failure_class=failure_class, confidence=0.7)
+    if failure_class == CODE_ERROR:
+        return FailureClassification(failure_class=failure_class, confidence=0.5)
+    return FailureClassification(failure_class=failure_class, confidence=0.7)
+
+
+def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     """Classify a task failure for deployment monitoring.
     Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API"""
 
@@ -1194,3 +1262,8 @@ def classify_failure(task: "Task", logs: str | None = None) -> str:
     # heartbeat happened to be in latest_status_message.
     record_residual_fingerprint(task, logs=logs)
     return "CODE_ERROR"
+
+
+def classify_failure(task: "Task", logs: str | None = None) -> str:
+    """Backward-compatible shim that returns only the failure class string."""
+    return classify_failure_with_confidence(task, logs).failure_class

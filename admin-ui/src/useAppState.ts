@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import type { Task } from './types/task';
-import type { Project, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig } from './types/project';
+import type { Project, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from './types/project';
 import type { Alert } from './types/alert';
 import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api';
 import { useToasts } from './components/Toasts';
@@ -989,6 +989,40 @@ export function useAppState() {
     }
   };
 
+  // ── Auto-review config (project-scoped) ─────────────────────────────────
+  const [autoReviewConfig, setAutoReviewConfig] = useState<AutoReviewConfig | null>(null);
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setAutoReviewConfig(null);
+      return;
+    }
+    authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/auto-review`)
+      .then(res => res.ok ? res.json() : null)
+      .then(data => { if (data?.config) setAutoReviewConfig(data.config); })
+      .catch(() => {});
+  }, [selectedProjectId]);
+
+  const handleUpdateAutoReviewConfig = async (patch: Partial<AutoReviewConfig>) => {
+    if (!selectedProjectId || Object.keys(patch).length === 0) return;
+    const prev = autoReviewConfig;
+    setAutoReviewConfig(prev ? { ...prev, ...patch } : prev);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/auto-review`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify(patch),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setAutoReviewConfig(data.config);
+      addToast('Auto-review config saved', 'success');
+    } catch {
+      setAutoReviewConfig(prev);
+      addToast('Failed to save auto-review config', 'error');
+    }
+  };
+
   return {
     // Auth
     user, authLoading, userRole, accessDenied, error, setError,
@@ -1054,6 +1088,7 @@ export function useAppState() {
     buildConfig, handleUpdateBuildConfig, handleDetectBuildConfig,
     autoRemediationConfig, autoRemediationStats, handleUpdateAutoRemediationConfig,
     issueImplementationConfig, handleUpdateIssueImplementationConfig,
+    autoReviewConfig, handleUpdateAutoReviewConfig,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountProvider, setNewAccountProvider,
     newAccountAuthMode, setNewAccountAuthMode, newAccountToken, setNewAccountToken,

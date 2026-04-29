@@ -997,12 +997,14 @@ async def update_agent_status(
                     except Exception as e:
                         logger.warning(f"[STATUS] record_completion_event failed for {acct_id_clear}: {e}", exc_info=True)
             else:
-                failure_class = classify_failure(task, payload.logs)
+                from app.failure_classification import classify_failure_with_confidence  # noqa: PLC0415
+                classification = classify_failure_with_confidence(task, payload.logs)
+                failure_class = classification.failure_class
                 from app.failure_classification import (  # noqa: PLC0415
                     EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
                     persist_failure_category,
                 )
-                persist_failure_category(task, failure_class)
+                persist_failure_category(task, failure_class, confidence=classification.confidence)
                 record_task_result(success=False, failure_class=failure_class, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}), auto_remediation=task.auto_remediation)
                 _shared_state.tasks_failed_total += 1
                 if _direction_id:

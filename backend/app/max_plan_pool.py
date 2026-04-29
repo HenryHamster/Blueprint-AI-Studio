@@ -819,6 +819,10 @@ def _account_at_cap(acct: dict) -> str | None:
 
 
 _QUOTA_EXHAUSTED_COOLDOWN_SECONDS = 24 * 60 * 60  # flat 24h for billing walls
+_QUARANTINE_COOLDOWN_SECONDS = 15 * 60  # flat 15-min recheck for confidence-gated quarantine
+QUARANTINE_CONSECUTIVE_N = 3  # consecutive qualifying failures to trip the quarantine
+QUARANTINE_CONFIDENCE_THRESHOLD = 0.8  # minimum per-record confidence to count
+_QUARANTINE_ELIGIBLE_CLASSES = frozenset({"RATE_LIMIT", "PROVISION_FAILURE"})
 
 
 def _serialize_disabled_model_info(info: dict) -> dict:
@@ -831,8 +835,8 @@ def _serialize_disabled_model_info(info: dict) -> dict:
         "hits": info.get("hits", 1),
         "at": info["at"].isoformat(),
     }
-    if info.get("kind") == "quota_exhausted":
-        out["kind"] = "quota_exhausted"
+    if info.get("kind") in ("quota_exhausted", "quarantine"):
+        out["kind"] = info["kind"]
     hint = info.get("retry_after_seconds")
     if isinstance(hint, (int, float)) and hint > 0:
         out["retry_after_seconds"] = int(hint)
@@ -852,12 +856,32 @@ def _cooldown_seconds_for_info(info: dict) -> int:
     """
     if info.get("kind") == "quota_exhausted":
         return _QUOTA_EXHAUSTED_COOLDOWN_SECONDS
+    if info.get("kind") == "quarantine":
+        return _QUARANTINE_COOLDOWN_SECONDS
     hits = info.get("hits", 1)
     exponential = min(30 * (2 ** (hits - 1)), 240) * 60
     hint = info.get("retry_after_seconds")
     if isinstance(hint, (int, float)) and hint > exponential:
         return int(hint)
     return exponential
+
+
+def _check_quarantine_trigger(account_id: str) -> bool:
+    """Return True if the last QUARANTINE_CONSECUTIVE_N failure records for account_id
+    are all RATE_LIMIT or PROVISION_FAILURE with confidence >= QUARANTINE_CONFIDENCE_THRESHOLD.
+
+    Lazy-imports get_account_failure_class_records to avoid the module-level cycle:
+    failure_classification already imports from max_plan_pool at module load time.
+    """
+    from app.failure_classification import get_account_failure_class_records  # lazy — avoids cycle
+    records = get_account_failure_class_records(account_id)
+    if len(records) < QUARANTINE_CONSECUTIVE_N:
+        return False
+    last_n = records[-QUARANTINE_CONSECUTIVE_N:]
+    return all(
+        cls in _QUARANTINE_ELIGIBLE_CLASSES and (conf or 0.0) >= QUARANTINE_CONFIDENCE_THRESHOLD
+        for cls, conf, _ts in last_n
+    )
 
 
 def _account_state_for_model(acct: dict, model: str | None, now: datetime | None = None) -> str:
@@ -1661,6 +1685,14 @@ async def disable_account_model(
             acct["disabled_reason"] = reason
             _pending_cap_persists.add(acct_id)
             logger.warning(f"[POOL] Account {acct['name']} auto-disabled: {reason}")
+
+        if kind != "quota_exhausted" and _check_quarantine_trigger(acct_id):
+            for m in cascade:
+                dm[m]["kind"] = "quarantine"
+            logger.warning(
+                f"[POOL] Account {acct['name']} quarantine triggered: last {QUARANTINE_CONSECUTIVE_N} "
+                f"high-confidence failures — {_QUARANTINE_COOLDOWN_SECONDS // 60}min recheck cooldown"
+            )
 
         try:
             await _persist_rate_limit_state(acct_id)

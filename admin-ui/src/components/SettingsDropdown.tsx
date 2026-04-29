@@ -7,7 +7,8 @@ import { ProviderCategoriesPanel } from './ProviderCategoriesPanel';
 import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
 import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
 import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
-import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig } from '../types/project';
+import { ProjectAutoReviewSection } from './ProjectAutoReviewSection';
+import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from '../types/project';
 import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench, Tag, HelpCircle, Plus, ChevronDown, ChevronUp, RefreshCw } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
 export type { MaxPlanAccount } from '../types/settings';
@@ -136,6 +137,9 @@ interface SettingsDropdownProps {
   onSignOut: () => void;
   showUserManagement: boolean;
   onToggleUserManagement: () => void;
+  showProjectMembers: boolean;
+  onToggleProjectMembers: () => void;
+  selectedProjectMyRole: string | null;
   // Build config (project-scoped)
   selectedProjectId: string | null;
   selectedProjectOwner: string | null;
@@ -150,6 +154,10 @@ interface SettingsDropdownProps {
   // Issue implementation config (project-scoped)
   issueImplementationConfig: IssueImplementationConfig | null;
   onUpdateIssueImplementationConfig: (config: IssueImplementationConfig) => Promise<void>;
+  // Auto-review config (project-scoped)
+  selectedProjectRole?: 'owner' | 'member' | 'viewer' | null;
+  autoReviewConfig: AutoReviewConfig | null;
+  onUpdateAutoReviewConfig: (patch: Partial<AutoReviewConfig>) => Promise<void>;
 }
 
 
@@ -228,7 +236,7 @@ const CREDENTIAL_GUIDES: Record<string, CredentialGuide> = {
   },
 };
 
-type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation';
+type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review';
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
@@ -239,6 +247,7 @@ const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly
   { id: 'accounts', label: 'Accounts', icon: User },
   { id: 'notifications', label: 'Notifications', icon: Bell },
   { id: 'build-config', label: 'Build Config', icon: Wrench, projectOnly: true },
+  { id: 'auto-review', label: 'Auto-Review', icon: HelpCircle, projectOnly: true },
   { id: 'auto-remediation', label: 'Auto-Remediation', icon: Settings, projectOnly: true },
   { id: 'issue-implementation', label: 'Issue Implementation', icon: Tag, projectOnly: true },
   { id: 'advanced', label: 'Advanced', icon: FileDown },
@@ -367,6 +376,9 @@ export function SettingsDropdown({
   onSignOut,
   showUserManagement,
   onToggleUserManagement,
+  showProjectMembers,
+  onToggleProjectMembers,
+  selectedProjectMyRole,
   selectedProjectId,
   selectedProjectOwner,
   selectedProjectRepo,
@@ -378,6 +390,9 @@ export function SettingsDropdown({
   onUpdateAutoRemediationConfig,
   issueImplementationConfig,
   onUpdateIssueImplementationConfig,
+  selectedProjectRole,
+  autoReviewConfig,
+  onUpdateAutoReviewConfig,
 }: SettingsDropdownProps) {
   const [, setTick] = useState(0);
   const [activeSection, setActiveSection] = useState<SectionId>('general');
@@ -903,6 +918,25 @@ export function SettingsDropdown({
           </div>
         )}
 
+        {/* Project Members */}
+        {selectedProjectId && (selectedProjectMyRole === 'owner' || isAdmin) && (
+          <div>
+            <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Project Members</h3>
+            <button
+              data-testid="toggle-project-members"
+              onClick={() => { onToggleProjectMembers(); onToggleSettings(); }}
+              className={`flex items-center gap-2 text-xs py-2 px-4 rounded-lg transition-colors border ${
+                showProjectMembers
+                  ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
+                  : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
+              }`}
+            >
+              <Users className="w-3.5 h-3.5" />
+              {showProjectMembers ? 'Close Project Members' : 'Manage Project Members'}
+            </button>
+          </div>
+        )}
+
         {/* GitHub */}
         <div>
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">GitHub</h3>
@@ -1397,6 +1431,16 @@ export function SettingsDropdown({
     );
   }
 
+  function renderAutoReview() {
+    return (
+      <ProjectAutoReviewSection
+        config={autoReviewConfig}
+        canSave={selectedProjectRole === 'owner'}
+        onSave={onUpdateAutoReviewConfig}
+      />
+    );
+  }
+
   function renderIssueImplementation() {
     return (
       <ProjectIssueImplementationSection
@@ -1449,6 +1493,7 @@ export function SettingsDropdown({
       case 'accounts': return renderAccounts();
       case 'notifications': return renderNotifications();
       case 'build-config': return renderBuildConfig();
+      case 'auto-review': return renderAutoReview();
       case 'auto-remediation': return renderAutoRemediation();
       case 'issue-implementation': return renderIssueImplementation();
       case 'advanced': return renderAdvanced();

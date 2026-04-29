@@ -1107,6 +1107,8 @@ async def test_strategic_completion_persists_recommended_mode_on_create(db_sessi
                 "rationale": "stale tests",
                 "system_id": "auth",
                 "recommended_mode": "audit",
+                "success_evidence": "Auth tests passing with no regressions",
+                "retirement_condition": "2 consecutive cycles with 0 auth failures",
             },
         ],
     })
@@ -1213,6 +1215,8 @@ async def test_strategic_completion_drops_invalid_recommended_mode(db_session, m
                 "priority": "medium",
                 "rationale": "x",
                 "recommended_mode": "not-a-canonical-mode",
+                "success_evidence": "All tasks merged",
+                "retirement_condition": "No open tasks remaining",
             },
         ],
     })
@@ -1261,7 +1265,9 @@ async def test_strategic_completion_pause_mode_auto_pauses_on_create(db_session,
     logs = json.dumps({
         "vision": {"purpose": "test", "revision": 2},
         "direction_operations": [{"op": "create", "text": "Paused direction",
-                                   "priority": "medium", "recommended_mode": "pause"}],
+                                   "priority": "medium", "recommended_mode": "pause",
+                                   "success_evidence": "No blockers remain",
+                                   "retirement_condition": "Gap closed for 2 cycles"}],
     })
     await _handle_strategic_completion(task, logs, db_session)
 
@@ -1370,3 +1376,161 @@ async def test_strategic_completion_non_pause_modes_preserve_active_status(db_se
         assert d.get("status") == "active", f"{did} should stay active for mode={expected_mode}"
         assert d.get("recommended_mode") == expected_mode
         assert not d.get("auto_paused")
+
+
+# ── Structured direction fields (success_evidence / retirement_condition) ─────
+
+
+def _make_project_and_task_for_structured_fields(db_session):
+    """Helper returning (project, task) for structured-field tests."""
+    import asyncio
+
+    async def _build():
+        project = Project(
+            name="SF", user_id="u1",
+            vision={"purpose": "test", "revision": 1},
+            directions=[],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+            context={},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        return project, task
+
+    return asyncio.get_event_loop().run_until_complete(_build())
+
+
+@pytest.mark.asyncio
+async def test_direction_create_persists_structured_fields(db_session, mocker):
+    """A create op that includes success_evidence and retirement_condition persists both on direction.context."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="SF", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [{
+            "op": "create",
+            "text": "Users can authenticate via SSO",
+            "priority": "medium",
+            "success_evidence": "Login flow passes end-to-end with SAML provider",
+            "retirement_condition": "3 consecutive cycles with 0 auth-related failures",
+        }],
+    })
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    dirs = [d for d in (project.directions or []) if "SSO" in d.get("text", "")]
+    assert len(dirs) == 1, "Direction should have been created"
+    ctx = dirs[0].get("context") or {}
+    assert ctx.get("success_evidence") == "Login flow passes end-to-end with SAML provider"
+    assert ctx.get("retirement_condition") == "3 consecutive cycles with 0 auth-related failures"
+
+
+@pytest.mark.asyncio
+async def test_direction_create_rejected_when_success_evidence_missing(db_session, mocker, caplog):
+    """A create op missing success_evidence is rejected (direction not created) with a warning log."""
+    import json
+    import logging
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="SF2", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [{
+            "op": "create",
+            "text": "Improve test coverage",
+            "priority": "medium",
+            # success_evidence intentionally omitted
+            "retirement_condition": "Coverage above 80%",
+        }],
+    })
+    with caplog.at_level(logging.WARNING, logger="app.strategic_completion"):
+        await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    dirs = [d for d in (project.directions or []) if "test coverage" in d.get("text", "").lower()]
+    assert len(dirs) == 0, "Direction without success_evidence must not be created"
+    assert any("success_evidence" in r.message or "retirement_condition" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_legacy_direction_without_structured_fields_loads(db_session, mocker):
+    """Directions that pre-date structured fields (no context key) still load and read correctly."""
+    from app.strategic_completion import _handle_strategic_completion
+
+    legacy_dir = {
+        "id": "d-legacy01",
+        "text": "Legacy direction",
+        "status": "active",
+        "priority": "medium",
+        "notes": [],
+        "research_history": [],
+        # no 'context' key — this is a pre-structured-fields direction
+    }
+    project = Project(
+        name="Legacy", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[legacy_dir],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Confirm the direction is readable and context is absent
+    found = next(
+        (d for d in (project.directions or []) if d.get("id") == "d-legacy01"),
+        None,
+    )
+    assert found is not None
+    assert found.get("context") is None, "Legacy direction should have no context field"
+    # text and status are still accessible
+    assert found["text"] == "Legacy direction"
+    assert found["status"] == "active"

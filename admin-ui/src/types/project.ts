@@ -82,6 +82,12 @@ export interface IssueImplementationConfig {
   default_effort: 'low' | 'medium' | 'high';
 }
 
+export interface AutoReviewConfig {
+  enabled: boolean;
+  max_per_hour: number;
+  max_concurrent: number;
+}
+
 export interface ProjectMemberEntry {
   id: string;
   user_id: string;

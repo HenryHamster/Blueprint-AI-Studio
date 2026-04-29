@@ -1808,7 +1808,7 @@ Walk the current problem_model section by section. What's accurate, stale, missi
 For each existing gap: open, progressing, or closed? For each new gap you're opening: name, description, evidence, size (small/medium/large), priority (high/medium/low), and source (if one exists).
 
 ## 3. Moves
-Directions to retire (one-sentence reason each) and to create (name the gap_id each closes + a success condition that would retire it). Parallel moves are fine and encouraged when non-clashing.
+Directions to retire (one-sentence reason each) and to create (name the gap_id each closes, a \`success_evidence\` string describing the observable outcome that proves the direction is done, and a \`retirement_condition\` string describing the measurable trigger for retirement). Parallel moves are fine and encouraged when non-clashing.
 
 ## 4. Running update document (for the user)
 Write the full refined running_update as markdown to \`/tmp/running_update_${taskId}.md\` (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
@@ -1893,7 +1893,7 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # Direction operations (link each create to a gap_id from the problem_model).
 # conflicts_with: list direction IDs that touch overlapping code/systems — they won't run in parallel.
 # recommended_mode: audit|fundamentals|ship|pause — your judgment for this direction's system health.
-./strategic create-direction '{"text": "outcome statement", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "conflicts_with": ["d-xxx"], "recommended_mode": "ship"}'
+./strategic create-direction '{"text": "outcome statement", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "conflicts_with": ["d-xxx"], "recommended_mode": "ship", "success_evidence": "observable outcome that proves this direction is done (required)", "retirement_condition": "measurable condition that triggers retirement (required)", "implementation_constraints": "optional constraints for implementors"}'
 ./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...], "recommended_mode": "audit"}, "rationale": "..."}'
 ./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
 

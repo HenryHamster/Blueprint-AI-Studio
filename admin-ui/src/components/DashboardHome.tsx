@@ -321,6 +321,7 @@ export interface AccountHealthEntry {
   rl_events_24h: number;
   rate_limited_models: RateLimitedModel[];
   failure_class_counts: Partial<Record<string, number>>;
+  failure_class_buckets?: { provider?: number; code?: number; infrastructure?: number };
 }
 
 // ---------- props ----------
@@ -1914,21 +1915,39 @@ export function PoolAccountHealthPanel({ accounts, loading }: {
                     {acct.completions_24h}c {acct.rl_events_24h}rl
                   </span>
                   {totalFailures > 0 && (
-                    <div className="flex items-center gap-1 ml-auto">
-                      {dominantEntry && (
-                        <span className="text-[9px] text-neutral-400" title="Dominant failure class (24h)">
-                          {FAILURE_CLASS_SHORT[dominantEntry[0]] ?? dominantEntry[0].toLowerCase()}:{dominantEntry[1]}
-                        </span>
+                    <div className="flex flex-col items-end gap-0.5 ml-auto">
+                      {acct.failure_class_buckets && (
+                        <div className="flex items-center gap-1.5 text-[9px]">
+                          <span className="text-yellow-400/80" title="provider: rate-limit + external API">
+                            <span className="inline-block w-1.5 h-1.5 rounded-sm bg-yellow-400/70 align-middle mr-0.5" />
+                            {acct.failure_class_buckets.provider ?? 0}p
+                          </span>
+                          <span className="text-red-400/80" title="code: code error + migration">
+                            <span className="inline-block w-1.5 h-1.5 rounded-sm bg-red-400/70 align-middle mr-0.5" />
+                            {acct.failure_class_buckets.code ?? 0}c
+                          </span>
+                          <span className="text-orange-400/80" title="infra: provision + timeout + scope">
+                            <span className="inline-block w-1.5 h-1.5 rounded-sm bg-orange-400/70 align-middle mr-0.5" />
+                            {acct.failure_class_buckets.infrastructure ?? 0}i
+                          </span>
+                        </div>
                       )}
-                      <div className="flex items-center gap-0.5">
-                        {counts.sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0)).map(([cls, count]) => (
-                          <div
-                            key={cls}
-                            title={`${FAILURE_CLASS_SHORT[cls] ?? cls}: ${count}`}
-                            className={`h-2 rounded-sm ${FAILURE_CLASS_BAR_COLORS[cls] ?? 'bg-neutral-500'}`}
-                            style={{ width: `${Math.max(4, Math.round(((count ?? 0) / totalFailures) * 32))}px` }}
-                          />
-                        ))}
+                      <div className="flex items-center gap-1">
+                        {dominantEntry && (
+                          <span className="text-[9px] text-neutral-400" title="Dominant failure class (24h)">
+                            {FAILURE_CLASS_SHORT[dominantEntry[0]] ?? dominantEntry[0].toLowerCase()}:{dominantEntry[1]}
+                          </span>
+                        )}
+                        <div className="flex items-center gap-0.5">
+                          {counts.sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0)).map(([cls, count]) => (
+                            <div
+                              key={cls}
+                              title={`${FAILURE_CLASS_SHORT[cls] ?? cls}: ${count}`}
+                              className={`h-2 rounded-sm ${FAILURE_CLASS_BAR_COLORS[cls] ?? 'bg-neutral-500'}`}
+                              style={{ width: `${Math.max(4, Math.round(((count ?? 0) / totalFailures) * 32))}px` }}
+                            />
+                          ))}
+                        </div>
                       </div>
                     </div>
                   )}

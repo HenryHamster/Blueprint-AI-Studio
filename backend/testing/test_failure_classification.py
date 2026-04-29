@@ -27,9 +27,11 @@ from app.failure_classification import (
     _timeout_subtype_from_message,
     classify_external_api_subtype,
     classify_failure,
+    classify_failure_with_confidence,
     classify_failure_taxonomy,
     classify_timeout_subtype,
     get_account_failure_class_counts,
+    get_account_failure_class_records,
     get_top_residual_fingerprints,
     normalize_agent_failure_category,
     persist_failure_category,
@@ -183,6 +185,46 @@ class TestClassifyFailureCodeError:
     ])
     def test_generic_python_errors(self, msg):
         assert classify_failure(_task(msg)) == CODE_ERROR
+
+
+class TestClassifyFailureWithConfidence:
+    def test_structured_failure_category_is_high_confidence(self):
+        task = _task("anything", ctx={"failure_category": "rate_limited"})
+        result = classify_failure_with_confidence(task)
+        assert result.failure_class == RATE_LIMIT
+        assert result.confidence == 0.9
+
+    def test_migration_regex_is_high_confidence(self):
+        task = _task("alembic.util.exc.CommandError: Can't locate revision")
+        result = classify_failure_with_confidence(task)
+        assert result.failure_class == MIGRATION_ERROR
+        assert result.confidence == 0.9
+
+    def test_provider_rate_limit_and_provision_and_external_api_are_medium_high(self):
+        rate_task = _task("quota exceeded for quota metric", ctx={"llm_provider": "gemini", "llm_auth_mode": "api_key"})
+        assert classify_failure_with_confidence(rate_task).confidence == 0.8
+
+        provision_task = _task("failed to provision VM in zone us-central1")
+        assert classify_failure_with_confidence(provision_task).confidence == 0.8
+
+        external_task = _task("psycopg OperationalError: could not connect to server")
+        assert classify_failure_with_confidence(external_task).confidence == 0.8
+
+    def test_timeout_keywords_are_medium_confidence(self):
+        task = _task("No heartbeat received after 300s")
+        result = classify_failure_with_confidence(task)
+        assert result.failure_class == AGENT_TIMEOUT
+        assert result.confidence == 0.7
+
+    def test_code_error_fallthrough_is_low_confidence(self):
+        task = _task("TypeError: unsupported operand")
+        result = classify_failure_with_confidence(task)
+        assert result.failure_class == CODE_ERROR
+        assert result.confidence == 0.5
+
+    def test_legacy_shim_matches_dataclass_failure_class(self):
+        task = _task("No heartbeat received after 300s")
+        assert classify_failure(task) == classify_failure_with_confidence(task).failure_class
 
 
 class TestClassifyFailureProvision:
@@ -1096,9 +1138,25 @@ class TestAccountFailureClassTracking:
     def test_window_filter_excludes_old_events(self):
         import app.failure_classification as fc
         import time
-        fc._account_failure_log["acct-2"] = {CODE_ERROR: [time.time() - 90000]}
+        fc._account_failure_log["acct-2"] = [(CODE_ERROR, 0.5, time.time() - 90000)]
         counts = get_account_failure_class_counts("acct-2", window_seconds=86400)
         assert counts[CODE_ERROR] == 0
+
+    def test_record_and_retrieve_raw_records_with_confidence(self):
+        record_account_failure_class("acct-raw", CODE_ERROR, confidence=0.5)
+        record_account_failure_class("acct-raw", RATE_LIMIT, confidence=0.8)
+        records = get_account_failure_class_records("acct-raw")
+        assert len(records) == 2
+        assert any(rec[0] == CODE_ERROR and rec[1] == 0.5 for rec in records)
+        assert any(rec[0] == RATE_LIMIT and rec[1] == 0.8 for rec in records)
+
+    def test_persist_failure_category_forwards_confidence(self):
+        task = _task("some error", ctx={"llm_account_id": "acct-confidence"})
+        persist_failure_category(task, CODE_ERROR, confidence=0.5)
+        records = get_account_failure_class_records("acct-confidence")
+        assert len(records) == 1
+        assert records[0][0] == CODE_ERROR
+        assert records[0][1] == 0.5
 
     def test_persist_failure_category_records_for_account(self):
         task = _task("some error", ctx={"llm_account_id": "acct-3"})

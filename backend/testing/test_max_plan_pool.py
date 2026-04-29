@@ -4,18 +4,25 @@ These tests avoid the in-memory pool dicts and DB — they construct account
 dicts directly and pass an explicit `now` where the function supports it,
 keeping assertions deterministic without fixtures or locks.
 """
+import time
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
 from app.max_plan_pool import (
+    QUARANTINE_CONFIDENCE_THRESHOLD,
+    QUARANTINE_CONSECUTIVE_N,
     _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
     _HEALTH_WINDOW_SECONDS,
     _LATENCY_MIN_SAMPLES,
     _OUTCOME_WINDOW_SECONDS,
+    _QUARANTINE_COOLDOWN_SECONDS,
     _QUOTA_EXHAUSTED_COOLDOWN_SECONDS,
     _account_at_cap,
     _account_available_for_model,
+    _account_by_id,
+    _check_quarantine_trigger,
     _compute_avg_duration_24h,
     _compute_health_score,
     _compute_success_rate_7d,
@@ -23,18 +30,18 @@ from app.max_plan_pool import (
     _effective_success_rate,
     _cooldown_seconds_for_info,
     _daily_reset_if_elapsed,
+    _max_plan_pools,
     _normalize_rl_model,
     _prune_health_events,
     _serialize_disabled_model_info,
+    _SUCCESS_RATE_DEPRIORITIZE_MARGIN,
     cascade_disabled_models,
     describe_pool_blockage,
+    disable_account_model,
     get_account_health_stats,
     get_all_account_health_summaries,
-    summarize_pool_state,
-    _account_by_id,
-    _max_plan_pools,
-    _SUCCESS_RATE_DEPRIORITIZE_MARGIN,
     select_max_plan_account_balanced,
+    summarize_pool_state,
 )
 
 OPUS = "claude-opus-4-7"
@@ -415,6 +422,13 @@ class TestSerializeDisabledModelInfo:
             {"hits": 1, "at": at, "kind": "quota_exhausted"}
         )
         assert out["kind"] == "quota_exhausted"
+
+    def test_preserves_quarantine_kind(self):
+        at = datetime(2026, 4, 22, 3, 0, tzinfo=timezone.utc)
+        out = _serialize_disabled_model_info(
+            {"hits": 1, "at": at, "kind": "quarantine"}
+        )
+        assert out["kind"] == "quarantine"
 
     def test_preserves_positive_retry_hint(self):
         at = datetime(2026, 4, 22, 3, 0, tzinfo=timezone.utc)
@@ -801,6 +815,121 @@ class TestBalancedSuccessRateBias:
         # edge (rate=0.8) >= 1.0 - 0.20 = 0.80 → kept; winner is hi (also at 0 active_tasks)
         # both kept means result can be either; just assert no crash and winner is valid
         assert result[0]["id"] in ("hi", "edge")
+
+
+# ── _check_quarantine_trigger + disable_account_model quarantine integration ──
+
+class TestQuarantineTrigger:
+    """Tests for the confidence-gated quarantine trip-wire."""
+
+    def _set_records(self, account_id: str, records: list[tuple[str, float | None]]) -> None:
+        from app.failure_classification import _account_failure_log
+        now_ts = time.time()
+        _account_failure_log[account_id] = [
+            (cls, conf, now_ts - (len(records) - i) * 100)
+            for i, (cls, conf) in enumerate(records)
+        ]
+
+    def setup_method(self):
+        from app.failure_classification import _account_failure_log
+        _account_failure_log.clear()
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+
+    def teardown_method(self):
+        from app.failure_classification import _account_failure_log
+        _account_failure_log.clear()
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+
+    def test_triggers_when_last_n_are_rate_limit_high_confidence(self):
+        self._set_records("a", [
+            ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
+        ])
+        assert _check_quarantine_trigger("a") is True
+
+    def test_triggers_when_last_n_are_provision_failure_high_confidence(self):
+        self._set_records("a", [
+            ("PROVISION_FAILURE", 0.85), ("RATE_LIMIT", 0.9), ("PROVISION_FAILURE", 0.9),
+        ])
+        assert _check_quarantine_trigger("a") is True
+
+    def test_no_trigger_when_confidence_below_threshold(self):
+        self._set_records("a", [
+            ("RATE_LIMIT", 0.5), ("RATE_LIMIT", 0.5), ("RATE_LIMIT", 0.5),
+        ])
+        assert _check_quarantine_trigger("a") is False
+
+    def test_no_trigger_when_mixed_classes_break_streak(self):
+        self._set_records("a", [
+            ("RATE_LIMIT", 0.9), ("CODE_ERROR", 0.9), ("RATE_LIMIT", 0.9),
+        ])
+        assert _check_quarantine_trigger("a") is False
+
+    def test_no_trigger_when_fewer_than_n_records(self):
+        self._set_records("a", [
+            ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
+        ])
+        assert _check_quarantine_trigger("a") is False
+
+    def test_no_trigger_for_code_error_regardless_of_confidence(self):
+        self._set_records("a", [
+            ("CODE_ERROR", 0.95), ("CODE_ERROR", 0.95), ("CODE_ERROR", 0.95),
+        ])
+        assert _check_quarantine_trigger("a") is False
+
+    def test_no_trigger_when_earlier_records_disqualify_last_n(self):
+        # 5 records: last 3 must all qualify; position [2] is CODE_ERROR
+        self._set_records("a", [
+            ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
+            ("CODE_ERROR", 0.9), ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
+        ])
+        assert _check_quarantine_trigger("a") is False
+
+    async def test_disable_account_model_sets_quarantine_kind(self):
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        self._set_records(acct_id, [
+            ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
+        ])
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(acct_id, OPUS, kind="rate_limit")
+        assert acct["disabled_models"][OPUS]["kind"] == "quarantine"
+
+    async def test_disable_account_model_no_quarantine_below_confidence(self):
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        self._set_records(acct_id, [
+            ("RATE_LIMIT", 0.5), ("RATE_LIMIT", 0.5), ("RATE_LIMIT", 0.5),
+        ])
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(acct_id, OPUS, kind="rate_limit")
+        assert acct["disabled_models"][OPUS].get("kind") != "quarantine"
+
+    async def test_quarantine_cooldown_is_short_flat(self):
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        self._set_records(acct_id, [
+            ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
+        ])
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(acct_id, OPUS, kind="rate_limit")
+        assert acct["disabled_models"][OPUS]["kind"] == "quarantine"
+        assert _cooldown_seconds_for_info(acct["disabled_models"][OPUS]) == _QUARANTINE_COOLDOWN_SECONDS
+
+    async def test_quota_exhausted_not_overridden_by_quarantine(self):
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        self._set_records(acct_id, [
+            ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9), ("RATE_LIMIT", 0.9),
+        ])
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(acct_id, OPUS, kind="quota_exhausted")
+        assert acct["disabled_models"][OPUS].get("kind") == "quota_exhausted"
 
 
 # ── _compute_success_rate_7d_for_type ────────────────────────────────────────

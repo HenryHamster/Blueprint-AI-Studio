@@ -1974,6 +1974,13 @@ async def strategic_operation(
             session.add(task)
             await session.commit()
             return JSONResponse(content=_resp({"status": "skipped", "reason": "duplicate"}), status_code=409)
+        success_evidence = str(data.get("success_evidence", "")).strip()
+        retirement_condition = str(data.get("retirement_condition", "")).strip()
+        if not success_evidence or not retirement_condition:
+            raise HTTPException(
+                status_code=400,
+                detail="success_evidence and retirement_condition are required for direction creation",
+            )
         active_count = sum(1 for d in directions if d.get('status') == 'active')
         max_active = _runtime_config.get('max_active_directions', 5)
         if active_count >= max_active:
@@ -1983,6 +1990,7 @@ async def strategic_operation(
             session.add(task)
             await session.commit()
             return JSONResponse(content=_resp({'status': 'skipped', 'reason': f'Direction cap reached: {active_count}/{max_active} active'}), status_code=409)
+        _DIR_FIELD_MAX = 500
         new_dir: dict = {
             "id": f"d-{uuid.uuid4().hex[:8]}",
             "text": text,
@@ -1990,7 +1998,14 @@ async def strategic_operation(
             "priority": priority,
             "notes": [{"text": f"Created by strategic review: {rationale}", "added_at": _utcnow().isoformat()}] if rationale else [],
             "research_history": [],
+            "context": {
+                "success_evidence": success_evidence[:_DIR_FIELD_MAX],
+                "retirement_condition": retirement_condition[:_DIR_FIELD_MAX],
+            },
         }
+        impl_constraints = str(data.get("implementation_constraints", "")).strip()
+        if impl_constraints:
+            new_dir["context"]["implementation_constraints"] = impl_constraints[:_DIR_FIELD_MAX]
         if data.get("system_id"):
             new_dir["system_id"] = _cap_str(data["system_id"], STRATEGIC_SYSTEM_ID_MAX, "system_id", warnings)
         if data.get("paths"):

@@ -115,7 +115,7 @@ export default function App() {
   }, [setupProjectId, s.projects]);
 
   // Project members panel
-  const [showProjectMembers] = useState(false);
+  const [showProjectMembers, setShowProjectMembers] = useState(false);
   const selectedProject = useMemo(
     () => s.projects.find(p => p.id === s.selectedProjectId) ?? null,
     [s.projects, s.selectedProjectId],
@@ -426,6 +426,9 @@ export default function App() {
         zoneHealth={s.zoneHealth}
         showUserManagement={s.showUserManagement}
         onToggleUserManagement={() => s.setShowUserManagement(prev => !prev)}
+        showProjectMembers={showProjectMembers}
+        onToggleProjectMembers={() => setShowProjectMembers(prev => !prev)}
+        selectedProjectMyRole={selectedProject?.my_role ?? null}
         userRole={s.userRole}
         notificationConfig={s.notificationConfig}
         onUpdateNotificationConfig={s.updateNotificationConfig}
@@ -434,6 +437,7 @@ export default function App() {
         selectedProjectId={s.selectedProjectId}
         selectedProjectOwner={selectedProject?.github_owner ?? null}
         selectedProjectRepo={selectedProject?.github_repo ?? null}
+        selectedProjectRole={selectedProject?.my_role ?? null}
         buildConfig={s.buildConfig}
         onUpdateBuildConfig={s.handleUpdateBuildConfig}
         onDetectBuildConfig={s.handleDetectBuildConfig}
@@ -442,6 +446,8 @@ export default function App() {
         onUpdateAutoRemediationConfig={s.handleUpdateAutoRemediationConfig}
         issueImplementationConfig={s.issueImplementationConfig}
         onUpdateIssueImplementationConfig={s.handleUpdateIssueImplementationConfig}
+        autoReviewConfig={s.autoReviewConfig}
+        onUpdateAutoReviewConfig={s.handleUpdateAutoReviewConfig}
       />
 
       <div

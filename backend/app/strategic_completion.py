@@ -894,8 +894,17 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                        for d in directions):
                     logger.info(f"[STRATEGIC] Skipping duplicate direction '{text[:60]}' for project {project.id}")
                     continue
+                success_evidence = str(op_entry.get("success_evidence", "")).strip()
+                retirement_condition = str(op_entry.get("retirement_condition", "")).strip()
+                if not success_evidence or not retirement_condition:
+                    logger.warning(
+                        f"[STRATEGIC] Task {task.id}: direction create '{text[:60]}' rejected — "
+                        f"missing success_evidence or retirement_condition; strategic agent should include both fields"
+                    )
+                    continue
                 raw_priority = op_entry.get("priority", "medium")
                 priority = raw_priority if raw_priority in ("high", "medium", "low") else "medium"
+                _DIR_FIELD_MAX = 500
                 new_dir = {
                     "id": f"d-{uuid.uuid4().hex[:8]}",
                     "text": text,
@@ -903,7 +912,14 @@ async def _handle_strategic_completion(task: Task, logs: str, session: AsyncSess
                     "priority": priority,
                     "notes": [{"text": f"Created by strategic review: {rationale}", "added_at": _utcnow().isoformat()}] if rationale else [],
                     "research_history": [],
+                    "context": {
+                        "success_evidence": success_evidence[:_DIR_FIELD_MAX],
+                        "retirement_condition": retirement_condition[:_DIR_FIELD_MAX],
+                    },
                 }
+                impl_constraints = str(op_entry.get("implementation_constraints", "")).strip()
+                if impl_constraints:
+                    new_dir["context"]["implementation_constraints"] = impl_constraints[:_DIR_FIELD_MAX]
                 if op_entry.get("source"):
                     new_dir["source"] = str(op_entry["source"])[:64]
                 if op_entry.get("paths"):

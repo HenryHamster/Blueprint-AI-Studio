@@ -2641,7 +2641,9 @@ async def test_strategic_api_create_direction_respects_cap(db_session, mocker):
                 resp = await ac.post(
                     "/api/agent/strategic",
                     json={"op": "create_direction", "task_id": task_id,
-                          "data": {"text": "Overcap direction", "priority": "medium"}},
+                          "data": {"text": "Overcap direction", "priority": "medium",
+                                   "success_evidence": "No overcap errors",
+                                   "retirement_condition": "Cap resolved"}},
                 )
             assert resp.status_code == 409, resp.text
             body = resp.json()
@@ -2768,13 +2770,17 @@ async def test_strategic_api_accumulates_direction_ids(db_session, mocker):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
             r1 = await ac.post("/api/agent/strategic", json={
                 "op": "create_direction", "task_id": task_id,
-                "data": {"text": "New direction alpha", "priority": "medium"}})
+                "data": {"text": "New direction alpha", "priority": "medium",
+                         "success_evidence": "Alpha outcome achieved",
+                         "retirement_condition": "Alpha gap closed"}})
             assert r1.status_code == 200, r1.text
             new_id_1 = r1.json()["direction_id"]
 
             r2 = await ac.post("/api/agent/strategic", json={
                 "op": "create_direction", "task_id": task_id,
-                "data": {"text": "New direction beta", "priority": "low"}})
+                "data": {"text": "New direction beta", "priority": "low",
+                         "success_evidence": "Beta outcome achieved",
+                         "retirement_condition": "Beta gap closed"}})
             assert r2.status_code == 200, r2.text
             new_id_2 = r2.json()["direction_id"]
 
@@ -2789,6 +2795,74 @@ async def test_strategic_api_accumulates_direction_ids(db_session, mocker):
         assert ctx.get("_strategic_retired_ids") == ["d-retire-me"]
         assert ctx.get("_strategic_dirs_created") == 2
         assert ctx.get("_strategic_dirs_retired") == 1
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_create_direction_rejects_missing_structured_fields(db_session, mocker):
+    """create_direction returns 400 when success_evidence or retirement_condition is absent."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    project = Project(
+        name="P-structured-missing",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            # Missing success_evidence
+            resp_no_evidence = await ac.post("/api/agent/strategic", json={
+                "op": "create_direction", "task_id": task_id,
+                "data": {"text": "Direction without evidence", "priority": "medium",
+                         "retirement_condition": "Gap closed"},
+            })
+            assert resp_no_evidence.status_code == 400, resp_no_evidence.text
+            msg_no_ev = resp_no_evidence.json().get("error", {}).get("message", "")
+            assert "success_evidence" in msg_no_ev
+
+            # Missing retirement_condition
+            resp_no_retirement = await ac.post("/api/agent/strategic", json={
+                "op": "create_direction", "task_id": task_id,
+                "data": {"text": "Direction without retirement", "priority": "medium",
+                         "success_evidence": "Outcome achieved"},
+            })
+            assert resp_no_retirement.status_code == 400, resp_no_retirement.text
+            msg_no_ret = resp_no_retirement.json().get("error", {}).get("message", "")
+            assert "retirement_condition" in msg_no_ret
+
+        # Neither direction should have been created
+        await db_session.refresh(project)
+        assert len(project.directions or []) == 0, "No directions should be created without required fields"
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)
