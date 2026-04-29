@@ -34,6 +34,7 @@ from typing import Callable
 import pytest
 
 from app import compute
+from app.compute_startup_script import build_agent_startup_script
 
 
 # ---------------------------------------------------------------------------
@@ -54,32 +55,17 @@ class ShellGenerator:
 
 
 def _render_compute_startup_script() -> str:
-    """Extract and render the VM startup script f-string from compute.py.
-
-    We parse the source instead of actually calling ``_provision_gcp`` so
-    we don't need GCP credentials. The regex matches the exact literal
-    at line 711 of compute.py; if that block moves, update the regex.
-    """
-    compute_py = Path(compute.__file__).read_text(encoding="utf-8")
-    # Match the f-string body. Split the quote markers to avoid confusing
-    # Python's own tokenizer when pytest compiles this module.
-    q3 = '"' * 3
-    pattern = r'startup_script = f' + re.escape(q3) + r'(.*?)' + re.escape(q3)
-    m = re.search(pattern, compute_py, re.DOTALL)
-    assert m, "could not locate startup_script f-string in compute.py"
-    body = m.group(1)
-    placeholders = {
-        "ORCHESTRATOR_URL": "https://orch.test",
-        "secret_version_name": "projects/test/secrets/agent/versions/1",
-        "task_id": "00000000-0000-0000-0000-000000000000",
+    """Render the VM startup script without provisioning a GCP instance."""
+    return build_agent_startup_script(
+        task_id="00000000-0000-0000-0000-000000000000",
+        secret_version_name="projects/test/secrets/agent/versions/1",
         # Base64 of a valid GCS URI so the `echo ... | base64 -d` round-trips
-        "payload_uri_b64": "Z3M6Ly9idWNrZXQvb2JqZWN0",
-        "GCP_PROJECT_ID": "test-project",
+        payload_uri_b64="Z3M6Ly9idWNrZXQvb2JqZWN0",
+        orchestrator_url="https://orch.test",
         # Use the real embedded base64 of materialize_manifest.py so the
         # rendered script's `base64 -d` would produce valid Python.
-        "_MATERIALIZE_MANIFEST_B64": compute._MATERIALIZE_MANIFEST_B64,
-    }
-    return body.format(**placeholders)
+        materialize_manifest_b64=compute._MATERIALIZE_MANIFEST_B64,
+    )
 
 
 GENERATORS: list[ShellGenerator] = [
@@ -96,8 +82,14 @@ GENERATORS: list[ShellGenerator] = [
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def bash_available() -> bool:
-    return shutil.which("bash") is not None
+def bash_executable() -> str | None:
+    for candidate in (
+        Path("C:/Program Files/Git/bin/bash.exe"),
+        Path("C:/Program Files/Git/usr/bin/bash.exe"),
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("bash")
 
 
 # Parametrize once over every generator. pytest gives us one named test
@@ -127,17 +119,17 @@ class TestGeneratedShellContract:
             f"{gen.name} missing shebang {gen.expected_shebang!r}"
         )
 
-    def test_bash_syntax(self, gen: ShellGenerator, bash_available: bool, tmp_path: Path):
+    def test_bash_syntax(self, gen: ShellGenerator, bash_executable: str | None, tmp_path: Path):
         """Structural test: bash -n rejects syntactic nonsense (missing
         `fi`, unbalanced heredoc, bad quoting) without running any code.
         Fast (~10 ms) and catches any regression that breaks parsing.
         """
-        if not bash_available:
+        if not bash_executable:
             pytest.skip("bash not available on this host")
         path = tmp_path / f"{gen.name}.sh"
         path.write_text(gen.render(), encoding="utf-8")
         result = subprocess.run(
-            ["bash", "-n", str(path)],
+            [bash_executable, "-n", str(path)],
             capture_output=True,
             text=True,
             timeout=10,
@@ -605,12 +597,12 @@ _STATIC_PARAMS = [
 
 
 @pytest.mark.parametrize("path", _STATIC_PARAMS)
-def test_static_script_bash_syntax(path: Path, bash_available: bool):
-    if not bash_available:
+def test_static_script_bash_syntax(path: Path, bash_executable: str | None):
+    if not bash_executable:
         pytest.skip("bash not available")
     assert path is not None
     result = subprocess.run(
-        ["bash", "-n", str(path)], capture_output=True, text=True, timeout=10
+        [bash_executable, "-n", str(path)], capture_output=True, text=True, timeout=10
     )
     assert result.returncode == 0, f"bash -n failed on {path}:\n{result.stderr}"
 
