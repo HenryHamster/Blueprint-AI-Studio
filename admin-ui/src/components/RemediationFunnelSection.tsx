@@ -762,6 +762,14 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                             </span>
                           );
                         })()}
+                        {(r.audit_defer_count ?? 0) > 0 && (
+                          <span
+                            className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${(r.audit_defer_count ?? 0) >= 3 ? 'bg-violet-500/30 text-violet-300 border-violet-500/50' : 'bg-violet-500/15 text-violet-400 border-violet-500/30'}`}
+                            title={`Auto-remediation is held until${r.audit_deferred_system_id ? ` system ${r.audit_deferred_system_id}` : ' the named system'} completes its audit`}
+                          >
+                            DEFERRED ×{r.audit_defer_count}{r.audit_deferred_system_id ? ` · ${r.audit_deferred_system_id}` : ''}
+                          </span>
+                        )}
                         <span className="font-mono text-[9px] text-neutral-600 truncate flex-1">{r.fingerprint}</span>
                         {canUnsuspend && (
                           <button
@@ -791,6 +799,11 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                         <div className="text-[10px] text-red-400 mb-1">Failed to ignore: {ignoreError}</div>
                       )}
                       <div className="text-[11px] text-neutral-400 leading-snug mb-1.5">{truncate(r.sample_message, 140)}</div>
+                      {(r.audit_defer_count ?? 0) > 0 && (
+                        <div className="text-[10px] text-violet-400/70 mb-1.5">
+                          held by audit{r.audit_deferred_system_id ? ` on ${r.audit_deferred_system_id}` : ''} — spawning paused until audit completes
+                        </div>
+                      )}
                       <div className="flex gap-2 flex-wrap">
                         {r.example_task_ids.map(id => (
                           <a

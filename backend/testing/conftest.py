@@ -156,6 +156,23 @@ def reset_digest_cache():
 
 
 @pytest.fixture(autouse=True)
+def reset_runtime_config():
+    """Snapshot and restore runtime_config around every test.
+
+    Tests that call admin-settings PATCH endpoints mutate the global
+    runtime_config dict in-place (e.g. residual_audit_defer_escalation_threshold).
+    Without a reset those mutations bleed into unrelated tests and break
+    assertions that rely on hardcoded defaults.
+    """
+    import copy
+    from app import shared_state
+    snapshot = copy.deepcopy(shared_state.runtime_config)
+    yield
+    shared_state.runtime_config.clear()
+    shared_state.runtime_config.update(snapshot)
+
+
+@pytest.fixture(autouse=True)
 def reset_rate_limiter():
     """
     Reset the slowapi in-memory rate-limit counters before every test so that

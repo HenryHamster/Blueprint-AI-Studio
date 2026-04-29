@@ -236,6 +236,26 @@ async def _record_residual_audit_deferral(
     case.updated_at = _utcnow()
     session.add(case)
 
+    # One-shot escalation: fire exactly when count first reaches the threshold
+    # (== not >=) so the alert fires once per deferral streak. The streak
+    # resets to 0 in post_residual_fix_spawned_message when a fix is spawned,
+    # allowing re-escalation on a future audit cycle.
+    from app.notification_dispatch import (  # deferred — avoids circular import
+        _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
+        post_residual_fix_audit_deferred_escalation_message,
+    )
+    threshold = int(_runtime_config.get(
+        'residual_audit_defer_escalation_threshold',
+        _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
+    ))
+    if case.audit_defer_count == threshold:
+        await post_residual_fix_audit_deferred_escalation_message(
+            session,
+            project_id,
+            fingerprint=fingerprint,
+            defer_count=case.audit_defer_count,
+        )
+
 
 async def _spawn_self_audit_task(
     project: Project, session: AsyncSession, audit_payload: dict,

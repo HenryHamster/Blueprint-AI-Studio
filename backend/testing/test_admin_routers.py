@@ -1242,6 +1242,33 @@ class TestNotificationConfigSettings:
         assert nc["webhook_url"] == "https://hooks.example.com/secret-token"
 
     @pytest.mark.asyncio
+    async def test_patch_residual_audit_defer_escalation_threshold(self, client: AsyncClient):
+        """residual_audit_defer_escalation_threshold accepts ints in [1,50] and rejects bad values."""
+        resp = await client.patch("/api/admin/settings", json={"residual_audit_defer_escalation_threshold": 10})
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["residual_audit_defer_escalation_threshold"] == 10
+
+        bad_low = await client.patch("/api/admin/settings", json={"residual_audit_defer_escalation_threshold": 0})
+        assert bad_low.status_code == 400
+        bad_high = await client.patch("/api/admin/settings", json={"residual_audit_defer_escalation_threshold": 51})
+        assert bad_high.status_code == 400
+        bad_str = await client.patch("/api/admin/settings", json={"residual_audit_defer_escalation_threshold": "x"})
+        assert bad_str.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_notification_config_residual_fix_audit_deferred_is_valid(self, client: AsyncClient):
+        """RESIDUAL_FIX_AUDIT_DEFERRED is accepted as a valid notification event."""
+        resp = await client.patch("/api/admin/settings", json={
+            "notification_config": {
+                "webhook_url": "https://hooks.example.com/x",
+                "enabled_events": ["TASK_FAILED", "RESIDUAL_FIX_AUDIT_DEFERRED"],
+                "throttle_seconds": 30,
+            }
+        })
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
     async def test_get_settings_non_admin_webhook_url_masked(self, override_get_session):
         """Non-admin caller gets empty webhook_url and a boolean configured flag instead."""
         from app.main import app as _app

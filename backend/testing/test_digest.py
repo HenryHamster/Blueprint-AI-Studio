@@ -5527,6 +5527,41 @@ async def test_residual_fingerprints_case_status_project_scoped(client: AsyncCli
     assert "case_status" not in top[0]
 
 
+@pytest.mark.asyncio
+async def test_residual_fingerprints_includes_audit_deferral_fields(client: AsyncClient, db_session):
+    """audit_defer_count and audit_deferred_system_id are included when a case exists."""
+    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    msg = "runtime error: nil pointer dereference in module core"
+    fp = _error_fingerprint(msg)
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+    ))
+    case = ResidualRemediationCase(
+        fingerprint=fp,
+        project_id=project.id,
+        status=ResidualCaseStatus.ACTIVE,
+        audit_defer_count=3,
+        audit_deferred_system_id="sys-payments",
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/residual-fingerprints?project_id={project.id}")
+    assert response.status_code == 200
+    top = response.json()["top_residuals"]
+    assert len(top) == 1
+    assert top[0]["audit_defer_count"] == 3
+    assert top[0]["audit_deferred_system_id"] == "sys-payments"
+
+
 # ---------------------------------------------------------------------------
 # cost_per_merge_exceeds_threshold / median_cost_per_merged_pr tests
 # ---------------------------------------------------------------------------

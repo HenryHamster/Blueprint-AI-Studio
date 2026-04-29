@@ -1052,6 +1052,8 @@ async def get_residual_fingerprints(
                 ResidualRemediationCase.last_spawned_pr_number,
                 ResidualRemediationCase.consecutive_failure_count,
                 ResidualRemediationCase.suspended_at,
+                ResidualRemediationCase.audit_defer_count,
+                ResidualRemediationCase.audit_deferred_system_id,
             ))
         )
         for c in case_rows.scalars().all():
@@ -1072,6 +1074,8 @@ async def get_residual_fingerprints(
             entry["last_spawned_pr_number"] = c.last_spawned_pr_number
             entry["consecutive_failure_count"] = c.consecutive_failure_count
             entry["suspended_at"] = c.suspended_at.isoformat() if c.suspended_at else None
+            entry["audit_defer_count"] = c.audit_defer_count
+            entry["audit_deferred_system_id"] = c.audit_deferred_system_id
         enriched.append(entry)
 
     return {

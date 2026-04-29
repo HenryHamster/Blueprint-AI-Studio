@@ -522,6 +522,7 @@ async def post_auto_fix_spawned_message(
 
 _AUTO_REMEDIATION_ESCALATION_THRESHOLD = 3
 _AUTO_REMEDIATION_REGRESSION_ESCALATION_THRESHOLD = 1
+_RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD = 5
 
 
 async def post_auto_fix_result_message(
@@ -728,6 +729,9 @@ async def post_residual_fix_spawned_message(
     case.last_spawned_task_id = task_id
     case.last_spawned_at = _utcnow()
     case.updated_at = _utcnow()
+    # Reset audit-deferral streak so a future audit cycle can re-escalate.
+    case.audit_defer_count = 0
+    case.audit_deferred_system_id = None
     session.add(case)
 
     summary = f'Residual auto-fix spawned for fingerprint {fingerprint[:32]}'
@@ -961,6 +965,72 @@ async def post_residual_fix_unsuspend_message(
         {
             'fingerprint': fingerprint,
             'recovered_at': recovered_at,
+            'manual_intervention_required': False,
+            'summary': summary,
+        },
+    ))
+    return msg
+
+
+async def post_residual_fix_audit_deferred_escalation_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    fingerprint: str,
+    defer_count: int,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a BLOCKER-severity escalation when a residual case is repeatedly
+    blocked by an in-progress audit.
+
+    Called when audit_defer_count first crosses
+    _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD (default 5, configurable via
+    runtime_config["residual_audit_defer_escalation_threshold"]). The case
+    status stays ACTIVE — the case is legitimately still open, just waiting
+    for the audit to complete.
+
+    Callers are responsible for the idempotency guard: fire only when
+    audit_defer_count == threshold (not >= threshold) so the message fires
+    once per deferral streak. post_residual_fix_spawned_message resets
+    audit_defer_count to 0 when a fix spawns so future audit cycles can
+    re-escalate.
+    """
+    try:
+        from app.shared_state import runtime_config
+        threshold = int(runtime_config.get(
+            'residual_audit_defer_escalation_threshold',
+            _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
+        ))
+    except Exception:
+        threshold = _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
+
+    summary = (
+        f'Residual case for fingerprint {fingerprint[:32]} has been deferred by audit '
+        f'{defer_count} times (threshold: {threshold}). No fix has been spawned yet — '
+        f'the case is blocked pending audit completion.'
+    )
+    ctx: dict[str, Any] = {
+        'event_type': 'residual_fix_audit_deferred',
+        'fingerprint': fingerprint,
+        'audit_defer_count': defer_count,
+        'threshold': threshold,
+    }
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType.BLOCKER,
+        from_type='system',
+        from_task_id=task_id,
+        content=summary,
+        context=ctx,
+    )
+    session.add(msg)
+    asyncio.ensure_future(dispatch_external_notification(
+        project_id,
+        'RESIDUAL_FIX_AUDIT_DEFERRED',
+        {
+            'fingerprint': fingerprint,
+            'audit_defer_count': defer_count,
+            'threshold': threshold,
+            'severity': 'blocker',
             'manual_intervention_required': False,
             'summary': summary,
         },

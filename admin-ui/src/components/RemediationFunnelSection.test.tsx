@@ -598,4 +598,29 @@ describe('RemediationFunnelSection residuals status pill', () => {
       expect(screen.getByText(status)).toBeInTheDocument();
     },
   );
+
+  it('shows DEFERRED badge and subline when audit_defer_count > 0', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+      baseCluster({ audit_defer_count: 2, audit_deferred_system_id: 'sys-foo' }),
+    ])));
+    const user = userEvent.setup();
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} projectId="p1" />);
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+    expect(screen.getByText('DEFERRED ×2 · sys-foo')).toBeInTheDocument();
+    expect(screen.getByText(/held by audit on sys-foo/)).toBeInTheDocument();
+  });
+
+  it('shows high-prominence DEFERRED badge when audit_defer_count >= 3', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+      baseCluster({ audit_defer_count: 4, audit_deferred_system_id: 'sys-bar' }),
+    ])));
+    const user = userEvent.setup();
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} projectId="p1" />);
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+    const badge = screen.getByText('DEFERRED ×4 · sys-bar');
+    expect(badge).toBeInTheDocument();
+    expect(badge.className).toContain('bg-violet-500/30');
+  });
 });

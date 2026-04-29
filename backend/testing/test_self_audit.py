@@ -622,6 +622,133 @@ class TestAutoModeRecover:
         assert project.directions[0]["recommended_mode"] == "audit"
 
 
+# ── Audit-deferral escalation ──────────────────────────────────────────────
+
+class TestRecordResidualAuditDeferralEscalation:
+    """_record_residual_audit_deferral fires the escalation message exactly
+    when audit_defer_count first reaches the threshold (== not >=)."""
+
+    @pytest.mark.asyncio
+    async def test_escalation_fires_at_threshold(self, db_session):
+        from unittest.mock import AsyncMock, patch
+        from app.models import ResidualRemediationCase, ResidualCaseStatus
+        from app.self_audit_dispatch import _record_residual_audit_deferral
+        from app.notification_dispatch import _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
+
+        project = await _seed_project_with_member(db_session)
+        fp = "fp-esc-threshold"
+        case = ResidualRemediationCase(
+            project_id=project.id,
+            fingerprint=fp,
+            status=ResidualCaseStatus.ACTIVE,
+            audit_defer_count=_RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD - 1,
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        with patch(
+            "app.notification_dispatch.post_residual_fix_audit_deferred_escalation_message",
+            new_callable=AsyncMock,
+        ) as mock_esc:
+            await _record_residual_audit_deferral(db_session, project.id, fp, "sys-x")
+
+        mock_esc.assert_awaited_once()
+        call_kwargs = mock_esc.call_args.kwargs
+        assert call_kwargs["defer_count"] == _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
+        assert call_kwargs["fingerprint"] == fp
+
+    @pytest.mark.asyncio
+    async def test_escalation_not_fired_below_threshold(self, db_session):
+        from unittest.mock import AsyncMock, patch
+        from app.models import ResidualRemediationCase, ResidualCaseStatus
+        from app.self_audit_dispatch import _record_residual_audit_deferral
+
+        project = await _seed_project_with_member(db_session)
+        fp = "fp-esc-below"
+        case = ResidualRemediationCase(
+            project_id=project.id,
+            fingerprint=fp,
+            status=ResidualCaseStatus.ACTIVE,
+            audit_defer_count=1,
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        with patch(
+            "app.notification_dispatch.post_residual_fix_audit_deferred_escalation_message",
+            new_callable=AsyncMock,
+        ) as mock_esc:
+            await _record_residual_audit_deferral(db_session, project.id, fp, "sys-y")
+
+        mock_esc.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_escalation_not_fired_above_threshold(self, db_session):
+        """One-shot guard: count already at threshold → next increment skips alert."""
+        from unittest.mock import AsyncMock, patch
+        from app.models import ResidualRemediationCase, ResidualCaseStatus
+        from app.self_audit_dispatch import _record_residual_audit_deferral
+        from app.notification_dispatch import _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
+
+        project = await _seed_project_with_member(db_session)
+        fp = "fp-esc-above"
+        case = ResidualRemediationCase(
+            project_id=project.id,
+            fingerprint=fp,
+            status=ResidualCaseStatus.ACTIVE,
+            audit_defer_count=_RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        with patch(
+            "app.notification_dispatch.post_residual_fix_audit_deferred_escalation_message",
+            new_callable=AsyncMock,
+        ) as mock_esc:
+            await _record_residual_audit_deferral(db_session, project.id, fp, "sys-z")
+
+        mock_esc.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_escalation_re_fires_after_streak_reset(self, db_session):
+        """Streak reset (simulating a successful fix spawn) enables re-escalation
+        on the next deferral cycle — the one-shot guard resets with the counter."""
+        from unittest.mock import AsyncMock, patch
+        from app.models import ResidualRemediationCase, ResidualCaseStatus
+        from app.self_audit_dispatch import _record_residual_audit_deferral
+        from app.notification_dispatch import _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
+
+        project = await _seed_project_with_member(db_session)
+        fp = "fp-esc-refire"
+        case = ResidualRemediationCase(
+            project_id=project.id,
+            fingerprint=fp,
+            status=ResidualCaseStatus.ACTIVE,
+            audit_defer_count=_RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD - 1,
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        with patch(
+            "app.notification_dispatch.post_residual_fix_audit_deferred_escalation_message",
+            new_callable=AsyncMock,
+        ) as mock_esc:
+            # First streak reaches threshold → escalation fires once.
+            await _record_residual_audit_deferral(db_session, project.id, fp, "sys-refire-a")
+            assert mock_esc.await_count == 1
+
+            # Simulate the streak reset that post_residual_fix_spawned_message
+            # performs when a fix is successfully spawned.
+            await db_session.refresh(case)
+            case.audit_defer_count = _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD - 1
+            db_session.add(case)
+            await db_session.commit()
+
+            # Second streak reaches threshold → escalation fires again.
+            await _record_residual_audit_deferral(db_session, project.id, fp, "sys-refire-b")
+            assert mock_esc.await_count == 2
+
+
 # ── Drift-triggered dispatch context ───────────────────────────────────────
 
 class TestDriftTriggeredDispatch:
