@@ -48,6 +48,15 @@ _PLAYBOOK_ARCHIVE_MAX_DEFAULT = 50
 _STALE_AGE_DAYS = 30
 _STALE_CONFIRM_THRESHOLD = 3
 
+# Minimum followed_count before success rate replaces raw confirmed_count in
+# archival ranking and retirement decisions.
+_MIN_FOLLOWED_FOR_RATE = 3
+
+# Auto-retirement: entries followed ≥ _RETIRE_MIN_FOLLOWED times with a success
+# rate below _RETIRE_MAX_SUCCESS_RATE are archived with a _retirement_reason tag.
+_RETIRE_MIN_FOLLOWED = 5
+_RETIRE_MAX_SUCCESS_RATE = 0.20
+
 # Review-extracted playbook entries are refreshed in-place when their
 # updated_at exceeds _REVIEW_PLAYBOOK_REFRESH_DAYS, and flagged
 # potentially_stale once they exceed _REVIEW_PLAYBOOK_STALE_DAYS without
@@ -184,7 +193,9 @@ def _archive_least_useful_entry(doc: dict) -> dict:
 
     "Least useful" is determined by a sort over:
     1. ``stale_file_refs`` flag (stale first)
-    2. Inverse ``confirmed_count`` (least confirmed first)
+    2. Effectiveness: inverse success rate (confirmed/followed) when
+       ``followed_count ≥ _MIN_FOLLOWED_FOR_RATE``, otherwise inverse
+       ``confirmed_count`` (least confirmed first)
     3. Entry age (oldest first, using ``updated_at``)
     4. Key name (tie-break)
 
@@ -200,6 +211,7 @@ def _archive_least_useful_entry(doc: dict) -> dict:
         if not k.startswith("playbook/") or not isinstance(v, dict):
             continue
         confirmed = v.get("confirmed_count", 0)
+        followed = v.get("followed_count", 0)
         stale = 1 if v.get("stale_file_refs") else 0
         updated_at_str = v.get("updated_at", "")
         age_days = 0
@@ -212,8 +224,14 @@ def _archive_least_useful_entry(doc: dict) -> dict:
                 age_days = (now - updated).days
             except (ValueError, TypeError):
                 pass
-        # Sort: stale first, then least-confirmed, then oldest, then key
-        candidates.append((stale, -confirmed, age_days, k))
+        # Use inverse success rate when enough observations exist so low-performing
+        # entries surface before unobserved ones; fall back to raw confirmed_count.
+        if followed >= _MIN_FOLLOWED_FOR_RATE:
+            effectiveness = -(confirmed / followed)
+        else:
+            effectiveness = -confirmed
+        # Sort: stale first, then least-effective, then oldest, then key
+        candidates.append((stale, effectiveness, age_days, k))
 
     if not candidates:
         return doc
@@ -286,6 +304,84 @@ def maybe_archive_for_capacity(doc: dict, new_entry_estimate: int = 0) -> dict:
     if _playbook_size_bytes(doc) + new_entry_estimate > _PLAYBOOK_CAPACITY_BYTES:
         doc = _archive_least_useful_entry(doc)
     return doc
+
+
+def record_playbook_applied(doc: dict, key: str) -> None:
+    """Increment followed_count when a playbook entry is applied to a task prompt.
+
+    *key* may be the short form (e.g. ``"success-create-small"``) or the full
+    ``playbook/<key>`` form.  No-op if the entry is not present.
+    """
+    full_key = key if key.startswith("playbook/") else f"playbook/{key}"
+    entry = doc.get(full_key)
+    if isinstance(entry, dict):
+        e = dict(entry)
+        e["followed_count"] = e.get("followed_count", 0) + 1
+        doc[full_key] = e
+
+
+def record_playbook_confirmed(doc: dict, key: str) -> None:
+    """Increment confirmed_count when a task that used this entry completes successfully.
+
+    *key* may be the short form or the full ``playbook/<key>`` form.
+    No-op if the entry is not present.
+    """
+    full_key = key if key.startswith("playbook/") else f"playbook/{key}"
+    entry = doc.get(full_key)
+    if isinstance(entry, dict):
+        e = dict(entry)
+        e["confirmed_count"] = e.get("confirmed_count", 0) + 1
+        doc[full_key] = e
+
+
+def retire_ineffective_patterns(
+    doc: dict,
+    *,
+    min_followed: int = _RETIRE_MIN_FOLLOWED,
+    max_success_rate: float = _RETIRE_MAX_SUCCESS_RATE,
+) -> list[str]:
+    """Auto-archive playbook entries whose success rate has fallen below the threshold.
+
+    Only considers entries with ``followed_count >= min_followed`` so the rate
+    is statistically meaningful.  Archived entries receive a ``_retirement_reason``
+    tag with the computed success rate for operator review.
+
+    Returns a list of full playbook keys that were archived.
+    """
+    from app.shared_state import runtime_config as _rc  # noqa: PLC0415
+
+    archive_max = _rc.get("playbook_archive_max", _PLAYBOOK_ARCHIVE_MAX_DEFAULT)
+    now = _utcnow()
+    retired: list[str] = []
+
+    for k in list(doc.keys()):
+        if not k.startswith("playbook/") or not isinstance(doc.get(k), dict):
+            continue
+        entry = doc[k]
+        followed = entry.get("followed_count", 0)
+        if followed < min_followed:
+            continue
+        confirmed = entry.get("confirmed_count", 0)
+        success_rate = confirmed / followed
+        if success_rate >= max_success_rate:
+            continue
+
+        victim = dict(doc.pop(k))
+        victim["_archived_key"] = k
+        victim["_archived_at"] = now.isoformat()
+        victim["_retirement_reason"] = f"low_success_rate:{success_rate:.2f}"
+        archive = list(doc.get("playbook_archive") or [])
+        archive.append(victim)
+        if archive_max > 0 and len(archive) > archive_max:
+            archive = archive[-archive_max:]
+        doc["playbook_archive"] = archive
+        retired.append(k)
+        logger.info(
+            "[PLAYBOOK] Retired '%s' success_rate=%.2f followed=%d confirmed=%d",
+            k, success_rate, followed, confirmed,
+        )
+
+    return retired
 
 
 # ---------------------------------------------------------------------------

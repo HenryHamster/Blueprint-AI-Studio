@@ -469,3 +469,154 @@ class TestShouldDispatchDirectionMode:
 
         result = await _should_dispatch_self_audit(project, db_session)
         assert result is None
+
+
+# ── Auto-clear mode on recovery ────────────────────────────────────────────
+
+class TestAutoModeRecover:
+    """Auto-clear: audit/fundamentals mode resets when system health recovers.
+
+    The threshold is 2 consecutive ship assessments on the linked system.
+    Only directions whose mode was set by self_audit (source == 'self_audit')
+    are eligible; operator-pinned modes (no meta or different source) are exempt.
+    """
+
+    @pytest.mark.asyncio
+    async def test_audit_mode_clears_after_two_consecutive_ship_assessments(
+        self, db_session, mock_broadcast
+    ):
+        """Direction auto-clears from audit → default after 2 ship assessments."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{
+            "id": "d1",
+            "status": "active",
+            "system_id": "sys-auth",
+            "recommended_mode": "audit",
+            "recommended_mode_meta": {
+                "source": "self_audit",
+                "mode": "audit",
+                "set_at": "2026-04-01T00:00:00",
+            },
+            "notes": [],
+        }]
+        db_session.add(project)
+
+        ship_logs = json.dumps({"findings": [{"system_id": "sys-auth", "score": 90, "recommended_mode": "ship"}]})
+
+        task1 = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task1)
+        await db_session.commit()
+        await _handle_self_audit_completion(task1, ship_logs, db_session)
+
+        task2 = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task2)
+        await db_session.commit()
+        await _handle_self_audit_completion(task2, ship_logs, db_session)
+
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d.get("recommended_mode") in (None, "ship"), (
+            f"Expected mode cleared, got {d.get('recommended_mode')!r}"
+        )
+        notes = d.get("notes") or []
+        assert any(
+            any(kw in (n.get("text") or "").lower() for kw in ("auto", "clear", "recover", "healthy"))
+            for n in notes
+        ), "Expected an auto-clear explanatory note on the direction"
+
+    @pytest.mark.asyncio
+    async def test_fundamentals_mode_clears_after_two_consecutive_ship_assessments(
+        self, db_session, mock_broadcast
+    ):
+        """Direction auto-clears from fundamentals → default after 2 ship assessments."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{
+            "id": "d1",
+            "status": "active",
+            "system_id": "sys-fund",
+            "recommended_mode": "fundamentals",
+            "recommended_mode_meta": {
+                "source": "self_audit",
+                "mode": "fundamentals",
+                "set_at": "2026-04-01T00:00:00",
+            },
+            "notes": [],
+        }]
+        db_session.add(project)
+
+        ship_logs = json.dumps({"findings": [{"system_id": "sys-fund", "score": 85, "recommended_mode": "ship"}]})
+
+        task1 = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task1)
+        await db_session.commit()
+        await _handle_self_audit_completion(task1, ship_logs, db_session)
+
+        task2 = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task2)
+        await db_session.commit()
+        await _handle_self_audit_completion(task2, ship_logs, db_session)
+
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d.get("recommended_mode") in (None, "ship"), (
+            f"Expected fundamentals cleared, got {d.get('recommended_mode')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_ship_assessment_does_not_auto_clear_mode(
+        self, db_session, mock_broadcast
+    ):
+        """One ship assessment is below the 2-assessment threshold — mode stays."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{
+            "id": "d1",
+            "status": "active",
+            "system_id": "sys-auth",
+            "recommended_mode": "audit",
+            "recommended_mode_meta": {
+                "source": "self_audit",
+                "mode": "audit",
+                "set_at": "2026-04-01T00:00:00",
+            },
+        }]
+        db_session.add(project)
+
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+
+        ship_logs = json.dumps({"findings": [{"system_id": "sys-auth", "score": 90, "recommended_mode": "ship"}]})
+        await _handle_self_audit_completion(task, ship_logs, db_session)
+
+        await db_session.refresh(project)
+        assert project.directions[0]["recommended_mode"] == "audit"
+
+    @pytest.mark.asyncio
+    async def test_operator_pinned_mode_not_cleared_by_auto_recover(
+        self, db_session, mock_broadcast
+    ):
+        """Operator-set audit mode (no self_audit meta) survives consecutive ship assessments."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{
+            "id": "d1",
+            "status": "active",
+            "system_id": "sys-auth",
+            "recommended_mode": "audit",
+            # No recommended_mode_meta → operator-pinned, not auto-set by self_audit
+        }]
+        db_session.add(project)
+
+        ship_logs = json.dumps({"findings": [{"system_id": "sys-auth", "score": 90, "recommended_mode": "ship"}]})
+
+        task1 = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task1)
+        await db_session.commit()
+        await _handle_self_audit_completion(task1, ship_logs, db_session)
+
+        task2 = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task2)
+        await db_session.commit()
+        await _handle_self_audit_completion(task2, ship_logs, db_session)
+
+        await db_session.refresh(project)
+        assert project.directions[0]["recommended_mode"] == "audit"

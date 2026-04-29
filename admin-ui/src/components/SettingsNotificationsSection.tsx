@@ -19,6 +19,8 @@ const EVENT_OPTIONS: { key: string; label: string; description: string; defaultO
   { key: 'AUTO_FIX_MERGED', label: 'CI Auto-Fix Merged', description: 'When a Blueprint auto-remediation fix PR is merged', defaultOn: false },
   { key: 'REMEDIATION_ESCALATED', label: 'Remediation Escalation', description: 'When a direction exhausts remediation and needs manual intervention', defaultOn: true },
   { key: 'DIRECTION_MILESTONE', label: 'Direction Milestone', description: 'When a direction is auto-completed, auto-paused, or auto-retired', defaultOn: true },
+  { key: 'AUTO_FIX_ESCALATED', label: 'CI Auto-Fix Escalated', description: 'When CI auto-fix repeatedly fails and the branch is suspended', defaultOn: true },
+  { key: 'RESIDUAL_FIX_ESCALATED', label: 'Residual Fix Escalated', description: 'When a residual fingerprint remediation repeatedly fails and is suspended', defaultOn: true },
 ];
 
 interface SettingsNotificationsSectionProps {

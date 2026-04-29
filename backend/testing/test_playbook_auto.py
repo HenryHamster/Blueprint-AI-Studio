@@ -957,6 +957,169 @@ def test_archive_cap_respects_runtime_config_override():
         runtime_config.pop("playbook_archive_max", None)
 
 
+def test_archive_uses_rate_over_raw_count_when_enough_observations():
+    """_archive_least_useful_entry uses success rate when followed_count >= _MIN_FOLLOWED_FOR_RATE.
+
+    An entry with many raw confirmations but no follow tracking should be kept
+    over an entry that has few confirmations relative to many follows, because
+    the rate-based score (effectiveness = -(confirmed/followed)) of the
+    low-performer is higher (closer to 0) than the score of the well-confirmed
+    entry that lacks follow tracking (effectiveness = -confirmed).
+    """
+    from app.playbook_learning import _archive_least_useful_entry, _MIN_FOLLOWED_FOR_RATE
+
+    doc = {
+        # Many raw confirmations but no follow tracking (old-style entry)
+        "playbook/well-confirmed": {
+            "content": "well-confirmed tip",
+            "confirmed_count": 5,
+            "followed_count": 0,  # below threshold → effectiveness = -5
+            "updated_at": _utcnow().isoformat(),
+        },
+        # Low success rate with enough follows — effectiveness = -(1/10) = -0.1
+        # This sorts higher than -5, so gets archived even though it has 1 confirmation
+        "playbook/low-performer": {
+            "content": "low performer tip",
+            "confirmed_count": 1,
+            "followed_count": 10,  # 10% success rate
+            "updated_at": _utcnow().isoformat(),
+        },
+    }
+    result = _archive_least_useful_entry(doc)
+    # The low-performer (10% success rate on 10 follows) archives before the
+    # 5-raw-confirmation entry, because -0.1 > -5 in the sort.
+    assert "playbook/low-performer" not in result, "Low-success-rate entry should be archived first"
+    assert "playbook/well-confirmed" in result
+    archive = result.get("playbook_archive", [])
+    assert archive[0]["_archived_key"] == "playbook/low-performer"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for record_playbook_applied / record_playbook_confirmed
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_record_playbook_applied_increments_followed_count():
+    from app.playbook_learning import record_playbook_applied
+
+    doc = {"playbook/my-tip": {"content": "x", "confirmed_count": 2}}
+    record_playbook_applied(doc, "my-tip")
+    assert doc["playbook/my-tip"]["followed_count"] == 1
+    record_playbook_applied(doc, "my-tip")
+    assert doc["playbook/my-tip"]["followed_count"] == 2
+
+
+def test_record_playbook_applied_accepts_full_key_form():
+    from app.playbook_learning import record_playbook_applied
+
+    doc = {"playbook/tip": {"content": "x"}}
+    record_playbook_applied(doc, "playbook/tip")
+    assert doc["playbook/tip"]["followed_count"] == 1
+
+
+def test_record_playbook_applied_noop_for_missing_key():
+    from app.playbook_learning import record_playbook_applied
+
+    doc = {}
+    record_playbook_applied(doc, "nonexistent")
+    assert doc == {}
+
+
+def test_record_playbook_confirmed_increments_confirmed_count():
+    from app.playbook_learning import record_playbook_confirmed
+
+    doc = {"playbook/tip": {"content": "x", "confirmed_count": 1}}
+    record_playbook_confirmed(doc, "tip")
+    assert doc["playbook/tip"]["confirmed_count"] == 2
+
+
+def test_record_playbook_confirmed_accepts_full_key_form():
+    from app.playbook_learning import record_playbook_confirmed
+
+    doc = {"playbook/tip": {"content": "x", "confirmed_count": 0}}
+    record_playbook_confirmed(doc, "playbook/tip")
+    assert doc["playbook/tip"]["confirmed_count"] == 1
+
+
+def test_record_playbook_confirmed_noop_for_missing_key():
+    from app.playbook_learning import record_playbook_confirmed
+
+    doc = {}
+    record_playbook_confirmed(doc, "nonexistent")
+    assert doc == {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for retire_ineffective_patterns
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_retire_ineffective_patterns_retires_low_success_rate():
+    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED, _RETIRE_MAX_SUCCESS_RATE
+
+    doc = {
+        "playbook/bad": {
+            "content": "bad tip",
+            "followed_count": _RETIRE_MIN_FOLLOWED,
+            "confirmed_count": 0,  # 0% success rate — below threshold
+        },
+    }
+    retired = retire_ineffective_patterns(doc)
+    assert retired == ["playbook/bad"]
+    assert "playbook/bad" not in doc
+    archive = doc.get("playbook_archive", [])
+    assert len(archive) == 1
+    assert archive[0]["_archived_key"] == "playbook/bad"
+    assert "low_success_rate" in archive[0].get("_retirement_reason", "")
+
+
+def test_retire_ineffective_patterns_keeps_sufficient_success_rate():
+    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED, _RETIRE_MAX_SUCCESS_RATE
+
+    doc = {
+        "playbook/good": {
+            "content": "good tip",
+            "followed_count": _RETIRE_MIN_FOLLOWED,
+            "confirmed_count": _RETIRE_MIN_FOLLOWED,  # 100% — well above threshold
+        },
+    }
+    retired = retire_ineffective_patterns(doc)
+    assert retired == []
+    assert "playbook/good" in doc
+
+
+def test_retire_ineffective_patterns_skips_entries_below_min_followed():
+    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED
+
+    doc = {
+        "playbook/new": {
+            "content": "new tip",
+            "followed_count": _RETIRE_MIN_FOLLOWED - 1,
+            "confirmed_count": 0,  # Would retire if followed enough
+        },
+    }
+    retired = retire_ineffective_patterns(doc)
+    assert retired == []
+    assert "playbook/new" in doc
+
+
+def test_retire_ineffective_patterns_retirement_reason_includes_rate():
+    from app.playbook_learning import retire_ineffective_patterns
+
+    doc = {
+        "playbook/tip": {
+            "content": "x",
+            "followed_count": 10,
+            "confirmed_count": 1,  # 10% success rate
+        },
+    }
+    retire_ineffective_patterns(doc)
+    archive = doc.get("playbook_archive", [])
+    assert len(archive) == 1
+    reason = archive[0]["_retirement_reason"]
+    assert "0.10" in reason
+
+
 def test_maybe_archive_for_capacity_triggers_at_threshold():
     """maybe_archive_for_capacity archives when combined size exceeds 25KB."""
     from app.playbook_learning import maybe_archive_for_capacity, _PLAYBOOK_CAPACITY_BYTES
@@ -2908,3 +3071,129 @@ def test_summarize_decomposition_outcomes_only_last_three_productive():
     assert out is not None
     assert out["prior_decomposition_count"] == 3
     assert out["avg_subtask_merge_rate"] == 0.5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for effectiveness tracking: confirmed_count / followed_count increment
+# (TDD stubs — xfail until sibling clusters 1–3 land)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.xfail(strict=False, reason="Sibling cluster 1/4 adds increment_playbook_applied_counts to playbook_learning.py")
+@pytest.mark.asyncio
+async def test_confirmed_count_increments_on_applied_entry_success(db_session: AsyncSession):
+    """When a completed task has _applied_playbook_entries in its context, the referenced
+    entry's confirmed_count and followed_count both increment."""
+    from app.playbook_learning import increment_playbook_applied_counts
+
+    key = "playbook/success-create-small"
+    project = await _make_project(db_session, design_doc={
+        key: {
+            "content": "First-attempt success pattern for create tasks.",
+            "source": "success-pattern",
+            "confirmed_count": 1,
+            "followed_count": 3,
+            "applicable_types": ["create"],
+            "updated_at": _utcnow().isoformat(),
+        }
+    })
+    task = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    task.context = {**(task.context or {}), "_applied_playbook_entries": ["success-create-small"]}
+    await db_session.flush()
+
+    await increment_playbook_applied_counts(task, db_session, success=True)
+    await db_session.flush()
+
+    entry = (project.design_doc or {})[key]
+    assert entry["confirmed_count"] == 2, "confirmed_count must increment on success"
+    assert entry["followed_count"] == 4, "followed_count must increment on any application"
+
+
+@pytest.mark.xfail(strict=False, reason="Sibling cluster 1/4 adds increment_playbook_applied_counts to playbook_learning.py")
+@pytest.mark.asyncio
+async def test_followed_count_increments_without_confirmed_on_failure(db_session: AsyncSession):
+    """When an applied task fails, followed_count grows (denominator) but confirmed_count
+    stays fixed — causing the success rate to drop as expected."""
+    from app.playbook_learning import increment_playbook_applied_counts
+
+    key = "playbook/success-create-small"
+    project = await _make_project(db_session, design_doc={
+        key: {
+            "content": "First-attempt success pattern for create tasks.",
+            "source": "success-pattern",
+            "confirmed_count": 2,
+            "followed_count": 3,
+            "applicable_types": ["create"],
+            "updated_at": _utcnow().isoformat(),
+        }
+    })
+    task = Task(
+        project_id=project.id,
+        title="Failed task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.FAILED,
+        context={"scope": "small", "_applied_playbook_entries": ["success-create-small"]},
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    await increment_playbook_applied_counts(task, db_session, success=False)
+    await db_session.flush()
+
+    entry = (project.design_doc or {})[key]
+    assert entry["confirmed_count"] == 2, "confirmed_count must not change on failure"
+    assert entry["followed_count"] == 4, "followed_count must grow regardless of outcome"
+
+
+@pytest.mark.xfail(strict=False, reason="Sibling cluster 1/4 adds auto_retire_low_effectiveness_entries to playbook_learning.py")
+def test_auto_retire_archives_low_success_rate_entry():
+    """auto_retire_low_effectiveness_entries moves entries with followed_count >= min and
+    confirmed/followed ratio below threshold into playbook_archive with an _archived_reason."""
+    from app.playbook_learning import auto_retire_low_effectiveness_entries
+
+    doc = {
+        "playbook/stale-pattern": {
+            "content": "Old pattern that stopped working",
+            "source": "auto-generated",
+            "confirmed_count": 1,
+            "followed_count": 10,  # 10% success rate — well below threshold
+            "updated_at": _utcnow().isoformat(),
+        },
+        "playbook/good-pattern": {
+            "content": "Pattern that still works",
+            "source": "auto-generated",
+            "confirmed_count": 8,
+            "followed_count": 10,  # 80% success rate — healthy
+            "updated_at": _utcnow().isoformat(),
+        },
+    }
+
+    auto_retire_low_effectiveness_entries(doc)
+
+    assert "playbook/stale-pattern" not in doc, "Low-rate entry should be archived"
+    assert "playbook/good-pattern" in doc, "High-rate entry should remain"
+    archive = doc.get("playbook_archive", [])
+    assert any(e.get("_archived_key") == "playbook/stale-pattern" for e in archive)
+    assert any("_archived_reason" in e for e in archive), "Must include explanatory reason tag"
+
+
+@pytest.mark.xfail(strict=False, reason="Sibling cluster 1/4 adds auto_retire_low_effectiveness_entries to playbook_learning.py")
+def test_auto_retire_skips_entries_below_min_observations():
+    """Entries with too few followed_count observations are not retired — insufficient data
+    to judge effectiveness, so the rate is statistically meaningless."""
+    from app.playbook_learning import auto_retire_low_effectiveness_entries
+
+    doc = {
+        "playbook/new-pattern": {
+            "content": "Pattern with only 2 observations — not enough data",
+            "source": "success-pattern",
+            "confirmed_count": 0,
+            "followed_count": 2,  # below minimum observation threshold
+            "updated_at": _utcnow().isoformat(),
+        },
+    }
+
+    auto_retire_low_effectiveness_entries(doc)
+
+    assert "playbook/new-pattern" in doc, "Under-observed entry must not be auto-retired"
+    assert not doc.get("playbook_archive"), "No archive entries should be created for under-observed patterns"

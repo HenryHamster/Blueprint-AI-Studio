@@ -188,6 +188,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
   const [ignoredFingerprints, setIgnoredFingerprints] = useState<Set<string>>(new Set());
   const [undoFingerprints, setUndoFingerprints] = useState<Map<string, ResidualFingerprint>>(new Map());
   const [ignoreErrors, setIgnoreErrors] = useState<Map<string, string>>(new Map());
+  const [showIgnored, setShowIgnored] = useState(true);
 
   function handleIgnore(fp: ResidualFingerprint) {
     const fingerprint = fp.fingerprint;
@@ -649,91 +650,113 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
         );
       })()}
 
-      {residuals && residuals.top_residuals.length > 0 && (
-        <div className="mt-2 bg-neutral-900/50 border border-amber-800/30 rounded-lg">
-          <button
-            type="button"
-            onClick={() => setResidualsOpen(v => !v)}
-            className="w-full flex items-center justify-between px-3 py-2 text-left"
-            aria-expanded={residualsOpen}
-          >
-            <span className="text-[10px] text-amber-500/80 uppercase tracking-wide">
-              Unclassified CODE_ERROR patterns — {residuals.top_residuals.length} clusters · {residuals.total_code_error_count} occurrences (last {residuals.window_hours}h)
-            </span>
-            <span className="text-[10px] text-neutral-500">{residualsOpen ? '▾' : '▸'}</span>
-          </button>
-          {residualsOpen && (
-            <div className="px-3 pb-3 space-y-2">
-              {residuals.top_residuals.map(r => {
-                const isIgnored = ignoredFingerprints.has(r.fingerprint);
-                const undoFp = undoFingerprints.get(r.fingerprint);
-                const ignoreError = ignoreErrors.get(r.fingerprint);
+      {residuals && residuals.top_residuals.length > 0 && (() => {
+        const apiIgnoredCount = residuals.top_residuals.filter(
+          r => r.case_status === 'IGNORED' && !ignoredFingerprints.has(r.fingerprint)
+        ).length;
+        const visibleResiduals = residuals.top_residuals.filter(
+          r => r.case_status !== 'IGNORED' || showIgnored || ignoredFingerprints.has(r.fingerprint)
+        );
+        return (
+          <div className="mt-2 bg-neutral-900/50 border border-amber-800/30 rounded-lg">
+            <button
+              type="button"
+              onClick={() => setResidualsOpen(v => !v)}
+              className="w-full flex items-center justify-between px-3 py-2 text-left"
+              aria-expanded={residualsOpen}
+            >
+              <span className="text-[10px] text-amber-500/80 uppercase tracking-wide">
+                Unclassified CODE_ERROR patterns — {residuals.top_residuals.length} clusters · {residuals.total_code_error_count} occurrences (last {residuals.window_hours}h)
+              </span>
+              <span className="text-[10px] text-neutral-500">{residualsOpen ? '▾' : '▸'}</span>
+            </button>
+            {residualsOpen && (
+              <div className="px-3 pb-3 space-y-2">
+                {apiIgnoredCount > 0 && (
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() => setShowIgnored(v => !v)}
+                      className="text-[10px] text-neutral-500 hover:text-neutral-300 underline underline-offset-2"
+                    >
+                      {showIgnored ? `Hide ignored (${apiIgnoredCount})` : `Show ignored (${apiIgnoredCount})`}
+                    </button>
+                  </div>
+                )}
+                {visibleResiduals.map(r => {
+                  const isIgnored = ignoredFingerprints.has(r.fingerprint);
+                  const undoFp = undoFingerprints.get(r.fingerprint);
+                  const ignoreError = ignoreErrors.get(r.fingerprint);
+                  const canIgnore = !r.case_status || r.case_status === 'ACTIVE' || r.case_status === 'REMEDIATING';
 
-                if (isIgnored && undoFp) {
+                  if (isIgnored && undoFp) {
+                    return (
+                      <div key={r.fingerprint} className="border border-neutral-800/40 rounded p-2 flex items-center justify-between gap-2">
+                        <span className="text-[11px] text-neutral-500 italic">Ignored</span>
+                        <button
+                          type="button"
+                          onClick={() => handleUndo(r.fingerprint)}
+                          className="text-[10px] text-amber-400 hover:text-amber-300 underline underline-offset-2"
+                        >
+                          Undo
+                        </button>
+                      </div>
+                    );
+                  }
+                  if (isIgnored) return null;
+
                   return (
-                    <div key={r.fingerprint} className="border border-neutral-800/40 rounded p-2 flex items-center justify-between gap-2">
-                      <span className="text-[11px] text-neutral-500 italic">Ignored</span>
-                      <button
-                        type="button"
-                        onClick={() => handleUndo(r.fingerprint)}
-                        className="text-[10px] text-amber-400 hover:text-amber-300 underline underline-offset-2"
-                      >
-                        Undo
-                      </button>
+                    <div key={r.fingerprint} className="border border-neutral-800/40 rounded p-2">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="font-mono text-[10px] bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded shrink-0">
+                          {r.count}×
+                        </span>
+                        <span className="text-[10px] text-neutral-500 shrink-0">{relativeTime(r.most_recent_at)}</span>
+                        {(() => {
+                          const label = caseStatusLabel(r);
+                          if (!label) return null;
+                          const style = CASE_STATUS_STYLES[r.case_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+                          return (
+                            <span className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${style}`}>
+                              {label}
+                            </span>
+                          );
+                        })()}
+                        <span className="font-mono text-[9px] text-neutral-600 truncate flex-1">{r.fingerprint}</span>
+                        {canIgnore && (
+                          <button
+                            type="button"
+                            onClick={() => handleIgnore(r)}
+                            className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-neutral-700 text-neutral-500 hover:text-neutral-300 hover:border-neutral-500 transition-colors"
+                            aria-label={`Ignore fingerprint ${r.fingerprint}`}
+                          >
+                            Ignore
+                          </button>
+                        )}
+                      </div>
+                      {ignoreError && (
+                        <div className="text-[10px] text-red-400 mb-1">Failed to ignore: {ignoreError}</div>
+                      )}
+                      <div className="text-[11px] text-neutral-400 leading-snug mb-1.5">{truncate(r.sample_message, 140)}</div>
+                      <div className="flex gap-2 flex-wrap">
+                        {r.example_task_ids.map(id => (
+                          <a
+                            key={id}
+                            href={`/tasks/${id}`}
+                            className="font-mono text-[9px] text-neutral-500 hover:text-neutral-300 underline underline-offset-2"
+                          >
+                            {id.slice(0, 8)}
+                          </a>
+                        ))}
+                      </div>
                     </div>
                   );
-                }
-                if (isIgnored) return null;
-
-                return (
-                  <div key={r.fingerprint} className="border border-neutral-800/40 rounded p-2">
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className="font-mono text-[10px] bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded shrink-0">
-                        {r.count}×
-                      </span>
-                      <span className="text-[10px] text-neutral-500 shrink-0">{relativeTime(r.most_recent_at)}</span>
-                      {(() => {
-                        const label = caseStatusLabel(r);
-                        if (!label) return null;
-                        const style = CASE_STATUS_STYLES[r.case_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
-                        return (
-                          <span className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${style}`}>
-                            {label}
-                          </span>
-                        );
-                      })()}
-                      <span className="font-mono text-[9px] text-neutral-600 truncate flex-1">{r.fingerprint}</span>
-                      <button
-                        type="button"
-                        onClick={() => handleIgnore(r)}
-                        className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-neutral-700 text-neutral-500 hover:text-neutral-300 hover:border-neutral-500 transition-colors"
-                        aria-label={`Ignore fingerprint ${r.fingerprint}`}
-                      >
-                        Ignore
-                      </button>
-                    </div>
-                    {ignoreError && (
-                      <div className="text-[10px] text-red-400 mb-1">Failed to ignore: {ignoreError}</div>
-                    )}
-                    <div className="text-[11px] text-neutral-400 leading-snug mb-1.5">{truncate(r.sample_message, 140)}</div>
-                    <div className="flex gap-2 flex-wrap">
-                      {r.example_task_ids.map(id => (
-                        <a
-                          key={id}
-                          href={`/tasks/${id}`}
-                          className="font-mono text-[9px] text-neutral-500 hover:text-neutral-300 underline underline-offset-2"
-                        >
-                          {id.slice(0, 8)}
-                        </a>
-                      ))}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      )}
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })()}
     </section>
   );
 }

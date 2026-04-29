@@ -2378,6 +2378,66 @@ async def test_sweep_stale_residual_cases_ignores_already_closed(reaper_db):
     assert "closed-fp-already" not in _fc._residual_closed_fingerprints
 
 
+@pytest.mark.asyncio
+async def test_sweep_stale_residual_cases_resolves_stale_remediating(reaper_db, mocker):
+    """A REMEDIATING case quiet beyond the cutoff auto-resolves and emits an event."""
+    import app.failure_classification as _fc
+    from app.models import ResidualRemediationCase, ResidualCaseStatus
+    from app.reaper import _sweep_stale_residual_cases
+
+    event_mock = mocker.patch("app.notification_dispatch.post_event_message", new_callable=AsyncMock)
+    _fc._residual_closed_fingerprints.clear()
+    stale_case = ResidualRemediationCase(
+        fingerprint="remediating-old-fp",
+        status=ResidualCaseStatus.REMEDIATING,
+        project_id=_uuid_mod.uuid4(),
+        last_seen_at=datetime.utcnow() - timedelta(hours=73),
+        last_spawned_at=datetime.utcnow() - timedelta(hours=73),
+        last_spawned_task_id=_uuid_mod.uuid4(),
+    )
+    reaper_db.add(stale_case)
+    await reaper_db.commit()
+    await reaper_db.refresh(stale_case)
+
+    closed = await _sweep_stale_residual_cases(reaper_db)
+
+    assert closed == 1
+    await reaper_db.refresh(stale_case)
+    assert stale_case.status == ResidualCaseStatus.RESOLVED
+    assert "remediating-old-fp" in _fc._residual_closed_fingerprints
+    event_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sweep_stale_residual_cases_keeps_recent_remediating(reaper_db, mocker):
+    """A REMEDIATING case with recent spawn/seen timestamps should not auto-resolve."""
+    import app.failure_classification as _fc
+    from app.models import ResidualRemediationCase, ResidualCaseStatus
+    from app.reaper import _sweep_stale_residual_cases
+
+    event_mock = mocker.patch("app.notification_dispatch.post_event_message", new_callable=AsyncMock)
+    _fc._residual_closed_fingerprints.clear()
+    recent_case = ResidualRemediationCase(
+        fingerprint="remediating-recent-fp",
+        status=ResidualCaseStatus.REMEDIATING,
+        project_id=_uuid_mod.uuid4(),
+        last_seen_at=datetime.utcnow() - timedelta(hours=1),
+        last_spawned_at=datetime.utcnow() - timedelta(hours=1),
+        last_spawned_task_id=_uuid_mod.uuid4(),
+    )
+    reaper_db.add(recent_case)
+    await reaper_db.commit()
+    await reaper_db.refresh(recent_case)
+
+    closed = await _sweep_stale_residual_cases(reaper_db)
+
+    assert closed == 0
+    await reaper_db.refresh(recent_case)
+    assert recent_case.status == ResidualCaseStatus.REMEDIATING
+    assert "remediating-recent-fp" not in _fc._residual_closed_fingerprints
+    event_mock.assert_not_awaited()
+
+
 # ── _task_has_open_pr + reap-with-PR handoff to EVALUATING ────────────────
 
 

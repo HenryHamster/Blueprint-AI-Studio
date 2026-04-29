@@ -836,22 +836,43 @@ async def _upsert_residual_case_async(
     """
     from app.database import AsyncSessionLocal  # noqa: PLC0415
     from app.models import ResidualRemediationCase, ResidualCaseStatus  # noqa: PLC0415
+    from sqlalchemy import update as sa_update  # noqa: PLC0415
     from sqlalchemy.exc import IntegrityError  # noqa: PLC0415
     from sqlmodel import select  # noqa: PLC0415
 
+    async def _atomic_increment(session, row_id, reopen: bool) -> None:
+        """Increment hit_count atomically at the SQL layer (no read-modify-write)."""
+        vals: dict = {
+            "hit_count": ResidualRemediationCase.hit_count + 1,
+            "last_seen_at": now_dt,
+            "updated_at": now_dt,
+        }
+        if reopen:
+            vals["status"] = ResidualCaseStatus.ACTIVE
+        await session.execute(
+            sa_update(ResidualRemediationCase)
+            .where(ResidualRemediationCase.id == row_id)
+            .values(**vals)
+        )
+
     async def _apply_update(session) -> None:
-        stmt = select(ResidualRemediationCase).where(
-            ResidualRemediationCase.project_id == project_id,
-            ResidualRemediationCase.fingerprint == fingerprint,
+        # SELECT FOR UPDATE acquires a row lock on Postgres, preventing
+        # concurrent transactions from racing on hit_count.
+        stmt = (
+            select(ResidualRemediationCase)
+            .where(
+                ResidualRemediationCase.project_id == project_id,
+                ResidualRemediationCase.fingerprint == fingerprint,
+            )
+            .with_for_update()
         )
         existing = (await session.execute(stmt)).scalars().first()
         if existing is not None:
-            existing.hit_count = (existing.hit_count or 0) + 1
-            existing.last_seen_at = now_dt
-            existing.updated_at = now_dt
-            if existing.status == ResidualCaseStatus.CLOSED_ORGANICALLY:
-                existing.status = ResidualCaseStatus.ACTIVE
-            session.add(existing)
+            await _atomic_increment(
+                session,
+                existing.id,
+                reopen=existing.status == ResidualCaseStatus.CLOSED_ORGANICALLY,
+            )
         else:
             session.add(ResidualRemediationCase(
                 project_id=project_id,
@@ -869,20 +890,23 @@ async def _upsert_residual_case_async(
                 async with session.begin():
                     await _apply_update(session)
             except IntegrityError:
-                # Concurrent INSERT won the race; retry as a pure UPDATE.
+                # Concurrent INSERT won the race; retry as a pure atomic UPDATE.
                 async with session.begin():
-                    stmt = select(ResidualRemediationCase).where(
-                        ResidualRemediationCase.project_id == project_id,
-                        ResidualRemediationCase.fingerprint == fingerprint,
+                    stmt = (
+                        select(ResidualRemediationCase)
+                        .where(
+                            ResidualRemediationCase.project_id == project_id,
+                            ResidualRemediationCase.fingerprint == fingerprint,
+                        )
+                        .with_for_update()
                     )
                     existing = (await session.execute(stmt)).scalars().first()
                     if existing is not None:
-                        existing.hit_count = (existing.hit_count or 0) + 1
-                        existing.last_seen_at = now_dt
-                        existing.updated_at = now_dt
-                        if existing.status == ResidualCaseStatus.CLOSED_ORGANICALLY:
-                            existing.status = ResidualCaseStatus.ACTIVE
-                        session.add(existing)
+                        await _atomic_increment(
+                            session,
+                            existing.id,
+                            reopen=existing.status == ResidualCaseStatus.CLOSED_ORGANICALLY,
+                        )
     except Exception:
         logger.exception(
             "[FAILURE_CLASS] Residual case DB upsert failed (fingerprint=%r)", fingerprint

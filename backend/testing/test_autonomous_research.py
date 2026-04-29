@@ -7792,3 +7792,152 @@ async def test_residual_db_selection_skips_non_active_statuses(db_session, _clea
 
     spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
     assert spawned == 0, "Non-ACTIVE DB cases must not trigger spawn in DB-driven selection"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Playbook followed_count — research_completion credits shown entries
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_followed_count_incremented_when_research_spawns_impl_task(db_session, mocker):
+    """When a research task spawns >= 1 impl task and _shown_playbook_keys is set,
+    followed_count is incremented on each shown playbook entry in design_doc.
+    Entries not listed in _shown_playbook_keys are not modified."""
+    direction = _active_direction("d-followpb1", "Playbook follow test direction")
+    project = Project(
+        name="Followed Count Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    project.design_doc = {
+        "playbook/shown-entry": {
+            "content": "use dependency injection",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 2,
+            "reference_count": 4,
+            "followed_count": 1,
+        },
+        "playbook/not-shown-entry": {
+            "content": "write unit tests first",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 0,
+            "reference_count": 1,
+            "followed_count": 0,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: Playbook follow test direction",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0, "_shown_playbook_keys": ["shown-entry"]},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    shown = project.design_doc["playbook/shown-entry"]
+    not_shown = project.design_doc["playbook/not-shown-entry"]
+
+    assert shown["followed_count"] == 2, (
+        f"Expected followed_count=2, got {shown['followed_count']}"
+    )
+    assert not_shown["followed_count"] == 0, "Not-shown entry must not be modified"
+
+
+@pytest.mark.asyncio
+async def test_followed_count_not_incremented_when_no_impl_spawned(db_session, mocker):
+    """When research produces zero impl tasks (all findings deduped), followed_count
+    must NOT be incremented even if _shown_playbook_keys is set."""
+    direction = _active_direction("d-followpb2", "Playbook follow zero-spawn direction")
+    project = Project(
+        name="Followed Count Zero Spawn",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    project.design_doc = {
+        "playbook/shown-entry": {
+            "content": "avoid globals",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 1,
+            "reference_count": 2,
+            "followed_count": 3,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dup_title = "Avoid globals in config module"
+    dup_desc = "Global state causes test isolation failures"
+    import hashlib as _hashlib
+    fhash = _hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+    existing = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "remove globals", "base_branch": "main"}],
+        context={"finding_hash": fhash},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+
+    task = Task(
+        project_id=project.id,
+        title="Research: zero spawn",
+        payloads=[{"type": "research", "directions": [direction], "base_branch": "main"}],
+        context={"research_depth": 0, "_shown_playbook_keys": ["shown-entry"]},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": dup_title,
+            "description": dup_desc,
+            "prompt": "remove globals",
+            "priority": "medium",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+        }],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    shown = project.design_doc["playbook/shown-entry"]
+    assert shown["followed_count"] == 3, (
+        "followed_count must not change when no impl tasks are spawned"
+    )

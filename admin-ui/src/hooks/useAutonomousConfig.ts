@@ -14,6 +14,10 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
   const [configMaxTasksPerHour, setConfigMaxTasksPerHour] = useState<number>(10);
   const [configMaxConcurrentAutoRemediations, setConfigMaxConcurrentAutoRemediations] = useState<number>(2);
   const [configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours] = useState<number>(24);
+  const [configMaxActiveDirections, setConfigMaxActiveDirections] = useState<number>(10);
+  const [configArchitectureReviewFrequency, setConfigArchitectureReviewFrequency] = useState<number>(3);
+  const [configMaxProvisionRetries, setConfigMaxProvisionRetries] = useState<number>(3);
+  const [configMaxRollupRetries, setConfigMaxRollupRetries] = useState<number>(5);
   const [autonomousConfigOpen, setAutonomousConfigOpen] = useState(false);
   const [savingConfigField, setSavingConfigField] = useState<string | null>(null);
   const [cooldownMinutes, setCooldownMinutes] = useState<number>(240);
@@ -45,6 +49,10 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
       if (data.max_autonomous_tasks_per_hour != null) setConfigMaxTasksPerHour(data.max_autonomous_tasks_per_hour);
       if (data.max_concurrent_auto_remediations != null) setConfigMaxConcurrentAutoRemediations(data.max_concurrent_auto_remediations);
       if (data.residual_remediation_cooldown_hours != null) setConfigResidualRemediationCooldownHours(data.residual_remediation_cooldown_hours);
+      if (data.max_active_directions != null) setConfigMaxActiveDirections(data.max_active_directions);
+      if (data.architecture_review_frequency != null) setConfigArchitectureReviewFrequency(data.architecture_review_frequency);
+      if (data.max_provision_retries != null) setConfigMaxProvisionRetries(data.max_provision_retries);
+      if (data.max_rollup_retries != null) setConfigMaxRollupRetries(data.max_rollup_retries);
     } catch { /* ignore */ }
   }
 
@@ -92,6 +100,10 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
     configMaxTasksPerHour, setConfigMaxTasksPerHour,
     configMaxConcurrentAutoRemediations, setConfigMaxConcurrentAutoRemediations,
     configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours,
+    configMaxActiveDirections, setConfigMaxActiveDirections,
+    configArchitectureReviewFrequency, setConfigArchitectureReviewFrequency,
+    configMaxProvisionRetries, setConfigMaxProvisionRetries,
+    configMaxRollupRetries, setConfigMaxRollupRetries,
     autonomousConfigOpen, setAutonomousConfigOpen,
     savingConfigField,
     cooldownMinutes,

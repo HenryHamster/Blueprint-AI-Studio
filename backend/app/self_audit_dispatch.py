@@ -23,6 +23,24 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
+def _record_auto_clear_note(direction: dict, cleared_from: str, count: int) -> None:
+    """Append an explanatory note to a direction dict when its mode is auto-cleared.
+
+    Called by task_completion._maybe_auto_clear_direction_mode so the note lives
+    alongside the self_audit dispatch logic rather than in the general completion module.
+    """
+    notes = list(direction.get("notes") or [])
+    notes.append({
+        "text": (
+            f"Auto-cleared from '{cleared_from}': system health recovered "
+            f"({count} consecutive 'ship' maturity assessments)"
+        ),
+        "source": "auto_clear",
+        "created_at": _utcnow().isoformat(),
+    })
+    direction["notes"] = notes
+
+
 # Default freshness threshold for SystemMaturity rows; rows older than this
 # count as stale and qualify the system for an audit dispatch. Configurable
 # via runtime_config.self_audit_staleness_days.

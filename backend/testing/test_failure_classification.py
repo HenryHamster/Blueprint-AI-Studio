@@ -1262,3 +1262,35 @@ class TestResidualFingerprintDbWrite:
             )).scalars().first()
         assert row.status == ResidualCaseStatus.IGNORED
         assert row.hit_count == 2
+
+    @pytest.mark.asyncio
+    async def test_repeated_hits_are_not_undercounted(self, session_factory, monkeypatch):
+        """N sequential record calls must produce hit_count == N (SQL atomic increment).
+
+        The SQL-level UPDATE hit_count = hit_count + 1 (not Python read-modify-write)
+        ensures no lost updates. On Postgres, with_for_update() additionally serialises
+        concurrent writers; SQLite StaticPool serialises them implicitly.
+        """
+        from datetime import datetime, timezone
+        import app.database as db_mod
+        from app.failure_classification import _upsert_residual_case_async
+        from app.models import ResidualRemediationCase
+        from sqlmodel import select
+
+        N = 8
+        project_id = uuid.uuid4()
+        now_dt = datetime.now(tz=timezone.utc)
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+
+        for _ in range(N):
+            await _upsert_residual_case_async(project_id, "fp-repeated", now_dt, "err")
+
+        async with session_factory() as session:
+            row = (await session.execute(
+                select(ResidualRemediationCase).where(
+                    ResidualRemediationCase.project_id == project_id,
+                    ResidualRemediationCase.fingerprint == "fp-repeated",
+                )
+            )).scalars().first()
+        assert row is not None
+        assert row.hit_count == N

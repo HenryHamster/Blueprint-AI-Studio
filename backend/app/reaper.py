@@ -173,34 +173,77 @@ async def _sweep_orphan_direction_holds(session) -> int:
 
 
 async def _sweep_stale_residual_cases(session) -> int:
-    """Close ACTIVE residual cases whose last_seen_at is older than 72 hours.
+    """Close stale residual cases and auto-resolve quiet REMEDIATING cases.
 
-    When a CODE_ERROR fingerprint stops occurring (infra recovers, an unrelated
-    PR fixes it, etc.) the ResidualRemediationCase row stays ACTIVE forever
-    without this sweep. Returns the number of cases transitioned to
-    CLOSED_ORGANICALLY.
+    ACTIVE rows transition to CLOSED_ORGANICALLY after the configured quiet
+    window, unless the fingerprint has been seen recently. REMEDIATING rows
+    transition to RESOLVED when the remediation has been stale for the
+    configured window and no new failures carried that fingerprint in-window.
     """
     from app.models import ResidualRemediationCase, ResidualCaseStatus  # noqa: PLC0415
     from app.failure_classification import _mark_residual_case_closed  # noqa: PLC0415
+    from app.notification_dispatch import post_event_message  # noqa: PLC0415
 
-    stale_cutoff = _utcnow() - timedelta(hours=72)
-    stale_cases = (await session.execute(
+    now = _utcnow()
+    active_hours = int(_runtime_config.get("residual_active_auto_close_hours", 72))
+    remediating_hours = int(_runtime_config.get("residual_remediating_auto_resolve_hours", active_hours))
+    recent_hit_grace_hours = int(_runtime_config.get("residual_recent_hit_grace_hours", 1))
+    active_cutoff = now - timedelta(hours=active_hours)
+    remediating_cutoff = now - timedelta(hours=remediating_hours)
+    recent_hit_cutoff = now - timedelta(hours=recent_hit_grace_hours)
+
+    active_stale_cases = (await session.execute(
         select(ResidualRemediationCase).where(
             ResidualRemediationCase.status == ResidualCaseStatus.ACTIVE,
-            ResidualRemediationCase.last_seen_at < stale_cutoff,
+            ResidualRemediationCase.last_seen_at < active_cutoff,
+        )
+    )).scalars().all()
+    remediating_stale_cases = (await session.execute(
+        select(ResidualRemediationCase).where(
+            ResidualRemediationCase.status == ResidualCaseStatus.REMEDIATING,
+            ResidualRemediationCase.last_spawned_at.is_not(None),
+            ResidualRemediationCase.last_spawned_at < remediating_cutoff,
+            ResidualRemediationCase.last_seen_at < remediating_cutoff,
         )
     )).scalars().all()
 
     closed = 0
-    for case in stale_cases:
+    for case in active_stale_cases:
+        if case.last_seen_at >= recent_hit_cutoff:
+            logger.info(
+                "[REAPER] Deferring ACTIVE residual case close %s (fingerprint=%r, last_seen_at=%s)",
+                case.id, case.fingerprint, case.last_seen_at.isoformat(),
+            )
+            continue
         case.status = ResidualCaseStatus.CLOSED_ORGANICALLY
-        case.updated_at = _utcnow()
+        case.updated_at = now
         session.add(case)
         _mark_residual_case_closed(case.fingerprint)
         closed += 1
         logger.info(
             "[REAPER] Closed stale residual case %s (fingerprint=%r, last_seen_at=%s)",
             case.id, case.fingerprint, case.last_seen_at.isoformat(),
+        )
+    for case in remediating_stale_cases:
+        case.status = ResidualCaseStatus.RESOLVED
+        case.updated_at = now
+        session.add(case)
+        _mark_residual_case_closed(case.fingerprint)
+        closed += 1
+        await post_event_message(
+            session,
+            case.project_id,
+            event_type="residual_fix_resolved_organically",
+            summary=f"Residual auto-fix resolved organically for {case.fingerprint[:32]} after quiet period",
+            context={"fingerprint": case.fingerprint, "result": "resolved_organically"},
+            task_id=case.last_spawned_task_id,
+        )
+        logger.info(
+            "[REAPER] Auto-resolved stale REMEDIATING residual case %s (fingerprint=%r, last_spawned_at=%s, last_seen_at=%s)",
+            case.id,
+            case.fingerprint,
+            case.last_spawned_at.isoformat() if case.last_spawned_at else None,
+            case.last_seen_at.isoformat(),
         )
 
     if closed:

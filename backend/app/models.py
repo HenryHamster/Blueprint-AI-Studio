@@ -589,6 +589,17 @@ class MaxPlanAccount(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow)
 
 
+# --- Residual-case reaper thresholds ---
+# Both are tunable via runtime_config using the same-named lowercase keys
+# (e.g. runtime_config.get("residual_stale_close_hours", RESIDUAL_STALE_CLOSE_HOURS)).
+# RESIDUAL_STALE_CLOSE_HOURS:     Hours of fingerprint silence before an ACTIVE case is
+#   closed organically OR a stuck REMEDIATING case is auto-resolved to RESOLVED.
+# RESIDUAL_RECENT_HIT_DEFER_HOURS: If a fingerprint's last_seen_at is within this window,
+#   defer the ACTIVE → CLOSED_ORGANICALLY close even if the 72 h outer window has elapsed.
+RESIDUAL_STALE_CLOSE_HOURS = 72
+RESIDUAL_RECENT_HIT_DEFER_HOURS = 1
+
+
 class ResidualCaseStatus(str, Enum):
     # Passive states (existing): set by record_residual_fingerprint + reaper
     ACTIVE = "ACTIVE"

@@ -132,6 +132,10 @@ async def get_settings(
         "auto_archive_terminal_after_days": _runtime_config.get("auto_archive_terminal_after_days", 7),
         "auto_archive_max_terminal_tasks_per_project": _runtime_config.get("auto_archive_max_terminal_tasks_per_project", 200),
         "auto_archive_interval_minutes": _runtime_config.get("auto_archive_interval_minutes", 60),
+        "max_provision_retries": _runtime_config.get("max_provision_retries", 3),
+        "max_rollup_retries": _runtime_config.get("max_rollup_retries", 5),
+        "architecture_review_frequency": _runtime_config.get("architecture_review_frequency", 3),
+        "max_active_directions": _runtime_config.get("max_active_directions", 10),
         "webhook_url_configured": bool(os.getenv("PIPELINE_WEBHOOK_URL")),
         "notification_config": _build_notification_config_response(
             _runtime_config.get("notification_config", {

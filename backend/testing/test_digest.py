@@ -5076,6 +5076,83 @@ async def test_ignore_residual_case_requires_auth(unauthenticated_client: AsyncC
     assert response.status_code in (401, 403)
 
 
+@pytest.mark.asyncio
+async def test_unignore_residual_case_reactivates(client: AsyncClient, db_session):
+    """POST /residual-cases/{fp}/unignore sets an IGNORED case back to ACTIVE."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "err-fingerprint-unignore"
+    case = ResidualRemediationCase(
+        project_id=project.id,
+        fingerprint=fingerprint,
+        status=ResidualCaseStatus.IGNORED,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/admin/residual-cases/{fingerprint}/unignore",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["fingerprint"] == fingerprint
+    assert data["status"] == "ACTIVE"
+    assert "id" in data
+
+
+@pytest.mark.asyncio
+async def test_unignore_residual_case_404_when_missing(client: AsyncClient, db_session):
+    """POST /residual-cases/{fp}/unignore returns 404 when no case row exists."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.post(
+        "/api/admin/residual-cases/nonexistent-fp/unignore",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_unignore_residual_case_404_when_not_ignored(client: AsyncClient, db_session):
+    """POST /residual-cases/{fp}/unignore returns 404 when case is not IGNORED."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "err-fingerprint-active"
+    case = ResidualRemediationCase(
+        project_id=project.id,
+        fingerprint=fingerprint,
+        status=ResidualCaseStatus.ACTIVE,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/admin/residual-cases/{fingerprint}/unignore",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_unignore_residual_case_requires_auth(unauthenticated_client: AsyncClient):
+    """Unignore endpoint requires admin auth."""
+    response = await unauthenticated_client.post(
+        "/api/admin/residual-cases/some-fp/unignore",
+        params={"project_id": "00000000-0000-0000-0000-000000000000"},
+    )
+    assert response.status_code in (401, 403)
+
+
 # ---------------------------------------------------------------------------
 # ResidualRemediationCase lifecycle status enrichment
 # ---------------------------------------------------------------------------

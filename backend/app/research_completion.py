@@ -1589,6 +1589,29 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 session.add(project)
                 await session.commit()
 
+    # Credit playbook entries shown to this research agent when research succeeded.
+    # followed_count tracks how many times each entry was seen by a successful research agent,
+    # giving a denominator for per-entry success rates used by the archival ranker.
+    _shown_pb_keys = list((task.context or {}).get("_shown_playbook_keys") or [])
+    if _shown_pb_keys and _impl_spawned > 0:
+        _pb_proj = await session.get(Project, task.project_id)
+        if _pb_proj and _pb_proj.design_doc:
+            _pb_doc = dict(_pb_proj.design_doc)
+            _pb_updated = False
+            for _pb_key in _shown_pb_keys:
+                _pb_full_key = f"playbook/{_pb_key}"
+                _pb_entry = _pb_doc.get(_pb_full_key)
+                if isinstance(_pb_entry, dict):
+                    _pb_entry = dict(_pb_entry)
+                    _pb_entry["followed_count"] = _pb_entry.get("followed_count", 0) + 1
+                    _pb_doc[_pb_full_key] = _pb_entry
+                    _pb_updated = True
+            if _pb_updated:
+                _pb_proj.design_doc = _pb_doc
+                flag_modified(_pb_proj, "design_doc")
+                session.add(_pb_proj)
+                await session.commit()
+
 
 async def _record_research_task_failure(task: Task, session: AsyncSession) -> None:
     """Record a FAILED research task in the direction's research_history.

@@ -57,6 +57,7 @@ from app.payload_schemas import validate_internal_payload
 from app.broadcast import broadcast_to_project
 from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
 from app.time_utils import _utcnow
+from app.self_audit_dispatch import _record_auto_clear_note
 
 logger = logging.getLogger(__name__)
 
@@ -1893,6 +1894,8 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 _VALID_SELF_AUDIT_MODES = {"audit", "fundamentals", "ship", "pause"}
 _SELF_AUDIT_PROPAGATED_MODES = {"audit", "fundamentals", "pause"}
 _MODE_STRICTNESS = {"ship": 0, "fundamentals": 1, "audit": 2, "pause": 3}
+_SHIP_RECOVERY_THRESHOLD = 2  # consecutive ship assessments before auto-clearing audit/fundamentals
+_AUDIT_CLEARABLE_MODES = {"audit", "fundamentals"}
 
 # Per-component scores must be 0-100 integers; we don't enforce a DB check
 # constraint, so we clamp here to keep downstream consumers safe.
@@ -1990,6 +1993,47 @@ def _normalize_self_audit_finding(raw: Dict[str, Any]) -> Optional[Dict[str, Any
     }
 
 
+def _maybe_auto_clear_direction_mode(
+    directions: List[Dict[str, Any]],
+    system_id: str,
+    consecutive_ship_count: int,
+    source_task_id: str,
+    now: datetime,
+) -> bool:
+    """Auto-clear audit/fundamentals direction mode when maturity fully recovers.
+
+    Only clears modes that were auto-set via self_audit — strategic-set and
+    operator-set modes (any other source) are left untouched.  Returns True if
+    any direction was changed.
+    """
+    if consecutive_ship_count < _SHIP_RECOVERY_THRESHOLD:
+        return False
+    changed = False
+    for d in directions:
+        if d.get("status") != "active" or d.get("system_id") != system_id:
+            continue
+        current_mode = str(d.get("recommended_mode") or "").strip().lower()
+        if current_mode not in _AUDIT_CLEARABLE_MODES:
+            continue
+        meta = d.get(RECOMMENDED_MODE_META_KEY) or {}
+        if not isinstance(meta, dict) or meta.get("source") != RECOMMENDED_MODE_SOURCE_SELF_AUDIT:
+            continue
+        d["recommended_mode"] = None
+        d[RECOMMENDED_MODE_META_KEY] = {
+            "mode": None,
+            "source": RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
+            "source_task_id": source_task_id,
+            "set_at": now.isoformat(),
+            "cleared_reason": (
+                f"Auto-cleared after {consecutive_ship_count} consecutive 'ship' "
+                "maturity assessments — system health recovered"
+            ),
+        }
+        _record_auto_clear_note(d, current_mode, consecutive_ship_count)
+        changed = True
+    return changed
+
+
 def _is_recent_strategic_mode_lock(direction: Dict[str, Any], incoming_mode: str, now: datetime) -> bool:
     meta = direction.get(RECOMMENDED_MODE_META_KEY) or {}
     if not isinstance(meta, dict) or meta.get("source") != RECOMMENDED_MODE_SOURCE_STRATEGIC:
@@ -2062,9 +2106,22 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
             )
         )).scalars().first()
         now = _utcnow()
+        # Track consecutive ship assessments so we can auto-clear recovered directions.
+        if existing is not None:
+            prev_mode = existing.recommended_mode
+            prev_ship_count = int((existing.components or {}).get("_consecutive_ship_count", 0))
+        else:
+            prev_mode = None
+            prev_ship_count = 0
+        if mode == "ship":
+            consecutive_ship_count = prev_ship_count + 1 if prev_mode == "ship" else 1
+        else:
+            consecutive_ship_count = 0
+        new_components = dict(finding["components"])
+        new_components["_consecutive_ship_count"] = consecutive_ship_count
         if existing is not None:
             existing.score = finding["score"]
-            existing.components = finding["components"]
+            existing.components = new_components
             existing.recommended_mode = finding["recommended_mode"]
             existing.top_issues = finding["top_issues"]
             existing.evidence = finding["evidence"]
@@ -2079,7 +2136,7 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
                 project_id=task.project_id,
                 system_id=system_id,
                 score=finding["score"],
-                components=finding["components"],
+                components=new_components,
                 recommended_mode=finding["recommended_mode"],
                 top_issues=finding["top_issues"],
                 evidence=finding["evidence"],
@@ -2087,21 +2144,24 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
                 source_task_id=task.id,
             ))
         upserted += 1
-        if mode not in _SELF_AUDIT_PROPAGATED_MODES:
-            continue
         now = _utcnow()
-        for d in directions:
-            if d.get("status") != "active" or d.get("system_id") != system_id:
-                continue
-            if _is_recent_strategic_mode_lock(d, mode, now):
-                continue
-            d["recommended_mode"] = mode
-            d[RECOMMENDED_MODE_META_KEY] = {
-                "mode": mode,
-                "source": RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
-                "source_task_id": str(task.id),
-                "set_at": now.isoformat(),
-            }
+        if mode in _SELF_AUDIT_PROPAGATED_MODES:
+            for d in directions:
+                if d.get("status") != "active" or d.get("system_id") != system_id:
+                    continue
+                if _is_recent_strategic_mode_lock(d, mode, now):
+                    continue
+                d["recommended_mode"] = mode
+                d[RECOMMENDED_MODE_META_KEY] = {
+                    "mode": mode,
+                    "source": RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
+                    "source_task_id": str(task.id),
+                    "set_at": now.isoformat(),
+                }
+                directions_changed = True
+        elif mode == "ship" and _maybe_auto_clear_direction_mode(
+            directions, system_id, consecutive_ship_count, str(task.id), now
+        ):
             directions_changed = True
     if project and directions_changed:
         project.directions = directions
@@ -2697,3 +2757,37 @@ async def _handle_design_doc_completion(task: Task, logs: str, session: AsyncSes
     # eventual strategic cycle_summary carries the user-facing narrative.
     session.add(task)
     await session.commit()
+
+
+async def confirm_applied_playbook_entries(task: Task, session: AsyncSession) -> None:
+    """Increment confirmed_count for playbook entries that guided this task's prompt.
+
+    Called after a create/fix/refactor task merges. Reads playbook_applied_entry_ids
+    from task.context (stamped at spawn time by research_completion) and bumps
+    confirmed_count on each live entry in project.design_doc so the archival ranker
+    can distinguish actively-effective patterns from stale ones.
+    """
+    entry_ids = (task.context or {}).get("playbook_applied_entry_ids") or []
+    if not entry_ids:
+        return
+    project = await session.get(Project, task.project_id)
+    if not project or not project.design_doc:
+        return
+    doc = dict(project.design_doc)
+    confirmed = 0
+    now_iso = _utcnow().isoformat()
+    for entry_id in entry_ids:
+        full_key = entry_id if entry_id.startswith("playbook/") else f"playbook/{entry_id}"
+        entry = doc.get(full_key)
+        if not isinstance(entry, dict):
+            continue
+        entry = dict(entry)
+        entry["confirmed_count"] = entry.get("confirmed_count", 0) + 1
+        entry["last_confirmed_at"] = now_iso
+        doc[full_key] = entry
+        confirmed += 1
+    if confirmed:
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)
+        logger.info("[PLAYBOOK] Confirmed %d entries for task %s", confirmed, task.id)

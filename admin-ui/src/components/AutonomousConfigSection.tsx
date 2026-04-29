@@ -16,6 +16,14 @@ export interface AutonomousConfigSectionProps {
   setConfigMaxConcurrentAutoRemediations: (v: number) => void;
   configResidualRemediationCooldownHours: number;
   setConfigResidualRemediationCooldownHours: (v: number) => void;
+  configMaxActiveDirections: number;
+  setConfigMaxActiveDirections: (v: number) => void;
+  configArchitectureReviewFrequency: number;
+  setConfigArchitectureReviewFrequency: (v: number) => void;
+  configMaxProvisionRetries: number;
+  setConfigMaxProvisionRetries: (v: number) => void;
+  configMaxRollupRetries: number;
+  setConfigMaxRollupRetries: (v: number) => void;
   autonomousConfigOpen: boolean;
   setAutonomousConfigOpen: React.Dispatch<React.SetStateAction<boolean>>;
   savingConfigField: string | null;
@@ -31,6 +39,10 @@ export function AutonomousConfigSection({
   configMaxTasksPerHour, setConfigMaxTasksPerHour,
   configMaxConcurrentAutoRemediations, setConfigMaxConcurrentAutoRemediations,
   configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours,
+  configMaxActiveDirections, setConfigMaxActiveDirections,
+  configArchitectureReviewFrequency, setConfigArchitectureReviewFrequency,
+  configMaxProvisionRetries, setConfigMaxProvisionRetries,
+  configMaxRollupRetries, setConfigMaxRollupRetries,
   autonomousConfigOpen, setAutonomousConfigOpen,
   savingConfigField, saveConfigField,
   clearResidualFingerprints,
@@ -193,6 +205,90 @@ export function AutonomousConfigSection({
             <button
               onClick={() => saveConfigField('residual_remediation_cooldown_hours', configResidualRemediationCooldownHours)}
               disabled={savingConfigField === 'residual_remediation_cooldown_hours'}
+              className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+              title="Save"
+            >
+              <Check className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Max active directions */}
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Maximum number of active (non-paused, non-retired) directions at once.">Max directions</label>
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={configMaxActiveDirections}
+              onChange={e => setConfigMaxActiveDirections(Number(e.target.value))}
+              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <button
+              onClick={() => saveConfigField('max_active_directions', configMaxActiveDirections)}
+              disabled={savingConfigField === 'max_active_directions'}
+              className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+              title="Save"
+            >
+              <Check className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Architecture review frequency */}
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Run an architecture review every N strategic cycles. 0 = disabled.">Arch review (cycles)</label>
+            <input
+              type="number"
+              min={0}
+              max={100}
+              value={configArchitectureReviewFrequency}
+              onChange={e => setConfigArchitectureReviewFrequency(Number(e.target.value))}
+              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <button
+              onClick={() => saveConfigField('architecture_review_frequency', configArchitectureReviewFrequency)}
+              disabled={savingConfigField === 'architecture_review_frequency'}
+              className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+              title="Save"
+            >
+              <Check className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Max provision retries */}
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Max VM provisioning retries before marking a task as failed (1–10).">Provision retries</label>
+            <input
+              type="number"
+              min={1}
+              max={10}
+              value={configMaxProvisionRetries}
+              onChange={e => setConfigMaxProvisionRetries(Number(e.target.value))}
+              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <button
+              onClick={() => saveConfigField('max_provision_retries', configMaxProvisionRetries)}
+              disabled={savingConfigField === 'max_provision_retries'}
+              className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+              title="Save"
+            >
+              <Check className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Max rollup retries */}
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Max research rollup retries before abandoning (1–20).">Rollup retries</label>
+            <input
+              type="number"
+              min={1}
+              max={20}
+              value={configMaxRollupRetries}
+              onChange={e => setConfigMaxRollupRetries(Number(e.target.value))}
+              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <button
+              onClick={() => saveConfigField('max_rollup_retries', configMaxRollupRetries)}
+              disabled={savingConfigField === 'max_rollup_retries'}
               className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
               title="Save"
             >

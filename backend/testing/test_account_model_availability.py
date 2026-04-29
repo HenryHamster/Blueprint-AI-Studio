@@ -690,6 +690,54 @@ class TestBalancedSuccessRateSelection:
                 _account_by_id.pop(bad_id, None)
 
     @pytest.mark.asyncio
+    async def test_all_low_success_rates_fall_back_to_load_balance(self):
+        """When all accounts have uniformly low success rates the soft-bias
+        filter keeps the full pool — no account is starved — and the
+        load-based tiebreak picks the least-busy one."""
+        user_id = f"u-{uuid.uuid4().hex}"
+        now = datetime.utcnow()
+        busy_id = f"acct-busy-{uuid.uuid4().hex}"
+        idle_id = f"acct-idle-{uuid.uuid4().hex}"
+        busy = {
+            "id": busy_id,
+            "name": "busy-low",
+            "enabled": True,
+            "oauth_token": "tok",
+            "active_tasks": 2,
+            # 0% success — lowest possible
+            "outcome_events": [{"at": now - timedelta(hours=i + 1), "success": False} for i in range(5)],
+        }
+        idle = {
+            "id": idle_id,
+            "name": "idle-low",
+            "enabled": True,
+            "oauth_token": "tok",
+            "active_tasks": 0,
+            # 20% success — also low, but this account is idle
+            "outcome_events": [{"at": now - timedelta(hours=i + 1), "success": i == 0} for i in range(5)],
+        }
+        async with _max_plan_pool_lock:
+            _max_plan_pools[user_id] = [busy, idle]
+            _account_by_id[busy_id] = busy
+            _account_by_id[idle_id] = idle
+        try:
+            result = await select_max_plan_account_balanced(
+                user_id=user_id,
+                provider_models=[("anthropic", None)],
+            )
+            # Must not starve: selection succeeds even when all rates are low.
+            assert result is not None
+            # Pool median = 0.20 (upper element of sorted [0.0, 0.2]);
+            # threshold = 0.20 - 0.20 = 0.0 → busy (0.0 >= 0.0) survives too,
+            # so both accounts pass and load is the tiebreak.
+            assert result[0]["id"] == idle_id
+        finally:
+            async with _max_plan_pool_lock:
+                _max_plan_pools.pop(user_id, None)
+                _account_by_id.pop(busy_id, None)
+                _account_by_id.pop(idle_id, None)
+
+    @pytest.mark.asyncio
     async def test_probing_account_eligible_when_idle(self):
         """A probing-state account (cooldown elapsed, active_tasks == 0) is
         selected in balanced mode when no healthy account is available."""

@@ -830,6 +830,39 @@ async def post_residual_fix_escalation_message(
     return msg
 
 
+async def close_residual_case_resolved(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    fingerprint: str,
+    reason: str = 'fingerprint_went_silent',
+) -> ProjectMessage:
+    """Transition a ResidualRemediationCase to RESOLVED and emit a notification.
+
+    Called by the reaper when a REMEDIATING case has been silent past the
+    auto-resolve threshold. Distinct from MERGED (PR-driven close) and from
+    CLOSED_ORGANICALLY (legacy reaper close of ACTIVE rows).
+    """
+    case = await _get_or_create_residual_case(session, project_id, fingerprint)
+    case.status = ResidualCaseStatus.RESOLVED
+    case.updated_at = _utcnow()
+    session.add(case)
+
+    summary = f'Residual case auto-resolved: fingerprint {fingerprint[:32]} went silent'
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type='residual_case_auto_resolved',
+        summary=summary,
+        context={'fingerprint': fingerprint, 'reason': reason},
+    )
+    asyncio.ensure_future(dispatch_external_notification(
+        project_id,
+        'RESIDUAL_CASE_AUTO_RESOLVED',
+        {'fingerprint': fingerprint, 'reason': reason},
+    ))
+    return msg
+
+
 async def post_remediation_escalation_message(
     session: AsyncSession,
     project_id: uuid.UUID,

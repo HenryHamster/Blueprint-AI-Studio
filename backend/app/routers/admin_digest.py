@@ -6,7 +6,7 @@ import statistics
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -1117,6 +1117,34 @@ async def ignore_residual_case(
         case.updated_at = now
     await session.commit()
     return {"id": str(case.id), "fingerprint": fingerprint, "status": ResidualRemediationCaseStatus.IGNORED}
+
+
+@router.post("/residual-cases/{fingerprint}/unignore")
+async def unignore_residual_case(
+    fingerprint: str,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """Reactivate a previously IGNORED residual fingerprint.
+
+    Sets the ResidualRemediationCase back to ACTIVE so auto-remediation
+    can resume spawning for this fingerprint. Returns 404 if no case
+    exists or if the case is not currently IGNORED.
+    """
+    result = await session.execute(
+        select(ResidualRemediationCase).where(
+            ResidualRemediationCase.project_id == project_id,
+            ResidualRemediationCase.fingerprint == fingerprint,
+        )
+    )
+    case = result.scalar_one_or_none()
+    if case is None or case.status != ResidualRemediationCaseStatus.IGNORED:
+        raise HTTPException(status_code=404, detail="No IGNORED case found for this fingerprint and project")
+    case.status = ResidualRemediationCaseStatus.ACTIVE
+    case.updated_at = _utcnow()
+    await session.commit()
+    return {"id": str(case.id), "fingerprint": fingerprint, "status": ResidualRemediationCaseStatus.ACTIVE}
 
 
 @router.post("/residual-fingerprints/clear")

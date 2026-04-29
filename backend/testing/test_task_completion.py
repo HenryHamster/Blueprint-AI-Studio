@@ -4626,3 +4626,290 @@ class TestPatchPrBodyWithBlueprintMeta:
             await patch_pr_body_with_blueprint_meta("tok", "owner", "repo", 1, "<!-- blueprint:meta -->\n*x*")
 
         assert not patch_called
+
+
+# ── _handle_self_audit_completion / auto-clear direction mode ─────────────────
+
+class TestHandleSelfAuditCompletion:
+    """Tests for _handle_self_audit_completion focusing on the direction-mode
+    auto-clear path: a direction stuck in audit/fundamentals mode (set by
+    self_audit) should be cleared once the system reports 'ship' for
+    _SHIP_RECOVERY_THRESHOLD consecutive assessments."""
+
+    def _findings(self, system_id="sys-1", mode="ship", score=90):
+        return json.dumps({"findings": [{
+            "system_id": system_id,
+            "recommended_mode": mode,
+            "score": score,
+            "components": {
+                "test_coverage": 90,
+                "friction_density": 10,
+                "claim_consistency": 90,
+                "failure_mix": 10,
+            },
+            "top_issues": [],
+            "evidence": [],
+        }]})
+
+    async def _run(self, db_session, mocker, task, logs):
+        from app.task_completion import _handle_self_audit_completion
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        await _handle_self_audit_completion(task, logs, db_session)
+
+    @pytest.mark.asyncio
+    async def test_audit_mode_clears_after_threshold_ship_assessments(self, db_session, mocker):
+        """Direction in 'audit' (auto-set) clears after 2 consecutive 'ship' assessments."""
+        from app.models import SystemMaturity, RECOMMENDED_MODE_META_KEY, RECOMMENDED_MODE_SOURCE_SELF_AUDIT
+        direction = {
+            "id": "dir-1",
+            "system_id": "sys-1",
+            "status": "active",
+            "recommended_mode": "audit",
+            RECOMMENDED_MODE_META_KEY: {"source": RECOMMENDED_MODE_SOURCE_SELF_AUDIT, "mode": "audit"},
+        }
+        project = make_project(directions=[direction])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # First ship assessment — count not yet at threshold, mode stays.
+        task1 = make_task(project_id=project.id)
+        db_session.add(task1)
+        await db_session.commit()
+        await db_session.refresh(task1)
+        await self._run(db_session, mocker, task1, self._findings(mode="ship"))
+        await db_session.refresh(project)
+        assert project.directions[0]["recommended_mode"] == "audit", "should not clear after 1 ship"
+
+        # Second ship assessment — threshold met, mode clears.
+        task2 = make_task(project_id=project.id)
+        db_session.add(task2)
+        await db_session.commit()
+        await db_session.refresh(task2)
+        await self._run(db_session, mocker, task2, self._findings(mode="ship"))
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["recommended_mode"] is None, "audit mode should be auto-cleared after 2 ship assessments"
+        meta = d.get(RECOMMENDED_MODE_META_KEY, {})
+        assert "cleared_reason" in meta, "clear metadata should record reason"
+
+    @pytest.mark.asyncio
+    async def test_strategic_set_mode_is_not_cleared(self, db_session, mocker):
+        """Directions whose mode was set by the strategic agent are left untouched."""
+        from app.models import RECOMMENDED_MODE_META_KEY, RECOMMENDED_MODE_SOURCE_STRATEGIC, SystemMaturity
+        direction = {
+            "id": "dir-2",
+            "system_id": "sys-2",
+            "status": "active",
+            "recommended_mode": "audit",
+            RECOMMENDED_MODE_META_KEY: {"source": RECOMMENDED_MODE_SOURCE_STRATEGIC, "mode": "audit"},
+        }
+        project = make_project(directions=[direction])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Seed SystemMaturity with 1 prior ship so next ship hits threshold=2.
+        db_session.add(SystemMaturity(
+            project_id=project.id,
+            system_id="sys-2",
+            score=90,
+            components={"_consecutive_ship_count": 1},
+            recommended_mode="ship",
+            top_issues=[],
+            evidence=[],
+        ))
+        await db_session.commit()
+
+        task = make_task(project_id=project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        await self._run(db_session, mocker, task, self._findings(system_id="sys-2", mode="ship"))
+        await db_session.refresh(project)
+        assert project.directions[0]["recommended_mode"] == "audit", \
+            "strategic-set mode must not be auto-cleared"
+
+    @pytest.mark.asyncio
+    async def test_fundamentals_mode_clears_after_threshold(self, db_session, mocker):
+        """'fundamentals' mode (auto-set) also clears after threshold ship assessments."""
+        from app.models import SystemMaturity, RECOMMENDED_MODE_META_KEY, RECOMMENDED_MODE_SOURCE_SELF_AUDIT
+        direction = {
+            "id": "dir-3",
+            "system_id": "sys-3",
+            "status": "active",
+            "recommended_mode": "fundamentals",
+            RECOMMENDED_MODE_META_KEY: {"source": RECOMMENDED_MODE_SOURCE_SELF_AUDIT, "mode": "fundamentals"},
+        }
+        project = make_project(directions=[direction])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Seed 1 prior ship so the next ship hits threshold.
+        db_session.add(SystemMaturity(
+            project_id=project.id,
+            system_id="sys-3",
+            score=90,
+            components={"_consecutive_ship_count": 1},
+            recommended_mode="ship",
+            top_issues=[],
+            evidence=[],
+        ))
+        await db_session.commit()
+
+        task = make_task(project_id=project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        await self._run(db_session, mocker, task, self._findings(system_id="sys-3", mode="ship"))
+        await db_session.refresh(project)
+        assert project.directions[0]["recommended_mode"] is None, \
+            "fundamentals mode should clear after threshold ship assessments"
+
+    @pytest.mark.asyncio
+    async def test_non_ship_mode_resets_consecutive_count(self, db_session, mocker):
+        """A non-ship audit finding resets the consecutive ship counter."""
+        from app.models import SystemMaturity, RECOMMENDED_MODE_META_KEY, RECOMMENDED_MODE_SOURCE_SELF_AUDIT
+        project = make_project(directions=[])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Seed with 1 consecutive ship.
+        db_session.add(SystemMaturity(
+            project_id=project.id,
+            system_id="sys-4",
+            score=90,
+            components={"_consecutive_ship_count": 1},
+            recommended_mode="ship",
+            top_issues=[],
+            evidence=[],
+        ))
+        await db_session.commit()
+
+        task = make_task(project_id=project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        # Incoming mode is "audit" — not ship, so counter resets.
+        await self._run(db_session, mocker, task, self._findings(system_id="sys-4", mode="audit"))
+
+        from sqlmodel import select as _sel
+        sm = (await db_session.execute(
+            _sel(SystemMaturity).where(SystemMaturity.system_id == "sys-4")
+        )).scalars().first()
+        assert sm is not None
+        assert sm.components.get("_consecutive_ship_count", -1) == 0, \
+            "consecutive ship count should reset on non-ship finding"
+
+
+# ── confirm_applied_playbook_entries ────────────────────────────────────────
+
+class TestConfirmAppliedPlaybookEntries:
+    @pytest.mark.asyncio
+    async def test_no_op_when_no_entry_ids(self, db_session):
+        """Returns early without DB write when playbook_applied_entry_ids is absent."""
+        from app.task_completion import confirm_applied_playbook_entries
+        project = make_project(design_doc={"playbook/tip-a": {"content": "x", "confirmed_count": 0}})
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, context={})
+        db_session.add(task)
+        await db_session.commit()
+
+        await confirm_applied_playbook_entries(task, db_session)
+        await db_session.refresh(project)
+        assert project.design_doc["playbook/tip-a"]["confirmed_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_increments_confirmed_count_and_stamps_timestamp(self, db_session):
+        """Increments confirmed_count and sets last_confirmed_at for matching entries."""
+        from app.task_completion import confirm_applied_playbook_entries
+        project = make_project(design_doc={
+            "playbook/tip-a": {"content": "a", "confirmed_count": 2},
+            "playbook/tip-b": {"content": "b", "confirmed_count": 0},
+        })
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={"playbook_applied_entry_ids": ["playbook/tip-a"]},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await confirm_applied_playbook_entries(task, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert project.design_doc["playbook/tip-a"]["confirmed_count"] == 3
+        assert "last_confirmed_at" in project.design_doc["playbook/tip-a"]
+        # unmentioned entry untouched
+        assert project.design_doc["playbook/tip-b"]["confirmed_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_normalizes_missing_prefix(self, db_session):
+        """Entry IDs without 'playbook/' prefix are auto-prefixed before lookup."""
+        from app.task_completion import confirm_applied_playbook_entries
+        project = make_project(design_doc={
+            "playbook/tip-x": {"content": "x", "confirmed_count": 1},
+        })
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={"playbook_applied_entry_ids": ["tip-x"]},  # no prefix
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await confirm_applied_playbook_entries(task, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert project.design_doc["playbook/tip-x"]["confirmed_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_skips_unknown_entry_ids(self, db_session):
+        """Entry IDs not present in design_doc are silently skipped."""
+        from app.task_completion import confirm_applied_playbook_entries
+        project = make_project(design_doc={
+            "playbook/real": {"content": "r", "confirmed_count": 0},
+        })
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={"playbook_applied_entry_ids": ["playbook/ghost"]},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await confirm_applied_playbook_entries(task, db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert project.design_doc["playbook/real"]["confirmed_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_project_has_no_design_doc(self, db_session):
+        """Returns early without error when project.design_doc is None."""
+        from app.task_completion import confirm_applied_playbook_entries
+        project = make_project(design_doc=None)
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={"playbook_applied_entry_ids": ["playbook/tip-a"]},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        await confirm_applied_playbook_entries(task, db_session)
+        # no exception raised, no changes
