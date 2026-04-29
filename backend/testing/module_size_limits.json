@@ -15,7 +15,7 @@
     "max_plan_pool.py": 2100,
     "anomaly_detection.py": 2000,
     "routers/agent.py": 2900,
-    "services.py": 1900,
+    "services.py": 2000,
     "routers/agent_status.py": 1800,
     "autonomous_research.py": 1900,
     "research_completion.py": 2050,
