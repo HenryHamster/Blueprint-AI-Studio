@@ -173,6 +173,30 @@ class TestNormalizeAgentFailureCategory:
 
         assert normalize_agent_failure_category("fatal", task) == CODE_ERROR
 
+    def test_build_failed_routes_to_provision_failure(self):
+        """Agent emits build_failed for test setup failures (Postgres sidecar
+        startup, Docker build, dep install) — environmental, not code defect.
+        Must route to PROVISION_FAILURE so the orchestrator's infra retry
+        path applies instead of burning the code-error retry budget."""
+        msg = (
+            "Test suite could not run (setup failure — not a fixable test failure):\n"
+            "[pytest (backend pyproject)] runner timeout: Command failed: "
+            "bash scripts/test-backend.sh --postgres\n"
+            "Signal: SIGTERM\n=== Starting Postgres sidecar (blueprint-test-pg-15410) ===\n"
+            "=== Building backend image ==="
+        )
+        task = _task(msg)
+        assert normalize_agent_failure_category("build_failed", task) == PROVISION_FAILURE
+
+    def test_build_failed_routes_to_provision_failure_via_classify_failure(self):
+        """End-to-end: classify_failure sees build_failed in context and routes
+        to PROVISION_FAILURE without falling through to text classification."""
+        task = _task(
+            "Test suite could not run (setup failure)",
+            {"failure_category": "build_failed"},
+        )
+        assert classify_failure(task) == PROVISION_FAILURE
+
 
 class TestClassifyFailureCodeError:
     """Non-keyword failures fall through to CODE_ERROR (the default)."""

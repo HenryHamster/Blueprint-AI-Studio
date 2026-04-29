@@ -3,11 +3,12 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
-  persistAndPostStatus, apiGet, git, gitAsync, gitCommit, cloneWithRetry,
+  persistAndPostStatus, apiGet, git, gitAsync, gitCommit,
   runClaudeCode, runProjectLintChecks, lintFixLoop, testFixLoop,
   captureTestBaseline, sendHeartbeatSync, extractPytestSelectorsFromOutput,
   snapshotToolTrace, extractInvestigatedFiles,
 } from '../index.js';
+import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT } from '../constants.js';
 import {
@@ -391,10 +392,12 @@ export async function handleReview(
   // Clone the full repo so Claude can explore everything, then checkout the PR branch
   statusRef.value = `Cloning ${owner}/${repo} (PR #${prNumber})...`;
   sendLog(ws, `Reviewing PR #${prNumber} on branch ${branch} (iteration ${iteration})\n`);
-  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
-  await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', branch, cloneUrl, WORKSPACE]);
+  await prepareWorkspaceForRole({
+    workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
+    branch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
+  });
   // Fetch the base branch into the shallow clone so `git diff origin/${baseBranch}...HEAD`
   // and `git merge-base --is-ancestor ... origin/${baseBranch}` actually work.  Without
   // this, the changed-files list and every verification instruction in the review prompt
@@ -545,7 +548,13 @@ actual changes.
     const unplannedNonTest = changedFilePathList.filter(f => !plannedSet.has(f) && !isTestPath(f));
     plannedFilesSection = `Planned files from the original analysis plan:\n${plannedFiles.map(f => `  - ${f}`).join('\n')}\n` +
       (unplannedNonTest.length > 0
-        ? `\nFiles changed but NOT in the original plan:\n${unplannedNonTest.map(f => `  - ${f}`).join('\n')}\n\nUnplanned non-test file changes may indicate scope creep — flag them as MAJOR unless they are directly necessary to fix a listed review issue.\n\n`
+        ? `\nFiles changed but NOT in the original plan:\n${unplannedNonTest.map(f => `  - ${f}`).join('\n')}\n\n` +
+          `Classify each unplanned non-test file before flagging. Apply skepticism — do not assume a stated reason is correct, but do not flag categories that are valid even when unstated:\n` +
+          `  - scope-creep: file has no causal link to anything in the plan or prior reviews. → MAJOR.\n` +
+          `  - caller-impact: a planned file's API change forced consumer updates here. Verify the consumer reference exists (grep the planned file for the new/changed API and confirm this file uses it). → not a violation.\n` +
+          `  - discovered-dependency: planned change required a missing import / helper / flag-flip that lives here. Verify by reading the planned file and confirming the dependency. → not a violation.\n` +
+          `  - cluster-boundary-correction: file logically belongs in this cluster but was misallocated to a sibling task. Verify the PR description explicitly explains the correction. → not a violation IF acknowledged in PR description; flag MAJOR if not acknowledged.\n` +
+          `If unsure on edge cases, do not flag — let the operator decide.\n\n`
         : `\nAll non-test changed files are in the original plan.\n\n`);
   }
 
@@ -707,10 +716,12 @@ export async function handleFix(
   // Clone the existing PR branch (don't create a new one)
   statusRef.value = `Cloning ${owner}/${repo} (fixing PR #${prNumber})...`;
   sendLog(ws, `Fixing PR #${prNumber} on branch ${branch}\n`);
-  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
-  await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', branch, cloneUrl, WORKSPACE]);
+  await prepareWorkspaceForRole({
+    workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
+    branch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
+  });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedToolsFix = configureAgentPermissions('fix');

@@ -325,7 +325,14 @@ def should_trigger_timeout_investigation(task: "Task") -> bool:
 
 _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     'clone_failed': PROVISION_FAILURE,
-    'build_failed': CODE_ERROR,
+    # build_failed = test setup couldn't run (Postgres sidecar startup, Docker
+    # build, dependency install). Agent emits this when the test environment
+    # itself failed to come up, NOT when user code failed to compile — the
+    # latter would surface as test_failed or claude_code_failed. Routing as
+    # PROVISION_FAILURE gets the 5-min infra backoff and resurrection-sweep
+    # eligibility instead of burning the code-error retry budget on something
+    # the agent can't fix by editing code.
+    'build_failed': PROVISION_FAILURE,
     'test_failed': CODE_ERROR,
     'lint_failed': CODE_ERROR,
     'pr_creation_failed': EXTERNAL_API,

@@ -33,6 +33,10 @@ vi.mock('../index.js', () => ({
   sendHeartbeatSync: vi.fn(),
 }));
 
+vi.mock('../workspacePrep.js', () => ({
+  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('../prompt.js', () => ({
   getTaskTypeHints: vi.fn().mockReturnValue({}),
   PLAYBOOK_GUIDANCE: '',
@@ -546,6 +550,101 @@ describe('handleReview — self-review blind-spots surfacing', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
     expect(promptMod.formatSelfReviewBlindSpots).toHaveBeenCalledWith(undefined, ['a.ts']);
+  });
+});
+
+// ── handleReview: planned-files classifier (four-category parity) ───────────
+describe('handleReview — unplanned-file four-category classifier', () => {
+  it('replaces the old "flag as MAJOR unless directly necessary" line with the four-category classifier when planned files are configured and the diff contains an unplanned non-test file', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        // planned: src/auth.ts; unplanned non-test: src/main.ts
+        return 'M\tagent/src/auth.ts\nM\tagent/src/main.ts';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-classifier',
+      { pr_number: 401, branch: 'feat/classifier', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small', _planned_files: ['agent/src/auth.ts'] } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    // Old harsh phrasing must be gone.
+    expect(prompt).not.toContain('flag them as MAJOR unless they are directly necessary to fix a listed review issue');
+    // All four categories must appear so the reviewer can classify.
+    expect(prompt).toContain('scope-creep');
+    expect(prompt).toContain('caller-impact');
+    expect(prompt).toContain('discovered-dependency');
+    expect(prompt).toContain('cluster-boundary-correction');
+    // Skepticism guard must be present so reviewer doesn't take the agent's stated reason at face value.
+    expect(prompt).toContain('Apply skepticism');
+    // The unplanned file must still be listed so the classifier has something to act on.
+    expect(prompt).toContain('agent/src/main.ts');
+  });
+
+  it('shows the "all in plan" message instead of the classifier when no unplanned non-test files are present', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tagent/src/auth.ts';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-allplanned',
+      { pr_number: 402, branch: 'feat/allplanned', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small', _planned_files: ['agent/src/auth.ts'] } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    expect(prompt).toContain('All non-test changed files are in the original plan');
+    expect(prompt).not.toContain('Classify each unplanned non-test file');
+  });
+
+  it('does not emit the planned-files section when the task has no _planned_files context', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tagent/src/main.ts';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-noplan',
+      { pr_number: 403, branch: 'feat/noplan', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    expect(prompt).not.toContain('Planned files from the original analysis plan');
+    expect(prompt).not.toContain('Classify each unplanned non-test file');
+  });
+
+  it('classifier omits unplanned TEST-path files (test paths are not in scope-creep scope)', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tagent/src/auth.ts\nA\tagent/src/auth.test.ts';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-test-unplanned',
+      { pr_number: 404, branch: 'feat/test-unplanned', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small', _planned_files: ['agent/src/auth.ts'] } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    // Test files are explicitly excluded from the unplanned-non-test list, so the
+    // classifier section should not fire on this PR.
+    expect(prompt).toContain('All non-test changed files are in the original plan');
+    expect(prompt).not.toContain('Classify each unplanned non-test file');
   });
 });
 
