@@ -19,6 +19,7 @@ import { PRMonitorSection, type OpenPR } from './PRMonitorSection';
 import { MediumScopeWidget, type MediumScopeMeasurement } from './MediumScopeWidget';
 import { RemediationFunnelSection } from './RemediationFunnelSection';
 import { FailureStageWidget } from './FailureStageWidget';
+import { TaskDurationWidget, type TaskDurationStats } from './TaskDurationWidget';
 import { ScopeConversionRatesSection } from './ScopeConversionRatesSection';
 import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSection';
 import { ProviderCostPanel } from './ProviderCostPanel';
@@ -675,6 +676,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [scopeTrendsOpen, setScopeTrendsOpen] = useState(false);
   const [accountHealth, setAccountHealth] = useState<AccountHealthEntry[] | null>(null);
   const [systemMaturity, setSystemMaturity] = useState<SystemMaturityRow[] | null>(null);
+  const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
   const [lastFetchError, setLastFetchError] = useState(false);
@@ -783,6 +785,18 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
         })(),
       );
     }
+
+    fetches.push(
+      (async () => {
+        try {
+          const url = selectedProjectId
+            ? `/api/admin/task-duration-stats?project_id=${encodeURIComponent(selectedProjectId)}`
+            : `/api/admin/task-duration-stats`;
+          const res = await apiFetch(url);
+          if (res.ok) setTaskDurationStats(await res.json());
+        } catch { /* silent */ }
+      })(),
+    );
 
     await Promise.allSettled(fetches);
     setLoading(false);
@@ -940,6 +954,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
           {/* Section 1d: Failure Stage Distribution */}
           {!loading && <FailureStageWidget distribution={digest?.failure_stage_distribution} />}
+
+          {/* Section 1d3: Task Duration Percentiles */}
+          {!loading && <TaskDurationWidget data={taskDurationStats} />}
 
           {/* Section 1d2: Review Rejection Reason Breakdown */}
           {!loading && (() => {

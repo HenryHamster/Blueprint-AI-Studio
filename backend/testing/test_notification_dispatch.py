@@ -1150,6 +1150,37 @@ async def test_post_residual_fix_spawned_null_task_id_in_context(db_session):
     assert msg.context["event_type"] == "residual_fix_spawned"
 
 
+@pytest.mark.asyncio
+async def test_post_residual_fix_spawned_fires_external_webhook(db_session):
+    """post_residual_fix_spawned_message dispatches a RESIDUAL_FIX_SPAWNED
+    external webhook once per spawn, carrying fingerprint, hit_count, and task_id."""
+    from app.models import Task, TaskStatus  # noqa: PLC0415
+    project = Project(name="Spawned Webhook", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    fix_task = Task(
+        project_id=project.id, status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix"}],
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+
+    dispatch_mock = AsyncMock()
+    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+        await post_residual_fix_spawned_message(
+            db_session, project.id, fingerprint="fp-wh",
+            sample_message="AssertionError in test_bar", task_id=fix_task.id,
+        )
+        await db_session.commit()
+
+    dispatch_mock.assert_called_once()
+    args = dispatch_mock.call_args.args
+    assert args[1] == "RESIDUAL_FIX_SPAWNED"
+    assert args[2]["fingerprint"] == "fp-wh"
+    assert args[2]["task_id"] == str(fix_task.id)
+    assert "hit_count" in args[2]
+
+
 # ─── RESOLVED transition on PR merge ─────────────────────────────────────────
 
 @pytest.mark.asyncio

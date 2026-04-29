@@ -2094,6 +2094,84 @@ async def test_strategic_review_includes_drift_signals_when_drift_present(db_ses
 
 
 @pytest.mark.asyncio
+async def test_drift_signals_persist_snapshot_and_include_consecutive_cycles(db_session):
+    """_spawn_strategic_review persists a drift snapshot and enriches the payload
+    with consecutive_flagged_cycles when prior flagged snapshots exist."""
+    from datetime import timedelta
+    from app.drift_detection import DirectionDriftSnapshot
+    from app.time_utils import _utcnow
+
+    project = _make_project(
+        directions=[
+            {"id": "d-trend01", "status": "active", "text": "x", "priority": "medium",
+             "system_id": "sys-T"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed two prior flagged snapshots to simulate previous cycles.
+    now = _utcnow()
+    for i in range(2, 0, -1):
+        db_session.add(DirectionDriftSnapshot(
+            project_id=project.id,
+            direction_id="d-trend01",
+            snapshot_at=now - timedelta(hours=i * 6),
+            claimed_changes_count=5,
+            actually_merged_prs=0,
+            claim_shipped_consistency=0.0,
+            over_claim_flag=False,
+            stalled_despite_churn_flag=True,
+        ))
+    await db_session.commit()
+
+    # Create 5 completed claim-tasks with no PR artifacts → stalled_despite_churn
+    for i in range(5):
+        db_session.add(Task(
+            project_id=project.id,
+            title=f"trend claim {i}",
+            description="",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            payloads=[{"type": "create", "prompt": "x", "current_direction_id": "d-trend01"}],
+            context={"direction_id": "d-trend01"},
+            plan_output={"summary": "shipped"},
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        ))
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    sr_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "strategic_review"]
+    assert sr_tasks, "No strategic_review task spawned"
+    payload = sr_tasks[0].payloads[0]
+    assert "drift_signals" in payload, f"drift_signals missing; keys: {sorted(payload.keys())}"
+    drift = payload["drift_signals"]
+    assert "d-trend01" in drift.get("by_direction", {}), (
+        f"d-trend01 not in by_direction: {list(drift.get('by_direction', {}).keys())}"
+    )
+    sig = drift["by_direction"]["d-trend01"]
+    # 2 prior flagged + 1 current (written by persist_drift_snapshot) = 3 consecutive
+    assert "consecutive_flagged_cycles" in sig, f"consecutive_flagged_cycles missing from sig: {sig}"
+    assert sig["consecutive_flagged_cycles"] == 3
+
+    # Verify snapshot was persisted to DB (one new row for the current cycle).
+    from sqlmodel import select as _select
+    snap_result = await db_session.execute(
+        _select(DirectionDriftSnapshot).where(
+            DirectionDriftSnapshot.project_id == project.id,
+            DirectionDriftSnapshot.direction_id == "d-trend01",
+        )
+    )
+    snaps = snap_result.scalars().all()
+    assert len(snaps) == 3, f"Expected 3 snapshots (2 seeded + 1 persisted), got {len(snaps)}"
+
+
+@pytest.mark.asyncio
 async def test_strategic_review_payload_documents_recommended_mode(db_session):
     """The optional `recommended_mode` field is part of the StrategicReviewPayload
     schema (validated via validate_internal_payload). Absence in a typical

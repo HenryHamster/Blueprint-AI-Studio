@@ -15,11 +15,13 @@ when drift is high — independent of lifetime merge calibration.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+import uuid
+from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import Index, delete
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
+from sqlmodel import Field, SQLModel, select
 
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.time_utils import _utcnow
@@ -30,6 +32,8 @@ logger = logging.getLogger(__name__)
 _OVER_CLAIM_MIN_CLAIMS_DEFAULT = 3
 _OVER_CLAIM_CONSISTENCY_THRESHOLD_DEFAULT = 0.4
 _STALL_MIN_CLAIMS_DEFAULT = 5
+# Maximum snapshots retained per (project_id, direction_id) pair.
+_DRIFT_SNAPSHOT_RETENTION = 50
 
 
 def _drift_thresholds() -> tuple[int, float, int]:
@@ -41,6 +45,29 @@ def _drift_thresholds() -> tuple[int, float, int]:
         int(_rc.get("drift_over_claim_min_claims", _OVER_CLAIM_MIN_CLAIMS_DEFAULT)),
         float(_rc.get("drift_over_claim_consistency_threshold", _OVER_CLAIM_CONSISTENCY_THRESHOLD_DEFAULT)),
         int(_rc.get("drift_stall_min_claims", _STALL_MIN_CLAIMS_DEFAULT)),
+    )
+
+
+class DirectionDriftSnapshot(SQLModel, table=True):
+    """One drift-signal observation for a single direction at a point in time.
+
+    Written by persist_drift_snapshot() each autonomous cycle so consumers
+    can look back N cycles and distinguish a one-off spike from a sustained
+    breakdown.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(index=True)
+    direction_id: str = Field(index=True)
+    snapshot_at: datetime = Field(default_factory=_utcnow)
+    claimed_changes_count: int = Field(default=0)
+    actually_merged_prs: int = Field(default=0)
+    claim_shipped_consistency: float = Field(default=1.0)
+    over_claim_flag: bool = Field(default=False)
+    stalled_despite_churn_flag: bool = Field(default=False)
+
+    __table_args__ = (
+        Index("ix_dds_project_direction_at", "project_id", "direction_id", "snapshot_at"),
     )
 
 
@@ -259,3 +286,79 @@ async def compute_direction_drift(
         "generated_at": generated_at,
         "window_days": window_days,
     }
+
+
+async def persist_drift_snapshot(
+    session: AsyncSession,
+    project: Project,
+    drift_result: dict[str, Any],
+) -> None:
+    """Write one DirectionDriftSnapshot row per direction and prune excess history.
+
+    Callers (strategic_spawning, self_audit_dispatch) call this after
+    compute_direction_drift() to build the time-series. The session is
+    flushed but NOT committed — the caller owns the transaction boundary.
+
+    Prunes rows beyond _DRIFT_SNAPSHOT_RETENTION newest for each direction.
+    """
+    by_direction = drift_result.get("by_direction", {})
+    if not by_direction:
+        return
+
+    snapshot_at = _utcnow()
+    for direction_id, signal in by_direction.items():
+        session.add(
+            DirectionDriftSnapshot(
+                project_id=project.id,
+                direction_id=direction_id,
+                snapshot_at=snapshot_at,
+                claimed_changes_count=signal.get("claimed_changes_count", 0),
+                actually_merged_prs=signal.get("actually_merged_prs", 0),
+                claim_shipped_consistency=signal.get("claim_shipped_consistency", 1.0),
+                over_claim_flag=bool(signal.get("over_claim_flag", False)),
+                stalled_despite_churn_flag=bool(signal.get("stalled_despite_churn_flag", False)),
+            )
+        )
+
+    await session.flush()
+
+    for direction_id in by_direction:
+        excess = (
+            await session.execute(
+                select(DirectionDriftSnapshot.id)
+                .where(
+                    DirectionDriftSnapshot.project_id == project.id,
+                    DirectionDriftSnapshot.direction_id == direction_id,
+                )
+                .order_by(DirectionDriftSnapshot.snapshot_at.desc())
+                .offset(_DRIFT_SNAPSHOT_RETENTION)
+            )
+        ).all()
+        if excess:
+            await session.execute(
+                delete(DirectionDriftSnapshot).where(
+                    DirectionDriftSnapshot.id.in_([r[0] for r in excess])
+                )
+            )
+
+
+async def last_n_drift_snapshots(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_id: str,
+    n: int = 10,
+) -> list[DirectionDriftSnapshot]:
+    """Return the n most-recent drift snapshots for a direction, newest first."""
+    return list(
+        (
+            await session.execute(
+                select(DirectionDriftSnapshot)
+                .where(
+                    DirectionDriftSnapshot.project_id == project_id,
+                    DirectionDriftSnapshot.direction_id == direction_id,
+                )
+                .order_by(DirectionDriftSnapshot.snapshot_at.desc())
+                .limit(n)
+            )
+        ).scalars().all()
+    )

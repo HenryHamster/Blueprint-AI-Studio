@@ -620,3 +620,94 @@ class TestAutoModeRecover:
 
         await db_session.refresh(project)
         assert project.directions[0]["recommended_mode"] == "audit"
+
+
+# ── Drift-triggered dispatch context ───────────────────────────────────────
+
+class TestDriftTriggeredDispatch:
+    """Drift signals are embedded as drift_context in the dispatched task.
+
+    When _should_dispatch_self_audit finds over-claimed or stalled systems,
+    the returned dict must carry drift_context keyed by system_id.
+    When _spawn_self_audit_task consumes that payload, the created task's
+    context must carry the same drift_context so the agent can reconcile
+    claims vs shipped work explicitly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatch_result_includes_drift_context_for_over_claim_system(
+        self, db_session
+    ):
+        """_should_dispatch_self_audit returns drift_context when system has over_claim_flag."""
+        from unittest.mock import patch, AsyncMock
+
+        project = await _seed_project_with_member(db_session)
+        project.directions = [{"id": "d-drift", "system_id": "sys-drifted"}]
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(project, "directions")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        drift_sig = {
+            "claimed_changes_count": 5,
+            "actually_merged_prs": 0,
+            "claim_shipped_consistency": 0.0,
+            "over_claim_flag": True,
+            "stalled_despite_churn_flag": True,
+        }
+        fake_drift = {
+            "by_direction": {},
+            "by_system": {"sys-drifted": drift_sig},
+        }
+
+        with patch(
+            "app.drift_detection.compute_direction_drift",
+            new=AsyncMock(return_value=fake_drift),
+        ):
+            result = await _should_dispatch_self_audit(project, db_session)
+
+        assert result is not None
+        assert "sys-drifted" in (result.get("focus_systems") or [])
+        drift_ctx = result.get("drift_context") or {}
+        assert "sys-drifted" in drift_ctx
+        sig = drift_ctx["sys-drifted"]
+        assert sig["over_claim_flag"] is True
+        assert sig["claimed_changes_count"] == 5
+        assert sig["actually_merged_prs"] == 0
+
+    @pytest.mark.asyncio
+    async def test_spawned_task_context_carries_drift_context(self, db_session):
+        """_spawn_self_audit_task embeds drift_context from audit_payload into task.context."""
+        from app.self_audit_dispatch import _spawn_self_audit_task
+        from app.models import Task
+        from sqlmodel import select
+
+        project = await _seed_project_with_member(db_session)
+
+        drift_ctx = {
+            "sys-drifted": {
+                "claimed_changes_count": 4,
+                "actually_merged_prs": 0,
+                "claim_shipped_consistency": 0.0,
+                "over_claim_flag": True,
+                "stalled_despite_churn_flag": False,
+            }
+        }
+        audit_payload = {
+            "focus_systems": ["sys-drifted"],
+            "max_systems": 3,
+            "drift_context": drift_ctx,
+        }
+
+        spawned = await _spawn_self_audit_task(project, db_session, audit_payload)
+        assert spawned is True
+
+        tasks = (await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )).scalars().all()
+        assert len(tasks) == 1
+        task_context = tasks[0].context or {}
+        assert "drift_context" in task_context
+        assert "sys-drifted" in task_context["drift_context"]
+        assert task_context["drift_context"]["sys-drifted"]["over_claim_flag"] is True

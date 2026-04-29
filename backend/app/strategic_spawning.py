@@ -173,6 +173,48 @@ def _summarize_drift_signals(drift: dict) -> dict:
     }
 
 
+# How many stored snapshots to look back when computing consecutive_flagged_cycles.
+_DRIFT_TREND_LOOKBACK = 5
+
+
+async def _enrich_drift_with_trend(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    drift_summary: dict,
+) -> dict:
+    """Add consecutive_flagged_cycles to each direction already in drift_summary.
+
+    For each interesting direction, reads the last _DRIFT_TREND_LOOKBACK stored
+    snapshots (newest first) and counts how many consecutive leading entries had
+    at least one flag set. This lets the strategic agent distinguish a one-off
+    spike from a sustained breakdown without reading the full history.
+
+    Only enriches directions already filtered into drift_summary by
+    _summarize_drift_signals, so the extra queries are bounded by the
+    flagged-direction count (typically 0–3 per project).
+    """
+    from app.drift_detection import last_n_drift_snapshots
+    by_direction = (drift_summary or {}).get("by_direction") or {}
+    if not by_direction:
+        return drift_summary
+    enriched_directions = {}
+    for direction_id, sig in by_direction.items():
+        snapshots = await last_n_drift_snapshots(
+            session, project_id, direction_id, n=_DRIFT_TREND_LOOKBACK
+        )
+        consecutive = 0
+        for snap in snapshots:
+            if snap.over_claim_flag or snap.stalled_despite_churn_flag:
+                consecutive += 1
+            else:
+                break
+        enriched_sig = dict(sig)
+        if consecutive > 0:
+            enriched_sig["consecutive_flagged_cycles"] = consecutive
+        enriched_directions[direction_id] = enriched_sig
+    return {**drift_summary, "by_direction": enriched_directions}
+
+
 # Per-payload caps used by the strategic-spawn schema's summarize_fns. These are
 # what the agent sees by default; for full content the agent uses ./fetch.
 _DIRECTIONS_SUMMARY_KEEP = 12
@@ -1129,9 +1171,12 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     # project has no SystemMaturity rows or no in-window task data.
     system_maturity_payload = await _build_system_maturity_payload(project, session)
     try:
-        from app.drift_detection import compute_direction_drift
+        from app.drift_detection import compute_direction_drift, persist_drift_snapshot
         drift_raw = await compute_direction_drift(session, project)
+        await persist_drift_snapshot(session, project, drift_raw)
         drift_summary = _summarize_drift_signals(drift_raw)
+        if drift_summary.get("by_direction"):
+            drift_summary = await _enrich_drift_with_trend(session, project.id, drift_summary)
     except Exception:  # noqa: BLE001 — drift signals are best-effort
         logger.exception("[STRATEGIC] drift signal computation failed; continuing")
         drift_summary = {}

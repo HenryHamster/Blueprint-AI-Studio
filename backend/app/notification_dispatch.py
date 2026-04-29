@@ -645,7 +645,7 @@ async def post_residual_fix_spawned_message(
     session.add(case)
 
     summary = f'Residual auto-fix spawned for fingerprint {fingerprint[:32]}'
-    return await post_event_message(
+    msg = await post_event_message(
         session,
         project_id,
         event_type='residual_fix_spawned',
@@ -657,6 +657,16 @@ async def post_residual_fix_spawned_message(
         },
         task_id=task_id,
     )
+    asyncio.ensure_future(dispatch_external_notification(
+        project_id,
+        'RESIDUAL_FIX_SPAWNED',
+        {
+            'fingerprint': fingerprint,
+            'hit_count': case.hit_count,
+            'task_id': str(task_id) if task_id else None,
+        },
+    ))
+    return msg
 
 
 async def post_residual_fix_result_message(

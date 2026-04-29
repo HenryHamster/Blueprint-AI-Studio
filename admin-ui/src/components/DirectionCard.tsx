@@ -212,6 +212,12 @@ function DirectionCardImpl({
       ? `Last cycle: ${lastPrs} PR${lastPrs !== 1 ? 's' : ''}`
       : `No merges in last ${recentNoMergeCount} cycle${recentNoMergeCount !== 1 ? 's' : ''}`;
 
+    const prevEntry = history.length >= 2 ? history[history.length - 2] : null;
+    const deltaPrs = prevEntry != null ? lastPrs - (prevEntry.prs_merged ?? 0) : null;
+    const rollingAvg3 = history.length >= 3
+      ? history.slice(-3).reduce((s, e) => s + (e.prs_merged ?? 0), 0) / 3
+      : null;
+
     return {
       totalMerged,
       successRate,
@@ -219,6 +225,9 @@ function DirectionCardImpl({
       truncatedTitle,
       sparkData,
       lastCycleLabel,
+      latestCyclePrs: lastPrs,
+      deltaPrs,
+      rollingAvg3,
       totalAutonomous,
       totalAssisted,
       totalOperatorActions,
@@ -1095,9 +1104,34 @@ function DirectionCardImpl({
                       />
                     </BarChart>
                   </ResponsiveContainer>
-                  <p className="text-[10px] text-neutral-600 mt-0.5">{lifetimeMetrics.lastCycleLabel}</p>
                 </div>
               )}
+              <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                <p className="text-[10px] text-neutral-600">{lifetimeMetrics.lastCycleLabel}</p>
+                {lifetimeMetrics.deltaPrs != null ? (
+                  <span
+                    title={`Latest cycle: ${lifetimeMetrics.latestCyclePrs} PRs merged`}
+                    className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${
+                      lifetimeMetrics.deltaPrs > 0
+                        ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400'
+                        : lifetimeMetrics.deltaPrs < 0
+                          ? 'bg-red-950/40 border-red-900/50 text-red-400'
+                          : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-500'
+                    }`}
+                  >
+                    {lifetimeMetrics.deltaPrs > 0 ? '+' : ''}{lifetimeMetrics.deltaPrs} vs prior
+                  </span>
+                ) : (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
+                    {lifetimeMetrics.latestCyclePrs} this cycle
+                  </span>
+                )}
+                {lifetimeMetrics.rollingAvg3 != null && (
+                  <span className="text-[10px] text-neutral-600">
+                    avg {lifetimeMetrics.rollingAvg3 % 1 === 0 ? lifetimeMetrics.rollingAvg3.toFixed(0) : lifetimeMetrics.rollingAvg3.toFixed(1)}/cycle
+                  </span>
+                )}
+              </div>
             </div>
           )}
           {d.research_history && d.research_history.length > 0 && (

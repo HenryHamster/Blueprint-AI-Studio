@@ -447,6 +447,70 @@ describe('DirectionCard cost-per-merge retirement warning', () => {
   });
 });
 
+describe('DirectionCard per-cycle delta badge', () => {
+  it('shows "N this cycle" badge with no delta when only one cycle available', () => {
+    const d = makeDirection({
+      research_history: [makeResearchEntry({ prs_merged: 3 })],
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('3 this cycle')).toBeInTheDocument();
+    expect(screen.queryByText(/vs prior/)).not.toBeInTheDocument();
+  });
+
+  it('shows green "+N vs prior" badge when latest cycle improved', () => {
+    const d = makeDirection({
+      research_history: [
+        makeResearchEntry({ prs_merged: 1, timestamp: '2026-01-01T00:00:00Z' }),
+        makeResearchEntry({ prs_merged: 3, timestamp: '2026-01-02T00:00:00Z' }),
+      ],
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    const badge = screen.getByText('+2 vs prior');
+    expect(badge).toBeInTheDocument();
+    expect(badge.className).toMatch(/emerald/);
+  });
+
+  it('shows red "-N vs prior" badge when latest cycle regressed', () => {
+    const d = makeDirection({
+      research_history: [
+        makeResearchEntry({ prs_merged: 3, timestamp: '2026-01-01T00:00:00Z' }),
+        makeResearchEntry({ prs_merged: 1, timestamp: '2026-01-02T00:00:00Z' }),
+      ],
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    const badge = screen.getByText('-2 vs prior');
+    expect(badge).toBeInTheDocument();
+    expect(badge.className).toMatch(/red/);
+  });
+
+  it('shows neutral "0 vs prior" badge when latest cycle matches prior', () => {
+    const d = makeDirection({
+      research_history: [
+        makeResearchEntry({ prs_merged: 2, timestamp: '2026-01-01T00:00:00Z' }),
+        makeResearchEntry({ prs_merged: 2, timestamp: '2026-01-02T00:00:00Z' }),
+      ],
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    const badge = screen.getByText('0 vs prior');
+    expect(badge).toBeInTheDocument();
+    expect(badge.className).not.toMatch(/emerald/);
+    expect(badge.className).not.toMatch(/red/);
+  });
+
+  it('shows rolling avg label when three or more cycles are available', () => {
+    const d = makeDirection({
+      research_history: [
+        makeResearchEntry({ prs_merged: 2, timestamp: '2026-01-01T00:00:00Z' }),
+        makeResearchEntry({ prs_merged: 4, timestamp: '2026-01-02T00:00:00Z' }),
+        makeResearchEntry({ prs_merged: 3, timestamp: '2026-01-03T00:00:00Z' }),
+      ],
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    // avg of last 3: (2+4+3)/3 = 3.0
+    expect(screen.getByText('avg 3/cycle')).toBeInTheDocument();
+  });
+});
+
 function makeResearchEntry(overrides: Partial<import('./DirectionsPanel').ResearchHistoryEntry> = {}): import('./DirectionsPanel').ResearchHistoryEntry {
   return {
     timestamp: '2026-01-01T00:00:00Z',

@@ -179,14 +179,15 @@ async def _should_dispatch_self_audit(
             "[SELF_AUDIT] drift computation failed; skipping drift-driven dispatch",
         )
         drift = {"by_direction": {}, "by_system": {}}
+    drift_by_system: dict[str, dict] = {}
     for did, sig in (drift.get("by_direction") or {}).items():
         if sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag"):
             high_drift_directions.append(did)
     for sid, sig in (drift.get("by_system") or {}).items():
-        if (
-            sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag")
-        ) and sid not in candidate_systems:
-            candidate_systems.append(sid)
+        if sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag"):
+            drift_by_system[sid] = sig
+            if sid not in candidate_systems:
+                candidate_systems.append(sid)
 
     if not candidate_systems and not high_drift_directions:
         return None
@@ -200,9 +201,11 @@ async def _should_dispatch_self_audit(
     else:
         rotated = []
     focus = rotated[:_SELF_AUDIT_FOCUS_SYSTEMS_CAP]
+    focus_drift = {sid: drift_by_system[sid] for sid in focus if sid in drift_by_system}
     return {
         "focus_systems": focus or None,
         "max_systems": _SELF_AUDIT_FOCUS_SYSTEMS_CAP,
+        "drift_context": focus_drift or None,
     }
 
 
@@ -301,6 +304,10 @@ async def _spawn_self_audit_task(
             f"[SELF_AUDIT] payload too large for project {project.id}: {e}; skipping"
         )
         return False
+    task_context: dict = {}
+    drift_ctx = audit_payload.get("drift_context")
+    if drift_ctx:
+        task_context["drift_context"] = drift_ctx
     new_task = Task(
         project_id=project.id,
         title=f"Self-audit: {project.name}",
@@ -309,7 +316,7 @@ async def _spawn_self_audit_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        context={},
+        context=task_context,
     )
     session.add(new_task)
     await session.flush()

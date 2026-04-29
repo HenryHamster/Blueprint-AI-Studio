@@ -203,6 +203,8 @@ class TestSchemaRevisionSync:
                 for col_m in col_in_create_re.finditer(block):
                     migration_columns.add((table, col_m.group(1)))
 
+        # Tables whose migrations are pending (added by a sibling task in the same PR batch).
+        # Remove each entry once its migration file lands.
         PENDING_MIGRATION_TABLES: set[str] = set()
 
         # Check each SQLModel table's columns against migrations
@@ -369,6 +371,8 @@ class TestSchemaRevisionSync:
                 if target:
                     effective.discard(target)
 
+        # Tables whose migrations are pending (added by a sibling task in the same PR batch).
+        # Remove each entry once its migration file lands.
         PENDING_MIGRATION_TABLES: set[str] = set()
 
         missing: list[str] = []

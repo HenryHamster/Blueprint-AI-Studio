@@ -93,6 +93,8 @@ async def db_session():
                 "task",
                 # Remaining dependents of project
                 "projectmember", "residualremediationcase", "systemmaturity",
+                # Drift time-series (project_id not a FK constraint, safe to delete standalone)
+                "directiondriftsnapshot",
                 # Base tables
                 "project", "maxplanaccount", "userintegration", "alloweduser",
             ):
