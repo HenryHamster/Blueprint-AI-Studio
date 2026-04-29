@@ -596,6 +596,31 @@ export function snapshotToolTrace(): ToolTraceEntry[] {
   return _toolTrace.slice();
 }
 
+// Extract repo-relative file paths the agent looked at during a task. Used to
+// hand the reviewer's working set forward to the fix agent so it doesn't have
+// to rediscover which files matter. Reads input_preview (truncated to 200
+// chars by recordToolUse) with a regex so a JSON-truncated entry still yields
+// the leading path. WORKSPACE prefix is stripped so the consumer sees
+// repo-relative paths regardless of where the producing agent ran.
+const _INVESTIGATION_TOOLS = new Set(['Read', 'Edit', 'Write', 'NotebookEdit', 'Grep', 'Glob']);
+export function extractInvestigatedFiles(trace: ToolTraceEntry[]): string[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const entry of trace) {
+    if (!_INVESTIGATION_TOOLS.has(entry.tool)) continue;
+    const m = entry.input_preview.match(/"(?:file_path|path)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/);
+    if (!m) continue;
+    let p: string;
+    try { p = JSON.parse(`"${m[1]}"`); } catch { p = m[1]; }
+    p = p.replace(/\\/g, '/').trim();
+    if (p.startsWith(`${WORKSPACE}/`)) p = p.slice(WORKSPACE.length + 1);
+    if (p.startsWith('/tmp/workspace/')) p = p.slice('/tmp/workspace/'.length);
+    if (!p || p.includes('\n') || p === '.' || p === '/') continue;
+    if (!seen.has(p)) { seen.add(p); ordered.push(p); }
+  }
+  return ordered;
+}
+
 // ── Heartbeat ───────────────────────────────────────────────────────────────
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 

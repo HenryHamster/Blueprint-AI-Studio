@@ -6,6 +6,7 @@ import {
   persistAndPostStatus, apiGet, git, gitAsync, gitCommit, cloneWithRetry,
   runClaudeCode, runProjectLintChecks, lintFixLoop, testFixLoop,
   captureTestBaseline, sendHeartbeatSync, extractPytestSelectorsFromOutput,
+  snapshotToolTrace, extractInvestigatedFiles,
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT } from '../constants.js';
@@ -647,17 +648,28 @@ IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (N
 
   let logs = '';
   let verdictJsonField: string | undefined;
+  // Reviewer's working set: every file path the agent Read/Edit/Grep/Glob'd
+  // during this run, derived from the in-process tool trace. Forwarded to the
+  // downstream fix agent so it can start from the reviewer's locations
+  // instead of redoing the investigation from scratch.
+  const investigatedFiles = extractInvestigatedFiles(snapshotToolTrace());
   try {
     if (fs.existsSync(`/tmp/review_verdict_${taskId}.json`)) {
       const verdictJson = fs.readFileSync(`/tmp/review_verdict_${taskId}.json`, 'utf-8').trim();
       // Validate it's actual verdict JSON
-      const parsed = JSON.parse(verdictJson) as { verdict?: string };
+      const parsed = JSON.parse(verdictJson) as Record<string, unknown>;
       if (parsed.verdict) {
-        // Send verdict via dedicated field (structured, tamper-resistant vs log parsing)
-        verdictJsonField = verdictJson;
+        // Inject investigated_files alongside the agent-emitted verdict
+        // fields, then re-serialize. Capped to keep verdict_json under
+        // schemas.StatusUpdate.verdict_json max_length=10000.
+        if (investigatedFiles.length > 0 && !parsed.investigated_files) {
+          parsed.investigated_files = investigatedFiles.slice(0, 25);
+        }
+        const augmented = JSON.stringify(parsed);
+        verdictJsonField = augmented;
         // Also append to logs for backwards compatibility
         const reviewText = sanitize(lastResultText || allOutput.slice(-50_000));
-        logs = reviewText + '\n\n' + verdictJson;
+        logs = reviewText + '\n\n' + augmented;
         sendLog(ws, `Verdict read from file: ${parsed.verdict}\n`);
       }
     }
@@ -936,6 +948,19 @@ export async function handleFix(
   // Prepend related test context so the agent knows which tests to update
   if (fixRelatedTestContext) {
     enrichedPrompt = `${fixRelatedTestContext}${enrichedPrompt}`;
+  }
+
+  // Reviewer's working set: paths the previous review agent Read/Edit/Grep'd
+  // while forming this verdict. Hand them forward as starting context so the
+  // fix agent doesn't re-do the same investigation. Informational only — the
+  // agent stays free to look at other files if the issues lead elsewhere.
+  const reviewerInvestigatedFiles = (taskContext.investigated_files as string[] | undefined) || [];
+  if (reviewerInvestigatedFiles.length > 0) {
+    const formatted = reviewerInvestigatedFiles.slice(0, 25).map(f => `- ${f}`).join('\n');
+    enrichedPrompt =
+      `## Reviewer's Working Set\n` +
+      `The reviewer Read/Edit/Grep'd these paths while forming the verdict above. Start your investigation here — they are the most likely place the cited issues live. You may look elsewhere if the trail leads there:\n${formatted}\n\n` +
+      enrichedPrompt;
   }
 
   // Prepend CLAUDE.md instructions + playbook

@@ -1494,6 +1494,7 @@ async def _process_post_commit(
                 verdict = "REQUEST_CHANGES"
                 feedback = verdict_text
                 issues = []
+                investigated_files: list[str] = []
 
                 # Parse verdict: prefer structured verdict_json field, fall back to log parsing
                 import re
@@ -1508,6 +1509,12 @@ async def _process_post_commit(
                             verdict = vj["verdict"]
                             feedback = vj.get("feedback", verdict_text)
                             issues = vj.get("issues", []) if isinstance(vj.get("issues"), list) else []
+                            raw_investigated = vj.get("investigated_files")
+                            if isinstance(raw_investigated, list):
+                                investigated_files = [
+                                    str(p) for p in raw_investigated
+                                    if isinstance(p, str) and p
+                                ][:25]
                             verdict_parsed = True
                             logger.info(f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}")
                     except (json.JSONDecodeError, TypeError):
@@ -2190,7 +2197,8 @@ async def _process_post_commit(
                         original_prompt=original_prompt,
                         original_task_id=original_task_id,
                         current_feedback=feedback,
-                        current_issues=issues
+                        current_issues=issues,
+                        investigated_files=investigated_files,
                     )
                     if fix_task:
                         logger.info(f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}")

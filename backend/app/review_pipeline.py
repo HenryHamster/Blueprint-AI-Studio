@@ -745,6 +745,7 @@ async def _spawn_pipeline_task(
     original_prompt: str = "", fix_prompt: str = "", original_task_id: str = "",
     current_feedback: str = "", fix_reason: str = "", current_issues: list | None = None,
     ci_failure_logs: str = "",
+    investigated_files: list[str] | None = None,
 ) -> tuple[Task | None, bool]:
     """Spawn a review or fix task as part of the automated review pipeline.
 
@@ -1437,6 +1438,15 @@ async def _spawn_pipeline_task(
         # (the ones the agent extracts selectors from) sit at the tail of each
         # job's log section.
         propagated_ctx["ci_failure_logs"] = str(ci_failure_logs)[-5000:]
+
+    if task_type == "fix" and investigated_files:
+        # Reviewer's working set forwarded so the fix agent can start at the
+        # paths the reviewer already opened, instead of rediscovering them.
+        # Capped to keep per-task context bounded; the cap mirrors the agent
+        # side's 25-path slice when it builds verdict_json.
+        propagated_ctx["investigated_files"] = [
+            str(p) for p in investigated_files if isinstance(p, str) and p
+        ][:25]
 
     # Propagate the original create task's planned file list so the reviewer can
     # objectively detect scope creep (files changed but not in the original plan).

@@ -58,7 +58,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, type FailureCategory } from './index.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
@@ -1643,6 +1643,43 @@ describe('pytest CI selector extraction', () => {
       '--postgres',
       'testing/test_models.py::test_create',
     ]);
+  });
+});
+
+describe('extractInvestigatedFiles', () => {
+  it('extracts repo-relative paths from Read/Edit/Grep input previews and dedupes', () => {
+    const trace = [
+      { t: '1', tool: 'Read',  input_preview: '{"file_path":"/tmp/workspace/admin-ui/src/components/DirectionCard.tsx","offset":180,"limit":20}' },
+      { t: '2', tool: 'Grep',  input_preview: '{"pattern":"total_operator_action","path":"/tmp/workspace/admin-ui/src","output_mode":"content"}' },
+      { t: '3', tool: 'Edit',  input_preview: '{"file_path":"/tmp/workspace/admin-ui/src/components/DirectionCard.test.tsx","old_string":"x","new_string":"y"}' },
+      { t: '4', tool: 'Read',  input_preview: '{"file_path":"/tmp/workspace/admin-ui/src/components/DirectionCard.tsx","offset":200,"limit":40}' },
+      { t: '5', tool: 'Bash',  input_preview: '{"command":"ls","description":"list"}' },
+    ];
+    expect(extractInvestigatedFiles(trace)).toEqual([
+      'admin-ui/src/components/DirectionCard.tsx',
+      'admin-ui/src',
+      'admin-ui/src/components/DirectionCard.test.tsx',
+    ]);
+  });
+
+  it('returns paths in first-seen order, preserves Grep directories, ignores non-investigation tools', () => {
+    const trace = [
+      { t: '1', tool: 'Read',  input_preview: '{"file_path":"/tmp/workspace/backend/app/foo.py"}' },
+      { t: '2', tool: 'Bash',  input_preview: '{"command":"echo hi"}' },
+      { t: '3', tool: 'Grep',  input_preview: '{"pattern":"x","path":"/tmp/workspace/backend/app"}' },
+      { t: '4', tool: 'Read',  input_preview: '{"file_path":"/tmp/workspace/backend/app/foo.py"}' },
+    ];
+    expect(extractInvestigatedFiles(trace)).toEqual([
+      'backend/app/foo.py',
+      'backend/app',
+    ]);
+  });
+
+  it('handles JSON-truncated input previews via regex fallback', () => {
+    const trace = [
+      { t: '1', tool: 'Read', input_preview: '{"file_path":"/tmp/workspace/agent/src/handlers/review-fix.ts","offset":1,"limit":2000,"some_other_field":"...truncated' },
+    ];
+    expect(extractInvestigatedFiles(trace)).toEqual(['agent/src/handlers/review-fix.ts']);
   });
 });
 

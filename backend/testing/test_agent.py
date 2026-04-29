@@ -1244,6 +1244,93 @@ async def test_claim_skips_stale_playbook_entries(client: AsyncClient, db_sessio
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_claim_caps_playbook_entries_for_fix_tasks(client: AsyncClient, db_session):
+    """Playbook is capped per task type: fix gets 8, regardless of how many
+    candidates pass the type/stale filters. Without the cap the agent's prompt
+    was being flooded with ~30 unrelated entries (see audit on PR #3407)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Playbook Cap Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    design_doc = {}
+    for i in range(20):
+        design_doc[f"playbook/entry-{i:02d}"] = {
+            "content": f"guidance #{i}",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": i,  # later entries rank higher by confirmed_count
+            "reference_count": 1,
+        }
+    project.design_doc = design_doc
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "Address review"}],
+        vm_instance_id="agent-vm-pbcap-test",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pbcap-test")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    playbook = resp.json().get("playbook", {})
+    assert len(playbook) == 8, f"fix tasks should cap at 8 entries, got {len(playbook)}"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_caps_playbook_entries_for_create_tasks(client: AsyncClient, db_session):
+    """Create tasks get a wider playbook (12) than fix/qa/review (8) — broader
+    investigation surface justifies more priors."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Playbook Cap Create Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    design_doc = {}
+    for i in range(20):
+        design_doc[f"playbook/entry-{i:02d}"] = {
+            "content": f"guidance #{i}",
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": i,
+            "reference_count": 1,
+        }
+    project.design_doc = design_doc
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Build X"}],
+        vm_instance_id="agent-vm-pbcap-create-test",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pbcap-create-test")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    playbook = resp.json().get("playbook", {})
+    assert len(playbook) == 12, f"create tasks should cap at 12 entries, got {len(playbook)}"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_claim_appends_recent_outcomes_on_reference(client: AsyncClient, db_session):
     """Claim appends False to recent_outcomes for each shown entry and stores _shown_playbook_keys."""
     from sqlalchemy.orm.attributes import flag_modified

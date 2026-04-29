@@ -1237,8 +1237,21 @@ async def claim_task(
                     relevance_reasons,
                 ))
         _playbook_candidates.sort()
+        # Cap shown entries: the sort already prioritizes direction match →
+        # system match → file overlap → effectiveness, so the head of the
+        # list is the most relevant subset. Without a cap, every fix task
+        # was getting flooded with ~30 entries (most irrelevant), burning
+        # prompt tokens and attention. Configurable via runtime_config so
+        # we can tune per task type without a redeploy. Defaults: fix/qa/
+        # review get 8 (focused work, narrow scope); create/refactor get 12
+        # (broader investigation, more priors useful); other types get 10.
+        _playbook_caps = (_shared_state.runtime_config.get("playbook_max_entries") or {}) \
+            if isinstance(_shared_state.runtime_config.get("playbook_max_entries"), dict) else {}
+        _default_caps = {"fix": 8, "qa": 8, "review": 8, "create": 12, "refactor": 12}
+        _cap = int(_playbook_caps.get(task_type, _default_caps.get(task_type, 10)))
+        _capped_candidates = _playbook_candidates[:max(_cap, 0)]
         for (_, _, _, _, _, _, _, _, short_key, content,
-             eff_score, conf_count, age_days_val, is_stale, relevance_reasons) in _playbook_candidates:
+             eff_score, conf_count, age_days_val, is_stale, relevance_reasons) in _capped_candidates:
             playbook_entries[short_key] = {
                 "content": content,
                 "effectiveness_score": round(eff_score, 3),
@@ -1250,6 +1263,11 @@ async def claim_task(
                     "local_match": bool(relevance_reasons),
                 },
             }
+        if len(_playbook_candidates) > len(_capped_candidates):
+            logger.info(
+                "Playbook capped to %d/%d entries for task %s (type=%s)",
+                len(_capped_candidates), len(_playbook_candidates), task.id, task_type,
+            )
         total_playbook_count = sum(
             1 for k in (project_for_playbook.design_doc or {}) if k.startswith("playbook/")
         )

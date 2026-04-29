@@ -26,6 +26,8 @@ vi.mock('../index.js', () => ({
     const match = output.match(/FAILED\s+(backend\/testing\/\S+\.py::\S+)/);
     return match ? [match[1].replace(/\s+-.*$/, '')] : [];
   }),
+  snapshotToolTrace: vi.fn().mockReturnValue([]),
+  extractInvestigatedFiles: vi.fn().mockReturnValue([]),
   runProjectLintChecks: vi.fn(),
   cloneWithRetry: vi.fn(),
   sendHeartbeatSync: vi.fn(),
@@ -578,6 +580,33 @@ describe('handleReview — verdict file parsing', () => {
     expect(String(status.logs)).toContain('"verdict":"APPROVE"');
   });
 
+  it("augments verdict_json with investigated_files derived from the review's tool trace", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      '{"verdict":"REQUEST_CHANGES","feedback":"x","issues":[]}'
+    );
+    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '', lastResultText: '',
+    });
+    vi.mocked(indexMod.extractInvestigatedFiles).mockReturnValueOnce([
+      'admin-ui/src/components/DirectionCard.tsx',
+      'admin-ui/src/components/DirectionCard.test.tsx',
+    ]);
+
+    await handleReview(
+      'task-investigated', basePayload, { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const verdictJson = JSON.parse(String(status.verdict_json));
+    expect(verdictJson.verdict).toBe('REQUEST_CHANGES');
+    expect(verdictJson.investigated_files).toEqual([
+      'admin-ui/src/components/DirectionCard.tsx',
+      'admin-ui/src/components/DirectionCard.test.tsx',
+    ]);
+  });
+
   it('falls back to output parsing when verdict file contains malformed JSON', async () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync).mockReturnValue('not json at all');
@@ -727,6 +756,46 @@ describe('handleFix — baseline capture', () => {
         maxFixAttempts: 0,
       }),
     );
+  });
+});
+
+describe('handleFix — reviewer working set propagation', () => {
+  it('prepends a Reviewer\'s Working Set section when task.context.investigated_files is present', async () => {
+    await handleFix(
+      'task-fix-investigated-1',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 7, prompt: 'address review feedback' },
+      {
+        context: {
+          scope: 'small',
+          review_loop: { fix_reason: 'code_review' },
+          investigated_files: [
+            'admin-ui/src/components/DirectionCard.tsx',
+            'admin-ui/src/components/DirectionCard.test.tsx',
+          ],
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const firstCall = vi.mocked(indexMod.runClaudeCode).mock.calls[0];
+    expect(firstCall, 'runClaudeCode should have been called').toBeTruthy();
+    const prompt = String(firstCall[0]);
+    expect(prompt).toContain("Reviewer's Working Set");
+    expect(prompt).toContain('admin-ui/src/components/DirectionCard.tsx');
+    expect(prompt).toContain('admin-ui/src/components/DirectionCard.test.tsx');
+  });
+
+  it('omits the section entirely when no investigated_files are present', async () => {
+    await handleFix(
+      'task-fix-investigated-2',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 7, prompt: 'address review feedback' },
+      { context: { scope: 'small', review_loop: { fix_reason: 'code_review' } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const firstCall = vi.mocked(indexMod.runClaudeCode).mock.calls[0];
+    const prompt = String(firstCall[0]);
+    expect(prompt).not.toContain("Reviewer's Working Set");
   });
 });
 

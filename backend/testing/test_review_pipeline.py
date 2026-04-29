@@ -2553,6 +2553,74 @@ async def test_ci_failure_logs_propagate_to_spawned_fix_context(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_investigated_files_propagate_to_spawned_fix_context(db_session, mocker):
+    """Code-review fix tasks carry the reviewer's working set forward so the
+    fix agent can start at the paths the reviewer already opened, rather than
+    rediscovering the codebase from scratch each iteration."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 503, "branch": "feat/inv",
+                   "base_branch": "main", "prompt": "Build Y"}],
+        context={"scope": "medium", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    investigated = [
+        "admin-ui/src/components/DirectionCard.tsx",
+        "admin-ui/src/components/DirectionCard.test.tsx",
+        "backend/app/direction_metrics.py",
+    ]
+    result, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=503, branch="feat/inv", base_branch="main",
+        fix_prompt="Address the review feedback",
+        investigated_files=investigated,
+    )
+
+    assert created is True
+    assert result is not None
+    assert (result.context or {}).get("investigated_files") == investigated
+
+
+@pytest.mark.asyncio
+async def test_investigated_files_capped_at_25(db_session, mocker):
+    """Working-set propagation respects a 25-path cap so a chatty reviewer
+    can't blow up downstream task contexts."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "pr_number": 504, "branch": "feat/cap",
+                   "base_branch": "main", "prompt": "Z"}],
+        context={"scope": "medium", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    big_list = [f"src/file_{i}.py" for i in range(40)]
+    result, created = await _spawn_pipeline_task(
+        source_task, "fix", db_session,
+        pr_number=504, branch="feat/cap", base_branch="main",
+        fix_prompt="x",
+        investigated_files=big_list,
+    )
+
+    assert created is True
+    propagated = (result.context or {}).get("investigated_files") or []
+    assert len(propagated) == 25
+    assert propagated == big_list[:25]
+
+
+@pytest.mark.asyncio
 async def test_self_review_outcome_propagates_to_spawned_review(db_session, mocker):
     """When the source task carries `_self_review_outcome` (set by the create
     handler's self-review), it must be carried forward to the spawned review
