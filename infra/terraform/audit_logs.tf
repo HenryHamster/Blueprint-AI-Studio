@@ -19,3 +19,24 @@ resource "google_project_iam_audit_config" "alloydb" {
     log_type = "DATA_WRITE"
   }
 }
+
+# ------------------------------------------------------------------------------
+# Cloud Audit Logs — Cloud SQL
+# ------------------------------------------------------------------------------
+# Same rationale as AlloyDB: ADMIN_READ + DATA_WRITE, omit DATA_READ for cost.
+# Always enabled (regardless of var.use_cloud_sql) — the audit_config is a
+# no-op until the Cloud SQL API is actually used, and pre-arming it means the
+# logs are in place from the very first migration step.
+
+resource "google_project_iam_audit_config" "cloudsql" {
+  project = var.project_id
+  service = "cloudsql.googleapis.com"
+
+  audit_log_config {
+    log_type = "ADMIN_READ"
+  }
+
+  audit_log_config {
+    log_type = "DATA_WRITE"
+  }
+}

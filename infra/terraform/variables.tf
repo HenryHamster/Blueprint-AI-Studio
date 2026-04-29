@@ -38,3 +38,15 @@ variable "orchestrator_url" {
   type        = string
   default     = ""
 }
+
+variable "use_cloud_sql" {
+  description = "Provision a Cloud SQL Postgres instance alongside AlloyDB. Used during the AlloyDB → Cloud SQL migration. After cutover, remove alloydb.tf and keep this true."
+  type        = bool
+  default     = false
+}
+
+variable "alert_email" {
+  description = "Email address that receives Cloud Monitoring alert pages (CPU, disk, connections, backup failure). Empty string disables alerting — no notification channel is created and alert policies skip themselves."
+  type        = string
+  default     = ""
+}

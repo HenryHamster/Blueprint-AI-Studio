@@ -1,0 +1,207 @@
+# ------------------------------------------------------------------------------
+# Cloud Monitoring — alert policies + email notification channel
+#
+# Phase A4 of the database remediation plan (HIGH H-O4): the project previously
+# had zero google_monitoring_alert_policy resources, so CPU/disk/connection/
+# backup-failure incidents were silent until they showed up as user-visible
+# 500s. This file fills that gap.
+#
+# All policies are gated behind var.alert_email — empty string disables alerting
+# (no notification channel created, no alert policies created). Set the variable
+# in terraform.tfvars or via -var="alert_email=foo@bar.com" to enable.
+#
+# Coverage during the AlloyDB → Cloud SQL migration window:
+#   - Cloud SQL CPU / disk / connections / backup health (count = use_cloud_sql)
+#   - AlloyDB CPU mirror so the same dashboards work pre-cutover (count = !use_cloud_sql)
+# Once alloydb.tf is removed post-cutover, the AlloyDB policy block becomes
+# inert (count = 0 by way of the missing resource reference) and can be
+# pruned.
+#
+# Documentation links target docs/db-migration-plan.md (Operational continuity
+# section) which carries the runbook for each incident type.
+# ------------------------------------------------------------------------------
+
+locals {
+  alerting_enabled = var.alert_email != ""
+}
+
+resource "google_monitoring_notification_channel" "email" {
+  count        = local.alerting_enabled ? 1 : 0
+  display_name = "Blueprint ops email"
+  type         = "email"
+  labels = {
+    email_address = var.alert_email
+  }
+}
+
+# ------------------------------------------------------------------------------
+# Cloud SQL — CPU > 80% sustained 5 min
+# ------------------------------------------------------------------------------
+resource "google_monitoring_alert_policy" "cloudsql_cpu" {
+  count        = local.alerting_enabled && var.use_cloud_sql ? 1 : 0
+  display_name = "Cloud SQL CPU > 80% (5 min)"
+  combiner     = "OR"
+  enabled      = true
+
+  conditions {
+    display_name = "CPU utilization above 80%"
+    condition_threshold {
+      filter          = "resource.type = \"cloudsql_database\" AND metric.type = \"cloudsql.googleapis.com/database/cpu/utilization\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0.8
+
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email[0].id]
+
+  documentation {
+    content   = "Cloud SQL CPU has been above 80% for 5 minutes. Runbook: docs/db-migration-plan.md (Operational continuity). Likely action: bump tier from db-g1-small → db-custom-1-3840."
+    mime_type = "text/markdown"
+  }
+}
+
+# ------------------------------------------------------------------------------
+# Cloud SQL — disk usage > 75% of disk_autoresize_limit (= 150 GB of 200 GB)
+# ------------------------------------------------------------------------------
+resource "google_monitoring_alert_policy" "cloudsql_disk" {
+  count        = local.alerting_enabled && var.use_cloud_sql ? 1 : 0
+  display_name = "Cloud SQL disk > 75% of autoresize cap"
+  combiner     = "OR"
+  enabled      = true
+
+  conditions {
+    display_name = "Disk bytes used above 150 GB"
+    condition_threshold {
+      filter = "resource.type = \"cloudsql_database\" AND metric.type = \"cloudsql.googleapis.com/database/disk/bytes_used\""
+      # 75% of 200 GB autoresize limit (cloud_sql.tf disk_autoresize_limit = 200) = 150 GB.
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 161061273600 # 150 * 1024^3 bytes
+
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email[0].id]
+
+  documentation {
+    content   = "Cloud SQL disk usage exceeded 150 GB (75% of 200 GB autoresize cap). At 200 GB autoresize stops; queries that grow tables will start failing. Runbook: docs/db-migration-plan.md (Operational continuity)."
+    mime_type = "text/markdown"
+  }
+}
+
+# ------------------------------------------------------------------------------
+# Cloud SQL — connections > 80% of max_connections (= 160 of 200)
+# ------------------------------------------------------------------------------
+resource "google_monitoring_alert_policy" "cloudsql_connections" {
+  count        = local.alerting_enabled && var.use_cloud_sql ? 1 : 0
+  display_name = "Cloud SQL connections > 80% of cap"
+  combiner     = "OR"
+  enabled      = true
+
+  conditions {
+    display_name = "num_backends above 160"
+    condition_threshold {
+      filter = "resource.type = \"cloudsql_database\" AND metric.type = \"cloudsql.googleapis.com/database/postgresql/num_backends\""
+      # 80% of max_connections=200 (cloud_sql.tf database_flag) = 160.
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 160
+
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email[0].id]
+
+  documentation {
+    content   = "Cloud SQL has more than 160 active backends (80% of the 200-connection cap). At 200, new connections are refused and the orchestrator pool starts timing out. Likely cause: pool_size + max_overflow misconfigured across Cloud Run instances, or a connection leak. Runbook: docs/db-migration-plan.md (Operational continuity)."
+    mime_type = "text/markdown"
+  }
+}
+
+# ------------------------------------------------------------------------------
+# Cloud SQL — backup health (instance availability flapping)
+#
+# Cloud Monitoring does not expose a direct "backup failed" metric for Cloud
+# SQL; the closest signal is `database/up` flapping (instance unavailable for
+# the backup window) or backup-failure events in audit logs. We use the
+# `database/up` signal here. A log-based metric on backup failure events can
+# be added in Phase B when the audit-log pipeline is wired up.
+# ------------------------------------------------------------------------------
+resource "google_monitoring_alert_policy" "cloudsql_up" {
+  count        = local.alerting_enabled && var.use_cloud_sql ? 1 : 0
+  display_name = "Cloud SQL instance unavailable"
+  combiner     = "OR"
+  enabled      = true
+
+  conditions {
+    display_name = "database/up = 0 for 5 min"
+    condition_threshold {
+      filter          = "resource.type = \"cloudsql_database\" AND metric.type = \"cloudsql.googleapis.com/database/up\""
+      duration        = "300s"
+      comparison      = "COMPARISON_LT"
+      threshold_value = 1
+
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email[0].id]
+
+  documentation {
+    content   = "Cloud SQL instance has been unavailable for 5 minutes. This catches both planned-maintenance overruns and backup-failure-induced outages. Runbook: docs/db-migration-plan.md (Operational continuity)."
+    mime_type = "text/markdown"
+  }
+}
+
+# ------------------------------------------------------------------------------
+# AlloyDB — CPU > 80% (mirror of Cloud SQL CPU policy)
+#
+# Active during the migration window so the same alert coverage applies before
+# cutover. Once alloydb.tf is removed, change the count to 0 (or delete this
+# block) to avoid Terraform errors on the missing resource reference.
+# ------------------------------------------------------------------------------
+resource "google_monitoring_alert_policy" "alloydb_cpu" {
+  count        = local.alerting_enabled && !var.use_cloud_sql ? 1 : 0
+  display_name = "AlloyDB CPU > 80% (5 min)"
+  combiner     = "OR"
+  enabled      = true
+
+  conditions {
+    display_name = "CPU utilization above 80%"
+    condition_threshold {
+      filter          = "resource.type = \"alloydb.googleapis.com/Instance\" AND metric.type = \"alloydb.googleapis.com/instance/cpu/utilization\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0.8
+
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email[0].id]
+
+  documentation {
+    content   = "AlloyDB instance CPU has been above 80% for 5 minutes. This is dual-coverage during the AlloyDB → Cloud SQL migration window. Runbook: docs/db-migration-plan.md (Operational continuity)."
+    mime_type = "text/markdown"
+  }
+}

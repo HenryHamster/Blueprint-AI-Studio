@@ -13,21 +13,22 @@ resource "google_project_iam_member" "orchestrator_compute_instance_admin" {
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 
-# Grant Orchestrator SA permissions to read secrets
+# Grant Orchestrator SA project-wide read on Secret Manager.
+# This is intentionally project-wide because Cloud Run --set-secrets in cloudbuild.yaml
+# loads ~10 secrets at instance boot (DATABASE_URL, AGENT_JWT_SECRET, WS_TICKET_SECRET,
+# GITHUB_*, ADMIN_API_KEY, REDIS_URL). Tightening this to per-secret bindings is a
+# follow-up: setup.sh's create_secret_if_missing would need to also bind orchestrator_sa
+# secretAccessor on each secret it creates. Out of scope for the AlloyDB→Cloud SQL cutover.
 resource "google_project_iam_member" "orchestrator_secret_accessor" {
   project = var.project_id
   role    = "roles/secretmanager.secretAccessor"
   member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
 }
 
-# Grant Orchestrator SA permissions to create secrets and add versions
-resource "google_project_iam_member" "orchestrator_secret_version_adder" {
-  project = var.project_id
-  role    = "roles/secretmanager.secretVersionAdder"
-  member  = "serviceAccount:${google_service_account.orchestrator_sa.email}"
-}
-
-# secretmanager.admin needed for create_secret() — no narrower project-level role exists
+# Grant Orchestrator SA permissions to create, update IAM on, list, and delete
+# runtime-managed secrets. Runtime paths in backend/app/compute.py and
+# backend/app/secrets_manager.py provision per-agent credentials and user token
+# secrets dynamically, so secretVersionAdder is insufficient here.
 resource "google_project_iam_member" "orchestrator_secret_creator" {
   project = var.project_id
   role    = "roles/secretmanager.admin"
@@ -75,9 +76,9 @@ resource "google_service_account_iam_member" "orchestrator_act_as_agent" {
 # Artifact Bucket (payloads, credentials, screenshots)
 # ------------------------------------------------------------------------------
 resource "google_storage_bucket" "artifacts" {
-  name          = "${var.project_id}-agent-artifacts"
-  location      = var.region
-  force_destroy = false
+  name                        = "${var.project_id}-agent-artifacts"
+  location                    = var.region
+  force_destroy               = false
   uniform_bucket_level_access = true
 
   lifecycle_rule {
@@ -98,4 +99,27 @@ resource "google_storage_bucket_iam_member" "agent_bucket_reader" {
   bucket = google_storage_bucket.artifacts.name
   role   = "roles/storage.objectViewer"
   member = "serviceAccount:${google_service_account.agent_sa.email}"
+}
+
+# ------------------------------------------------------------------------------
+# Migrator service account — used only by infra/migrate-alloydb-to-cloudsql.sh
+# to run pg_dump/pg_restore on a transient migrator VM. Has read access to
+# both DB password secrets and nothing else.
+# ------------------------------------------------------------------------------
+resource "google_service_account" "migrator_sa" {
+  account_id   = "migrator-sa"
+  display_name = "DB Migrator SA (transient, used during AlloyDB→Cloud SQL cutover)"
+}
+
+resource "google_secret_manager_secret_iam_member" "migrator_alloydb_password_access" {
+  secret_id = google_secret_manager_secret.db_password_secret.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.migrator_sa.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "migrator_cloud_sql_password_access" {
+  count     = var.use_cloud_sql ? 1 : 0
+  secret_id = google_secret_manager_secret.cloud_sql_db_password_secret[0].id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.migrator_sa.email}"
 }

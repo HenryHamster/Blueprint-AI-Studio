@@ -27,8 +27,9 @@ ZONE=$ZONE
 ORCHESTRATOR_URL=$ORCHESTRATOR_URL
 ORCHESTRATOR_SA=$ORCHESTRATOR_SA
 ARTIFACT_BUCKET=$ARTIFACT_BUCKET
-ALLOYDB_IP=$ALLOYDB_IP
-ALLOYDB_PW_SECRET=$ALLOYDB_PW_SECRET
+USE_CLOUD_SQL=${USE_CLOUD_SQL:-false}
+DB_IP=$DB_IP
+DB_PW_SECRET=$DB_PW_SECRET
 ADMIN_API_KEY=$ADMIN_API_KEY
 EOF
 }
@@ -36,6 +37,11 @@ EOF
 load_config() {
   if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
+    USE_CLOUD_SQL="${USE_CLOUD_SQL:-false}"
+    # Backward compatibility for .setup-config files written before the
+    # AlloyDB/Cloud SQL-neutral DB_* keys were introduced.
+    DB_IP="${DB_IP:-${ALLOYDB_IP:-}}"
+    DB_PW_SECRET="${DB_PW_SECRET:-${ALLOYDB_PW_SECRET:-}}"
     return 0
   fi
   return 1
@@ -214,6 +220,7 @@ if [ -z "$SKIP_TERRAFORM" ]; then
     secretmanager.googleapis.com \
     artifactregistry.googleapis.com \
     alloydb.googleapis.com \
+    sqladmin.googleapis.com \
     servicenetworking.googleapis.com \
     iam.googleapis.com \
     iamcredentials.googleapis.com \
@@ -227,15 +234,24 @@ if [ -z "$SKIP_TERRAFORM" ]; then
 
   terraform init -input=false
 
-  TF_VARS="-var=project_id=$PROJECT_ID -var=region=$REGION -var=zone=$ZONE"
+  USE_CLOUD_SQL="${USE_CLOUD_SQL:-false}"
+  TF_VARS="-var=project_id=$PROJECT_ID -var=region=$REGION -var=zone=$ZONE -var=use_cloud_sql=$USE_CLOUD_SQL"
 
   terraform apply -auto-approve $TF_VARS || warn "Terraform apply had errors (may be OK on re-run, continuing...)"
 
   ORCHESTRATOR_URL=$(terraform output -raw orchestrator_url 2>/dev/null || echo "")
   ARTIFACT_BUCKET=$(terraform output -raw artifact_bucket_name 2>/dev/null || echo "")
   ORCHESTRATOR_SA=$(terraform output -raw orchestrator_service_account 2>/dev/null || echo "")
-  ALLOYDB_IP=$(terraform output -raw alloydb_ip_address 2>/dev/null || echo "")
-  ALLOYDB_PW_SECRET=$(terraform output -raw alloydb_password_secret_id 2>/dev/null || echo "")
+  if [[ "$USE_CLOUD_SQL" == "true" ]]; then
+    DB_IP=$(terraform output -raw cloud_sql_ip_address 2>/dev/null || echo "")
+    DB_PW_SECRET=$(terraform output -raw cloud_sql_password_secret_id 2>/dev/null || echo "")
+    DB_LABEL="Cloud SQL"
+  else
+    DB_IP=$(terraform output -raw alloydb_ip_address 2>/dev/null || echo "")
+    DB_PW_SECRET=$(terraform output -raw alloydb_password_secret_id 2>/dev/null || echo "")
+    DB_LABEL="AlloyDB"
+  fi
+  echo "Using $DB_LABEL at $DB_IP"
 
   if [ -z "$ORCHESTRATOR_URL" ]; then
     fail "Could not read orchestrator_url from Terraform outputs."
@@ -249,8 +265,21 @@ fi
 
 info "Setting up secrets in Secret Manager..."
 
-ALLOYDB_PASSWORD=$(gcloud secrets versions access latest --secret="$ALLOYDB_PW_SECRET" --project="$PROJECT_ID")
-DATABASE_URL="postgresql+asyncpg://postgres:${ALLOYDB_PASSWORD}@${ALLOYDB_IP}:5432/postgres"
+urlencode() {
+  python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+DB_PASSWORD=$(gcloud secrets versions access latest --secret="$DB_PW_SECRET" --project="$PROJECT_ID")
+ENCODED_DB_PASSWORD=$(urlencode "$DB_PASSWORD")
+if [[ "$USE_CLOUD_SQL" == "true" ]]; then
+  DATABASE_URL="postgresql+asyncpg://postgres:${ENCODED_DB_PASSWORD}@${DB_IP}:5432/postgres?ssl=require"
+else
+  # AlloyDB also requires TLS — append ?ssl=require so asyncpg uses the
+  # request-rather-than-opportunistic SSL mode (mirrors Cloud SQL above).
+  DATABASE_URL="postgresql+asyncpg://postgres:${ENCODED_DB_PASSWORD}@${DB_IP}:5432/postgres?ssl=require"
+fi
+DB_PASSWORD=""
+ENCODED_DB_PASSWORD=""
 
 create_secret_if_missing() {
   local name=$1 value=$2

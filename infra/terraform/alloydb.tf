@@ -60,6 +60,21 @@ resource "google_alloydb_instance" "primary" {
     cpu_count = 2 # Minimum vCPUs for AlloyDB
   }
 
+  # Enforce encrypted-only client connections at the cluster boundary so a
+  # misconfigured client can't silently downgrade to plaintext (mirrors the
+  # `ssl_mode = ENCRYPTED_ONLY` posture in cloud_sql.tf). The
+  # client_connection_config block landed in google provider 5.16+; the
+  # provider in .terraform.lock.hcl is 5.45.2, so this is supported.
+  # Enabling alloydb.iam_authentication is defense-in-depth: it permits
+  # IAM-based auth alongside the existing password path without forcing
+  # rotation of the generated credential.
+  client_connection_config {
+    require_connectors = false
+    ssl_config {
+      ssl_mode = "ENCRYPTED_ONLY"
+    }
+  }
+
   # pgaudit logs DDL, role, and write statements (skips SELECT to keep log
   # volume sane). Enabling the extension requires an instance restart on
   # first apply. password.enforce_complexity gates future CREATE/ALTER ROLE
@@ -68,6 +83,7 @@ resource "google_alloydb_instance" "primary" {
     "alloydb.enable_pgaudit"      = "on"
     "pgaudit.log"                 = "ddl,role,write"
     "password.enforce_complexity" = "on"
+    "alloydb.iam_authentication"  = "on"
   }
 }
 
