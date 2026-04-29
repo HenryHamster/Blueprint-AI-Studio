@@ -76,6 +76,8 @@ interface DirectionProgress {
   review_quality?: { reviews_dismissed?: number; reviews_overridden?: number; user_issues_caught?: number } | null;
   stage_dropout?: Record<string, number> | null;
   recent_failure_titles?: string[] | null;
+  history_aggregate?: { total_autonomous_prs_merged?: number | null; total_operator_actions?: number | null; [key: string]: unknown } | null;
+  research_history?: Array<{ autonomous_prs_merged?: number | null; operator_action_count?: number | null; [key: string]: unknown }> | null;
 }
 
 interface FailureGroupTask {
@@ -847,6 +849,15 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const hasAttribution = directions.some(d => d.autonomous_prs_merged != null || d.assisted_prs_merged != null);
   const totalAutonomousPRs = hasAttribution ? directions.reduce((s, d) => s + (d.autonomous_prs_merged ?? 0), 0) : null;
   const totalAssistedPRs = hasAttribution ? directions.reduce((s, d) => s + (d.assisted_prs_merged ?? 0), 0) : null;
+  const selfSufficientCount = directions.filter(d => {
+    const history = d.research_history ?? [];
+    const histHasAttrib = history.some(e => e.autonomous_prs_merged != null);
+    const lifetimeAutonomous = histHasAttrib
+      ? history.reduce((s, e) => s + (e.autonomous_prs_merged ?? 0), 0) + ((d.history_aggregate?.total_autonomous_prs_merged as number | null) ?? 0)
+      : null;
+    const operatorActions = (d.history_aggregate?.total_operator_actions as number | null) ?? null;
+    return (lifetimeAutonomous ?? 0) >= 10 && operatorActions === 0;
+  }).length;
   const productPct = digest?.overall_product_ratio != null ? Math.round(digest.overall_product_ratio * 100) : null;
 
   return (
@@ -1275,6 +1286,14 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                       <span className="text-emerald-400">{totalAutonomousPRs ?? 0} autonomous</span>
                       <span className="text-neutral-600">·</span>
                       <span className="text-blue-400">{totalAssistedPRs ?? 0} assisted</span>
+                    </>
+                  )}
+                  {directions.length > 0 && (
+                    <>
+                      <span className="text-neutral-600">&middot;</span>
+                      <span className={selfSufficientCount === 0 ? 'text-neutral-500' : 'text-emerald-400'}>
+                        Self-sufficient: {selfSufficientCount} / {directions.length}
+                      </span>
                     </>
                   )}
                   <CalibrationChip

@@ -1637,6 +1637,7 @@ async def _compute_digest(
                 prs_merged = 0
                 autonomous_prs_merged = 0
                 assisted_prs_merged = 0
+                operator_action_count = 0
                 prs_rejected = 0
                 findings_tasks_created = 0
                 merge_time_values: List[float] = []
@@ -1669,6 +1670,7 @@ async def _compute_digest(
                         # Legacy fallback: pre-attribution entries lack autonomous_prs_merged.
                         autonomous_prs_merged += entry.get("autonomous_prs_merged", entry.get("prs_merged")) or 0
                         assisted_prs_merged += entry.get("assisted_prs_merged", 0) or 0
+                        operator_action_count += entry.get("operator_action_count", 0) or 0
                         prs_rejected += entry.get("prs_rejected") or 0
                         dir_reviews_dismissed += entry.get("reviews_dismissed") or 0
                         dir_reviews_overridden += entry.get("reviews_overridden") or 0
@@ -1805,6 +1807,15 @@ async def _compute_digest(
                 lifetime_conversion_rate = (
                     round(lifetime_prs_merged / lifetime_tasks_created, 3) if lifetime_tasks_created > 0 else None
                 )
+                lifetime_autonomous_prs_merged = (
+                    sum(h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in _history_all)
+                    + (_agg.get("total_autonomous_prs_merged") or 0)
+                )
+                lifetime_operator_actions = (
+                    sum(h.get("operator_action_count", 0) for h in _history_all)
+                    + (_agg.get("total_operator_actions") or 0)
+                )
+                retirement_eligible = lifetime_autonomous_prs_merged >= 10 and lifetime_operator_actions == 0
 
                 direction_text = (d.get("text") or d.get("description") or "")[:80]
                 total_prs = prs_merged + prs_rejected
@@ -1928,6 +1939,7 @@ async def _compute_digest(
                     "prs_merged": prs_merged,
                     "autonomous_prs_merged": autonomous_prs_merged,
                     "assisted_prs_merged": assisted_prs_merged,
+                    "operator_action_count": operator_action_count,
                     "prs_rejected": prs_rejected,
                     "acceptance_rate": acceptance_rate,
                     "conversion_rate": conversion_rate,
@@ -1970,6 +1982,9 @@ async def _compute_digest(
                     "lifetime_prs_rejected": lifetime_prs_rejected,
                     "lifetime_tasks_failed": lifetime_tasks_failed,
                     "lifetime_conversion_rate": lifetime_conversion_rate,
+                    "lifetime_autonomous_prs_merged": lifetime_autonomous_prs_merged,
+                    "lifetime_operator_actions": lifetime_operator_actions,
+                    "retirement_eligible": retirement_eligible,
                     "review_quality": {
                         "reviews_dismissed": dir_reviews_dismissed,
                         "reviews_overridden": dir_reviews_overridden,
@@ -2707,6 +2722,9 @@ async def _compute_digest(
         round(_pipeline_total_merged_d / _pipeline_total_created_d, 3)
         if _pipeline_total_created_d > 0 else None
     )
+    pipeline_autonomous_prs_merged = sum(d.get("autonomous_prs_merged") or 0 for d in direction_progress_list)
+    pipeline_assisted_prs_merged = sum(d.get("assisted_prs_merged") or 0 for d in direction_progress_list)
+    pipeline_operator_action_count = sum(d.get("operator_action_count") or 0 for d in direction_progress_list)
     overall_type_distribution: Dict[str, int] = {}
     for d in direction_progress_list:
         for ttype, cnt in (d.get("type_distribution") or {}).items():
@@ -3662,6 +3680,9 @@ async def _compute_digest(
         "prev_scope_conversion_rates": prev_scope_conversion_rates or None,
         "pipeline_acceptance_rate": pipeline_acceptance_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
+        "pipeline_autonomous_prs_merged": pipeline_autonomous_prs_merged,
+        "pipeline_assisted_prs_merged": pipeline_assisted_prs_merged,
+        "pipeline_operator_action_count": pipeline_operator_action_count,
         "pipeline_filter_funnel": pipeline_filter_funnel or None,
         "scope_mismatch_summary": scope_mismatch_summary,
         "escalation_outcome_summary": escalation_outcome_summary,

@@ -7,6 +7,8 @@ Covers:
   - operator_rejection_rate calculation in _spawn_strategic_review direction stats
   - Active-task guard: _spawn_design_doc_update and _spawn_strategic_review return False when blocked
   - _build_shipped_changes_manifest: cutoff, filtering, grouping, cap
+  - Autonomy fields (lifetime_autonomous_prs_merged, lifetime_operator_actions, retirement_eligible)
+    in directions_summary for the strategic agent
 """
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -15,6 +17,7 @@ import pytest
 from unittest.mock import AsyncMock
 from sqlalchemy import select
 
+import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
 import app.shared_state as _shared_state
 from app.models import Project, Task, TaskStatus, RECOMMENDED_MODE_META_KEY
 from app.autonomous_research import _spawn_research_task
@@ -490,6 +493,73 @@ async def test_operator_rejection_rate_zero_rejected_in_history_aggregate(db_ses
 
     assert "operator_rejection_rate" not in d_stat
     assert "prs_rejected" not in d_stat
+
+
+@pytest.mark.asyncio
+async def test_retirement_eligibility_fields_in_direction_stats(db_session):
+    """lifetime_autonomous_prs_merged, lifetime_operator_actions, and retirement_eligible are set on each direction stat."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-ret-eligible",
+                "status": "active",
+                "text": "Eligible direction",
+                "priority": "high",
+                # 2 explicit autonomous + 2 legacy fallback = 4 from history; 7 from aggregate → total 11
+                "research_history": [
+                    {"autonomous_prs_merged": 2, "prs_merged": 2, "operator_action_count": 0},
+                    {"prs_merged": 2},  # legacy: no autonomous_prs_merged, falls back to prs_merged
+                ],
+                "history_aggregate": {"total_autonomous_prs_merged": 7, "total_operator_actions": 0},
+            },
+            {
+                "id": "d-ret-ineligible-ops",
+                "status": "active",
+                "text": "Ineligible: has operator actions",
+                "priority": "medium",
+                "research_history": [
+                    {"autonomous_prs_merged": 15, "prs_merged": 15, "operator_action_count": 1},
+                ],
+                "history_aggregate": {"total_autonomous_prs_merged": 0, "total_operator_actions": 0},
+            },
+            {
+                "id": "d-ret-ineligible-count",
+                "status": "active",
+                "text": "Ineligible: not enough autonomous merges",
+                "priority": "low",
+                "research_history": [
+                    {"autonomous_prs_merged": 5, "prs_merged": 5, "operator_action_count": 0},
+                ],
+                "history_aggregate": {"total_autonomous_prs_merged": 4, "total_operator_actions": 0},
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    by_id = {s["id"]: s for s in payload["directions_summary"]}
+
+    eligible = by_id["d-ret-eligible"]
+    assert eligible["lifetime_autonomous_prs_merged"] == 11  # 2 + 2 (fallback) + 7
+    assert eligible["lifetime_operator_actions"] == 0
+    assert eligible["retirement_eligible"] is True
+
+    ineligible_ops = by_id["d-ret-ineligible-ops"]
+    assert ineligible_ops["lifetime_operator_actions"] == 1
+    assert ineligible_ops["retirement_eligible"] is False
+
+    ineligible_count = by_id["d-ret-ineligible-count"]
+    assert ineligible_count["lifetime_autonomous_prs_merged"] == 9  # 5 + 4
+    assert ineligible_count["retirement_eligible"] is False
 
 
 @pytest.mark.asyncio

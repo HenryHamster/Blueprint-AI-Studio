@@ -1012,6 +1012,17 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (agg.get("total_prs_rejected") or 0)
         total_failed = sum(h.get("tasks_failed", 0) for h in history) + (agg.get("total_tasks_failed") or 0)
         total_failed_infra = sum(h.get("tasks_failed_infra", 0) for h in history) + (agg.get("total_tasks_failed_infra") or 0)
+        # Autonomy lifetime totals — legacy fallback treats prs_merged as autonomous
+        # (same interpretation as admin_digest.py and direction_metrics.py).
+        lifetime_autonomous = (
+            sum(h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history)
+            + (agg.get("total_autonomous_prs_merged") or 0)
+        )
+        lifetime_op_actions = (
+            sum(h.get("operator_action_count", 0) for h in history)
+            + (agg.get("total_operator_actions") or 0)
+        )
+        retirement_eligible = lifetime_autonomous >= 10 and lifetime_op_actions == 0
         taxonomy_totals: dict[str, int] = {}
         for h in history:
             for tkey, tval in (h.get("taxonomy_summary") or {}).items():
@@ -1038,6 +1049,9 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         if taxonomy_totals:
             stat_entry["taxonomy_summary"] = taxonomy_totals
         stat_entry["quality_score"] = round(_compute_direction_quality_score(d), 3)
+        stat_entry["lifetime_autonomous_prs_merged"] = lifetime_autonomous
+        stat_entry["lifetime_operator_actions"] = lifetime_op_actions
+        stat_entry["retirement_eligible"] = retirement_eligible
         if total_rejected > 0:
             stat_entry["prs_rejected"] = total_rejected
         if operator_rejection_rate is not None and total_rejected > 0:

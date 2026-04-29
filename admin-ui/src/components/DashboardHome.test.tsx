@@ -24,6 +24,10 @@ vi.mock('./RecentErrorsWidget', () => ({
   RecentErrorsWidget: () => <div data-testid="recent-errors-widget">RecentErrorsWidget</div>,
 }));
 
+vi.mock('./TaskDurationWidget', () => ({
+  TaskDurationWidget: () => <div data-testid="task-duration-widget">TaskDurationWidget</div>,
+}));
+
 vi.mock('./DirectionAutoPauseWidget', () => ({
   DirectionAutoPauseWidget: (props: Record<string, unknown>) => {
     capturedProps.directionAutoPause = props;
@@ -745,6 +749,75 @@ describe('DashboardHome', () => {
       await screen.findByText('All systems healthy');
       const daProps = capturedProps.directionAutoPause ?? {};
       expect(daProps.selectedProjectId).toBe('proj-xyz');
+    });
+  });
+
+  describe('self-sufficient directions roll-up', () => {
+    const baseDigest = {
+      failed_count: 0,
+      pending_approval_count: 0,
+      completed_count: 0,
+      failure_groups: [],
+      recent_completions: [],
+    };
+
+    it('shows 0 / N when no directions meet threshold', async () => {
+      setupApiMocks({
+        digest: {
+          ...baseDigest,
+          direction_progress: [
+            { direction_id: 'd1', direction_text: 'Dir A', priority: 'high', cycles_in_window: 1, tasks_created: 2, prs_merged: 3, possibly_saturated: false },
+            { direction_id: 'd2', direction_text: 'Dir B', priority: 'low', cycles_in_window: 1, tasks_created: 1, prs_merged: 1, possibly_saturated: false },
+          ],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByText('Self-sufficient: 0 / 2')).toBeInTheDocument();
+    });
+
+    it('shows correct count when one direction is self-sufficient', async () => {
+      setupApiMocks({
+        digest: {
+          ...baseDigest,
+          direction_progress: [
+            {
+              direction_id: 'd1', direction_text: 'Dir A', priority: 'high', cycles_in_window: 1, tasks_created: 2, prs_merged: 12, possibly_saturated: false,
+              research_history: [{ autonomous_prs_merged: 12 }],
+              history_aggregate: { total_autonomous_prs_merged: 0, total_operator_actions: 0 },
+            },
+            { direction_id: 'd2', direction_text: 'Dir B', priority: 'low', cycles_in_window: 1, tasks_created: 1, prs_merged: 2, possibly_saturated: false },
+          ],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByText('Self-sufficient: 1 / 2')).toBeInTheDocument();
+    });
+
+    it('treats total_operator_actions undefined as null (not zero) when research_history has no attribution', async () => {
+      setupApiMocks({
+        digest: {
+          ...baseDigest,
+          direction_progress: [
+            {
+              direction_id: 'd1', direction_text: 'Dir A', priority: 'high', cycles_in_window: 1, tasks_created: 2, prs_merged: 12, possibly_saturated: false,
+              research_history: [{ autonomous_prs_merged: 12 }],
+              history_aggregate: { total_autonomous_prs_merged: 0 },
+            },
+          ],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      // total_operator_actions is undefined → null, so operatorActions === 0 is false → not self-sufficient
+      expect(await screen.findByText('Self-sufficient: 0 / 1')).toBeInTheDocument();
     });
   });
 

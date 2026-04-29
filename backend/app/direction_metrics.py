@@ -15,6 +15,8 @@ from app.failure_classification import (
     TAXONOMY_SCOPE_RELATED,
 )
 
+_AUTONOMY_RETIREMENT_THRESHOLD = 10  # autonomous merges required for retirement eligibility
+
 _HISTORY_AGG_DEFAULTS = {
     "total_cycles": 0,
     "total_tasks_created": 0,
@@ -249,6 +251,36 @@ def _compute_rolling_median_review_iterations(d: dict) -> float | None:
     if n % 2 == 1:
         return values[mid]
     return (values[mid - 1] + values[mid]) / 2.0
+
+
+def _compute_autonomy_threshold_state(d: dict) -> dict:
+    """Return lifetime autonomy state and retirement-eligibility for a direction.
+
+    Uses the same legacy fallback as admin_digest: pre-attribution research_history
+    entries (no ``autonomous_prs_merged`` key) treat all prs_merged as autonomous,
+    keeping CPM conservative for old data.
+
+    Returns a dict with:
+      - ``lifetime_autonomous_prs_merged`` (int)
+      - ``lifetime_operator_actions`` (int)
+      - ``retirement_eligible`` (bool): True iff >= _AUTONOMY_RETIREMENT_THRESHOLD
+        autonomous merges AND zero operator actions lifetime.
+    """
+    history = d.get("research_history") or []
+    agg = d.get("history_aggregate") or {}
+    lifetime_autonomous = (
+        sum(h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history)
+        + (agg.get("total_autonomous_prs_merged") or 0)
+    )
+    lifetime_operator_actions = (
+        sum(h.get("operator_action_count", 0) for h in history)
+        + (agg.get("total_operator_actions") or 0)
+    )
+    return {
+        "lifetime_autonomous_prs_merged": lifetime_autonomous,
+        "lifetime_operator_actions": lifetime_operator_actions,
+        "retirement_eligible": lifetime_autonomous >= _AUTONOMY_RETIREMENT_THRESHOLD and lifetime_operator_actions == 0,
+    }
 
 
 def _update_cycle_history(project: Any, cycle_id: str, updates: Dict[str, Any]) -> None:

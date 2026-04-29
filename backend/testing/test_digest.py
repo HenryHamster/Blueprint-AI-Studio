@@ -1515,6 +1515,153 @@ async def test_digest_direction_progress_lifetime_metrics(client: AsyncClient, d
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_retirement_eligibility(client: AsyncClient, db_session):
+    """lifetime_autonomous_prs_merged, lifetime_operator_actions, and retirement_eligible are computed correctly."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-eligible",
+                "text": "Eligible direction",
+                "status": "active",
+                # 4 autonomous from history (2 explicit + legacy fallback 2), aggregate adds 7 → total 11
+                "research_history": [
+                    {"timestamp": recent_ts, "autonomous_prs_merged": 2, "prs_merged": 2, "operator_action_count": 0, "tasks_created": 3},
+                    {"timestamp": old_ts, "prs_merged": 2, "tasks_created": 2},  # legacy: no autonomous_prs_merged, falls back to prs_merged
+                ],
+                "history_aggregate": {
+                    "total_cycles": 5,
+                    "total_tasks_created": 10,
+                    "total_prs_merged": 7,
+                    "total_autonomous_prs_merged": 7,
+                    "total_operator_actions": 0,
+                },
+            },
+            {
+                "id": "dir-ineligible-ops",
+                "text": "Ineligible: has operator actions",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "autonomous_prs_merged": 10, "prs_merged": 10, "operator_action_count": 1, "tasks_created": 10},
+                ],
+                "history_aggregate": {"total_cycles": 0, "total_prs_merged": 0, "total_autonomous_prs_merged": 0, "total_operator_actions": 0},
+            },
+            {
+                "id": "dir-ineligible-count",
+                "text": "Ineligible: not enough autonomous merges",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "autonomous_prs_merged": 5, "prs_merged": 5, "operator_action_count": 0, "tasks_created": 5},
+                ],
+                "history_aggregate": {"total_cycles": 0, "total_prs_merged": 0, "total_autonomous_prs_merged": 4, "total_operator_actions": 0},
+            },
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for dir_id in ("dir-eligible", "dir-ineligible-ops", "dir-ineligible-count"):
+        db_session.add(make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": dir_id},
+        ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    by_id = {dp["direction_id"]: dp for dp in response.json()["direction_progress"]}
+
+    eligible = by_id["dir-eligible"]
+    assert eligible["lifetime_autonomous_prs_merged"] == 11  # 2 + 2 (fallback) + 7
+    assert eligible["lifetime_operator_actions"] == 0
+    assert eligible["retirement_eligible"] is True
+
+    ineligible_ops = by_id["dir-ineligible-ops"]
+    assert ineligible_ops["lifetime_operator_actions"] == 1
+    assert ineligible_ops["retirement_eligible"] is False
+
+    ineligible_count = by_id["dir-ineligible-count"]
+    assert ineligible_count["lifetime_autonomous_prs_merged"] == 9  # 5 + 4
+    assert ineligible_count["retirement_eligible"] is False
+
+
+@pytest.mark.asyncio
+async def test_digest_retirement_eligibility_boundary_cases(client: AsyncClient, db_session):
+    """At-threshold (exactly 10, 0 ops → True) and above-threshold + operator action (12, 1 op → False)."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-at-threshold",
+                "text": "Exactly at threshold",
+                "status": "active",
+                # 4 from history + 6 from aggregate = 10 total, 0 operator actions
+                "research_history": [
+                    {"timestamp": recent_ts, "autonomous_prs_merged": 4, "prs_merged": 4, "operator_action_count": 0, "tasks_created": 4},
+                ],
+                "history_aggregate": {
+                    "total_cycles": 3,
+                    "total_tasks_created": 6,
+                    "total_prs_merged": 6,
+                    "total_autonomous_prs_merged": 6,
+                    "total_operator_actions": 0,
+                },
+            },
+            {
+                "id": "dir-above-with-ops",
+                "text": "Above threshold but has operator action",
+                "status": "active",
+                # 12 autonomous merges total, but 1 operator action → zero-tolerance blocks eligibility
+                "research_history": [
+                    {"timestamp": recent_ts, "autonomous_prs_merged": 6, "prs_merged": 6, "operator_action_count": 1, "tasks_created": 6},
+                ],
+                "history_aggregate": {
+                    "total_cycles": 3,
+                    "total_tasks_created": 6,
+                    "total_prs_merged": 6,
+                    "total_autonomous_prs_merged": 6,
+                    "total_operator_actions": 0,
+                },
+            },
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for dir_id in ("dir-at-threshold", "dir-above-with-ops"):
+        db_session.add(make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": dir_id},
+        ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    by_id = {dp["direction_id"]: dp for dp in response.json()["direction_progress"]}
+
+    at_threshold = by_id["dir-at-threshold"]
+    assert at_threshold["lifetime_autonomous_prs_merged"] == 10  # 4 + 6
+    assert at_threshold["lifetime_operator_actions"] == 0
+    assert at_threshold["retirement_eligible"] is True
+
+    above_with_ops = by_id["dir-above-with-ops"]
+    assert above_with_ops["lifetime_autonomous_prs_merged"] == 12  # 6 + 6
+    assert above_with_ops["lifetime_operator_actions"] == 1
+    assert above_with_ops["retirement_eligible"] is False  # zero-tolerance: any operator action blocks
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_sorted_by_cycles(client: AsyncClient, db_session):
     """direction_progress list is sorted by cycles_in_window descending."""
     project = make_project(
@@ -6140,6 +6287,145 @@ async def test_digest_needs_attention_approval_before_failed(client: AsyncClient
     assert len(items) == 2
     assert items[0]["reason"] == "approval_required"
     assert items[1]["reason"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_operator_action_count(client: AsyncClient, db_session):
+    """operator_action_count is summed from research_history entries within the window."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+    old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-1",
+                "text": "Direction A",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "prs_merged": 2, "autonomous_prs_merged": 1,
+                     "assisted_prs_merged": 1, "operator_action_count": 3},
+                    {"timestamp": old_ts, "prs_merged": 5, "operator_action_count": 10},
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-1"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    dp = data["direction_progress"][0]
+    assert dp["operator_action_count"] == 3  # only recent entry
+    assert dp["autonomous_prs_merged"] == 1
+    assert dp["assisted_prs_merged"] == 1
+
+
+@pytest.mark.asyncio
+async def test_digest_pipeline_autonomy_totals(client: AsyncClient, db_session):
+    """pipeline_autonomous_prs_merged, pipeline_assisted_prs_merged, pipeline_operator_action_count
+    are sums across active directions in the window."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-a",
+                "text": "Direction A",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "prs_merged": 2,
+                     "autonomous_prs_merged": 2, "assisted_prs_merged": 0, "operator_action_count": 1},
+                ],
+            },
+            {
+                "id": "dir-b",
+                "text": "Direction B",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts, "prs_merged": 1,
+                     "autonomous_prs_merged": 0, "assisted_prs_merged": 1, "operator_action_count": 2},
+                ],
+            },
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for did in ["dir-a", "dir-b"]:
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Task {did}",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": did},
+        ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["pipeline_autonomous_prs_merged"] == 2
+    assert data["pipeline_assisted_prs_merged"] == 1
+    assert data["pipeline_operator_action_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_digest_pipeline_autonomy_legacy_fallback(client: AsyncClient, db_session):
+    """Legacy entries lacking autonomous_prs_merged are counted as autonomous (fallback)."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-legacy",
+                "text": "Legacy direction",
+                "status": "active",
+                "research_history": [
+                    # No autonomous_prs_merged key — legacy pre-attribution entry
+                    {"timestamp": recent_ts, "prs_merged": 4},
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Legacy task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-legacy"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    dp = data["direction_progress"][0]
+    # Legacy fallback: autonomous = prs_merged, assisted = 0
+    assert dp["autonomous_prs_merged"] == 4
+    assert dp["assisted_prs_merged"] == 0
+    assert dp["operator_action_count"] == 0
+    assert data["pipeline_autonomous_prs_merged"] == 4
+    assert data["pipeline_assisted_prs_merged"] == 0
+    assert data["pipeline_operator_action_count"] == 0
 
 
 @pytest.mark.asyncio

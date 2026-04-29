@@ -2619,3 +2619,70 @@ def test_fold_evicted_attribution_accumulates_on_prior_agg():
     assert agg["total_autonomous_prs_merged"] == 5  # 4 + 1
     assert agg["total_assisted_prs_merged"] == 2    # 1 + 1
     assert agg["total_operator_actions"] == 2        # 1 + 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute_direction_autonomy_state
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_autonomy_state_below_threshold():
+    from app.direction_outcomes import compute_direction_autonomy_state
+    d = {
+        "research_history": [
+            {"autonomous_prs_merged": 3, "operator_action_count": 0},
+            {"autonomous_prs_merged": 5, "operator_action_count": 0},
+        ],
+    }
+    result = compute_direction_autonomy_state(d)
+    assert result["lifetime_autonomous_prs_merged"] == 8
+    assert result["lifetime_operator_actions"] == 0
+    assert result["retirement_eligible"] is False
+
+
+def test_autonomy_state_at_threshold():
+    from app.direction_outcomes import compute_direction_autonomy_state
+    d = {"research_history": [{"autonomous_prs_merged": 10, "operator_action_count": 0}]}
+    result = compute_direction_autonomy_state(d)
+    assert result["lifetime_autonomous_prs_merged"] == 10
+    assert result["lifetime_operator_actions"] == 0
+    assert result["retirement_eligible"] is True
+
+
+def test_autonomy_state_above_threshold_from_aggregate():
+    from app.direction_outcomes import compute_direction_autonomy_state
+    d = {
+        "research_history": [],
+        "history_aggregate": {"total_autonomous_prs_merged": 12, "total_operator_actions": 0},
+    }
+    result = compute_direction_autonomy_state(d)
+    assert result["lifetime_autonomous_prs_merged"] == 12
+    assert result["retirement_eligible"] is True
+
+
+def test_autonomy_state_operator_action_blocks_eligibility():
+    """12 autonomous merges but 1 operator action — must NOT be retirement-eligible."""
+    from app.direction_outcomes import compute_direction_autonomy_state
+    d = {"research_history": [{"autonomous_prs_merged": 12, "operator_action_count": 1}]}
+    result = compute_direction_autonomy_state(d)
+    assert result["lifetime_autonomous_prs_merged"] == 12
+    assert result["lifetime_operator_actions"] == 1
+    assert result["retirement_eligible"] is False
+
+
+def test_autonomy_state_legacy_fallback_treats_prs_merged_as_autonomous():
+    """Pre-attribution entries without autonomous_prs_merged fall back to prs_merged."""
+    from app.direction_outcomes import compute_direction_autonomy_state
+    d = {"research_history": [{"prs_merged": 5}]}  # no autonomous_prs_merged key
+    result = compute_direction_autonomy_state(d)
+    assert result["lifetime_autonomous_prs_merged"] == 5
+
+
+def test_autonomy_state_combines_history_and_aggregate():
+    from app.direction_outcomes import compute_direction_autonomy_state
+    d = {
+        "research_history": [{"autonomous_prs_merged": 3, "operator_action_count": 0}],
+        "history_aggregate": {"total_autonomous_prs_merged": 7, "total_operator_actions": 0},
+    }
+    result = compute_direction_autonomy_state(d)
+    assert result["lifetime_autonomous_prs_merged"] == 10
+    assert result["retirement_eligible"] is True
