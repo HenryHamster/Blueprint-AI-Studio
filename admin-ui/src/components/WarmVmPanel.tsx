@@ -225,8 +225,12 @@ function VmRow({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId: string
         ) : (
           <div className="space-y-0.5">
             {vm.warm_pinned_queued.map((p) => {
+              // ageSecs is Math.max(0, now - deadline): a positive value means
+              // the deadline has already passed.  Avoid an inline Date.now()
+              // call here — the lint rule blocks impure functions in render,
+              // and we already encode the comparison via the helper.
               const dlAge = ageSecs(p.warm_handoff_deadline);
-              const expired = dlAge !== null && dlAge >= 0 && p.warm_handoff_deadline && new Date(p.warm_handoff_deadline).getTime() < Date.now();
+              const expired = dlAge !== null && dlAge > 0;
               return (
                 <button
                   key={p.id}
