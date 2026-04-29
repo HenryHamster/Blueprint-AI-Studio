@@ -109,7 +109,12 @@ def _heartbeat_stale_cutoff(task, now: datetime) -> datetime:
 
 
 async def _task_has_open_pr(task, session) -> tuple[bool, int | None]:
-    """Check whether a task already published a PR that's still open.
+    """Check whether a task has a PULL_REQUEST artifact (PR was published).
+
+    NOTE: Despite the name, this only checks the Artifact table — it does
+    NOT verify the PR is still open on GitHub. The PR may have been closed
+    or merged out-of-band. Callers that act on "open" must re-confirm via
+    get_pull_request before parking the task in EVALUATING.
 
     Used by the reaper: a task that pushed a branch and opened a PR before
     being reaped should hand off to the review pipeline (EVALUATING) rather
@@ -117,8 +122,7 @@ async def _task_has_open_pr(task, session) -> tuple[bool, int | None]:
     existing branch and be refused by the agent's stale-branch guard
     (agent/src/index.ts:706), orphaning the PR.
 
-    Source of truth is the Artifact table: the backend writes a
-    PULL_REQUEST artifact atomically with PR creation (see
+    The Artifact table is written atomically with PR creation (see
     routers/agent.py:2035). Returns (True, pr_number) on match.
     """
     stmt = select(Artifact).where(
@@ -714,8 +718,81 @@ async def reaper_service():
                     # pipeline instead — review/fix iteration + the existing
                     # 6h EVALUATING hard timeout (services.py:807) + the 16-iter
                     # review-fix cap guarantee termination.
-                    _has_open_pr, _pr_num = await _task_has_open_pr(task, session)
-                    if _has_open_pr and _pr_num:
+                    _has_pr_artifact, _pr_num = await _task_has_open_pr(task, session)
+                    # Artifact existence is necessary but not sufficient: the PR
+                    # may have been closed (operator rejection / empty rollup) or
+                    # merged out-of-band before the reaper got here. Confirm the
+                    # actual GitHub state — handing off a closed PR to the review
+                    # pipeline wedges the task in EVALUATING since review can't
+                    # act on a closed PR.
+                    _gh_pr_state: str | None = None
+                    _gh_pr_merged: bool = False
+                    if _has_pr_artifact and _pr_num:
+                        try:
+                            from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+                            from app.github import get_pull_request  # noqa: PLC0415
+                            _gh_token, _gh_owner, _gh_repo = await get_github_token_for_task(task.id, session)
+                            _pr_data = await get_pull_request(_gh_token, _gh_owner, _gh_repo, _pr_num)
+                            _gh_pr_state = _pr_data.get("state")
+                            _gh_pr_merged = bool(_pr_data.get("merged"))
+                        except Exception as _gh_exc:
+                            # GH API unreachable: fall back to current behavior
+                            # (assume open and hand off). One transient error
+                            # shouldn't strand the task as FAILED.
+                            logger.warning(
+                                f"[REAPER] PR-state lookup failed for task {task.id} PR #{_pr_num}: "
+                                f"{type(_gh_exc).__name__}: {_gh_exc} — assuming open",
+                                exc_info=True,
+                            )
+                            _gh_pr_state = "open"
+                    _pr_actually_open = _has_pr_artifact and _pr_num and _gh_pr_state == "open"
+
+                    if _has_pr_artifact and _pr_num and _gh_pr_state == "closed" and _gh_pr_merged:
+                        # PR merged out-of-band: completion-processing didn't run
+                        # (agent died before reporting). Mark the task COMPLETED
+                        # so the rollup parent and downstream review/fix tasks
+                        # see the merge.
+                        logger.info(
+                            f"[REAPER] Task {task.id} reaped mid-run; PR #{_pr_num} already merged — "
+                            f"marking COMPLETED"
+                        )
+                        task.status = TaskStatus.COMPLETED
+                        task.vm_instance_id = None
+                        task.last_heartbeat = None
+                        task.latest_status_message = (
+                            f"Reaped mid-run; PR #{_pr_num} was merged out-of-band"
+                        )
+                        task.context = {**(task.context or {}), "pr_merged": True}
+                        session.add(task)
+                        await broadcast_to_project(
+                            str(task.project_id),
+                            "task_updated",
+                            {"task_id": str(task.id), "status": task.status}
+                        )
+                    elif _has_pr_artifact and _pr_num and _gh_pr_state == "closed" and not _gh_pr_merged:
+                        # PR closed without merging (operator rejection / empty
+                        # rollup short-circuit / review-pipeline rejection).
+                        # Don't hand off to review — review can't act on a closed
+                        # PR. Mark FAILED with the closure marker so Step 5's
+                        # resurrection sweep skips it.
+                        logger.info(
+                            f"[REAPER] Task {task.id} reaped mid-run; PR #{_pr_num} closed without merge — "
+                            f"marking FAILED"
+                        )
+                        task.status = TaskStatus.FAILED
+                        task.vm_instance_id = None
+                        task.last_heartbeat = None
+                        task.latest_status_message = (
+                            f"Reaped mid-run; PR #{_pr_num} was closed without merging"
+                        )
+                        task.context = {**(task.context or {}), "pr_closed_unmerged": True}
+                        session.add(task)
+                        await broadcast_to_project(
+                            str(task.project_id),
+                            "task_updated",
+                            {"task_id": str(task.id), "status": task.status}
+                        )
+                    elif _pr_actually_open:
                         # Provision failures can't publish a PR (agent never ran),
                         # so class_budget/reap_failure_class are only bound when
                         # the agent-error branch above ran. Guard the format args.
@@ -1224,6 +1301,19 @@ async def reaper_service():
                         if _fail_cat not in INFRA_CLASSES:
                             continue
                         if _ctx.get("_resurrection_count", 0) >= 1:
+                            continue
+                        # Skip terminal PR-closure outcomes. classify_failure routes
+                        # "closed without merging" / empty-rollup closures into
+                        # EXTERNAL_API (it shares the merge-blocking GitHub bank),
+                        # but operator rejection and empty-rollup short-circuit are
+                        # not infrastructure failures — re-running produces the same
+                        # rejected/empty PR. Mirrors the closure markers documented
+                        # in services._pr_possibly_open.
+                        if (
+                            _ctx.get("pr_closed_unmerged") is True
+                            or _ctx.get("pr_closed_empty") is True
+                            or _ctx.get("pr_rejected") is True
+                        ):
                             continue
                         # Skip parents — they must re-evaluate via _requeue_parent_task, not
                         # resurrect as leaf dispatches.

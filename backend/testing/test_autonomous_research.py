@@ -1906,6 +1906,100 @@ async def test_medium_scope_cross_module_related_files_auto_decomposes(db_sessio
 
 
 @pytest.mark.asyncio
+async def test_auto_decomposed_siblings_are_chained_via_depends_on(db_session, mocker, monkeypatch):
+    """Decomposed sibling tasks of one finding chain via depends_on so they run
+    serially, not in parallel.
+
+    Reproduces the dcd6e840 failure shape: a coupled feature change auto-split
+    into per-file siblings ran in parallel, and later siblings saw partial
+    sibling-merged scaffolding in their base branch instead of the actual
+    implementation. Sequential execution lets each agent work against the
+    actually-merged state of prior siblings."""
+    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    direction = _active_direction("d-chain01", "Sibling-chain direction")
+    project = Project(
+        name="Sibling Chain Test", user_id="test-user-123",
+        autonomous_enabled=True, directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    # 3-module finding triggers top-level-dir auto-decomposition (3 siblings).
+    finding = _make_finding("Coupled cross-module change", direction["id"], scope="medium")
+    finding["related_files"] = [
+        "backend/app/foo.py",
+        "agent/src/bar.ts",
+        "admin-ui/src/baz.tsx",
+    ]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        .order_by(Task.created_at)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 3
+
+    # All three are auto-decomposed siblings of the same parent finding.
+    assert all((ct.payloads[0]["type"] == "create") for ct in child_tasks)
+
+    # Chain: first sibling free, second depends on first, third depends on second.
+    assert list(child_tasks[0].depends_on or []) == []
+    assert list(child_tasks[1].depends_on or []) == [str(child_tasks[0].id)]
+    assert list(child_tasks[2].depends_on or []) == [str(child_tasks[1].id)]
+
+
+@pytest.mark.asyncio
+async def test_non_decomposed_siblings_do_not_chain(db_session, mocker, monkeypatch):
+    """Two unrelated findings produce two unrelated tasks — no chain dependency.
+    Only auto-decomposed sibling groups should chain; independent findings
+    stay parallel."""
+    monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})
+    direction = _active_direction("d-nochn01", "Independent findings direction")
+    project = Project(
+        name="No-Chain Test", user_id="test-user-123",
+        autonomous_enabled=True, directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    f1 = _make_finding("Bug A", direction["id"], scope="small")
+    f1["related_files"] = ["backend/app/a.py"]
+    f2 = _make_finding("Bug B", direction["id"], scope="small")
+    f2["related_files"] = ["backend/app/b.py"]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[f1, f2],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.parent_task_id == task.id)
+        .order_by(Task.created_at)
+    )
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 2
+    assert list(child_tasks[0].depends_on or []) == []
+    assert list(child_tasks[1].depends_on or []) == []
+
+
+@pytest.mark.asyncio
 async def test_medium_scope_expansion_ratio_prediction_upgrades_to_large(db_session, mocker, monkeypatch):
     """Medium finding with 4 related_files x 3.0 avg_expansion_ratio predicts >10 → upgrade."""
     monkeypatch.setitem(_shared_state.runtime_config, "pipeline_scope_baseline_rates", {})

@@ -1903,6 +1903,88 @@ async def test_step5_resurrection_creates_info_alert(
     assert "PROVISION_FAILURE" in (alerts[0].message or "")
 
 
+@pytest.mark.asyncio
+async def test_step5_pr_closed_unmerged_skips_resurrection(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """FAILED + EXTERNAL_API + pr_closed_unmerged=True → NOT resurrected.
+    Operator-rejected PRs share the merge-blocking 'closed without merging'
+    classification but are terminal, not infrastructure. Re-running produces
+    the same rejected code."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        attempt_count=2,
+        context={
+            "failure_category": "EXTERNAL_API",
+            "pr_closed_unmerged": True,
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED
+    assert "_resurrection_count" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_step5_pr_closed_empty_skips_resurrection(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Empty-rollup short-circuit closure → NOT resurrected. The branch was
+    equivalent to base; re-running produces the same empty PR."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        attempt_count=2,
+        context={
+            "failure_category": "EXTERNAL_API",
+            "pr_closed_empty": True,
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED
+    assert "_resurrection_count" not in (t.context or {})
+
+
+@pytest.mark.asyncio
+async def test_step5_pr_rejected_skips_resurrection(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Review-pipeline rejection (pr_rejected) → NOT resurrected."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        attempt_count=2,
+        context={
+            "failure_category": "EXTERNAL_API",
+            "pr_rejected": True,
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED
+    assert "_resurrection_count" not in (t.context or {})
+
+
 # ── Dependent-task unblocking on terminal failure ────────────────────────
 
 
@@ -2643,3 +2725,209 @@ async def test_terminal_reap_without_pr_still_fails(
     await reaper_db.refresh(t)
 
     assert t.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_reap_with_closed_unmerged_pr_marks_failed(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Reap with PR artifact + GitHub reports state=closed, merged=False →
+    FAILED with pr_closed_unmerged marker, no review-pipeline handoff. Without
+    this, the task wedges in EVALUATING since review can't act on a closed PR."""
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged": False},
+    )
+    _spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, True),
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-closed-pr",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(Artifact(
+        task_id=t.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/3444",
+    ))
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED
+    assert (t.context or {}).get("pr_closed_unmerged") is True
+    assert "#3444" in (t.latest_status_message or "")
+    assert "closed without merging" in (t.latest_status_message or "")
+    _spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reap_with_merged_pr_marks_completed(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Reap with PR artifact + GitHub reports state=closed, merged=True →
+    COMPLETED with pr_merged marker. Covers the case where the PR merged
+    out-of-band before completion-processing ran."""
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged": True},
+    )
+    _spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, True),
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-merged-pr",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(Artifact(
+        task_id=t.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/5555",
+    ))
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.COMPLETED
+    assert (t.context or {}).get("pr_merged") is True
+    assert "#5555" in (t.latest_status_message or "")
+    _spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reap_with_open_pr_via_gh_check_goes_to_evaluating(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Reap with PR artifact + GitHub reports state=open → existing handoff
+    to EVALUATING with review-pipeline spawn. Confirms the GH-state check
+    doesn't regress the happy path."""
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "open", "merged": False},
+    )
+    _spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, True),
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-open-pr",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(Artifact(
+        task_id=t.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/7777",
+    ))
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.EVALUATING
+    assert "#7777" in (t.latest_status_message or "")
+    assert "handed off to review pipeline" in (t.latest_status_message or "")
+    _spawn.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reap_with_pr_falls_back_to_open_when_gh_unreachable(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """GH API failure → fall back to current behavior (assume open and hand
+    off). One transient API error shouldn't strand the task as FAILED."""
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("gh down"),
+    )
+    _spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, True),
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-pr-gh-down",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(Artifact(
+        task_id=t.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/8888",
+    ))
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.EVALUATING
+    assert "#8888" in (t.latest_status_message or "")
+    _spawn.assert_called_once()

@@ -777,6 +777,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Create all child tasks — no wave dependencies, priority ordering handles dispatch order
     child_tasks = []
     finding_indices = []  # Maps child_tasks index → findings array index
+    # Parallel flag: True when the child came from an auto-decomposed sub-finding.
+    # Used to chain consecutive siblings of the same parent finding via depends_on
+    # (so they execute serially, each agent seeing prior siblings' actually-merged
+    # work in its base branch instead of partial scaffolding from in-flight peers).
+    _auto_decomposed_flags: list[bool] = []
 
     # Pre-load project for scope calibration (SQLAlchemy identity map — no extra query if already loaded)
     _scope_cal_project = await session.get(Project, task.project_id)
@@ -1434,6 +1439,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         session.add(new_task)
         child_tasks.append(new_task)
         finding_indices.append(orig_i)
+        _auto_decomposed_flags.append(bool(finding.get("auto_decomposed")))
         _impl_spawned += 1
 
     _now_iso = _utcnow().isoformat()
@@ -1495,6 +1501,25 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if explicit_deps:
             ct.depends_on = explicit_deps
             session.add(ct)
+
+    # Chain auto-decomposed siblings: when a finding is split into N sub-tasks
+    # by cochange/path clustering, run them serially rather than in parallel.
+    # Each sibling's base branch otherwise picks up partial sibling-merged
+    # state, which confuses agents (see dcd6e840: cluster 3's agent saw
+    # cluster 1's already-merged scaffolding in task_completion.py and edited
+    # the wrong file). Sequential execution lets each agent work against the
+    # actually-merged state of prior siblings.
+    for ci in range(1, len(child_tasks)):
+        if not (_auto_decomposed_flags[ci] and _auto_decomposed_flags[ci - 1]):
+            continue
+        if finding_indices[ci] != finding_indices[ci - 1]:
+            continue
+        prev_id = str(child_tasks[ci - 1].id)
+        existing = list(child_tasks[ci].depends_on or [])
+        if prev_id not in existing:
+            existing.append(prev_id)
+            child_tasks[ci].depends_on = existing
+            session.add(child_tasks[ci])
 
     # Log file overlap warnings for observability and surface them to agents
     overlaps = _log_file_overlaps(findings, "RESEARCH")
