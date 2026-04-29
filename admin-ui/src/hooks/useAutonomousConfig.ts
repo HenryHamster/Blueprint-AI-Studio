@@ -18,6 +18,9 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
   const [configArchitectureReviewFrequency, setConfigArchitectureReviewFrequency] = useState<number>(3);
   const [configMaxProvisionRetries, setConfigMaxProvisionRetries] = useState<number>(3);
   const [configMaxRollupRetries, setConfigMaxRollupRetries] = useState<number>(5);
+  const [configDriftOverClaimMinClaims, setConfigDriftOverClaimMinClaims] = useState<number>(3);
+  const [configDriftConsistencyThreshold, setConfigDriftConsistencyThreshold] = useState<number>(0.4);
+  const [configDriftStallMinClaims, setConfigDriftStallMinClaims] = useState<number>(5);
   const [autonomousConfigOpen, setAutonomousConfigOpen] = useState(false);
   const [savingConfigField, setSavingConfigField] = useState<string | null>(null);
   const [cooldownMinutes, setCooldownMinutes] = useState<number>(240);
@@ -53,6 +56,9 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
       if (data.architecture_review_frequency != null) setConfigArchitectureReviewFrequency(data.architecture_review_frequency);
       if (data.max_provision_retries != null) setConfigMaxProvisionRetries(data.max_provision_retries);
       if (data.max_rollup_retries != null) setConfigMaxRollupRetries(data.max_rollup_retries);
+      if (data.drift_over_claim_min_claims != null) setConfigDriftOverClaimMinClaims(data.drift_over_claim_min_claims);
+      if (data.drift_over_claim_consistency_threshold != null) setConfigDriftConsistencyThreshold(data.drift_over_claim_consistency_threshold);
+      if (data.drift_stall_min_claims != null) setConfigDriftStallMinClaims(data.drift_stall_min_claims);
     } catch { /* ignore */ }
   }
 
@@ -104,6 +110,9 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
     configArchitectureReviewFrequency, setConfigArchitectureReviewFrequency,
     configMaxProvisionRetries, setConfigMaxProvisionRetries,
     configMaxRollupRetries, setConfigMaxRollupRetries,
+    configDriftOverClaimMinClaims, setConfigDriftOverClaimMinClaims,
+    configDriftConsistencyThreshold, setConfigDriftConsistencyThreshold,
+    configDriftStallMinClaims, setConfigDriftStallMinClaims,
     autonomousConfigOpen, setAutonomousConfigOpen,
     savingConfigField,
     cooldownMinutes,

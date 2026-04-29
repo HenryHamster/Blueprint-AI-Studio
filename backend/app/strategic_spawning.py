@@ -14,6 +14,7 @@ from sqlmodel import select
 
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
+from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
 from app.models import Task, Project, TaskHistory, TaskStatus, ProjectMessage, SystemMaturity
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 import app.shared_state as _shared_state
@@ -261,6 +262,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "is_self_repo":                    {"priority": "critical"},
     "model":                           {"priority": "critical"},
     "effort":                          {"priority": "critical"},
+    "prompt_suffix":                   {"priority": "high"},
     # Vision + intent — small but load-bearing for every decision
     "vision":                          {"priority": "critical"},
     # User-facing state the agent must respond to
@@ -1037,6 +1039,21 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
             stat_entry["recommended_mode"] = _rec_mode
         direction_stats.append(stat_entry)
 
+    mode_hint_lines = []
+    for d in included_directions:
+        mode = normalized_recommended_mode(d)
+        hint = mode_prompt_hint(mode)
+        if not hint and mode != "pause":
+            continue
+        direction_label = f"{d.get('id')}: {(d.get('text') or '')[:120]}".strip()
+        if mode == "pause":
+            hint = (
+                "Mode hint: this direction is in pause mode. do not propose new feature "
+                "work for this direction in this cycle; defer new findings against it."
+            )
+        mode_hint_lines.append(f"- {direction_label} — {hint}")
+    prompt_suffix = "\n".join(["Mode hints for this cycle:"] + mode_hint_lines) if mode_hint_lines else None
+
     # Recently rejected proposals (last 30 days) — surfaced so the strategic
     # agent avoids re-proposing similar work the user already declined.
     cutoff_iso = (_utcnow() - timedelta(days=30)).isoformat()
@@ -1147,6 +1164,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "open_messages": open_msgs,
         "conversation_thread": conversation_thread,
         **({"rejected_proposals": rejected_proposals} if rejected_proposals else {}),
+        **({"prompt_suffix": prompt_suffix} if prompt_suffix else {}),
         # Mode-aware: include only when non-empty so cold-start projects
         # don't carry empty fields through the strategic payload size cap.
         **({"system_maturity": system_maturity_payload} if system_maturity_payload else {}),

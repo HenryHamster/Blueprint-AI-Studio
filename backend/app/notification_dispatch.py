@@ -811,7 +811,8 @@ async def post_residual_fix_escalation_message(
     summary = (
         f'Residual auto-fix suspended for fingerprint {fingerprint[:32]} '
         f'after {failure_count} consecutive failures. Manual intervention '
-        f'required. Re-enable by clearing suspended_at on the case row.'
+        f'required. Re-enable via the Unsuspend button in the dashboard '
+        f'or POST /api/admin/residual-cases/{fingerprint}/unsuspend.'
     )
     ctx: dict[str, Any] = {
         'event_type': 'residual_fix_escalated',
@@ -827,6 +828,47 @@ async def post_residual_fix_escalation_message(
         context=ctx,
     )
     session.add(msg)
+    return msg
+
+
+async def post_residual_fix_unsuspend_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    fingerprint: str,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a NOTE-severity message when a suspended residual fingerprint is
+    manually unsuspended by an operator. Paired with the BLOCKER escalation
+    message so the message stream shows suspend → unsuspend as a matched pair.
+    Also fires RESIDUAL_FIX_UNSUSPENDED external webhook (opt-in).
+    """
+    recovered_at = datetime.now(timezone.utc).isoformat()
+    summary = (
+        f'Residual auto-fix re-enabled for fingerprint {fingerprint[:32]}. '
+        f'Case manually unsuspended by operator. Spawn will resume after cooldown.'
+    )
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type='residual_fix_unsuspended',
+        summary=summary,
+        context={
+            'fingerprint': fingerprint,
+            'recovered_at': recovered_at,
+            'manual_intervention_required': False,
+        },
+        task_id=task_id,
+    )
+    asyncio.ensure_future(dispatch_external_notification(
+        project_id,
+        'RESIDUAL_FIX_UNSUSPENDED',
+        {
+            'fingerprint': fingerprint,
+            'recovered_at': recovered_at,
+            'manual_intervention_required': False,
+            'summary': summary,
+        },
+    ))
     return msg
 
 

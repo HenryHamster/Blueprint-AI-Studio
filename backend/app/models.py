@@ -668,6 +668,13 @@ class ResidualRemediationCase(SQLModel, table=True):
     )
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
+    # Audit-mode deferral fields (added 0056). Nullable / default-0 so existing
+    # rows backfilled by migration server_default work without a Python-side touch.
+    audit_defer_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    audit_deferred_system_id: Optional[str] = Field(default=None)
 
     __table_args__ = (
         Index("ix_residual_case_status_last_seen", "status", "last_seen_at"),

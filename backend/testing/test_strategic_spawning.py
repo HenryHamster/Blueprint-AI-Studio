@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock
 from sqlalchemy import select
 
 import app.shared_state as _shared_state
-from app.models import Project, Task, TaskStatus
+from app.models import Project, Task, TaskStatus, RECOMMENDED_MODE_META_KEY
 from app.autonomous_research import _spawn_research_task
 from app.strategic_spawning import _spawn_design_doc_update, _spawn_strategic_review, _build_shipped_changes_manifest
 from app.max_plan_pool import _max_plan_pools, _account_by_id
@@ -932,6 +932,55 @@ async def test_recommended_mode_pause_present_in_direction_stats(db_session):
     assert d_stat.get("recommended_mode") == "pause", (
         "Expected recommended_mode='pause' in direction stats for pause-mode direction"
     )
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_prompt_suffix_includes_mode_hints(db_session):
+    """Strategic review prompt suffix should spell out mode-specific guidance per direction."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-mode-audit",
+                "status": "active",
+                "text": "Direction in audit mode",
+                "priority": "high",
+                "recommended_mode": "audit",
+            },
+            {
+                "id": "d-mode-pause",
+                "status": "active",
+                "text": "Direction in pause mode",
+                "priority": "low",
+                "recommended_mode": "pause",
+            },
+            {
+                "id": "d-mode-operator",
+                "status": "active",
+                "text": "Operator-pinned fundamentals direction",
+                "priority": "medium",
+                "recommended_mode": "fundamentals",
+                RECOMMENDED_MODE_META_KEY: {"source": "operator", "set_at": "2026-04-01T00:00:00"},
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    suffix = payload["prompt_suffix"]
+
+    assert "Mode hints for this cycle:" in suffix
+    assert "d-mode-audit" in suffix and "audit mode" in suffix
+    assert "d-mode-pause" in suffix and "do not propose new feature work for" in suffix
+    assert "d-mode-operator" in suffix and "fundamentals mode" in suffix
 
 
 @pytest.mark.asyncio

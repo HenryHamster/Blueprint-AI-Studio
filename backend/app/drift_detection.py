@@ -27,9 +27,21 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
-_OVER_CLAIM_MIN_CLAIMS = 3
-_OVER_CLAIM_CONSISTENCY_THRESHOLD = 0.4
-_STALL_MIN_CLAIMS = 5
+_OVER_CLAIM_MIN_CLAIMS_DEFAULT = 3
+_OVER_CLAIM_CONSISTENCY_THRESHOLD_DEFAULT = 0.4
+_STALL_MIN_CLAIMS_DEFAULT = 5
+
+
+def _drift_thresholds() -> tuple[int, float, int]:
+    """Return (over_claim_min_claims, over_claim_consistency_threshold, stall_min_claims)
+    from runtime_config, falling back to defaults when absent.
+    """
+    from app.shared_state import runtime_config as _rc  # lazy import avoids circular
+    return (
+        int(_rc.get("drift_over_claim_min_claims", _OVER_CLAIM_MIN_CLAIMS_DEFAULT)),
+        float(_rc.get("drift_over_claim_consistency_threshold", _OVER_CLAIM_CONSISTENCY_THRESHOLD_DEFAULT)),
+        int(_rc.get("drift_stall_min_claims", _STALL_MIN_CLAIMS_DEFAULT)),
+    )
 
 
 def _neutral_signal() -> dict[str, Any]:
@@ -84,13 +96,25 @@ def _consistency(merged: int, claimed: int) -> float:
     return max(0.0, min(1.0, merged / claimed))
 
 
-def _build_direction_signal(claimed: int, merged: int) -> dict[str, Any]:
+def _build_direction_signal(
+    claimed: int,
+    merged: int,
+    *,
+    over_claim_min: int | None = None,
+    consistency_threshold: float | None = None,
+    stall_min: int | None = None,
+) -> dict[str, Any]:
+    if over_claim_min is None or consistency_threshold is None or stall_min is None:
+        _oc_min, _ct, _st_min = _drift_thresholds()
+        over_claim_min = over_claim_min if over_claim_min is not None else _oc_min
+        consistency_threshold = consistency_threshold if consistency_threshold is not None else _ct
+        stall_min = stall_min if stall_min is not None else _st_min
     consistency = _consistency(merged, claimed)
     over_claim = (
-        claimed >= _OVER_CLAIM_MIN_CLAIMS
-        and consistency < _OVER_CLAIM_CONSISTENCY_THRESHOLD
+        claimed >= over_claim_min
+        and consistency < consistency_threshold
     )
-    stalled = claimed >= _STALL_MIN_CLAIMS and merged == 0
+    stalled = claimed >= stall_min and merged == 0
     return {
         "claimed_changes_count": claimed,
         "actually_merged_prs": merged,
@@ -124,6 +148,7 @@ async def compute_direction_drift(
     signals so callers can rely on a stable shape.
     """
     generated_at = _utcnow().isoformat()
+    over_claim_min, consistency_threshold, stall_min = _drift_thresholds()
     directions = list(project.directions or [])
     by_direction: dict[str, dict[str, Any]] = {}
     by_system_accum: dict[str, dict[str, int]] = {}
@@ -194,7 +219,12 @@ async def compute_direction_drift(
             continue
         claimed = per_direction_claims.get(did, 0)
         merged = per_direction_merged.get(did, 0)
-        signal = _build_direction_signal(claimed, merged)
+        signal = _build_direction_signal(
+            claimed, merged,
+            over_claim_min=over_claim_min,
+            consistency_threshold=consistency_threshold,
+            stall_min=stall_min,
+        )
         by_direction[did] = signal
         sid = d.get("system_id")
         if sid:
@@ -207,7 +237,12 @@ async def compute_direction_drift(
     # neutral signal so consumers can rely on the by_system shape.
     by_system: dict[str, dict[str, Any]] = {}
     for sid, acc in by_system_accum.items():
-        by_system[sid] = _build_direction_signal(acc["claimed"], acc["merged"])
+        by_system[sid] = _build_direction_signal(
+            acc["claimed"], acc["merged"],
+            over_claim_min=over_claim_min,
+            consistency_threshold=consistency_threshold,
+            stall_min=stall_min,
+        )
 
     # Surface systems that exist on directions but had no in-window data —
     # neutral signal lets the strategic prompt still see the system_id.

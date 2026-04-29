@@ -410,6 +410,105 @@ describe('RemediationFunnelSection show/hide ignored toggle', () => {
   });
 });
 
+describe('RemediationFunnelSection unsuspend button', () => {
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+  });
+
+  it('shows an Unsuspend button for SUSPENDED fingerprints', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+      baseCluster({ case_status: 'SUSPENDED', consecutive_failure_count: 3 }),
+    ])));
+    const user = userEvent.setup();
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} projectId="proj-1" />);
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+    expect(screen.getByRole('button', { name: /Unsuspend fingerprint/i })).toBeInTheDocument();
+  });
+
+  it('POSTs to the correct unsuspend endpoint with project_id on click', async () => {
+    apiFetchMock.mockImplementation((url: string) => {
+      if (url.includes('residual-fingerprints')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(makeResiduals([
+          baseCluster({ fingerprint: 'fp-suspended', case_status: 'SUSPENDED', consecutive_failure_count: 2 }),
+        ])) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    const user = userEvent.setup();
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} projectId="proj-abc" />);
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+
+    const unsuspendButton = screen.getByRole('button', { name: /Unsuspend fingerprint/i });
+    await user.click(unsuspendButton);
+
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/residual-cases/fp-suspended/unsuspend?project_id=proj-abc',
+      { method: 'POST' },
+    );
+  });
+
+  it('does not show an Unsuspend button for ACTIVE fingerprints', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+      baseCluster({ case_status: 'ACTIVE' }),
+    ])));
+    const user = userEvent.setup();
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} />);
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+    expect(screen.queryByRole('button', { name: /Unsuspend fingerprint/i })).toBeNull();
+  });
+
+  it('does not show an Unsuspend button for REMEDIATING fingerprints', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+      baseCluster({ case_status: 'REMEDIATING' }),
+    ])));
+    const user = userEvent.setup();
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} />);
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+    expect(screen.queryByRole('button', { name: /Unsuspend fingerprint/i })).toBeNull();
+  });
+
+  it('does not show an Unsuspend button for IGNORED fingerprints', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse(makeResiduals([
+      baseCluster({ case_status: 'IGNORED' }),
+    ])));
+    const user = userEvent.setup();
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} />);
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+    expect(screen.queryByRole('button', { name: /Unsuspend fingerprint/i })).toBeNull();
+  });
+
+  it('shows error and re-enables button when unsuspend POST fails', async () => {
+    apiFetchMock.mockImplementation((url: string) => {
+      if (url.includes('residual-fingerprints')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(makeResiduals([
+          baseCluster({ fingerprint: 'fp-fail-unsuspend', case_status: 'SUSPENDED', consecutive_failure_count: 1 }),
+        ])) });
+      }
+      if (url.includes('unsuspend')) {
+        return Promise.resolve({ ok: false, status: 500 });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    const user = userEvent.setup();
+    render(<RemediationFunnelSection funnel={{ investigations_spawned: 1 }} />);
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Unclassified CODE_ERROR patterns/i }));
+
+    await user.click(screen.getByRole('button', { name: /Unsuspend fingerprint/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Failed to unsuspend/i)).toBeInTheDocument();
+    });
+    // Button should be re-shown after error
+    expect(screen.getByRole('button', { name: /Unsuspend fingerprint/i })).toBeInTheDocument();
+  });
+});
+
 describe('RemediationFunnelSection residuals status pill', () => {
   beforeEach(() => {
     apiFetchMock.mockReset();

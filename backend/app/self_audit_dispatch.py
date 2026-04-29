@@ -206,6 +206,34 @@ async def _should_dispatch_self_audit(
     }
 
 
+async def _record_residual_audit_deferral(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    fingerprint: str,
+    system_id: str,
+) -> None:
+    """Stamp a deferral event on the ResidualRemediationCase for *fingerprint*.
+
+    Increments ``audit_defer_count`` and records ``audit_deferred_system_id`` so
+    operators can see via GET /residual-cases why a case is held.
+    The caller (``_spawn_residual_fingerprint_remediation``) commits after return.
+    """
+    from app.models import ResidualRemediationCase
+
+    case = (await session.execute(
+        select(ResidualRemediationCase).where(
+            ResidualRemediationCase.project_id == project_id,
+            ResidualRemediationCase.fingerprint == fingerprint,
+        )
+    )).scalar_one_or_none()
+    if case is None:
+        return
+    case.audit_defer_count = (case.audit_defer_count or 0) + 1
+    case.audit_deferred_system_id = system_id
+    case.updated_at = _utcnow()
+    session.add(case)
+
+
 async def _spawn_self_audit_task(
     project: Project, session: AsyncSession, audit_payload: dict,
 ) -> bool:

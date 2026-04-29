@@ -13,7 +13,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.notification_dispatch import dispatch_external_notification
+from app.notification_dispatch import dispatch_external_notification, post_residual_fix_unsuspend_message
 
 from app.database import get_session
 from app.digest_cache import DigestCache, get_digest_cache
@@ -1142,6 +1142,8 @@ async def list_residual_cases(
                 "consecutive_failure_count": c.consecutive_failure_count,
                 "suspended_at": c.suspended_at.isoformat() if c.suspended_at else None,
                 "sample_message": (c.sample_messages[0] if c.sample_messages else c.sample_message),
+                "audit_defer_count": c.audit_defer_count,
+                "audit_deferred_system_id": c.audit_deferred_system_id,
             }
             for c in rows
         ],
@@ -1211,6 +1213,45 @@ async def unignore_residual_case(
     case.updated_at = _utcnow()
     await session.commit()
     return {"id": str(case.id), "fingerprint": fingerprint, "status": ResidualRemediationCaseStatus.ACTIVE}
+
+
+@router.post("/residual-cases/{fingerprint}/unsuspend")
+async def unsuspend_residual_case(
+    fingerprint: str,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """Re-enable a SUSPENDED residual fingerprint case.
+
+    Transitions status back to ACTIVE, clears suspended_at, and resets
+    consecutive_failure_count to 0. Returns 404 if no SUSPENDED case
+    exists for (project_id, fingerprint). The cooldown (last_spawned_at)
+    is intentionally preserved so the case does not immediately re-spawn.
+    """
+    result = await session.execute(
+        select(ResidualRemediationCase).where(
+            ResidualRemediationCase.project_id == project_id,
+            ResidualRemediationCase.fingerprint == fingerprint,
+        )
+    )
+    case = result.scalar_one_or_none()
+    if case is None or case.status != ResidualRemediationCaseStatus.SUSPENDED:
+        raise HTTPException(status_code=404, detail="No SUSPENDED case found for this fingerprint and project")
+    case.status = ResidualRemediationCaseStatus.ACTIVE
+    case.suspended_at = None
+    case.consecutive_failure_count = 0
+    case.updated_at = _utcnow()
+    session.add(case)
+    await post_residual_fix_unsuspend_message(session, project_id, fingerprint)
+    await session.commit()
+    return {
+        "id": str(case.id),
+        "fingerprint": fingerprint,
+        "status": ResidualRemediationCaseStatus.ACTIVE,
+        "consecutive_failure_count": 0,
+        "suspended_at": None,
+    }
 
 
 @router.post("/residual-fingerprints/clear")

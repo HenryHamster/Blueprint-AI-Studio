@@ -648,6 +648,12 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                 setConfigMaxProvisionRetries={config.setConfigMaxProvisionRetries}
                 configMaxRollupRetries={config.configMaxRollupRetries}
                 setConfigMaxRollupRetries={config.setConfigMaxRollupRetries}
+                configDriftOverClaimMinClaims={config.configDriftOverClaimMinClaims}
+                setConfigDriftOverClaimMinClaims={config.setConfigDriftOverClaimMinClaims}
+                configDriftConsistencyThreshold={config.configDriftConsistencyThreshold}
+                setConfigDriftConsistencyThreshold={config.setConfigDriftConsistencyThreshold}
+                configDriftStallMinClaims={config.configDriftStallMinClaims}
+                setConfigDriftStallMinClaims={config.setConfigDriftStallMinClaims}
                 autonomousConfigOpen={config.autonomousConfigOpen}
                 setAutonomousConfigOpen={config.setAutonomousConfigOpen}
                 savingConfigField={config.savingConfigField}

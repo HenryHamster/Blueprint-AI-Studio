@@ -5153,6 +5153,150 @@ async def test_unignore_residual_case_requires_auth(unauthenticated_client: Asyn
     assert response.status_code in (401, 403)
 
 
+# ── POST /residual-cases/{fp}/unsuspend ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unsuspend_residual_case_clears_state(client: AsyncClient, db_session, mocker):
+    """POST /residual-cases/{fp}/unsuspend transitions SUSPENDED→ACTIVE and clears fields."""
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=mocker.AsyncMock,
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "err-fp-unsuspend"
+    from datetime import timezone
+    suspended_at = _utcnow().replace(tzinfo=timezone.utc) if _utcnow().tzinfo is None else _utcnow()
+    case = ResidualRemediationCase(
+        project_id=project.id,
+        fingerprint=fingerprint,
+        status=ResidualCaseStatus.SUSPENDED,
+        suspended_at=_utcnow(),
+        consecutive_failure_count=3,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/admin/residual-cases/{fingerprint}/unsuspend",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["fingerprint"] == fingerprint
+    assert data["status"] == "ACTIVE"
+    assert data["consecutive_failure_count"] == 0
+    assert data["suspended_at"] is None
+    assert "id" in data
+
+    # Verify DB row was updated
+    await db_session.refresh(case)
+    assert case.status == ResidualCaseStatus.ACTIVE
+    assert case.consecutive_failure_count == 0
+    assert case.suspended_at is None
+
+
+@pytest.mark.asyncio
+async def test_unsuspend_residual_case_404_when_missing(client: AsyncClient, db_session):
+    """POST /residual-cases/{fp}/unsuspend returns 404 when no case row exists."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.post(
+        "/api/admin/residual-cases/nonexistent-fp/unsuspend",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_unsuspend_residual_case_404_when_not_suspended(client: AsyncClient, db_session):
+    """POST /residual-cases/{fp}/unsuspend returns 404 when case is ACTIVE (not SUSPENDED)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "err-fp-not-suspended"
+    case = ResidualRemediationCase(
+        project_id=project.id,
+        fingerprint=fingerprint,
+        status=ResidualCaseStatus.ACTIVE,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/admin/residual-cases/{fingerprint}/unsuspend",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_unsuspend_residual_case_emits_message_and_webhook(client: AsyncClient, db_session, mocker):
+    """POST /residual-cases/{fp}/unsuspend creates a ProjectMessage and fires the webhook."""
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=mocker.AsyncMock,
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "err-fp-webhook-test"
+    case = ResidualRemediationCase(
+        project_id=project.id,
+        fingerprint=fingerprint,
+        status=ResidualCaseStatus.SUSPENDED,
+        suspended_at=_utcnow(),
+        consecutive_failure_count=3,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/admin/residual-cases/{fingerprint}/unsuspend",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+
+    # Verify a ProjectMessage with the correct event_type was created
+    from app.models import ProjectMessage
+    result = await db_session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+        )
+    )
+    messages = result.scalars().all()
+    unsuspend_msgs = [m for m in messages if (m.context or {}).get("event_type") == "residual_fix_unsuspended"]
+    assert len(unsuspend_msgs) == 1
+    assert fingerprint in unsuspend_msgs[0].content
+
+    # Verify dispatch was called with RESIDUAL_FIX_UNSUSPENDED
+    assert dispatch_mock.called
+    call_args = dispatch_mock.call_args_list
+    event_types = [c.args[1] if c.args else c.kwargs.get("event_type") for c in call_args]
+    assert "RESIDUAL_FIX_UNSUSPENDED" in event_types
+
+
+@pytest.mark.asyncio
+async def test_unsuspend_residual_case_requires_auth(unauthenticated_client: AsyncClient):
+    """Unsuspend endpoint requires admin auth."""
+    response = await unauthenticated_client.post(
+        "/api/admin/residual-cases/some-fp/unsuspend",
+        params={"project_id": "00000000-0000-0000-0000-000000000000"},
+    )
+    assert response.status_code in (401, 403)
+
+
 # ── GET /residual-cases (list endpoint for ops.py fingerprints) ──────────────
 
 

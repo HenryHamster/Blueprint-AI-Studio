@@ -7581,6 +7581,360 @@ async def test_residual_fingerprint_remediation_error_shaped_uses_normal_thresho
     assert spawned == 1, "CODE_ERROR sample should spawn at hit_count=1"
 
 
+@pytest.mark.asyncio
+async def test_residual_defers_when_system_in_audit_mode(db_session, _clear_residual_state):
+    """Fingerprint whose tasks all map to a single system in audit mode is deferred (no spawn)."""
+    import time
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+    from app.models import SystemMaturity
+
+    system_id = "sys-auth"
+    dir_id = "d-auditgate01"
+    project = Project(
+        name="Audit Gate Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[{**_active_direction(dir_id), "system_id": system_id}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = Task(
+        project_id=project.id,
+        title="Source failing task",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"direction_id": dir_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    db_session.add(SystemMaturity(
+        project_id=project.id,
+        system_id=system_id,
+        score=40,
+        recommended_mode="audit",
+    ))
+    await db_session.commit()
+
+    fp = "fp_audit_gate_defers_xyz"
+    _residual_store[fp] = {
+        "count": 3, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "sample_message": "TypeError: audit mode test", "task_ids": [str(source_task.id)],
+        "is_error_shaped": True,
+    }
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 0, "Fingerprint mapped to audit-mode system must be deferred"
+
+
+@pytest.mark.asyncio
+async def test_residual_defers_when_system_in_fundamentals_mode(db_session, _clear_residual_state):
+    """Fingerprint whose tasks map to a system in fundamentals mode is also deferred."""
+    import time
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+    from app.models import SystemMaturity
+
+    system_id = "sys-core"
+    dir_id = "d-fundgate01"
+    project = Project(
+        name="Fundamentals Gate Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[{**_active_direction(dir_id), "system_id": system_id}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = Task(
+        project_id=project.id,
+        title="Source failing task",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"direction_id": dir_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    db_session.add(SystemMaturity(
+        project_id=project.id,
+        system_id=system_id,
+        score=30,
+        recommended_mode="fundamentals",
+    ))
+    await db_session.commit()
+
+    fp = "fp_fundamentals_gate_defers_xyz"
+    _residual_store[fp] = {
+        "count": 3, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "sample_message": "TypeError: fundamentals mode test", "task_ids": [str(source_task.id)],
+        "is_error_shaped": True,
+    }
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 0, "Fingerprint mapped to fundamentals-mode system must be deferred"
+
+
+@pytest.mark.asyncio
+async def test_record_residual_audit_deferral_stamps_updated_at(db_session, _clear_residual_state):
+    """_record_residual_audit_deferral increments audit_defer_count, records system_id, and bumps updated_at."""
+    import time
+    from datetime import datetime as _dt
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+    from app.models import ResidualRemediationCase, ResidualCaseStatus, SystemMaturity
+
+    system_id = "sys-defer-stamp"
+    dir_id = "d-deferstamp01"
+    project = Project(
+        name="Deferral Stamp Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[{**_active_direction(dir_id), "system_id": system_id}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = Task(
+        project_id=project.id,
+        title="Source failing task",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"direction_id": dir_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    db_session.add(SystemMaturity(
+        project_id=project.id,
+        system_id=system_id,
+        score=40,
+        recommended_mode="audit",
+    ))
+
+    fp = "fp_deferral_stamp_test_xyz"
+    # Use a hardcoded old timestamp so the comparison is unambiguous.
+    old_updated_at = _dt(2020, 1, 1, 0, 0, 0)
+    case = ResidualRemediationCase(
+        project_id=project.id,
+        fingerprint=fp,
+        status=ResidualCaseStatus.ACTIVE,
+        hit_count=5,
+        sample_message="TypeError: deferral stamp test",
+        first_seen_at=old_updated_at,
+        last_seen_at=old_updated_at,
+        created_at=old_updated_at,
+        updated_at=old_updated_at,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    _residual_store[fp] = {
+        "count": 5, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "sample_message": "TypeError: deferral stamp test",
+        "task_ids": [str(source_task.id)],
+        "is_error_shaped": True,
+    }
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 0
+    # Commit so the deferral's session.add(case) is persisted (the function
+    # returns 0 without committing; the real outer caller commits after return).
+    await db_session.commit()
+    await db_session.refresh(case)
+    assert case.updated_at > old_updated_at, "updated_at must be bumped by deferral recording"
+    assert case.audit_defer_count == 1, "audit_defer_count must be incremented"
+    assert case.audit_deferred_system_id == system_id, "audit_deferred_system_id must be recorded"
+
+
+@pytest.mark.asyncio
+async def test_residual_spawns_when_system_in_ship_mode(db_session, _clear_residual_state):
+    """Fingerprint tasks mapping to a ship-mode system are not gated — spawn proceeds normally."""
+    import time
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+    from app.models import SystemMaturity
+
+    system_id = "sys-api"
+    dir_id = "d-shipgate01"
+    project = Project(
+        name="Ship Gate Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[{**_active_direction(dir_id), "system_id": system_id}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = Task(
+        project_id=project.id,
+        title="Source failing task",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"direction_id": dir_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    db_session.add(SystemMaturity(
+        project_id=project.id,
+        system_id=system_id,
+        score=80,
+        recommended_mode="ship",
+    ))
+    await db_session.commit()
+
+    fp = "fp_ship_gate_spawns_xyz"
+    _residual_store[fp] = {
+        "count": 3, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "sample_message": "TypeError: ship mode spawns", "task_ids": [str(source_task.id)],
+        "is_error_shaped": True,
+    }
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 1, "Fingerprint in ship-mode system should spawn normally"
+
+
+@pytest.mark.asyncio
+async def test_residual_spawns_when_tasks_span_multiple_systems(db_session, _clear_residual_state):
+    """Fingerprint tasks spanning two systems produce an ambiguous mapping — spawn proceeds.
+
+    _infer_fingerprint_audit_system returns None when len(system_ids) != 1, so
+    uncertainty never becomes a block even when every candidate system is in audit mode.
+    """
+    import time
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+    from app.models import SystemMaturity
+
+    sys_a, sys_b = "sys-mixed-a", "sys-mixed-b"
+    dir_a, dir_b = "d-mixed-sysA", "d-mixed-sysB"
+    project = Project(
+        name="Mixed Systems Ambiguous Gate",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {**_active_direction(dir_a), "system_id": sys_a},
+            {**_active_direction(dir_b), "system_id": sys_b},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_a = Task(
+        project_id=project.id,
+        title="Failing task A",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"direction_id": dir_a},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    task_b = Task(
+        project_id=project.id,
+        title="Failing task B",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"direction_id": dir_b},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task_a)
+    db_session.add(task_b)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    db_session.add(SystemMaturity(project_id=project.id, system_id=sys_a, score=30, recommended_mode="audit"))
+    db_session.add(SystemMaturity(project_id=project.id, system_id=sys_b, score=35, recommended_mode="audit"))
+    await db_session.commit()
+
+    fp = "fp_mixed_systems_ambiguous_xyz"
+    _residual_store[fp] = {
+        "count": 4, "first_seen": time.time() - 3600, "last_seen": time.time(),
+        "sample_message": "TypeError: mixed systems test",
+        "task_ids": [str(task_a.id), str(task_b.id)],
+        "is_error_shaped": True,
+    }
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 1, (
+        "Fingerprint spanning multiple systems must spawn — ambiguous mapping is not a block"
+    )
+
+
+@pytest.mark.asyncio
+async def test_residual_resumes_spawn_when_system_exits_audit_mode(db_session, _clear_residual_state):
+    """Spawn resumes after a system's recommended_mode changes from audit back to ship."""
+    import time
+    from app.failure_classification import _residual_store
+    from app.autonomous_research import _spawn_residual_fingerprint_remediation
+    from app.models import ResidualRemediationCase, ResidualCaseStatus, SystemMaturity
+
+    system_id = "sys-resume"
+    dir_id = "d-resumetest01"
+    project = Project(
+        name="Resume After Audit",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[{**_active_direction(dir_id), "system_id": system_id}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = Task(
+        project_id=project.id,
+        title="Source failing task",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"direction_id": dir_id},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    mat = SystemMaturity(project_id=project.id, system_id=system_id, score=35, recommended_mode="audit")
+    db_session.add(mat)
+    case = ResidualRemediationCase(
+        project_id=project.id, fingerprint="fp_resume_audit_xyz",
+        status=ResidualCaseStatus.ACTIVE, hit_count=4,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    fp = "fp_resume_audit_xyz"
+    _residual_store[fp] = {
+        "count": 4, "first_seen": time.time() - 7200, "last_seen": time.time(),
+        "sample_message": "TypeError: resume test", "task_ids": [str(source_task.id)],
+        "is_error_shaped": True,
+    }
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 0, "Spawn must be blocked when system is in audit mode"
+
+    mat.recommended_mode = "ship"
+    db_session.add(mat)
+    await db_session.commit()
+
+    spawned = await _spawn_residual_fingerprint_remediation(project, db_session)
+    assert spawned == 1, "Spawn must resume when system exits audit mode"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Failure Feedback Consumption — Coaching Suffix & Scope Override
 # ─────────────────────────────────────────────────────────────────────────────

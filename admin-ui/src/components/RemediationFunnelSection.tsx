@@ -189,6 +189,8 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
   const [undoFingerprints, setUndoFingerprints] = useState<Map<string, ResidualFingerprint>>(new Map());
   const [ignoreErrors, setIgnoreErrors] = useState<Map<string, string>>(new Map());
   const [showIgnored, setShowIgnored] = useState(true);
+  const [unsuspendedFingerprints, setUnsuspendedFingerprints] = useState<Set<string>>(new Set());
+  const [unsuspendErrors, setUnsuspendErrors] = useState<Map<string, string>>(new Map());
 
   function handleIgnore(fp: ResidualFingerprint) {
     const fingerprint = fp.fingerprint;
@@ -209,6 +211,22 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
         setIgnoredFingerprints(prev => { const s = new Set(prev); s.delete(fingerprint); return s; });
         setUndoFingerprints(prev => { const m = new Map(prev); m.delete(fingerprint); return m; });
         setIgnoreErrors(prev => new Map([...prev, [fingerprint, err instanceof Error ? err.message : 'error']]));
+      });
+  }
+
+  function handleUnsuspend(fp: ResidualFingerprint) {
+    const fingerprint = fp.fingerprint;
+    setUnsuspendedFingerprints(prev => new Set([...prev, fingerprint]));
+    setUnsuspendErrors(prev => { const m = new Map(prev); m.delete(fingerprint); return m; });
+
+    const qs = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+    apiFetch(`/api/admin/residual-cases/${encodeURIComponent(fingerprint)}/unsuspend${qs}`, { method: 'POST' })
+      .then(r => {
+        if (!r.ok) throw new Error(`${r.status}`);
+      })
+      .catch((err: unknown) => {
+        setUnsuspendedFingerprints(prev => { const s = new Set(prev); s.delete(fingerprint); return s; });
+        setUnsuspendErrors(prev => new Map([...prev, [fingerprint, err instanceof Error ? err.message : 'error']]));
       });
   }
 
@@ -688,6 +706,9 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                   const undoFp = undoFingerprints.get(r.fingerprint);
                   const ignoreError = ignoreErrors.get(r.fingerprint);
                   const canIgnore = !r.case_status || r.case_status === 'ACTIVE' || r.case_status === 'REMEDIATING';
+                  const isUnsuspended = unsuspendedFingerprints.has(r.fingerprint);
+                  const unsuspendError = unsuspendErrors.get(r.fingerprint);
+                  const canUnsuspend = r.case_status === 'SUSPENDED' && !isUnsuspended;
 
                   if (isIgnored && undoFp) {
                     return (
@@ -713,9 +734,10 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                         </span>
                         <span className="text-[10px] text-neutral-500 shrink-0">{relativeTime(r.most_recent_at)}</span>
                         {(() => {
-                          const label = caseStatusLabel(r);
+                          const effectiveR = isUnsuspended ? { ...r, case_status: 'ACTIVE', consecutive_failure_count: 0 } : r;
+                          const label = caseStatusLabel(effectiveR);
                           if (!label) return null;
-                          const style = CASE_STATUS_STYLES[r.case_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+                          const style = CASE_STATUS_STYLES[effectiveR.case_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
                           return (
                             <span className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${style}`}>
                               {label}
@@ -723,6 +745,16 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                           );
                         })()}
                         <span className="font-mono text-[9px] text-neutral-600 truncate flex-1">{r.fingerprint}</span>
+                        {canUnsuspend && (
+                          <button
+                            type="button"
+                            onClick={() => handleUnsuspend(r)}
+                            className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-orange-700/60 text-orange-400 hover:text-orange-200 hover:border-orange-500 transition-colors"
+                            aria-label={`Unsuspend fingerprint ${r.fingerprint}`}
+                          >
+                            Unsuspend
+                          </button>
+                        )}
                         {canIgnore && (
                           <button
                             type="button"
@@ -734,6 +766,9 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                           </button>
                         )}
                       </div>
+                      {unsuspendError && (
+                        <div className="text-[10px] text-red-400 mb-1">Failed to unsuspend: {unsuspendError}</div>
+                      )}
                       {ignoreError && (
                         <div className="text-[10px] text-red-400 mb-1">Failed to ignore: {ignoreError}</div>
                       )}
